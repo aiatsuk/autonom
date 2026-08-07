@@ -1,0 +1,3 @@
+interface:
+  display_name: "Flutter Performance Audit"
+  short_description: "Audit Flutter performance in profile mode, separating UI build cost, raster cost, startup, images, and native Android bottlenecks."

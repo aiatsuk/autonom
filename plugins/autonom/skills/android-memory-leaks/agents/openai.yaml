@@ -1,0 +1,3 @@
+interface:
+  display_name: "Android Memory Leaks"
+  short_description: "Investigate managed and native Android memory with repeatable flows, meminfo, heap dumps, retaining paths, and heapprofd — growth is a lead, not proof."

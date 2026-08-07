@@ -1,0 +1,12 @@
+Applications Memory Usage (in Kilobytes):
+ App Summary
+           Java Heap:     4600
+         Native Heap:     2800
+            Graphics:     1100
+       Private Other:      600
+              System:     1000
+             TOTAL PSS:    10100            TOTAL RSS:    16500
+ Objects
+               Views:       25         ViewRootImpl:        1
+         AppContexts:        3           Activities:        1
+            WebViews:        0

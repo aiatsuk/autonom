@@ -1,0 +1,121 @@
+"""Stable machine-readable failures for the Autonom CLI (CAP-PLAT-005).
+
+Every expected failure travels as ``AutonomError`` and is rendered as one JSON
+object on stderr with exit code 2:
+
+    {"ok": false, "error_code": "idb_required", "error": "...", "hint": "..."}
+
+``error_code`` values are part of the agent-facing contract: they may be added
+but never repurposed, because a host agent branches on them. ``hint`` names the
+next action a human or agent can take, so a failure is never a dead end.
+"""
+from __future__ import annotations
+
+from typing import Any
+
+# --- Target resolution -------------------------------------------------------
+AMBIGUOUS_TARGET = "ambiguous_target"
+CONFLICTING_TARGET_FLAGS = "conflicting_target_flags"
+NO_TARGET = "no_target"
+UNKNOWN_PLATFORM = "unknown_platform"
+
+# --- Tooling -----------------------------------------------------------------
+ADB_NOT_FOUND = "adb_not_found"
+SIMCTL_NOT_FOUND = "simctl_not_found"
+IDB_REQUIRED = "idb_required"
+IDB_COMPANION_UNAVAILABLE = "idb_companion_unavailable"
+MITMDUMP_REQUIRED = "mitmdump_required"
+BACKEND_FAILED = "backend_failed"
+
+# --- Session -----------------------------------------------------------------
+NO_ACTIVE_SESSION = "no_active_session"
+INSTALL_PATH_NOT_FOUND = "install_path_not_found"
+APP_NOT_INSTALLED = "app_not_installed"
+IOS_BOOT_FAILED = "ios_boot_failed"
+IOS_CLEAR_REQUIRES_INSTALL_PATH = "ios_clear_requires_install_path"
+EMULATOR_NOT_FOUND = "emulator_not_found"
+AVD_NOT_FOUND = "avd_not_found"
+AVD_REQUIRED = "avd_required"
+EMULATOR_ONLY = "emulator_only"
+BOOT_TIMEOUT = "boot_timeout"
+
+# --- UI ----------------------------------------------------------------------
+AMBIGUOUS_SELECTOR = "ambiguous_selector"
+NO_MATCHING_NODE = "no_matching_node"
+SELECTOR_INDEX_OUT_OF_RANGE = "selector_index_out_of_range"
+COORDINATE_SPACE_MISMATCH = "coordinate_space_mismatch"
+UNSUPPORTED_KEY_FOR_PLATFORM = "unsupported_key_for_platform"
+UNSUPPORTED_ON_PLATFORM = "unsupported_on_platform"
+
+# --- Device state ------------------------------------------------------------
+INVALID_URL = "invalid_url"
+INVALID_COORDINATES = "invalid_coordinates"
+UNKNOWN_PRIVACY_SERVICE = "unknown_privacy_service"
+PATH_OUTSIDE_CONTAINER = "path_outside_container"
+RECORDING_ALREADY_ACTIVE = "recording_already_active"
+
+# --- Network -----------------------------------------------------------------
+PORT_UNAVAILABLE = "port_unavailable"
+PROXY_NOT_RUNNING = "proxy_not_running"
+FLOW_NOT_FOUND = "flow_not_found"
+MOCK_NOT_FOUND = "mock_not_found"
+BODY_FILE_NOT_FOUND = "body_file_not_found"
+BODIES_NOT_CAPTURED = "bodies_not_captured"
+UNSAFE_ARTIFACTS_PERMISSIONS = "unsafe_artifacts_permissions"
+
+# --- Consent (C-05) ----------------------------------------------------------
+CONSENT_REQUIRED = "consent_required"
+CONSENT_DECLINED = "consent_declined"
+PHYSICAL_DEVICE_ATTACH_UNSUPPORTED = "physical_device_attach_unsupported"
+
+
+class AutonomError(RuntimeError):
+    """An expected failure with a stable code and an actionable hint."""
+
+    def __init__(self, code: str, message: str, hint: str | None = None, **extra: Any) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.hint = hint
+        self.extra = extra
+
+    def as_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "ok": False,
+            "error_code": self.code,
+            "error": self.message,
+        }
+        if self.hint:
+            payload["hint"] = self.hint
+        payload.update(self.extra)
+        return payload
+
+
+def tool_missing(tool: str) -> AutonomError:
+    """Uniform 'this backend is not installed' failure with an install hint."""
+    table = {
+        "adb": (
+            ADB_NOT_FOUND,
+            "adb not found on PATH; install Android platform-tools",
+            "Install Android platform-tools, or pass --adb /path/to/adb. Run 'autonom doctor'.",
+        ),
+        "simctl": (
+            SIMCTL_NOT_FOUND,
+            "xcrun not found on PATH; iOS support needs macOS with Xcode",
+            "Install Xcode and run 'xcode-select --install'. Run 'autonom doctor'.",
+        ),
+        "idb": (
+            IDB_REQUIRED,
+            "idb not found on PATH; iOS UI verbs need the iOS Development Bridge",
+            "Install idb-companion and the idb client, or pass --idb /path/to/idb. "
+            "Run 'autonom doctor'.",
+        ),
+        "mitmdump": (
+            MITMDUMP_REQUIRED,
+            "mitmdump not found on PATH; network capture needs mitmproxy",
+            "Install mitmproxy (brew install mitmproxy, or pipx install mitmproxy), "
+            "or pass --mitmdump /path/to/mitmdump. Run 'autonom doctor'.",
+        ),
+    }
+    code, message, hint = table[tool]
+    return AutonomError(code, message, hint)

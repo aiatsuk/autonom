@@ -1,0 +1,3 @@
+interface:
+  display_name: "Toolchain Doctor"
+  short_description: "Inspect Flutter, Dart, Gradle, AGP, Kotlin, SDK levels, Java, and adb without claiming any version is “latest”."

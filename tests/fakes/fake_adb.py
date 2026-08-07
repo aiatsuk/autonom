@@ -1,0 +1,183 @@
+#!/usr/bin/env python3
+"""Deterministic stand-in for `adb`, used by Autonom tests.
+
+Records every invocation to ``$AUTONOM_FAKE_LOG`` (one JSON array element per
+line) so tests can assert **what was actually executed**, not what the CLI
+reported. Canned responses are overridable through ``$AUTONOM_FAKE_STATE``,
+a JSON file read fresh on every call.
+
+State keys (all optional):
+
+``devices``         list of ``[serial, state, "key:value ..."]`` rows
+``ui_dump``         path to a uiautomator XML file to echo
+``logcat``          list of raw logcat lines
+``pidof``           mapping of package -> pid string
+``settings``        mapping of setting name -> current value
+``clock_skew``      seconds the fake device clock lags the host (default 0)
+``fail``            mapping of "joined argv prefix" -> [exit_code, message]
+"""
+from __future__ import annotations
+
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+# 1x1 transparent PNG; enough for signature and size assertions.
+PNG = bytes.fromhex(
+    "89504e470d0a1a0a0000000d494844520000000100000001080600000"
+    "01f15c4890000000a49444154789c6360000002000100ffff03000006"
+    "00057dd8b7c40000000049454e44ae426082"
+)
+
+
+def load_state() -> dict:
+    path = os.environ.get("AUTONOM_FAKE_STATE")
+    if not path or not Path(path).exists():
+        return {}
+    return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+def record(argv: list[str]) -> None:
+    path = os.environ.get("AUTONOM_FAKE_LOG")
+    if not path:
+        return
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"tool": "adb", "argv": argv}) + "\n")
+
+
+def write_state(state: dict) -> None:
+    path = os.environ.get("AUTONOM_FAKE_STATE")
+    if path:
+        Path(path).write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+
+
+def main(argv: list[str]) -> int:
+    record(argv)
+    state = load_state()
+
+    for prefix, outcome in (state.get("fail") or {}).items():
+        if " ".join(argv).startswith(prefix):
+            code, message = outcome
+            sys.stdout.write(message + "\n")
+            return int(code)
+
+    # Strip the target selector so command matching is position-independent.
+    args = list(argv)
+    if len(args) >= 2 and args[0] == "-s":
+        args = args[2:]
+
+    if args[:1] == ["version"]:
+        sys.stdout.write(state.get("adb_version", "Android Debug Bridge version 1.0.41") + "\n")
+        return 0
+
+    if args[:1] == ["devices"]:
+        rows = state.get("devices", [["emulator-5554", "device", "product:sdk_gphone64_arm64"]])
+        sys.stdout.write("List of devices attached\n")
+        for row in rows:
+            serial, device_state = row[0], row[1]
+            extra = row[2] if len(row) > 2 else ""
+            sys.stdout.write(f"{serial}\t{device_state} {extra}\n".rstrip() + "\n")
+        return 0
+
+    if args[:3] == ["exec-out", "uiautomator", "dump"]:
+        dump = state.get("ui_dump")
+        if dump:
+            sys.stdout.write(Path(dump).read_text(encoding="utf-8"))
+        return 0
+
+    if args[:2] == ["exec-out", "screencap"]:
+        sys.stdout.buffer.write(PNG)
+        return 0
+
+    if args[:1] == ["logcat"]:
+        for line in state.get("logcat", []):
+            sys.stdout.write(line + "\n")
+        return 0
+
+    if args[:3] == ["shell", "dumpsys", "location"]:
+        default = (
+            "    fused provider:\n"
+            "      last location=Location[fused 55.751244,37.618423 hAcc=5.0 et=+1h]\n"
+            "    gps provider:\n"
+            "      last location=Location[gps 55.751244,37.618423 hAcc=8.0 et=+1h]\n"
+            "    network provider:\n"
+            "      last location=null\n"
+        )
+        sys.stdout.write(state.get("dumpsys_location", default))
+        return 0
+
+    if args[:2] == ["shell", "date"]:
+        # `logs tail` derives its window from the DEVICE clock, so the fake has
+        # to have one. `clock_skew` lets a test reproduce the drift that made a
+        # real emulator's --since window come back empty.
+        spec = (args[2] if len(args) > 2 else "+%s").lstrip("+").replace("_", " ")
+        moment = time.time() - float(state.get("clock_skew", 0))
+        sys.stdout.write(time.strftime(spec, time.localtime(moment)).replace(" ", "_")
+                         if "_" in (args[2] if len(args) > 2 else "")
+                         else time.strftime(spec, time.localtime(moment)))
+        sys.stdout.write("\n")
+        return 0
+
+    if args[:1] == ["root"]:
+        # `root_refused` reproduces a Play-store image, where adb root is blocked.
+        if state.get("root_refused"):
+            sys.stdout.write("adbd cannot run as root in production builds\n")
+        else:
+            sys.stdout.write("restarting adbd as root\n")
+        return 0
+
+    if args[:1] == ["wait-for-device"]:
+        return 0
+
+    if args[:3] == ["emu", "geo", "fix"]:
+        # `geo fix <lon> <lat>` — success is silent on a real emulator. A
+        # `geo_fix_fails` flag lets a test drive the unreachable-console path.
+        if state.get("geo_fix_fails"):
+            sys.stdout.write("KO: unable to reach the emulator console\n")
+            return 1
+        sys.stdout.write("OK\n")
+        return 0
+
+    if args[:2] == ["emu", "kill"]:
+        # The serial travels in the stripped-off selector; consume it from the
+        # raw argv so the killed emulator disappears from later `devices` calls.
+        killed = argv[1] if argv[:1] == ["-s"] and len(argv) >= 2 else None
+        rows = state.get("devices", [["emulator-5554", "device", "product:sdk_gphone64_arm64"]])
+        state["devices"] = [row for row in rows if killed is None or row[0] != killed]
+        write_state(state)
+        sys.stdout.write("OK: killing emulator, bye bye\n")
+        return 0
+
+    if args[:2] == ["shell", "getprop"]:
+        prop = args[2] if len(args) > 2 else ""
+        default = "1" if prop == "sys.boot_completed" else ""
+        sys.stdout.write(str((state.get("getprop") or {}).get(prop, default)) + "\n")
+        return 0
+
+    if args[:1] == ["push"]:
+        return 0
+
+    if args[:2] == ["shell", "pidof"]:
+        package = args[-1]
+        sys.stdout.write((state.get("pidof", {}).get(package, "")) + "\n")
+        return 0
+
+    if args[:4] == ["shell", "settings", "get", "global"]:
+        value = state.get("settings", {}).get(args[4], "null")
+        sys.stdout.write(f"{value}\n")
+        return 0
+
+    if args[:4] == ["shell", "settings", "put", "global"]:
+        settings = state.setdefault("settings", {})
+        settings[args[4]] = args[5]
+        write_state(state)
+        return 0
+
+    # install / shell input / shell am / shell pm all succeed silently.
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

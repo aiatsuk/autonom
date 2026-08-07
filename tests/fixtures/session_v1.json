@@ -1,0 +1,9 @@
+{
+  "session_id": "s_0a1b2c3d4e",
+  "platform": "android",
+  "serial": "emulator-5554",
+  "app_id": "com.example.app",
+  "started_at": "2026-01-15T09:41:00Z",
+  "artifacts_dir": ".autonom/s_0a1b2c3d4e",
+  "adb": "/usr/local/bin/adb"
+}

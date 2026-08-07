@@ -1,0 +1,3 @@
+interface:
+  display_name: "Android App Actions"
+  short_description: "Plan and ship deep links, App Links, shortcuts, external intents, and Assistant actions through a single typed, sanitized routing path."

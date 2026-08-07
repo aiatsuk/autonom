@@ -1,0 +1,3 @@
+interface:
+  display_name: "Android Debugger Agent"
+  short_description: "Build, install, launch, and debug Android apps on an explicit adb target with Gradle/Flutter builds, screenshots, UI Automator selectors, input, and focused logcat."

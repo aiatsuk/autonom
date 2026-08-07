@@ -1,0 +1,3 @@
+interface:
+  display_name: "Flutter Android Platform"
+  short_description: "Implement and debug Flutter’s Android shell: Gradle, manifests, flavors, permissions, channels, plugins, app links, notifications, lifecycle."

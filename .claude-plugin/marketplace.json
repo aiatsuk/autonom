@@ -1,0 +1,15 @@
+{
+  "name": "autonom",
+  "description": "Autonom — universal mobile test and debug harness for AI coding agents (Android + iOS Simulator).",
+  "owner": {
+    "name": "Andrei Iatsuk",
+    "url": "https://github.com/aiatsuk"
+  },
+  "plugins": [
+    {
+      "name": "autonom",
+      "source": "./plugins/autonom",
+      "description": "Universal mobile test/debug harness for AI agents — Android and iOS Simulator sessions, UI trees, screenshots, logs, and consent-gated network capture and mocking."
+    }
+  ]
+}

@@ -1,0 +1,280 @@
+{
+  "devices": {
+    "argv": [
+      "devices"
+    ],
+    "exit_code": 0,
+    "keys": [
+      "devices:array",
+      "devices[].platform:str",
+      "devices[].properties.product:str",
+      "devices[].properties:object",
+      "devices[].serial:str",
+      "devices[].state:str",
+      "devices[]:object",
+      "ok:bool"
+    ]
+  },
+  "logs_tail": {
+    "argv": [
+      "logs",
+      "tail",
+      "--package",
+      "com.example.app",
+      "--max-lines",
+      "20"
+    ],
+    "exit_code": 0,
+    "keys": [
+      "count:number",
+      "lines:array",
+      "lines[].line:str",
+      "lines[]:object",
+      "ok:bool",
+      "saved:str",
+      "serial:str"
+    ]
+  },
+  "screenshot": {
+    "argv": [
+      "screenshot"
+    ],
+    "exit_code": 0,
+    "keys": [
+      "ok:bool",
+      "path:str",
+      "serial:str"
+    ]
+  },
+  "session_show": {
+    "argv": [
+      "session",
+      "show"
+    ],
+    "exit_code": 0,
+    "keys": [
+      "ok:bool",
+      "session.adb:str",
+      "session.app_id:str",
+      "session.artifacts_dir:str",
+      "session.platform:str",
+      "session.serial:str",
+      "session.session_id:str",
+      "session.started_at:str",
+      "session:object"
+    ]
+  },
+  "session_start": {
+    "argv": [
+      "session",
+      "start",
+      "--app-id",
+      "com.example.app"
+    ],
+    "exit_code": 0,
+    "keys": [
+      "ok:bool",
+      "session.adb:str",
+      "session.app_id:str",
+      "session.artifacts_dir:str",
+      "session.platform:str",
+      "session.serial:str",
+      "session.session_id:str",
+      "session.started_at:str",
+      "session:object"
+    ]
+  },
+  "session_stop": {
+    "argv": [
+      "session",
+      "stop"
+    ],
+    "exit_code": 0,
+    "keys": [
+      "ok:bool",
+      "session.adb:str",
+      "session.app_id:str",
+      "session.artifacts_dir:str",
+      "session.platform:str",
+      "session.serial:str",
+      "session.session_id:str",
+      "session.started_at:str",
+      "session.stopped_at:str",
+      "session:object"
+    ]
+  },
+  "ui_find_dump": {
+    "argv": [
+      "ui",
+      "find",
+      "--dump",
+      "tests/fixtures/ui_dump.xml",
+      "--desc",
+      "Flutter Save Button",
+      "--mode",
+      "exact"
+    ],
+    "exit_code": 0,
+    "keys": [
+      "count:number",
+      "matches:array",
+      "matches[].bounds:array",
+      "matches[].bounds[]:number",
+      "matches[].checked:bool",
+      "matches[].class:str",
+      "matches[].clickable:bool",
+      "matches[].depth:number",
+      "matches[].desc:str",
+      "matches[].enabled:bool",
+      "matches[].focusable:bool",
+      "matches[].package:str",
+      "matches[].ref:str",
+      "matches[].resource_id:nullable",
+      "matches[].role:str",
+      "matches[].scrollable:bool",
+      "matches[].selected:bool",
+      "matches[].text:nullable",
+      "matches[]:object",
+      "ok:bool",
+      "source:str",
+      "target:str"
+    ]
+  },
+  "ui_key": {
+    "argv": [
+      "ui",
+      "key",
+      "KEYCODE_BACK"
+    ],
+    "exit_code": 0,
+    "keys": [
+      "keycode:str",
+      "ok:bool",
+      "serial:str"
+    ]
+  },
+  "ui_tap_coords": {
+    "argv": [
+      "ui",
+      "tap",
+      "--x",
+      "100",
+      "--y",
+      "200"
+    ],
+    "exit_code": 0,
+    "keys": [
+      "ok:bool",
+      "ref:nullable",
+      "serial:str",
+      "x:number",
+      "y:number"
+    ]
+  },
+  "ui_tap_selector": {
+    "argv": [
+      "ui",
+      "tap",
+      "--desc",
+      "Flutter Save Button",
+      "--mode",
+      "exact"
+    ],
+    "exit_code": 0,
+    "keys": [
+      "ok:bool",
+      "ref:str",
+      "serial:str",
+      "x:number",
+      "y:number"
+    ]
+  },
+  "ui_tree_dump": {
+    "argv": [
+      "ui",
+      "tree",
+      "--dump",
+      "tests/fixtures/ui_dump.xml"
+    ],
+    "exit_code": 0,
+    "keys": [
+      "count:number",
+      "nodes:array",
+      "nodes[].bounds:array",
+      "nodes[].bounds[]:number",
+      "nodes[].checked:bool",
+      "nodes[].class:str",
+      "nodes[].clickable:bool",
+      "nodes[].depth:number",
+      "nodes[].desc:nullable",
+      "nodes[].enabled:bool",
+      "nodes[].focusable:bool",
+      "nodes[].package:str",
+      "nodes[].ref:str",
+      "nodes[].resource_id:nullable",
+      "nodes[].role:str",
+      "nodes[].scrollable:bool",
+      "nodes[].selected:bool",
+      "nodes[].text:nullable",
+      "nodes[]:object",
+      "ok:bool",
+      "source:str",
+      "target:str"
+    ]
+  },
+  "ui_tree_live": {
+    "argv": [
+      "ui",
+      "tree"
+    ],
+    "exit_code": 0,
+    "keys": [
+      "count:number",
+      "nodes:array",
+      "nodes[].bounds:array",
+      "nodes[].bounds[]:number",
+      "nodes[].checked:bool",
+      "nodes[].class:str",
+      "nodes[].clickable:bool",
+      "nodes[].depth:number",
+      "nodes[].desc:nullable",
+      "nodes[].enabled:bool",
+      "nodes[].focusable:bool",
+      "nodes[].package:str",
+      "nodes[].ref:str",
+      "nodes[].resource_id:nullable",
+      "nodes[].role:str",
+      "nodes[].scrollable:bool",
+      "nodes[].selected:bool",
+      "nodes[].text:nullable",
+      "nodes[]:object",
+      "ok:bool",
+      "saved:str",
+      "source:str",
+      "target:str"
+    ]
+  },
+  "ui_type": {
+    "argv": [
+      "ui",
+      "type",
+      "hello world"
+    ],
+    "exit_code": 0,
+    "keys": [
+      "ok:bool",
+      "serial:str",
+      "typed:str"
+    ]
+  },
+  "version": {
+    "argv": [
+      "version"
+    ],
+    "exit_code": 0,
+    "keys": [
+      "name:str",
+      "version:str"
+    ]
+  }
+}

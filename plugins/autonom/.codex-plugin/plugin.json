@@ -1,0 +1,63 @@
+{
+  "name": "autonom",
+  "version": "0.15.1",
+  "description": "Universal mobile test and debug harness for AI agents. Portable skills plus a CLI control plane for device sessions, UI trees, screenshots, logs, crashes, device state, and HTTP(S) capture and mocking across Android and the iOS Simulator — Codex, Claude, Grok, and other skill-compatible agents.",
+  "author": {
+    "name": "Andrei Iatsuk",
+    "url": "https://github.com/aiatsuk"
+  },
+  "homepage": "https://github.com/aiatsuk/autonom",
+  "repository": "https://github.com/aiatsuk/autonom",
+  "license": "MIT",
+  "keywords": [
+    "adb",
+    "ai-agents",
+    "android",
+    "autonom",
+    "claude",
+    "codex",
+    "debugging",
+    "emulator",
+    "flutter",
+    "grok",
+    "har",
+    "harness",
+    "idb",
+    "ios",
+    "logcat",
+    "memory",
+    "mitmproxy",
+    "mobile-qa",
+    "mocking",
+    "network",
+    "performance",
+    "qa",
+    "screenshot",
+    "session",
+    "simulator",
+    "testing",
+    "ui-automation",
+    "ui-tree"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Autonom",
+    "shortDescription": "Universal mobile test/debug harness for AI agents",
+    "longDescription": "Autonom gives AI coding agents a portable skill pack and JSON CLI to test and debug mobile apps on Android and the iOS Simulator: explicit target sessions, compact accessibility/UI trees, semantic taps and gestures, screenshots, recordings, logs, crash reports, deep links, permissions, app-container files, and a consent-gated localhost MITM proxy for inspecting, mocking, and exporting HTTP(S) traffic. Works with Codex, Claude, Grok, and other skill hosts.",
+    "developerName": "Andrei Iatsuk",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "websiteURL": "https://github.com/aiatsuk/autonom",
+    "defaultPrompt": [
+      "Use Autonom to test, debug, profile, or validate this application with evidence-backed findings."
+    ],
+    "brandColor": "#00C2A8",
+    "composerIcon": "./assets/autonom-small.svg",
+    "logo": "./assets/autonom.png",
+    "screenshots": []
+  }
+}

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Mobile Screen"
+  short_description: "UI tree, find/tap, and screenshots for Android agent debugging"
+  default_prompt: "Dump the compact UI tree, find the target control by text or content-desc, tap it, and capture a screenshot as evidence."

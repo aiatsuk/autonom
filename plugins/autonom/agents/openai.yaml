@@ -1,0 +1,6 @@
+interface:
+  display_name: "Autonom"
+  short_description: "Universal test and debug harness for AI agents"
+  icon_small: "./assets/autonom-small.svg"
+  icon_large: "./assets/autonom.svg"
+  default_prompt: "Use Autonom to test, debug, profile, or validate this application with evidence-backed findings."

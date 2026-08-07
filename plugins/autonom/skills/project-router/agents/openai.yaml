@@ -1,0 +1,3 @@
+interface:
+  display_name: "Project Router"
+  short_description: "Route Flutter, native Android, native iOS, and device debug tasks to the smallest Autonom skill set after inspecting stack and runtime boundary."

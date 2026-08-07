@@ -1,0 +1,3 @@
+interface:
+  display_name: "Flutter Memory Leaks"
+  short_description: "Investigate Flutter memory growth with DevTools retaining paths, disposal review, native heap evidence, and comparable before/after flows."

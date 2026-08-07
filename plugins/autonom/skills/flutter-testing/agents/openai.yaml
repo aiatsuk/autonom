@@ -1,0 +1,3 @@
+interface:
+  display_name: "Flutter Testing"
+  short_description: "Design a layered Flutter test strategy across unit, widget, golden, integration, platform-channel, and native-UI layers."

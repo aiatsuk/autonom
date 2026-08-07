@@ -1,0 +1,4 @@
+interface:
+  display_name: "Mobile Session"
+  short_description: "Explicit Android device sessions for agent test/debug"
+  default_prompt: "Start an Autonom device session on an explicit adb serial, install or launch the app if needed, and keep artifacts under .autonom/."

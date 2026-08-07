@@ -1,0 +1,20 @@
+{
+  "name": "autonom",
+  "interface": {
+    "displayName": "Autonom"
+  },
+  "plugins": [
+    {
+      "name": "autonom",
+      "source": {
+        "source": "local",
+        "path": "./plugins/autonom"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "DeveloperTools"
+    }
+  ]
+}

@@ -1,0 +1,3 @@
+interface:
+  display_name: "Compose Performance Audit"
+  short_description: "Audit Compose performance from code and runtime evidence: invalidation, stability, lazy identity, effects, layout, draw, and images."

@@ -1,0 +1,3 @@
+interface:
+  display_name: "Android Emulator Browser"
+  short_description: "Stream an emulator or device into a token-protected localhost MJPEG bridge with accelerated and fallback transports for visual agent control."

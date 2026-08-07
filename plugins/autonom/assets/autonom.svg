@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Autonom">
+  <defs>
+    <linearGradient id="g" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0" stop-color="#00C2A8"/>
+      <stop offset="1" stop-color="#0891B2"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="#111418"/>
+  <path d="M138 198h236v176c0 53-43 96-96 96h-44c-53 0-96-43-96-96V198Z" fill="url(#g)"/>
+  <path d="M174 184c0-54 37-98 82-98s82 44 82 98" fill="none" stroke="url(#g)" stroke-width="54" stroke-linecap="round"/>
+  <path d="m183 106-35-58M329 106l35-58" stroke="#00C2A8" stroke-width="22" stroke-linecap="round"/>
+  <circle cx="212" cy="258" r="20" fill="#111418"/>
+  <circle cx="300" cy="258" r="20" fill="#111418"/>
+  <path d="M204 344h104" stroke="#111418" stroke-width="24" stroke-linecap="round"/>
+  <path d="M88 236v128M424 236v128" stroke="#00C2A8" stroke-width="34" stroke-linecap="round"/>
+</svg>

@@ -1,0 +1,3 @@
+interface:
+  display_name: "Flutter Debugger Agent"
+  short_description: "Build, run, attach, and debug Flutter apps on an explicit device using machine output, VM service, adb, screenshots, logs, and replayable flows."
