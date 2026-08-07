@@ -72,6 +72,9 @@ upgrade that breaks idb has a single-file blast radius.
 | `screenshot`, `record start\|stop` | visual evidence |
 | `logs tail`, `crash list\|show` | textual evidence |
 | `open`, `permissions`, `location`, `media`, `file` | drive device state |
+| `network *` | consent-gated HTTP(S) capture, mock, HAR |
+| `session outputs`, `logs follow`, `network requests follow` | **planned (Phase 4)** — live session watch |
+| `metrics *` | **planned (Phase 4)** — memory/CPU/frames/traces; see `docs/plans/PHASE_4_METRICS.md` |
 
 ## Compact node schema
 

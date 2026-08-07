@@ -29,6 +29,24 @@ Simpleperf only if Android/plugin work is implicated.
 
 ## Investigate memory growth
 
+> **Roadmap:** Phase 4 ([`docs/plans/PHASE_4_METRICS.md`](plans/PHASE_4_METRICS.md))
+> adds (1) **live session observation** — `session outputs`, `logs follow`,
+> `network requests follow` — so you do not need to memorize
+> `tail -f ~/.autonom/sessions/…/output/….log`, and (2) **`autonom metrics …`**
+> (snapshot, series, memory capture, simpleperf/xctrace, Flutter frames).
+> Until that ships:
+>
+> ```bash
+> # live output (manual)
+> tail -f ~/.autonom/sessions/<id>/output/flutter_run_mitm.log
+> autonom network requests list --max 50
+> autonom logs tail --package <app-id> --since 60
+> ```
+>
+> Use the skill helpers below for Android memory/perf; host/`xctrace` on iOS.
+
+## Investigate memory growth (current skill helpers)
+
 ```text
 Repeat the open/close flow five times, return to the same idle state after each
 run, compare Dart snapshots, capture Android meminfo/HPROF where indicated, and

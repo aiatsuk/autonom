@@ -42,9 +42,17 @@ Legend: ✅ shipped · ⚠️ partial · 🔜 planned · ❌ not planned for nea
 | Native Android / Compose debug + perf skills | ✅ | — | |
 | Native iOS project skills | — | ✅ | `ios-project-setup`, `ios-debugger-agent` |
 | React Native skills | 🔜 | 🔜 | |
-| Performance traces (`xctrace` / Instruments) | ⚠️ | 🔜 | Android has profiling skills; iOS traces are Phase 4 |
-| Flutter VM Service (widget tree, frame timings) | 🔜 | 🔜 | Phase 4 |
-| XCUITest execution | — | 🔜 | Phase 4 |
+| Live session outputs catalog | 🔜 | 🔜 | Phase 4 — `session outputs` + paths for `tail -f`; see `docs/plans/PHASE_4_METRICS.md` §2L |
+| Live follow (session files / device logs) | 🔜 | 🔜 | Phase 4 — `logs follow` (NDJSON, bounded) |
+| Network requests list | ✅ | ✅ | `network requests list --max N`; follow/poll in Phase 4 |
+| Network requests follow | 🔜 | 🔜 | Phase 4 — poll new flows as NDJSON |
+| Metrics snapshot (memory/CPU summary) | 🔜 | 🔜 | Phase 4 — `autonom metrics snapshot` |
+| Metrics series (directional growth) | 🔜 | 🔜 | Phase 4 — same plan; Android meminfo series exists as skill script today |
+| Memory capture pack / HPROF | ⚠️ | 🔜 | Android skill helpers; CLI in Phase 4 |
+| Performance traces (simpleperf / xctrace) | ⚠️ | 🔜 | Android skill scripts; iOS xctrace CLI in Phase 4 |
+| Frame stats (gfxinfo / Flutter timings) | ⚠️ | 🔜 | Partial via skills; unified CLI in Phase 4 |
+| Flutter VM Service (widget tree, heap) | 🔜 | 🔜 | Phase 4.4 optional; frames summary earlier |
+| XCUITest execution | — | 🔜 | Separate from metrics |
 | Optional MCP wrapper | 🔜 | 🔜 | CLI is source of truth first |
 
 ## CLI surface

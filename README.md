@@ -200,6 +200,7 @@ benchmark. Use a physical device plus native profilers for frame-rate review.
 - `docs/INSTALL.md` — Codex / Claude / Grok / generic install
 - `docs/CAPABILITIES.md` — Android/iOS capability matrix and roadmap
 - `docs/ARCHITECTURE.md` — routing, CLI control plane, evidence, security
+- `docs/plans/PHASE_4_METRICS.md` — plan: live session watch + metrics/memory/CPU/traces (Android, iOS, Flutter)
 - `docs/USAGE.md` — ready-to-use prompts and workflows
 - `docs/CAPABILITY_GAPS.md` — capability gaps closed during Autonom development
 - `AGENTS.md` — short operating contract for any consuming agent
