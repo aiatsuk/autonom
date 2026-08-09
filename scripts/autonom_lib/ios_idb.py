@@ -22,7 +22,21 @@ from . import errors
 from .platform import Target
 
 BUTTONS = ("APPLE_PAY", "HOME", "LOCK", "SIDE_BUTTON", "SIRI")
-GESTURES = ("swipe", "pinch", "rotate", "shake")
+
+# What `idb ui` actually accepts. Kept here, next to the code that builds those
+# argv lists, because this list is the thing that goes stale on an idb upgrade.
+UI_SUBCOMMANDS = (
+    "describe-all", "describe-point", "tap", "button", "text", "key",
+    "key-sequence", "swipe",
+)
+GESTURES = ("swipe",)
+# Offered by the CLI, backed by nothing. idb has no pinch/rotate/shake — not
+# under `idb ui`, not at the top level (verified against fb-idb 1.1.7) — so
+# these were dispatched as commands that do not exist and came back as
+# `backend_failed` carrying idb's own argparse usage text. Refusing them the way
+# Android gestures are already refused is the honest shape: a typed code, and a
+# hint that names the alternative instead of sending the reader to `doctor`.
+UNBACKED_GESTURES = ("pinch", "rotate", "shake")
 
 
 def find_idb(explicit: str | None = None) -> str:
@@ -189,17 +203,15 @@ def key(target: Target, keycode: str, *, idb_path: str | None = None) -> None:
 
 
 def gesture(target: Target, name: str, *, idb_path: str | None = None, **kwargs: Any) -> None:
-    idb = find_idb(idb_path)
-    if name == "shake":
-        run_idb(idb, ["ui", "shake"], udid=target.target_id, timeout=10)
-        return
-    if name == "rotate":
-        run_idb(idb, ["ui", "rotate"], udid=target.target_id, timeout=10)
-        return
-    if name == "pinch":
-        args = ["ui", "pinch", str(kwargs["x"]), str(kwargs["y"]), str(kwargs.get("scale", 2.0))]
-        run_idb(idb, args, udid=target.target_id, timeout=20)
-        return
+    if name in UNBACKED_GESTURES:
+        raise errors.AutonomError(
+            errors.UNSUPPORTED_ON_PLATFORM,
+            f"idb provides no '{name}' command, so it cannot be sent to a simulator",
+            "Use 'autonom ui swipe' for anything reachable by a drag. Rotation and "
+            "shake have no Autonom path; rotate the window by hand in Simulator "
+            "(Device > Rotate) if the test needs it.",
+            gesture=name,
+        )
     raise errors.AutonomError(
         errors.UNSUPPORTED_ON_PLATFORM,
         f"unknown gesture: {name}",

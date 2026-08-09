@@ -76,9 +76,14 @@ if [ "$os" = "Darwin" ]; then
     report idb 1 ""
   else
     missing_mechanical=1
-    report idb 0 "brew tap facebook/fb && brew install idb-companion && pipx install fb-idb"
+    # `brew trust` is not optional: Homebrew refuses to load a formula from a
+    # third-party tap without it, and the resulting error names neither the tap
+    # nor the fix. Leaving it out meant --install reliably tapped, then failed.
+    # `--formula` keeps the grant to this one formula rather than the whole tap.
+    report idb 0 "brew tap facebook/fb && brew trust --formula facebook/fb/idb-companion && brew install idb-companion && pipx install fb-idb"
     if [ "$DO_INSTALL" = "1" ] && have brew; then
       run brew tap facebook/fb
+      run brew trust --formula facebook/fb/idb-companion
       run brew install idb-companion
       have pipx && run pipx install fb-idb || echo "         then: pipx install fb-idb" >&2
     fi

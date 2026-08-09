@@ -243,6 +243,25 @@ class KeyAndGestureTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertEqual(json.loads(result.stderr)["error_code"], "unsupported_on_platform")
 
+    def test_unbacked_gestures_are_refused_before_reaching_idb(self) -> None:
+        """idb has no pinch/rotate/shake, so nothing may be dispatched for them.
+
+        These shipped for several releases building `idb ui pinch` and friends,
+        which every real machine rejected with an argparse usage dump wearing an
+        `backend_failed` code and a hint pointing at `doctor` — a tool that was
+        working fine. The refusal has to happen here, above the wrapper.
+        """
+        for gesture, extra in (("pinch", ("--at", "10,10")), ("rotate", ()), ("shake", ())):
+            with self.subTest(gesture=gesture):
+                before = len(self._calls())
+                result = self._run("ui", gesture, *extra)
+                self.assertEqual(result.returncode, 2)
+                error = json.loads(result.stderr)
+                self.assertEqual(error["error_code"], "unsupported_on_platform")
+                self.assertIn("idb provides no", error["error"])
+                self.assertIn("ui swipe", error["hint"])
+                self.assertEqual(self._calls()[before:], [], "nothing may reach idb")
+
     def test_type_passes_unicode_through_unmangled(self) -> None:
         result = self._run("ui", "type", "привет@example.com")
         self.assertEqual(result.returncode, 0, result.stderr)

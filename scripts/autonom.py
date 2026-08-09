@@ -1209,13 +1209,24 @@ def target_flags_parent() -> argparse.ArgumentParser:
     return parent
 
 
+def _bool_flag(value: str) -> bool:
+    return value.lower() in {"1", "true", "yes"}
+
+
 def _add_selector_flags(parser: argparse.ArgumentParser) -> None:
+    """The selector set, identical on every verb that selects a node.
+
+    `_selectors()` reads `enabled` for find *and* tap, so it belongs here rather
+    than on find alone — while it lived on find only, `ui tap --enabled false`
+    was rejected by argparse and the filter silently read `None` on tap.
+    """
     parser.add_argument("--text")
     parser.add_argument("--desc")
     parser.add_argument("--resource-id")
     parser.add_argument("--class-name")
     parser.add_argument("--package")
-    parser.add_argument("--clickable", type=lambda v: v.lower() in {"1", "true", "yes"}, default=None)
+    parser.add_argument("--clickable", type=_bool_flag, default=None)
+    parser.add_argument("--enabled", type=_bool_flag, default=None)
     parser.add_argument("--mode", choices=("exact", "contains", "regex"), default="contains")
     parser.add_argument("--case-sensitive", action="store_true")
     parser.add_argument("--index", type=int)
@@ -1318,7 +1329,6 @@ def build_parser() -> argparse.ArgumentParser:
     p = ui_sub.add_parser("find", help="find nodes by selector", parents=[target_flags])
     p.add_argument("--dump", help="parse an offline UI dump")
     _add_selector_flags(p)
-    p.add_argument("--enabled", type=lambda v: v.lower() in {"1", "true", "yes"}, default=None)
     p.add_argument("--all", action="store_true")
     p.set_defaults(func=cmd_ui_find)
 
@@ -1334,10 +1344,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--duration", type=float, default=0.3)
     p.set_defaults(func=cmd_ui_swipe)
 
+    # Only pinch takes an anchor and a scale; `idb ui rotate|shake` accept
+    # neither, and offering the flags there advertised an argument that was
+    # parsed, ignored, and never reached the device.
     for name in ("pinch", "rotate", "shake"):
         p = ui_sub.add_parser(name, help=f"{name} gesture (iOS)", parents=[target_flags])
-        p.add_argument("--at", metavar="X,Y", help="anchor point (pinch)")
-        p.add_argument("--scale", type=float, default=2.0)
+        if name == "pinch":
+            p.add_argument("--at", metavar="X,Y", help="anchor point")
+            p.add_argument("--scale", type=float, default=2.0)
         p.set_defaults(func=cmd_ui_gesture, gesture=name)
 
     p = ui_sub.add_parser("type", help="type text into the focused field", parents=[target_flags])
