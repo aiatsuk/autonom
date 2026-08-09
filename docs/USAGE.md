@@ -29,28 +29,50 @@ Simpleperf only if Android/plugin work is implicated.
 
 ## Investigate memory growth
 
-> **Roadmap:** Phase 4 ([`docs/plans/PHASE_4_METRICS.md`](plans/PHASE_4_METRICS.md))
-> adds (1) **live session observation** — `session outputs`, `logs follow`,
-> `network requests follow` — so you do not need to memorize
-> `tail -f ~/.autonom/sessions/…/output/….log`, and (2) **`autonom metrics …`**
-> (snapshot, series, memory capture, simpleperf/xctrace, Flutter frames).
-> Until that ships:
->
-> ```bash
-> # live output (manual)
-> tail -f ~/.autonom/sessions/<id>/output/flutter_run_mitm.log
-> autonom network requests list --max 50
-> autonom logs tail --package <app-id> --since 60
-> ```
->
-> Use the skill helpers below for Android memory/perf; host/`xctrace` on iOS.
-
-## Investigate memory growth (current skill helpers)
-
 ```text
 Repeat the open/close flow five times, return to the same idle state after each
 run, compare Dart snapshots, capture Android meminfo/HPROF where indicated, and
 prove or reject a retained path before patching.
+```
+
+> **Roadmap:** memory and CPU have no CLI verb yet — the work goes through the
+> skill helpers above (Android meminfo/HPROF, `xctrace` on iOS). Phase 4
+> ([`docs/plans/PHASE_4_METRICS.md`](plans/PHASE_4_METRICS.md)) adds
+> `autonom metrics …` (snapshot, series, memory capture, simpleperf/xctrace,
+> Flutter frames) plus live observation — `session outputs`, `logs follow`,
+> `network requests follow` — so no one has to memorize
+> `tail -f ~/.autonom/sessions/…/output/….log`. Until then, watch a run with:
+>
+> ```bash
+> tail -f ~/.autonom/sessions/<id>/output/flutter_run_mitm.log
+> autonom network requests list --max 50
+> autonom logs tail --package <app-id> --since 60
+> ```
+
+## See what the app actually sent
+
+```text
+Start a consent-gated capture on the emulator, attach it, walk the checkout
+flow, then list what went to the payments host, show the one that returned 500
+in full, and export a HAR into the session. Report the request the app never
+made separately from the ones that failed.
+```
+
+## Force a backend failure and check the UI
+
+```text
+Mock the login endpoint to return 500 with an error body, replay the login tap,
+and prove from the UI tree what the user sees. Take a screenshot, note that it
+was captured under an active mock, then disable the rule and confirm the real
+path still works.
+```
+
+## Read a run back / hand it off
+
+```text
+Show me this session's journal: every verb, in order, with the failures. Then
+list the screenshots taken under an active mock, and summarize what was
+measured versus what is still a hypothesis.
 ```
 
 ## Release validation

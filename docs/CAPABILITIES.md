@@ -18,9 +18,11 @@ Legend: ✅ shipped · ⚠️ partial · 🔜 planned · ❌ not planned for nea
 | Clear app data | ✅ | ⚠️ | Android `pm clear`; iOS uninstall+reinstall, or `--strategy privacy` for permissions only |
 | Compact UI / accessibility tree | ✅ | ✅ | UIAutomator; idb `describe-all` |
 | Semantic find / tap | ✅ | ✅ | text, desc/label, resource-id / accessibility identifier |
-| Gestures | ⚠️ | ✅ | Android: tap/swipe; iOS: + pinch, rotate, shake |
+| Gestures | ⚠️ | ⚠️ | tap/swipe on both; `ui pinch\|rotate\|shake` have no backend on either and are refused — see below |
 | Text and hardware keys | ✅ | ✅ | Android `KEYCODE_*`; iOS `HOME`/`LOCK`/`SIRI`/`SIDE_BUTTON` |
 | Screenshot | ✅ | ✅ | iOS uses `simctl`, so it works without idb |
+| Screenshot provenance | ✅ | ✅ | metadata embedded in the PNG; shots taken under an active mock are flagged `screenshot_shows_mocked_data` |
+| Screenshot index / browse | ✅ | ✅ | `autonom shots list [--task --grep --mocked-only]`, `shots show <path>` |
 | Screen recording artifact | ✅ | ✅ | `autonom record start\|stop` |
 | Logs | ⚠️ | ⚠️ | logcat; `log stream`/`log show` with a bundle predicate |
 | Crash reports | ⚠️ | ✅ | Android: crash logcat buffer; iOS: idb crash store |
@@ -55,30 +57,83 @@ Legend: ✅ shipped · ⚠️ partial · 🔜 planned · ❌ not planned for nea
 | XCUITest execution | — | 🔜 | Separate from metrics |
 | Optional MCP wrapper | 🔜 | 🔜 | CLI is source of truth first |
 
+### `ui pinch|rotate|shake` have no backend
+
+Neither platform can perform them. Android's `input` cannot express them, and
+idb has no such command either — `idb ui` accepts only `describe-all`,
+`describe-point`, `tap`, `button`, `text`, `key`, `key-sequence`, and `swipe`
+(verified against fb-idb 1.1.7). Both platforms therefore refuse the three verbs
+with `unsupported_on_platform` and a hint, rather than dispatching something the
+tool will reject.
+
+Until 0.15.1 the iOS path did dispatch them, and every real machine answered
+with `backend_failed` wrapping idb's argparse usage text plus a hint pointing at
+`doctor` — a tool that was working fine. The suite missed it because the fake
+idb returned 0 for any argv: it proved *what was dispatched*, never *that the
+dispatch names a command idb has*. The fake now carries idb's real command
+surface and refuses anything outside it.
+
+Use `ui swipe` for anything reachable by a drag. Rotation and shake need a hand
+on the Simulator window (Device > Rotate).
+
 ## CLI surface
 
+Every leaf command also accepts the target flags
+`--platform android|ios`, `--target`, `--serial`, `--udid`, and the tool
+overrides `--adb`, `--simctl`, `--idb`, `--idb-host`, `--idb-port`, before or
+after the verb.
+
 ```bash
+autonom version
 autonom devices [list] [--platform android|ios]
-autonom devices boot [--avd NAME | --target ID] [--no-wait] [--timeout S]
+autonom devices boot [--avd NAME | --target ID] [--no-wait] [--timeout S] [--emulator PATH]
 autonom devices shutdown [--target ID]
-autonom doctor [--strict]
-autonom session start|show|stop|launch|force-stop|clear|uninstall
-autonom ui tree|find|tap|swipe|pinch|rotate|shake|type|key
-autonom screenshot
-autonom record start|stop
-autonom logs tail
-autonom crash list|show
+autonom doctor [--strict] [--mitmdump PATH]
+
+autonom session start [--app-id ID] [--install PATH] [--launch [ID]] [--activity C] [--log-stream]
+autonom session show|stop
+autonom session launch <app-id> [--activity C] [--arg A] [--setenv K=V]
+autonom session force-stop|uninstall <app-id>
+autonom session clear <app-id> [--strategy auto|reinstall|privacy]
+
+autonom ui tree [--dump FILE] [--all] [--max-depth N] [--max-nodes N]
+autonom ui find [--text|--desc|--resource-id|--class-name|--package] [--mode exact|contains|regex]
+                [--case-sensitive] [--index N] [--clickable B] [--enabled B] [--all] [--dump FILE]
+autonom ui tap [selector flags] | [--x X --y Y]
+autonom ui swipe --from X,Y --to X,Y [--duration S]
+autonom ui pinch --at X,Y [--scale F] | ui rotate | ui shake   # iOS only
+autonom ui type <text>
+autonom ui key <keycode>
+
+autonom screenshot [--label L] [--task T] [--out PATH]
+autonom shots list [--task T] [--grep P] [--mocked-only] [--max N]
+autonom shots show <path>
+autonom record start [--name N] | record stop
+autonom note add <text> [--task T] [--tag T] [--author A] | note list [--task --grep --max]
+autonom journal [--kind action|note] [--verb V] [--task T] [--grep P] [--max N]
+
+autonom logs tail [--package ID] [--since S] [--max-lines N] [--grep P]
+autonom crash list [--app-id ID] | crash show <name>
 autonom open <url>
-autonom permissions grant|revoke|reset <service> [app-id]
-autonom location set|get|clear
+autonom permissions <grant|revoke|reset> <service> [app-id]
+autonom location set <LAT,LON> | location get | location clear
 autonom media add <path>
-autonom file ls|pull
-autonom note add <text> [--task --tag] | note list
-autonom journal [--kind action|note] [--verb V] [--task T] [--grep P]
-autonom network start|stop|status|attach|detach
-autonom network requests list|show
-autonom network mock add|list|show|update|enable|disable|remove|clear
-autonom network export --har <path>
+autonom file ls [remote] [--app-id ID] | file pull <remote> [--app-id ID] [--out PATH]
+
+autonom network start --i-understand-mitm [--port N] [--capture-bodies] [--mitmdump PATH]
+                      [--ignore-hosts REGEX] [--intercept-connectivity-checks]
+autonom network attach --i-understand-mitm [--install-ca] [--no-network-cycle]
+autonom network detach|stop|status
+autonom network requests list [--host --method --status --path --since --mocked --max]
+autonom network requests show <id> [--full]
+autonom network mock add [--url U | --match GLOB] [--method M] [--host H] [--status N]
+                         [--header 'K: V'] [--json BODY | --body-file PATH] [--note N]
+autonom network mock update <id> [--url U | --match GLOB] [--method M] [--host H] [--status N]
+                                 [--header 'K: V'] [--json BODY | --body-file PATH] [--note N]
+autonom network mock list [--all] | show <id> | remove <id> | clear
+autonom network mock enable [<id>|--all] | disable [<id>|--all]
+autonom network export [--har PATH]
+
 autonom processes
 autonom cleanup [--dry-run] [--all]
 ```
@@ -86,11 +141,47 @@ autonom cleanup [--dry-run] [--all]
 Every command prints JSON. Expected failures print
 `{"ok": false, "error_code": "...", "error": "...", "hint": "..."}` on stderr with
 exit code 2, so an agent can branch on `error_code` rather than parse prose.
+`doctor` is the exception: it exits 0 even when tools are missing unless
+`--strict` is passed, because a diagnostic that fails is useless in a pipeline.
+
+## Environment overrides
+
+| Variable | Effect |
+| --- | --- |
+| `AUTONOM_HOME` | Overrides both state roots: sessions land in `$AUTONOM_HOME/sessions`, registries and the mitmproxy confdir directly beneath it |
+| `XDG_STATE_HOME` | Machine state root when `AUTONOM_HOME` is unset (else `~/.local/state/autonom`) |
+| `AUTONOM_ADB`, `AUTONOM_SIMCTL`, `AUTONOM_IDB`, `AUTONOM_EMULATOR`, `AUTONOM_MITMDUMP` | Binary paths, equivalent to the matching flag |
+| `AUTONOM_IDB_COMPANION` | `host:port` of an idb companion on another Mac |
+| `AUTONOM_PREFIX`, `AUTONOM_BIN_DIR` | Installer only: bundle home and the directory `autonom` is linked into |
 
 ## Evidence ladder (unchanged)
 
 code → unit/widget → integration on explicit target → screenshot + UI tree + logs →
 profile/memory/network → before/after replay.
+
+## Limitations closed
+
+What each earlier limitation cost, and what replaced it.
+
+| Earlier limitation | Autonom response |
+| --- | --- |
+| Kotlin/Compose-first scope | Six Flutter-specific skills plus hybrid routing |
+| Codex-only packaging | Portable skills + one-command `install.sh` for Codex, Claude, Grok, generic agents |
+| Static toolchain snapshot | Repository/local inspection with no “latest” assertion |
+| Screenshot polling browser | H.264 + ffmpeg MJPEG path, persistent fallback, status and reconnect |
+| Android-only device control | One verb set over Android and the iOS Simulator, with a shared compact node schema |
+| Unauthenticated input bridge | Random token, localhost-only bind, allowlisted input, body limits |
+| Exact text-only UI targeting | text/semantics/id/class/package, exact/contains/regex, waits and duplicate control |
+| Directional memory capture only | Structured artifacts plus multi-capture trend analysis, while retaining proof rules |
+| Limited executable validation | Python and Node tests, fake adb/simctl/idb backends, a recorded contract golden, a bare-host sweep, a TTY guard, and a doc-drift check — all run locally by `./scripts/run_checks.sh` |
+| Generic Compose advice for Flutter apps | Flutter architecture, widgets, tests, performance, memory, platform, and release workflows |
+| Project-local artifacts, invisible from elsewhere | Machine-global `~/.autonom/`: the session, its mocks, and orphaned processes are found and reaped from any directory |
+| No record of what an agent did | Append-only `journal.ndjson` — every verb, its scrubbed argv, the result, and the failures, plus agent notes |
+| A screenshot that silently showed mocked data | Provenance embedded in the PNG; captures taken under an active rule are flagged `screenshot_shows_mocked_data` |
+
+The harness intentionally does not claim that trend analysis proves a memory
+leak or that a browser preview proves performance. Those require retained-path
+or repeatable runtime evidence.
 
 ## Competitive posture
 

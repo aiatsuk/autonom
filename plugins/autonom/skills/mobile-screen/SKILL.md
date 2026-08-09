@@ -79,8 +79,13 @@ by `--desc`, or by `--resource-id` when the app sets accessibility identifiers.
 | Verb | Android | iOS |
 | --- | --- | --- |
 | `ui tap`, `ui swipe`, `ui type` | yes | yes |
-| `ui pinch`, `ui rotate`, `ui shake` | refused with `unsupported_on_platform` | yes |
+| `ui pinch`, `ui rotate`, `ui shake` | refused with `unsupported_on_platform` | refused with `unsupported_on_platform` |
 | `ui key` | `KEYCODE_*` | `HOME`, `LOCK`, `SIDE_BUTTON`, `SIRI`, `APPLE_PAY`, or a numeric HID code |
+
+**No platform has pinch, rotate, or shake.** Android's `input` cannot express
+them and idb has no such command either, so both are refused rather than faked.
+Use `ui swipe` for anything reachable by a drag; rotation and shake need a hand
+on the Simulator window (Device > Rotate).
 
 iOS has no global Back button; tap the navigation bar's back control instead.
 

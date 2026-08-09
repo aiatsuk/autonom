@@ -20,8 +20,10 @@ find/tap/gestures, screenshots and recordings, logs and crashes, deep links,
 permissions, location, media and container files, consent-gated HTTP(S) capture
 and mocking, and a per-session journal of every action. Domain packs for
 Flutter, native Kotlin/Jetpack Compose, and iOS.  
-**Roadmap:** performance traces (Instruments), Flutter VM Service, React Native
-skills, optional MCP.
+**Roadmap:** live session watch (`session outputs`, `logs follow`), an
+`autonom metrics` family (memory, CPU, frames, traces), Flutter VM Service,
+React Native skills, optional MCP. See
+[`docs/plans/PHASE_4_METRICS.md`](docs/plans/PHASE_4_METRICS.md).
 
 ## Why Autonom
 
@@ -198,11 +200,11 @@ benchmark. Use a physical device plus native profilers for frame-rate review.
 ## Documentation
 
 - `docs/INSTALL.md` — Codex / Claude / Grok / generic install
-- `docs/CAPABILITIES.md` — Android/iOS capability matrix and roadmap
+- `docs/CAPABILITIES.md` — Android/iOS capability matrix, full CLI surface, roadmap
 - `docs/ARCHITECTURE.md` — routing, CLI control plane, evidence, security
 - `docs/plans/PHASE_4_METRICS.md` — plan: live session watch + metrics/memory/CPU/traces (Android, iOS, Flutter)
 - `docs/USAGE.md` — ready-to-use prompts and workflows
-- `docs/CAPABILITY_GAPS.md` — capability gaps closed during Autonom development
+- `SECURITY.md` — the enforced security model (MITM, consent, redaction)
 - `AGENTS.md` — short operating contract for any consuming agent
 
 ## Repository policy

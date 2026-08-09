@@ -56,11 +56,14 @@ cannot be inspected rather than working around the app's security.
 
 ## Session artifacts
 
-`.autonom/` can contain screenshots, accessibility trees, logs, crash reports,
-recordings, pulled application files, and captured traffic. Treat it as sensitive:
-it is gitignored, kept out of the plugin directory, and should be deleted when an
-investigation ends. App-container file access is confined to the container, and
-pulled file contents are never echoed to stdout.
+`~/.autonom/sessions/<id>/` can contain screenshots, accessibility trees, logs,
+crash reports, recordings, pulled application files, and captured traffic. It
+lives outside any repository — deliberately, so a capture cannot be committed by
+accident — but that also means no `.gitignore` protects you once a file is copied
+elsewhere. Treat the directory as sensitive and delete it when an investigation
+ends. (`AUTONOM_HOME` relocates it; the legacy project-local `.autonom/` layout
+is still gitignored for checkouts that use it.) App-container file access is
+confined to the container, and pulled file contents are never echoed to stdout.
 
 ## Emulator browser bridge
 

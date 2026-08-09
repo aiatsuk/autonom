@@ -10,6 +10,9 @@ directories.
 ./install.sh          # interactive checkboxes: device tools, Claude, Codex, Grok
 ./install.sh --all    # headless: everything
 ./install.sh --tools --claude   # any subset; positional `claude codex grok` works too
+./install.sh --cli-only         # just `autonom` on PATH
+./install.sh --link ~/.my-agent/skills   # + skills into any skill root (--copy for a snapshot)
+./install.sh --prefix /opt/autonom       # bundle home (default ~/.local/share/autonom)
 ```
 
 The `autonom` CLI is always installed; everything else is opt-in. On a TTY the
@@ -28,6 +31,14 @@ folder can be deleted. The sections below run the same layers one at a time.
 Nothing below is needed to install the skills or run `./scripts/run_checks.sh`.
 Each tool is discovered at runtime and unlocks one capability; `autonom doctor`
 reports exactly which are present and prints the install command for the rest.
+
+### Device tools, the short way
+
+`./install.sh --tools` (or `./scripts/bootstrap.sh --install` directly) fetches
+the mechanical ones — adb, mitmproxy, idb — through `brew`, `pipx`, or
+`apt-get`. Without `--install` the script only reports what is missing and the
+exact command for each. The manual sections below explain what those commands
+do and cover the traps the automation cannot decide for you.
 
 ### Android targets
 
@@ -67,8 +78,11 @@ idb list-targets
    ```
 
 2. `brew install idb-companion` fails with *"Refusing to load formula from
-   untrusted tap"* until the `brew trust` line above is run. Prefer the
-   `--formula` form so the grant covers one formula rather than the whole tap.
+   untrusted tap"* until the `brew trust` line above is run, and the error names
+   neither the tap nor the fix. Prefer the `--formula` form so the grant covers
+   one formula rather than the whole tap. `./install.sh --tools` runs the same
+   three commands in that order — asking for idb and then stopping at the trust
+   prompt would only leave a tapped-but-broken install behind.
 
 `idb_companion` prints an objc class-collision warning on stderr (it loads Apple
 private frameworks). It is cosmetic.
@@ -87,6 +101,23 @@ export AUTONOM_IDB_COMPANION=mac-farm-01:10882
 ```bash
 python3 scripts/autonom.py doctor
 ```
+
+## Where Autonom writes
+
+Nothing lands in the project directory.
+
+| Path | Holds |
+| --- | --- |
+| `~/.autonom/sessions/<id>/` | one run: `session.json`, `journal.ndjson`, shots, trees, logs, network flows, recordings, crashes, pulled files |
+| `~/.autonom/apps/<package>/` | per-app knowledge and flow runbooks (`mobile-memory`) |
+| `~/.local/state/autonom/` | mock registry, process registry, and the mitmproxy CA (mode `0700`) — `$XDG_STATE_HOME/autonom` when that is set |
+
+Set `AUTONOM_HOME` to move all of it under one root. Session artifacts can hold
+screenshots, logs, and captured traffic: treat the directory as sensitive and
+delete it when an investigation ends.
+
+Binary paths can be pinned without flags: `AUTONOM_ADB`, `AUTONOM_SIMCTL`,
+`AUTONOM_IDB`, `AUTONOM_EMULATOR`, `AUTONOM_MITMDUMP`.
 
 ## Put `autonom` on PATH
 
