@@ -1,0 +1,4 @@
+interface:
+  display_name: "Autonom Setup"
+  short_description: "Package the Autonom harness into one transferable bundle and install it on another machine or into another agent with a single command."
+  default_prompt: "Build an Autonom bundle, install it here, verify it, and register the skills with this agent."

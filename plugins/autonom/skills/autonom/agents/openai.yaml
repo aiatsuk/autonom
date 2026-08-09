@@ -1,0 +1,4 @@
+interface:
+  display_name: "Autonom"
+  short_description: "Start here: the map of the whole mobile test/debug harness — sessions, screen, logs, network, evidence — on Android and the iOS Simulator."
+  default_prompt: "Explain what Autonom can do against a running app, then drive the end-to-end loop: own a target, read the screen, act, and capture evidence."

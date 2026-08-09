@@ -69,6 +69,53 @@ def parse_frontmatter(path: Path, problems: list[Problem]) -> dict[str, str]:
     return result
 
 
+def check_agent_interface(skill_dir: Path, problems: list[Problem]) -> None:
+    """Every skill carries Codex interface metadata, and it has to stay true.
+
+    Two of these drifted for a whole platform release — still describing
+    "Android device sessions" and artifacts "under .autonom/" after iOS landed
+    and the session store went machine-global. Nothing read them on the way to a
+    green build, so nothing caught it. Requiring the file is what makes a new
+    skill inherit the obligation; the content checks are deliberately shallow,
+    because the failure mode was absence and staleness, not malformed YAML.
+    """
+    path = skill_dir / "agents/openai.yaml"
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        problems.append(Problem(path, "skill is missing agents/openai.yaml"))
+        return
+
+    fields: dict[str, str] = {}
+    inside = False
+    for raw in text.splitlines():
+        if not raw.strip() or raw.lstrip().startswith("#"):
+            continue
+        if not raw.startswith((" ", "\t")):
+            inside = raw.split(":", 1)[0].strip() == "interface"
+            continue
+        if not inside or ":" not in raw:
+            continue
+        key, value = raw.split(":", 1)
+        fields[key.strip()] = value.strip().strip("\"'")
+
+    for key in ("display_name", "short_description"):
+        if not fields.get(key):
+            problems.append(Problem(path, f"interface.{key} is required and must be non-empty"))
+    description = fields.get("short_description", "")
+    if description and len(description) > 320:
+        problems.append(Problem(path, "interface.short_description is too long for a listing"))
+    # The exact stale claim that survived the iOS release, so it fails loudly if
+    # it is ever reintroduced: artifacts have not lived in the project since the
+    # session store moved to ~/.autonom/sessions/.
+    for line in text.splitlines():
+        if ".autonom/" in line and "~/.autonom/" not in line:
+            problems.append(Problem(
+                path, "refers to a project-local .autonom/ — session artifacts live in "
+                      "~/.autonom/sessions/"
+            ))
+
+
 def read_lib_version(root: Path, problems: list[Problem]) -> str | None:
     init_path = root / "scripts/autonom_lib/__init__.py"
     try:
@@ -143,6 +190,7 @@ def validate(root: Path) -> list[Problem]:
 
         for skill_dir in sorted(path for path in skills_root.iterdir() if path.is_dir()):
             skill_path = skill_dir / "SKILL.md"
+            check_agent_interface(skill_dir, problems)
             meta = parse_frontmatter(skill_path, problems)
             skill_name = meta.get("name")
             description = meta.get("description", "")

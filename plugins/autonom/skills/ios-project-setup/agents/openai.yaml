@@ -1,0 +1,4 @@
+interface:
+  display_name: "iOS Project Setup"
+  short_description: "Resolve what an iOS repository actually builds — workspace vs project, schemes, configurations, bundle ids, destinations, and the built .app — without assuming any version."
+  default_prompt: "Inspect this iOS project and report its real schemes, configurations, bundle identifiers, and simulator destinations."

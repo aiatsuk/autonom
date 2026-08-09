@@ -1,0 +1,4 @@
+interface:
+  display_name: "iOS Debugger Agent"
+  short_description: "Build, run, and debug iOS apps on the Simulator: resolve scheme and destination, install and launch, then climb accessibility trees, screenshots, logs, and crash reports."
+  default_prompt: "Reproduce this iOS issue on the Simulator and report measured evidence separately from what is still inferred."

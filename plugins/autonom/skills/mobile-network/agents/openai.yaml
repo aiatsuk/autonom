@@ -1,0 +1,4 @@
+interface:
+  display_name: "Mobile Network"
+  short_description: "Inspect and mock a mobile app's HTTP(S) traffic through a consent-gated localhost MITM proxy: filter recorded flows, force responses, export HAR, redact credentials."
+  default_prompt: "Capture what this app sent and received, then force the failing response and prove from the UI how the app reacts."

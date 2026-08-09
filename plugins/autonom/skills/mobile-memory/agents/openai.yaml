@@ -1,0 +1,4 @@
+interface:
+  display_name: "Mobile Memory"
+  short_description: "Reuse and record per-app device knowledge under ~/.autonom/apps/ so a flow worked out once is replayed, not re-derived."
+  default_prompt: "Read what is already known about this app before driving the device, and save any durable, evidence-backed flow you work out."
