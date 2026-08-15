@@ -71,6 +71,8 @@ SWEEP: list[tuple[str, list[str], bool]] = [
     ("flow_list_missing", ["flow", "list", "/nonexistent"], False),
     ("flow_import_missing", ["flow", "import", "/nonexistent/maestro.yaml"], False),
     ("flow_export_missing", ["flow", "export", "/nonexistent/flow.yaml"], False),
+    # proof without a usable git ref fails as one machine-readable envelope
+    ("proof_bad_ref", ["proof", "--base", "no-such-ref"], False),
     # atlas/report verbs need an app id or session; they refuse cleanly
     ("atlas_update", ["atlas", "update"], False),
     ("atlas_show", ["atlas", "show"], False),

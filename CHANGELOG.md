@@ -7,6 +7,18 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
 
 ## [Unreleased]
 
+## [0.26.0] - 2026-08-15
+
+### Added
+- Local PR Proof: `autonom proof --base <ref>` reads the git diff, selects
+  the smallest sufficient flow suite deterministically (changed flow files,
+  `properties.covers` globs, `pull-request` tags), runs it against the
+  active session, and writes `proof.json` + a one-screen `proof.md`.
+  Verdicts are fixed and never upgraded: pass / fail / not_covered
+  (uncovered changed files listed by name; exit 1) / blocked /
+  inconclusive (exit 2).
+
+
 ## [0.25.0] - 2026-08-15
 
 ### Added

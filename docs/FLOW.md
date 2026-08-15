@@ -199,6 +199,18 @@ file for CI; `report open` opens the HTML, `report export --format
 html|junit --out` writes it anywhere. A failing step also leaves a
 screenshot, a hierarchy dump, and a log window beside the events.
 
+## Proving a diff (PR Proof)
+
+`autonom proof --base main` diffs the repository, selects the smallest
+sufficient suite deterministically — a changed flow file selects itself, a
+flow whose `properties.covers` globs (comma-separated, repo-relative) match
+a changed file is selected, and `pull-request`-tagged flows always run —
+executes it against the active session, and emits `proof.json` +
+`proof.md` (one screen). Verdicts are fixed and never upgraded: `pass`
+(exit 0), `fail` / `not_covered` (exit 1 — silence is not coverage),
+`blocked` / `inconclusive` (exit 2). Changed files with no covering flow
+are listed by name.
+
 ## The observed graph (Atlas-lite)
 
 Every executed step's screen fingerprint rides in the events for free, and

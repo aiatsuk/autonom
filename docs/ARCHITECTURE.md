@@ -93,6 +93,14 @@ scripts/autonom_lib/
     events.py                 versioned run events: NDJSON per run + slim journal bridge
     selectors.py              flow selector -> selector.py translation (never a reimplementation)
     conditions.py             `when:` evaluation (platform/visible/notVisible/envEquals, AND)
+    compiler.py               Session -> Flow: journal + action details -> canonical YAML
+    maestro.py                Maestro Core Profile import/export, faithful or refused
+    report.py                 run manifest -> self-contained HTML + JUnit renderers
+  atlas/
+    fingerprint.py            volatility-resistant screen identity (structure/state hashes)
+    graph.py                  the observed graph: storage, ingestion, coverage, paths, diff
+  proof.py                    PR proof: git diff -> covering suite -> honest verdict
+  actions.py                  per-action detail records feeding the Session -> Flow compiler
   network/
     proxy.py                  mitmdump lifecycle, machine-level confdir, CA publication
     mitm_addon.py             in-proxy addon: record, redact, serve mocks
@@ -130,6 +138,8 @@ Two rules carry the design.
 | `open`, `permissions`, `location`, `media`, `file` | drive device state |
 | `network *` | consent-gated HTTP(S) capture, mock, HAR |
 | `atlas update\|show\|coverage\|paths\|export\|diff` | the observed application graph, evidence-linked |
+| `proof --base` | run the covering flow suite for a diff; pass/fail/not_covered/blocked/inconclusive |
+| `report build\|open\|export` | self-contained HTML + JUnit from a run's manifest |
 | `report build\|open\|export` | self-contained HTML + JUnit from a run's manifest |
 | `flow check\|fmt\|list\|run` | validate, canonicalize, enumerate, and execute Flow v1 files (`docs/FLOW.md`); `run` polls assertions, fires mutations exactly once, and classifies failures |
 | `processes`, `cleanup` | machine-wide reaping of what Autonom started |

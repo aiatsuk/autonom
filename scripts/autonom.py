@@ -35,6 +35,7 @@ from autonom_lib import journal as journal_mod  # noqa: E402
 from autonom_lib import ios_simctl  # noqa: E402
 from autonom_lib import logs as logs_mod  # noqa: E402
 from autonom_lib import platform as platform_mod  # noqa: E402
+from autonom_lib import proof as proof_mod  # noqa: E402
 from autonom_lib import processes as processes_mod  # noqa: E402
 from autonom_lib import screenshot as shot_mod  # noqa: E402
 from autonom_lib import selector as selector_mod  # noqa: E402
@@ -1531,6 +1532,96 @@ def cmd_flow_run(args: argparse.Namespace) -> int:
     return exit_code
 
 
+# --- proof -------------------------------------------------------------------
+
+
+def cmd_proof(args: argparse.Namespace) -> int:
+    repo = Path(args.repo or ".").resolve()
+    changed = proof_mod.changed_files(repo, args.base, args.head)
+    flows_dir = Path(args.flows) if args.flows else repo / ".autonom/flows"
+    selected: list[dict[str, Any]] = []
+    covered: list[str] = []
+    if flows_dir.is_dir():
+        selected, covered = proof_mod.select_flows(flows_dir, repo, changed)
+    uncovered = [name for name in changed if name not in covered]
+
+    runs: list[dict[str, Any]] = []
+    blocked_reason: str | None = None
+    if selected:
+        record = session_mod.load_current()
+        if not record:
+            blocked_reason = ("no active session — start one with "
+                              "'autonom session start' so the suite can run")
+        else:
+            try:
+                target = _target(args)
+                secrets = {}
+                for name in args.secret or []:
+                    value = os.environ.get(name)
+                    if value is None:
+                        raise errors.AutonomError(
+                            errors.FLOW_SECRET_UNDEFINED,
+                            f"--secret {name} is not in the environment")
+                    secrets[name] = value
+                config = flow_executor.RunConfig(
+                    env=dict(pair.split("=", 1) for pair in (args.env or [])
+                             if "=" in pair),
+                    secrets=secrets)
+                for entry in selected:
+                    flow = flow_validator.validate_tree(entry["path"])
+                    runner = flow_executor.Executor(target, record, config)
+                    result = runner.run(flow)
+                    runs.append({
+                        "flow": str(entry["path"]),
+                        "reasons": entry["reasons"],
+                        "status": result.status,
+                        "run_id": result.run_id,
+                        "failure": result.failure,
+                        "events": result.events_path,
+                        "steps": [
+                            {k: v for k, v in vars(step).items()
+                             if v is not None}
+                            for step in result.steps],
+                    })
+            except errors.AutonomError as exc:
+                blocked_reason = f"{exc.code}: {exc.message}"
+
+    status = proof_mod.verdict(selected, runs, uncovered, blocked_reason)
+    result_payload: dict[str, Any] = {
+        "ok": True,
+        "status": status,
+        "base": args.base,
+        "head": args.head,
+        "changed_files": changed,
+        "changed_areas": proof_mod.changed_areas(changed),
+        "selected": [{"flow": str(e["path"]), "reasons": e["reasons"]}
+                     for e in selected],
+        "uncovered_files": uncovered,
+        "runs": [{k: v for k, v in run.items() if k != "steps"}
+                 for run in runs],
+    }
+    if blocked_reason:
+        result_payload["blocked_reason"] = blocked_reason
+
+    if args.out:
+        out_dir = Path(args.out)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        markdown_source = dict(result_payload)
+        (out_dir / "proof.json").write_text(
+            json.dumps(result_payload, ensure_ascii=False, indent=2),
+            encoding="utf-8")
+        (out_dir / "proof.md").write_text(
+            proof_mod.render_markdown(markdown_source), encoding="utf-8")
+        result_payload["out"] = str(out_dir)
+
+    emit(result_payload, as_json=True)
+    if status == "pass":
+        return 0
+    if status in ("fail", "not_covered"):
+        return 1  # a CI gate must go red; not_covered is never upgraded
+    return 2  # blocked / inconclusive: verification itself did not happen
+
+
 # --- atlas -------------------------------------------------------------------
 
 
@@ -2057,6 +2148,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dry-run", action="store_true",
                    help="validate and pre-flight against the target; run nothing")
     p.set_defaults(func=cmd_flow_run)
+
+    p = sub.add_parser("proof",
+                       help="verify a code diff with the covering flow suite",
+                       parents=[target_flags])
+    p.add_argument("--base", required=True, help="git ref to diff against")
+    p.add_argument("--head", help="git ref (default: the working tree)")
+    p.add_argument("--repo", help="repository root (default: cwd)")
+    p.add_argument("--flows", help="flow directory (default: <repo>/.autonom/flows)")
+    p.add_argument("--out", help="write proof.json + proof.md into this directory")
+    p.add_argument("--env", action="append", metavar="KEY=VALUE")
+    p.add_argument("--secret", action="append", metavar="NAME")
+    p.set_defaults(func=cmd_proof)
 
     atlas = sub.add_parser("atlas", help="the observed application graph")
     atlas_sub = atlas.add_subparsers(dest="atlas_command", required=True)
