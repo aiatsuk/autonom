@@ -29,6 +29,7 @@ from autonom_lib.flow import canonical as flow_canonical  # noqa: E402
 from autonom_lib.flow import compiler as flow_compiler  # noqa: E402
 from autonom_lib.flow import executor as flow_executor  # noqa: E402
 from autonom_lib.flow import maestro as flow_maestro  # noqa: E402
+from autonom_lib.flow import report as flow_report  # noqa: E402
 from autonom_lib.flow import validator as flow_validator  # noqa: E402
 from autonom_lib import journal as journal_mod  # noqa: E402
 from autonom_lib import ios_simctl  # noqa: E402
@@ -1528,6 +1529,90 @@ def cmd_flow_run(args: argparse.Namespace) -> int:
     return exit_code
 
 
+# --- report ------------------------------------------------------------------
+
+
+def _resolve_run_dir(record: dict[str, Any], run_id: str | None) -> Path:
+    flows_dir = Path(record["artifacts_dir"]) / "flows"
+    if run_id:
+        run_dir = flows_dir / run_id
+        if not (run_dir / "manifest.json").is_file():
+            raise errors.AutonomError(
+                errors.FLOW_FILE_NOT_FOUND,
+                f"no run {run_id!r} with a manifest in this session",
+                hint=f"Runs live under {flows_dir}.",
+            )
+        return run_dir
+    candidates = sorted(
+        (path.parent for path in flows_dir.glob("*/manifest.json")),
+        key=lambda directory: directory.stat().st_mtime,
+    )
+    if not candidates:
+        raise errors.AutonomError(
+            errors.FLOW_NO_FLOWS_FOUND,
+            "this session has no flow runs with a manifest",
+            hint="Run a flow first: autonom flow run <file>.",
+        )
+    return candidates[-1]
+
+
+def cmd_report_build(args: argparse.Namespace) -> int:
+    record = _session_by_id(args.session)
+    run_dir = _resolve_run_dir(record, args.run)
+    manifest = flow_report.load_manifest(run_dir)
+    artifacts_dir = Path(record["artifacts_dir"])
+    html_path = run_dir / "report.html"
+    html_path.write_text(flow_report.render_html(manifest, artifacts_dir),
+                         encoding="utf-8")
+    os.chmod(html_path, 0o600)
+    junit_path = run_dir / "report.xml"
+    junit_path.write_text(flow_report.render_junit(manifest), encoding="utf-8")
+    os.chmod(junit_path, 0o600)
+    return emit({
+        "ok": True,
+        "run_id": manifest.get("run_id"),
+        "status": manifest.get("status"),
+        "html": str(html_path),
+        "junit": str(junit_path),
+        "sensitive": manifest.get("sensitive", False),
+    }, as_json=True)
+
+
+def cmd_report_open(args: argparse.Namespace) -> int:
+    record = _session_by_id(args.session)
+    run_dir = _resolve_run_dir(record, args.run)
+    html_path = run_dir / "report.html"
+    if not html_path.is_file():
+        manifest = flow_report.load_manifest(run_dir)
+        html_path.write_text(
+            flow_report.render_html(manifest, Path(record["artifacts_dir"])),
+            encoding="utf-8")
+        os.chmod(html_path, 0o600)
+    import webbrowser
+    opened = webbrowser.open(html_path.as_uri())
+    return emit({"ok": True, "html": str(html_path), "opened": bool(opened)},
+                as_json=True)
+
+
+def cmd_report_export(args: argparse.Namespace) -> int:
+    record = _session_by_id(args.session)
+    run_dir = _resolve_run_dir(record, args.run)
+    manifest = flow_report.load_manifest(run_dir)
+    if args.format == "junit":
+        rendered = flow_report.render_junit(manifest)
+        default_name = "report.xml"
+    else:
+        rendered = flow_report.render_html(manifest,
+                                           Path(record["artifacts_dir"]))
+        default_name = "report.html"
+    out = Path(args.out) if args.out else run_dir / default_name
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(rendered, encoding="utf-8")
+    os.chmod(out, 0o600)
+    return emit({"ok": True, "format": args.format, "out": str(out),
+                 "sensitive": manifest.get("sensitive", False)}, as_json=True)
+
+
 # --- parser ------------------------------------------------------------------
 
 
@@ -1879,6 +1964,22 @@ def build_parser() -> argparse.ArgumentParser:
                    help="validate and pre-flight against the target; run nothing")
     p.set_defaults(func=cmd_flow_run)
 
+    report = sub.add_parser("report", help="evidence reports for flow runs")
+    report_sub = report.add_subparsers(dest="report_command", required=True)
+    for verb, func, extra in (
+        ("build", cmd_report_build, "render report.html + report.xml into the run dir"),
+        ("open", cmd_report_open, "open the HTML report in a browser"),
+        ("export", cmd_report_export, "write one report format to a path"),
+    ):
+        p = report_sub.add_parser(verb, help=extra)
+        p.add_argument("--session", default="current",
+                       help="session id (default: current)")
+        p.add_argument("--run", help="run id (default: the latest run)")
+        if verb == "export":
+            p.add_argument("--format", choices=("html", "junit"), default="html")
+            p.add_argument("--out", help="destination path")
+        p.set_defaults(func=func)
+
     network = sub.add_parser("network", help="HTTP(S) capture and mocking")
     network_sub = network.add_subparsers(dest="network_command", required=True)
 
@@ -1999,10 +2100,10 @@ _JOURNAL_SKIP = {"note", "journal", "version"}
 
 # Sub-command dests, in priority order, for reconstructing a verb string.
 _SUBCOMMAND_DESTS = (
-    "session_command", "ui_command", "flow_command", "network_command",
-    "requests_command", "mock_command", "location_command", "media_command",
-    "crash_command", "file_command", "record_command", "shots_command",
-    "devices_command", "note_command",
+    "session_command", "ui_command", "flow_command", "report_command",
+    "network_command", "requests_command", "mock_command", "location_command",
+    "media_command", "crash_command", "file_command", "record_command",
+    "shots_command", "devices_command", "note_command",
 )
 
 

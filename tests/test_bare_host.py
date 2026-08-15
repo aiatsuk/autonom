@@ -71,6 +71,10 @@ SWEEP: list[tuple[str, list[str], bool]] = [
     ("flow_list_missing", ["flow", "list", "/nonexistent"], False),
     ("flow_import_missing", ["flow", "import", "/nonexistent/maestro.yaml"], False),
     ("flow_export_missing", ["flow", "export", "/nonexistent/flow.yaml"], False),
+    # report verbs need an active session; without one they refuse cleanly
+    ("report_build", ["report", "build"], False),
+    ("report_open", ["report", "open"], False),
+    ("report_export", ["report", "export"], False),
     ("crash_list", ["crash", "list"], False),
     ("open_url", ["open", "https://example.com"], False),
     ("permissions", ["permissions", "grant", "photos", "com.example.app"], False),

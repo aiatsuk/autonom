@@ -7,6 +7,19 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
 
 ## [Unreleased]
 
+## [0.24.0] - 2026-08-15
+
+### Added
+- Evidence bundle per flow run: `flows/<run_id>/manifest.json`
+  (schema-versioned status, step records, artifact inventory, reproduction
+  command), failure log windows beside the screenshots and hierarchy dumps,
+  and run-scoped screenshot grouping under `shots/<run_id>/`.
+- `autonom report build|open|export` — a fully self-contained HTML report
+  (inline data: screenshots, restrictive CSP, everything escaped — UI text
+  is hostile input) and JUnit XML for CI, rendered from the manifest alone
+  so a report can be rebuilt from the same run forever.
+
+
 ## [0.23.0] - 2026-08-15
 
 The research doc's first flagship workflow: Session → Flow.

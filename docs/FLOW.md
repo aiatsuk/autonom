@@ -188,6 +188,17 @@ point-to-point swipes are reported as warnings, not guessed. The response
 carries a quality report and the exact `flow run … --secret …` replay
 command. End recordings with a `ui find` on the success state.
 
+## Evidence reports
+
+Every run writes `flows/<run_id>/manifest.json` (schema-versioned: status,
+per-step records with durations/attempts/errors, artifact inventory,
+reproduction command). `autonom report build` renders it as a fully
+self-contained `report.html` (screenshots inlined as data: URIs, a CSP that
+refuses any external fetch, everything escaped) plus a `report.xml` JUnit
+file for CI; `report open` opens the HTML, `report export --format
+html|junit --out` writes it anywhere. A failing step also leaves a
+screenshot, a hierarchy dump, and a log window beside the events.
+
 ## Maestro Core Profile
 
 `autonom flow import maestro.yaml` converts a Maestro flow within the

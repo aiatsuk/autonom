@@ -143,6 +143,7 @@ class Executor:
         self._counter = 0
         self._used_secret_anywhere = False
         self._retry_attempt: int | None = None
+        self._writer_run_id: str | None = None
 
     # -- public ---------------------------------------------------------------
 
@@ -160,6 +161,7 @@ class Executor:
             self.target.platform, self.target.target_id,
             serial=self.target.serial, stdout_stream=self.stdout_stream,
         )
+        self._writer_run_id = run_id
         result = RunResult(run_id=run_id, status="passed",
                            events_path=str(writer.path))
         evidence = flow.evidence or Evidence()
@@ -208,7 +210,54 @@ class Executor:
             "steps": len(result.steps),
             "failure": result.failure,
         }, sensitive=result.sensitive)
+        self._write_manifest(flow, writer, result)
         return result
+
+    def _write_manifest(self, flow: Flow, writer: EventWriter,
+                        result: RunResult) -> None:
+        """One evidence manifest per run (§9.2) — the report's only input."""
+        try:
+            run_dir = writer.run_dir()
+            shots_dir = Path(self.session.get("artifacts_dir", "")) / "shots" / writer.run_id
+            artifacts = sorted(
+                str(p.relative_to(self.session["artifacts_dir"]))
+                for base in (run_dir, shots_dir) if base.is_dir()
+                for p in base.rglob("*") if p.is_file())
+            manifest = {
+                "schema_version": 1,
+                "session_id": self.session.get("session_id"),
+                "run_id": writer.run_id,
+                "flow_id": flow.flow_id,
+                "flow_name": flow.name,
+                "flow_path": flow.path,
+                "app_id": flow.app_id,
+                "platform": self.target.platform,
+                "target_id": self.target.target_id,
+                "status": result.status,
+                "sensitive": result.sensitive,
+                "primary_error": result.failure,
+                "hook_failures": result.hook_failures,
+                "steps": [
+                    {k: v for k, v in vars(step).items() if v is not None}
+                    for step in result.steps
+                ],
+                "artifacts": artifacts,
+                "reproduction": self._reproduction_command(flow),
+            }
+            path = run_dir / "manifest.json"
+            path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2),
+                            encoding="utf-8")
+            import os as os_mod
+            os_mod.chmod(path, 0o600)
+        except Exception:  # noqa: BLE001 — evidence loss never fails the run
+            pass
+
+    def _reproduction_command(self, flow: Flow) -> str:
+        parts = [f"autonom flow run {flow.path}"]
+        parts.extend(f"--secret {name}" for name in sorted(self.secret_values))
+        for key, value in self.config.env.items():
+            parts.append(f"--env {key}={value}")
+        return " ".join(parts)
 
     # -- pre-flight -----------------------------------------------------------
 
@@ -694,7 +743,8 @@ class Executor:
             return
         try:
             detail = screenshot_mod.capture_evidence(
-                self.target, self.session, label=f"step-{index}-{phase}")
+                self.target, self.session, label=f"step-{index}-{phase}",
+                task=writer.run_id)
             writer.emit("flow.evidence.captured",
                         {"step_index": index, "phase": phase,
                          "screenshot": detail.get("path", "")})
@@ -809,7 +859,8 @@ class Executor:
             return secret
         if command == "takeScreenshot":
             label = step.args.get("label") or "flow"
-            screenshot_mod.capture_evidence(target, self.session, label=label)
+            screenshot_mod.capture_evidence(target, self.session, label=label,
+                                             task=self._writer_run_id)
             return False
         if command == "checkpoint":
             return False  # the step event itself is the checkpoint record
@@ -966,7 +1017,8 @@ class Executor:
         captured: dict[str, str] = {}
         try:
             detail = screenshot_mod.capture_evidence(
-                self.target, self.session, label=f"failure-step-{index}")
+                self.target, self.session, label=f"failure-step-{index}",
+                task=writer.run_id)
             captured["screenshot"] = detail.get("path", "")
         except Exception:  # noqa: BLE001 — evidence is best-effort on a failing run
             pass
@@ -976,6 +1028,19 @@ class Executor:
             path.write_text(json.dumps({"nodes": nodes}, indent=2),
                             encoding="utf-8")
             captured["hierarchy"] = str(path)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            from .. import logs as logs_mod
+            entries, _warnings = logs_mod.tail(
+                self.target, package=self.session.get("app_id"),
+                since_seconds=120, max_lines=100)
+            if entries:
+                path = writer.run_dir() / f"failure-step-{index}-logs.txt"
+                path.write_text(
+                    "\n".join(e.get("line", "") for e in entries) + "\n",
+                    encoding="utf-8")
+                captured["logs"] = str(path)
         except Exception:  # noqa: BLE001
             pass
         if captured:
