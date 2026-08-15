@@ -12,8 +12,10 @@ test isolation land first, so every slice here ships against a trusted suite.
 | 0.20.1 | Executor core: `flow run <file>`, polling assertions, failure classes, events |
 | 0.20.2 | Composition: runFlow execution, hooks, conditions, tags, suites; `mobile-flow` skill |
 
-Version lanes 0.16–0.19 stay reserved for the metrics phase
-(`docs/plans/PHASE_4_METRICS.md`); this phase takes 0.20.x (DEC-015).
+Version lanes 0.16–0.19 were reserved for the metrics phase while this phase
+took 0.20.x (DEC-015). The reservation lapsed unused: the metrics phase
+ultimately shipped after the whole flow arc as 0.27.0–0.27.2 (DEC-015 as
+amended; mapping table in `docs/plans/PHASE_4_METRICS.md`).
 
 ---
 
