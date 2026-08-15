@@ -38,6 +38,11 @@ from autonom_lib.flow import parser as flow_parser  # noqa: E402
 from autonom_lib.flow import schema as flow_schema  # noqa: E402
 from autonom_lib.platform import Target  # noqa: E402
 
+try:
+    from env_isolation import EnvSandboxMixin  # noqa: E402  (discover -s tests)
+except ImportError:  # direct `python3 -m unittest tests.test_...` runs
+    from tests.env_isolation import EnvSandboxMixin  # noqa: E402
+
 _HEAD = "schema: autonom.dev/flow/v1\nappId: com.example.app\nname: t\n---\n"
 
 
@@ -426,8 +431,13 @@ class IosLoginFlowTests(unittest.TestCase):
         self.assertEqual(len(taps), 1)
 
 
-class PollCadenceTests(unittest.TestCase):
-    """Injectable clock: the engine's timing is exact, not approximate."""
+class PollCadenceTests(EnvSandboxMixin, unittest.TestCase):
+    """Injectable clock: the engine's timing is exact, not approximate.
+
+    Runs the executor in-process, so the machine stores must be redirected —
+    failure evidence reads the mock registry, which would otherwise mkdir
+    the operator's real ~/.local/state/autonom.
+    """
 
     def _executor(self, **config):
         target = Target("android", "emulator-5554", str(FAKE_ADB),
@@ -453,6 +463,7 @@ class PollCadenceTests(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.tmp = self._tmp
         self.addCleanup(self._tmp.cleanup)
+        self.sandbox_home()
 
     def _build(self, body: str):
         return flow_schema.build_flow(
