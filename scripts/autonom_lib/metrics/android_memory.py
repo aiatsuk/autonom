@@ -7,31 +7,29 @@ session's `metrics/` dir with 0600 modes.
 """
 from __future__ import annotations
 
-import time
 from pathlib import Path
 from typing import Any
 
 from .. import adb as adb_mod
 from .. import errors
 from ..platform import Target
+from . import artifacts as artifacts_mod
 from . import meminfo as meminfo_mod
 from . import process as process_mod
 from . import series as series_mod
-
-
-def _write(path: Path, text: str) -> str:
-    path.write_text(text, encoding="utf-8")
-    path.chmod(0o600)
-    return str(path)
 
 
 def capture(target: Target, app_id: str, *, out_dir: Path, label: str,
             want_hprof: bool = True) -> dict[str, Any]:
     resolved = process_mod.resolve(target, app_id)
     pid = resolved["pid"]
-    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    stamp = artifacts_mod.stamp()
     out_dir.mkdir(parents=True, exist_ok=True)
-    prefix = out_dir / f"{label}-{stamp}"
+    stem = artifacts_mod.unique_stem(
+        out_dir, f"{stamp}-{label}",
+        "-metadata.txt", "-meminfo.txt", "-proc-status.txt",
+        "-gfxinfo.txt", ".hprof")
+    prefix = out_dir / stem
     files: list[str] = []
     warnings: list[dict[str, str]] = []
 
@@ -40,7 +38,7 @@ def capture(target: Target, app_id: str, *, out_dir: Path, label: str,
                                     serial=target.target_id, check=False)
         return (completed.stdout or "").strip()
 
-    files.append(_write(Path(f"{prefix}-metadata.txt"), (
+    files.append(artifacts_mod.write_text(Path(f"{prefix}-metadata.txt"), (
         f"captured_at_utc={stamp}\n"
         f"serial={target.target_id}\n"
         f"package={app_id}\n"
@@ -52,17 +50,26 @@ def capture(target: Target, app_id: str, *, out_dir: Path, label: str,
     meminfo = adb_mod.run_adb(target.tool,
                               ["shell", "dumpsys", "meminfo", app_id],
                               serial=target.target_id, check=False, timeout=60)
-    files.append(_write(Path(f"{prefix}-meminfo.txt"), meminfo.stdout or ""))
+    files.append(artifacts_mod.write_text(Path(f"{prefix}-meminfo.txt"),
+                                          meminfo.stdout or ""))
 
     status = adb_mod.run_adb(target.tool,
                              ["shell", "cat", f"/proc/{pid}/status"],
                              serial=target.target_id, check=False)
-    files.append(_write(Path(f"{prefix}-proc-status.txt"), status.stdout or ""))
+    files.append(artifacts_mod.write_text(Path(f"{prefix}-proc-status.txt"),
+                                          status.stdout or ""))
 
     gfx = adb_mod.run_adb(target.tool, ["shell", "dumpsys", "gfxinfo", app_id],
                           serial=target.target_id, check=False, timeout=60)
     if gfx.returncode == 0:
-        files.append(_write(Path(f"{prefix}-gfxinfo.txt"), gfx.stdout or ""))
+        files.append(artifacts_mod.write_text(Path(f"{prefix}-gfxinfo.txt"),
+                                              gfx.stdout or ""))
+    else:
+        warnings.append({
+            "code": "gfxinfo_unavailable",
+            "error": "dumpsys gfxinfo failed; the pack has no -gfxinfo.txt",
+            "hint": "Frame stats are supplementary; the memory files stand.",
+        })
 
     if want_hprof:
         remote = f"/data/local/tmp/autonom-{stamp}.hprof"

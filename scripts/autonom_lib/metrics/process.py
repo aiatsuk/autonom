@@ -2,14 +2,17 @@
 
 Failure always reports `sources_tried`, so an agent can see exactly which
 resolution paths came up empty instead of guessing (§3.7, D2).
+
+Deliberately NO free-text fallback like ``pgrep -f <bundle-id>``: the CLI's
+own command line contains the bundle id (``--app-id com.example.app``), so a
+substring match can "resolve" the dead app to the autonom process itself and
+silently measure the wrong program. A missing pid must stay a refusal.
 """
 from __future__ import annotations
 
 import re
-import subprocess
 
-from .. import adb as adb_mod
-from .. import errors, ios_simctl
+from .. import errors, ios_simctl, logs as logs_mod
 from ..platform import ANDROID, Target
 
 
@@ -30,17 +33,14 @@ def _not_running(app_id: str, tried: list[str]) -> errors.AutonomError:
 
 def _android(target: Target, app_id: str) -> dict[str, object]:
     tried = ["adb shell pidof -s"]
-    completed = adb_mod.run_adb(target.tool, ["shell", "pidof", "-s", app_id],
-                                serial=target.target_id, check=False)
-    pid = (completed.stdout or "").strip()
-    if pid.isdigit():
+    pid = logs_mod.pid_for_package(target.tool, target.target_id, app_id)
+    if pid and pid.isdigit():
         return {"pid": int(pid), "sources_tried": tried}
     raise _not_running(app_id, tried)
 
 
 def _ios(target: Target, app_id: str) -> dict[str, object]:
-    tried: list[str] = []
-    tried.append("simctl spawn launchctl list")
+    tried = ["simctl spawn launchctl list"]
     completed = ios_simctl.run_simctl(
         target.tool, ["spawn", target.target_id, "launchctl", "list"],
         check=False)
@@ -49,14 +49,4 @@ def _ios(target: Target, app_id: str) -> dict[str, object]:
     hit = pattern.search(completed.stdout or "")
     if hit:
         return {"pid": int(hit.group(1)), "sources_tried": tried}
-    tried.append("pgrep -f <bundle id>")
-    try:
-        pgrep = subprocess.run(["pgrep", "-n", "-f", app_id], text=True,
-                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                               check=False, timeout=15)
-        pid = (pgrep.stdout or "").strip().splitlines()
-        if pid and pid[0].isdigit():
-            return {"pid": int(pid[0]), "sources_tried": tried}
-    except (OSError, subprocess.TimeoutExpired):
-        pass
     raise _not_running(app_id, tried)

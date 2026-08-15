@@ -15,6 +15,7 @@ from typing import Any
 from .. import adb as adb_mod
 from .. import errors
 from ..platform import ANDROID, Target
+from . import artifacts as artifacts_mod
 from . import frames as frames_mod
 from . import presets as presets_mod
 from . import process as process_mod
@@ -26,10 +27,6 @@ XCTRACE_TEMPLATES = {
     "hitches": "Animation Hitches",
 }
 ANDROID_PRESETS = {"simpleperf", "gfxinfo-flow"}
-
-
-def _stamp() -> str:
-    return time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
 
 
 def run_preset(target: Target, app_id: str, preset: str, *, duration: float,
@@ -67,7 +64,7 @@ def _simpleperf(target: Target, app_id: str, duration: float, out_dir: Path,
             "push the NDK's simpleperf for your ABI to /data/local/tmp.",
             tool="simpleperf")
     pid = process_mod.resolve(target, app_id)["pid"]
-    remote = f"/data/local/tmp/autonom-{_stamp()}-perf.data"
+    remote = f"/data/local/tmp/autonom-{artifacts_mod.stamp()}-perf.data"
     try:
         record = adb_mod.run_adb(
             target.tool,
@@ -79,7 +76,9 @@ def _simpleperf(target: Target, app_id: str, duration: float, out_dir: Path,
                 errors.TRACE_FAILED,
                 f"simpleperf record failed: {(record.stdout or '').strip()[:300]}",
                 "Profiling may need a debuggable app or a userdebug image.")
-        local = out_dir / f"{_stamp()}-{label}-perf.data"
+        local = out_dir / (artifacts_mod.unique_stem(
+            out_dir, f"{artifacts_mod.stamp()}-{label}", "-perf.data")
+            + "-perf.data")
         pull = adb_mod.run_adb(target.tool, ["pull", remote, str(local)],
                                serial=target.target_id, check=False, timeout=300)
         if pull.returncode != 0 or not local.is_file():
@@ -99,9 +98,10 @@ def _gfxinfo_flow(target: Target, app_id: str, duration: float, out_dir: Path,
     frames_mod.reset(target, app_id)
     sleep(max(duration, 0.0))  # the agent drives the UI meanwhile
     raw, summary = frames_mod.capture(target, app_id)
-    artifact = out_dir / f"{_stamp()}-{label}-gfxinfo.txt"
-    artifact.write_text(raw, encoding="utf-8")
-    artifact.chmod(0o600)
+    stem = artifacts_mod.unique_stem(
+        out_dir, f"{artifacts_mod.stamp()}-{label}", "-gfxinfo.txt")
+    artifact = out_dir / f"{stem}-gfxinfo.txt"
+    artifacts_mod.write_text(artifact, raw)
     return {"ok": True, "preset": "gfxinfo-flow", "duration_s": duration,
             "summary": summary, "artifacts": [str(artifact)],
             "note": "reset → window → framestats; drive the flow during the window"}
@@ -115,7 +115,9 @@ def _xctrace(target: Target, app_id: str, preset: str, duration: float,
             "Install full Xcode (not just the CLT) and run "
             "'xcode-select --switch /Applications/Xcode.app'.", tool="xctrace")
     pid = process_mod.resolve(target, app_id)["pid"]
-    output = out_dir / f"{_stamp()}-{label}-{preset}.trace"
+    stem = artifacts_mod.unique_stem(
+        out_dir, f"{artifacts_mod.stamp()}-{label}", f"-{preset}.trace")
+    output = out_dir / f"{stem}-{preset}.trace"
     argv = [target.tool, "xctrace", "record",
             "--template", XCTRACE_TEMPLATES[preset],
             "--device", target.target_id,

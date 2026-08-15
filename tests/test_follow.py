@@ -226,6 +226,26 @@ class FollowPollTests(unittest.TestCase):
         self.assertEqual(eof["reason"], "max_seconds")
         self.assertEqual(eof["count"], 0)
 
+    def test_long_interval_never_overshoots_max_seconds(self) -> None:
+        fake = FakeTime()
+        follow.follow_poll(lambda: [], emit=lambda _: None, interval=60,
+                           max_seconds=5, clock=fake.clock, sleep=fake.sleep)
+        self.assertLessEqual(fake.now, 5.1,
+                             "--max-seconds is a hard bound, not a hint")
+
+
+class FollowProcessTests(unittest.TestCase):
+    def test_final_unterminated_line_is_flushed_at_stream_end(self) -> None:
+        emitted: list = []
+        eof = follow.follow_process(
+            [sys.executable, "-c",
+             "import sys; sys.stdout.write('done\\npartial-tail')"],
+            source="t", emit=emitted.append, max_seconds=10)
+        lines = [e["text"] for e in emitted if e.get("kind") == "line"]
+        self.assertEqual(lines, ["done", "partial-tail"])
+        self.assertEqual(eof["reason"], "stream_ended")
+        self.assertEqual(eof["lines"], 2)
+
 
 class SinceIdTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -362,6 +382,88 @@ class FollowCliTests(unittest.TestCase):
         events = self._ndjson(result.stdout)
         self.assertEqual(events[-1]["kind"], "eof")
         self.assertIn(events[-1]["reason"], {"stream_ended", "max_seconds"})
+
+    def test_consumer_closing_the_pipe_is_a_clean_exit(self) -> None:
+        # `autonom … --follow | head -1`: EPIPE must end the stream quietly,
+        # never with a traceback breaching the one-error-envelope contract
+        process = subprocess.Popen(
+            [sys.executable, str(CLI), "--platform", "android",
+             "--serial", "emulator-5554",
+             "--adb", str(ROOT / "tests/fakes/fake_adb.py"),
+             "journal", "--follow", "--from-start", "--max-seconds", "5"],
+            env=self.env, text=True, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE)
+        assert process.stdout is not None
+        process.stdout.readline()
+        process.stdout.close()  # the reader walks away mid-stream
+        _, stderr = process.communicate(timeout=30)
+        self.assertEqual(process.returncode, 0, stderr)
+        self.assertNotIn("Traceback", stderr)
+
+
+class IosDeviceFollowTests(unittest.TestCase):
+    """The iOS device branch honors --session-id and dead stream writers."""
+
+    UDID = "AAAAAAAA-1111-2222-3333-BBBBBBBBBBBB"
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        state = Path(self.tmp.name) / "state.json"
+        state.write_text(json.dumps({
+            "installed": ["com.example.app"],
+            "ios_log": ['{"live": 1}', '{"live": 2}'],
+        }), encoding="utf-8")
+        self.env = dict(os.environ)
+        self.env.update({
+            "AUTONOM_HOME": str(Path(self.tmp.name) / "home"),
+            "AUTONOM_FAKE_STATE": str(state),
+            "AUTONOM_FAKE_LOG": str(Path(self.tmp.name) / "log.jsonl"),
+        })
+        result = self._cli("session", "start", "--app-id", "com.example.app")
+        assert result.returncode == 0, result.stderr
+        payload = json.loads(result.stdout)
+        self.session_id = payload["session"]["session_id"]
+        self.artifacts = Path(payload["session"]["artifacts_dir"])
+
+    def _cli(self, *args: str):
+        return subprocess.run(
+            [sys.executable, str(CLI), "--platform", "ios",
+             "--target", self.UDID,
+             "--simctl", str(ROOT / "tests/fakes/fake_simctl.py"),
+             "--idb", str(ROOT / "tests/fakes/fake_idb.py"), *args],
+            env=self.env, text=True, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, check=False, timeout=60,
+        )
+
+    def test_session_id_replays_that_sessions_recorded_stream(self) -> None:
+        (self.artifacts / "logs/stream.ndjson").write_text(
+            '{"recorded": "line"}\n', encoding="utf-8")
+        result = self._cli("logs", "follow", "--source", "device",
+                           "--session-id", self.session_id, "--max-lines", "1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        events = [json.loads(line) for line in result.stdout.splitlines()]
+        self.assertEqual(events[0]["text"], '{"recorded": "line"}')
+
+    def test_session_id_without_a_recording_refuses(self) -> None:
+        result = self._cli("logs", "follow", "--source", "device",
+                           "--session-id", self.session_id,
+                           "--max-seconds", "1")
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(json.loads(result.stderr)["error_code"],
+                         "stream_not_found")
+
+    def test_dead_stream_writer_falls_back_to_live_logs(self) -> None:
+        # a stream file exists but no writer pid is alive: tailing the dead
+        # file would show nothing forever — the live spawn must win
+        (self.artifacts / "logs/stream.ndjson").write_text(
+            '{"stale": true}\n', encoding="utf-8")
+        result = self._cli("logs", "follow", "--source", "device",
+                           "--max-seconds", "5")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        texts = [json.loads(line).get("text", "")
+                 for line in result.stdout.splitlines()]
+        self.assertIn('{"live": 1}', texts)
 
 
 if __name__ == "__main__":

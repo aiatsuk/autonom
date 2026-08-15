@@ -146,6 +146,14 @@ class ProofTests(unittest.TestCase):
         self.assertEqual(payload["status"], "not_covered")
         self.assertIn("src/payments/pay.py", payload["uncovered_files"])
 
+    def test_malformed_env_is_refused_like_flow_run(self) -> None:
+        (self.repo / "src/settings/screen.py").write_text("v2\n")
+        result = self._proof("--env", "NOEQUALS")
+        self.assertEqual(result.returncode, 2)
+        payload = json.loads(result.stderr)
+        self.assertEqual(payload["error_code"], "flow_command_invalid",
+                         "proof must not silently drop a malformed --env")
+
     def test_no_session_is_blocked_not_pass(self) -> None:
         stop = self._cli("session", "stop")
         assert stop.returncode == 0, stop.stderr

@@ -60,8 +60,11 @@ def parse_proc_status(text: str) -> dict[str, int]:
 
 def parse_cpuinfo(text: str, package: str) -> float | None:
     """The process' load percent from `dumpsys cpuinfo`, e.g.
-    ` 12% 4321/com.example.app: 8% user + 4% kernel`."""
+    ` 12% 4321/com.example.app: 8% user + 4% kernel`.
+
+    The package must end exactly at `:` or whitespace — a bare word boundary
+    would let `com.example.app` claim `com.example.app.dev`'s line."""
     pattern = re.compile(
-        rf"^\s*([\d.]+)%\s+\d+/{re.escape(package)}(?::|\b)", re.MULTILINE)
+        rf"^\s*([\d.]+)%\s+\d+/{re.escape(package)}(?=[:\s]|$)", re.MULTILINE)
     hit = pattern.search(text)
     return float(hit.group(1)) if hit else None

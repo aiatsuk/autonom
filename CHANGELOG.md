@@ -7,6 +7,48 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
 
 ## [Unreleased]
 
+## [0.27.3] - 2026-08-15
+
+### Fixed
+Findings of the closing adversarial review of 0.26.0–0.27.2, each pinned
+by a regression test:
+
+- iOS pid resolution dropped its `pgrep -f <bundle-id>` fallback: the
+  CLI's own command line contains the bundle id (`--app-id …`), so a dead
+  app could "resolve" to the autonom process itself and `metrics
+  snapshot` would silently measure the wrong program. A missing pid is
+  now always an `app_not_running` refusal.
+- Same-second metrics artifacts no longer overwrite each other: all
+  writers share one naming owner (`metrics/artifacts.py` — `{stamp}-
+  {label}` order everywhere, 0600, `-2`/`-3` suffixes on collision), so
+  `metrics series --interval 0` keeps every sample. A snapshot's raw
+  dump is now `…-meminfo.raw.txt` so `metrics memory analyze` (glob
+  `*-meminfo.txt`) can never fold snapshots into a capture-pack series.
+- A consumer closing the NDJSON pipe (`… follow | head`) ends the stream
+  cleanly (exit 0) instead of a BrokenPipeError traceback; stalled
+  device calls (`dumpheap`, simpleperf, a wedged adb) fail as one
+  `backend_failed` envelope instead of an uncaught TimeoutExpired.
+- `follow` reads files in binary with exact byte offsets: text-mode
+  `tell()` returns an opaque cookie mid-multibyte-character, which could
+  misread rotation and replay the whole file; reads are also bounded
+  (1 MiB slices) and `follow_poll` never sleeps past `--max-seconds`.
+  `--grep` is now case-insensitive like `logs tail`/`journal --grep`;
+  a process stream's final unterminated line is emitted, not dropped.
+- iOS `logs follow --source device` honors `--session-id` (replays that
+  session's recorded stream, refuses if none), applies `--package` when
+  tailing a stream file, and falls back to live `log stream` when the
+  recorded file's writer is dead — a stale file no longer shadows live
+  logs.
+- `autonom proof` shares `--env`/`--secret` handling with `flow run`: a
+  malformed `--env` is a hard `flow_command_invalid` refusal instead of
+  a silently dropped override that could pass a diff under the wrong
+  config. `parse_cpuinfo` can no longer credit `com.example.app` with
+  `com.example.app.dev`'s CPU line. `metrics memory capture` warns when
+  gfxinfo fails instead of silently omitting the artifact; `metrics
+  memory analyze` without a session hints at `--dir` (the flag it
+  actually has); Flutter frame-key preference is deterministic; `metrics
+  frames reset` joined the bare-host sweep.
+
 ## [0.27.2] - 2026-08-15
 
 ### Added

@@ -10,6 +10,11 @@ Every follow is bounded by ``--max-seconds`` / ``--max-lines`` and always ends
 with one ``{"kind": "eof", "reason": …}`` line, so an agent in CI can never
 hang on observation. Files are confined to the session's ``artifacts_dir`` —
 the follow verbs read evidence, they are not a general file tailer.
+
+Files are read in binary and split on ``\\n`` before decoding: byte offsets
+stay exact for the rotation check (text-mode ``tell()`` returns an opaque
+cookie once the incremental decoder holds state), and a multibyte character
+split across writes is only decoded when its line completes.
 """
 from __future__ import annotations
 
@@ -27,6 +32,8 @@ from . import errors
 # writer forgot to register). Kind mirrors the registered vocabulary.
 _SCAN_DIRS = (("output", "output"), ("logs", "device_log"), ("network", "network"))
 _SCAN_SUFFIXES = {".log", ".ndjson", ".jsonl", ".txt"}
+
+_READ_CHUNK = 1 << 20  # drain in bounded slices, never the whole file at once
 
 
 def _now() -> str:
@@ -121,7 +128,7 @@ def resolve_source(record: dict[str, Any], source: str) -> Path:
         if dirname in {d for d, _ in _SCAN_DIRS}:
             return confine(base, f"{dirname}/{name}")
     if source == "journal":
-        return base / "journal.ndjson"
+        return confine(base, "journal.ndjson")
     known = ", ".join(sorted(e["id"] for e in catalog(record))) or "none"
     raise errors.AutonomError(
         errors.STREAM_NOT_FOUND,
@@ -135,12 +142,17 @@ def _compile(grep: str | None) -> re.Pattern[str] | None:
     if not grep:
         return None
     try:
-        return re.compile(grep)
+        # IGNORECASE matches the twins: `logs tail --grep` and `journal --grep`.
+        return re.compile(grep, re.IGNORECASE)
     except re.error as exc:
         raise errors.AutonomError(
             errors.BACKEND_FAILED, f"invalid --grep regex: {exc}",
             "The filter is a Python regular expression.",
         )
+
+
+def _decode(raw_line: bytes) -> str:
+    return raw_line.decode("utf-8", errors="replace").rstrip("\r")
 
 
 def follow_file(
@@ -154,6 +166,7 @@ def follow_file(
     grep: str | None = None,
     poll_ms: int = 250,
     raw: bool = False,
+    line_filter: Callable[[str], bool] | None = None,
     clock: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
 ) -> dict[str, Any]:
@@ -165,56 +178,69 @@ def follow_file(
     emitted = 0
     handle = None
     inode = None
-    buffer = ""
-
-    def _eof(reason: str) -> dict[str, Any]:
-        if handle is not None:
-            handle.close()
-        payload = {"kind": "eof", "reason": reason, "lines": emitted,
-                   "source": source}
-        emit(payload)
-        return payload
+    position = 0
+    buffer = b""
 
     if not path.is_file():
         from_start = True  # a file born after the follow began is all new
 
-    while True:
-        if handle is None and path.is_file():
-            handle = path.open("r", encoding="utf-8", errors="replace")
-            inode = os.fstat(handle.fileno()).st_ino
-            buffer = ""
-            if not from_start:
-                handle.seek(0, os.SEEK_END)
-            from_start = True  # a rotated replacement is always read fully
+    try:
+        while True:
+            if handle is None and path.is_file():
+                handle = path.open("rb")
+                inode = os.fstat(handle.fileno()).st_ino
+                buffer = b""
+                if not from_start:
+                    handle.seek(0, os.SEEK_END)
+                position = handle.tell()
+                from_start = True  # a rotated replacement is always read fully
+            if handle is not None:
+                try:
+                    stat = path.stat()
+                    rotated = stat.st_ino != inode or stat.st_size < position
+                except OSError:
+                    rotated = True  # deleted; wait for the writer to recreate it
+                if rotated:
+                    handle.close()
+                    handle = None
+                    continue
+                chunk = handle.read(_READ_CHUNK)
+                if chunk:
+                    position += len(chunk)
+                    buffer += chunk
+                    *complete, buffer = buffer.split(b"\n")
+                    for raw_line in complete:
+                        line = _decode(raw_line)
+                        if pattern and not pattern.search(line):
+                            continue
+                        if line_filter and not line_filter(line):
+                            continue
+                        if raw:
+                            emit(line)
+                        else:
+                            emit({"kind": "line", "source": source,
+                                  "ts": _now(), "text": line})
+                        emitted += 1
+                        if max_lines and emitted >= max_lines:
+                            return _eof_line(emit, "max_lines", emitted, source)
+                    continue  # drain to EOF before checking the clock
+            if deadline is not None and clock() >= deadline:
+                return _eof_line(emit, "max_seconds", emitted, source)
+            pause = max(poll_ms, 20) / 1000.0
+            if deadline is not None:
+                pause = min(pause, max(0.0, deadline - clock()))
+            sleep(pause)
+    finally:
         if handle is not None:
-            try:
-                stat = path.stat()
-                rotated = stat.st_ino != inode or stat.st_size < handle.tell()
-            except OSError:
-                rotated = True  # deleted; wait for the writer to recreate it
-            if rotated:
-                handle.close()
-                handle = None
-                continue
-            chunk = handle.read()
-            if chunk:
-                buffer += chunk
-                *complete, buffer = buffer.split("\n")
-                for line in complete:
-                    if pattern and not pattern.search(line):
-                        continue
-                    if raw:
-                        emit(line)
-                    else:
-                        emit({"kind": "line", "source": source, "ts": _now(),
-                              "text": line})
-                    emitted += 1
-                    if max_lines and emitted >= max_lines:
-                        return _eof("max_lines")
-                continue  # drain to EOF before checking the clock
-        if deadline is not None and clock() >= deadline:
-            return _eof("max_seconds")
-        sleep(max(poll_ms, 20) / 1000.0)
+            handle.close()
+
+
+def _eof_line(emit: Callable[[Any], None], reason: str, emitted: int,
+              source: str) -> dict[str, Any]:
+    payload = {"kind": "eof", "reason": reason, "lines": emitted,
+               "source": source}
+    emit(payload)
+    return payload
 
 
 def follow_process(
@@ -225,10 +251,13 @@ def follow_process(
     max_seconds: float = 0.0,
     max_lines: int = 0,
     grep: str | None = None,
+    line_filter: Callable[[str], bool] | None = None,
     clock: Callable[[], float] = time.monotonic,
 ) -> dict[str, Any]:
     """Stream a log subprocess's stdout line by line until a bound is hit or
-    the process ends. The child is always reaped."""
+    the process ends. The child is always reaped; when it closes its stream,
+    a final unterminated line is still emitted — the writer is done, so the
+    fragment is complete evidence."""
     pattern = _compile(grep)
     deadline = clock() + max_seconds if max_seconds > 0 else None
     emitted = 0
@@ -242,34 +271,40 @@ def follow_process(
     selector = selectors.DefaultSelector()
     selector.register(process.stdout, selectors.EVENT_READ)
     buffer = b""
-    reason = "stream_ended"
+    reason = None
+
+    def push(line: str) -> bool:
+        """Emit one line; True when the max_lines bound has been reached."""
+        nonlocal emitted
+        if pattern and not pattern.search(line):
+            return False
+        if line_filter and not line_filter(line):
+            return False
+        emit({"kind": "line", "source": source, "ts": _now(), "text": line})
+        emitted += 1
+        return bool(max_lines and emitted >= max_lines)
+
     try:
-        while True:
+        while reason is None:
             timeout = 0.25
             if deadline is not None:
                 timeout = min(timeout, max(0.0, deadline - clock()))
-            ready = selector.select(timeout)
-            if ready:
+            if selector.select(timeout):
                 chunk = os.read(process.stdout.fileno(), 65536)
-                if not chunk:
-                    break  # process closed stdout
+                if not chunk:  # the process closed stdout: flush the tail
+                    if buffer and reason is None:
+                        push(_decode(buffer))
+                        buffer = b""
+                    reason = reason or "stream_ended"
+                    break
                 buffer += chunk
                 *complete, buffer = buffer.split(b"\n")
                 for raw_line in complete:
-                    line = raw_line.decode("utf-8", errors="replace").rstrip("\r")
-                    if pattern and not pattern.search(line):
-                        continue
-                    emit({"kind": "line", "source": source, "ts": _now(),
-                          "text": line})
-                    emitted += 1
-                    if max_lines and emitted >= max_lines:
+                    if push(_decode(raw_line)):
                         reason = "max_lines"
-                        raise _Stop
-            if deadline is not None and clock() >= deadline:
+                        break
+            if reason is None and deadline is not None and clock() >= deadline:
                 reason = "max_seconds"
-                raise _Stop
-    except _Stop:
-        pass
     finally:
         selector.close()
         if process.poll() is None:
@@ -280,13 +315,7 @@ def follow_process(
                 process.kill()
                 process.wait()
         process.stdout.close()
-    payload = {"kind": "eof", "reason": reason, "lines": emitted, "source": source}
-    emit(payload)
-    return payload
-
-
-class _Stop(Exception):
-    """Internal: unwind the follow loop when a bound is reached."""
+    return _eof_line(emit, reason or "stream_ended", emitted, source)
 
 
 def follow_poll(
@@ -317,4 +346,8 @@ def follow_poll(
                 return _eof("max")
         if deadline is not None and clock() >= deadline:
             return _eof("max_seconds")
-        sleep(max(interval, 0.05))
+        pause = max(interval, 0.05)
+        if deadline is not None:
+            # never sleep past the deadline: --max-seconds is a hard bound
+            pause = min(pause, max(0.05, deadline - clock()))
+        sleep(pause)

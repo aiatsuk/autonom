@@ -59,6 +59,11 @@ class MeminfoParserTests(unittest.TestCase):
         self.assertEqual(meminfo.parse_cpuinfo(text, "com.example.app"), 12.5)
         self.assertIsNone(meminfo.parse_cpuinfo(text, "com.other.app"))
 
+    def test_cpuinfo_never_claims_a_sibling_flavor_package(self) -> None:
+        text = "  7% 999/com.example.app.dev: 5% user + 2% kernel\n"
+        self.assertIsNone(meminfo.parse_cpuinfo(text, "com.example.app"),
+                          "com.example.app must not claim .dev's line")
+
 
 class SeriesMathTests(unittest.TestCase):
     def _samples(self) -> list[dict]:
@@ -150,7 +155,9 @@ class AndroidSnapshotCliTests(unittest.TestCase):
         self.assertTrue(all(a.is_file() for a in artifacts), artifacts)
         self.assertTrue(any(a.name.endswith("-baseline-snapshot.json")
                             for a in artifacts))
-        self.assertTrue(any(a.name.endswith("-baseline-meminfo.txt")
+        # `.raw.txt`, never `-meminfo.txt`: `metrics memory analyze` globs
+        # `*-meminfo.txt` for capture packs, and a snapshot must not fold in
+        self.assertTrue(any(a.name.endswith("-baseline-meminfo.raw.txt")
                             for a in artifacts))
         self.assertTrue(str(artifacts[0]).startswith(str(self.artifacts)))
 
@@ -172,6 +179,10 @@ class AndroidSnapshotCliTests(unittest.TestCase):
         self.assertEqual(payload["directional_growth_leads"], [])
         self.assertIn("Directional trend only", payload["interpretation"])
         self.assertTrue(Path(payload["artifact"]).is_file())
+        # same-second snapshots must not overwrite each other's artifacts
+        sample_artifacts = [s["artifact"] for s in payload["samples"]]
+        self.assertEqual(len(set(sample_artifacts)), 3, sample_artifacts)
+        self.assertTrue(all(Path(a).is_file() for a in sample_artifacts))
 
     def test_series_from_dir_is_offline(self) -> None:
         src = Path(self.tmp.name) / "snaps"
@@ -243,6 +254,19 @@ class IosSnapshotCliTests(unittest.TestCase):
         self.assertGreaterEqual(payload["disk"]["data_container_bytes"], 4096)
         self.assertTrue(any("host view" in line
                             for line in payload["limitations"]))
+
+    def test_dead_app_refuses_instead_of_measuring_the_cli_itself(self) -> None:
+        # our own argv contains `--app-id com.example.app`, so any free-text
+        # process-name fallback would "find" the autonom CLI and measure it
+        state = json.loads(Path(self.env["AUTONOM_FAKE_STATE"]).read_text())
+        state["running"] = []
+        Path(self.env["AUTONOM_FAKE_STATE"]).write_text(json.dumps(state))
+        result = self._cli("metrics", "snapshot", "--app-id", "com.example.app")
+        self.assertEqual(result.returncode, 2, result.stdout)
+        envelope = json.loads(result.stderr)
+        self.assertEqual(envelope["error_code"], "app_not_running")
+        self.assertEqual(envelope["sources_tried"],
+                         ["simctl spawn launchctl list"])
 
 
 class DoctorMetricsTests(unittest.TestCase):

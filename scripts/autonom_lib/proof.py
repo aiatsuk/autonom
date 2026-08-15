@@ -114,10 +114,8 @@ def verdict(selected: list[dict[str, Any]], runs: list[dict[str, Any]],
     executed = [step for run in runs for step in run.get("steps", [])]
     if executed and all(step.get("status") == "skipped" for step in executed):
         return "inconclusive"
-    if uncovered:
-        # flows ran and passed, but some changed areas have no coverage —
-        # the verdict names the stronger claim it CANNOT make
-        return "pass"  # per-area gaps are listed; the suite itself passed
+    # Leftover uncovered files do not soften the verdict: the suite that WAS
+    # selected passed, and the per-file gaps are listed by name beside it.
     return "pass"
 
 

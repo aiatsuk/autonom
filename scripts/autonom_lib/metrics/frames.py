@@ -69,6 +69,9 @@ _RASTER_KEYS: Sequence[str] = (
 
 
 def _numeric_list(value: Any) -> list[float] | None:
+    """Deliberately stricter than the skill twin here: a boolean in a timing
+    array is garbage input and is refused, where the twin would silently
+    count `true` as 1.0 ms. Equivalence holds for every well-formed file."""
     if not isinstance(value, list) or not value:
         return None
     out: list[float] = []
@@ -83,7 +86,7 @@ def _numeric_list(value: Any) -> list[float] | None:
 
 
 def _find_key(value: Any, keys: Iterable[str]) -> list[float] | None:
-    wanted = frozenset(keys)
+    wanted = tuple(keys)  # declared order: preference must be deterministic
     stack: list[Any] = [value]
     while stack:
         current = stack.pop()

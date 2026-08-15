@@ -7,6 +7,7 @@ import difflib
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -35,6 +36,7 @@ from autonom_lib.flow import validator as flow_validator  # noqa: E402
 from autonom_lib import journal as journal_mod  # noqa: E402
 from autonom_lib import ios_simctl  # noqa: E402
 from autonom_lib.metrics import android_memory as metrics_memory  # noqa: E402
+from autonom_lib.metrics import artifacts as metrics_artifacts  # noqa: E402
 from autonom_lib.metrics import frames as metrics_frames  # noqa: E402
 from autonom_lib.metrics import presets as metrics_presets  # noqa: E402
 from autonom_lib.metrics import series as metrics_series  # noqa: E402
@@ -493,6 +495,14 @@ def _stream_print(payload: Any) -> None:
         print(json.dumps(payload, ensure_ascii=False), flush=True)
 
 
+def _finish_stream(eof: dict[str, Any]) -> int:
+    """Every streaming verb ends here: the eof summary — not the line spam —
+    becomes the journal payload."""
+    global _LAST_EMIT
+    _LAST_EMIT = {"ok": True, **eof}
+    return 0
+
+
 def _observed_session(args: argparse.Namespace) -> dict[str, Any]:
     session_id = getattr(args, "session_id", None)
     return _session_by_id(session_id) if session_id else session_mod.require_current()
@@ -506,72 +516,90 @@ def cmd_session_outputs(args: argparse.Namespace) -> int:
                  "count": len(streams), "streams": streams}, as_json=True)
 
 
-def cmd_logs_follow(args: argparse.Namespace) -> int:
-    limits = {"from_start": args.from_start, "max_seconds": args.max_seconds,
-              "max_lines": args.max_lines, "grep": args.grep}
-    if args.source == "device":
-        target = _target(args)
-        if target.platform == ANDROID:
-            argv = [target.tool, "-s", target.target_id, "logcat", "-v", "time"]
-            if args.package:
-                pid = logs_mod._pid_for_package(  # noqa: SLF001 - same package
-                    target.tool, target.target_id, args.package)
-                if pid:
-                    argv.append(f"--pid={pid}")
-            del limits["from_start"]  # a live stream has no beginning to replay
-            eof = follow_mod.follow_process(argv, source="device",
-                                            emit=_stream_print, **limits)
-        else:
-            current = session_mod.load_current()
-            stream = (Path(current["artifacts_dir"]) / "logs" / "stream.ndjson"
-                      if current else None)
-            if stream is not None and stream.exists():
-                eof = follow_mod.follow_file(
-                    stream, source="device", emit=_stream_print,
-                    poll_ms=args.poll_ms, **limits)
-            else:
-                argv = [target.tool, "simctl", "spawn", target.target_id,
-                        "log", "stream", "--style", "ndjson", "--level", "info"]
-                if args.package:
-                    argv += ["--predicate", logs_mod._ios_predicate(args.package)]  # noqa: SLF001
-                del limits["from_start"]
-                eof = follow_mod.follow_process(argv, source="device",
-                                                emit=_stream_print, **limits)
-    else:
-        record = _observed_session(args)
-        base = Path(record["artifacts_dir"])
-        if args.path:
-            path = follow_mod.confine(base, args.path)
-            source = args.path
-        elif args.source:
-            path = follow_mod.resolve_source(record, args.source)
-            source = args.source
-        else:
+def _follow_device(args: argparse.Namespace) -> dict[str, Any]:
+    target = _target(args)
+    if target.platform == ANDROID:
+        argv = [target.tool, "-s", target.target_id, "logcat", "-v", "time"]
+        if args.package:
+            pid = logs_mod.pid_for_package(
+                target.tool, target.target_id, args.package)
+            if pid:
+                argv.append(f"--pid={pid}")
+        return follow_mod.follow_process(
+            argv, source="device", emit=_stream_print,
+            max_seconds=args.max_seconds, max_lines=args.max_lines,
+            grep=args.grep)
+
+    # iOS: a named past session can only replay its recorded stream file; the
+    # current session's file is preferred only while its writer is alive —
+    # a dead stream must not shadow live device logs.
+    record = (_session_by_id(args.session_id) if args.session_id
+              else session_mod.load_current())
+    stream = (Path(record["artifacts_dir"]) / "logs" / "stream.ndjson"
+              if record else None)
+    package_filter = ((lambda line: args.package in line)
+                      if args.package else None)
+    if args.session_id:
+        if stream is None or not stream.exists():
             raise errors.AutonomError(
                 errors.STREAM_NOT_FOUND,
-                "nothing to follow: pass --source or --path",
-                "List followable streams with 'autonom session outputs', or "
-                "use --source device for the device log.",
+                f"session {args.session_id} recorded no device log stream",
+                "Only sessions started with --log-stream have one; live "
+                "device logs belong to the current target, not a past session.",
             )
-        eof = follow_mod.follow_file(path, source=source, emit=_stream_print,
-                                     poll_ms=args.poll_ms, **limits)
-    global _LAST_EMIT
-    _LAST_EMIT = {"ok": True, **eof}  # journal the summary, not every line
-    return 0
+        writer_alive = True  # replaying a past recording, liveness irrelevant
+        args.from_start = True  # a recording is read, not awaited
+    else:
+        pid = (record or {}).get("background", {}).get("log_stream_pid")
+        writer_alive = session_mod.pid_alive(pid)
+    if stream is not None and stream.exists() and writer_alive:
+        return follow_mod.follow_file(
+            stream, source="device", emit=_stream_print,
+            from_start=args.from_start, max_seconds=args.max_seconds,
+            max_lines=args.max_lines, grep=args.grep,
+            poll_ms=args.poll_ms, line_filter=package_filter)
+    argv = [target.tool, "simctl", "spawn", target.target_id,
+            "log", "stream", "--style", "ndjson", "--level", "info"]
+    if args.package:
+        argv += ["--predicate", logs_mod._ios_predicate(args.package)]  # noqa: SLF001
+    return follow_mod.follow_process(
+        argv, source="device", emit=_stream_print,
+        max_seconds=args.max_seconds, max_lines=args.max_lines, grep=args.grep)
+
+
+def cmd_logs_follow(args: argparse.Namespace) -> int:
+    if args.source == "device":
+        return _finish_stream(_follow_device(args))
+    record = _observed_session(args)
+    base = Path(record["artifacts_dir"])
+    if args.path:
+        path = follow_mod.confine(base, args.path)
+        source = args.path
+    elif args.source:
+        path = follow_mod.resolve_source(record, args.source)
+        source = args.source
+    else:
+        raise errors.AutonomError(
+            errors.STREAM_NOT_FOUND,
+            "nothing to follow: pass --source or --path",
+            "List followable streams with 'autonom session outputs', or "
+            "use --source device for the device log.",
+        )
+    return _finish_stream(follow_mod.follow_file(
+        path, source=source, emit=_stream_print,
+        from_start=args.from_start, max_seconds=args.max_seconds,
+        max_lines=args.max_lines, grep=args.grep, poll_ms=args.poll_ms))
 
 
 def cmd_journal(args: argparse.Namespace) -> int:
     session = session_mod.load_current()
     if getattr(args, "follow", False):
         record = _observed_session(args)
-        eof = follow_mod.follow_file(
+        return _finish_stream(follow_mod.follow_file(
             journal_mod.journal_path(record), source="journal",
             emit=_stream_print, raw=True, from_start=args.from_start,
             max_seconds=args.max_seconds, max_lines=args.max_lines,
-            grep=args.grep)
-        global _LAST_EMIT
-        _LAST_EMIT = {"ok": True, **eof}
-        return 0
+            grep=args.grep))
     if not session:
         return emit({"ok": True, "count": 0, "total_matched": 0, "truncated": False,
                      "entries": [], "note": "no active session"}, as_json=True)
@@ -819,53 +847,61 @@ def _safe_label(label: str | None) -> str:
     return re.sub(r"[^A-Za-z0-9._-]", "_", label or "").strip("_") or "capture"
 
 
-def _write_snapshot_artifacts(payload: dict[str, Any], label: str,
-                              out: str | None) -> list[str]:
-    """Persist the snapshot JSON (and the raw meminfo text on Android) under
-    the session `metrics/` dir, or under --out. No destination, no artifact —
-    the stdout payload still carries every metric."""
-    raw = payload.pop("raw_meminfo", None)
-    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-    base: Path | None = None
-    json_path: Path | None = None
+def _snapshot_base_dir(out: str | None) -> Path | None:
+    """Artifact destination for snapshots: --out (dir, or a .json file's
+    parent), else the session metrics/ dir, else None — no destination is
+    allowed, the stdout payload still carries every metric."""
     if out:
         target = Path(out)
         if target.suffix == ".json":
             target.parent.mkdir(parents=True, exist_ok=True)
-            json_path = target
-            base = target.parent
-        else:
-            target.mkdir(parents=True, exist_ok=True)
-            base = target
-    else:
-        record = session_mod.load_current()
-        if record:
-            base = session_mod.artifact_path(record, "metrics", "x").parent
+            return target.parent
+        target.mkdir(parents=True, exist_ok=True)
+        return target
+    record = session_mod.load_current()
+    return metrics_artifacts.metrics_dir(record) if record else None
+
+
+def _write_snapshot_artifacts(payload: dict[str, Any], raw: str | None,
+                              label: str, out: str | None,
+                              base: Path | None) -> list[str]:
+    """Persist the snapshot JSON (and the raw meminfo text on Android).
+
+    The raw file is named `…-meminfo.raw.txt` deliberately: `metrics memory
+    analyze` globs `*-meminfo.txt` for capture packs, and a snapshot's raw
+    dump must never fold into that series unasked. Stems are uniquified —
+    a fast series would otherwise overwrite same-second artifacts."""
     if base is None:
         return []
-    if json_path is None:
-        json_path = base / f"{stamp}-{label}-snapshot.json"
+    if out and Path(out).suffix == ".json":
+        target = Path(out)
+        stem = metrics_artifacts.unique_stem(base, target.stem, ".json")
+        json_path = base / f"{stem}.json"
+    else:
+        stem = metrics_artifacts.unique_stem(
+            base, f"{metrics_artifacts.stamp()}-{label}",
+            "-snapshot.json", "-meminfo.raw.txt")
+        json_path = base / f"{stem}-snapshot.json"
     written: list[str] = []
     if raw:
-        raw_path = base / f"{stamp}-{label}-meminfo.txt"
-        raw_path.write_text(raw, encoding="utf-8")
-        raw_path.chmod(0o600)
-        written.append(str(raw_path))
+        written.append(metrics_artifacts.write_text(
+            base / f"{stem}-meminfo.raw.txt", raw))
     payload["artifacts"] = [str(json_path)] + written
-    json_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
-                         encoding="utf-8")
-    json_path.chmod(0o600)
+    metrics_artifacts.write_text(
+        json_path,
+        json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
     return payload["artifacts"]
 
 
 def cmd_metrics_snapshot(args: argparse.Namespace) -> int:
     target = _target(args)
     app_id = _app_id(args)
-    payload = metrics_snapshot.take(target, app_id)
+    payload, raw = metrics_snapshot.take(target, app_id)
     if args.task:
         payload["task"] = args.task
-    _write_snapshot_artifacts(payload, _safe_label(args.label or "snapshot"),
-                              args.out)
+    _write_snapshot_artifacts(payload, raw,
+                              _safe_label(args.label or "snapshot"),
+                              args.out, _snapshot_base_dir(args.out))
     return emit({**payload, **target.identity()}, as_json=True)
 
 
@@ -878,10 +914,11 @@ def cmd_metrics_series(args: argparse.Namespace) -> int:
         target = _target(args)
         app_id = _app_id(args)
         identity = target.identity()
+        base = _snapshot_base_dir(args.out)  # resolved once, not per sample
 
         def snap() -> dict[str, Any]:
-            payload = metrics_snapshot.take(target, app_id)
-            _write_snapshot_artifacts(payload, label, args.out)
+            payload, raw = metrics_snapshot.take(target, app_id)
+            _write_snapshot_artifacts(payload, raw, label, None, base)
             return payload
 
         samples = metrics_series.capture(snap, count=max(args.count, 1),
@@ -893,9 +930,8 @@ def cmd_metrics_series(args: argparse.Namespace) -> int:
     record = session_mod.load_current()
     if record and not args.from_dir:
         out = session_mod.artifact_path(record, "metrics", f"series-{label}.json")
-        out.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
-                       encoding="utf-8")
-        out.chmod(0o600)
+        metrics_artifacts.write_text(
+            out, json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
         payload["artifact"] = str(out)
     return emit(payload, as_json=True)
 
@@ -907,7 +943,7 @@ def _metrics_out_dir(args: argparse.Namespace) -> Path:
         return Path(args.out)
     record = session_mod.load_current()
     if record:
-        return session_mod.artifact_path(record, "metrics", "x").parent
+        return metrics_artifacts.metrics_dir(record)
     raise errors.AutonomError(
         errors.NO_ACTIVE_SESSION,
         "no session to hold the artifacts and no --out given",
@@ -915,14 +951,16 @@ def _metrics_out_dir(args: argparse.Namespace) -> Path:
     )
 
 
+def _require_android(target: Target, message: str, hint: str) -> None:
+    if target.platform != ANDROID:
+        raise errors.AutonomError(errors.UNSUPPORTED_ON_PLATFORM, message, hint)
+
+
 def cmd_metrics_memory_capture(args: argparse.Namespace) -> int:
     target = _target(args)
-    if target.platform != ANDROID:
-        raise errors.AutonomError(
-            errors.UNSUPPORTED_ON_PLATFORM,
-            "the memory pack reads Android dumpsys; on iOS use "
-            "'metrics snapshot' and 'metrics trace --preset allocations'",
-        )
+    _require_android(target, "the memory pack reads Android dumpsys",
+                     "On iOS use 'metrics snapshot' and "
+                     "'metrics trace --preset allocations'.")
     payload = metrics_memory.capture(
         target, _app_id(args), out_dir=_metrics_out_dir(args),
         label=_safe_label(args.label), want_hprof=not args.no_hprof)
@@ -930,7 +968,17 @@ def cmd_metrics_memory_capture(args: argparse.Namespace) -> int:
 
 
 def cmd_metrics_memory_analyze(args: argparse.Namespace) -> int:
-    directory = Path(args.dir) if args.dir else _metrics_out_dir(args)
+    if args.dir:
+        directory = Path(args.dir)
+    else:
+        record = session_mod.load_current()
+        if not record:
+            raise errors.AutonomError(
+                errors.NO_ACTIVE_SESSION,
+                "no session whose metrics/ dir could be analyzed",
+                "Start a session, or pass --dir with the capture directory.",
+            )
+        directory = metrics_artifacts.metrics_dir(record)
     report = metrics_memory.analyze(directory, glob=args.glob,
                                     min_growth_kb=args.min_growth_kb)
     return emit({"ok": True, **report}, as_json=True)
@@ -949,18 +997,19 @@ def cmd_metrics_memory_warn(args: argparse.Namespace) -> int:
         ["spawn", target.target_id, "notifyutil", "-p",
          "UISimulatedMemoryWarningNotification"])
     return emit({"ok": True, "stimulus": "memory_warning",
-                 "note": "best-effort Darwin notification; newer runtimes may "
-                         "ignore it — verify the app actually reacted",
+                 "note": "the Darwin notification was posted (delivery "
+                         "verified); whether the app reacts is not — newer "
+                         "runtimes may ignore it, check the app's logs",
                  **target.identity()}, as_json=True)
+
+
+_FRAMES_ANDROID_ONLY = ("gfxinfo frame stats are Android-only",
+                        "On iOS use 'metrics trace --preset hitches'.")
 
 
 def cmd_metrics_frames_reset(args: argparse.Namespace) -> int:
     target = _target(args)
-    if target.platform != ANDROID:
-        raise errors.AutonomError(
-            errors.UNSUPPORTED_ON_PLATFORM,
-            "gfxinfo frame stats are Android-only; on iOS use "
-            "'metrics trace --preset hitches'")
+    _require_android(target, *_FRAMES_ANDROID_ONLY)
     app_id = _app_id(args)
     metrics_frames.reset(target, app_id)
     return emit({"ok": True, "reset": app_id, **target.identity()}, as_json=True)
@@ -968,25 +1017,19 @@ def cmd_metrics_frames_reset(args: argparse.Namespace) -> int:
 
 def cmd_metrics_frames_capture(args: argparse.Namespace) -> int:
     target = _target(args)
-    if target.platform != ANDROID:
-        raise errors.AutonomError(
-            errors.UNSUPPORTED_ON_PLATFORM,
-            "gfxinfo frame stats are Android-only; on iOS use "
-            "'metrics trace --preset hitches'")
+    _require_android(target, *_FRAMES_ANDROID_ONLY)
     app_id = _app_id(args)
     raw, summary = metrics_frames.capture(target, app_id)
     payload: dict[str, Any] = {"ok": True, "summary": summary,
                                **target.identity()}
-    out_dir = None
-    record = session_mod.load_current()
-    if args.out or record:
+    if args.out or session_mod.load_current():
         out_dir = _metrics_out_dir(args)
-        out_dir.mkdir(parents=True, exist_ok=True)
-        stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-        artifact = out_dir / f"{stamp}-{_safe_label(args.label)}-gfxinfo.txt"
-        artifact.write_text(raw, encoding="utf-8")
-        artifact.chmod(0o600)
-        payload["artifacts"] = [str(artifact)]
+        stem = metrics_artifacts.unique_stem(
+            out_dir,
+            f"{metrics_artifacts.stamp()}-{_safe_label(args.label)}",
+            "-gfxinfo.txt")
+        payload["artifacts"] = [metrics_artifacts.write_text(
+            out_dir / f"{stem}-gfxinfo.txt", raw)]
     return emit(payload, as_json=True)
 
 
@@ -1364,29 +1407,57 @@ def cmd_network_requests_follow(args: argparse.Namespace) -> int:
     record = session_mod.require_current()
     filters = {"host": args.host, "method": args.method, "status": args.status,
                "path_glob": args.path, "mocked": args.mocked}
+    flows_file = store_mod.flows_path(record)
     seen: set[str] = set()
+    # The store is append-only JSONL (its own contract), so the follow tails
+    # by byte offset and parses only what was appended — never the whole
+    # history again on every tick. A shrink means the store was replaced:
+    # start over from byte 0; `seen` keeps replayed flows from re-emitting.
+    state = {"offset": 0, "buffer": b""}
+
+    def read_appended() -> list[dict[str, Any]]:
+        if not flows_file.exists():
+            return []
+        size = flows_file.stat().st_size
+        if size < state["offset"]:
+            state["offset"], state["buffer"] = 0, b""
+        if size == state["offset"]:
+            return []
+        with flows_file.open("rb") as handle:
+            handle.seek(state["offset"])
+            chunk = handle.read()
+        state["offset"] += len(chunk)
+        state["buffer"] += chunk
+        *complete, state["buffer"] = state["buffer"].split(b"\n")
+        parsed: list[dict[str, Any]] = []
+        for raw_line in complete:
+            line = raw_line.decode("utf-8", errors="replace").strip()
+            if not line:
+                continue
+            try:
+                parsed.append(redact_mod.scrub_flow(json.loads(line)))
+            except json.JSONDecodeError:
+                continue  # a torn write; the next append completes nothing
+        return parsed
+
     if not args.from_start:
-        flows, _warnings = store_mod.read_all(record)
-        seen = {flow.get("id") for flow in flows if flow.get("id")}
+        for flow in read_appended():  # baseline: everything already recorded
+            if flow.get("id"):
+                seen.add(flow["id"])
 
     def fetch_new() -> list[dict[str, Any]]:
-        flows, _warnings = store_mod.read_all(record)
         fresh = []
-        for flow in flows:
+        for flow in read_appended():
             flow_id = flow.get("id")
             if not flow_id or flow_id in seen:
                 continue
             seen.add(flow_id)  # dedup happens pre-filter: skipped ≠ unseen
-            if store_mod.filter_flows([flow], **filters):
-                fresh.append(flow)
-        return fresh
+            fresh.append(flow)
+        return store_mod.filter_flows(fresh, **filters)
 
-    eof = follow_mod.follow_poll(
+    return _finish_stream(follow_mod.follow_poll(
         fetch_new, emit=_stream_print, interval=args.interval,
-        max_seconds=args.max_seconds, max_items=args.max)
-    global _LAST_EMIT
-    _LAST_EMIT = {"ok": True, **eof}
-    return 0
+        max_seconds=args.max_seconds, max_items=args.max))
 
 
 def cmd_network_requests_show(args: argparse.Namespace) -> int:
@@ -1783,6 +1854,34 @@ def cmd_flow_export(args: argparse.Namespace) -> int:
     return emit(payload, as_json=True)
 
 
+def _flow_env_overrides(args: argparse.Namespace) -> dict[str, str]:
+    """One owner of --env parsing for every verb that runs flows."""
+    env_overrides: dict[str, str] = {}
+    for pair in args.env or []:
+        if "=" not in pair:
+            raise errors.AutonomError(
+                errors.FLOW_COMMAND_INVALID, f"--env takes KEY=VALUE, got {pair!r}")
+        key, value = pair.split("=", 1)
+        env_overrides[key] = value
+    return env_overrides
+
+
+def _flow_secrets(args: argparse.Namespace) -> dict[str, str]:
+    """One owner of --secret resolution for every verb that runs flows."""
+    secrets: dict[str, str] = {}
+    for name in args.secret or []:
+        value = os.environ.get(name)
+        if value is None:
+            raise errors.AutonomError(
+                errors.FLOW_SECRET_UNDEFINED,
+                f"--secret {name} is not present in the process environment",
+                hint="Export the variable before running; its value never "
+                     "enters the flow file or artifacts.",
+            )
+        secrets[name] = value
+    return secrets
+
+
 def cmd_flow_run(args: argparse.Namespace) -> int:
     path = Path(args.path)
     include = args.include_tag or []
@@ -1815,24 +1914,8 @@ def cmd_flow_run(args: argparse.Namespace) -> int:
         )
     target = _target(args)
 
-    env_overrides: dict[str, str] = {}
-    for pair in args.env or []:
-        if "=" not in pair:
-            raise errors.AutonomError(
-                errors.FLOW_COMMAND_INVALID, f"--env takes KEY=VALUE, got {pair!r}")
-        key, value = pair.split("=", 1)
-        env_overrides[key] = value
-    secrets: dict[str, str] = {}
-    for name in args.secret or []:
-        value = os.environ.get(name)
-        if value is None:
-            raise errors.AutonomError(
-                errors.FLOW_SECRET_UNDEFINED,
-                f"--secret {name} is not present in the process environment",
-                hint="Export the variable before running; its value never "
-                     "enters the flow file or artifacts.",
-            )
-        secrets[name] = value
+    env_overrides = _flow_env_overrides(args)
+    secrets = _flow_secrets(args)
 
     config = flow_executor.RunConfig(
         env=env_overrides, secrets=secrets,
@@ -1889,6 +1972,9 @@ def cmd_flow_run(args: argparse.Namespace) -> int:
 
 def cmd_proof(args: argparse.Namespace) -> int:
     repo = Path(args.repo or ".").resolve()
+    # A malformed --env is the caller's CLI mistake, exactly as in flow run —
+    # a hard refusal, never a silently dropped override or a blocked verdict.
+    env_overrides = _flow_env_overrides(args)
     changed = proof_mod.changed_files(repo, args.base, args.head)
     flows_dir = Path(args.flows) if args.flows else repo / ".autonom/flows"
     selected: list[dict[str, Any]] = []
@@ -1907,18 +1993,10 @@ def cmd_proof(args: argparse.Namespace) -> int:
         else:
             try:
                 target = _target(args)
-                secrets = {}
-                for name in args.secret or []:
-                    value = os.environ.get(name)
-                    if value is None:
-                        raise errors.AutonomError(
-                            errors.FLOW_SECRET_UNDEFINED,
-                            f"--secret {name} is not in the environment")
-                    secrets[name] = value
+                # a missing secret blocks the verdict (config problem), it
+                # does not crash the proof — hence inside this try
                 config = flow_executor.RunConfig(
-                    env=dict(pair.split("=", 1) for pair in (args.env or [])
-                             if "=" in pair),
-                    secrets=secrets)
+                    env=env_overrides, secrets=_flow_secrets(args))
                 for entry in selected:
                     flow = flow_validator.validate_tree(entry["path"])
                     runner = flow_executor.Executor(target, record, config)
@@ -1958,12 +2036,11 @@ def cmd_proof(args: argparse.Namespace) -> int:
     if args.out:
         out_dir = Path(args.out)
         out_dir.mkdir(parents=True, exist_ok=True)
-        markdown_source = dict(result_payload)
         (out_dir / "proof.json").write_text(
             json.dumps(result_payload, ensure_ascii=False, indent=2),
             encoding="utf-8")
         (out_dir / "proof.md").write_text(
-            proof_mod.render_markdown(markdown_source), encoding="utf-8")
+            proof_mod.render_markdown(result_payload), encoding="utf-8")
         result_payload["out"] = str(out_dir)
 
     emit(result_payload, as_json=True)
@@ -2851,6 +2928,23 @@ def main(argv: list[str] | None = None) -> int:
     except errors.AutonomError as exc:
         ok, error_code = False, exc.code
         return fail_error(exc)
+    except BrokenPipeError:
+        # The consumer closed the stream (`… follow | head`): that is a clean
+        # end for NDJSON output, not an error. Point stdout at devnull so the
+        # interpreter's shutdown flush cannot raise a second time.
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, sys.stdout.fileno())
+        return 0
+    except subprocess.TimeoutExpired as exc:
+        # Long device calls (dumpheap, simpleperf, a wedged adb) must fail as
+        # one envelope, never a traceback.
+        ok, error_code = False, errors.BACKEND_FAILED
+        return fail_error(errors.AutonomError(
+            errors.BACKEND_FAILED,
+            f"backend timed out: {' '.join(map(str, exc.cmd or []))[:200]}",
+            "The device or tool stopped responding; check 'autonom doctor' "
+            "and retry.",
+        ))
     except FileNotFoundError as exc:
         ok = False
         return fail(str(exc))

@@ -201,6 +201,21 @@ class AndroidDepthCliTests(unittest.TestCase):
         self.assertEqual(json.loads(result.stderr)["error_code"],
                          "unsupported_on_platform")
 
+    def test_analyze_without_session_points_at_dir_not_out(self) -> None:
+        env = dict(self.env)
+        env["AUTONOM_HOME"] = str(Path(self.tmp.name) / "empty-home")
+        result = subprocess.run(
+            [sys.executable, str(CLI), "--platform", "android",
+             "--adb", str(FAKE_ADB), "metrics", "memory", "analyze"],
+            env=env, text=True, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, check=False, timeout=60)
+        self.assertEqual(result.returncode, 2)
+        envelope = json.loads(result.stderr)
+        self.assertIn("--dir", envelope["hint"])
+        self.assertNotIn("--out", envelope["hint"],
+                         "analyze does not accept --out; the hint must not "
+                         "recommend a flag argparse would reject")
+
 
 class IosDepthCliTests(unittest.TestCase):
     def setUp(self) -> None:

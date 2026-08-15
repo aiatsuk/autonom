@@ -34,17 +34,20 @@ def _now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
-def take(target: Target, app_id: str) -> dict[str, Any]:
+def take(target: Target, app_id: str) -> tuple[dict[str, Any], str | None]:
+    """-> (payload, raw_meminfo_text). The raw dump travels beside the payload,
+    never inside it: the payload goes to stdout and the journal, and the
+    package rule is that neither ever carries full dump text."""
     if target.platform == ANDROID:
-        payload = _android(target, app_id)
+        payload, raw = _android(target, app_id)
     else:
-        payload = _ios(target, app_id)
+        payload, raw = _ios(target, app_id), None
     payload["captured_at"] = _now()
     payload["app_id"] = app_id
-    return payload
+    return payload, raw
 
 
-def _android(target: Target, app_id: str) -> dict[str, Any]:
+def _android(target: Target, app_id: str) -> tuple[dict[str, Any], str]:
     resolved = process_mod.resolve(target, app_id)
     pid = resolved["pid"]
     warnings: list[dict[str, str]] = []
@@ -99,11 +102,10 @@ def _android(target: Target, app_id: str) -> dict[str, Any]:
         "cpu": cpu,
         "proc": proc,
         "limitations": [],
-        "raw_meminfo": raw_meminfo,  # persisted by the caller, stripped from stdout
     }
     if warnings:
         payload["warnings"] = warnings
-    return payload
+    return payload, raw_meminfo
 
 
 def _ios(target: Target, app_id: str) -> dict[str, Any]:
@@ -115,7 +117,7 @@ def _ios(target: Target, app_id: str) -> dict[str, Any]:
         ps = subprocess.run(["ps", "-p", str(pid), "-o", "%cpu=,rss="],
                             text=True, stdout=subprocess.PIPE,
                             stderr=subprocess.DEVNULL, check=False, timeout=15)
-    except OSError as exc:
+    except (OSError, subprocess.TimeoutExpired) as exc:
         raise errors.AutonomError(
             errors.TOOL_MISSING, f"host 'ps' unavailable: {exc}", tool="ps")
     fields = (ps.stdout or "").split()
