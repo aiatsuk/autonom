@@ -41,7 +41,7 @@ jobs:
         if: steps.avd-cache.outputs.cache-hit != 'true'
         uses: reactivecircus/android-emulator-runner@v2
         with:
-          api-level: 30
+          api-level: ${{ env.API_LEVEL }}
           arch: x86_64
           target: default
           force-avd-creation: false
@@ -52,7 +52,7 @@ jobs:
       - name: Run the smoke script on a real emulator
         uses: reactivecircus/android-emulator-runner@v2
         with:
-          api-level: 30
+          api-level: ${{ env.API_LEVEL }}
           arch: x86_64
           target: default
           force-avd-creation: false

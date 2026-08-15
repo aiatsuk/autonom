@@ -79,6 +79,12 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
         echo "FATAL: 'ui find' failed permanently with $code:" >&2
         cat "$OUT/find.err" >&2
         exit 1 ;;
+      unparsed)
+        # Non-JSON stderr means the CLI itself crashed (traceback, argparse
+        # error) — that is permanent, not a flake to retry for 60 seconds.
+        echo "FATAL: 'ui find' produced a non-JSON failure (CLI crash?):" >&2
+        cat "$OUT/find.err" >&2
+        exit 1 ;;
       *)
         # Likely-transient (a dump race right after launch): keep polling,
         # but leave a trace so a real failure is not misread as flake.

@@ -71,6 +71,19 @@ class RoundTripTests(unittest.TestCase):
         self.assertNotIn("collect", emitted)
         self.assertNotIn("beforeMutation", emitted)
 
+    def test_small_floats_never_go_scientific(self) -> None:
+        """str(1e-05) would emit '1e-05', which the decimal-only grammar
+        refuses — fmt must never write what parse cannot read back."""
+        text = ("schema: autonom.dev/flow/v1\nappId: a.b\nname: x\n---\n"
+                "- setLocation:\n    latitude: 0.00001\n"
+                "    longitude: -122.4194\n")
+        flow = _build(text)
+        emitted = canonical.emit_flow(flow)
+        self.assertIn("latitude: 0.00001\n", emitted)
+        self.assertNotIn("e-", emitted)
+        reparsed = _build(emitted)
+        self.assertEqual(reparsed.steps[0].args["latitude"], 0.00001)
+
     def test_no_label_is_invented(self) -> None:
         emitted = canonical.emit_flow(_build(
             "schema: autonom.dev/flow/v1\nname: x\n---\n- tapOn: Login\n"))

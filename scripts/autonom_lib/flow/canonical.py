@@ -40,7 +40,20 @@ _PLAIN_SAFE_FIRST = re.compile(r"[^\[\]{}&*!|>#%'\"@`?,\s-]")
 def _scalar(value, item_context: bool = False) -> str:
     if isinstance(value, bool):
         return "true" if value else "false"
-    if isinstance(value, (int, float)):
+    if isinstance(value, float):
+        # str() would give scientific notation for small values (1e-05),
+        # which the schema's decimal-only grammar rejects — fmt must never
+        # emit what parse cannot read back.
+        text = repr(value)
+        if "e" in text or "E" in text:
+            for precision in (17, 30, 60, 120, 350):  # 350 covers denormals
+                text = format(value, f".{precision}f").rstrip("0")
+                if text.endswith("."):
+                    text += "0"
+                if float(text) == value:
+                    break
+        return text
+    if isinstance(value, int):
         return str(value)
     text = str(value)
     if _needs_quote(text, item_context):

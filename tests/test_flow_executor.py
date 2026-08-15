@@ -362,6 +362,119 @@ class CompositionTests(_AndroidRunBase):
                          "flow_no_flows_found")
 
 
+class ReviewRegressionTests(_AndroidRunBase):
+    """Fixes from the adversarial review of the flow commits — each of these
+    was a reproduced defect, so each gets a pinned regression."""
+
+    def test_runflow_env_variables_are_preflighted(self) -> None:
+        sub = self.root / "sub.yaml"
+        sub.write_text("schema: autonom.dev/flow/v1\nname: child\n---\n- back\n",
+                       encoding="utf-8")
+        before = len(self._adb_calls())
+        flow = self._flow("- runFlow:\n    file: sub.yaml\n"
+                          "    env:\n      TOKEN: ${UNDEFINED}\n")
+        result = self._cli("flow", "run", str(flow))
+        self.assertEqual(result.returncode, 2, result.stdout)
+        envelope = json.loads(result.stderr)
+        self.assertEqual(envelope["error_code"], "flow_var_undefined")
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertEqual(len(self._adb_calls()), before,
+                         "pre-flight must fail with zero device side effects")
+
+    def test_second_inclusion_with_a_different_frame_is_preflighted(self) -> None:
+        sub = self.root / "sub.yaml"
+        sub.write_text("schema: autonom.dev/flow/v1\nname: child\n---\n"
+                       "- note: hello ${USER}\n", encoding="utf-8")
+        before = len(self._adb_calls())
+        flow = self._flow(
+            "- runFlow:\n    file: sub.yaml\n    env:\n      USER: alice\n"
+            "- runFlow: sub.yaml\n")
+        result = self._cli("flow", "run", str(flow))
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertEqual(json.loads(result.stderr)["error_code"],
+                         "flow_var_undefined")
+        self.assertEqual(len(self._adb_calls()), before)
+
+    def test_cleanup_hook_composes_runflow_with_env_and_when(self) -> None:
+        inner = self.root / "inner.yaml"
+        inner.write_text("schema: autonom.dev/flow/v1\nname: inner\n---\n- back\n",
+                         encoding="utf-8")
+        cleanup = self.root / "cleanup.yaml"
+        cleanup.write_text(
+            "schema: autonom.dev/flow/v1\nname: cleanup\n---\n"
+            "- note: cleanup for ${ACCOUNT}\n"
+            "- runFlow: inner.yaml\n", encoding="utf-8")
+        flow = self._flow(
+            "- assertVisible:\n    selector:\n"
+            "      id: com.example.app:id/search\n",
+            header=("schema: autonom.dev/flow/v1\nappId: com.example.app\n"
+                    "name: t\nonFlowComplete:\n"
+                    "  - runFlow:\n"
+                    "      file: cleanup.yaml\n"
+                    "      env:\n        ACCOUNT: tester\n"
+                    "  - runFlow:\n"
+                    "      file: inner.yaml\n"
+                    "      when:\n        platform: ios\n---\n"))
+        result = self._cli("flow", "run", str(flow))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        summary = json.loads(result.stdout)
+        self.assertEqual(summary["status"], "passed")
+        self.assertNotIn("hook_failures", summary,
+                         "a composed cleanup hook must succeed")
+        keyevents = [a for a in self._adb_calls() if "keyevent" in " ".join(a)]
+        self.assertEqual(len(keyevents), 1,
+                         "nested runFlow ran once; the ios-only hook skipped")
+
+    def test_when_clause_interpolates_variables(self) -> None:
+        sub = self.root / "sub.yaml"
+        sub.write_text("schema: autonom.dev/flow/v1\nname: child\n---\n- back\n",
+                       encoding="utf-8")
+        flow = self._flow(
+            "- runFlow:\n"
+            "    file: sub.yaml\n"
+            "    when:\n"
+            "      visible:\n"
+            "        text: ${ROW}\n"
+            "        match: exact\n"
+            "      envEquals:\n"
+            "        MODE: ${WANTED}\n",
+            header=("schema: autonom.dev/flow/v1\nappId: com.example.app\n"
+                    "name: t\nenv:\n  ROW: Settings\n  MODE: fast\n"
+                    "  WANTED: fast\n---\n"))
+        result = self._cli("flow", "run", str(flow))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        summary = json.loads(result.stdout)
+        statuses = {s["command"]: s["status"] for s in summary["steps"]}
+        self.assertEqual(statuses["back"], "passed",
+                         "an interpolated when: must evaluate, not compare "
+                         "the literal ${...} text")
+
+    def test_assertions_honor_selector_index(self) -> None:
+        # the fixture has two 'Settings' nodes: index 1 exists, index 5 does not
+        flow = self._flow(
+            "- assertVisible:\n    selector:\n      text: Settings\n"
+            "      match: exact\n      index: 1\n")
+        result = self._cli("flow", "run", str(flow))
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        flow = self._flow(
+            "- assertVisible:\n    selector:\n      text: Settings\n"
+            "      match: exact\n      index: 5\n    timeoutMs: 400\n")
+        result = self._cli("flow", "run", str(flow))
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["failure"]["error_code"],
+                         "flow_assertion_timeout")
+
+    def test_malformed_number_is_a_positioned_definition_error(self) -> None:
+        flow = self._flow("- assertVisible:\n    selector:\n      id: a\n"
+                          "    timeoutMs: --5\n")
+        result = self._cli("flow", "check", str(flow))
+        self.assertEqual(result.returncode, 2)
+        envelope = json.loads(result.stderr)
+        self.assertEqual(envelope["error_code"], "flow_command_invalid")
+        self.assertIn("line", envelope)
+
+
 class IosLoginFlowTests(unittest.TestCase):
     """The same shape on fake iOS — selectors via id/description, proving the
     platform caveat: the visible label lives in `description`, not `text`."""
@@ -494,6 +607,27 @@ class PollCadenceTests(EnvSandboxMixin, unittest.TestCase):
         self.assertEqual(snap.call_count, 3)
         tap.assert_called_once()
         self.assertEqual(tap.call_args.kwargs.get("screen"), (1080, 1920))
+
+    def test_stale_screen_cache_is_refreshed_on_guard_refusal(self) -> None:
+        """Mid-flow rotation: the coordinate guard fires pre-dispatch, the
+        executor refreshes the cached size once and retries the guard —
+        never the tap itself."""
+        node = {"ref": "n1", "text": "Login", "bounds": [1400, 100, 1500, 160],
+                "enabled": True}
+        runner, _sleeps = self._executor()
+        flow = self._build("- tapOn:\n    selector:\n      text: Login\n")
+        boom = errors.AutonomError(errors.COORDINATE_SPACE_MISMATCH,
+                                   "outside 1080x1920")
+        with mock.patch("autonom_lib.ui.snapshot", return_value=[node]), \
+             mock.patch("autonom_lib.ui.tap",
+                        side_effect=[boom, None]) as tap, \
+             mock.patch("autonom_lib.ui.screen_size",
+                        return_value=(1920, 1080)) as size:
+            result = runner.run(flow)
+        self.assertEqual(result.status, "passed")
+        self.assertEqual(tap.call_count, 2)
+        self.assertEqual(tap.call_args.kwargs.get("screen"), (1920, 1080))
+        size.assert_called_once()
 
     def test_backend_death_mid_poll_aborts_as_infrastructure(self) -> None:
         runner, _sleeps = self._executor()

@@ -58,6 +58,7 @@ from .schema import (
     MATCH_MODES,
     Step,
     TEST_FAILURE,
+    WhenClause,
     failure_class,
 )
 
@@ -184,7 +185,8 @@ class Executor:
             result.status = "failed"
         finally:
             if flow.on_flow_complete and not self.config.dry_run:
-                self._run_complete_hooks(flow, root_values, writer, result)
+                self._run_complete_hooks(flow, root_values, writer, result,
+                                         evidence)
 
         if result.status == "failed" and result.steps:
             failed = next((s for s in result.steps if s.status == "failed"), None)
@@ -229,9 +231,13 @@ class Executor:
     def _preflight_flow(self, flow: Flow, values: dict, *,
                         is_root: bool, _seen: set | None = None) -> None:
         seen = _seen if _seen is not None else set()
-        if flow.path in seen:
+        # Keyed on (path, available names): the same subflow can be included
+        # twice with different env frames, and only checking the first would
+        # let the second inclusion's missing variables escape to run time.
+        key = (flow.path, tuple(sorted(values)))
+        if key in seen:
             return
-        seen.add(flow.path)
+        seen.add(key)
         if is_root and flow.requires_platforms and \
                 self.target.platform not in flow.requires_platforms:
             raise errors.AutonomError(
@@ -249,6 +255,12 @@ class Executor:
     def _preflight_step(self, step: Step, flow: Flow, values: dict,
                         seen: set) -> None:
         if step.command == "runFlow":
+            # The step's own env: values and when: clause resolve in the
+            # PARENT frame — check them here before descending.
+            for name in self._step_var_names(step):
+                if name not in values:
+                    self._definition(step, f"${{{name}}} is not defined",
+                                     code=errors.FLOW_VAR_UNDEFINED)
             child = self._child_of(flow, step)
             child_values = {**child.env,
                             **{k: v for k, v in step.args.get("env", {}).items()},
@@ -272,15 +284,25 @@ class Executor:
                                  code=errors.FLOW_VAR_UNDEFINED)
 
     def _step_var_names(self, step: Step):
+        def from_selector(selector: FlowSelector):
+            for text in selector.fields.values():
+                if isinstance(text, str):
+                    yield from _iter_var_names(text)
+
         for value in step.args.values():
             if isinstance(value, str):
                 yield from _iter_var_names(value)
             elif isinstance(value, FlowSelector):
-                for text in value.fields.values():
-                    if isinstance(text, str):
-                        yield from _iter_var_names(text)
+                yield from from_selector(value)
             elif isinstance(value, dict):
                 for text in value.values():
+                    if isinstance(text, str):
+                        yield from _iter_var_names(text)
+            elif isinstance(value, WhenClause):
+                for selector in (value.visible, value.not_visible):
+                    if selector is not None:
+                        yield from from_selector(selector)
+                for text in value.env_equals.values():
                     if isinstance(text, str):
                         yield from _iter_var_names(text)
 
@@ -299,6 +321,13 @@ class Executor:
         def substitute(match: re.Match) -> str:
             nonlocal used_secret
             name = match.group(1)
+            if name not in self.values:
+                # pre-flight checks every reference, so reaching this means a
+                # frame bug — still fail as a positioned envelope, never KeyError
+                raise errors.AutonomError(
+                    errors.FLOW_VAR_UNDEFINED, f"${{{name}}} is not defined",
+                    hint="Define it in the flow env, --env, or --secret.",
+                )
             if name in self.secret_values:
                 used_secret = True
             return self.values[name]
@@ -320,6 +349,17 @@ class Executor:
         if used_secret:
             self._used_secret_anywhere = True
         return "".join(out), used_secret
+
+    def _resolve_when(self, when: WhenClause) -> WhenClause:
+        """Interpolate ${VAR} in a when: clause before evaluating it."""
+        visible = self._resolve_selector(when.visible)[0] if when.visible else None
+        not_visible = (self._resolve_selector(when.not_visible)[0]
+                       if when.not_visible else None)
+        env_equals = {key: self._resolve(value)[0]
+                      for key, value in when.env_equals.items()}
+        return WhenClause(platform=when.platform, visible=visible,
+                          not_visible=not_visible, env_equals=env_equals,
+                          line=when.line, col=when.col)
 
     def _resolve_selector(self, selector: FlowSelector) -> tuple[FlowSelector, bool]:
         used = False
@@ -374,7 +414,7 @@ class Executor:
         when = step.args.get("when")
         if when is not None:
             met, reason = flow_conditions.evaluate(
-                when, self.target.platform, self.values,
+                self._resolve_when(when), self.target.platform, self.values,
                 lambda: ui_mod.snapshot(self.target))
             if not met:
                 outcome.status = "skipped"
@@ -425,44 +465,38 @@ class Executor:
         result.steps.append(outcome)
 
     def _run_complete_hooks(self, flow: Flow, values: dict,
-                            writer: EventWriter, result: RunResult) -> None:
-        """Isolated cleanup: every failure is recorded, none masks the run."""
-        previous_values = self.values
-        self.values = values
-        try:
-            for step in flow.on_flow_complete:
-                self._counter += 1
-                payload = {"step_index": self._counter, "command": step.command,
-                           "label": step.label, "file": flow.path,
-                           "line": step.line, "hook": "onFlowComplete"}
-                try:
-                    if step.command == "runFlow":
-                        child = self._child_of(flow, step)
-                        child_values = {**child.env, **self.config.env,
-                                        **self.config.secrets}
-                        inner = self.values
-                        self.values = child_values
-                        try:
-                            for child_step in child.steps:
-                                self._dispatch(child_step, child, [0])
-                        finally:
-                            self.values = inner
-                    else:
-                        self._dispatch(step, flow, [0])
-                    payload["status"] = "passed"
-                except Exception as exc:  # noqa: BLE001 — isolation is the point
-                    code = getattr(exc, "code", errors.BACKEND_FAILED)
-                    payload["status"] = "failed"
-                    payload["error_code"] = code
-                    payload["failure_class"] = failure_class(code)
-                    payload["error"] = str(exc)
-                    result.hook_failures.append({
-                        "command": step.command, "line": step.line,
-                        "error_code": code, "error": str(exc),
-                    })
-                writer.emit("flow.hook.finished", payload)
-        finally:
-            self.values = previous_values
+                            writer: EventWriter, result: RunResult,
+                            evidence: Evidence) -> None:
+        """Isolated cleanup: every failure is recorded, none masks the run.
+
+        Each hook step goes through the same machinery as regular steps
+        (so a hook runFlow composes, its env: frame applies, and its when:
+        clause is honored), but failures are contained per step — the run's
+        primary status never changes here.
+        """
+        for step in flow.on_flow_complete:
+            before = len(result.steps)
+            hook_payload = {"command": step.command, "label": step.label,
+                            "file": flow.path, "line": step.line,
+                            "hook": "onFlowComplete", "status": "passed"}
+            try:
+                self._execute_steps([step], flow, values, writer, result,
+                                    evidence, hook="onFlowComplete")
+            except (_Stop, errors.AutonomError) as exc:
+                failed = next((s for s in result.steps[before:]
+                               if s.status == "failed"), None)
+                code = (failed.error_code if failed is not None
+                        else getattr(exc, "code", errors.BACKEND_FAILED))
+                message = (failed.error if failed is not None else str(exc))
+                hook_payload.update({
+                    "status": "failed", "error_code": code,
+                    "failure_class": failure_class(code), "error": message,
+                })
+                result.hook_failures.append({
+                    "command": step.command, "line": step.line,
+                    "error_code": code, "error": message,
+                })
+            writer.emit("flow.hook.finished", hook_payload)
 
     def _execute_step(self, step: Step, flow: Flow, writer: EventWriter,
                       evidence: Evidence, hook: str | None = None) -> StepOutcome:
@@ -579,7 +613,7 @@ class Executor:
             selector, secret = self._resolve_selector(step.selector)
             node = self._poll_for_one(selector, step, attempts)
             x, y = ui_mod.center_of(node)
-            ui_mod.tap(target, x, y, screen=self._screen_size())
+            self._tap(x, y)
             return secret
         if command == "inputText":
             value, secret = self._resolve(step.args["value"])
@@ -657,10 +691,18 @@ class Executor:
     def _matches(self, selector: FlowSelector) -> list:
         mode, case_sensitive = MATCH_MODES[selector.match]
         nodes = ui_mod.snapshot(self.target)
-        return selector_engine.select(
+        matches = selector_engine.select(
             nodes, dict(selector.fields),
             mode=mode, case_sensitive=case_sensitive, all_matches=True,
         )
+        if selector.index is not None:
+            # An assertion with index asserts about THAT occurrence; a missing
+            # occurrence is simply "not there", not an error.
+            try:
+                matches = [matches[selector.index]]
+            except IndexError:
+                matches = []
+        return matches
 
     def _poll_for_one(self, selector: FlowSelector, step: Step, attempts: list):
         """Poll while ZERO nodes match; the moment any match, select once."""
@@ -730,7 +772,34 @@ class Executor:
             self._screen_fetched = True
         return self._screen
 
+    def _refresh_screen(self) -> tuple[int, int] | None:
+        self._screen = ui_mod.screen_size(self.target)
+        self._screen_fetched = True
+        return self._screen
+
+    def _tap(self, x: int, y: int) -> None:
+        """Tap with the cached screen size; on a coordinate guard refusal,
+        refresh the cache once (the app may have rotated mid-flow) and retry
+        the guard. The guard raises *before* dispatch, so this can never
+        double-tap."""
+        try:
+            ui_mod.tap(self.target, x, y, screen=self._screen_size())
+        except errors.AutonomError as exc:
+            if exc.code != errors.COORDINATE_SPACE_MISMATCH:
+                raise
+            ui_mod.tap(self.target, x, y, screen=self._refresh_screen())
+
     def _swipe(self, direction: str, duration_ms: int) -> None:
+        def geometry(screen):
+            width, height = screen
+            boxes = {
+                "up": ((width // 2, int(height * 0.7)), (width // 2, int(height * 0.3))),
+                "down": ((width // 2, int(height * 0.3)), (width // 2, int(height * 0.7))),
+                "left": ((int(width * 0.7), height // 2), (int(width * 0.3), height // 2)),
+                "right": ((int(width * 0.3), height // 2), (int(width * 0.7), height // 2)),
+            }
+            return boxes[direction]
+
         screen = self._screen_size()
         if not screen:
             raise errors.AutonomError(
@@ -738,15 +807,19 @@ class Executor:
                 "cannot determine the screen size for a directional swipe",
                 hint="The backend did not report a screen size.",
             )
-        width, height = screen
-        boxes = {
-            "up": ((width // 2, int(height * 0.7)), (width // 2, int(height * 0.3))),
-            "down": ((width // 2, int(height * 0.3)), (width // 2, int(height * 0.7))),
-            "left": ((int(width * 0.7), height // 2), (int(width * 0.3), height // 2)),
-            "right": ((int(width * 0.3), height // 2), (int(width * 0.7), height // 2)),
-        }
-        (x1, y1), (x2, y2) = boxes[direction]
-        ui_mod.swipe(self.target, x1, y1, x2, y2, duration_ms / 1000, screen=screen)
+        try:
+            (x1, y1), (x2, y2) = geometry(screen)
+            ui_mod.swipe(self.target, x1, y1, x2, y2, duration_ms / 1000,
+                         screen=screen)
+        except errors.AutonomError as exc:
+            if exc.code != errors.COORDINATE_SPACE_MISMATCH:
+                raise
+            screen = self._refresh_screen()  # rotated mid-flow; guard fired pre-dispatch
+            if not screen:
+                raise
+            (x1, y1), (x2, y2) = geometry(screen)
+            ui_mod.swipe(self.target, x1, y1, x2, y2, duration_ms / 1000,
+                         screen=screen)
 
     def _ios_launch_env(self) -> dict:
         from ..network import device_proxy_ios

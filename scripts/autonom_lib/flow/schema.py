@@ -11,6 +11,7 @@ filesystem access (that is ``validator.py``) and no device knowledge.
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 
 from . import FLOW_SCHEMA_ID
@@ -305,17 +306,14 @@ def _coerce(scalar, kind: str, code: str, path: str, what: str):
         _fail(code, f"{what} must be true or false{quoted}, got {scalar.text!r}",
               path, scalar.line, scalar.col)
     if kind == "int":
-        if scalar.style == "plain" and scalar.text.lstrip("-").isdigit():
+        if scalar.style == "plain" and re.fullmatch(r"-?[0-9]+", scalar.text):
             return int(scalar.text)
         _fail(code, f"{what} must be an integer, got {scalar.text!r}",
               path, scalar.line, scalar.col)
     if kind == "float":
-        text = scalar.text
-        stripped = text.lstrip("-")
-        parts = stripped.split(".")
-        if scalar.style == "plain" and 1 <= len(parts) <= 2 and all(
-                p.isdigit() for p in parts) and stripped:
-            return float(text)
+        if scalar.style == "plain" and re.fullmatch(r"-?[0-9]+(\.[0-9]+)?",
+                                                    scalar.text):
+            return float(scalar.text)
         _fail(code, f"{what} must be a number, got {scalar.text!r}",
               path, scalar.line, scalar.col)
     raise AssertionError(f"unhandled kind {kind}")

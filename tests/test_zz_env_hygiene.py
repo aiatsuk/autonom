@@ -51,9 +51,16 @@ def _sentinels(env: dict[str, str]) -> dict[str, str]:
 
 class EnvRestorationGuardTests(unittest.TestCase):
     def test_sentinel_environment_matches_the_pre_suite_snapshot(self) -> None:
-        if not snapshot_is_authoritative():
-            self.skipTest("snapshot taken late (subset run) — the aa module's "
-                          "own test fails loudly in that mode")
+        # Fail loudly, never skip: on a subset run the aa module may not be
+        # collected at all, so a skip here would leave NO signal anywhere
+        # that the guard was vacuous.
+        self.assertTrue(
+            snapshot_is_authoritative(),
+            "the environment snapshot was taken after other test modules "
+            "imported (subset run) — the hygiene guard cannot vouch for this "
+            "run. Use 'unittest discover -s tests' (or run_checks.sh), or "
+            "leave test_zz_env_hygiene out of hand-picked subsets.",
+        )
         before = _sentinels(ENV_SNAPSHOT)
         after = _sentinels(dict(os.environ))
         lost = {k: before[k] for k in before.keys() - after.keys()}
