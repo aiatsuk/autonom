@@ -68,6 +68,28 @@ CONSENT_REQUIRED = "consent_required"
 CONSENT_DECLINED = "consent_declined"
 PHYSICAL_DEVICE_ATTACH_UNSUPPORTED = "physical_device_attach_unsupported"
 
+# --- Flow DSL ----------------------------------------------------------------
+# The DSL's code family is deliberately distinct from network capture's
+# FLOW_NOT_FOUND above ("flow" there is a recorded HTTP request, mitmproxy's
+# vocabulary). That code stays network-owned forever; the DSL's file-missing
+# code is FLOW_FILE_NOT_FOUND (docs/COMPATIBILITY.md).
+FLOW_PARSE_ERROR = "flow_parse_error"
+FLOW_SCHEMA_UNSUPPORTED = "flow_schema_unsupported"
+FLOW_HEADER_INVALID = "flow_header_invalid"
+FLOW_UNKNOWN_COMMAND = "flow_unknown_command"
+FLOW_COMMAND_INVALID = "flow_command_invalid"
+FLOW_SELECTOR_INVALID = "flow_selector_invalid"
+FLOW_OPTIONAL_ASSERTION_FORBIDDEN = "flow_optional_assertion_forbidden"
+FLOW_VAR_UNDEFINED = "flow_var_undefined"
+FLOW_SECRET_UNDEFINED = "flow_secret_undefined"
+FLOW_FILE_NOT_FOUND = "flow_file_not_found"
+FLOW_PATH_ESCAPES_WORKSPACE = "flow_path_escapes_workspace"
+FLOW_CYCLE_DETECTED = "flow_cycle_detected"
+FLOW_REQUIREMENTS_UNMET = "flow_requirements_unmet"
+FLOW_ASSERTION_TIMEOUT = "flow_assertion_timeout"
+FLOW_CHECK_FAILED = "flow_check_failed"
+FLOW_NO_FLOWS_FOUND = "flow_no_flows_found"
+
 
 class AutonomError(RuntimeError):
     """An expected failure with a stable code and an actionable hint."""

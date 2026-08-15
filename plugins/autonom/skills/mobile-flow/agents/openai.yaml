@@ -1,0 +1,4 @@
+interface:
+  display_name: "Mobile Flow"
+  short_description: "Author, validate, and run repeatable Flow v1 files: strict YAML flows with exact selectors, polling assertions, single-fire mutations, and per-run event evidence under ~/.autonom/sessions/."
+  default_prompt: "Turn the journey we just verified into a Flow v1 file, run `flow check` on it, then execute it with `flow run` and report the summary."

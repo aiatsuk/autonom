@@ -135,17 +135,18 @@ def screen_size(target: Target) -> tuple[int, int] | None:
     return _ios().screen_size(target)
 
 
-def tap(target: Target, x: int, y: int) -> None:
-    _guard_point(target, x, y)
+def tap(target: Target, x: int, y: int, *, screen: tuple[int, int] | None = None) -> None:
+    _guard_point(target, x, y, screen=screen)
     if target.platform == ANDROID:
         ui_android.tap(target.tool, target.target_id, x, y)
         return
     _ios().tap(target, x, y)
 
 
-def swipe(target: Target, x1: int, y1: int, x2: int, y2: int, duration: float) -> None:
+def swipe(target: Target, x1: int, y1: int, x2: int, y2: int, duration: float,
+          *, screen: tuple[int, int] | None = None) -> None:
     for point in ((x1, y1), (x2, y2)):
-        _guard_point(target, *point)
+        _guard_point(target, *point, screen=screen)
     if target.platform == ANDROID:
         ui_android.swipe(target.tool, target.target_id, x1, y1, x2, y2, duration)
         return
@@ -177,14 +178,19 @@ def gesture(target: Target, name: str, **kwargs: Any) -> None:
     _ios().gesture(target, name, **kwargs)
 
 
-def _guard_point(target: Target, x: int, y: int) -> None:
+def _guard_point(target: Target, x: int, y: int,
+                 *, screen: tuple[int, int] | None = None) -> None:
     """INV-06 — refuse a point outside the screen rather than tapping blind.
 
     A point/pixel mix-up on Retina simulators produces coordinates ~3x too
     large. Dispatching them would 'succeed' while landing nowhere, so the agent
     would report a defect that does not exist (RISK-005).
+
+    ``screen`` lets a caller that already knows the size (the flow executor
+    caches it once per run) skip the lookup — on iOS ``screen_size`` re-runs a
+    full accessibility dump, so the default path costs one extra dump per tap.
     """
-    size = screen_size(target)
+    size = screen if screen is not None else screen_size(target)
     if not size:
         return
     width, height = size

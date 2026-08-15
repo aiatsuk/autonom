@@ -117,7 +117,13 @@ assert_json "$OUT/shot.json" 'p["ok"]'
 SHOT_PATH="$(jget "$OUT/shot.json" 'p["path"]')"
 test -s "$SHOT_PATH"
 
-step "9. session stop + artifact assertions"
+step "9. flow run: the same journey as a repeatable Flow v1 file"
+"${CLI[@]}" flow run tests/fixtures/flows/settings_smoke.yaml >"$OUT/flowrun.json"
+assert_json "$OUT/flowrun.json" 'p["ok"] and p["status"] == "passed"'
+EVENTS_PATH="$(jget "$OUT/flowrun.json" 'p["events"]')"
+test -s "$EVENTS_PATH"
+
+step "10. session stop + artifact assertions"
 "${CLI[@]}" session stop >"$OUT/stop.json"
 assert_json "$OUT/stop.json" 'p["ok"]'
 # `session stop` itself is not journaled (the current-session pointer is

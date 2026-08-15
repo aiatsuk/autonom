@@ -1,6 +1,6 @@
 {
   "name": "autonom",
-  "version": "0.15.2",
+  "version": "0.20.2",
   "description": "Universal mobile test and debug harness for AI agents. Portable skills plus a CLI control plane for device sessions, UI trees, screenshots, logs, crashes, device state, and HTTP(S) capture and mocking across Android and the iOS Simulator — Codex, Claude, Grok, and other skill-compatible agents.",
   "author": {
     "name": "Andrei Iatsuk",
@@ -43,7 +43,7 @@
   "interface": {
     "displayName": "Autonom",
     "shortDescription": "Universal mobile test/debug harness for AI agents",
-    "longDescription": "Autonom gives AI coding agents a portable skill pack and JSON CLI to test and debug mobile apps on Android and the iOS Simulator: explicit target sessions, compact accessibility/UI trees, semantic taps and gestures, screenshots, recordings, logs, crash reports, deep links, permissions, app-container files, and a consent-gated localhost MITM proxy for inspecting, mocking, and exporting HTTP(S) traffic. Works with Codex, Claude, Grok, and other skill hosts.",
+    "longDescription": "Autonom gives AI coding agents a portable skill pack and JSON CLI to test and debug mobile apps on Android and the iOS Simulator: explicit target sessions, compact accessibility/UI trees, semantic taps and gestures, screenshots, recordings, logs, crash reports, deep links, permissions, app-container files, a consent-gated localhost MITM proxy for inspecting, mocking, and exporting HTTP(S) traffic, and Flow v1 — repeatable flow files with exact selectors, polling assertions, and machine-readable failure classes. Works with Codex, Claude, Grok, and other skill hosts.",
     "developerName": "Andrei Iatsuk",
     "category": "Developer Tools",
     "capabilities": [

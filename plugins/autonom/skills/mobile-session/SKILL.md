@@ -72,6 +72,7 @@ active session is found from any directory, like mocks and per-app knowledge:
 
 ```text
 ~/.autonom/sessions/<session_id>/{shots,trees,logs,network,recordings,crashes,files,journal.ndjson,session.json}
+~/.autonom/sessions/<session_id>/flows/<run_id>/events.ndjson   # per-step flow run evidence (mobile-flow)
 ~/.autonom/sessions/current.json
 ```
 

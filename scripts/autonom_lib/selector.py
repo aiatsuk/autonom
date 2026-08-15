@@ -18,6 +18,7 @@ STRING_FIELDS = {
     "resource_id": "resource_id",
     "class_name": "class",
     "package": "package",
+    "role": "role",
 }
 BOOL_FIELDS = ("clickable", "enabled", "focusable", "scrollable", "selected", "checked")
 MODES = ("exact", "contains", "regex")

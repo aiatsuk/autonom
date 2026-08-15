@@ -159,6 +159,10 @@ def main(argv: list[str]) -> int:
     if args[:1] == ["push"]:
         return 0
 
+    if args[:3] == ["shell", "wm", "size"]:
+        sys.stdout.write(state.get("wm_size", "Physical size: 1080x1920") + "\n")
+        return 0
+
     if args[:2] == ["shell", "pidof"]:
         package = args[-1]
         sys.stdout.write((state.get("pidof", {}).get(package, "")) + "\n")

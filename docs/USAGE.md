@@ -117,6 +117,25 @@ Open the deep link myapp://order/42, grant photo permission, set the location to
 resulting screen with a UI tree and a screenshot.
 ```
 
+## Turn a verified journey into a repeatable flow
+
+```text
+The login journey we just walked through works. Write it as an Autonom Flow v1
+file under .autonom/flows/auth/login.yaml (secrets via ${TEST_EMAIL} and
+${TEST_PASSWORD}, never inline), run `flow check` on it, then execute it with
+`flow run --secret TEST_EMAIL --secret TEST_PASSWORD` and report the summary
+with the events path.
+```
+
+## Run the smoke suite and explain any failure
+
+```text
+Run `autonom flow run .autonom/flows --include-tag smoke --exclude-tag flaky`.
+If a flow fails with failure_class test_failure, read its events.ndjson and
+failure screenshot and tell me what the app actually showed; do not retry the
+flow.
+```
+
 ## Check what this machine can do
 
 ```text

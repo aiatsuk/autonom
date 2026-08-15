@@ -62,6 +62,13 @@ SWEEP: list[tuple[str, list[str], bool]] = [
     ("network_mock_add", ["network", "mock", "add", "--match", "*"], True),
     ("network_mock_list", ["network", "mock", "list"], True),
     ("network_mock_clear", ["network", "mock", "clear"], True),
+    # Flow static verbs are pure local file ops: a valid file succeeds with no
+    # tools at all; a missing path fails with one machine-readable code.
+    ("flow_check", ["flow", "check",
+                    str(ROOT / "tests/fixtures/flows/settings_smoke.yaml")], True),
+    ("flow_check_missing", ["flow", "check", "/nonexistent/flow.yaml"], False),
+    ("flow_fmt_missing", ["flow", "fmt", "/nonexistent/flow.yaml"], False),
+    ("flow_list_missing", ["flow", "list", "/nonexistent"], False),
     ("crash_list", ["crash", "list"], False),
     ("open_url", ["open", "https://example.com"], False),
     ("permissions", ["permissions", "grant", "photos", "com.example.app"], False),

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import difflib
 import json
+import os
 import re
 import sys
 import time
@@ -22,6 +24,9 @@ from autonom_lib import doctor as doctor_mod  # noqa: E402
 from autonom_lib import emulator as emulator_mod  # noqa: E402
 from autonom_lib import errors  # noqa: E402
 from autonom_lib import ios_idb  # noqa: E402
+from autonom_lib.flow import canonical as flow_canonical  # noqa: E402
+from autonom_lib.flow import executor as flow_executor  # noqa: E402
+from autonom_lib.flow import validator as flow_validator  # noqa: E402
 from autonom_lib import journal as journal_mod  # noqa: E402
 from autonom_lib import ios_simctl  # noqa: E402
 from autonom_lib import logs as logs_mod  # noqa: E402
@@ -72,6 +77,7 @@ def _selectors(args: argparse.Namespace) -> dict[str, Any]:
         "resource_id": getattr(args, "resource_id", None),
         "class_name": getattr(args, "class_name", None),
         "package": getattr(args, "package", None),
+        "role": getattr(args, "role", None),
         "clickable": getattr(args, "clickable", None),
         "enabled": getattr(args, "enabled", None),
     }
@@ -1185,6 +1191,215 @@ def cmd_network_mock_clear(_: argparse.Namespace) -> int:
     return emit({"ok": True, **mocks_mod.clear()}, as_json=True)
 
 
+# --- flow --------------------------------------------------------------------
+
+
+def _flow_summary(flow) -> dict[str, Any]:
+    return {
+        "file": flow.path,
+        "id": flow.flow_id,
+        "name": flow.name,
+        "tags": flow.tags,
+        "platforms": flow.requires_platforms or ["android", "ios"],
+    }
+
+
+def _flow_files(path: Path) -> list[Path]:
+    if path.is_dir():
+        files = flow_validator.discover(path)
+        if not files:
+            raise errors.AutonomError(
+                errors.FLOW_NO_FLOWS_FOUND,
+                f"no .yaml flow files under {path}",
+                hint="Flow files use the .yaml extension.",
+            )
+        return files
+    return [path]
+
+
+def cmd_flow_check(args: argparse.Namespace) -> int:
+    path = Path(args.path)
+    files = _flow_files(path)
+    flows: list[dict[str, Any]] = []
+    problems: list[dict[str, Any]] = []
+    for file in files:
+        try:
+            flows.append(_flow_summary(flow_validator.validate_tree(file)))
+        except errors.AutonomError as exc:
+            if len(files) == 1:
+                raise
+            problems.append(exc.as_dict())
+    if problems:
+        raise errors.AutonomError(
+            errors.FLOW_CHECK_FAILED,
+            f"{len(problems)} of {len(files)} flow files failed validation",
+            hint="Each entry in 'errors' carries file, line, and column.",
+            errors=problems, checked=len(files),
+        )
+    return emit({"ok": True, "checked": len(files), "flows": flows}, as_json=True)
+
+
+def cmd_flow_fmt(args: argparse.Namespace) -> int:
+    path = Path(args.path)
+    files = _flow_files(path)
+    results: list[dict[str, Any]] = []
+    changed_any = False
+    for file in files:
+        flow = flow_validator.load_flow(file)
+        canonical_text = flow_canonical.emit_flow(flow)
+        original = file.read_text(encoding="utf-8")
+        changed = canonical_text != original
+        entry: dict[str, Any] = {"file": str(file), "changed": changed}
+        if changed and args.diff:
+            entry["diff"] = "".join(difflib.unified_diff(
+                original.splitlines(keepends=True),
+                canonical_text.splitlines(keepends=True),
+                fromfile=str(file), tofile=f"{file} (canonical)",
+            ))
+        if changed and args.write:
+            file.write_text(canonical_text, encoding="utf-8")
+            entry["written"] = True
+        if not args.write and len(files) == 1:
+            entry["canonical"] = canonical_text
+        results.append(entry)
+        changed_any = changed_any or changed
+    emit({"ok": True, "changed": changed_any, "files": results}, as_json=True)
+    if args.check and changed_any and not args.write:
+        return 1  # doctor --strict precedent: report on stdout, nonzero exit
+    return 0
+
+
+def cmd_flow_list(args: argparse.Namespace) -> int:
+    base = Path(args.path) if args.path else Path(".autonom/flows")
+    if not base.exists():
+        raise errors.AutonomError(
+            errors.FLOW_NO_FLOWS_FOUND, f"no flow directory at {base}",
+            hint="Pass a directory or file path, or create .autonom/flows.",
+        )
+    files = _flow_files(base)
+    flows: list[dict[str, Any]] = []
+    invalid: list[dict[str, Any]] = []
+    for file in files:
+        try:
+            flows.append(_flow_summary(flow_validator.load_flow(file)))
+        except errors.AutonomError as exc:
+            invalid.append({"file": str(file), "error_code": exc.code,
+                            "error": exc.message})
+    payload: dict[str, Any] = {"ok": True, "count": len(flows), "flows": flows}
+    if invalid:
+        payload["invalid"] = invalid
+    return emit(payload, as_json=True)
+
+
+def _tag_selected(tags: list[str], include: list[str], exclude: list[str]) -> bool:
+    if exclude and any(tag in exclude for tag in tags):
+        return False
+    if include and not any(tag in include for tag in tags):
+        return False
+    return True
+
+
+def cmd_flow_run(args: argparse.Namespace) -> int:
+    path = Path(args.path)
+    include = args.include_tag or []
+    exclude = args.exclude_tag or []
+    if path.is_dir():
+        candidates = _flow_files(path)
+        selected = []
+        for file in candidates:
+            flow = flow_validator.load_flow(file)
+            if _tag_selected(flow.tags, include, exclude):
+                selected.append(file)
+        if not selected:
+            raise errors.AutonomError(
+                errors.FLOW_NO_FLOWS_FOUND,
+                f"no flows under {path} match the tag filters",
+                hint="Check --include-tag/--exclude-tag against 'flow list'.",
+            )
+        files = selected
+    else:
+        files = [path]
+
+    flows = [flow_validator.validate_tree(file) for file in files]
+
+    record = session_mod.load_current()
+    if not record:
+        raise errors.AutonomError(
+            errors.NO_ACTIVE_SESSION,
+            "flow run needs an active session",
+            "Start one with 'autonom session start'.",
+        )
+    target = _target(args)
+
+    env_overrides: dict[str, str] = {}
+    for pair in args.env or []:
+        if "=" not in pair:
+            raise errors.AutonomError(
+                errors.FLOW_COMMAND_INVALID, f"--env takes KEY=VALUE, got {pair!r}")
+        key, value = pair.split("=", 1)
+        env_overrides[key] = value
+    secrets: dict[str, str] = {}
+    for name in args.secret or []:
+        value = os.environ.get(name)
+        if value is None:
+            raise errors.AutonomError(
+                errors.FLOW_SECRET_UNDEFINED,
+                f"--secret {name} is not present in the process environment",
+                hint="Export the variable before running; its value never "
+                     "enters the flow file or artifacts.",
+            )
+        secrets[name] = value
+
+    config = flow_executor.RunConfig(
+        env=env_overrides, secrets=secrets,
+        default_timeout_ms=args.default_timeout_ms, dry_run=args.dry_run,
+    )
+
+    def run_one(flow) -> dict[str, Any]:
+        runner = flow_executor.Executor(
+            target, record, config,
+            stdout_stream=sys.stdout if args.events else None,
+        )
+        result = runner.run(flow)
+        summary: dict[str, Any] = {
+            "status": result.status,
+            "run_id": result.run_id,
+            "flow": flow.path,
+            "name": flow.name,
+            "steps": [
+                {k: v for k, v in vars(step).items() if v is not None}
+                for step in result.steps
+            ],
+            "events": result.events_path,
+            "sensitive": result.sensitive,
+        }
+        if result.failure:
+            summary["failure"] = result.failure
+        if result.hook_failures:
+            summary["hook_failures"] = result.hook_failures
+        return summary
+
+    if len(flows) == 1:
+        summary = {"ok": True, **run_one(flows[0]), **target.identity()}
+        exit_code = 0 if summary["status"] == "passed" else 1
+    else:
+        runs = []
+        for flow in flows:  # a test failure moves on; an AutonomError aborts
+            runs.append(run_one(flow))
+        overall = "passed" if all(r["status"] == "passed" for r in runs) else "failed"
+        summary = {"ok": True, "status": overall,
+                   "flows": len(runs),
+                   "failed": sum(1 for r in runs if r["status"] != "passed"),
+                   "runs": runs, **target.identity()}
+        exit_code = 0 if overall == "passed" else 1
+    if not args.events:
+        emit(summary, as_json=True)
+    else:
+        global _LAST_EMIT
+        _LAST_EMIT = summary  # the journal summary stays useful in events mode
+    return exit_code
+
+
 # --- parser ------------------------------------------------------------------
 
 
@@ -1225,6 +1440,7 @@ def _add_selector_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--resource-id")
     parser.add_argument("--class-name")
     parser.add_argument("--package")
+    parser.add_argument("--role")
     parser.add_argument("--clickable", type=_bool_flag, default=None)
     parser.add_argument("--enabled", type=_bool_flag, default=None)
     parser.add_argument("--mode", choices=("exact", "contains", "regex"), default="contains")
@@ -1476,6 +1692,43 @@ def build_parser() -> argparse.ArgumentParser:
     p = record_sub.add_parser("stop", parents=[target_flags])
     p.set_defaults(func=cmd_record_stop)
 
+    flow = sub.add_parser("flow", help="Flow v1: strict, repeatable flow files")
+    flow_sub = flow.add_subparsers(dest="flow_command", required=True)
+    p = flow_sub.add_parser("check",
+                            help="validate flow files, including the whole runFlow graph")
+    p.add_argument("path", help="a flow file or a directory of flows")
+    p.set_defaults(func=cmd_flow_check)
+    p = flow_sub.add_parser("fmt", help="canonical formatting")
+    p.add_argument("path", help="a flow file or a directory of flows")
+    p.add_argument("--write", action="store_true", help="rewrite files in place")
+    p.add_argument("--check", action="store_true",
+                   help="exit 1 when reformatting is needed")
+    p.add_argument("--diff", action="store_true",
+                   help="include a unified diff per changed file")
+    p.set_defaults(func=cmd_flow_fmt)
+    p = flow_sub.add_parser("list", help="list flows: file, id, name, tags, platforms")
+    p.add_argument("path", nargs="?", help="directory to scan (default .autonom/flows)")
+    p.set_defaults(func=cmd_flow_list)
+    p = flow_sub.add_parser("run", help="execute flows against the active session",
+                            parents=[target_flags])
+    p.add_argument("path", help="a flow file, or a directory for a tag-filtered suite")
+    p.add_argument("--include-tag", action="append", metavar="TAG",
+                   help="directory runs: only flows carrying at least one included tag")
+    p.add_argument("--exclude-tag", action="append", metavar="TAG",
+                   help="directory runs: skip flows carrying any excluded tag")
+    p.add_argument("--env", action="append", metavar="KEY=VALUE",
+                   help="non-secret variable override (repeatable)")
+    p.add_argument("--secret", action="append", metavar="NAME",
+                   help="read NAME from the process environment as a secret "
+                        "(repeatable; the value never enters artifacts)")
+    p.add_argument("--default-timeout-ms", type=int, default=10_000,
+                   help="assertion poll timeout when a step sets none")
+    p.add_argument("--events", action="store_true",
+                   help="stream NDJSON events to stdout instead of one summary doc")
+    p.add_argument("--dry-run", action="store_true",
+                   help="validate and pre-flight against the target; run nothing")
+    p.set_defaults(func=cmd_flow_run)
+
     network = sub.add_parser("network", help="HTTP(S) capture and mocking")
     network_sub = network.add_subparsers(dest="network_command", required=True)
 
@@ -1596,10 +1849,10 @@ _JOURNAL_SKIP = {"note", "journal", "version"}
 
 # Sub-command dests, in priority order, for reconstructing a verb string.
 _SUBCOMMAND_DESTS = (
-    "session_command", "ui_command", "network_command", "requests_command",
-    "mock_command", "location_command", "media_command", "crash_command",
-    "file_command", "record_command", "shots_command", "devices_command",
-    "note_command",
+    "session_command", "ui_command", "flow_command", "network_command",
+    "requests_command", "mock_command", "location_command", "media_command",
+    "crash_command", "file_command", "record_command", "shots_command",
+    "devices_command", "note_command",
 )
 
 
@@ -1636,8 +1889,16 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     ok, error_code = True, None
     try:
-        platform_mod.apply_tool_overrides(args)
-        return args.func(args)
+        code = None
+        try:
+            platform_mod.apply_tool_overrides(args)
+            code = args.func(args)
+            return code
+        finally:
+            # A handler that returns nonzero (doctor --strict, flow run's
+            # test failures, fmt --check) did not succeed — journal it so.
+            if code not in (0, None):
+                ok = False
     except errors.AutonomError as exc:
         ok, error_code = False, exc.code
         return fail_error(exc)

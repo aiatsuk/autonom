@@ -37,7 +37,7 @@ TARGET_FLAGS = frozenset({
 # find and refers to it on tap, which keeps the block readable.
 SELECTOR_TOKEN = "[selector flags]"
 SELECTOR_FLAGS = frozenset({
-    "--text", "--desc", "--resource-id", "--class-name", "--package",
+    "--text", "--desc", "--resource-id", "--class-name", "--package", "--role",
     "--clickable", "--enabled", "--mode", "--case-sensitive", "--index",
 })
 

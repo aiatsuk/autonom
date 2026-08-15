@@ -44,6 +44,9 @@ Legend: ✅ shipped · ⚠️ partial · 🔜 planned · ❌ not planned for nea
 | Native Android / Compose debug + perf skills | ✅ | — | |
 | Native iOS project skills | — | ✅ | `ios-project-setup`, `ios-debugger-agent` |
 | React Native skills | 🔜 | 🔜 | |
+| Flow DSL: check / fmt / list | ✅ | ✅ | strict YAML subset, exact-match selectors by default, positioned errors; `docs/FLOW.md` |
+| Flow DSL: run | ✅ | ✅ | polling assertions, single-fire mutations, `failure_class` + exit 1 for test failures, per-run `events.ndjson`; iOS `eraseText` dispatches HID backspace but is unproven on a real simulator |
+| Flow DSL: runFlow / tags / hooks execution | ✅ | ✅ | subflows inline with inherited appId, isolated `onFlowComplete`, `when:` conditions, tag-filtered directory suites, evidence policy |
 | Live session outputs catalog | 🔜 | 🔜 | Phase 4 — `session outputs` + paths for `tail -f`; see `docs/plans/PHASE_4_METRICS.md` §2L |
 | Live follow (session files / device logs) | 🔜 | 🔜 | Phase 4 — `logs follow` (NDJSON, bounded) |
 | Network requests list | ✅ | ✅ | `network requests list --max N`; follow/poll in Phase 4 |
@@ -97,13 +100,19 @@ autonom session force-stop|uninstall <app-id>
 autonom session clear <app-id> [--strategy auto|reinstall|privacy]
 
 autonom ui tree [--dump FILE] [--all] [--max-depth N] [--max-nodes N]
-autonom ui find [--text|--desc|--resource-id|--class-name|--package] [--mode exact|contains|regex]
+autonom ui find [--text|--desc|--resource-id|--class-name|--package|--role] [--mode exact|contains|regex]
                 [--case-sensitive] [--index N] [--clickable B] [--enabled B] [--all] [--dump FILE]
 autonom ui tap [selector flags] | [--x X --y Y]
 autonom ui swipe --from X,Y --to X,Y [--duration S]
 autonom ui pinch --at X,Y [--scale F] | ui rotate | ui shake   # iOS only
 autonom ui type <text>
 autonom ui key <keycode>
+
+autonom flow check <path>
+autonom flow fmt <path> [--write] [--check] [--diff]
+autonom flow list [path]
+autonom flow run <path> [--include-tag TAG] [--exclude-tag TAG] [--env KEY=VALUE]
+                 [--secret NAME] [--default-timeout-ms N] [--events] [--dry-run]
 
 autonom screenshot [--label L] [--task T] [--out PATH]
 autonom shots list [--task T] [--grep P] [--mocked-only] [--max N]

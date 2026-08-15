@@ -83,6 +83,16 @@ scripts/autonom_lib/
   processes.py                machine-wide process registry, orphan detection, reaping
   doctor.py                   toolchain, capabilities, session, orphans
   paths.py                    locate the bundled skill helper scripts
+  flow/
+    parser.py                 strict YAML-subset parser: text -> positioned nodes, one error code
+    schema.py                 typed model: command registry, selector surface, failure classes
+    validator.py              runFlow graph loading, workspace containment, cycle refusal
+    canonical.py              deterministic emitter behind `flow fmt`
+    executor.py               `flow run`: pre-flight, polling engine, single-fire mutations,
+                              runFlow composition, isolated cleanup hooks, evidence policy
+    events.py                 versioned run events: NDJSON per run + slim journal bridge
+    selectors.py              flow selector -> selector.py translation (never a reimplementation)
+    conditions.py             `when:` evaluation (platform/visible/notVisible/envEquals, AND)
   network/
     proxy.py                  mitmdump lifecycle, machine-level confdir, CA publication
     mitm_addon.py             in-proxy addon: record, redact, serve mocks
@@ -119,6 +129,7 @@ Two rules carry the design.
 | `logs tail`, `crash list\|show` | textual evidence |
 | `open`, `permissions`, `location`, `media`, `file` | drive device state |
 | `network *` | consent-gated HTTP(S) capture, mock, HAR |
+| `flow check\|fmt\|list\|run` | validate, canonicalize, enumerate, and execute Flow v1 files (`docs/FLOW.md`); `run` polls assertions, fires mutations exactly once, and classifies failures |
 | `processes`, `cleanup` | machine-wide reaping of what Autonom started |
 | `session outputs`, `logs follow`, `network requests follow` | **planned (Phase 4)** — live session watch |
 | `metrics *` | **planned (Phase 4)** — memory/CPU/frames/traces; see `docs/plans/PHASE_4_METRICS.md` |
@@ -148,7 +159,7 @@ point/pixel mix-up otherwise "succeeds" while landing in the wrong place.
 
 | Surface | Path | Consumers |
 | --- | --- | --- |
-| Portable skills | `plugins/autonom/skills/*/SKILL.md` (23) | All agents |
+| Portable skills | `plugins/autonom/skills/*/SKILL.md` (24) | All agents |
 | CLI | `scripts/autonom.py`, `scripts/autonom_lib/` | Skills + humans |
 | Claude marketplace | `.claude-plugin/marketplace.json` | Claude Code |
 | Codex marketplace | `.agents/plugins/marketplace.json` | Codex |

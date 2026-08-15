@@ -93,6 +93,7 @@ reads it back — the record you use to re-check or hand off a flow.
 | Device state | `open` (deep link), `permissions`, `location` (iOS + Android emulator), `media add`, `file ls/pull` |
 | Diagnostics | `logs tail`, `crash list/show` |
 | Network | `network start/stop/status/attach/detach`, `network requests list/show`, `network mock …`, `network export --har` |
+| Flows | `flow check/fmt/list/run` — repeatable Flow v1 files with exact selectors and failure classes |
 | Housekeeping | `processes`, `cleanup` |
 
 ## Which skill for what
@@ -103,6 +104,7 @@ reads it back — the record you use to re-check or hand off a flow.
 - **`mobile-session`** — own a target, the artifact dirs, the journal.
 - **`mobile-screen`** — trees, semantic find/tap, gestures, screenshots.
 - **`mobile-network`** — capture, mock, HAR — consent-gated MITM.
+- **`mobile-flow`** — repeatable Flow v1 files: author, validate, run, replay.
 - **`mobile-memory`** — read/write per-app knowledge and flow runbooks.
 - **`android-debugger-agent` / `ios-debugger-agent` / `flutter-debugger-agent`**
   — build-run-inspect for a specific stack.
@@ -139,10 +141,13 @@ screenshot + UI tree + logs → profile / memory / network → before/after repl
 
 ```
 ~/.autonom/sessions/<id>/   shots, trees (full history), logs, network, recordings,
-                            crashes, files, journal.ndjson, session.json
+                            crashes, files, journal.ndjson, session.json,
+                            flows/<run_id>/events.ndjson  (flow run evidence)
 ~/.autonom/apps/<package>/  per-app knowledge: app.md, flows/, bodies/  (mobile-memory)
 ~/.local/state/autonom/     mocks registry, process registry  (machine-level, persistent)
 ```
+Flow *files* are repository source (conventionally `.autonom/flows/` in the
+app repo — see `mobile-flow`); only run artifacts land under `~/.autonom`.
 
 ## Related
 

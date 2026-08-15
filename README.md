@@ -18,12 +18,15 @@ server is required (optional MCP wrapper is planned).
 **Shipped:** Android emulator + iOS Simulator sessions, UI trees, semantic
 find/tap/gestures, screenshots and recordings, logs and crashes, deep links,
 permissions, location, media and container files, consent-gated HTTP(S) capture
-and mocking, and a per-session journal of every action. Domain packs for
-Flutter, native Kotlin/Jetpack Compose, and iOS.  
+and mocking, a per-session journal of every action, and **Flow v1** —
+repeatable flow files with exact selectors, polling assertions, and failure
+classes ([`docs/FLOW.md`](docs/FLOW.md)). Domain packs for Flutter, native
+Kotlin/Jetpack Compose, and iOS.  
 **Roadmap:** live session watch (`session outputs`, `logs follow`), an
 `autonom metrics` family (memory, CPU, frames, traces), Flutter VM Service,
-React Native skills, optional MCP. See
-[`docs/plans/PHASE_4_METRICS.md`](docs/plans/PHASE_4_METRICS.md).
+React Native skills, session→flow compilation, optional MCP. See
+[`docs/plans/PHASE_4_METRICS.md`](docs/plans/PHASE_4_METRICS.md) and
+[`docs/plans/PHASE_5_FLOW_DSL.md`](docs/plans/PHASE_5_FLOW_DSL.md).
 
 ## Why Autonom
 
@@ -88,6 +91,7 @@ See `docs/CAPABILITIES.md` for the full shipped vs planned matrix.
 - `mobile-session` — explicit target session, global `~/.autonom/sessions/` artifacts, journal
 - `mobile-screen` — accessibility tree, find/tap/gestures, screenshot
 - `mobile-network` — consent-gated HTTP(S) capture, mocking, HAR export
+- `mobile-flow` — repeatable Flow v1 files: strict YAML, exact selectors, polling assertions, failure classes
 - `mobile-memory` — per-app knowledge and flow runbooks under `~/.autonom/apps/`
 
 ### Flutter
@@ -203,6 +207,7 @@ benchmark. Use a physical device plus native profilers for frame-rate review.
 - `docs/CAPABILITIES.md` — Android/iOS capability matrix, full CLI surface, environment overrides
 - `docs/ARCHITECTURE.md` — routing, CLI control plane, evidence, security
 - `docs/COMPATIBILITY.md` — the frozen CLI contract (error codes, response keys, exit codes)
+- `docs/FLOW.md` — Flow v1: the strict flow language (`flow check|fmt|list`; `run` next)
 - `docs/plans/PHASE_0_RELEASE_ENGINEERING.md` — shipped: test isolation, CI, tagged releases
 - `docs/plans/PHASE_4_METRICS.md` — plan: live session watch + metrics/memory/CPU/traces (Android, iOS, Flutter)
 - `docs/USAGE.md` — ready-to-use prompts and workflows

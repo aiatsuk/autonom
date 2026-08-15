@@ -60,6 +60,10 @@ is not a flow.
 - **flows/<name>.md** — Goal · Endpoint · Schema source · Steps (exact CLI) ·
   Verify · Gotchas. Reconstruct a response schema from the freezed model:
   `@JsonKey(name: ...)` is the JSON field, `required` without `?` is mandatory.
+  These are prose runbooks — working knowledge. When one has become fully
+  deterministic (stable selectors, no judgment calls), propose converting it
+  into an Autonom Flow v1 file in the app repository (`mobile-flow`), which
+  the CLI can then validate and replay exactly.
 - **bodies/<name>.json** — a captured or hand-built payload a flow points at, so
   the shape is not rebuilt each time.
 

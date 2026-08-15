@@ -95,5 +95,50 @@ class UiCommonTests(unittest.TestCase):
         self.assertEqual(payload["nodes"][0]["bounds"]["center_x"], 740)
 
 
+class SelectorRoleFieldTests(unittest.TestCase):
+    """`role` joined `selector.STRING_FIELDS` for the Flow DSL — additively.
+
+    The 0.4.0-compat `ui.find_nodes` path builds a selector dict without a
+    role key; widening the field table must not change its behavior, and the
+    new field must actually match the role the compact node carries.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        sys.path.insert(0, str(ROOT / "scripts"))
+        from autonom_lib import selector as selector_mod
+        from autonom_lib import ui as ui_mod
+        cls.selector_mod = selector_mod
+        cls.ui_mod = ui_mod
+        cls.xml = (ROOT / "tests/fixtures/ui_dump.xml").read_text(encoding="utf-8")
+
+    def test_legacy_find_nodes_is_unchanged(self) -> None:
+        matches = self.ui_mod.find_nodes(self.xml, desc="Flutter Save Button",
+                                         mode="exact")
+        self.assertEqual(len(matches), 1)
+
+    def test_role_selects_compact_nodes(self) -> None:
+        nodes = self.ui_mod.parse_compact_tree(self.xml, meaningful_only=False)
+        fields = self.selector_mod.select(nodes, {"role": "textfield"},
+                                          mode="exact", all_matches=True)
+        self.assertGreater(len(fields), 0)
+        self.assertTrue(all(node["role"] == "textfield" for node in fields))
+
+    def test_cli_role_flag_reaches_the_engine(self) -> None:
+        import os
+        import tempfile
+        with tempfile.TemporaryDirectory() as home:
+            env = dict(os.environ)
+            env["AUTONOM_HOME"] = home
+            result = subprocess.run(
+                [sys.executable, str(ROOT / "scripts/autonom.py"), "ui", "find",
+                 "--dump", str(ROOT / "tests/fixtures/ui_dump.xml"),
+                 "--role", "textfield", "--all"],
+                check=True, text=True, stdout=subprocess.PIPE, env=env,
+            )
+        payload = json.loads(result.stdout)
+        self.assertGreater(payload["count"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()
