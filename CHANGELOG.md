@@ -7,6 +7,30 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
 
 ## [Unreleased]
 
+## [0.27.1] - 2026-08-15
+
+### Added
+- Metrics foundation (research Phase 4 §2.2–2.3, §2.7). `metrics snapshot`
+  answers "how is the app right now": Android reads `dumpsys meminfo` +
+  `/proc/<pid>/status` + best-effort `cpuinfo`; iOS measures the Simulator
+  process **on the host** (`ps` RSS/CPU + data-container size) and carries
+  `metric_semantics` + `limitations` saying exactly that — the two are
+  never comparable 1:1. Partial data prefers `ok: true` with `warnings[]`.
+- `metrics series` takes N spaced snapshots (or reads them back with
+  `--from-dir`) and reports first/last/delta/slope per metric with
+  `directional_growth_leads` — the algorithm is the proven one from the
+  android-memory-leaks skill script, and equivalence tests pin the two to
+  the same fixtures. The interpretation line is contract: a lead is never
+  called a leak.
+- `metrics list-presets` reports which heavy profilers this host can run;
+  `doctor` gains a `metrics` capability block (optional profilers never
+  fail `--strict`). Snapshot artifacts land under session `metrics/`
+  (0600), raw meminfo text beside the JSON.
+- Process identity helper: pid via `pidof -s` (Android) / `launchctl list`
+  + `pgrep` (iOS Simulator); failures carry `sources_tried`. New stable
+  error codes: `app_not_running`, `tool_missing`, `preset_unavailable`,
+  `trace_failed`.
+
 ## [0.27.0] - 2026-08-15
 
 ### Added

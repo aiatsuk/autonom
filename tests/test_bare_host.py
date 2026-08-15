@@ -105,6 +105,12 @@ SWEEP: list[tuple[str, list[str], bool]] = [
     ("network_requests_follow", ["network", "requests", "follow",
                                  "--max-seconds", "1"], False),
     ("journal_follow", ["journal", "--follow", "--max-seconds", "1"], False),
+    # Metrics need a device backend; list-presets is the honest empty answer.
+    ("metrics_snapshot", ["metrics", "snapshot", "--app-id", "com.example.app"],
+     False),
+    ("metrics_series", ["metrics", "series", "--count", "1",
+                        "--app-id", "com.example.app"], False),
+    ("metrics_list_presets", ["metrics", "list-presets"], True),
 ]
 
 

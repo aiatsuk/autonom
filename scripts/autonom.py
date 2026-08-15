@@ -34,6 +34,9 @@ from autonom_lib.flow import report as flow_report  # noqa: E402
 from autonom_lib.flow import validator as flow_validator  # noqa: E402
 from autonom_lib import journal as journal_mod  # noqa: E402
 from autonom_lib import ios_simctl  # noqa: E402
+from autonom_lib.metrics import presets as metrics_presets  # noqa: E402
+from autonom_lib.metrics import series as metrics_series  # noqa: E402
+from autonom_lib.metrics import snapshot as metrics_snapshot  # noqa: E402
 from autonom_lib import logs as logs_mod  # noqa: E402
 from autonom_lib import platform as platform_mod  # noqa: E402
 from autonom_lib import proof as proof_mod  # noqa: E402
@@ -804,6 +807,109 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     healthy = doctor_mod.is_healthy(report)
     emit(report, as_json=True)
     return 0 if (healthy or not args.strict) else 1
+
+
+# --- metrics -----------------------------------------------------------------
+
+
+def _safe_label(label: str | None) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]", "_", label or "").strip("_") or "capture"
+
+
+def _write_snapshot_artifacts(payload: dict[str, Any], label: str,
+                              out: str | None) -> list[str]:
+    """Persist the snapshot JSON (and the raw meminfo text on Android) under
+    the session `metrics/` dir, or under --out. No destination, no artifact —
+    the stdout payload still carries every metric."""
+    raw = payload.pop("raw_meminfo", None)
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    base: Path | None = None
+    json_path: Path | None = None
+    if out:
+        target = Path(out)
+        if target.suffix == ".json":
+            target.parent.mkdir(parents=True, exist_ok=True)
+            json_path = target
+            base = target.parent
+        else:
+            target.mkdir(parents=True, exist_ok=True)
+            base = target
+    else:
+        record = session_mod.load_current()
+        if record:
+            base = session_mod.artifact_path(record, "metrics", "x").parent
+    if base is None:
+        return []
+    if json_path is None:
+        json_path = base / f"{stamp}-{label}-snapshot.json"
+    written: list[str] = []
+    if raw:
+        raw_path = base / f"{stamp}-{label}-meminfo.txt"
+        raw_path.write_text(raw, encoding="utf-8")
+        raw_path.chmod(0o600)
+        written.append(str(raw_path))
+    payload["artifacts"] = [str(json_path)] + written
+    json_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
+                         encoding="utf-8")
+    json_path.chmod(0o600)
+    return payload["artifacts"]
+
+
+def cmd_metrics_snapshot(args: argparse.Namespace) -> int:
+    target = _target(args)
+    app_id = _app_id(args)
+    payload = metrics_snapshot.take(target, app_id)
+    if args.task:
+        payload["task"] = args.task
+    _write_snapshot_artifacts(payload, _safe_label(args.label or "snapshot"),
+                              args.out)
+    return emit({**payload, **target.identity()}, as_json=True)
+
+
+def cmd_metrics_series(args: argparse.Namespace) -> int:
+    label = _safe_label(args.label or "series")
+    if args.from_dir:
+        samples = metrics_series.from_dir(Path(args.from_dir), args.glob)
+        identity: dict[str, Any] = {}
+    else:
+        target = _target(args)
+        app_id = _app_id(args)
+        identity = target.identity()
+
+        def snap() -> dict[str, Any]:
+            payload = metrics_snapshot.take(target, app_id)
+            _write_snapshot_artifacts(payload, label, args.out)
+            return payload
+
+        samples = metrics_series.capture(snap, count=max(args.count, 1),
+                                         interval=args.interval,
+                                         sleep=time.sleep)
+    report = metrics_series.summarize(samples, max(args.min_growth_kb, 0))
+    payload = {"ok": True, "label": label, "samples": samples, **report,
+               **identity}
+    record = session_mod.load_current()
+    if record and not args.from_dir:
+        out = session_mod.artifact_path(record, "metrics", f"series-{label}.json")
+        out.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
+                       encoding="utf-8")
+        out.chmod(0o600)
+        payload["artifact"] = str(out)
+    return emit(payload, as_json=True)
+
+
+def cmd_metrics_list_presets(args: argparse.Namespace) -> int:
+    platform = getattr(args, "platform", None)
+    try:
+        adb_path: str | None = adb_mod.find_adb(getattr(args, "adb", None))
+    except errors.AutonomError:
+        adb_path = None
+    try:
+        xcrun: str | None = ios_simctl.find_simctl(getattr(args, "simctl", None))
+    except errors.AutonomError:
+        xcrun = None
+    listing = metrics_presets.listing(platform, adb=adb_path, xcrun=xcrun)
+    return emit({"ok": True, "platform": platform or "all", **listing},
+                as_json=True)
 
 
 # --- device state ------------------------------------------------------------
@@ -2460,6 +2566,33 @@ def build_parser() -> argparse.ArgumentParser:
     p = mock_sub.add_parser("clear", parents=[target_flags])
     p.set_defaults(func=cmd_network_mock_clear)
 
+    metrics = sub.add_parser("metrics", help="load metrics: snapshot, series, presets")
+    metrics_sub = metrics.add_subparsers(dest="metrics_command", required=True)
+    p = metrics_sub.add_parser("snapshot", parents=[target_flags],
+                               help="one memory/CPU summary of the app right now")
+    p.add_argument("--app-id", help="package / bundle id (defaults to the session's)")
+    p.add_argument("--label", help="short name used in artifact filenames")
+    p.add_argument("--task", help="task label recorded with the artifact")
+    p.add_argument("--out", help="artifact dir or .json file (default: session metrics/)")
+    p.set_defaults(func=cmd_metrics_snapshot)
+    p = metrics_sub.add_parser("series", parents=[target_flags],
+                               help="N snapshots + deltas and directional-growth leads")
+    p.add_argument("--app-id")
+    p.add_argument("--label")
+    p.add_argument("--task")
+    p.add_argument("--out")
+    p.add_argument("--count", type=int, default=5, help="snapshots to take")
+    p.add_argument("--interval", type=float, default=2.0, help="seconds between snapshots")
+    p.add_argument("--min-growth-kb", type=int, default=1024,
+                   help="minimum first→last growth to flag a lead")
+    p.add_argument("--from-dir", help="summarize existing snapshot files instead of capturing")
+    p.add_argument("--glob", default="*-snapshot.json",
+                   help="pattern applied under --from-dir")
+    p.set_defaults(func=cmd_metrics_series)
+    p = metrics_sub.add_parser("list-presets", parents=[target_flags],
+                               help="which heavy profilers this host can run")
+    p.set_defaults(func=cmd_metrics_list_presets)
+
     logs = sub.add_parser("logs", help="device logs")
     logs_sub = logs.add_subparsers(dest="logs_command", required=True)
     p = logs_sub.add_parser("tail", help="tail recent logs", parents=[target_flags])
@@ -2498,7 +2631,7 @@ _SUBCOMMAND_DESTS = (
     "report_command", "network_command", "requests_command", "mock_command",
     "location_command", "media_command", "crash_command", "file_command",
     "record_command", "shots_command", "devices_command", "note_command",
-    "logs_command",
+    "logs_command", "metrics_command",
 )
 
 

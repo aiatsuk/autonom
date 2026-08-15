@@ -30,24 +30,14 @@ Simpleperf only if Android/plugin work is implicated.
 ## Investigate memory growth
 
 ```text
-Repeat the open/close flow five times, return to the same idle state after each
-run, compare Dart snapshots, capture Android meminfo/HPROF where indicated, and
-prove or reject a retained path before patching.
+Take `autonom metrics snapshot --label baseline`, repeat the open/close flow
+five times returning to the same idle state, then `metrics snapshot --label
+after`. If the delta looks interesting, run `autonom metrics series --count 5
+--interval 2` while repeating the flow and read directional_growth_leads.
+A lead is a direction, not a leak: prove or reject a retained path (HPROF /
+Instruments) before patching. Never compare Android total_pss_kb with iOS
+rss_bytes — the payload's metric_semantics and limitations say why.
 ```
-
-> **Roadmap:** memory and CPU have no CLI verb yet — the work goes through the
-> skill helpers above (Android meminfo/HPROF, `xctrace` on iOS). Phase 4
-> ([`docs/plans/PHASE_4_METRICS.md`](plans/PHASE_4_METRICS.md)) adds
-> `autonom metrics …` (snapshot, series, memory capture, simpleperf/xctrace,
-> Flutter frames) plus live observation — `session outputs`, `logs follow`,
-> `network requests follow` — so no one has to memorize
-> `tail -f ~/.autonom/sessions/…/output/….log`. Until then, watch a run with:
->
-> ```bash
-> tail -f ~/.autonom/sessions/<id>/output/flutter_run_mitm.log
-> autonom network requests list --max 50
-> autonom logs tail --package <app-id> --since 60
-> ```
 
 ## See what the app actually sent
 

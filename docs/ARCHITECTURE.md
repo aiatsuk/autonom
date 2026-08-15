@@ -81,6 +81,12 @@ scripts/autonom_lib/
   device_state.py             deep links, permissions, location, media, crashes, files, recording
   screenshot.py / logs.py     per-platform dispatch; shots carry provenance metadata in the PNG
   follow.py                   bounded NDJSON follows: file tail, device-log stream, store poll
+  metrics/
+    meminfo.py                dumpsys meminfo / proc status / cpuinfo parsers
+    process.py                pid resolution with sources_tried on failure
+    snapshot.py               per-platform load summary; iOS is host accounting, and says so
+    series.py                 first/last/delta/slope math; directional leads, never "leak"
+    presets.py                which heavy profilers this host can run
   processes.py                machine-wide process registry, orphan detection, reaping
   doctor.py                   toolchain, capabilities, session, orphans
   paths.py                    locate the bundled skill helper scripts

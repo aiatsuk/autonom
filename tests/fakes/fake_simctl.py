@@ -116,6 +116,16 @@ def main(argv: list[str]) -> int:
         sys.stdout.write(state.get("container", "/tmp/fake-container") + "\n")
         return 0
 
+    if args[:1] == ["spawn"] and "launchctl" in args:
+        # `launchctl list` inside the sim: UIKit apps carry their bundle id.
+        # Default pid 1 exists on every host, so `ps -p` measurements work.
+        pid = state.get("launchctl_pid", "1")
+        bundles = state.get("running", ["com.example.app"])
+        sys.stdout.write("PID\tStatus\tLabel\n")
+        for bundle in bundles:
+            sys.stdout.write(f"{pid}\t0\tUIKitApplication:{bundle}[0xd5f][77]\n")
+        return 0
+
     if args[:1] == ["spawn"] and "log" in args:
         for line in state.get("ios_log", []):
             sys.stdout.write(line + "\n")

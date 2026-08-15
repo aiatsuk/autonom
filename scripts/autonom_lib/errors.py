@@ -69,9 +69,13 @@ CONSENT_REQUIRED = "consent_required"
 CONSENT_DECLINED = "consent_declined"
 PHYSICAL_DEVICE_ATTACH_UNSUPPORTED = "physical_device_attach_unsupported"
 
-# --- Live observation (Phase 4) ----------------------------------------------
+# --- Live observation & metrics (Phase 4) ------------------------------------
 STREAM_NOT_FOUND = "stream_not_found"
 PATH_FORBIDDEN = "path_forbidden"
+APP_NOT_RUNNING = "app_not_running"
+TOOL_MISSING = "tool_missing"  # generic, with a `tool` extra; per-tool codes above stay
+PRESET_UNAVAILABLE = "preset_unavailable"
+TRACE_FAILED = "trace_failed"
 
 # --- Flow DSL ----------------------------------------------------------------
 # The DSL's code family is deliberately distinct from network capture's

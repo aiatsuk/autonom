@@ -56,8 +56,8 @@ Legend: ✅ shipped · ⚠️ partial · 🔜 planned · ❌ not planned for nea
 | Live follow (session files / device logs) | ✅ | ✅ | `logs follow` — NDJSON lines, always bounded by `--max-seconds`/`--max-lines`; `journal --follow` for the timeline |
 | Network requests list | ✅ | ✅ | `network requests list --max N --since-id F` |
 | Network requests follow | ✅ | ✅ | `network requests follow` — polls the store, emits only new flows as NDJSON |
-| Metrics snapshot (memory/CPU summary) | 🔜 | 🔜 | Phase 4 — `autonom metrics snapshot` |
-| Metrics series (directional growth) | 🔜 | 🔜 | Phase 4 — same plan; Android meminfo series exists as skill script today |
+| Metrics snapshot (memory/CPU summary) | ✅ | ✅ | `metrics snapshot` — Android meminfo/proc/cpuinfo vs iOS **host** `ps`+container size; `metric_semantics` + `limitations` name the difference, never comparable 1:1 |
+| Metrics series (directional growth) | ✅ | ✅ | `metrics series` — live capture or `--from-dir`; leads are directional only, never called a leak |
 | Memory capture pack / HPROF | ⚠️ | 🔜 | Android skill helpers; CLI in Phase 4 |
 | Performance traces (simpleperf / xctrace) | ⚠️ | 🔜 | Android skill scripts; iOS xctrace CLI in Phase 4 |
 | Frame stats (gfxinfo / Flutter timings) | ⚠️ | 🔜 | Partial via skills; unified CLI in Phase 4 |
@@ -144,6 +144,11 @@ autonom record start [--name N] | record stop
 autonom note add <text> [--task T] [--tag T] [--author A] | note list [--task --grep --max]
 autonom journal [--kind action|note] [--verb V] [--task T] [--grep P] [--max N]
                 [--follow] [--session-id ID] [--from-start] [--max-seconds N] [--max-lines N]
+
+autonom metrics snapshot [--app-id ID] [--label L] [--task T] [--out PATH]
+autonom metrics series [--app-id ID] [--label L] [--task T] [--out PATH] [--count N]
+                       [--interval S] [--min-growth-kb N] [--from-dir DIR] [--glob G]
+autonom metrics list-presets
 
 autonom logs tail [--package ID] [--since S] [--max-lines N] [--grep P]
 autonom logs follow [--source SRC | --path P] [--session-id ID] [--package ID] [--from-start]
