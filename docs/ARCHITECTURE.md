@@ -129,6 +129,8 @@ Two rules carry the design.
 | `logs tail`, `crash list\|show` | textual evidence |
 | `open`, `permissions`, `location`, `media`, `file` | drive device state |
 | `network *` | consent-gated HTTP(S) capture, mock, HAR |
+| `atlas update\|show\|coverage\|paths\|export\|diff` | the observed application graph, evidence-linked |
+| `report build\|open\|export` | self-contained HTML + JUnit from a run's manifest |
 | `flow check\|fmt\|list\|run` | validate, canonicalize, enumerate, and execute Flow v1 files (`docs/FLOW.md`); `run` polls assertions, fires mutations exactly once, and classifies failures |
 | `processes`, `cleanup` | machine-wide reaping of what Autonom started |
 | `session outputs`, `logs follow`, `network requests follow` | **planned (Phase 4)** — live session watch |

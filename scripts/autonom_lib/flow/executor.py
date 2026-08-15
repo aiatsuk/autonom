@@ -47,6 +47,7 @@ from .. import selector as selector_engine
 from .. import session as session_mod
 from .. import ui as ui_mod
 from ..platform import ANDROID, IOS, Target
+from ..atlas import fingerprint as atlas_fingerprint
 from . import conditions as flow_conditions
 from . import selectors as flow_selectors
 from . import validator as flow_validator
@@ -144,6 +145,7 @@ class Executor:
         self._used_secret_anywhere = False
         self._retry_attempt: int | None = None
         self._writer_run_id: str | None = None
+        self._last_nodes: list | None = None
 
     # -- public ---------------------------------------------------------------
 
@@ -684,6 +686,7 @@ class Executor:
         self._auto_evidence(evidence, step, "before", index, writer)
         sensitive = bool(step.args.get("sensitive"))
         started = self.clock()
+        self._last_nodes = None
         attempts = [0]
         try:
             secret_used = self._dispatch(step, flow, attempts)
@@ -715,6 +718,10 @@ class Executor:
             finished["failure_class"] = outcome.failure_class
         if outcome.skip_reason:
             finished["skip_reason"] = outcome.skip_reason
+        if self._last_nodes:
+            # nearly free: the snapshot is already in memory, and the Atlas
+            # ingests these fingerprints into the observed graph
+            finished["screen"] = atlas_fingerprint.fingerprint(self._last_nodes)
         event = writer.emit("flow.step.finished", finished, sensitive=sensitive)
         writer.journal_step(event)
 
@@ -876,6 +883,7 @@ class Executor:
     def _matches(self, selector: FlowSelector) -> list:
         mode, case_sensitive = MATCH_MODES[selector.match]
         nodes = ui_mod.snapshot(self.target)
+        self._last_nodes = nodes
         matches = selector_engine.select(
             nodes, dict(selector.fields),
             mode=mode, case_sensitive=case_sensitive, all_matches=True,
@@ -896,6 +904,7 @@ class Executor:
         while True:
             attempts[0] += 1
             nodes = ui_mod.snapshot(self.target)
+            self._last_nodes = nodes
             candidates = flow_selectors.select(nodes, selector)
             if candidates:
                 return candidates[0]  # >1 already raised ambiguous_selector

@@ -7,6 +7,20 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
 
 ## [Unreleased]
 
+## [0.25.0] - 2026-08-15
+
+### Added
+- Atlas-lite: a local observed-only application graph. Screen fingerprints
+  are computed from snapshots the executor already holds (free) and ride in
+  run events; `atlas update` folds runs and manual tap details into
+  `~/.autonom/apps/<app-id>/atlas/graph.json` — screens keyed by a
+  volatility-resistant structure hash (clocks, counters, list length, and
+  the status bar do not move identity; real state changes become variants),
+  transitions labeled by the triggering command with evidence references.
+  `atlas show|coverage|paths|export|diff` query it; coverage explicitly
+  reports the unknown as unknown.
+
+
 ## [0.24.0] - 2026-08-15
 
 ### Added

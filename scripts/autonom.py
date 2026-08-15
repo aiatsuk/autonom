@@ -45,6 +45,8 @@ from autonom_lib.network import device_proxy_android, har as har_mod  # noqa: E4
 from autonom_lib.network import mocks as mocks_mod  # noqa: E402
 from autonom_lib.network import proxy as proxy_mod, store as store_mod  # noqa: E402
 from autonom_lib.network import redact as redact_mod  # noqa: E402
+from autonom_lib.atlas import fingerprint as atlas_fingerprint  # noqa: E402
+from autonom_lib.atlas import graph as atlas_graph  # noqa: E402
 
 
 _LAST_EMIT: dict[str, Any] | None = None
@@ -1529,6 +1531,98 @@ def cmd_flow_run(args: argparse.Namespace) -> int:
     return exit_code
 
 
+# --- atlas -------------------------------------------------------------------
+
+
+def _atlas_app_id(args: argparse.Namespace,
+                  record: dict[str, Any] | None = None) -> str:
+    app_id = getattr(args, "app_id", None) or (record or {}).get("app_id")
+    if not app_id:
+        raise errors.AutonomError(
+            errors.NO_TARGET, "no app id for the atlas",
+            "Pass --app-id, or use a session started with --app-id.",
+        )
+    return app_id
+
+
+def cmd_atlas_update(args: argparse.Namespace) -> int:
+    record = _session_by_id(args.session)
+    app_id = _atlas_app_id(args, record)
+    graph = atlas_graph.load(app_id)
+    session_id = record.get("session_id")
+    artifacts = Path(record["artifacts_dir"])
+
+    runs = 0
+    edges = 0
+    for events_path in sorted(artifacts.glob("flows/*/events.ndjson")):
+        events = []
+        for line in events_path.read_text(encoding="utf-8").splitlines():
+            try:
+                events.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+        edges += atlas_graph.ingest_flow_events(graph, events, session_id)
+        runs += 1
+    details = list(actions_mod.read_details(record).values())
+    edges += atlas_graph.ingest_action_details(graph, details, session_id)
+
+    path = atlas_graph.save(app_id, graph)
+    return emit({"ok": True, "app_id": app_id, "graph": str(path),
+                 "runs_ingested": runs, "transitions_touched": edges,
+                 **atlas_graph.summary(graph)}, as_json=True)
+
+
+def cmd_atlas_show(args: argparse.Namespace) -> int:
+    app_id = _atlas_app_id(args, session_mod.load_current())
+    return emit({"ok": True,
+                 **atlas_graph.summary(atlas_graph.load(app_id))}, as_json=True)
+
+
+def cmd_atlas_coverage(args: argparse.Namespace) -> int:
+    app_id = _atlas_app_id(args, session_mod.load_current())
+    return emit({"ok": True, "app_id": app_id,
+                 **atlas_graph.coverage(atlas_graph.load(app_id))}, as_json=True)
+
+
+def cmd_atlas_paths(args: argparse.Namespace) -> int:
+    app_id = _atlas_app_id(args, session_mod.load_current())
+    graph = atlas_graph.load(app_id)
+    return emit({"ok": True, "app_id": app_id,
+                 **atlas_graph.paths(graph, getattr(args, "from"), args.to)},
+                as_json=True)
+
+
+def cmd_atlas_export(args: argparse.Namespace) -> int:
+    app_id = _atlas_app_id(args, session_mod.load_current())
+    graph = atlas_graph.load(app_id)
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(graph, ensure_ascii=False, indent=2),
+                   encoding="utf-8")
+    return emit({"ok": True, "app_id": app_id, "out": str(out),
+                 "screens": len(graph.get("screens", {})),
+                 "transitions": len(graph.get("transitions", {}))}, as_json=True)
+
+
+def cmd_atlas_diff(args: argparse.Namespace) -> int:
+    def load_snapshot(path_text: str) -> dict[str, Any]:
+        path = Path(path_text)
+        if not path.is_file():
+            raise errors.AutonomError(
+                errors.FLOW_FILE_NOT_FOUND, f"no atlas snapshot at {path}",
+                hint="Create one with 'autonom atlas export --out <file>'.",
+                file=str(path),
+            )
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    base = load_snapshot(args.base)
+    if args.head:
+        head = load_snapshot(args.head)
+    else:
+        head = atlas_graph.load(_atlas_app_id(args, session_mod.load_current()))
+    return emit({"ok": True, **atlas_graph.diff(base, head)}, as_json=True)
+
+
 # --- report ------------------------------------------------------------------
 
 
@@ -1964,6 +2058,34 @@ def build_parser() -> argparse.ArgumentParser:
                    help="validate and pre-flight against the target; run nothing")
     p.set_defaults(func=cmd_flow_run)
 
+    atlas = sub.add_parser("atlas", help="the observed application graph")
+    atlas_sub = atlas.add_subparsers(dest="atlas_command", required=True)
+    p = atlas_sub.add_parser("update", help="ingest a session's runs and actions")
+    p.add_argument("--session", default="current", help="session id (default: current)")
+    p.add_argument("--app-id", help="override the session's app id")
+    p.set_defaults(func=cmd_atlas_update)
+    p = atlas_sub.add_parser("show", help="screens, variants, transitions")
+    p.add_argument("--app-id")
+    p.set_defaults(func=cmd_atlas_show)
+    p = atlas_sub.add_parser("coverage", help="observed edges with evidence refs")
+    p.add_argument("--app-id")
+    p.set_defaults(func=cmd_atlas_coverage)
+    p = atlas_sub.add_parser("paths", help="observed routes between two screens")
+    p.add_argument("--from", required=True, metavar="SCREEN",
+                   help="screen id or label substring")
+    p.add_argument("--to", required=True, metavar="SCREEN")
+    p.add_argument("--app-id")
+    p.set_defaults(func=cmd_atlas_paths)
+    p = atlas_sub.add_parser("export", help="write a graph snapshot")
+    p.add_argument("--out", required=True)
+    p.add_argument("--app-id")
+    p.set_defaults(func=cmd_atlas_export)
+    p = atlas_sub.add_parser("diff", help="compare two graph snapshots")
+    p.add_argument("--base", required=True, help="a snapshot file")
+    p.add_argument("--head", help="a snapshot file (default: the live graph)")
+    p.add_argument("--app-id")
+    p.set_defaults(func=cmd_atlas_diff)
+
     report = sub.add_parser("report", help="evidence reports for flow runs")
     report_sub = report.add_subparsers(dest="report_command", required=True)
     for verb, func, extra in (
@@ -2100,10 +2222,10 @@ _JOURNAL_SKIP = {"note", "journal", "version"}
 
 # Sub-command dests, in priority order, for reconstructing a verb string.
 _SUBCOMMAND_DESTS = (
-    "session_command", "ui_command", "flow_command", "report_command",
-    "network_command", "requests_command", "mock_command", "location_command",
-    "media_command", "crash_command", "file_command", "record_command",
-    "shots_command", "devices_command", "note_command",
+    "session_command", "ui_command", "flow_command", "atlas_command",
+    "report_command", "network_command", "requests_command", "mock_command",
+    "location_command", "media_command", "crash_command", "file_command",
+    "record_command", "shots_command", "devices_command", "note_command",
 )
 
 

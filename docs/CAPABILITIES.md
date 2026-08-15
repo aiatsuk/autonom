@@ -48,6 +48,7 @@ Legend: ✅ shipped · ⚠️ partial · 🔜 planned · ❌ not planned for nea
 | Flow DSL: run | ✅ | ✅ | polling assertions, single-fire mutations, `failure_class` + exit 1 for test failures, per-run `events.ndjson`; iOS `eraseText` dispatches HID backspace but is unproven on a real simulator |
 | Flow DSL: runFlow / tags / hooks execution | ✅ | ✅ | subflows inline with inherited appId, isolated `onFlowComplete`, `when:` conditions, tag-filtered directory suites, evidence policy |
 | Flow DSL: Session → Flow compiler | ✅ | ✅ | `flow create --from-session` — proven selectors reused, secrets become `${SECRET_n}`, coordinate taps refuse to compile |
+| Atlas-lite: observed screens/transitions graph | ✅ | ✅ | `atlas update|show|coverage|paths|export|diff`; fingerprints ride in run events; observed-only, unknown stays unknown |
 | Evidence: run manifest + HTML/JUnit reports | ✅ | ✅ | `report build|open|export`; self-contained HTML (CSP, inline screenshots), JUnit for CI, failure log window |
 | Flow DSL: Maestro Core Profile import/export | ✅ | ✅ | `flow import`/`flow export --format maestro`; outside-profile constructs refuse with `unsupported_flow_command` |
 | Live session outputs catalog | 🔜 | 🔜 | Phase 4 — `session outputs` + paths for `tail -f`; see `docs/plans/PHASE_4_METRICS.md` §2L |
@@ -119,6 +120,13 @@ autonom flow import <path> [--out PATH]
 autonom flow export <path> [--format maestro] [--out PATH]
 autonom flow run <path> [--include-tag TAG] [--exclude-tag TAG] [--env KEY=VALUE]
                  [--secret NAME] [--default-timeout-ms N] [--events] [--dry-run]
+
+autonom atlas update [--session ID] [--app-id ID]
+autonom atlas show [--app-id ID]
+autonom atlas coverage [--app-id ID]
+autonom atlas paths --from <SCREEN> --to <SCREEN> [--app-id ID]
+autonom atlas export --out <PATH> [--app-id ID]
+autonom atlas diff --base <PATH> [--head PATH] [--app-id ID]
 
 autonom report build [--session ID] [--run ID]
 autonom report open [--session ID] [--run ID]

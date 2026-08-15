@@ -199,6 +199,18 @@ file for CI; `report open` opens the HTML, `report export --format
 html|junit --out` writes it anywhere. A failing step also leaves a
 screenshot, a hierarchy dump, and a log window beside the events.
 
+## The observed graph (Atlas-lite)
+
+Every executed step's screen fingerprint rides in the events for free, and
+`autonom atlas update` folds a session's runs (plus manually recorded tap
+details) into `~/.autonom/apps/<app-id>/atlas/graph.json` — screens keyed by
+a volatility-resistant structure hash (clock ticks, counters, list length,
+and the status bar do not move it; a real state change becomes a *variant*),
+transitions labeled by the triggering command with evidence references back
+to the run and step. `atlas show|coverage|paths|export|diff` query it. The
+graph records only what was observed: a missing edge means unknown, never
+impossible.
+
 ## Maestro Core Profile
 
 `autonom flow import maestro.yaml` converts a Maestro flow within the

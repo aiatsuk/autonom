@@ -71,7 +71,11 @@ SWEEP: list[tuple[str, list[str], bool]] = [
     ("flow_list_missing", ["flow", "list", "/nonexistent"], False),
     ("flow_import_missing", ["flow", "import", "/nonexistent/maestro.yaml"], False),
     ("flow_export_missing", ["flow", "export", "/nonexistent/flow.yaml"], False),
-    # report verbs need an active session; without one they refuse cleanly
+    # atlas/report verbs need an app id or session; they refuse cleanly
+    ("atlas_update", ["atlas", "update"], False),
+    ("atlas_show", ["atlas", "show"], False),
+    ("atlas_diff_missing", ["atlas", "diff", "--base", "/nonexistent.json",
+                            "--app-id", "com.example.app"], False),
     ("report_build", ["report", "build"], False),
     ("report_open", ["report", "open"], False),
     ("report_export", ["report", "export"], False),
