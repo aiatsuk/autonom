@@ -111,6 +111,16 @@ SWEEP: list[tuple[str, list[str], bool]] = [
     ("metrics_series", ["metrics", "series", "--count", "1",
                         "--app-id", "com.example.app"], False),
     ("metrics_list_presets", ["metrics", "list-presets"], True),
+    ("metrics_memory_capture", ["metrics", "memory", "capture",
+                                "--app-id", "com.example.app"], False),
+    ("metrics_memory_analyze", ["metrics", "memory", "analyze"], False),
+    ("metrics_memory_warn", ["metrics", "memory", "warn"], False),
+    ("metrics_frames_capture", ["metrics", "frames", "capture",
+                                "--app-id", "com.example.app"], False),
+    ("metrics_frames_flutter", ["metrics", "frames", "flutter-summary",
+                                "/nonexistent/timings.json"], False),
+    ("metrics_trace", ["metrics", "trace", "--preset", "simpleperf",
+                       "--app-id", "com.example.app"], False),
 ]
 
 

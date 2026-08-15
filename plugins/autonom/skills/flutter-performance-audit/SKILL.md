@@ -26,9 +26,11 @@ Read `references/performance-evidence.md` first.
 ```bash
 flutter run --profile -d <device-id> --target <target>
 flutter test integration_test/performance_test.dart -d <device-id>
-python3 <skill-root>/scripts/frame_timings_summary.py \
-  build/integration_response_data.json
+autonom metrics frames flutter-summary build/integration_response_data.json
 ```
+
+(`<skill-root>/scripts/frame_timings_summary.py` is the same math for hosts
+without the Autonom CLI.)
 
 ## Metrics
 

@@ -63,6 +63,25 @@ def main(argv: list[str]) -> int:
             sys.stderr.write(message + "\n")
             return int(code)
 
+    if argv[:1] == ["xctrace"]:
+        # Off unless a test opts in — doctor/presets probes must stay honest
+        # about hosts without Xcode.
+        if not state.get("xctrace"):
+            sys.stderr.write("xcrun: error: unable to find utility \"xctrace\"\n")
+            return 1
+        if argv[1:2] == ["version"]:
+            sys.stdout.write("xctrace version 16.0\n")
+            return 0
+        if argv[1:2] == ["record"]:
+            if state.get("xctrace_fail"):
+                sys.stderr.write(state.get("xctrace_fail") + "\n")
+                return 1
+            output = argv[argv.index("--output") + 1]
+            Path(output).mkdir(parents=True, exist_ok=True)
+            (Path(output) / "info.plist").write_text("fake trace\n")
+            return 0
+        return 0
+
     if argv[:1] != ["simctl"]:
         sys.stderr.write(f"fake xcrun: unsupported driver {argv[:1]}\n")
         return 1

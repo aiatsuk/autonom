@@ -34,9 +34,12 @@ from autonom_lib.flow import report as flow_report  # noqa: E402
 from autonom_lib.flow import validator as flow_validator  # noqa: E402
 from autonom_lib import journal as journal_mod  # noqa: E402
 from autonom_lib import ios_simctl  # noqa: E402
+from autonom_lib.metrics import android_memory as metrics_memory  # noqa: E402
+from autonom_lib.metrics import frames as metrics_frames  # noqa: E402
 from autonom_lib.metrics import presets as metrics_presets  # noqa: E402
 from autonom_lib.metrics import series as metrics_series  # noqa: E402
 from autonom_lib.metrics import snapshot as metrics_snapshot  # noqa: E402
+from autonom_lib.metrics import trace as metrics_trace  # noqa: E402
 from autonom_lib import logs as logs_mod  # noqa: E402
 from autonom_lib import platform as platform_mod  # noqa: E402
 from autonom_lib import proof as proof_mod  # noqa: E402
@@ -895,6 +898,124 @@ def cmd_metrics_series(args: argparse.Namespace) -> int:
         out.chmod(0o600)
         payload["artifact"] = str(out)
     return emit(payload, as_json=True)
+
+
+def _metrics_out_dir(args: argparse.Namespace) -> Path:
+    """--out dir, else the session's metrics/ dir; metrics depth verbs write
+    real evidence, so unlike snapshot they refuse to run with nowhere to put it."""
+    if getattr(args, "out", None):
+        return Path(args.out)
+    record = session_mod.load_current()
+    if record:
+        return session_mod.artifact_path(record, "metrics", "x").parent
+    raise errors.AutonomError(
+        errors.NO_ACTIVE_SESSION,
+        "no session to hold the artifacts and no --out given",
+        "Start a session, or pass --out DIR.",
+    )
+
+
+def cmd_metrics_memory_capture(args: argparse.Namespace) -> int:
+    target = _target(args)
+    if target.platform != ANDROID:
+        raise errors.AutonomError(
+            errors.UNSUPPORTED_ON_PLATFORM,
+            "the memory pack reads Android dumpsys; on iOS use "
+            "'metrics snapshot' and 'metrics trace --preset allocations'",
+        )
+    payload = metrics_memory.capture(
+        target, _app_id(args), out_dir=_metrics_out_dir(args),
+        label=_safe_label(args.label), want_hprof=not args.no_hprof)
+    return emit({**payload, **target.identity()}, as_json=True)
+
+
+def cmd_metrics_memory_analyze(args: argparse.Namespace) -> int:
+    directory = Path(args.dir) if args.dir else _metrics_out_dir(args)
+    report = metrics_memory.analyze(directory, glob=args.glob,
+                                    min_growth_kb=args.min_growth_kb)
+    return emit({"ok": True, **report}, as_json=True)
+
+
+def cmd_metrics_memory_warn(args: argparse.Namespace) -> int:
+    target = _target(args)
+    if target.platform == ANDROID:
+        raise errors.AutonomError(
+            errors.UNSUPPORTED_ON_PLATFORM,
+            "memory-warning injection exists only on the iOS Simulator",
+            "On Android drive real pressure instead (fill memory in-app).",
+        )
+    ios_simctl.run_simctl(
+        target.tool,
+        ["spawn", target.target_id, "notifyutil", "-p",
+         "UISimulatedMemoryWarningNotification"])
+    return emit({"ok": True, "stimulus": "memory_warning",
+                 "note": "best-effort Darwin notification; newer runtimes may "
+                         "ignore it — verify the app actually reacted",
+                 **target.identity()}, as_json=True)
+
+
+def cmd_metrics_frames_reset(args: argparse.Namespace) -> int:
+    target = _target(args)
+    if target.platform != ANDROID:
+        raise errors.AutonomError(
+            errors.UNSUPPORTED_ON_PLATFORM,
+            "gfxinfo frame stats are Android-only; on iOS use "
+            "'metrics trace --preset hitches'")
+    app_id = _app_id(args)
+    metrics_frames.reset(target, app_id)
+    return emit({"ok": True, "reset": app_id, **target.identity()}, as_json=True)
+
+
+def cmd_metrics_frames_capture(args: argparse.Namespace) -> int:
+    target = _target(args)
+    if target.platform != ANDROID:
+        raise errors.AutonomError(
+            errors.UNSUPPORTED_ON_PLATFORM,
+            "gfxinfo frame stats are Android-only; on iOS use "
+            "'metrics trace --preset hitches'")
+    app_id = _app_id(args)
+    raw, summary = metrics_frames.capture(target, app_id)
+    payload: dict[str, Any] = {"ok": True, "summary": summary,
+                               **target.identity()}
+    out_dir = None
+    record = session_mod.load_current()
+    if args.out or record:
+        out_dir = _metrics_out_dir(args)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        artifact = out_dir / f"{stamp}-{_safe_label(args.label)}-gfxinfo.txt"
+        artifact.write_text(raw, encoding="utf-8")
+        artifact.chmod(0o600)
+        payload["artifacts"] = [str(artifact)]
+    return emit(payload, as_json=True)
+
+
+def cmd_metrics_frames_flutter(args: argparse.Namespace) -> int:
+    path = Path(args.file)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise errors.AutonomError(errors.BACKEND_FAILED, str(exc))
+    except json.JSONDecodeError as exc:
+        raise errors.AutonomError(
+            errors.BACKEND_FAILED, f"{path} is not JSON: {exc}")
+    summary = metrics_frames.flutter_summary(payload, args.budget_ms)
+    if summary is None:
+        raise errors.AutonomError(
+            errors.BACKEND_FAILED,
+            f"no supported frame timing arrays found in {path}",
+            "Expected keys like frame_build_times / frame_rasterizer_times "
+            "from an integration-test timeline summary.",
+        )
+    return emit({"ok": True, "file": str(path), **summary}, as_json=True)
+
+
+def cmd_metrics_trace(args: argparse.Namespace) -> int:
+    target = _target(args)
+    payload = metrics_trace.run_preset(
+        target, _app_id(args), args.preset, duration=max(args.duration, 1.0),
+        out_dir=_metrics_out_dir(args), label=_safe_label(args.label))
+    return emit({**payload, **target.identity()}, as_json=True)
 
 
 def cmd_metrics_list_presets(args: argparse.Namespace) -> int:
@@ -2589,6 +2710,55 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--glob", default="*-snapshot.json",
                    help="pattern applied under --from-dir")
     p.set_defaults(func=cmd_metrics_series)
+    memory = metrics_sub.add_parser("memory", help="Android evidence pack + iOS stimulus")
+    memory_sub = memory.add_subparsers(dest="memory_command", required=True)
+    p = memory_sub.add_parser("capture", parents=[target_flags],
+                              help="meminfo + proc + gfxinfo + optional HPROF")
+    p.add_argument("--app-id")
+    p.add_argument("--label", default="capture")
+    p.add_argument("--out", help="artifact dir (default: session metrics/)")
+    p.add_argument("--no-hprof", action="store_true",
+                   help="skip the Java/Kotlin heap dump")
+    p.set_defaults(func=cmd_metrics_memory_capture)
+    p = memory_sub.add_parser("analyze", parents=[target_flags],
+                              help="series math over captured meminfo files")
+    p.add_argument("--dir", help="capture dir (default: session metrics/)")
+    p.add_argument("--glob", default="*-meminfo.txt")
+    p.add_argument("--min-growth-kb", type=int, default=1024)
+    p.set_defaults(func=cmd_metrics_memory_analyze)
+    p = memory_sub.add_parser("warn", parents=[target_flags],
+                              help="inject a simulated memory warning (iOS Simulator)")
+    p.set_defaults(func=cmd_metrics_memory_warn)
+
+    frames = metrics_sub.add_parser("frames", help="frame statistics")
+    frames_sub = frames.add_subparsers(dest="frames_command", required=True)
+    p = frames_sub.add_parser("reset", parents=[target_flags],
+                              help="zero gfxinfo counters before a flow")
+    p.add_argument("--app-id")
+    p.set_defaults(func=cmd_metrics_frames_reset)
+    p = frames_sub.add_parser("capture", parents=[target_flags],
+                              help="gfxinfo framestats after the flow")
+    p.add_argument("--app-id")
+    p.add_argument("--label", default="frames")
+    p.add_argument("--out")
+    p.set_defaults(func=cmd_metrics_frames_capture)
+    p = frames_sub.add_parser("flutter-summary", parents=[target_flags],
+                              help="summarize a Flutter frame-timings JSON file")
+    p.add_argument("file")
+    p.add_argument("--budget-ms", type=float, default=16.67)
+    p.set_defaults(func=cmd_metrics_frames_flutter)
+
+    p = metrics_sub.add_parser("trace", parents=[target_flags],
+                               help="heavy profile with an explicit duration")
+    p.add_argument("--preset", required=True,
+                   choices=("simpleperf", "gfxinfo-flow", "allocations",
+                            "time-profiler", "leaks", "hitches"))
+    p.add_argument("--duration", type=float, default=30.0, help="seconds")
+    p.add_argument("--app-id")
+    p.add_argument("--label", default="trace")
+    p.add_argument("--out")
+    p.set_defaults(func=cmd_metrics_trace)
+
     p = metrics_sub.add_parser("list-presets", parents=[target_flags],
                                help="which heavy profilers this host can run")
     p.set_defaults(func=cmd_metrics_list_presets)

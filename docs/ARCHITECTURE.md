@@ -87,6 +87,9 @@ scripts/autonom_lib/
     snapshot.py               per-platform load summary; iOS is host accounting, and says so
     series.py                 first/last/delta/slope math; directional leads, never "leak"
     presets.py                which heavy profilers this host can run
+    android_memory.py         evidence pack: metadata+meminfo+proc+gfxinfo+HPROF, analyze
+    frames.py                 gfxinfo reset/capture (best-effort parse) + Flutter timings
+    trace.py                  simpleperf / gfxinfo-flow / xctrace presets → artifacts
   processes.py                machine-wide process registry, orphan detection, reaping
   doctor.py                   toolchain, capabilities, session, orphans
   paths.py                    locate the bundled skill helper scripts

@@ -7,6 +7,34 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
 
 ## [Unreleased]
 
+## [0.27.2] - 2026-08-15
+
+### Added
+- Metrics depth (research Phase 4 §2.4–2.6), closing the metrics phase:
+  `metrics memory capture` writes the Android evidence pack (metadata,
+  meminfo, proc status, gfxinfo, optional HPROF with `--no-hprof` for
+  non-debuggable builds; the remote dump is always cleaned up) and
+  `metrics memory analyze` runs the series math over captured meminfo
+  files. `metrics memory warn` posts the simulated memory-warning
+  notification on the iOS Simulator (best-effort, and says so).
+- `metrics frames reset|capture` wraps gfxinfo with a best-effort summary
+  (unknown API shapes stay honest: raw artifact + `parsed: false`);
+  `metrics frames flutter-summary` is the CLI twin of the
+  flutter-performance-audit script, pinned by an equivalence test.
+- `metrics trace --preset simpleperf|gfxinfo-flow|allocations|
+  time-profiler|leaks|hitches` records heavy profiles with an explicit
+  duration into session `metrics/` — missing tools are `tool_missing` with
+  an install hint, platform mismatches `preset_unavailable`, profiler
+  failures `trace_failed` with the stderr tail. xctrace argv is fake-
+  tested; real-Xcode recording remains a manual checklist item (⚠️ in
+  CAPABILITIES).
+- Skills now lead with the CLI (`android-memory-leaks`,
+  `android-runtime-performance`, `flutter-performance-audit`,
+  `flutter-memory-leaks`, `ios-debugger-agent`, `mobile-session`,
+  `autonom`); the standalone scripts remain for hosts without a session.
+- `docs/plans/PHASE_4_METRICS.md` renumbered to the shipped 0.27.0–0.27.2
+  lanes (DEC-015 amended): the 0.16–0.19 reservation lapsed unused.
+
 ## [0.27.1] - 2026-08-15
 
 ### Added

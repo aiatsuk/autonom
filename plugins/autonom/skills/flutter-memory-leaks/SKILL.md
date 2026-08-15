@@ -15,8 +15,10 @@ allocations. Compare equivalent idle points.
 3. Inspect retaining paths for growing types.
 4. Review disposal: controllers, streams, timers, listeners, `BuildContext`
    capture, image caches, statics, platform-channel subscriptions.
-5. Escalate to `android-memory-leaks` (and `analyze_meminfo_series.py`) when
-   process PSS/graphics/activity growth is not explained by Dart snapshots.
+5. Escalate to platform metrics when process growth is not explained by Dart
+   snapshots: `autonom metrics snapshot` / `series` on both platforms, then
+   `android-memory-leaks` (`autonom metrics memory capture|analyze`) for the
+   Android evidence pack.
 6. Fix the retaining edge; repeat the same flow.
 
 Read `references/memory-evidence.md`.

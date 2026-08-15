@@ -91,7 +91,7 @@ other API levels or locales; physical devices; performance.
 | # | Decision |
 | --- | --- |
 | DEC-014 | Real CI supersedes DEC-012 ("the bare-host sweep replaces CI"). The sweep is retained as the empty-PATH invariant (VER-011/INV-08), no longer as the CI substitute. `tests/test_bare_host.py` docstring updated. |
-| DEC-015 | Version lanes: 0.15.2 = this phase; 0.16–0.19 remain reserved for the metrics work documented in `PHASE_4_METRICS.md`; the Flow DSL takes 0.20.x as house **Phase 5** (`docs/plans/PHASE_5_FLOW_DSL.md`). This renumbers `PHASE_2_3_IOS_NETWORK.md`'s D10, which had penciled the MCP wrapper in as "Phase 5" — the MCP wrapper moves after the Flow DSL. |
+| DEC-015 | Version lanes: 0.15.2 = this phase; 0.16–0.19 were reserved for the metrics work documented in `PHASE_4_METRICS.md`; the Flow DSL takes 0.20.x as house **Phase 5** (`docs/plans/PHASE_5_FLOW_DSL.md`). This renumbers `PHASE_2_3_IOS_NETWORK.md`'s D10, which had penciled the MCP wrapper in as "Phase 5" — the MCP wrapper moves after the Flow DSL. **Amended 2026-08-15:** the Flow arc ran through 0.26.0 before the metrics phase started, so the 0.16–0.19 reservation lapsed unused — Phase 4 shipped as 0.27.0–0.27.2 (mapping table at the top of `PHASE_4_METRICS.md`). |
 | DEC-016 | `AUTONOM_REQUIRE_SHELLCHECK` is dev tooling, not CLI surface: documented in the `CAPABILITIES.md` environment table, deliberately outside the machine-checked CLI-surface fence. |
 | DEC-017 | The smoke targets the preinstalled Settings app — no APK to build, install, or pin; third-party-app smoke waits for the Flow DSL slice that can express it as a flow file. |
 

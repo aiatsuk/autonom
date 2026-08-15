@@ -22,9 +22,12 @@ structured error handling and activity recreation.
 ## Investigate jank
 
 ```text
-Profile the exact scroll flow in Flutter profile mode on the physical device.
-Report UI/raster p90, p99, worst and over-budget frames. Escalate to Perfetto or
-Simpleperf only if Android/plugin work is implicated.
+Profile the exact scroll flow in Flutter profile mode on the physical device;
+summarize with `autonom metrics frames flutter-summary <timings.json>`. On
+Android wrap the flow in `autonom metrics frames reset` / `capture` (or
+`metrics trace --preset gfxinfo-flow --duration 30`). Report UI/raster p90,
+p99, worst and over-budget frames. Escalate to Perfetto or `metrics trace
+--preset simpleperf` only if Android/plugin work is implicated.
 ```
 
 ## Investigate memory growth

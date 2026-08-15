@@ -18,23 +18,25 @@ accumulation under an equivalent flow.
 4. Perfetto `heapprofd` for native allocation growth.
 5. Same flow again after the fix; same metrics and paths.
 
-## Capture helper
+## Capture
+
+Prefer the Autonom CLI — artifacts land in the session's `metrics/` dir and
+the journal keeps the timeline:
+
+```bash
+autonom metrics snapshot --label baseline        # cheap directional point
+autonom metrics memory capture --label after-flow [--no-hprof]
+autonom metrics memory analyze                   # series math, leads only
+autonom metrics series --count 5 --interval 2    # snapshots + slope/leads
+```
+
+Pass `--no-hprof` for release/profileable builds where dumpheap is
+unavailable. The standalone scripts remain for hosts without a session:
 
 ```bash
 <skill-root>/scripts/capture_android_memory.sh \
-  --serial <serial> \
-  --package <application-id> \
-  --out-dir <artifact-dir> \
-  --label after-flow
-```
-
-Requires an explicit serial when multiple devices are up. Sanitizes artifact
-names, gathers several process views, and removes temporary device files. Pass
-`--no-hprof` for release/profileable builds where dumpheap is unavailable.
-
-Series analysis (directional only):
-
-```bash
+  --serial <serial> --package <application-id> \
+  --out-dir <artifact-dir> --label after-flow
 python3 <skill-root>/scripts/analyze_meminfo_series.py <artifact-dir> \
   --glob '*-meminfo.txt' --json
 ```

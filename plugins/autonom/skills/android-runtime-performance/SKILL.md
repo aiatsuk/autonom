@@ -23,6 +23,18 @@ Read `references/native-performance-workflows.md` before capture.
 
 ## Fast frame snapshot
 
+Prefer the Autonom CLI inside a session — it owns reset/capture, keeps the
+raw text as the artifact, and journals the run:
+
+```bash
+autonom metrics frames reset
+# replay one focused flow
+autonom metrics frames capture
+autonom metrics trace --preset simpleperf --duration 30
+```
+
+Raw adb equivalent without a session:
+
 ```bash
 adb -s "$SERIAL" shell dumpsys gfxinfo "$PACKAGE" reset
 # replay one focused flow

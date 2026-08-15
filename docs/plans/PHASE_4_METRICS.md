@@ -1,6 +1,14 @@
 # Phase 4: Metrics, memory, and live session observation
 
-**Status:** planning only (no implementation in this document).  
+**Status:** shipped as **0.27.0–0.27.2** (2026-08-15). The plan was written
+when 0.16–0.19 were the reserved lanes; the Flow DSL arc (0.20.x–0.26.0)
+landed first, so this phase shipped renumbered — see the version table below
+and DEC-015 in `PHASE_0_RELEASE_ENGINEERING.md`. Deviations from the plan as
+written: `journal follow` shipped as the additive flag `journal --follow`
+(restructuring the existing `journal` verb into subcommands would have broken
+its shipped surface); `session watch` (multiplex) was deliberately not built —
+the follow primitives cover the need; `xctrace --export-xml`, the host
+`sample` option, and the Flutter VM-service probe stayed unshipped (D3/D4).
 **Goal:** teach Autonom to **observe what an app is doing** while a session runs:
 
 1. **Load** — memory, CPU, frames, heavier profiles (Android, iOS Simulator, Flutter).
@@ -12,14 +20,15 @@
 (shipped), `logs tail` / `network requests list` (shipped, snapshot-oriented),
 Android skill helpers for meminfo/simpleperf/frame timings (shipped as scripts,
 not CLI).  
-**Target versions (proposed):**
+**Versions as shipped** (the section headings below keep their original
+0.16–0.19 numbers; map them through this table):
 
-| Version | Theme |
-| --- | --- |
-| **0.16.0** | **Live session watch** (`session outputs`, `logs follow`, `network requests` poll/follow) + `metrics snapshot` / `series` |
-| **0.17.0** | `metrics memory capture` / `analyze`; Android gfxinfo + simpleperf traces |
-| **0.18.0** | iOS `xctrace` traces; honest limitations; skill rewrites to call CLI |
-| **0.19.0** | Flutter frame summary + optional VM Service attach (narrow) |
+| Planned | Shipped | Theme |
+| --- | --- | --- |
+| 0.16.0 | **0.27.0 + 0.27.1** | Live session watch (`session outputs`, `logs follow`, `network requests` follow/`--since-id`, `journal --follow`) shipped as 0.27.0; `metrics snapshot` / `series` / `list-presets` + doctor block as 0.27.1 |
+| 0.17.0 | **0.27.2** | `metrics memory capture` / `analyze`; gfxinfo frames; simpleperf trace |
+| 0.18.0 | **0.27.2** | iOS `xctrace` presets + `metrics memory warn`; honest limitations |
+| 0.19.0 | **0.27.2** | `metrics frames flutter-summary` (VM Service probe not shipped) |
 
 ---
 

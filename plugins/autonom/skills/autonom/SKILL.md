@@ -58,10 +58,12 @@ autonom ui tap --desc "Log In"
 autonom ui type "test-user"                        # into the focused field
 
 # 3. Watch what happens
-autonom logs tail --package com.example.app --since 60
+autonom session outputs                            # what is followable + tail -f hints
+autonom logs follow --source device --grep 'Error' --max-seconds 60   # live, bounded NDJSON
 autonom network start --i-understand-mitm          # decrypt + record (consent-gated)
 autonom network attach --i-understand-mitm
 autonom network requests list --host api.example.com --status 401
+autonom metrics snapshot --label baseline          # memory/CPU point, honest semantics
 
 # 4. Force a failure and check the UI reacts
 autonom network mock add --url '.../v1/login' --status 500 --json '{"error":"x"}'
@@ -92,6 +94,8 @@ reads it back — the record you use to re-check or hand off a flow.
 | Evidence | `screenshot`, `shots list/show`, `record start/stop`, `note add/list`, `journal` |
 | Device state | `open` (deep link), `permissions`, `location` (iOS + Android emulator), `media add`, `file ls/pull` |
 | Diagnostics | `logs tail`, `crash list/show` |
+| Live observation | `session outputs`, `logs follow`, `network requests follow`, `journal --follow` — bounded NDJSON streams |
+| Metrics | `metrics snapshot/series/list-presets`, `metrics memory capture/analyze/warn`, `metrics frames …`, `metrics trace --preset …` |
 | Network | `network start/stop/status/attach/detach`, `network requests list/show`, `network mock …`, `network export --har` |
 | Flows | `flow check/fmt/list/run` — repeatable Flow v1 files with exact selectors and failure classes |
 | Housekeeping | `processes`, `cleanup` |

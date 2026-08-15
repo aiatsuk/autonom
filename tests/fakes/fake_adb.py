@@ -159,6 +159,18 @@ def main(argv: list[str]) -> int:
     if args[:1] == ["push"]:
         return 0
 
+    if args[:1] == ["pull"] and len(args) > 2:
+        Path(args[2]).write_bytes(state.get("pull_bytes", "FAKEDATA").encode())
+        return 0
+
+    if args[:2] == ["shell", "which"]:
+        binary = args[2] if len(args) > 2 else ""
+        table = state.get("which", {})
+        if binary in table:
+            sys.stdout.write(table[binary] + "\n")
+            return 0
+        return 1
+
     if args[:3] == ["shell", "wm", "size"]:
         sys.stdout.write(state.get("wm_size", "Physical size: 1080x1920") + "\n")
         return 0

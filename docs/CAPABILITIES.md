@@ -58,10 +58,10 @@ Legend: ✅ shipped · ⚠️ partial · 🔜 planned · ❌ not planned for nea
 | Network requests follow | ✅ | ✅ | `network requests follow` — polls the store, emits only new flows as NDJSON |
 | Metrics snapshot (memory/CPU summary) | ✅ | ✅ | `metrics snapshot` — Android meminfo/proc/cpuinfo vs iOS **host** `ps`+container size; `metric_semantics` + `limitations` name the difference, never comparable 1:1 |
 | Metrics series (directional growth) | ✅ | ✅ | `metrics series` — live capture or `--from-dir`; leads are directional only, never called a leak |
-| Memory capture pack / HPROF | ⚠️ | 🔜 | Android skill helpers; CLI in Phase 4 |
-| Performance traces (simpleperf / xctrace) | ⚠️ | 🔜 | Android skill scripts; iOS xctrace CLI in Phase 4 |
-| Frame stats (gfxinfo / Flutter timings) | ⚠️ | 🔜 | Partial via skills; unified CLI in Phase 4 |
-| Flutter VM Service (widget tree, heap) | 🔜 | 🔜 | Phase 4.4 optional; frames summary earlier |
+| Memory capture pack / HPROF | ✅ | ⚠️ | `metrics memory capture` (meminfo+proc+gfxinfo+HPROF, `--no-hprof`) + `analyze`; iOS gets `metrics memory warn` (best-effort stimulus) — full heaps go through `trace --preset allocations` |
+| Performance traces (simpleperf / xctrace) | ✅ | ⚠️ | `metrics trace` — simpleperf/gfxinfo-flow proven against the fake adb; xctrace presets build correct argv and are fake-tested, unproven against a real Xcode recording in CI |
+| Frame stats (gfxinfo / Flutter timings) | ✅ | ⚠️ | `metrics frames reset|capture` (best-effort parse, raw always kept) + `flutter-summary`; iOS frames only via `trace --preset hitches` |
+| Flutter VM Service (widget tree, heap) | 🔜 | 🔜 | deliberately unshipped (Phase 4 D4) — profile-mode DevTools workflow stays documented in the Flutter skills |
 | XCUITest execution | — | 🔜 | Separate from metrics |
 | Optional MCP wrapper | 🔜 | 🔜 | CLI is source of truth first |
 
@@ -148,6 +148,14 @@ autonom journal [--kind action|note] [--verb V] [--task T] [--grep P] [--max N]
 autonom metrics snapshot [--app-id ID] [--label L] [--task T] [--out PATH]
 autonom metrics series [--app-id ID] [--label L] [--task T] [--out PATH] [--count N]
                        [--interval S] [--min-growth-kb N] [--from-dir DIR] [--glob G]
+autonom metrics memory capture [--app-id ID] [--label L] [--out DIR] [--no-hprof]
+autonom metrics memory analyze [--dir D] [--glob G] [--min-growth-kb N]
+autonom metrics memory warn
+autonom metrics frames reset [--app-id ID]
+autonom metrics frames capture [--app-id ID] [--label L] [--out DIR]
+autonom metrics frames flutter-summary <file> [--budget-ms F]
+autonom metrics trace --preset <simpleperf|gfxinfo-flow|allocations|time-profiler|leaks|hitches>
+                      [--duration S] [--app-id ID] [--label L] [--out DIR]
 autonom metrics list-presets
 
 autonom logs tail [--package ID] [--since S] [--max-lines N] [--grep P]
