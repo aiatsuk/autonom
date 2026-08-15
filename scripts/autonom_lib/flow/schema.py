@@ -61,18 +61,21 @@ SELECTOR_STRING_FIELDS = {
     "description": "desc",
     "role": "role",
 }
-SELECTOR_BOOL_FIELDS = ("enabled", "checked", "selected")
+SELECTOR_BOOL_FIELDS = ("enabled", "checked", "selected", "focused")
+# flow relational name -> engine relation key. The geometric four need a
+# unique anchor; childOf walks ancestors, containsChild checks direct children.
+SELECTOR_RELATIONAL_FIELDS = {
+    "above": "above",
+    "below": "below",
+    "leftOf": "left_of",
+    "rightOf": "right_of",
+    "childOf": "child_of",
+    "containsChild": "contains_child",
+}
 # Recognized-but-deferred fields are rejected with a pointed hint so demand is
 # measurable and nothing is silently ignored.
 SELECTOR_DEFERRED_FIELDS = {
-    "above": "relational selectors are planned; tighten with id, role, or index",
-    "below": "relational selectors are planned; tighten with id, role, or index",
-    "leftOf": "relational selectors are planned; tighten with id, role, or index",
-    "rightOf": "relational selectors are planned; tighten with id, role, or index",
-    "childOf": "relational selectors are planned; tighten with id, role, or index",
-    "containsChild": "relational selectors are planned; tighten with id, role, or index",
-    "containsDescendants": "relational selectors are planned; tighten with id, role, or index",
-    "focused": "the focused state is not in the compact node schema yet",
+    "containsDescendants": "use containsChild (direct children) or childOf on the target",
     "point": "raw coordinates are not a flow selector; use 'autonom ui tap --x --y' for one-off taps",
     "bounds": "bounds are diagnostic output, not a selector",
 }
@@ -124,6 +127,15 @@ REGISTRY: dict[str, CommandSpec] = {spec.name: spec for spec in [
     CommandSpec("tapOn", True, shorthand="selector.text", optional_allowed=True,
                 args=(ArgSpec("selector", "selector", required=True),
                       _LABEL, _TIMEOUT) + _OPTIONAL),
+    CommandSpec("longPressOn", True, shorthand="selector.text",
+                optional_allowed=True, since="0.21.0",
+                args=(ArgSpec("selector", "selector", required=True),
+                      ArgSpec("durationMs", "int"),
+                      _LABEL, _TIMEOUT) + _OPTIONAL),
+    CommandSpec("doubleTapOn", True, shorthand="selector.text",
+                optional_allowed=True, since="0.21.0",
+                args=(ArgSpec("selector", "selector", required=True),
+                      _LABEL, _TIMEOUT) + _OPTIONAL),
     CommandSpec("inputText", True, shorthand="value",
                 args=(ArgSpec("value", "str", required=True),
                       ArgSpec("sensitive", "bool"), _LABEL)),
@@ -169,10 +181,23 @@ REGISTRY: dict[str, CommandSpec] = {spec.name: spec for spec in [
                       ArgSpec("appId", "str"), _LABEL)),
     CommandSpec("addMedia", True, shorthand="path", since="0.20.2",
                 args=(ArgSpec("path", "str", required=True), _LABEL)),
+    CommandSpec("setOrientation", True, shorthand="orientation", since="0.21.0",
+                args=(ArgSpec("orientation", "str", required=True,
+                              choices=("portrait", "landscape",
+                                       "portrait-reversed", "landscape-reversed")),
+                      _LABEL)),
     # composition
     CommandSpec("runFlow", True, shorthand="file", since="0.20.2",
                 args=(ArgSpec("file", "str", required=True),
                       ArgSpec("env", "env"), ArgSpec("when", "when"), _LABEL)),
+    CommandSpec("retry", False, since="0.21.0",
+                args=(ArgSpec("commands", "commands", required=True),
+                      ArgSpec("maxAttempts", "int"),
+                      ArgSpec("onlyOn", "strlist"),
+                      ArgSpec("allowMutations", "bool"), _LABEL)),
+    CommandSpec("group", False, since="0.21.0",
+                args=(ArgSpec("commands", "commands", required=True),
+                      ArgSpec("label", "str", required=True))),
     # evidence
     CommandSpec("takeScreenshot", False, bare=True, shorthand="label",
                 args=(_LABEL,)),
@@ -185,12 +210,7 @@ REGISTRY: dict[str, CommandSpec] = {spec.name: spec for spec in [
 # Known names we deliberately do not run, each with a pointed hint. An unknown
 # command is never ignored (research doc §17, Phase 1 exit criterion).
 DEFERRED_COMMANDS = {
-    "longPressOn": "long press needs a duration surface the adapters do not expose yet",
-    "doubleTapOn": "double tap needs a duration surface the adapters do not expose yet",
     "waitForIdle": "no idle signal exists on either backend; use waitUntil with an explicit timeoutMs",
-    "setOrientation": "orientation control has no device_state substrate yet",
-    "retry": "explicit retry blocks are deferred; assertions already poll",
-    "group": "grouping is deferred; use runFlow with a subflow file",
     "extendedWaitUntil": "use waitUntil with an explicit timeoutMs",
     "runScript": "Flow v1 has no script engine, by design; run scripts outside the flow",
     "evalScript": "Flow v1 has no script engine, by design",
@@ -219,6 +239,10 @@ class FlowSelector:
     col: int = 0
     # flow-facing field names in source order, for canonical output
     source_fields: dict = field(default_factory=dict)
+    # engine relation key -> {"fields", "mode", "case_sensitive"} anchor spec
+    relations: dict = field(default_factory=dict)
+    # flow-facing relational name -> nested FlowSelector, for canonical output
+    source_relations: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -348,7 +372,7 @@ def _string_map(node, code: str, path: str, what: str) -> dict:
 # --- Selector ----------------------------------------------------------------
 
 
-def build_selector(node, path: str) -> FlowSelector:
+def build_selector(node, path: str, *, _anchor: bool = False) -> FlowSelector:
     code = errors.FLOW_SELECTOR_INVALID
     if isinstance(node, Scalar):
         # shorthand: bare text with exact match
@@ -376,7 +400,23 @@ def build_selector(node, path: str) -> FlowSelector:
                       hint="Match modes: " + ", ".join(sorted(MATCH_MODES)) + ".")
             selector.match = mode
         elif name == "index":
+            if _anchor:
+                _fail(code, "a relational anchor cannot carry index",
+                      path, key.line, key.col,
+                      hint="Anchors must identify their element by fields alone.")
             selector.index = _coerce(value, "int", code, path, "selector.index")
+        elif name in SELECTOR_RELATIONAL_FIELDS:
+            if _anchor:
+                _fail(code, "relational anchors cannot nest further relations",
+                      path, key.line, key.col)
+            anchor = build_selector(value, path, _anchor=True)
+            mode, case_sensitive = MATCH_MODES[anchor.match]
+            selector.relations[SELECTOR_RELATIONAL_FIELDS[name]] = {
+                "fields": anchor.fields,
+                "mode": mode,
+                "case_sensitive": case_sensitive,
+            }
+            selector.source_relations[name] = anchor
         elif name in SELECTOR_DEFERRED_FIELDS:
             _fail(code, f"selector field {name!r} is not supported in Flow v1",
                   path, key.line, key.col, hint=SELECTOR_DEFERRED_FIELDS[name])
@@ -384,11 +424,18 @@ def build_selector(node, path: str) -> FlowSelector:
             _fail(code, f"unknown selector field {name!r}", path, key.line, key.col,
                   hint="Fields: " + ", ".join(list(SELECTOR_STRING_FIELDS)
                                               + list(SELECTOR_BOOL_FIELDS)
+                                              + list(SELECTOR_RELATIONAL_FIELDS)
                                               + ["match", "index"]) + ".")
-    if not (set(selector.fields) & set(SELECTOR_STRING_FIELDS.values())):
-        _fail(code, "selector needs at least one of id, text, description, role",
+    has_strings = bool(set(selector.fields) & set(SELECTOR_STRING_FIELDS.values()))
+    if not has_strings and not selector.relations:
+        what = "anchor" if _anchor else "selector"
+        _fail(code, f"{what} needs at least one of id, text, description, role"
+                    + ("" if _anchor else " (or a relational constraint)"),
               path, node.line, node.col,
               hint="State fields and index alone would match too broadly.")
+    if _anchor and not has_strings:
+        _fail(code, "anchor needs at least one of id, text, description, role",
+              path, node.line, node.col)
     return selector
 
 
@@ -492,6 +539,14 @@ def build_step(item, path: str) -> Step:
             args[arg_name] = _string_map(arg_value, code, path, f"{name}.env")
         elif arg.kind == "when":
             args[arg_name] = build_when(arg_value, path)
+        elif arg.kind == "commands":
+            if not isinstance(arg_value, Sequence):
+                _fail(code, f"{name}.commands must be a sequence of commands",
+                      path, arg_key.line, arg_key.col)
+            args[arg_name] = [build_step(item, path) for item in arg_value.items]
+        elif arg.kind == "strlist":
+            args[arg_name] = _string_list(arg_value, code, path,
+                                          f"{name}.{arg_name}")
         else:
             coerced = _coerce(arg_value, arg.kind, code, path, f"{name}.{arg_name}")
             if arg.choices and coerced not in arg.choices:
@@ -533,6 +588,33 @@ def _finish_step(spec: CommandSpec, args: dict, key: Scalar, path: str) -> Step:
     if "when" in args and spec.name != "runFlow":
         _fail(code, "when is only supported on runFlow in v1",
               path, key.line, key.col)
+    if spec.name == "retry":
+        attempts = args.setdefault("maxAttempts", 2)
+        if not 1 <= attempts <= 3:
+            _fail(code, "retry.maxAttempts must be between 1 and 3",
+                  path, key.line, key.col,
+                  hint="Retrying a large block hides defects; keep it tight.")
+        for sub in args["commands"]:
+            if sub.command in ("retry", "group", "runFlow"):
+                _fail(code, f"retry cannot contain {sub.command} — retried "
+                            "blocks stay small and atomic",
+                      path, sub.line, sub.col)
+            if REGISTRY[sub.command].mutating and not args.get("allowMutations"):
+                _fail(code, f"retry contains the mutating command "
+                            f"{sub.command}; repeating mutations needs an "
+                            "explicit allowMutations: true",
+                      path, sub.line, sub.col,
+                      hint="A repeated tap or input can act twice on the app. "
+                           "Say allowMutations: true only when that is safe.")
+        if not args["commands"]:
+            _fail(code, "retry.commands is empty", path, key.line, key.col)
+    if spec.name == "group":
+        for sub in args["commands"]:
+            if sub.command == "group":
+                _fail(code, "groups do not nest — use runFlow for structure",
+                      path, sub.line, sub.col)
+        if not args["commands"]:
+            _fail(code, "group.commands is empty", path, key.line, key.col)
     return Step(spec.name, args, key.line, key.col)
 
 

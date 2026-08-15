@@ -142,6 +142,7 @@ class Executor:
         self._children: dict[str, Flow] = {}
         self._counter = 0
         self._used_secret_anywhere = False
+        self._retry_attempt: int | None = None
 
     # -- public ---------------------------------------------------------------
 
@@ -267,11 +268,15 @@ class Executor:
                             **self.config.env, **self.config.secrets}
             self._preflight_flow(child, child_values, is_root=False, _seen=seen)
             return
+        if step.command in ("retry", "group"):
+            for sub in step.args["commands"]:
+                self._preflight_step(sub, flow, values, seen)
+            return
         if step.command in ("launchApp", "stopApp", "clearState") and not flow.app_id:
             self._definition(step, f"{step.command} needs an appId, and neither "
                                    "this flow nor the root flow provides one")
         if self.target.platform == IOS:
-            if step.command in ("clearState", "back"):
+            if step.command in ("clearState", "back", "setOrientation"):
                 self._definition(step, f"{step.command} is not supported on iOS",
                                  code=errors.UNSUPPORTED_ON_PLATFORM)
             if step.command == "launchApp" and step.args.get("clearState"):
@@ -288,6 +293,10 @@ class Executor:
             for text in selector.fields.values():
                 if isinstance(text, str):
                     yield from _iter_var_names(text)
+            for spec in selector.relations.values():
+                for text in spec["fields"].values():
+                    if isinstance(text, str):
+                        yield from _iter_var_names(text)
 
         for value in step.args.values():
             if isinstance(value, str):
@@ -363,18 +372,30 @@ class Executor:
 
     def _resolve_selector(self, selector: FlowSelector) -> tuple[FlowSelector, bool]:
         used = False
-        fields = {}
-        for key, value in selector.fields.items():
-            if isinstance(value, str):
-                resolved, secret = self._resolve(value)
-                used = used or secret
-                fields[key] = resolved
-            else:
-                fields[key] = value
-        clone = FlowSelector(fields=fields, match=selector.match,
+
+        def resolve_fields(fields: dict) -> dict:
+            nonlocal used
+            out = {}
+            for key, value in fields.items():
+                if isinstance(value, str):
+                    resolved, secret = self._resolve(value)
+                    used = used or secret
+                    out[key] = resolved
+                else:
+                    out[key] = value
+            return out
+
+        relations = {
+            name: {**spec, "fields": resolve_fields(spec["fields"])}
+            for name, spec in selector.relations.items()
+        }
+        clone = FlowSelector(fields=resolve_fields(selector.fields),
+                             match=selector.match,
                              index=selector.index, line=selector.line,
                              col=selector.col,
-                             source_fields=selector.source_fields)
+                             source_fields=selector.source_fields,
+                             relations=relations,
+                             source_relations=selector.source_relations)
         return clone, used
 
     # -- execution ------------------------------------------------------------
@@ -389,6 +410,14 @@ class Executor:
                 if step.command == "runFlow":
                     self._execute_runflow(step, flow, writer, result,
                                           evidence, hook)
+                    continue
+                if step.command == "retry":
+                    self._execute_retry(step, flow, writer, result,
+                                        evidence, hook)
+                    continue
+                if step.command == "group":
+                    self._execute_group(step, flow, writer, result,
+                                        evidence, hook)
                     continue
                 outcome = self._execute_step(step, flow, writer, evidence,
                                              hook=hook)
@@ -464,6 +493,92 @@ class Executor:
         writer.journal_step(event)
         result.steps.append(outcome)
 
+    def _execute_group(self, step: Step, flow: Flow, writer: EventWriter,
+                       result: RunResult, evidence: Evidence,
+                       hook: str | None) -> None:
+        self._counter += 1
+        writer.emit("flow.step.started", {
+            "step_index": self._counter, "command": "group",
+            "label": step.label, "file": flow.path, "line": step.line,
+            "steps": len(step.args["commands"]),
+        })
+        index = self._counter
+        started = self.clock()
+        status = "passed"
+        try:
+            self._execute_steps(step.args["commands"], flow, self.values,
+                                writer, result, evidence, hook=hook)
+        except (_Stop, errors.AutonomError):
+            status = "failed"
+            raise
+        finally:
+            writer.emit("flow.step.finished", {
+                "step_index": index, "command": "group", "label": step.label,
+                "file": flow.path, "line": step.line, "status": status,
+                "duration_ms": int((self.clock() - started) * 1000),
+                "attempts": 1,
+            })
+
+    def _execute_retry(self, step: Step, flow: Flow, writer: EventWriter,
+                       result: RunResult, evidence: Evidence,
+                       hook: str | None) -> None:
+        """Explicit, bounded retry of a small non-composed block (§7.11).
+
+        Only test-failure-class outcomes are retried (and only those in
+        onlyOn, when given); infrastructure and definition errors always
+        abort. Every attempt's steps land in the journal and events.
+        """
+        max_attempts = step.args["maxAttempts"]
+        only_on = step.args.get("onlyOn") or []
+        self._counter += 1
+        block_index = self._counter
+        writer.emit("flow.step.started", {
+            "step_index": block_index, "command": "retry", "label": step.label,
+            "file": flow.path, "line": step.line,
+            "max_attempts": max_attempts,
+        })
+        if step.args.get("allowMutations"):
+            writer.emit("flow.step.finished", {
+                "step_index": block_index, "command": "retry",
+                "label": step.label, "file": flow.path, "line": step.line,
+                "status": "warning", "duration_ms": 0, "attempts": 0,
+                "warning": "allowMutations: mutating commands inside this "
+                           "block may act on the app more than once",
+            })
+        started = self.clock()
+        for attempt in range(1, max_attempts + 1):
+            before = len(result.steps)
+            previous_attempt = self._retry_attempt
+            self._retry_attempt = attempt
+            try:
+                self._execute_steps(step.args["commands"], flow, self.values,
+                                    writer, result, evidence, hook=hook)
+                self._emit_retry_finished(step, flow, writer, block_index,
+                                          started, "passed", attempt)
+                return
+            except _Stop:
+                failed = next((s for s in result.steps[before:]
+                               if s.status == "failed"), None)
+                retryable = (failed is not None
+                             and (not only_on or failed.error_code in only_on)
+                             and attempt < max_attempts)
+                if not retryable:
+                    self._emit_retry_finished(step, flow, writer, block_index,
+                                              started, "failed", attempt)
+                    raise
+            finally:
+                self._retry_attempt = previous_attempt
+
+    def _emit_retry_finished(self, step: Step, flow: Flow, writer: EventWriter,
+                             block_index: int, started: float, status: str,
+                             attempts: int) -> None:
+        writer.emit("flow.step.finished", {
+            "step_index": block_index, "command": "retry", "label": step.label,
+            "file": flow.path, "line": step.line, "status": status,
+            "duration_ms": int((self.clock() - started) * 1000),
+            "attempts": attempts,
+        })
+
     def _run_complete_hooks(self, flow: Flow, values: dict,
                             writer: EventWriter, result: RunResult,
                             evidence: Evidence) -> None:
@@ -511,6 +626,8 @@ class Executor:
         }
         if hook:
             payload["hook"] = hook
+        if self._retry_attempt is not None:
+            payload["retry_attempt"] = self._retry_attempt
         if step.selector is not None:
             payload["selector"] = flow_selectors.describe(step.selector)
         writer.emit("flow.step.started", payload)
@@ -615,6 +732,23 @@ class Executor:
             x, y = ui_mod.center_of(node)
             self._tap(x, y)
             return secret
+        if command == "longPressOn":
+            selector, secret = self._resolve_selector(step.selector)
+            node = self._poll_for_one(selector, step, attempts)
+            x, y = ui_mod.center_of(node)
+            ui_mod.long_press(target, x, y, step.args.get("durationMs", 600),
+                              screen=self._screen_size())
+            return secret
+        if command == "doubleTapOn":
+            selector, secret = self._resolve_selector(step.selector)
+            node = self._poll_for_one(selector, step, attempts)
+            x, y = ui_mod.center_of(node)
+            ui_mod.double_tap(target, x, y, screen=self._screen_size())
+            return secret
+        if command == "setOrientation":
+            device_state.set_orientation(target, step.args["orientation"])
+            self._screen_fetched = False  # dimensions just swapped
+            return False
         if command == "inputText":
             value, secret = self._resolve(step.args["value"])
             ui_mod.type_text(target, value)

@@ -530,8 +530,15 @@ def cmd_ui_tap(args: argparse.Namespace) -> int:
         node = matches[0]
         x, y = ui_mod.center_of(node)
         ref = node.get("ref")
-    ui_mod.tap(target, x, y)
-    return emit({"ok": True, "x": x, "y": y, "ref": ref, **target.identity()}, as_json=True)
+    duration = getattr(args, "duration", None)
+    if duration:
+        ui_mod.long_press(target, x, y, duration)
+    else:
+        ui_mod.tap(target, x, y)
+    payload: dict[str, Any] = {"ok": True, "x": x, "y": y, "ref": ref}
+    if duration:
+        payload["duration_ms"] = duration
+    return emit({**payload, **target.identity()}, as_json=True)
 
 
 def cmd_ui_swipe(args: argparse.Namespace) -> int:
@@ -1552,6 +1559,8 @@ def build_parser() -> argparse.ArgumentParser:
     _add_selector_flags(p)
     p.add_argument("--x", type=int)
     p.add_argument("--y", type=int)
+    p.add_argument("--duration", type=int, metavar="MS",
+                   help="hold for MS milliseconds (a long press)")
     p.set_defaults(func=cmd_ui_tap)
 
     p = ui_sub.add_parser("swipe", help="swipe between two points", parents=[target_flags])

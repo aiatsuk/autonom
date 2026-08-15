@@ -20,8 +20,17 @@ STRING_FIELDS = {
     "package": "package",
     "role": "role",
 }
-BOOL_FIELDS = ("clickable", "enabled", "focusable", "scrollable", "selected", "checked")
+BOOL_FIELDS = ("clickable", "enabled", "focusable", "focused", "scrollable",
+               "selected", "checked")
 MODES = ("exact", "contains", "regex")
+
+# Relational constraints. Values are {"fields": {...engine keys...},
+# "mode": ..., "case_sensitive": ...} anchor specs. The geometric four need a
+# UNIQUE anchor (a reference rectangle); the ancestry two are per-candidate
+# predicates and tolerate any number of anchor-shaped nodes.
+GEOMETRIC_RELATIONS = ("above", "below", "left_of", "right_of")
+ANCESTRY_RELATIONS = ("child_of", "contains_child")
+RELATIONAL_FIELDS = GEOMETRIC_RELATIONS + ANCESTRY_RELATIONS
 
 
 def match_string(actual: str | None, expected: str, mode: str, case_sensitive: bool) -> bool:
@@ -49,6 +58,115 @@ def visible_label(node: Mapping[str, Any]) -> str:
         if value:
             return str(value)
     return "<unlabelled>"
+
+
+def _plain_match(node: Mapping[str, Any], fields: Mapping[str, Any],
+                 mode: str, case_sensitive: bool) -> bool:
+    """String + bool field matching for one node (no relational, no errors
+    beyond a bad regex)."""
+    for name, key in STRING_FIELDS.items():
+        expected = fields.get(name)
+        if expected is None:
+            continue
+        if not isinstance(expected, str):
+            return False
+        if not match_string(node.get(key), expected, mode, case_sensitive):
+            return False
+    for name in BOOL_FIELDS:
+        expected = fields.get(name)
+        if expected is None:
+            continue
+        if bool(node.get(name)) is not bool(expected):
+            return False
+    return True
+
+
+def _apply_relations(
+    all_nodes: list[Mapping[str, Any]],
+    candidates: list[dict[str, Any]],
+    relations: Mapping[str, Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Narrow candidates by geometric/ancestry constraints.
+
+    Deterministic by design: geometry is a pure edge comparison against one
+    unique anchor rectangle (no "nearest" heuristics), ancestry follows the
+    parent refs the snapshot carries. Both platforms share this code, so a
+    relation that is ambiguous on one is ambiguous on the other.
+    """
+    by_ref = {node.get("ref"): node for node in all_nodes if node.get("ref")}
+
+    def anchor_matches(spec: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+        return [node for node in all_nodes
+                if _plain_match(node, spec["fields"], spec.get("mode", "exact"),
+                                spec.get("case_sensitive", True))]
+
+    for name, spec in relations.items():
+        if name in GEOMETRIC_RELATIONS:
+            anchors = [a for a in anchor_matches(spec) if a.get("bounds")]
+            if not anchors:
+                raise errors.AutonomError(
+                    errors.NO_MATCHING_NODE,
+                    f"relational anchor for {name!r} matched nothing",
+                    "The reference element must be on screen (and have bounds).",
+                )
+            if len(anchors) > 1:
+                labels = ", ".join(visible_label(a) for a in anchors[:8])
+                raise errors.AutonomError(
+                    errors.AMBIGUOUS_SELECTOR,
+                    f"relational anchor for {name!r} matched {len(anchors)} "
+                    f"nodes ({labels}); a geometric relation needs exactly one",
+                    "Tighten the anchor selector.",
+                    match_count=len(anchors),
+                )
+            left, top, right, bottom = anchors[0]["bounds"]
+
+            def keeps(node: Mapping[str, Any], relation: str = name) -> bool:
+                bounds = node.get("bounds")
+                if not bounds:
+                    return False
+                if relation == "above":
+                    return bounds[3] <= top
+                if relation == "below":
+                    return bounds[1] >= bottom
+                if relation == "left_of":
+                    return bounds[2] <= left
+                return bounds[0] >= right  # right_of
+
+            candidates = [node for node in candidates if keeps(node)]
+        elif name == "child_of":
+            def has_matching_ancestor(node: Mapping[str, Any]) -> bool:
+                seen: set[str] = set()
+                parent = node.get("parent")
+                while parent and parent not in seen:
+                    seen.add(parent)
+                    ancestor = by_ref.get(parent)
+                    if ancestor is None:
+                        return False
+                    if _plain_match(ancestor, spec["fields"],
+                                    spec.get("mode", "exact"),
+                                    spec.get("case_sensitive", True)):
+                        return True
+                    parent = ancestor.get("parent")
+                return False
+
+            candidates = [node for node in candidates if has_matching_ancestor(node)]
+        else:  # contains_child — a DIRECT child matches
+            children_of: dict[str, list[Mapping[str, Any]]] = {}
+            for node in all_nodes:
+                parent = node.get("parent")
+                if parent:
+                    children_of.setdefault(parent, []).append(node)
+
+            def has_matching_child(node: Mapping[str, Any]) -> bool:
+                for child in children_of.get(node.get("ref"), []):
+                    if _plain_match(child, spec["fields"],
+                                    spec.get("mode", "exact"),
+                                    spec.get("case_sensitive", True)):
+                        return True
+                return False
+
+            candidates = [node for node in candidates if has_matching_child(node)]
+    return candidates
 
 
 def filter_nodes(
@@ -93,7 +211,8 @@ def filter_nodes(
 
 
 def has_selector(selectors: Mapping[str, Any]) -> bool:
-    return any(selectors.get(name) is not None for name in (*STRING_FIELDS, *BOOL_FIELDS))
+    return any(selectors.get(name) is not None
+               for name in (*STRING_FIELDS, *BOOL_FIELDS, *RELATIONAL_FIELDS))
 
 
 def select(
@@ -111,7 +230,13 @@ def select(
     wins": an agent that taps the wrong one of three identical buttons produces
     convincing but false evidence.
     """
-    matches = filter_nodes(nodes, selectors, mode=mode, case_sensitive=case_sensitive)
+    all_nodes = list(nodes)
+    matches = filter_nodes(all_nodes, selectors, mode=mode,
+                           case_sensitive=case_sensitive)
+    relations = {name: spec for name, spec in selectors.items()
+                 if name in RELATIONAL_FIELDS and spec is not None}
+    if relations and matches:
+        matches = _apply_relations(all_nodes, matches, relations)
     if not matches:
         return []
     if all_matches:

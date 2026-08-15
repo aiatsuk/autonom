@@ -32,7 +32,9 @@ _HEADER_ORDER = ("schema", "id", "appId", "name", "description", "tags",
                  "properties", "env", "requires", "evidence",
                  "onFlowStart", "onFlowComplete")
 _SELECTOR_ORDER = ("id", "text", "description", "role",
-                   "enabled", "checked", "selected")
+                   "enabled", "checked", "selected", "focused")
+_RELATION_ORDER = ("above", "below", "leftOf", "rightOf",
+                   "childOf", "containsChild")
 _EVIDENCE_ORDER = ("mode", "beforeMutation", "afterAssertion", "collect", "bodies")
 _PLAIN_SAFE_FIRST = re.compile(r"[^\[\]{}&*!|>#%'\"@`?,\s-]")
 
@@ -124,6 +126,10 @@ def _emit_selector(writer: _Writer, indent: int, key: str,
     writer.pair(indent + 2, "match", selector.match)
     if selector.index is not None:
         writer.pair(indent + 2, "index", selector.index)
+    for name in _RELATION_ORDER:
+        if name in selector.source_relations:
+            _emit_selector(writer, indent + 2, name,
+                           selector.source_relations[name])
 
 
 def _emit_when(writer: _Writer, indent: int, when: WhenClause) -> None:
@@ -155,6 +161,12 @@ def _emit_step(writer: _Writer, indent: int, step: Step) -> None:
             writer.string_map(arg_indent, arg.name, value)
         elif arg.kind == "when":
             _emit_when(writer, arg_indent, value)
+        elif arg.kind == "commands":
+            writer.line(arg_indent, f"{arg.name}:")
+            for sub in value:
+                _emit_step(writer, arg_indent + 2, sub)
+        elif arg.kind == "strlist":
+            writer.string_list(arg_indent, arg.name, value)
         else:
             writer.pair(arg_indent, arg.name, value)
 
@@ -226,8 +238,12 @@ def emit_flow(flow: Flow) -> str:
 
 
 def _selector_fp(selector: FlowSelector):
+    relations = tuple(sorted(
+        (name, tuple(sorted(spec["fields"].items())), spec.get("mode"),
+         spec.get("case_sensitive"))
+        for name, spec in selector.relations.items()))
     return ("selector", tuple(sorted(selector.fields.items())),
-            selector.match, selector.index)
+            selector.match, selector.index, relations)
 
 
 def _when_fp(when: WhenClause):
@@ -247,6 +263,10 @@ def _step_fp(step: Step):
             args.append((name, _when_fp(value)))
         elif isinstance(value, dict):
             args.append((name, tuple(sorted(value.items()))))
+        elif isinstance(value, list) and value and isinstance(value[0], Step):
+            args.append((name, tuple(_step_fp(sub) for sub in value)))
+        elif isinstance(value, list):
+            args.append((name, tuple(value)))
         else:
             args.append((name, value))
     return (step.command, tuple(args))

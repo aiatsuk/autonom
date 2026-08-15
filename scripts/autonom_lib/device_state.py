@@ -57,6 +57,47 @@ def open_url(target: Target, url: str) -> None:
     )
 
 
+# --- orientation -------------------------------------------------------------
+
+_ORIENTATIONS = {
+    "portrait": "0",
+    "landscape": "1",
+    "portrait-reversed": "2",
+    "landscape-reversed": "3",
+}
+
+
+def set_orientation(target: Target, orientation: str) -> dict[str, Any]:
+    """Force a device orientation (Android only).
+
+    Disables the accelerometer rotation first — otherwise the sensor snaps
+    the value straight back. iOS Simulators expose no orientation surface
+    through simctl or idb, so the verb refuses there rather than pretending.
+    """
+    rotation = _ORIENTATIONS.get(orientation)
+    if rotation is None:
+        raise errors.AutonomError(
+            errors.INVALID_COORDINATES,
+            f"unknown orientation {orientation!r}",
+            "Orientations: " + ", ".join(_ORIENTATIONS) + ".",
+        )
+    if target.platform == IOS:
+        raise _unsupported(target, "setOrientation",
+                           "simctl/idb expose no orientation control; rotate "
+                           "in the Simulator app manually.")
+    adb_mod.run_adb(
+        target.tool,
+        ["shell", "settings", "put", "system", "accelerometer_rotation", "0"],
+        serial=target.target_id, timeout=10, check=True,
+    )
+    adb_mod.run_adb(
+        target.tool,
+        ["shell", "settings", "put", "system", "user_rotation", rotation],
+        serial=target.target_id, timeout=10, check=True,
+    )
+    return {"orientation": orientation, "user_rotation": rotation}
+
+
 # --- permissions -------------------------------------------------------------
 
 

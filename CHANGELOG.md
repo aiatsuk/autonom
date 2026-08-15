@@ -7,6 +7,28 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-08-15
+
+Flow v1 surface completion; ten review-confirmed executor/language defects
+fixed (see the commit "Fix ten defects the adversarial review...").
+
+### Added
+- Relational selectors: `above`, `below`, `leftOf`, `rightOf` (pure edge
+  geometry against a provably unique anchor), `childOf` (ancestors),
+  `containsChild` (direct children) — powered by an additive `parent` ref
+  every compact-node snapshot now carries.
+- `focused` selector/state field on both platforms; iOS `AXFocused` was
+  misfiled under `focusable` and is now mapped correctly (iOS `focusable`
+  reads false — the platform has no such concept).
+- Commands: `longPressOn` (Android zero-distance swipe / idb `--duration`),
+  `doubleTapOn`, `setOrientation` (Android `user_rotation`; refuses on iOS;
+  invalidates the executor's cached screen size), `retry:` (explicit,
+  max 3 attempts, `onlyOn` code filter, mutations demand
+  `allowMutations: true`, no nesting/runFlow inside, every attempt in the
+  journal and events), `group:` (labeled boundary events).
+- CLI: `ui tap --duration MS` long-presses via the same adapters.
+
+
 ## [0.20.2] - 2026-08-15
 
 Flow DSL v1, slice 3 of 3: composition, suites, packaging.

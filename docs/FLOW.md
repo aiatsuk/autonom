@@ -82,10 +82,26 @@ selector:
 ```
 
 String fields: `id` (resource-id / accessibility identifier), `text`,
-`description`, `role`. State fields: `enabled`, `checked`, `selected`.
-**iOS caveat:** UIKit/SwiftUI expose the visible label as `description`
-(`AXLabel`), not `text` (`AXValue`) — cross-platform flows should prefer
-`id`, then `description`.
+`description`, `role`. State fields: `enabled`, `checked`, `selected`,
+`focused`. **iOS caveat:** UIKit/SwiftUI expose the visible label as
+`description` (`AXLabel`), not `text` (`AXValue`) — cross-platform flows
+should prefer `id`, then `description`.
+
+Relational constraints narrow a match by another element (the *anchor*):
+
+```yaml
+selector:
+  text: Settings
+  match: exact
+  leftOf:            # also: above, below, rightOf, childOf, containsChild
+    id: com.example.app:id/settings_secondary
+```
+
+Geometry is a pure edge comparison (no "nearest" guessing) and the anchor
+of a geometric relation must match exactly one on-screen element; `childOf`
+walks ancestors and `containsChild` checks direct children via the parent
+refs every snapshot carries. Anchors identify by fields alone — no `index`,
+no nested relations.
 
 ## Where flow files live
 
@@ -110,13 +126,16 @@ is not listed here fails the build, and vice versa.
 ```text
 header: schema appId name id description tags properties env requires evidence onFlowStart onFlowComplete
 selector-strings: id text description role
-selector-bools: enabled checked selected
+selector-bools: enabled checked selected focused
+selector-relational: above below leftOf rightOf childOf containsChild
 match-modes: exact caseInsensitiveExact contains regex
 command launchApp: clearState label
 command stopApp: label
 command clearState: label
 command openLink: url label
 command tapOn: selector label timeoutMs optional reason
+command longPressOn: selector durationMs label timeoutMs optional reason
+command doubleTapOn: selector label timeoutMs optional reason
 command inputText: value sensitive label
 command eraseText: chars label
 command pressKey: key label
@@ -131,11 +150,14 @@ command waitUntil: visible notVisible timeoutMs label
 command setLocation: latitude longitude label
 command setPermissions: action service appId label
 command addMedia: path label
+command setOrientation: orientation label
 command runFlow: file env when label
+command retry: commands maxAttempts onlyOn allowMutations label
+command group: commands label
 command takeScreenshot: label
 command checkpoint: name
 command note: text
-deferred: longPressOn doubleTapOn waitForIdle setOrientation retry group extendedWaitUntil runScript evalScript repeat
+deferred: waitForIdle extendedWaitUntil runScript evalScript repeat
 ```
 
 ## Semantics fixed by the language (run slice)

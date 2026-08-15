@@ -35,7 +35,8 @@ class RegistryIntegrityTests(unittest.TestCase):
         for name, spec in schema.REGISTRY.items():
             with self.subTest(command=name):
                 self.assertIsInstance(spec.mutating, bool)
-                self.assertIn(spec.since, ("0.20.0", "0.20.1", "0.20.2"))
+                self.assertIn(spec.since,
+                              ("0.20.0", "0.20.1", "0.20.2", "0.21.0"))
 
     def test_assertions_are_never_mutating(self) -> None:
         for spec in schema.REGISTRY.values():
@@ -182,10 +183,65 @@ class SelectorTests(unittest.TestCase):
         flow = _build(_HEAD + "- tapOn: Login\n")
         self.assertEqual(flow.steps[0].selector.match, "exact")
 
-    def test_relational_fields_reject_with_hint(self) -> None:
-        exc = _rejects(self, _HEAD + "- tapOn:\n    selector:\n      below: x\n",
-                       errors.FLOW_SELECTOR_INVALID)
-        self.assertIn("planned", exc.hint)
+    def test_relational_fields_build_engine_specs(self) -> None:
+        flow = _build(_HEAD + "- tapOn:\n    selector:\n      text: Settings\n"
+                              "      leftOf:\n        id: anchor_id\n"
+                              "        match: contains\n")
+        selector = flow.steps[0].selector
+        self.assertEqual(selector.relations["left_of"], {
+            "fields": {"resource_id": "anchor_id"},
+            "mode": "contains", "case_sensitive": True,
+        })
+        self.assertIn("leftOf", selector.source_relations)
+
+    def test_relational_anchor_rules(self) -> None:
+        # anchors carry no index and no nested relations
+        _rejects(self, _HEAD + "- tapOn:\n    selector:\n      text: a\n"
+                               "      below:\n        id: x\n        index: 0\n",
+                 errors.FLOW_SELECTOR_INVALID, "index")
+        _rejects(self, _HEAD + "- tapOn:\n    selector:\n      text: a\n"
+                               "      below:\n        id: x\n"
+                               "        above:\n          id: y\n",
+                 errors.FLOW_SELECTOR_INVALID, "nest")
+        # a relation alone is a legal selector; a bare state field is not
+        flow = _build(_HEAD + "- assertVisible:\n    selector:\n"
+                              "      childOf:\n        id: list\n")
+        self.assertIn("child_of", flow.steps[0].selector.relations)
+
+    def test_focused_is_a_selector_field(self) -> None:
+        flow = _build(_HEAD + "- assertVisible:\n    selector:\n"
+                              "      id: email\n      focused: true\n")
+        self.assertIs(flow.steps[0].selector.fields["focused"], True)
+
+    def test_retry_static_rules(self) -> None:
+        _rejects(self, _HEAD + "- retry:\n    maxAttempts: 4\n    commands:\n"
+                               "      - assertVisible:\n          selector:\n"
+                               "            id: a\n",
+                 errors.FLOW_COMMAND_INVALID, "between 1 and 3")
+        _rejects(self, _HEAD + "- retry:\n    commands:\n"
+                               "      - tapOn:\n          selector:\n"
+                               "            id: a\n",
+                 errors.FLOW_COMMAND_INVALID, "allowMutations")
+        _rejects(self, _HEAD + "- retry:\n    commands:\n"
+                               "      - retry:\n          commands:\n"
+                               "            - assertVisible:\n"
+                               "                selector:\n"
+                               "                  id: a\n",
+                 errors.FLOW_COMMAND_INVALID, "retry cannot contain")
+        flow = _build(_HEAD + "- retry:\n    allowMutations: true\n"
+                              "    onlyOn:\n      - flow_assertion_timeout\n"
+                              "    commands:\n"
+                              "      - tapOn:\n          selector:\n"
+                              "            id: a\n")
+        self.assertEqual(flow.steps[0].args["maxAttempts"], 2)
+
+    def test_group_rules(self) -> None:
+        _rejects(self, _HEAD + "- group:\n    commands:\n      - back\n",
+                 errors.FLOW_COMMAND_INVALID, "label")
+        _rejects(self, _HEAD + "- group:\n    label: outer\n    commands:\n"
+                               "      - group:\n          label: inner\n"
+                               "          commands:\n            - back\n",
+                 errors.FLOW_COMMAND_INVALID, "nest")
 
     def test_state_only_selector_is_too_broad(self) -> None:
         _rejects(self, _HEAD + "- tapOn:\n    selector:\n      enabled: true\n",

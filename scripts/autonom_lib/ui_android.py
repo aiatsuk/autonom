@@ -56,6 +56,7 @@ def compact_node(node: Any, ref: str) -> dict[str, Any]:
         "clickable": node.bool_attr("clickable"),
         "enabled": node.bool_attr("enabled"),
         "focusable": node.bool_attr("focusable"),
+        "focused": node.bool_attr("focused"),
         "scrollable": node.bool_attr("scrollable"),
         "selected": node.bool_attr("selected"),
         "checked": node.bool_attr("checked"),
@@ -138,6 +139,17 @@ def screen_size(adb: str, serial: str) -> tuple[int, int] | None:
 
 def tap(adb: str, serial: str, x: int, y: int) -> None:
     adb_mod.run_adb(adb, ["shell", "input", "tap", str(x), str(y)], serial=serial, timeout=10, check=True)
+
+
+def long_press(adb: str, serial: str, x: int, y: int, duration_ms: int) -> None:
+    # A zero-distance swipe with a duration IS Android's long press.
+    adb_mod.run_adb(
+        adb,
+        ["shell", "input", "swipe", str(x), str(y), str(x), str(y), str(duration_ms)],
+        serial=serial,
+        timeout=20,
+        check=True,
+    )
 
 
 def swipe(adb: str, serial: str, x1: int, y1: int, x2: int, y2: int, duration: float) -> None:

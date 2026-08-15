@@ -52,6 +52,7 @@ def registry_surface() -> dict:
             "header": list(schema.HEADER_FIELDS),
             "selector-strings": list(schema.SELECTOR_STRING_FIELDS),
             "selector-bools": list(schema.SELECTOR_BOOL_FIELDS),
+            "selector-relational": list(schema.SELECTOR_RELATIONAL_FIELDS),
             "match-modes": list(schema.MATCH_MODES),
             "deferred": list(schema.DEFERRED_COMMANDS),
         },

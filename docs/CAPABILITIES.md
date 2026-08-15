@@ -102,7 +102,7 @@ autonom session clear <app-id> [--strategy auto|reinstall|privacy]
 autonom ui tree [--dump FILE] [--all] [--max-depth N] [--max-nodes N]
 autonom ui find [--text|--desc|--resource-id|--class-name|--package|--role] [--mode exact|contains|regex]
                 [--case-sensitive] [--index N] [--clickable B] [--enabled B] [--all] [--dump FILE]
-autonom ui tap [selector flags] | [--x X --y Y]
+autonom ui tap [selector flags] | [--x X --y Y] [--duration MS]
 autonom ui swipe --from X,Y --to X,Y [--duration S]
 autonom ui pinch --at X,Y [--scale F] | ui rotate | ui shake   # iOS only
 autonom ui type <text>

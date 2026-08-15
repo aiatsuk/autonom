@@ -27,6 +27,8 @@ def select(nodes: list, flow_selector: FlowSelector) -> list:
         "enabled": selectors.get("enabled"),
         "checked": selectors.get("checked"),
         "selected": selectors.get("selected"),
+        "focused": selectors.get("focused"),
+        **flow_selector.relations,
     }
     return selector_engine.select(
         nodes, engine_keys, mode=mode, case_sensitive=case_sensitive,
@@ -40,4 +42,6 @@ def describe(flow_selector: FlowSelector) -> dict:
     described["match"] = flow_selector.match
     if flow_selector.index is not None:
         described["index"] = flow_selector.index
+    for name, anchor in flow_selector.source_relations.items():
+        described[name] = describe(anchor)
     return described

@@ -49,6 +49,39 @@ env:
 - swipe:
     direction: left
     durationMs: 300
+- longPressOn:
+    selector:
+      id: row_item
+    durationMs: 800
+- doubleTapOn:
+    selector:
+      description: Zoomable image
+- tapOn:
+    selector:
+      text: Settings
+      match: exact
+      focused: false
+      leftOf:
+        id: settings_secondary
+      childOf:
+        role: framelayout
+        match: caseInsensitiveExact
+- setOrientation: landscape
+- retry:
+    maxAttempts: 3
+    onlyOn:
+      - flow_assertion_timeout
+    commands:
+      - assertVisible:
+          selector:
+            id: retryable_status
+- group:
+    label: wrap-up checks
+    commands:
+      - assertNotVisible:
+          selector:
+            text: Error
+            match: contains
 - pressKey: KEYCODE_BACK
 - back
 - eraseText:

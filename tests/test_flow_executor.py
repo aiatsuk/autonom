@@ -475,6 +475,139 @@ class ReviewRegressionTests(_AndroidRunBase):
         self.assertIn("line", envelope)
 
 
+class Slice021CommandTests(_AndroidRunBase):
+    """0.21.0: relational selectors, long/double press, orientation, group."""
+
+    def test_relational_tap_disambiguates_and_hits_the_left_twin(self) -> None:
+        flow = self._flow(
+            "- tapOn:\n"
+            "    selector:\n"
+            "      text: Settings\n"
+            "      match: exact\n"
+            "      leftOf:\n"
+            "        id: com.example.app:id/settings_secondary\n")
+        result = self._cli("flow", "run", str(flow))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        taps = self._taps()
+        self.assertEqual(len(taps), 1)
+        # center of the left twin [40,100,440,220]
+        self.assertEqual(taps[0][-2:], ["240", "160"])
+
+    def test_long_press_is_a_zero_distance_swipe(self) -> None:
+        flow = self._flow(
+            "- longPressOn:\n"
+            "    selector:\n"
+            "      description: Flutter Save Button\n"
+            "    durationMs: 800\n")
+        result = self._cli("flow", "run", str(flow))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        presses = [a for a in self._adb_calls()
+                   if a[2:5] == ["shell", "input", "swipe"]]
+        self.assertEqual(len(presses), 1)
+        self.assertEqual(presses[0][5:], ["300", "360", "300", "360", "800"])
+
+    def test_double_tap_dispatches_twice_exactly(self) -> None:
+        flow = self._flow(
+            "- doubleTapOn:\n"
+            "    selector:\n"
+            "      description: Flutter Save Button\n")
+        result = self._cli("flow", "run", str(flow))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self._taps()), 2)
+
+    def test_set_orientation_android_and_ios_refusal(self) -> None:
+        flow = self._flow("- setOrientation: landscape\n")
+        result = self._cli("flow", "run", str(flow))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rotations = [a for a in self._adb_calls()
+                     if a[2:6] == ["shell", "settings", "put", "system"]]
+        self.assertEqual([r[6:] for r in rotations],
+                         [["accelerometer_rotation", "0"], ["user_rotation", "1"]])
+
+    def test_group_wraps_steps_with_boundary_events(self) -> None:
+        flow = self._flow(
+            "- group:\n"
+            "    label: sanity\n"
+            "    commands:\n"
+            "      - back\n"
+            "      - assertVisible:\n"
+            "          selector:\n"
+            "            id: com.example.app:id/search\n")
+        result = self._cli("flow", "run", str(flow))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        summary = json.loads(result.stdout)
+        self.assertEqual([s["command"] for s in summary["steps"]],
+                         ["back", "assertVisible"])
+        kinds = [json.loads(line)["kind"]
+                 for line in Path(summary["events"]).read_text().splitlines()]
+        self.assertEqual(kinds.count("flow.step.started"), 3)  # group + 2 steps
+
+
+class RetryExecutionTests(EnvSandboxMixin, unittest.TestCase):
+    """In-process retry semantics with an injectable clock."""
+
+    def setUp(self) -> None:
+        import tempfile as _tempfile
+        self._tmp = _tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.sandbox_home()
+
+    def _executor(self):
+        target = Target("android", "emulator-5554", str(FAKE_ADB),
+                        {"serial": "emulator-5554"})
+        session = {"session_id": "s_test", "artifacts_dir": self._tmp.name}
+        clock_value = [0.0]
+        return flow_executor.Executor(
+            target, session,
+            flow_executor.RunConfig(default_timeout_ms=500, interval_ms=500),
+            clock=lambda: clock_value[0],
+            sleep=lambda s: clock_value.__setitem__(0, clock_value[0] + s),
+            screen=(1080, 1920),
+        )
+
+    def _build(self, body: str):
+        return flow_schema.build_flow(
+            flow_parser.parse_document(_HEAD + body, "t.yaml"))
+
+    def test_retry_succeeds_on_the_second_attempt(self) -> None:
+        node = {"ref": "n1", "resource_id": "status", "bounds": [0, 0, 10, 10],
+                "enabled": True}
+        flow = self._build(
+            "- retry:\n"
+            "    maxAttempts: 2\n"
+            "    onlyOn:\n      - flow_assertion_timeout\n"
+            "    commands:\n"
+            "      - assertVisible:\n"
+            "          selector:\n"
+            "            id: status\n")
+        runner = self._executor()
+        responses = [[], [], [node]]  # attempt 1 times out, attempt 2 sees it
+        with mock.patch("autonom_lib.ui.snapshot",
+                        side_effect=lambda _t: responses.pop(0)
+                        if responses else [node]):
+            result = runner.run(flow)
+        self.assertEqual(result.status, "passed")
+        statuses = [(s.command, s.status, s.error_code) for s in result.steps]
+        self.assertEqual(statuses[0][1], "failed", statuses)
+        self.assertEqual(statuses[1][1], "passed", statuses)
+
+    def test_retry_does_not_catch_codes_outside_only_on(self) -> None:
+        flow = self._build(
+            "- retry:\n"
+            "    maxAttempts: 3\n"
+            "    onlyOn:\n      - no_matching_node\n"
+            "    commands:\n"
+            "      - assertVisible:\n"
+            "          selector:\n"
+            "            id: status\n")
+        runner = self._executor()
+        with mock.patch("autonom_lib.ui.snapshot", return_value=[]):
+            result = runner.run(flow)
+        self.assertEqual(result.status, "failed")
+        failed = [s for s in result.steps if s.status == "failed"]
+        self.assertEqual(len(failed), 1, "one attempt only — the code is not retryable")
+
+
 class IosLoginFlowTests(unittest.TestCase):
     """The same shape on fake iOS — selectors via id/description, proving the
     platform caveat: the visible label lives in `description`, not `text`."""
