@@ -7,6 +7,30 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
 
 ## [Unreleased]
 
+## [0.27.0] - 2026-08-15
+
+### Added
+- Live session observation (research Phase 4 §2L). `session outputs`
+  catalogs every followable session file — registered `streams[]` plus a
+  conventional scan of `output/`, `logs/`, `network/` — with `abs_path` and
+  a copy-pasteable `shell_hint` (`tail -f …`) for a human's second terminal.
+- `logs follow` streams a session file (`--path`, `--source output:<name>`,
+  or a stream id) or the device log (`--source device`) as NDJSON lines,
+  always bounded by `--max-seconds` / `--max-lines`, with `--grep`,
+  `--from-start`, and rotation-aware tailing. Files are confined to the
+  session artifacts dir (`path_forbidden`).
+- `network requests follow` polls the flow store and emits only new flows
+  as NDJSON; `network requests list --since-id` pages from a cursor (an
+  unknown cursor returns everything plus a `since_id_not_found` warning,
+  never a silent empty). `journal --follow` tails the session timeline.
+- Session records register their long-lived writers: the iOS `--log-stream`
+  file and the mitm flow store appear in `session.json` `streams[]`; older
+  sessions fall back to the directory scan.
+- New stable error codes: `stream_not_found`, `path_forbidden`. Every
+  follow ends with one `{"kind": "eof", "reason": …}` line — the NDJSON
+  streaming exception is documented in COMPATIBILITY.md alongside
+  `flow run --events`.
+
 ## [0.26.0] - 2026-08-15
 
 ### Added

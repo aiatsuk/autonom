@@ -52,10 +52,10 @@ Legend: ✅ shipped · ⚠️ partial · 🔜 planned · ❌ not planned for nea
 | Atlas-lite: observed screens/transitions graph | ✅ | ✅ | `atlas update|show|coverage|paths|export|diff`; fingerprints ride in run events; observed-only, unknown stays unknown |
 | Evidence: run manifest + HTML/JUnit reports | ✅ | ✅ | `report build|open|export`; self-contained HTML (CSP, inline screenshots), JUnit for CI, failure log window |
 | Flow DSL: Maestro Core Profile import/export | ✅ | ✅ | `flow import`/`flow export --format maestro`; outside-profile constructs refuse with `unsupported_flow_command` |
-| Live session outputs catalog | 🔜 | 🔜 | Phase 4 — `session outputs` + paths for `tail -f`; see `docs/plans/PHASE_4_METRICS.md` §2L |
-| Live follow (session files / device logs) | 🔜 | 🔜 | Phase 4 — `logs follow` (NDJSON, bounded) |
-| Network requests list | ✅ | ✅ | `network requests list --max N`; follow/poll in Phase 4 |
-| Network requests follow | 🔜 | 🔜 | Phase 4 — poll new flows as NDJSON |
+| Live session outputs catalog | ✅ | ✅ | `session outputs` — registered `streams[]` + directory scan, `abs_path`/`shell_hint` for `tail -f` |
+| Live follow (session files / device logs) | ✅ | ✅ | `logs follow` — NDJSON lines, always bounded by `--max-seconds`/`--max-lines`; `journal --follow` for the timeline |
+| Network requests list | ✅ | ✅ | `network requests list --max N --since-id F` |
+| Network requests follow | ✅ | ✅ | `network requests follow` — polls the store, emits only new flows as NDJSON |
 | Metrics snapshot (memory/CPU summary) | 🔜 | 🔜 | Phase 4 — `autonom metrics snapshot` |
 | Metrics series (directional growth) | 🔜 | 🔜 | Phase 4 — same plan; Android meminfo series exists as skill script today |
 | Memory capture pack / HPROF | ⚠️ | 🔜 | Android skill helpers; CLI in Phase 4 |
@@ -100,6 +100,7 @@ autonom doctor [--strict] [--mitmdump PATH]
 
 autonom session start [--app-id ID] [--install PATH] [--launch [ID]] [--activity C] [--log-stream]
 autonom session show|stop
+autonom session outputs [--session-id ID]
 autonom session launch <app-id> [--activity C] [--arg A] [--setenv K=V]
 autonom session force-stop|uninstall <app-id>
 autonom session clear <app-id> [--strategy auto|reinstall|privacy]
@@ -142,8 +143,11 @@ autonom shots show <path>
 autonom record start [--name N] | record stop
 autonom note add <text> [--task T] [--tag T] [--author A] | note list [--task --grep --max]
 autonom journal [--kind action|note] [--verb V] [--task T] [--grep P] [--max N]
+                [--follow] [--session-id ID] [--from-start] [--max-seconds N] [--max-lines N]
 
 autonom logs tail [--package ID] [--since S] [--max-lines N] [--grep P]
+autonom logs follow [--source SRC | --path P] [--session-id ID] [--package ID] [--from-start]
+                    [--max-seconds N] [--max-lines N] [--grep P] [--poll-ms N]
 autonom crash list [--app-id ID] | crash show <name>
 autonom open <url>
 autonom permissions <grant|revoke|reset> <service> [app-id]
@@ -155,7 +159,9 @@ autonom network start --i-understand-mitm [--port N] [--capture-bodies] [--mitmd
                       [--ignore-hosts REGEX] [--intercept-connectivity-checks]
 autonom network attach --i-understand-mitm [--install-ca] [--no-network-cycle]
 autonom network detach|stop|status
-autonom network requests list [--host --method --status --path --since --mocked --max]
+autonom network requests list [--host --method --status --path --since --mocked --max --since-id]
+autonom network requests follow [--host --method --status --path --mocked] [--interval S]
+                                [--max N] [--max-seconds N] [--from-start]
 autonom network requests show <id> [--full]
 autonom network mock add [--url U | --match GLOB] [--method M] [--host H] [--status N]
                          [--header 'K: V'] [--json BODY | --body-file PATH] [--note N]

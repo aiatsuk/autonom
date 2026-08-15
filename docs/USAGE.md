@@ -146,6 +146,17 @@ failure screenshot and tell me what the app actually showed; do not retry the
 flow.
 ```
 
+## Watch a session live
+
+```text
+Run `autonom session outputs` and tell me what is followable. While I drive the
+app, stream errors with
+`autonom logs follow --source device --grep 'Exception|Error' --max-seconds 60`
+and new API calls with `autonom network requests follow --max-seconds 60`.
+Every follow must be bounded (--max-seconds / --max-lines); to watch in my own
+terminal give me the `shell_hint` (`tail -f <abs_path>`) from session outputs.
+```
+
 ## Check what this machine can do
 
 ```text

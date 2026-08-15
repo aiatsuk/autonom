@@ -24,6 +24,7 @@ from autonom_lib import device_state  # noqa: E402
 from autonom_lib import doctor as doctor_mod  # noqa: E402
 from autonom_lib import emulator as emulator_mod  # noqa: E402
 from autonom_lib import errors  # noqa: E402
+from autonom_lib import follow as follow_mod  # noqa: E402
 from autonom_lib import ios_idb  # noqa: E402
 from autonom_lib.flow import canonical as flow_canonical  # noqa: E402
 from autonom_lib.flow import compiler as flow_compiler  # noqa: E402
@@ -233,9 +234,14 @@ def cmd_session_start(args: argparse.Namespace) -> int:
 
     if target.platform == IOS and getattr(args, "log_stream", False):
         stream = session_mod.artifact_path(record, "logs", "stream.ndjson")
-        record["background"]["log_stream_pid"] = logs_mod.start_log_stream(
+        pid = logs_mod.start_log_stream(
             target, stream, bundle_id=record.get("app_id")
         )
+        record["background"]["log_stream_pid"] = pid
+        if pid:
+            session_mod.register_stream(
+                record, stream_id="log_stream", kind="device_log",
+                path="logs/stream.ndjson", label="ios log stream", pid=pid)
 
     session_mod.save(record)
     payload: dict[str, Any] = {"ok": True, "session": record}
@@ -472,8 +478,94 @@ def cmd_note_list(args: argparse.Namespace) -> int:
                  "truncated": total > len(entries), "notes": entries}, as_json=True)
 
 
+def _stream_print(payload: Any) -> None:
+    """One NDJSON line per event — the documented exception to the one-JSON-doc
+    rule, shared with `flow run --events` (docs/CAPABILITIES.md)."""
+    if isinstance(payload, str):
+        print(payload, flush=True)
+    else:
+        print(json.dumps(payload, ensure_ascii=False), flush=True)
+
+
+def _observed_session(args: argparse.Namespace) -> dict[str, Any]:
+    session_id = getattr(args, "session_id", None)
+    return _session_by_id(session_id) if session_id else session_mod.require_current()
+
+
+def cmd_session_outputs(args: argparse.Namespace) -> int:
+    record = _observed_session(args)
+    streams = follow_mod.catalog(record)
+    return emit({"ok": True, "session_id": record.get("session_id"),
+                 "artifacts_dir": record.get("artifacts_dir"),
+                 "count": len(streams), "streams": streams}, as_json=True)
+
+
+def cmd_logs_follow(args: argparse.Namespace) -> int:
+    limits = {"from_start": args.from_start, "max_seconds": args.max_seconds,
+              "max_lines": args.max_lines, "grep": args.grep}
+    if args.source == "device":
+        target = _target(args)
+        if target.platform == ANDROID:
+            argv = [target.tool, "-s", target.target_id, "logcat", "-v", "time"]
+            if args.package:
+                pid = logs_mod._pid_for_package(  # noqa: SLF001 - same package
+                    target.tool, target.target_id, args.package)
+                if pid:
+                    argv.append(f"--pid={pid}")
+            del limits["from_start"]  # a live stream has no beginning to replay
+            eof = follow_mod.follow_process(argv, source="device",
+                                            emit=_stream_print, **limits)
+        else:
+            current = session_mod.load_current()
+            stream = (Path(current["artifacts_dir"]) / "logs" / "stream.ndjson"
+                      if current else None)
+            if stream is not None and stream.exists():
+                eof = follow_mod.follow_file(
+                    stream, source="device", emit=_stream_print,
+                    poll_ms=args.poll_ms, **limits)
+            else:
+                argv = [target.tool, "simctl", "spawn", target.target_id,
+                        "log", "stream", "--style", "ndjson", "--level", "info"]
+                if args.package:
+                    argv += ["--predicate", logs_mod._ios_predicate(args.package)]  # noqa: SLF001
+                del limits["from_start"]
+                eof = follow_mod.follow_process(argv, source="device",
+                                                emit=_stream_print, **limits)
+    else:
+        record = _observed_session(args)
+        base = Path(record["artifacts_dir"])
+        if args.path:
+            path = follow_mod.confine(base, args.path)
+            source = args.path
+        elif args.source:
+            path = follow_mod.resolve_source(record, args.source)
+            source = args.source
+        else:
+            raise errors.AutonomError(
+                errors.STREAM_NOT_FOUND,
+                "nothing to follow: pass --source or --path",
+                "List followable streams with 'autonom session outputs', or "
+                "use --source device for the device log.",
+            )
+        eof = follow_mod.follow_file(path, source=source, emit=_stream_print,
+                                     poll_ms=args.poll_ms, **limits)
+    global _LAST_EMIT
+    _LAST_EMIT = {"ok": True, **eof}  # journal the summary, not every line
+    return 0
+
+
 def cmd_journal(args: argparse.Namespace) -> int:
     session = session_mod.load_current()
+    if getattr(args, "follow", False):
+        record = _observed_session(args)
+        eof = follow_mod.follow_file(
+            journal_mod.journal_path(record), source="journal",
+            emit=_stream_print, raw=True, from_start=args.from_start,
+            max_seconds=args.max_seconds, max_lines=args.max_lines,
+            grep=args.grep)
+        global _LAST_EMIT
+        _LAST_EMIT = {"ok": True, **eof}
+        return 0
     if not session:
         return emit({"ok": True, "count": 0, "total_matched": 0, "truncated": False,
                      "entries": [], "note": "no active session"}, as_json=True)
@@ -866,6 +958,9 @@ def cmd_network_start(args: argparse.Namespace) -> int:
     network = record.setdefault("network", {})
     network.update({"enabled": True, "proxy_host": state["proxy_host"],
                     "proxy_port": state["port"]})
+    session_mod.register_stream(record, stream_id="network_flows",
+                                kind="network", path="network/flows.jsonl",
+                                label="mitm flows")
     session_mod.save(record)
 
     payload: dict[str, Any] = {"ok": True, **state}
@@ -1033,8 +1128,38 @@ def cmd_network_requests_list(args: argparse.Namespace) -> int:
         path_glob=args.path,
         since_seconds=args.since,
         mocked=args.mocked,
+        since_id=args.since_id,
     )
     return emit({"ok": True, **payload}, as_json=True)
+
+
+def cmd_network_requests_follow(args: argparse.Namespace) -> int:
+    record = session_mod.require_current()
+    filters = {"host": args.host, "method": args.method, "status": args.status,
+               "path_glob": args.path, "mocked": args.mocked}
+    seen: set[str] = set()
+    if not args.from_start:
+        flows, _warnings = store_mod.read_all(record)
+        seen = {flow.get("id") for flow in flows if flow.get("id")}
+
+    def fetch_new() -> list[dict[str, Any]]:
+        flows, _warnings = store_mod.read_all(record)
+        fresh = []
+        for flow in flows:
+            flow_id = flow.get("id")
+            if not flow_id or flow_id in seen:
+                continue
+            seen.add(flow_id)  # dedup happens pre-filter: skipped ≠ unseen
+            if store_mod.filter_flows([flow], **filters):
+                fresh.append(flow)
+        return fresh
+
+    eof = follow_mod.follow_poll(
+        fetch_new, emit=_stream_print, interval=args.interval,
+        max_seconds=args.max_seconds, max_items=args.max)
+    global _LAST_EMIT
+    _LAST_EMIT = {"ok": True, **eof}
+    return 0
 
 
 def cmd_network_requests_show(args: argparse.Namespace) -> int:
@@ -1907,6 +2032,10 @@ def build_parser() -> argparse.ArgumentParser:
     p = session_sub.add_parser("stop", help="stop current session metadata", parents=[target_flags])
     p.set_defaults(func=cmd_session_stop)
 
+    p = session_sub.add_parser("outputs", help="catalog followable session streams",
+                               parents=[target_flags])
+    p.add_argument("--session-id", help="a past session instead of the current one")
+    p.set_defaults(func=cmd_session_outputs)
     p = session_sub.add_parser("show", help="show current session", parents=[target_flags])
     p.set_defaults(func=cmd_session_show)
 
@@ -2007,6 +2136,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--task", help="only entries under this task label")
     p.add_argument("--grep", help="regex over every field")
     p.add_argument("--max", type=int, default=100)
+    p.add_argument("--follow", action="store_true",
+                   help="stream new journal lines as NDJSON instead of listing")
+    p.add_argument("--from-start", action="store_true",
+                   help="with --follow: replay the whole journal first")
+    p.add_argument("--max-seconds", type=float, default=0,
+                   help="with --follow: stop after N seconds")
+    p.add_argument("--max-lines", type=int, default=0,
+                   help="with --follow: stop after N emitted lines")
+    p.add_argument("--session-id", help="with --follow: a past session's journal")
     p.set_defaults(func=cmd_journal)
 
     shots = sub.add_parser("shots", help="browse captured screenshots")
@@ -2252,7 +2390,22 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--since", type=float, help="seconds")
     p.add_argument("--mocked", type=lambda v: v.lower() in {"1", "true", "yes"}, default=None)
     p.add_argument("--max", type=int, default=store_mod.DEFAULT_MAX)
+    p.add_argument("--since-id", help="only flows recorded after this id")
     p.set_defaults(func=cmd_network_requests_list)
+    p = requests_sub.add_parser("follow", parents=[target_flags],
+                                help="poll the store, stream new flows as NDJSON")
+    p.add_argument("--host")
+    p.add_argument("--method")
+    p.add_argument("--status", type=int)
+    p.add_argument("--path", help="glob over path or url")
+    p.add_argument("--mocked", type=lambda v: v.lower() in {"1", "true", "yes"}, default=None)
+    p.add_argument("--interval", type=float, default=1.0, help="poll seconds")
+    p.add_argument("--max", type=int, default=0, help="stop after N new flows")
+    p.add_argument("--max-seconds", type=float, default=0,
+                   help="stop after N seconds (0 = until interrupted)")
+    p.add_argument("--from-start", action="store_true",
+                   help="emit already-recorded flows first, then follow")
+    p.set_defaults(func=cmd_network_requests_follow)
     p = requests_sub.add_parser("show", parents=[target_flags])
     p.add_argument("id")
     p.add_argument("--full", action="store_true", help="include full bodies when captured")
@@ -2315,6 +2468,22 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-lines", type=int, default=200)
     p.add_argument("--grep", help="regex filter")
     p.set_defaults(func=cmd_logs_tail)
+    p = logs_sub.add_parser("follow", help="stream a session file or the device "
+                                           "log as NDJSON", parents=[target_flags])
+    p.add_argument("--source", help="'device', a stream id, or output:<name> / "
+                                    "logs:<name> / network:<name>")
+    p.add_argument("--path", help="file to tail, relative to the session artifacts dir")
+    p.add_argument("--session-id", help="a past session instead of the current one")
+    p.add_argument("--package", help="device mode: filter to this package / bundle id")
+    p.add_argument("--from-start", action="store_true",
+                   help="replay the existing file, then follow (default: start at end)")
+    p.add_argument("--max-seconds", type=float, default=0,
+                   help="stop after N seconds (0 = until interrupted; CI must bound)")
+    p.add_argument("--max-lines", type=int, default=0, help="stop after N emitted lines")
+    p.add_argument("--grep", help="regex filter; only matching lines are emitted")
+    p.add_argument("--poll-ms", type=int, default=250,
+                   help="file poll interval in milliseconds")
+    p.set_defaults(func=cmd_logs_follow)
 
     return parser
 
@@ -2329,6 +2498,7 @@ _SUBCOMMAND_DESTS = (
     "report_command", "network_command", "requests_command", "mock_command",
     "location_command", "media_command", "crash_command", "file_command",
     "record_command", "shots_command", "devices_command", "note_command",
+    "logs_command",
 )
 
 

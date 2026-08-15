@@ -97,6 +97,14 @@ SWEEP: list[tuple[str, list[str], bool]] = [
     # empty, never an error. A note needs a session, so it fails cleanly.
     ("journal", ["journal"], True),
     ("note_add", ["note", "add", "a thought"], False),
+    # Live observation needs a session; every follow refuses cleanly and is
+    # bounded so the sweep can never hang on it.
+    ("session_outputs", ["session", "outputs"], False),
+    ("logs_follow", ["logs", "follow", "--path", "output/x.log",
+                     "--max-seconds", "1"], False),
+    ("network_requests_follow", ["network", "requests", "follow",
+                                 "--max-seconds", "1"], False),
+    ("journal_follow", ["journal", "--follow", "--max-seconds", "1"], False),
 ]
 
 

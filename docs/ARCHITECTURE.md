@@ -80,6 +80,7 @@ scripts/autonom_lib/
   emulator.py                 AVD discovery, emulator boot and kill
   device_state.py             deep links, permissions, location, media, crashes, files, recording
   screenshot.py / logs.py     per-platform dispatch; shots carry provenance metadata in the PNG
+  follow.py                   bounded NDJSON follows: file tail, device-log stream, store poll
   processes.py                machine-wide process registry, orphan detection, reaping
   doctor.py                   toolchain, capabilities, session, orphans
   paths.py                    locate the bundled skill helper scripts

@@ -69,6 +69,10 @@ CONSENT_REQUIRED = "consent_required"
 CONSENT_DECLINED = "consent_declined"
 PHYSICAL_DEVICE_ATTACH_UNSUPPORTED = "physical_device_attach_unsupported"
 
+# --- Live observation (Phase 4) ----------------------------------------------
+STREAM_NOT_FOUND = "stream_not_found"
+PATH_FORBIDDEN = "path_forbidden"
+
 # --- Flow DSL ----------------------------------------------------------------
 # The DSL's code family is deliberately distinct from network capture's
 # FLOW_NOT_FOUND above ("flow" there is a recorded HTTP request, mitmproxy's

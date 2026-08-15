@@ -78,6 +78,7 @@ def new_record(
             "previous_http_proxy": None,
         },
         "background": {"log_stream_pid": None, "recorder_pid": None},
+        "streams": [],
         "consent_log": [],
     }
     if platform == "android":
@@ -115,8 +116,32 @@ def upgrade(record: dict[str, Any]) -> dict[str, Any]:
         },
     )
     upgraded.setdefault("background", {"log_stream_pid": None, "recorder_pid": None})
+    upgraded.setdefault("streams", [])
     upgraded.setdefault("consent_log", [])
     return upgraded
+
+
+def register_stream(record: dict[str, Any], *, stream_id: str, kind: str,
+                    path: str, label: str | None = None,
+                    pid: int | None = None) -> dict[str, Any]:
+    """Record a followable append-only file so `session outputs` can list it.
+
+    Idempotent per stream_id: a writer restarting (network start twice) updates
+    its entry in place. `path` is relative to the artifacts dir. The caller
+    saves the record.
+    """
+    entry: dict[str, Any] = {"id": stream_id, "kind": kind, "path": path}
+    if label:
+        entry["label"] = label
+    if pid:
+        entry["pid"] = pid
+    streams = record.setdefault("streams", [])
+    for index, existing in enumerate(streams):
+        if existing.get("id") == stream_id:
+            streams[index] = entry
+            return record
+    streams.append(entry)
+    return record
 
 
 def start_session(
@@ -139,7 +164,8 @@ def start_session(
         raise errors.AutonomError(errors.NO_TARGET, "a target id is required to start a session")
     session_id = f"s_{uuid.uuid4().hex[:10]}"
     root = artifacts_root(cwd) / session_id
-    for name in ("shots", "trees", "logs", "network", "recordings", "crashes", "files"):
+    for name in ("shots", "trees", "logs", "network", "recordings", "crashes",
+                 "files", "output"):
         (root / name).mkdir(parents=True, exist_ok=True)
 
     resolved_tooling = dict(tooling or {})
