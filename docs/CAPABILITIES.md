@@ -153,6 +153,7 @@ exit code 2, so an agent can branch on `error_code` rather than parse prose.
 | `AUTONOM_ADB`, `AUTONOM_SIMCTL`, `AUTONOM_IDB`, `AUTONOM_EMULATOR`, `AUTONOM_MITMDUMP` | Binary paths, equivalent to the matching flag |
 | `AUTONOM_IDB_COMPANION` | `host:port` of an idb companion on another Mac |
 | `AUTONOM_PREFIX`, `AUTONOM_BIN_DIR` | Installer only: bundle home and the directory `autonom` is linked into |
+| `AUTONOM_REQUIRE_SHELLCHECK` | Dev tooling only: `run_checks.sh` fails instead of skipping the shell lint when shellcheck is missing (set by CI) |
 
 ## Evidence ladder (unchanged)
 

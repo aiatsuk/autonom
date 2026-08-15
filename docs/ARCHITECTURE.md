@@ -29,8 +29,10 @@ The core design is **routing first, evidence second**.
 5. Helpers (UI Automator parsers, browser bridge, meminfo/frame tools) back the CLI
    and specialized skills.
 6. `./scripts/run_checks.sh` validates manifests, frontmatter, Python/Node syntax,
-   and the unit suite. It is run locally; this repository ships no CI
-   configuration, so "green" means a clean local run.
+   and the unit suite. The same script runs locally and in GitHub Actions:
+   `checks` on every PR and push to main (ubuntu + macOS, pinned Python and
+   Node, shellcheck required), `android-smoke` on main (a real API-30 emulator
+   driven through the CLI), and `release` on `v*` tags. "Green" means CI green.
 
 ## Control plane
 
@@ -153,7 +155,8 @@ point/pixel mix-up otherwise "succeeds" while landing in the wrong place.
 | Plugin manifests | `plugins/autonom/.claude-plugin/plugin.json`, `.codex-plugin/plugin.json` | Claude, Codex |
 | One-command installer | `install.sh` (+ `scripts/bootstrap.sh` for device tools) | everyone |
 | Per-layer installers | `install_cli.sh`, `install_claude.sh`, `install_codex.sh`, `install_skills.sh` | Claude, Codex, Grok, generic |
-| Validation | `scripts/validate_plugin.py`, `scripts/run_checks.sh` | local |
+| Validation | `scripts/validate_plugin.py`, `scripts/run_checks.sh` | local + CI (`.github/workflows/`) |
+| Release | `scripts/build_release.sh`, `.github/workflows/release.yml`, `CHANGELOG.md` | tagged GitHub Releases |
 
 The version in `scripts/autonom_lib/__init__.py` is the single source: the
 validator fails the build when a plugin manifest disagrees with it.
@@ -175,8 +178,14 @@ validator fails the build when a plugin manifest disagrees with it.
 - **TTY guard** — the suite is re-run with a stdin that claims to be a terminal
   and raises on read. A consent prompt that would block a developer's terminal
   fails here instead, which a headless run would never catch.
-- **Device-backed** — real simulator or emulator runs are manual and evidenced by
-  before/after artifacts, never by exit codes alone.
+- **Environment hygiene guard** — the alphabetically-first test module snapshots
+  `os.environ`, the alphabetically-last compares it; a test that mutates the
+  environment without restoring it (`tests/env_isolation.py` is the sanctioned
+  idiom) fails the suite instead of silently redirecting later tests to the
+  operator's real `~/.autonom`.
+- **Device-backed** — the `android-smoke` workflow drives a real emulator
+  through the CLI on every push to main; deeper simulator/emulator runs remain
+  manual and evidenced by before/after artifacts, never by exit codes alone.
 
 ## Flutter-first boundary (current domain pack)
 

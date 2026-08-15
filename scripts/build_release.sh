@@ -14,12 +14,41 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-version="$(grep -oE '"[0-9]+\.[0-9]+\.[0-9]+"' scripts/autonom_lib/__init__.py | tr -d '"' | head -1)"
+resolve_version() {
+  # The same resolver validate_plugin.py trusts — not a second regex parser.
+  # release.yml calls `--print-version` so there is exactly one copy of this.
+  python3 -c 'import sys; sys.path.insert(0, "scripts"); import autonom_lib; print(autonom_lib.__version__)'
+}
+
+run_checks=1
+for arg in "$@"; do
+  case "$arg" in
+    --no-check) run_checks=0 ;;
+    --print-version) resolve_version; exit 0 ;;
+    *) echo "unknown argument: $arg (supported: --no-check, --print-version)" >&2; exit 2 ;;
+  esac
+done
+
+# Pre-flight: the bundle must carry these; failing here beats failing after
+# staging (or, worse, shipping without them — CHANGELOG.md did exactly that
+# while it did not exist and the `[ -e ] &&` loop stayed silent).
+for required in LICENSE CHANGELOG.md README.md install.sh; do
+  [ -e "$required" ] || { echo "missing required release file: $required" >&2; exit 1; }
+done
+
+version="$(resolve_version)"
 [ -n "$version" ] || { echo "cannot read version from scripts/autonom_lib/__init__.py" >&2; exit 1; }
+
+# A stale dist/ stage would be swept by run_checks.sh's shell lint and by
+# validate_plugin.py's markdown scan — clear it before checks, not after.
+rm -rf dist
+
+if [ "$run_checks" = "1" ]; then
+  ./scripts/run_checks.sh
+fi
 
 name="autonom-${version}"
 stage="dist/${name}"
-rm -rf "$stage"
 mkdir -p "$stage"
 
 # Curated runnable set — no tests, no caches, no VCS.
@@ -27,9 +56,7 @@ cp -R scripts "$stage/scripts"
 cp -R plugins "$stage/plugins"
 cp -R .agents "$stage/.agents"
 cp -R .claude-plugin "$stage/.claude-plugin"
-for extra in marketplace.json README.md CHANGELOG.md LICENSE; do
-  [ -e "$extra" ] && cp "$extra" "$stage/"
-done
+cp README.md CHANGELOG.md LICENSE "$stage/"
 find "$stage" -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true
 find "$stage" -name '*.pyc' -delete 2>/dev/null || true
 
@@ -43,8 +70,14 @@ tarball="dist/${name}.tgz"
 tar czf "$tarball" -C dist "$name"
 rm -rf "$stage"
 
+(cd dist && if command -v sha256sum >/dev/null 2>&1; then
+  sha256sum "${name}.tgz" > SHA256SUMS
+else
+  shasum -a 256 "${name}.tgz" > SHA256SUMS
+fi)
+
 size="$(du -h "$tarball" | cut -f1)"
-echo "built ${tarball} (${size})"
+echo "built ${tarball} (${size}) + dist/SHA256SUMS"
 echo
 echo "hand off: copy ${tarball} to the target any way you like, then:"
 echo "  tar xzf ${name}.tgz && ./${name}/install.sh   # checkbox picker (or --all / claude codex grok)"

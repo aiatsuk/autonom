@@ -20,6 +20,11 @@ SESSION_V1 = ROOT / "tests/fixtures/session_v1.json"
 sys.path.insert(0, str(ROOT / "scripts"))
 from autonom_lib import errors, platform as platform_mod, session as session_mod  # noqa: E402
 
+try:
+    from env_isolation import EnvSandboxMixin  # noqa: E402  (discover -s tests)
+except ImportError:  # direct `python3 -m unittest tests.test_...` runs
+    from tests.env_isolation import EnvSandboxMixin  # noqa: E402
+
 UDID = "AAAAAAAA-1111-2222-3333-BBBBBBBBBBBB"
 
 
@@ -32,17 +37,16 @@ def namespace(**kwargs):
     return argparse.Namespace(**base)
 
 
-class TargetResolutionTests(unittest.TestCase):
+class TargetResolutionTests(EnvSandboxMixin, unittest.TestCase):
     """CAP-PLAT-001 — one precedence order, identical on both platforms."""
 
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         state = Path(self.tmp.name) / "state.json"
         state.write_text("{}", encoding="utf-8")
-        os.environ["AUTONOM_FAKE_STATE"] = str(state)
+        self.set_env(AUTONOM_FAKE_STATE=str(state))
 
     def tearDown(self) -> None:
-        os.environ.pop("AUTONOM_FAKE_STATE", None)
         self.tmp.cleanup()
 
     def test_explicit_platform_and_target_win_over_session(self) -> None:
@@ -151,11 +155,13 @@ class DevicesDegradationTests(unittest.TestCase):
             env["PATH"] = path
         env.pop("AUTONOM_ADB", None)
         env.pop("AUTONOM_SIMCTL", None)
-        return subprocess.run(
-            [sys.executable, str(CLI), *args],
-            cwd=ROOT, env=env, text=True,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
-        )
+        with tempfile.TemporaryDirectory() as home:
+            env["AUTONOM_HOME"] = home
+            return subprocess.run(
+                [sys.executable, str(CLI), *args],
+                cwd=ROOT, env=env, text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+            )
 
     def test_both_platforms_are_listed(self) -> None:
         result = self._run("devices", "--adb", str(FAKE_ADB), "--simctl", str(FAKE_SIMCTL))
@@ -205,10 +211,14 @@ class TargetFlagPositionTests(unittest.TestCase):
     """The plan's examples put target flags both before and after the subcommand."""
 
     def _devices(self, *args: str):
-        return subprocess.run(
-            [sys.executable, str(CLI), *args],
-            cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
-        )
+        with tempfile.TemporaryDirectory() as home:
+            env = dict(os.environ)
+            env["AUTONOM_HOME"] = home
+            return subprocess.run(
+                [sys.executable, str(CLI), *args],
+                cwd=ROOT, env=env, text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+            )
 
     def test_flags_are_accepted_in_either_position(self) -> None:
         after = self._devices("devices", "--platform", "ios", "--simctl", str(FAKE_SIMCTL))

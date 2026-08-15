@@ -200,10 +200,13 @@ benchmark. Use a physical device plus native profilers for frame-rate review.
 ## Documentation
 
 - `docs/INSTALL.md` — Codex / Claude / Grok / generic install
-- `docs/CAPABILITIES.md` — Android/iOS capability matrix, full CLI surface, roadmap
+- `docs/CAPABILITIES.md` — Android/iOS capability matrix, full CLI surface, environment overrides
 - `docs/ARCHITECTURE.md` — routing, CLI control plane, evidence, security
+- `docs/COMPATIBILITY.md` — the frozen CLI contract (error codes, response keys, exit codes)
+- `docs/plans/PHASE_0_RELEASE_ENGINEERING.md` — shipped: test isolation, CI, tagged releases
 - `docs/plans/PHASE_4_METRICS.md` — plan: live session watch + metrics/memory/CPU/traces (Android, iOS, Flutter)
 - `docs/USAGE.md` — ready-to-use prompts and workflows
+- `CHANGELOG.md` — release history
 - `SECURITY.md` — the enforced security model (MITM, consent, redaction)
 - `AGENTS.md` — short operating contract for any consuming agent
 

@@ -82,11 +82,14 @@ SWEEP: list[tuple[str, list[str], bool]] = [
 
 
 class BareHostTests(unittest.TestCase):
-    """VER-011 / INV-08 — the oracle that replaces CI (DEC-012).
+    """VER-011 / INV-08 — the bare-host oracle (DEC-012, superseded by DEC-014).
 
-    Every verb must fail with one machine-readable error code when its backend
-    is absent. A traceback on stdout, or a non-JSON stderr, would leave a host
-    agent with nothing to branch on.
+    Written as the CI substitute when the repository shipped no CI; real CI
+    exists now (DEC-014, docs/plans/PHASE_0_RELEASE_ENGINEERING.md), and this
+    sweep remains as the empty-PATH invariant: every verb must fail with one
+    machine-readable error code when its backend is absent. A traceback on
+    stdout, or a non-JSON stderr, would leave a host agent with nothing to
+    branch on.
     """
 
     @classmethod

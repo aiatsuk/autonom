@@ -92,6 +92,7 @@ run_picker() {
   local drawn=0
   local key rest i mark ptr
 
+  # shellcheck disable=SC2016  # the backticks are literal, not a substitution
   printf 'Autonom %s — the `autonom` CLI is installed always. Extras:\n' "$1"
   printf '  arrows/jk move · space toggles · a all · n none · enter installs · q quits\n\n'
   printf '\033[?25l'

@@ -136,6 +136,9 @@ class CoordinateGuardTests(unittest.TestCase):
         env = dict(os.environ)
         env["AUTONOM_FAKE_LOG"] = str(self.log)
         env["AUTONOM_FAKE_STATE"] = str(self.state)
+        # The CLI resolves the machine session store on every target-taking
+        # verb; without this it mkdirs the operator's real ~/.autonom.
+        env["AUTONOM_HOME"] = self.tmp.name
         return subprocess.run(
             [sys.executable, str(CLI), "--platform", "ios", "--target", UDID,
              "--simctl", str(FAKE_SIMCTL), "--idb", str(FAKE_IDB), *args],
@@ -212,6 +215,7 @@ class KeyAndGestureTests(unittest.TestCase):
         env = dict(os.environ)
         env["AUTONOM_FAKE_LOG"] = str(self.log)
         env["AUTONOM_FAKE_STATE"] = str(self.state)
+        env["AUTONOM_HOME"] = self.tmp.name
         return subprocess.run(
             [sys.executable, str(CLI), "--platform", platform, "--target", target,
              "--simctl", str(FAKE_SIMCTL), "--idb", str(FAKE_IDB),

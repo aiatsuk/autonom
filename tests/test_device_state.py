@@ -13,6 +13,11 @@ sys.path.insert(0, str(ROOT / "scripts"))
 from autonom_lib import device_state, errors  # noqa: E402
 from autonom_lib.platform import Target  # noqa: E402
 
+try:
+    from env_isolation import EnvSandboxMixin  # noqa: E402  (discover -s tests)
+except ImportError:  # direct `python3 -m unittest tests.test_...` runs
+    from tests.env_isolation import EnvSandboxMixin  # noqa: E402
+
 FAKE_ADB = str(ROOT / "tests/fakes/fake_adb.py")
 FAKE_SIMCTL = str(ROOT / "tests/fakes/fake_simctl.py")
 ANDROID_TARGET = Target("android", "emulator-5554", "/fake/adb", {"serial": "emulator-5554"})
@@ -83,20 +88,18 @@ class CoordinateTests(unittest.TestCase):
                 self.assertEqual(caught.exception.code, errors.INVALID_COORDINATES)
 
 
-class AndroidLocationTests(unittest.TestCase):
+class AndroidLocationTests(EnvSandboxMixin, unittest.TestCase):
     """CAP-IOSDIAG-004 (Android) — the emulator console path for `geo fix`."""
 
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.log = Path(self.tmp.name) / "log.jsonl"
-        os.environ["AUTONOM_FAKE_LOG"] = str(self.log)
         state = Path(self.tmp.name) / "state.json"
         state.write_text("{}", encoding="utf-8")
-        os.environ["AUTONOM_FAKE_STATE"] = str(state)
+        self.set_env(AUTONOM_FAKE_LOG=str(self.log),
+                     AUTONOM_FAKE_STATE=str(state))
 
     def tearDown(self) -> None:
-        os.environ.pop("AUTONOM_FAKE_LOG", None)
-        os.environ.pop("AUTONOM_FAKE_STATE", None)
         self.tmp.cleanup()
 
     def _calls(self) -> list[list[str]]:
