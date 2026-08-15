@@ -1,126 +1,126 @@
-# Autonom: продуктовая и техническая стратегия на основе Revyl и Maestro
+# Autonom: product and technical strategy based on Revyl and Maestro
 
-**Статус:** рабочая спецификация  
-**Дата исследования:** 15 августа 2026 года  
-**Текущая версия Autonom:** 0.15.1  
-**Цель документа:** определить, что взять из Revyl и Maestro, что не копировать и как превратить Autonom в полезный local-first runtime, test и evidence layer для coding agents.
+**Status:** working specification  
+**Research date:** August 15, 2026  
+**Current Autonom version:** 0.15.1  
+**Purpose of this document:** determine what to take from Revyl and Maestro, what not to copy, and how to turn Autonom into a useful local-first runtime, test, and evidence layer for coding agents.
 
 ---
 
-## 1. Короткий вывод
+## 1. Short conclusion
 
-Revyl и Maestro решают разные части одной задачи.
+Revyl and Maestro solve different parts of the same problem.
 
-- **Revyl** показывает, как упаковать мобильный runtime в законченный продукт: remote device, AI execution, отчёты, Atlas, Explore и PR proof.
-- **Maestro** показывает, как сделать простой и устойчивый Flow DSL: читаемый YAML, автоматические ожидания, selectors, subflows, hooks, tags и CI reports.
-- **Autonom** уже имеет сильное техническое ядро: локальное управление Android Emulator и iOS Simulator, общий UI schema, JSON CLI, безопасный MITM, HAR, screenshots, recordings, logs, crashes и переносимые agent skills.
+- **Revyl** shows how to package a mobile runtime into a finished product: remote device, AI execution, reports, Atlas, Explore, and PR proof.
+- **Maestro** shows how to build a simple and robust Flow DSL: readable YAML, automatic waits, selectors, subflows, hooks, tags, and CI reports.
+- **Autonom** already has a strong technical core: local control of the Android Emulator and iOS Simulator, a shared UI schema, a JSON CLI, safe MITM, HAR, screenshots, recordings, logs, crashes, and portable agent skills.
 
-Рекомендуемое направление:
+Recommended direction:
 
-> **Autonom — local-first mobile runtime and evidence layer for coding agents. Он детерминированно управляет приложением, запускает повторяемые flows и сохраняет проверяемые доказательства на инфраструктуре пользователя.**
+> **Autonom — local-first mobile runtime and evidence layer for coding agents. It deterministically controls the application, runs repeatable flows, and stores verifiable evidence on the user's infrastructure.**
 
-Autonom не должен становиться маленькой копией Revyl или новой полной реализацией Maestro. Он должен соединить:
+Autonom should not become a small copy of Revyl or a new full reimplementation of Maestro. It should combine:
 
-1. локальность, прозрачность и безопасность текущего Autonom;
-2. простой Flow UX из Maestro;
-3. evidence, Atlas-lite и PR proof из Revyl;
-4. более строгую семантику, рассчитанную на автономных AI-агентов.
+1. the locality, transparency, and safety of the current Autonom;
+2. the simple Flow UX from Maestro;
+3. evidence, Atlas-lite, and PR proof from Revyl;
+4. stricter semantics designed for autonomous AI agents.
 
-Главный порядок работ:
+The main order of work:
 
-1. Надёжный CI и test isolation.
+1. Reliable CI and test isolation.
 2. Autonom Flow v1.
 3. Session → Flow compiler.
-4. Evidence bundle и HTML/JUnit report.
+4. Evidence bundle and HTML/JUnit report.
 5. Atlas-lite.
 6. PR Proof.
 7. Explore.
-8. Remote и physical-device adapters.
+8. Remote and physical-device adapters.
 
 ---
 
-## 2. Что такое Autonom сейчас
+## 2. What Autonom is now
 
-[Autonom](https://github.com/aiatsuk/autonom) — универсальный мобильный test и debug harness для AI coding agents.
+[Autonom](https://github.com/aiatsuk/autonom) is a universal mobile test and debug harness for AI coding agents.
 
-Текущая поставка:
+Current deliverables:
 
-- 23 переносимых `SKILL.md`-скилла;
+- 23 portable `SKILL.md` skills;
 - dependency-light Python CLI;
-- стабильный machine-readable JSON API;
-- поддержка Codex, Claude, Grok и generic skill hosts;
-- Android Emulator и iOS Simulator;
-- одинаковые основные команды и компактная UI node schema на двух платформах;
+- stable machine-readable JSON API;
+- support for Codex, Claude, Grok, and generic skill hosts;
+- Android Emulator and iOS Simulator;
+- identical core commands and a compact UI node schema on both platforms;
 - accessibility-first targeting;
-- screenshots как доказательства, а не как единственный источник управления;
-- отсутствие обязательного MCP и платного vision API.
+- screenshots as evidence, not as the sole source of control;
+- no mandatory MCP and no paid vision API.
 
-### 2.1 Уже реализовано
+### 2.1 Already implemented
 
-- создание и завершение сессий;
-- inventory, boot и shutdown устройств;
-- установка, запуск, остановка и очистка приложения;
-- UI tree, `find`, semantic tap и coordinate tap;
-- ввод текста, keys и swipe;
-- screenshots с embedded provenance;
+- session creation and termination;
+- device inventory, boot, and shutdown;
+- app install, launch, stop, and clear;
+- UI tree, `find`, semantic tap, and coordinate tap;
+- text input, keys, and swipe;
+- screenshots with embedded provenance;
 - screenshot index;
 - screen recording;
-- Android logcat и iOS syslog;
-- Android crash buffer и iOS crash store;
+- Android logcat and iOS syslog;
+- Android crash buffer and iOS crash store;
 - deep links;
 - permissions;
-- simulated location с платформенными ограничениями;
+- simulated location with platform-specific limitations;
 - media seeding;
-- безопасный доступ к app container;
-- iOS remote target через `idb companion` на другом Mac;
+- safe access to the app container;
+- iOS remote target via `idb companion` on another Mac;
 - Android browser mirror;
-- consent-gated HTTP/S interception через mitmproxy;
+- consent-gated HTTP/S interception via mitmproxy;
 - response mocking;
 - persistent mock rules;
 - HAR 1.2 export;
-- redaction перед записью;
-- process registry и cleanup;
+- redaction before writing;
+- process registry and cleanup;
 - append-only `journal.ndjson`;
-- Flutter, Android/Compose и iOS skill packs.
+- Flutter, Android/Compose, and iOS skill packs.
 
-Подробности: [Capabilities](https://github.com/aiatsuk/autonom/blob/main/docs/CAPABILITIES.md), [Architecture](https://github.com/aiatsuk/autonom/blob/main/docs/ARCHITECTURE.md), [Security](https://github.com/aiatsuk/autonom/blob/main/SECURITY.md).
+Details: [Capabilities](https://github.com/aiatsuk/autonom/blob/main/docs/CAPABILITIES.md), [Architecture](https://github.com/aiatsuk/autonom/blob/main/docs/ARCHITECTURE.md), [Security](https://github.com/aiatsuk/autonom/blob/main/SECURITY.md).
 
-### 2.2 Пока отсутствует или частично реализовано
+### 2.2 Not yet present or partially implemented
 
-- единый Flow DSL;
-- replay сессии как теста;
-- единый live stream для logs, network и metrics;
-- общий CPU, memory, frame и trace report;
+- a unified Flow DSL;
+- replay of a session as a test;
+- a unified live stream for logs, network, and metrics;
+- a combined CPU, memory, frame, and trace report;
 - Flutter VM Service integration;
 - React Native skill pack;
 - XCUITest integration;
-- Atlas или экранный граф;
+- Atlas or a screen graph;
 - PR proof;
-- полноценный CI release pipeline;
+- a full-fledged CI release pipeline;
 - tagged releases;
 - optional MCP wrapper;
-- доказанная smoke matrix на реальных simulator/emulator environments.
+- a proven smoke matrix on real simulator/emulator environments.
 
-### 2.3 Результат локальной проверки
+### 2.3 Local verification result
 
-Проверен commit `1a0f03d53e5b68a8c5d5fa3c24255b52c2ddf4d9`.
+Commit `1a0f03d53e5b68a8c5d5fa3c24255b52c2ddf4d9` was verified.
 
-- Validation подтвердил 23 skills.
-- Прошли 245 Python tests.
-- Прошли 7 Node tests.
-- Все shell и syntax checks завершились успешно.
+- Validation confirmed 23 skills.
+- 245 Python tests passed.
+- 7 Node tests passed.
+- All shell and syntax checks completed successfully.
 
-Для успешного запуска потребовалось задать полностью временный `HOME`. Обнаружен test-hygiene bug: `LifecycleBase.tearDown` в `tests/test_devices_lifecycle.py` удаляет `AUTONOM_HOME`, но не восстанавливает предыдущее значение. Последующие тесты переходят на настоящий `~/.autonom`. На read-only home это даёт ложные failures. На обычном developer machine suite может трогать пользовательское состояние.
+A fully temporary `HOME` had to be set for a successful run. A test-hygiene bug was found: `LifecycleBase.tearDown` in `tests/test_devices_lifecycle.py` deletes `AUTONOM_HOME` but does not restore the previous value. Subsequent tests fall back to the real `~/.autonom`. On a read-only home this produces false failures. On an ordinary developer machine the suite may touch user state.
 
-Это нужно исправить до добавления новых подсистем. Проверка использовала fixtures и fake drivers. Она не доказывает надёжность на настоящих iOS Simulator и Android Emulator.
+This must be fixed before adding new subsystems. The verification used fixtures and fake drivers. It does not prove reliability on real iOS Simulator and Android Emulator.
 
 ---
 
-## 3. Что полезного есть в Revyl
+## 3. What is useful in Revyl
 
-[Revyl](https://www.revyl.com/platform/) позиционируется как mobile development platform для coding agents. Это managed cloud product, а не только test runner.
+[Revyl](https://www.revyl.com/platform/) positions itself as a mobile development platform for coding agents. It is a managed cloud product, not just a test runner.
 
-Его полный цикл:
+Its full cycle:
 
 ```text
 build
@@ -133,197 +133,197 @@ build
   → GitHub PR proof
 ```
 
-### 3.1 Сильные продуктовые решения
+### 3.1 Strong product decisions
 
-#### Один замкнутый цикл
+#### One closed loop
 
-Revyl связывает код, сборку, runtime, тест, evidence и pull request. Пользователь не собирает отдельную систему из Appium, device farm, report portal и CI scripts.
+Revyl connects code, build, runtime, test, evidence, and pull request. The user does not assemble a separate system out of Appium, a device farm, a report portal, and CI scripts.
 
 #### Session → Test
 
-Пользователь или агент сначала проходит сценарий на устройстве. Затем Revyl превращает проверенную сессию в сохраняемый тест. Это намного полезнее, чем начинать с пустого YAML-файла.
+The user or agent first walks through the scenario on a device. Then Revyl turns the verified session into a saved test. This is far more useful than starting from an empty YAML file.
 
 #### Git-friendly tests
 
-Тесты описываются YAML и хранятся в репозитории. Поддерживаются:
+Tests are described in YAML and stored in the repository. Supported are:
 
 - AI instruction;
 - validation;
 - extraction;
 - manual action;
-- Python, JavaScript, TypeScript и Bash steps;
+- Python, JavaScript, TypeScript, and Bash steps;
 - `if/else`;
 - `while`;
 - reusable modules;
 - variables.
 
-Источники: [Creating tests](https://docs.revyl.com/cli/tests/creating-tests), [YAML format](https://docs.revyl.com/appendix/yaml-test-format), [Step types](https://docs.revyl.com/appendix/step-types).
+Sources: [Creating tests](https://docs.revyl.com/cli/tests/creating-tests), [YAML format](https://docs.revyl.com/appendix/yaml-test-format), [Step types](https://docs.revyl.com/appendix/step-types).
 
 #### Evidence report
 
-Revyl собирает:
+Revyl collects:
 
-- видео полного запуска;
-- timeline действий;
-- AI summary и reasoning;
-- grounding screenshots и bounds;
-- iOS syslog и Android logcat;
-- CPU, FPS, RSS, VSS и memory pressure;
+- video of the full run;
+- a timeline of actions;
+- AI summary and reasoning;
+- grounding screenshots and bounds;
+- iOS syslog and Android logcat;
+- CPU, FPS, RSS, VSS, and memory pressure;
 - Android Perfetto;
-- HTTP и WebSocket waterfall;
-- headers, payload и response;
+- HTTP and WebSocket waterfall;
+- headers, payload, and response;
 - Copy as cURL;
 - shareable report links.
 
-Источник: [Reports](https://docs.revyl.com/tests/reports).
+Source: [Reports](https://docs.revyl.com/tests/reports).
 
 #### Atlas
 
-Atlas строит карту фактически увиденных:
+Atlas builds a map of what was actually seen:
 
-- экранов;
-- вариантов экранов;
-- состояний;
-- переходов;
-- покрытых и неизвестных участков.
+- screens;
+- screen variants;
+- states;
+- transitions;
+- covered and unknown areas.
 
-Важно: Atlas не знает всё приложение. Он знает только наблюдённые пути. Документация признаёт empty maps, processing lag, partial runs и auth blockers.
+Important: Atlas does not know the entire application. It knows only the observed paths. The documentation acknowledges empty maps, processing lag, partial runs, and auth blockers.
 
-Источники: [Atlas](https://docs.revyl.com/atlas), [Explore](https://docs.revyl.com/atlas/explore).
+Sources: [Atlas](https://docs.revyl.com/atlas), [Explore](https://docs.revyl.com/atlas/explore).
 
 #### Explore
 
-Несколько агентов могут параллельно обходить приложение по разным стратегиям:
+Several agents can traverse the application in parallel using different strategies:
 
 - balanced;
 - surface sweep;
 - journey focus;
 - hard edges.
 
-Главная идея полезна для Autonom: exploration должен оставлять структурированный граф и воспроизводимый evidence, а не только текстовый отчёт агента.
+The main idea is useful for Autonom: exploration should leave behind a structured graph and reproducible evidence, not just a textual agent report.
 
 #### PR Proof
 
-GitHub integration связывает diff, build и runtime verification. Результат включает screenshots и video proof. Это превращает mobile testing в часть code review.
+The GitHub integration ties together diff, build, and runtime verification. The result includes screenshots and video proof. This turns mobile testing into part of code review.
 
-Источник: [GitHub integration](https://docs.revyl.com/integrations/github).
+Source: [GitHub integration](https://docs.revyl.com/integrations/github).
 
-#### Auth и test data как часть продукта
+#### Auth and test data as part of the product
 
-Revyl поддерживает подготовку сессии, variables, secrets и способы выдавать session-scoped tokens. Это важно, потому что OTP, login, seed data и permissions часто блокируют автономный test run раньше, чем UI automation становится полезной.
+Revyl supports session preparation, variables, secrets, and ways to issue session-scoped tokens. This matters because OTP, login, seed data, and permissions often block an autonomous test run before UI automation becomes useful.
 
-Источник: [Auth and session prep](https://docs.revyl.com/cli/device/auth-and-session-prep).
+Source: [Auth and session prep](https://docs.revyl.com/cli/device/auth-and-session-prep).
 
-### 3.2 Техническая поверхность Revyl
+### 3.2 Revyl's technical surface
 
-- публичный Go CLI;
-- installation через Homebrew, shell script, `pipx`, `uv` и `pip`;
-- macOS, Linux и Windows binaries;
+- public Go CLI;
+- installation via Homebrew, shell script, `pipx`, `uv`, and `pip`;
+- macOS, Linux, and Windows binaries;
 - `--json` output;
-- Codex, Claude и Cursor skills;
+- Codex, Claude, and Cursor skills;
 - MCP server;
 - cloud builds;
-- upload готовых artifacts;
+- upload of prebuilt artifacts;
 - remote device viewer;
-- Expo и React Native hot reload;
-- Flutter, native, KMP и Bazel rebuild loop;
-- generic CI и GitHub Actions;
-- retries и quarantine для flaky tests.
+- Expo and React Native hot reload;
+- Flutter, native, KMP, and Bazel rebuild loop;
+- generic CI and GitHub Actions;
+- retries and quarantine for flaky tests.
 
-Текущий публичный CLI release на дату исследования: [v0.1.85](https://github.com/RevylAI/revyl-cli/releases/tag/v0.1.85), опубликован 13 августа 2026 года.
+The current public CLI release as of the research date: [v0.1.85](https://github.com/RevylAI/revyl-cli/releases/tag/v0.1.85), published on August 13, 2026.
 
-### 3.3 Ограничения Revyl
+### 3.3 Revyl's limitations
 
-#### Это не physical-device farm
+#### It is not a physical-device farm
 
-Основная инфраструктура использует iOS Simulator и Android Emulator.
+The core infrastructure uses the iOS Simulator and the Android Emulator.
 
-- iOS принимает simulator `.app`;
-- `.ipa` не поддерживается;
-- Android принимает один `.apk`;
-- `.aab`, `.apks` и split APK не поддерживаются.
+- iOS accepts a simulator `.app`;
+- `.ipa` is not supported;
+- Android accepts a single `.apk`;
+- `.aab`, `.apks`, and split APKs are not supported.
 
-Источник: [Artifact requirements](https://docs.revyl.com/builds/artifact-requirements).
+Source: [Artifact requirements](https://docs.revyl.com/builds/artifact-requirements).
 
-Следовательно, Revyl не проверяет реальные:
+Consequently, Revyl does not verify real:
 
-- thermal и battery effects;
+- thermal and battery effects;
 - camera hardware;
 - carrier network;
 - OEM skins;
-- Bluetooth и sensor behavior;
-- производительность физического устройства.
+- Bluetooth and sensor behavior;
+- physical-device performance.
 
-#### Flutter dev loop слабее React Native
+#### The Flutter dev loop is weaker than React Native's
 
-Настоящий hot reload есть для Expo и React Native. Flutter требует rebuild, upload и reinstall. Документация указывает типичный цикл 30–60 секунд.
+True hot reload exists for Expo and React Native. Flutter requires rebuild, upload, and reinstall. The documentation cites a typical cycle of 30–60 seconds.
 
-Источник: [Dev Loop](https://docs.revyl.com/develop/dev-loop-overview).
+Source: [Dev Loop](https://docs.revyl.com/develop/dev-loop-overview).
 
 #### Cloud dependency
 
-AI execution, device backend, reports и Atlas являются SaaS. Полного self-host варианта нет.
+AI execution, the device backend, reports, and Atlas are SaaS. There is no fully self-hosted option.
 
-#### Privacy и telemetry
+#### Privacy and telemetry
 
-CLI telemetry включена по умолчанию. Она может включать CLI/OS/architecture, user и organization IDs, auth/CI/agent metadata, command metadata и sanitized tail ошибки. Отключение выполняется через `REVYL_TELEMETRY_DISABLED=true` или `DO_NOT_TRACK=true`.
+CLI telemetry is enabled by default. It may include CLI/OS/architecture, user and organization IDs, auth/CI/agent metadata, command metadata, and a sanitized error tail. It is disabled via `REVYL_TELEMETRY_DISABLED=true` or `DO_NOT_TRACK=true`.
 
-Источники: [analytics.go](https://github.com/RevylAI/revyl-cli/blob/main/internal/analytics/analytics.go), [Privacy](https://www.revyl.com/privacy/).
+Sources: [analytics.go](https://github.com/RevylAI/revyl-cli/blob/main/internal/analytics/analytics.go), [Privacy](https://www.revyl.com/privacy/).
 
-Публичная privacy policy не даёт точных сроков хранения builds, videos, logs и network captures. Она также не раскрывает полный список LLM providers, regions и deletion SLA.
+The public privacy policy does not give exact retention periods for builds, videos, logs, and network captures. It also does not disclose the full list of LLM providers, regions, and deletion SLAs.
 
-#### Непрозрачная стоимость CI
+#### Opaque CI cost
 
-На дату исследования:
+As of the research date:
 
-- Trial: 5 часов;
-- Solo: $20 в месяц, 1 concurrent device;
-- Starter: $250 в месяц, 3 devices;
-- Team Pro: $750 в месяц, 10 devices;
-- overage: $0.15/min iOS и $0.12/min Android.
+- Trial: 5 hours;
+- Solo: $20 per month, 1 concurrent device;
+- Starter: $250 per month, 3 devices;
+- Team Pro: $750 per month, 10 devices;
+- overage: $0.15/min iOS and $0.12/min Android.
 
-Количество включённых Solo minutes не опубликовано. Starter и Team Pro выражены как множители от этого неизвестного объёма.
+The number of included Solo minutes is not published. Starter and Team Pro are expressed as multiples of that unknown volume.
 
-Источник: [Pricing](https://www.revyl.com/pricing/).
+Source: [Pricing](https://www.revyl.com/pricing/).
 
-### 3.4 Что взять из Revyl
+### 3.4 What to take from Revyl
 
 1. Session → Test.
 2. Evidence timeline.
-3. Atlas как observed graph.
-4. Explore со стратегиями.
-5. PR proof, связанный с diff.
-6. Auth и test-data preparation.
-7. Параллельный запуск и tagged suites.
-8. Stability history и quarantine.
-9. Один понятный путь от code change до proof.
+3. Atlas as an observed graph.
+4. Explore with strategies.
+5. PR proof tied to the diff.
+6. Auth and test-data preparation.
+7. Parallel execution and tagged suites.
+8. Stability history and quarantine.
+9. One clear path from code change to proof.
 
-### 3.5 Что не брать из Revyl
+### 3.5 What not to take from Revyl
 
-1. Cloud-first архитектуру ядра.
-2. Обязательный vision/LLM grounding.
-3. Собственную device farm на ранней стадии.
-4. Скрытую telemetry по умолчанию.
-5. Бессрочные public report links.
-6. Непрозрачную usage model.
-7. Обещания «no maintenance» и «real devices», которые не совпадают с технической реальностью.
+1. The cloud-first core architecture.
+2. Mandatory vision/LLM grounding.
+3. Its own device farm at an early stage.
+4. Hidden telemetry by default.
+5. Perpetual public report links.
+6. An opaque usage model.
+7. The promises of "no maintenance" and "real devices" that do not match the technical reality.
 
 ---
 
-## 4. Что полезного есть в Maestro
+## 4. What Maestro offers that is useful
 
-[Maestro](https://github.com/mobile-dev-inc/Maestro) — Apache 2.0 UI и E2E automation framework для Android, iOS и web. Текущая версия на дату исследования: [CLI 2.8.0](https://github.com/mobile-dev-inc/Maestro/releases/tag/cli-2.8.0).
+[Maestro](https://github.com/mobile-dev-inc/Maestro) is an Apache 2.0 UI and E2E automation framework for Android, iOS, and web. Current version as of the research date: [CLI 2.8.0](https://github.com/mobile-dev-inc/Maestro/releases/tag/cli-2.8.0).
 
-Maestro особенно полезен как референс для Flow DSL и execution semantics.
+Maestro is especially useful as a reference for the Flow DSL and execution semantics.
 
-### 4.1 Основные идеи Maestro
+### 4.1 Core ideas of Maestro
 
-#### Читаемый YAML
+#### Readable YAML
 
-Flow разделён на две части:
+A Flow is split into two parts:
 
-1. configuration header;
-2. список команд после `---`.
+1. a configuration header;
+2. a list of commands after `---`.
 
 ```yaml
 appId: com.example.app
@@ -340,17 +340,17 @@ env:
 - assertVisible: Welcome
 ```
 
-Источник: [Maestro Flows overview](https://github.com/mobile-dev-inc/maestro-docs/blob/main/flows/README.md).
+Source: [Maestro Flows overview](https://github.com/mobile-dev-inc/maestro-docs/blob/main/flows/README.md).
 
-#### Shorthand и expanded form
+#### Shorthand and expanded form
 
-Простая команда остаётся короткой:
+A simple command stays short:
 
 ```yaml
 - tapOn: Login
 ```
 
-Точная команда раскрывается в map:
+A precise command expands into a map:
 
 ```yaml
 - tapOn:
@@ -358,11 +358,11 @@ env:
     enabled: true
 ```
 
-Это хороший баланс между ручным написанием и machine-generated canonical form.
+This is a good balance between hand-written and machine-generated canonical form.
 
 #### Accessibility-first selectors
 
-Maestro использует accessibility tree и поддерживает:
+Maestro uses the accessibility tree and supports:
 
 - `text`;
 - `id`;
@@ -371,50 +371,50 @@ Maestro использует accessibility tree и поддерживает:
 - state selectors;
 - `above`, `below`, `leftOf`, `rightOf`;
 - `childOf`, `containsChild`, `containsDescendants`;
-- dimensions и traits.
+- dimensions and traits.
 
-Источники: [Selector guide](https://github.com/mobile-dev-inc/maestro-docs/blob/main/flows/how-to-use-selectors.md), [Core selectors](https://github.com/mobile-dev-inc/maestro-docs/blob/main/api-reference/selectors/core-selectors.md), [Relational selectors](https://github.com/mobile-dev-inc/maestro-docs/blob/main/api-reference/selectors/relational-selectors.md).
+Sources: [Selector guide](https://github.com/mobile-dev-inc/maestro-docs/blob/main/flows/how-to-use-selectors.md), [Core selectors](https://github.com/mobile-dev-inc/maestro-docs/blob/main/api-reference/selectors/core-selectors.md), [Relational selectors](https://github.com/mobile-dev-inc/maestro-docs/blob/main/api-reference/selectors/relational-selectors.md).
 
-#### Assertions являются ожиданиями
+#### Assertions are expectations
 
-`assertVisible` не проверяет состояние один раз. Он опрашивает UI до появления элемента или timeout. В Maestro default составляет до 7 секунд. Для долгих процессов есть `extendedWaitUntil`.
+`assertVisible` does not check the state just once. It polls the UI until the element appears or a timeout is reached. In Maestro the default is up to 7 seconds. For long-running processes there is `extendedWaitUntil`.
 
-Это важная практика: flow не должен содержать произвольные `sleep`.
+This is an important practice: a flow must not contain arbitrary `sleep` calls.
 
-Источники: [assertVisible](https://github.com/mobile-dev-inc/maestro-docs/blob/main/api-reference/commands-available/assertvisible.md), [Wait commands](https://github.com/mobile-dev-inc/maestro-docs/blob/main/flows/flow-control-and-logic/wait-commands.md).
+Sources: [assertVisible](https://github.com/mobile-dev-inc/maestro-docs/blob/main/api-reference/commands-available/assertvisible.md), [Wait commands](https://github.com/mobile-dev-inc/maestro-docs/blob/main/flows/flow-control-and-logic/wait-commands.md).
 
 #### Atomic nested flows
 
-`runFlow` переиспользует login, onboarding, permissions и другие маленькие сценарии. Он принимает `file`, `env`, inline `commands` и `label`.
+`runFlow` reuses login, onboarding, permissions, and other small scenarios. It accepts `file`, `env`, inline `commands`, and `label`.
 
-Maestro рекомендует держать subflows атомарными и отделять их от end-to-end journeys.
+Maestro recommends keeping subflows atomic and separating them from end-to-end journeys.
 
-Источники: [Nested flows](https://github.com/mobile-dev-inc/maestro-docs/blob/main/flows/flow-control-and-logic/nested-flows.md), [runFlow](https://github.com/mobile-dev-inc/maestro-docs/blob/main/api-reference/commands-available/runflow.md).
+Sources: [Nested flows](https://github.com/mobile-dev-inc/maestro-docs/blob/main/flows/flow-control-and-logic/nested-flows.md), [runFlow](https://github.com/mobile-dev-inc/maestro-docs/blob/main/api-reference/commands-available/runflow.md).
 
-#### Условия без полного языка программирования
+#### Conditions without a full programming language
 
-Поддерживаются:
+The following are supported:
 
 - `when.visible`;
 - `when.notVisible`;
 - `when.platform`;
-- `when.true` через JavaScript.
+- `when.true` via JavaScript.
 
-Документация отдельно предупреждает, что чрезмерные conditions делают flow сложным. Для существенно разных сценариев лучше отдельные flows.
+The documentation specifically warns that excessive conditions make a flow complex. For substantially different scenarios, separate flows are preferable.
 
-Источник: [Conditions](https://github.com/mobile-dev-inc/maestro-docs/blob/main/flows/flow-control-and-logic/conditions.md).
+Source: [Conditions](https://github.com/mobile-dev-inc/maestro-docs/blob/main/flows/flow-control-and-logic/conditions.md).
 
 #### Hooks
 
-`onFlowStart` и `onFlowComplete` отделяют setup и cleanup от основного journey. Complete hook выполняется после pass или fail.
+`onFlowStart` and `onFlowComplete` separate setup and cleanup from the main journey. The complete hook runs after pass or fail.
 
-Источник: [Hooks](https://github.com/mobile-dev-inc/maestro-docs/blob/main/flows/flow-control-and-logic/hooks.md).
+Source: [Hooks](https://github.com/mobile-dev-inc/maestro-docs/blob/main/flows/flow-control-and-logic/hooks.md).
 
-#### Test discovery и tags
+#### Test discovery and tags
 
-`config.yaml` определяет glob patterns, include/exclude tags, execution order и output directory.
+`config.yaml` defines glob patterns, include/exclude tags, execution order, and the output directory.
 
-Это позволяет хранить:
+This makes it possible to keep:
 
 - `smoke`;
 - `critical`;
@@ -424,26 +424,26 @@ Maestro рекомендует держать subflows атомарными и �
 - `flaky`;
 - platform tags.
 
-Источники: [Test discovery and tags](https://github.com/mobile-dev-inc/maestro-docs/blob/main/flows/workspace-management/test-discovery-and-tags.md), [Workspace configuration](https://github.com/mobile-dev-inc/maestro-docs/blob/main/api-reference/workspace-configuration.md).
+Sources: [Test discovery and tags](https://github.com/mobile-dev-inc/maestro-docs/blob/main/flows/workspace-management/test-discovery-and-tags.md), [Workspace configuration](https://github.com/mobile-dev-inc/maestro-docs/blob/main/api-reference/workspace-configuration.md).
 
-#### Стандартные отчёты
+#### Standard reports
 
-Maestro выдаёт:
+Maestro produces:
 
 - JUnit XML;
 - HTML;
-- detailed HTML со steps;
+- detailed HTML with steps;
 - screenshots;
 - recordings;
 - logs;
 - custom report properties;
-- стабильные `junitId` и `junitClassname`.
+- stable `junitId` and `junitClassname`.
 
-Источник: [Reports and artifacts](https://github.com/mobile-dev-inc/maestro-docs/blob/main/flows/workspace-management/test-reports-and-artifacts.md).
+Source: [Reports and artifacts](https://github.com/mobile-dev-inc/maestro-docs/blob/main/flows/workspace-management/test-reports-and-artifacts.md).
 
-#### Чистое разделение слоёв
+#### Clean separation of layers
 
-Внутренняя схема Maestro:
+Maestro's internal scheme:
 
 ```text
 YAML Flow
@@ -454,160 +454,160 @@ YAML Flow
   → Android/iOS/Web driver
 ```
 
-Эту границу стоит повторить в Autonom: parser и flow engine не должны знать детали `adb`, `simctl` или `idb`.
+This boundary is worth replicating in Autonom: the parser and flow engine must not know the details of `adb`, `simctl`, or `idb`.
 
-Источник: [Maestro contributing architecture](https://github.com/mobile-dev-inc/Maestro/blob/main/CONTRIBUTING.md).
+Source: [Maestro contributing architecture](https://github.com/mobile-dev-inc/Maestro/blob/main/CONTRIBUTING.md).
 
-### 4.2 Новые практики Maestro 2.7–2.8
+### 4.2 New Maestro practices in 2.7–2.8
 
-Maestro недавно улучшил artifacts:
+Maestro recently improved artifacts:
 
 - flat per-flow bundle;
 - structured manifest;
 - readable step names;
-- screenshot перед каждым step;
-- hierarchy на failure;
+- a screenshot before every step;
+- hierarchy on failure;
 - device logs;
-- crash и ANR reports.
+- crash and ANR reports.
 
-В 2.8 появились дополнительные safety fixes:
+Version 2.8 added further safety fixes:
 
 - artifact path containment;
-- отказ от записи в directory path вместо файла;
-- сохранение artifacts при ошибке `onFlowComplete`;
-- исправление stale hierarchy в relational selectors;
-- точные timestamps и durations в reports.
+- refusal to write to a directory path instead of a file;
+- preservation of artifacts when `onFlowComplete` fails;
+- a fix for stale hierarchy in relational selectors;
+- accurate timestamps and durations in reports.
 
-Источник: [Maestro changelog](https://github.com/mobile-dev-inc/Maestro/blob/main/CHANGELOG.md).
+Source: [Maestro changelog](https://github.com/mobile-dev-inc/Maestro/blob/main/CHANGELOG.md).
 
-### 4.3 Недостатки Maestro, которые нельзя повторять
+### 4.3 Maestro's shortcomings that must not be repeated
 
-#### Regex по умолчанию
+#### Regex by default
 
-`text` и `id` считаются regex. Это удобно, но специальные символы и слишком широкие patterns дают неожиданные matches.
+`text` and `id` are treated as regex. This is convenient, but special characters and overly broad patterns produce unexpected matches.
 
-В Autonom default должен быть `exact`. `contains` и `regex` включаются явно.
+In Autonom the default must be `exact`. `contains` and `regex` are enabled explicitly.
 
 #### Stateful input
 
-`inputText` вводит текст в текущий focused field. Такой flow зависит от успешности предыдущего tap. Autonom может поддерживать Maestro form, но canonical representation должен уметь фиксировать target.
+`inputText` types text into the currently focused field. Such a flow depends on the success of the preceding tap. Autonom may support the Maestro form, but the canonical representation must be able to pin the target.
 
-#### Неявные повторы mutating actions
+#### Implicit retries of mutating actions
 
-Maestro имеет `retryTapIfNoChange`. Раньше он использовался шире, но был отключён по умолчанию из-за side effects.
+Maestro has `retryTapIfNoChange`. It used to be applied more broadly, but was disabled by default because of side effects.
 
-Autonom не должен автоматически повторять tap, type, openLink, permission mutation или network mock mutation.
+Autonom must not automatically retry tap, type, openLink, permission mutation, or network mock mutation.
 
-Источники: [tapOn](https://github.com/mobile-dev-inc/maestro-docs/blob/main/api-reference/commands-available/tapon.md), [Changelog](https://github.com/mobile-dev-inc/Maestro/blob/main/CHANGELOG.md).
+Sources: [tapOn](https://github.com/mobile-dev-inc/maestro-docs/blob/main/api-reference/commands-available/tapon.md), [Changelog](https://github.com/mobile-dev-inc/Maestro/blob/main/CHANGELOG.md).
 
-#### Retry может скрыть дефект
+#### Retry can mask a defect
 
-Maestro ограничивает `maxRetries` значением 3 и называет retry большого flow anti-pattern. Autonom должен применять ещё более строгие правила.
+Maestro caps `maxRetries` at 3 and calls retrying a large flow an anti-pattern. Autonom must apply even stricter rules.
 
-Источник: [retry](https://github.com/mobile-dev-inc/maestro-docs/blob/main/api-reference/commands-available/retry.md).
+Source: [retry](https://github.com/mobile-dev-inc/maestro-docs/blob/main/api-reference/commands-available/retry.md).
 
-#### JavaScript слишком расширяет DSL
+#### JavaScript stretches the DSL too far
 
-JS, HTTP requests, loops и expressions превращают YAML в второй язык программирования. Это усложняет determinism, sandboxing, review и secret handling.
+JS, HTTP requests, loops, and expressions turn YAML into a second programming language. This complicates determinism, sandboxing, review, and secret handling.
 
-Autonom Flow v1 не должен включать общий JavaScript engine.
+Autonom Flow v1 must not include a general-purpose JavaScript engine.
 
 ---
 
-## 5. Итоговое сравнение
+## 5. Summary comparison
 
-| Область | Revyl | Maestro | Autonom сейчас | Цель Autonom |
+| Area | Revyl | Maestro | Autonom today | Autonom target |
 |---|---|---|---|---|
-| Runtime | Cloud | Local или Cloud | Local и remote Mac | Local-first, provider-neutral |
-| Devices | Simulator/Emulator | Simulator/Emulator/physical | Simulator/Emulator | Добавить physical adapters |
-| Targeting | Vision/LLM + hierarchy | Accessibility selectors | Accessibility JSON | Строгие typed selectors + optional vision |
-| Flow DSL | Богатый YAML | Зрелый YAML | Нет | Maestro-inspired strict Flow v1 |
-| Replay | Да | Да | Журнал без replay | Session → Flow → Replay |
-| Evidence | Очень богатый cloud report | Хороший test bundle | Разрозненные artifacts | Local evidence timeline |
-| App graph | Atlas | Нет | Нет | Atlas-lite |
-| Exploration | Multi-agent Explore | Нет | Agent может действовать вручную | Structured Explore strategies |
-| PR proof | Да | Через CI | Нет | Local/generated PR Proof |
-| Privacy | Cloud | Local или Cloud | Local | Local by default, explicit upload |
-| Agent portability | Codex/Claude/Cursor | MCP и CLI | Skills для разных agents | Skills + CLI + optional MCP |
-| Determinism | Частично model-dependent | Средний | Высокий | Высокий и проверяемый |
-| Security | SaaS policy | Framework-level | Explicit consent и redaction | Сохранить и расширить |
+| Runtime | Cloud | Local or Cloud | Local and remote Mac | Local-first, provider-neutral |
+| Devices | Simulator/Emulator | Simulator/Emulator/physical | Simulator/Emulator | Add physical adapters |
+| Targeting | Vision/LLM + hierarchy | Accessibility selectors | Accessibility JSON | Strict typed selectors + optional vision |
+| Flow DSL | Rich YAML | Mature YAML | None | Maestro-inspired strict Flow v1 |
+| Replay | Yes | Yes | Journal without replay | Session → Flow → Replay |
+| Evidence | Very rich cloud report | Good test bundle | Scattered artifacts | Local evidence timeline |
+| App graph | Atlas | None | None | Atlas-lite |
+| Exploration | Multi-agent Explore | None | Agent can act manually | Structured Explore strategies |
+| PR proof | Yes | Via CI | None | Local/generated PR Proof |
+| Privacy | Cloud | Local or Cloud | Local | Local by default, explicit upload |
+| Agent portability | Codex/Claude/Cursor | MCP and CLI | Skills for different agents | Skills + CLI + optional MCP |
+| Determinism | Partially model-dependent | Medium | High | High and verifiable |
+| Security | SaaS policy | Framework-level | Explicit consent and redaction | Preserve and extend |
 
 ---
 
-## 6. Продуктовая позиция Autonom
+## 6. Autonom product position
 
-### 6.1 Основная формулировка
+### 6.1 Core statement
 
 > **Autonom gives coding agents a deterministic mobile runtime, repeatable flows, and local evidence on infrastructure you control.**
 
-Русская версия:
+Russian version:
 
-> **Autonom даёт coding agents детерминированный мобильный runtime, повторяемые сценарии и локальные доказательства на инфраструктуре пользователя.**
+> **Autonom gives coding agents a deterministic mobile runtime, repeatable scenarios, and local proof on the user's infrastructure.**
 
-### 6.2 Для кого
+### 6.2 Who it is for
 
-- разработчик мобильного приложения;
-- coding agent, который меняет UI или business logic;
-- команда, которая не может отправлять artifacts во внешний SaaS;
-- Flutter, Android и iOS проекты;
+- a mobile application developer;
+- a coding agent that changes UI or business logic;
+- a team that cannot send artifacts to an external SaaS;
+- Flutter, Android, and iOS projects;
 - self-hosted CI;
-- remote Mac и локальные device labs;
-- разработчики agent tools и IDE integrations.
+- remote Macs and local device labs;
+- developers of agent tools and IDE integrations.
 
-### 6.3 Главный use case
+### 6.3 Primary use case
 
 ```text
-Agent изменил код
-  → собрал приложение
-  → запустил на устройстве
-  → прошёл пользовательский путь
-  → проверил UI, logs, network и performance
-  → сохранил flow
-  → повторил flow
-  → вернул человеку proof
+Agent changed the code
+  → built the application
+  → launched it on a device
+  → walked through the user journey
+  → verified UI, logs, network, and performance
+  → saved the flow
+  → replayed the flow
+  → returned proof to the human
 ```
 
-### 6.4 Чем Autonom должен отличаться
+### 6.4 How Autonom should differ
 
-1. Local-first, а не cloud-first.
-2. Accessibility-first, а не vision-first.
-3. Exact и typed semantics, а не fuzzy behavior.
-4. Agent-portable, а не привязанный к одному IDE.
-5. Evidence является частью protocol.
-6. Все ошибки machine-readable.
-7. Dangerous actions требуют явного intent.
-8. Cloud и vision являются adapters, а не core dependency.
+1. Local-first, not cloud-first.
+2. Accessibility-first, not vision-first.
+3. Exact and typed semantics, not fuzzy behavior.
+4. Agent-portable, not tied to a single IDE.
+5. Evidence is part of the protocol.
+6. All errors are machine-readable.
+7. Dangerous actions require explicit intent.
+8. Cloud and vision are adapters, not a core dependency.
 
 ---
 
 ## 7. Autonom Flow v1
 
-### 7.1 Цели
+### 7.1 Goals
 
-- человек может прочитать flow без отдельного обучения;
-- агент может безопасно сгенерировать flow;
-- parser выдаёт точный filename, line, column и error code;
-- один flow работает на Android и iOS, если UI semantics совпадают;
-- повторный запуск имеет предсказуемую семантику;
-- flow сохраняется в Git;
-- каждый step связывается с evidence;
-- supported Maestro flows можно импортировать;
-- новые версии schema не ломают старые flows молча.
+- a human can read a flow without separate training;
+- an agent can safely generate a flow;
+- the parser reports an exact filename, line, column, and error code;
+- a single flow works on Android and iOS when the UI semantics match;
+- a repeated run has predictable semantics;
+- a flow is stored in Git;
+- every step is linked to evidence;
+- supported Maestro flows can be imported;
+- new schema versions do not silently break old flows.
 
-### 7.2 Не-цели v1
+### 7.2 Non-goals for v1
 
-- общий язык программирования;
-- произвольный JavaScript;
-- произвольные HTTP calls;
-- visual AI как обязательный selector;
-- бесконечные loops;
-- скрытое восстановление после mutating failures;
-- полный parity со всеми командами Maestro;
-- orchestration cloud fleet.
+- a general-purpose programming language;
+- arbitrary JavaScript;
+- arbitrary HTTP calls;
+- visual AI as a mandatory selector;
+- infinite loops;
+- hidden recovery after mutating failures;
+- full parity with all Maestro commands;
+- cloud fleet orchestration.
 
-### 7.3 Расположение файлов
+### 7.3 File layout
 
-Рекомендуемая структура:
+Recommended structure:
 
 ```text
 .autonom/
@@ -625,15 +625,15 @@ Agent изменил код
   schemas/
 ```
 
-Runtime artifacts не должны попадать в repository:
+Runtime artifacts must not end up in the repository:
 
 ```text
 ~/.autonom/sessions/<session-id>/
 ```
 
-### 7.4 Формат документа
+### 7.4 Document format
 
-Flow состоит из header и commands, разделённых `---`.
+A Flow consists of a header and commands separated by `---`.
 
 ```yaml
 schema: autonom.dev/flow/v1
@@ -648,22 +648,22 @@ tags: [smoke, auth]
 
 ### 7.5 Header v1
 
-| Поле | Обязательное | Назначение |
+| Field | Required | Purpose |
 |---|---:|---|
-| `schema` | Да | Версия контракта |
-| `appId` | Да для root flow | Bundle ID или package name |
-| `name` | Да | Читаемое имя |
-| `id` | Рекомендуется | Стабильный machine ID |
-| `description` | Нет | Назначение flow |
-| `tags` | Нет | Фильтрация suite |
-| `properties` | Нет | CI и test-management metadata |
-| `env` | Нет | Несекретные defaults |
-| `requires` | Нет | Capabilities и platform constraints |
-| `evidence` | Нет | Политика сбора artifacts |
-| `onFlowStart` | Нет | Setup commands или subflow |
-| `onFlowComplete` | Нет | Cleanup commands или subflow |
+| `schema` | Yes | Contract version |
+| `appId` | Yes for a root flow | Bundle ID or package name |
+| `name` | Yes | Human-readable name |
+| `id` | Recommended | Stable machine ID |
+| `description` | No | Purpose of the flow |
+| `tags` | No | Suite filtering |
+| `properties` | No | CI and test-management metadata |
+| `env` | No | Non-secret defaults |
+| `requires` | No | Capabilities and platform constraints |
+| `evidence` | No | Artifact collection policy |
+| `onFlowStart` | No | Setup commands or a subflow |
+| `onFlowComplete` | No | Cleanup commands or a subflow |
 
-Пример capabilities:
+Capabilities example:
 
 ```yaml
 requires:
@@ -674,9 +674,9 @@ requires:
     - network.capture
 ```
 
-Runner должен проверить requirements до первого mutating action.
+The runner must verify the requirements before the first mutating action.
 
-### 7.6 Команды v1
+### 7.6 Commands v1
 
 #### Lifecycle
 
@@ -697,7 +697,7 @@ Runner должен проверить requirements до первого mutating
 - `scrollUntilVisible`
 - `back`
 
-#### Assertions и ожидания
+#### Assertions and waits
 
 - `assertVisible`
 - `assertNotVisible`
@@ -725,17 +725,17 @@ Runner должен проверить requirements до первого mutating
 - `takeScreenshot`
 - `note`
 
-Большую часть evidence runner собирает автоматически. Эти команды нужны только для именованных checkpoints и ручных заметок.
+Most evidence is collected automatically by the runner. These commands are only needed for named checkpoints and manual notes.
 
 ### 7.7 Canonical command form
 
-Человек может использовать shorthand:
+A human may use shorthand:
 
 ```yaml
 - tapOn: Login
 ```
 
-`autonom flow fmt` преобразует его в canonical form:
+`autonom flow fmt` converts it into the canonical form:
 
 ```yaml
 - tapOn:
@@ -745,13 +745,13 @@ Runner должен проверить requirements до первого mutating
     label: Tap Login
 ```
 
-Canonical form используется:
+The canonical form is used by:
 
-- Session → Flow compiler;
+- the Session → Flow compiler;
 - machine diffs;
 - debugging;
 - schema migrations;
-- report manifest.
+- the report manifest.
 
 ### 7.8 Selectors v1
 
@@ -762,7 +762,7 @@ selector:
   enabled: true
 ```
 
-Поддерживаемые поля:
+Supported fields:
 
 - `id`;
 - `text`;
@@ -779,8 +779,8 @@ selector:
 - `rightOf`;
 - `childOf`;
 - `containsChild`;
-- `bounds` для диагностики;
-- `point` как последний fallback.
+- `bounds` for diagnostics;
+- `point` as a last-resort fallback.
 
 Match modes:
 
@@ -791,35 +791,35 @@ Match modes:
 
 ### 7.9 Selector priority
 
-Compiler должен выбирать selector в таком порядке:
+The compiler must choose a selector in this order:
 
-1. стабильный accessibility `id`;
-2. уникальный visible text;
+1. a stable accessibility `id`;
+2. unique visible text;
 3. `id + state`;
 4. `text + relation`;
 5. `role + relation`;
 6. explicit `index`;
-7. relative point внутри стабильного element;
-8. absolute coordinates только с предупреждением.
+7. a relative point inside a stable element;
+8. absolute coordinates only with a warning.
 
-Autonom сохраняет текущее важное свойство: если selector находит несколько nodes, action не выполняется без явного `index` или уточнения.
+Autonom preserves its current important property: if a selector matches multiple nodes, the action is not performed without an explicit `index` or refinement.
 
 ### 7.10 Wait semantics
 
-Запрещены скрытые sleeps после каждой команды.
+Hidden sleeps after every command are forbidden.
 
-Правила:
+Rules:
 
-- read и assertion commands могут poll UI;
-- default assertion timeout задаётся workspace config;
-- step может уменьшить или увеличить timeout;
-- runner завершает ожидание сразу после выполнения condition;
-- timeout является test failure, а не infrastructure error;
-- недоступный backend является infrastructure error;
-- `waitForIdle` используется только для animation или framework idle;
-- долгий backend operation использует `waitUntil` с явным timeout.
+- read and assertion commands may poll the UI;
+- the default assertion timeout is set by the workspace config;
+- a step may decrease or increase the timeout;
+- the runner ends the wait as soon as the condition is satisfied;
+- a timeout is a test failure, not an infrastructure error;
+- an unreachable backend is an infrastructure error;
+- `waitForIdle` is used only for animation or framework idle;
+- a long backend operation uses `waitUntil` with an explicit timeout.
 
-Пример:
+Example:
 
 ```yaml
 - waitUntil:
@@ -830,15 +830,15 @@ Autonom сохраняет текущее важное свойство: есл�
 
 ### 7.11 Retry semantics
 
-Автоматический retry разрешён для:
+Automatic retry is allowed for:
 
 - UI tree read;
 - screenshots;
 - logs read;
 - assertion polling;
-- временной transport ошибки до начала mutation.
+- a transient transport error before any mutation has started.
 
-Автоматический retry запрещён для:
+Automatic retry is forbidden for:
 
 - tap;
 - double tap;
@@ -848,9 +848,9 @@ Autonom сохраняет текущее важное свойство: есл�
 - permissions mutation;
 - location mutation;
 - mock registry mutation;
-- payment-like или destructive actions.
+- payment-like or destructive actions.
 
-Явный retry:
+Explicit retry:
 
 ```yaml
 - retry:
@@ -862,17 +862,17 @@ Autonom сохраняет текущее важное свойство: есл�
           id: retryable_status
 ```
 
-Ограничения:
+Constraints:
 
-- максимум 3 attempts;
+- a maximum of 3 attempts;
 - no nested retry;
-- retry большого root flow запрещён;
-- каждый attempt отдельно попадает в journal и report;
-- mutating commands требуют `allowMutations: true` и warning.
+- retrying a large root flow is forbidden;
+- each attempt is recorded separately in the journal and the report;
+- mutating commands require `allowMutations: true` and a warning.
 
 ### 7.12 Conditions
 
-v1 поддерживает только ограниченный набор:
+v1 supports only a limited set:
 
 ```yaml
 - runFlow:
@@ -884,26 +884,26 @@ v1 поддерживает только ограниченный набор:
     file: ../subflows/android-permissions.yaml
 ```
 
-Допустимы:
+Allowed:
 
 - `platform`;
 - `visible`;
 - `notVisible`;
 - `envEquals`;
-- логическое AND внутри одного `when`.
+- logical AND within a single `when`.
 
-Не нужны в v1:
+Not needed in v1:
 
 - arbitrary expression;
 - `eval`;
 - unbounded `while`;
 - hidden else branches.
 
-Для существенно разного поведения создаются отдельные flows.
+For substantially different behavior, separate flows are created.
 
 ### 7.13 Optional steps
 
-Optional step может использоваться только для внешнего UI, который не определяет успех сценария:
+An optional step may be used only for external UI that does not determine the success of the scenario:
 
 ```yaml
 - tapOn:
@@ -914,23 +914,23 @@ Optional step может использоваться только для вне
     reason: System prompt may not appear on a reused simulator
 ```
 
-Требования:
+Requirements:
 
-- `reason` обязателен;
-- skipped optional step отображается в report;
-- optional assertion запрещён;
-- optional step не может скрыть crash или transport failure.
+- `reason` is mandatory;
+- a skipped optional step is shown in the report;
+- an optional assertion is forbidden;
+- an optional step cannot hide a crash or a transport failure.
 
-### 7.14 Variables и secrets
+### 7.14 Variables and secrets
 
-Несекретные значения могут находиться в header:
+Non-secret values may live in the header:
 
 ```yaml
 env:
   LOCALE: en_US
 ```
 
-Секреты передаются только снаружи:
+Secrets are passed in only from the outside:
 
 ```bash
 autonom flow run login.yaml \
@@ -938,21 +938,21 @@ autonom flow run login.yaml \
   --secret TEST_PASSWORD
 ```
 
-Источники secrets:
+Secret sources:
 
 - process environment;
 - stdin descriptor;
 - OS keychain adapter;
 - CI secret provider;
-- будущий plugin interface.
+- a future plugin interface.
 
-Правила:
+Rules:
 
-- flow не хранит secret value;
-- journal хранит имя и длину, но не значение;
-- typed text редактируется до записи;
-- screenshots и UI tree могут содержать PII, поэтому помечаются sensitive;
-- report не становится public автоматически.
+- a flow does not store a secret value;
+- the journal stores the name and the length, but not the value;
+- typed text is redacted before being recorded;
+- screenshots and the UI tree may contain PII, so they are marked sensitive;
+- a report does not become public automatically.
 
 ### 7.15 Subflows
 
@@ -964,15 +964,15 @@ autonom flow run login.yaml \
       USER_ROLE: editor
 ```
 
-Правила:
+Rules:
 
-- один subflow выполняет одну задачу;
-- path разрешается относительно текущего flow;
-- path traversal за workspace root запрещён;
-- recursion и cycles запрещены;
-- root `appId` наследуется;
-- subflow может объявить более строгие requirements;
-- arguments валидируются до запуска.
+- one subflow performs one task;
+- the path is resolved relative to the current flow;
+- path traversal beyond the workspace root is forbidden;
+- recursion and cycles are forbidden;
+- the root `appId` is inherited;
+- a subflow may declare stricter requirements;
+- arguments are validated before the run.
 
 ### 7.16 Hooks
 
@@ -984,14 +984,14 @@ onFlowComplete:
   - runFlow: ../subflows/cleanup-session.yaml
 ```
 
-Правила:
+Rules:
 
-- `onFlowComplete` запускается после pass и fail;
-- teardown failure не перезаписывает primary failure;
-- оба failure сохраняются;
-- artifacts сохраняются до cleanup;
-- hooks не наследуются рекурсивно subflows;
-- workspace policy может запретить mutating teardown.
+- `onFlowComplete` runs after both pass and fail;
+- a teardown failure does not overwrite the primary failure;
+- both failures are preserved;
+- artifacts are saved before cleanup;
+- hooks are not inherited recursively by subflows;
+- workspace policy may forbid mutating teardown.
 
 ### 7.17 Evidence policy
 
@@ -1016,9 +1016,9 @@ Modes:
 - `always`;
 - `custom`.
 
-Full network bodies остаются opt-in и требуют существующий Autonom consent.
+Full network bodies remain opt-in and require the existing Autonom consent.
 
-### 7.18 Полный пример Flow v1
+### 7.18 Complete Flow v1 example
 
 ```yaml
 schema: autonom.dev/flow/v1
@@ -1106,9 +1106,9 @@ onFlowComplete:
 
 ## 8. Session → Flow compiler
 
-Это наиболее выгодная первая продуктовая функция после parser и runner.
+This is the most advantageous first product feature after the parser and runner.
 
-### 8.1 Команда
+### 8.1 Command
 
 ```bash
 autonom flow create \
@@ -1117,18 +1117,18 @@ autonom flow create \
   --out .autonom/flows/auth/login.yaml
 ```
 
-### 8.2 Входные данные
+### 8.2 Input data
 
 - `journal.ndjson`;
 - screenshots index;
-- UI tree перед action;
-- selected node и bounds;
-- platform и target;
+- UI tree before the action;
+- selected node and bounds;
+- platform and target;
 - app ID;
-- logs и crash state;
-- пользовательские notes;
+- logs and crash state;
+- user notes;
 - network checkpoints;
-- successful final assertions или выбранные checkpoints.
+- successful final assertions or selected checkpoints.
 
 ### 8.3 Compiler pipeline
 
@@ -1147,38 +1147,38 @@ journal
   → write canonical YAML
 ```
 
-### 8.4 Что compiler не должен делать молча
+### 8.4 What the compiler must not do silently
 
-- превращать ambiguous match в `index: 0`;
-- сохранять password или token;
-- заменять failed action на successful-looking step;
-- использовать absolute coordinates без warning;
-- считать screenshot похожим без явного visual assertion;
-- добавлять retry для mutating action;
-- считать flow cross-platform без второго replay.
+- turn an ambiguous match into `index: 0`;
+- store a password or token;
+- replace a failed action with a successful-looking step;
+- use absolute coordinates without a warning;
+- consider a screenshot similar without an explicit visual assertion;
+- add retry for a mutating action;
+- consider a flow cross-platform without a second replay.
 
 ### 8.5 Quality score
 
-Compiler может вычислять score:
+The compiler can compute a score:
 
-| Фактор | Хорошо | Плохо |
+| Factor | Good | Bad |
 |---|---|---|
 | Selector | stable unique ID | absolute point |
 | Match | exact | broad regex |
 | Input | external secret | literal credential |
-| Assertion | semantic state | нет финальной проверки |
+| Assertion | semantic state | no final check |
 | Replay | passed twice | never replayed |
 | Platform | verified both | inferred |
 
-Score не заменяет replay. Он только объясняет риск.
+The score does not replace replay. It only explains the risk.
 
 ---
 
 ## 9. Evidence Bundle
 
-Evidence должен быть стабильным локальным protocol, а HTML является только одним renderer.
+Evidence must be a stable local protocol, and HTML is only one renderer.
 
-### 9.1 Структура
+### 9.1 Structure
 
 ```text
 ~/.autonom/sessions/s_123/
@@ -1245,25 +1245,25 @@ Evidence должен быть стабильным локальным protocol,
 
 ### 9.3 Step record
 
-Каждый step хранит:
+Each step stores:
 
 - stable step ID;
-- source filename, line и column;
+- source filename, line, and column;
 - command type;
-- canonical arguments после redaction;
+- canonical arguments after redaction;
 - selector;
-- matched node ID и bounds;
-- start и end timestamps;
+- matched node ID and bounds;
+- start and end timestamps;
 - duration;
 - attempt number;
 - result;
 - warning list;
 - artifact references;
-- precondition и postcondition fingerprints.
+- precondition and postcondition fingerprints.
 
 ### 9.4 Report views
 
-HTML report должен иметь:
+The HTML report must have:
 
 1. Summary.
 2. Timeline.
@@ -1282,15 +1282,15 @@ HTML report должен иметь:
 
 - JUnit XML;
 - compact JSON summary;
-- SARIF только для code-linked findings;
-- optional Markdown summary для PR;
+- SARIF only for code-linked findings;
+- optional Markdown summary for the PR;
 - stable exit codes.
 
 ---
 
 ## 10. Atlas-lite
 
-Atlas-lite — локальный observed graph. Он не должен называться полным source of truth.
+Atlas-lite is a local observed graph. It must not be called a complete source of truth.
 
 ### 10.1 Data model
 
@@ -1301,9 +1301,9 @@ Atlas-lite — локальный observed graph. Он не должен наз�
 - platform;
 - normalized accessibility fingerprint;
 - representative screenshot;
-- stable labels и IDs;
+- stable labels and IDs;
 - variants;
-- first и last seen;
+- first and last seen;
 - source sessions;
 - sensitivity.
 
@@ -1313,11 +1313,11 @@ Atlas-lite — локальный observed graph. Он не должен наз�
 - `to_screen_id`;
 - triggering command;
 - selector;
-- flow и step ID;
+- flow and step ID;
 - success count;
 - failure count;
 - median duration;
-- first и last seen.
+- first and last seen.
 
 #### Coverage
 
@@ -1325,21 +1325,21 @@ Atlas-lite — локальный observed graph. Он не должен наз�
 - transitions observed;
 - flows covering each node/edge;
 - last successful verification;
-- stale nodes после UI changes;
+- stale nodes after UI changes;
 - unverified branches.
 
 ### 10.2 Fingerprint
 
-Fingerprint не должен зависеть от:
+The fingerprint must not depend on:
 
 - timestamps;
 - counters;
 - random IDs;
-- list item order, если он не важен;
+- list item order, if it does not matter;
 - keyboard visibility;
 - system status bar values.
 
-Он должен учитывать:
+It must take into account:
 
 - stable IDs;
 - roles;
@@ -1348,7 +1348,7 @@ Fingerprint не должен зависеть от:
 - hierarchy shape;
 - optional coarse layout zones.
 
-### 10.3 Команды
+### 10.3 Commands
 
 ```bash
 autonom atlas update --session s_123
@@ -1358,7 +1358,7 @@ autonom atlas coverage
 autonom atlas diff --base main --head HEAD
 ```
 
-### 10.4 Хранение
+### 10.4 Storage
 
 ```text
 ~/.autonom/apps/<app-id>/atlas/
@@ -1368,7 +1368,7 @@ autonom atlas diff --base main --head HEAD
   coverage.json
 ```
 
-Repository может хранить только export snapshot:
+The repository may store only an export snapshot:
 
 ```bash
 autonom atlas export --out .autonom/atlas.json
@@ -1378,7 +1378,7 @@ autonom atlas export --out .autonom/atlas.json
 
 ## 11. PR Proof
 
-PR Proof связывает code diff и runtime evidence.
+PR Proof links the code diff and runtime evidence.
 
 ### 11.1 Pipeline
 
@@ -1394,7 +1394,7 @@ git diff
   → emit Markdown + JSON + JUnit
 ```
 
-### 11.2 Команда
+### 11.2 Command
 
 ```bash
 autonom proof \
@@ -1404,7 +1404,7 @@ autonom proof \
   --out build/autonom-proof
 ```
 
-### 11.3 Результат
+### 11.3 Result
 
 ```text
 Status: PASS
@@ -1428,60 +1428,60 @@ Runtime findings:
 - Home screen median load +180 ms
 ```
 
-### 11.4 Статусы
+### 11.4 Statuses
 
-- `pass` — все required checks прошли;
-- `fail` — есть подтверждённый failure;
-- `not_covered` — нет flow или platform coverage;
-- `blocked` — build, auth, device или infrastructure issue;
-- `inconclusive` — evidence недостаточно.
+- `pass` — all required checks passed;
+- `fail` — there is a confirmed failure;
+- `not_covered` — no flow or platform coverage;
+- `blocked` — build, auth, device, or infrastructure issue;
+- `inconclusive` — the evidence is insufficient.
 
-Нельзя превращать `blocked` или `not_covered` в `pass`.
+`blocked` or `not_covered` must never be turned into `pass`.
 
 ---
 
 ## 12. Explore
 
-Explore запускается только после Flow, Evidence и Atlas-lite.
+Explore runs only after Flow, Evidence, and Atlas-lite.
 
-### 12.1 Стратегии
+### 12.1 Strategies
 
-- `surface` — открыть все доступные controls текущего экрана;
-- `journey` — достичь заданной цели;
-- `edges` — permissions, offline, invalid inputs, retries и backgrounding;
-- `coverage` — пройти неизвестные Atlas edges;
-- `change-focused` — исследовать области, затронутые diff;
-- `performance` — повторить путь и собрать metrics.
+- `surface` — open all available controls on the current screen;
+- `journey` — reach a given goal;
+- `edges` — permissions, offline, invalid inputs, retries, and backgrounding;
+- `coverage` — traverse unknown Atlas edges;
+- `change-focused` — explore areas affected by the diff;
+- `performance` — repeat a path and collect metrics.
 
 ### 12.2 Safety budget
 
-Explore получает явные ограничения:
+Explore receives explicit constraints:
 
 - maximum actions;
 - maximum duration;
 - allowed app IDs;
 - allowed deep-link schemes;
-- forbidden text patterns, например Buy или Delete;
+- forbidden text patterns, for example Buy or Delete;
 - network capture policy;
 - permission mutation policy;
 - reset policy;
 - allowed routes.
 
-### 12.3 Результат
+### 12.3 Result
 
-Explore обязан вернуть:
+Explore must return:
 
-- новые Atlas nodes и edges;
+- new Atlas nodes and edges;
 - journal;
 - evidence;
-- найденные failures;
+- discovered failures;
 - unreached goals;
 - generated draft flows;
-- warnings о non-deterministic selectors.
+- warnings about non-deterministic selectors.
 
 ---
 
-## 13. Архитектура
+## 13. Architecture
 
 ```mermaid
 flowchart TD
@@ -1496,7 +1496,7 @@ flowchart TD
     H --> J["Atlas-lite indexer"]
 ```
 
-### 13.1 Модули
+### 13.1 Modules
 
 ```text
 autonom_lib/
@@ -1531,19 +1531,19 @@ autonom_lib/
     ios.py
 ```
 
-### 13.2 Главные границы
+### 13.2 Key boundaries
 
-- Parser не вызывает device tools.
-- Flow executor не формирует HTML.
-- Device adapter не знает YAML.
-- Evidence collector получает structured events.
-- Atlas получает только redacted normalized events.
-- Agent skills используют публичный CLI, а не internal modules.
-- MCP является wrapper над тем же CLI contract.
+- The parser does not call device tools.
+- The Flow executor does not produce HTML.
+- The device adapter knows nothing about YAML.
+- The Evidence collector receives structured events.
+- Atlas receives only redacted normalized events.
+- Agent skills use the public CLI, not internal modules.
+- MCP is a wrapper over the same CLI contract.
 
 ### 13.3 Event protocol
 
-Все runtime events должны иметь единую envelope:
+All runtime events must share a single envelope:
 
 ```json
 {
@@ -1558,7 +1558,7 @@ autonom_lib/
 }
 ```
 
-Этот protocol питает:
+This protocol feeds:
 
 - `journal.ndjson`;
 - live follow;
@@ -1614,19 +1614,19 @@ autonom network follow
 autonom metrics follow
 ```
 
-Каждая команда поддерживает `--json`. Human output идёт в stderr или отдельный renderer. JSON stdout остаётся чистым.
+Every command supports `--json`. Human output goes to stderr or a separate renderer. JSON stdout stays clean.
 
 ---
 
-## 15. Совместимость с Maestro
+## 15. Maestro compatibility
 
-### 15.1 Рекомендация
+### 15.1 Recommendation
 
-Не заявлять полную Maestro compatibility. Поддерживать документированный **Maestro Core Profile**.
+Do not claim full Maestro compatibility. Support a documented **Maestro Core Profile**.
 
 ### 15.2 Core Profile
 
-Первый профиль:
+The first profile:
 
 - header: `appId`, `name`, `tags`, `env`;
 - `launchApp`, `stopApp`, `clearState`;
@@ -1647,14 +1647,14 @@ autonom flow import maestro.yaml --out autonom.yaml
 
 Importer:
 
-- добавляет `schema`;
-- делает `match` явным;
-- проверяет selector uniqueness при dry run;
-- переносит tags и metadata;
-- помечает unsupported commands;
-- не исполняет файл при неоднозначной конвертации.
+- adds `schema`;
+- makes `match` explicit;
+- checks selector uniqueness during dry run;
+- carries over tags and metadata;
+- flags unsupported commands;
+- does not execute the file when the conversion is ambiguous.
 
-Ошибка:
+Error:
 
 ```json
 {
@@ -1667,122 +1667,122 @@ Importer:
 }
 ```
 
-### 15.4 Почему не использовать Maestro runtime напрямую
+### 15.4 Why not use the Maestro runtime directly
 
-- Java 17 увеличивает installation cost;
-- Maestro приносит собственные Android и iOS drivers;
-- это дублирует Autonom adapters;
-- full semantics слишком широкая;
-- Autonom потеряет dependency-light design;
-- evidence и security model придётся строить вокруг чужого executor;
-- Autonom нужен target-neutral protocol, который работает и вне E2E tests.
+- Java 17 increases installation cost;
+- Maestro brings its own Android and iOS drivers;
+- this duplicates Autonom adapters;
+- the full semantics are too broad;
+- Autonom would lose its dependency-light design;
+- the evidence and security model would have to be built around a foreign executor;
+- Autonom needs a target-neutral protocol that also works outside E2E tests.
 
 ---
 
-## 16. Безопасность
+## 16. Security
 
-Текущая security модель Autonom является преимуществом и не должна размываться.
+Autonom's current security model is an advantage and must not be diluted.
 
-### 16.1 Обязательные правила
+### 16.1 Mandatory rules
 
-- local-only по умолчанию;
-- никакой telemetry без явного opt-in;
-- MITM только на loopback;
-- physical-device proxy attachment запрещён, пока нет безопасной модели;
-- consent нельзя выдать через environment variable;
-- full network bodies являются opt-in;
-- redaction выполняется до записи;
-- CA private key не входит в session artifacts;
-- app-container path traversal запрещён;
-- artifact paths confined внутри output root;
-- flow subpaths confined внутри workspace;
-- public sharing отсутствует по умолчанию;
-- каждое upload action требует явного destination;
-- secrets не попадают в journal, report и command echo;
-- screenshot, video, hierarchy и HAR маркируются sensitive.
+- local-only by default;
+- no telemetry without explicit opt-in;
+- MITM on loopback only;
+- physical-device proxy attachment is forbidden until there is a safe model;
+- consent cannot be granted via an environment variable;
+- full network bodies are opt-in;
+- redaction is performed before writing;
+- the CA private key is not part of session artifacts;
+- app-container path traversal is forbidden;
+- artifact paths are confined within the output root;
+- flow subpaths are confined within the workspace;
+- there is no public sharing by default;
+- every upload action requires an explicit destination;
+- secrets do not end up in the journal, report, or command echo;
+- screenshot, video, hierarchy, and HAR are marked sensitive.
 
-### 16.2 Новые угрозы от Flow engine
+### 16.2 New threats from the Flow engine
 
-- replay destructive step;
+- replay of a destructive step;
 - duplicate tap;
-- secret interpolation в report;
-- path traversal через `runFlow` и screenshot path;
+- secret interpolation into the report;
+- path traversal via `runFlow` and the screenshot path;
 - recursive subflows;
 - unbounded loops;
-- cleanup, который удаляет не test data;
-- condition, скрывающий failed assertion;
-- imported Maestro script с arbitrary JS;
-- report, который открывает remote resources;
-- HTML injection через UI text или logs.
+- cleanup that deletes non-test data;
+- a condition that hides a failed assertion;
+- an imported Maestro script with arbitrary JS;
+- a report that opens remote resources;
+- HTML injection via UI text or logs.
 
-### 16.3 Меры
+### 16.3 Mitigations
 
-- schema validation до execution;
+- schema validation before execution;
 - dry-run capability check;
 - typed command risk level;
 - mutating command audit;
 - no implicit mutation retry;
 - output path containment;
-- HTML escaping и Content Security Policy;
+- HTML escaping and Content Security Policy;
 - no external report assets;
-- bounded actions и duration;
-- primary и cleanup errors хранятся отдельно;
-- imported scripts не выполняются;
-- secrets передаются через explicit providers.
+- bounded actions and duration;
+- primary and cleanup errors are stored separately;
+- imported scripts are not executed;
+- secrets are passed via explicit providers.
 
 ---
 
-## 17. План реализации
+## 17. Implementation plan
 
-### Phase 0. Надёжное основание
+### Phase 0. A reliable foundation
 
-Задачи:
+Tasks:
 
-- исправить восстановление `AUTONOM_HOME` в tests;
-- добавить GitHub Actions;
-- добавить Python и Node checks;
-- добавить macOS и Linux matrix;
-- добавить Android emulator smoke;
-- добавить iOS simulator smoke на macOS;
-- добавить version tags и release artifacts;
-- зафиксировать CLI compatibility policy.
+- fix `AUTONOM_HOME` restoration in tests;
+- add GitHub Actions;
+- add Python and Node checks;
+- add a macOS and Linux matrix;
+- add an Android emulator smoke;
+- add an iOS simulator smoke on macOS;
+- add version tags and release artifacts;
+- lock in the CLI compatibility policy.
 
-Критерии готовности:
+Completion criteria:
 
-- suite не пишет в реальный home;
-- все tests проходят в clean environment;
-- два последовательных runs не влияют друг на друга;
-- Android и iOS smoke запускают приложение и выполняют UI tree + tap + screenshot;
-- release воспроизводим из tag.
+- the suite does not write to the real home;
+- all tests pass in a clean environment;
+- two consecutive runs do not affect each other;
+- the Android and iOS smokes launch the app and perform UI tree + tap + screenshot;
+- the release is reproducible from a tag.
 
 ### Phase 1. Flow v1 foundation
 
-Задачи:
+Tasks:
 
 - schema;
 - parser;
 - canonical model;
-- validation errors с line/column;
+- validation errors with line/column;
 - basic commands;
 - selectors;
-- assertions с polling;
+- assertions with polling;
 - `runFlow`;
 - tags;
 - `flow check`, `fmt`, `run`;
 - JSON event stream.
 
-Критерии готовности:
+Completion criteria:
 
-- один login flow проходит на Android и iOS fixtures;
-- unsupported command никогда не игнорируется;
-- duplicate selector не вызывает action;
-- exact match является default;
-- mutating command не повторяется автоматически;
-- invalid path блокируется до device action.
+- one login flow passes on Android and iOS fixtures;
+- an unsupported command is never ignored;
+- a duplicate selector does not trigger an action;
+- exact match is the default;
+- a mutating command is not retried automatically;
+- an invalid path is blocked before the device action.
 
 ### Phase 2. Session → Flow
 
-Задачи:
+Tasks:
 
 - journal compiler;
 - selector scoring;
@@ -1792,17 +1792,17 @@ Importer:
 - same-platform replay;
 - quality explanation.
 
-Критерии готовности:
+Completion criteria:
 
-- успешная ручная login session превращается в flow;
-- secrets не появляются в output;
-- generated flow проходит два replay runs;
-- coordinate fallback явно помечен;
-- ambiguous selector блокирует generation или требует выбора.
+- a successful manual login session turns into a flow;
+- secrets do not appear in the output;
+- the generated flow passes two replay runs;
+- coordinate fallback is explicitly marked;
+- an ambiguous selector blocks generation or requires a choice.
 
 ### Phase 3. Evidence Bundle
 
-Задачи:
+Tasks:
 
 - manifest v1;
 - per-step artifacts;
@@ -1815,18 +1815,18 @@ Importer:
 - JUnit;
 - reproduction command.
 
-Критерии готовности:
+Completion criteria:
 
-- любой failed step объясняется без повторного запуска;
-- report не требует internet;
-- report paths confined;
-- teardown failure не удаляет evidence;
-- sensitive values redacted;
-- CI может открыть JUnit и HTML artifacts.
+- any failed step can be explained without a re-run;
+- the report does not require internet;
+- report paths are confined;
+- a teardown failure does not delete evidence;
+- sensitive values are redacted;
+- CI can open the JUnit and HTML artifacts.
 
 ### Phase 4. Atlas-lite
 
-Задачи:
+Tasks:
 
 - screen fingerprint;
 - variant detection;
@@ -1836,38 +1836,38 @@ Importer:
 - stale node detection;
 - path query.
 
-Критерии готовности:
+Completion criteria:
 
-- повторный visit не создаёт duplicate screen;
-- значимое UI state создаёт variant;
-- каждый edge ссылается на session и evidence;
-- пользователь видит observed, stale и uncovered paths;
-- Atlas не заявляет ненаблюдаемое покрытым.
+- a repeat visit does not create a duplicate screen;
+- a meaningful UI state creates a variant;
+- every edge references a session and evidence;
+- the user sees observed, stale, and uncovered paths;
+- Atlas does not claim the unobserved as covered.
 
 ### Phase 5. PR Proof
 
-Задачи:
+Tasks:
 
 - diff reader;
 - changed-area mapping;
 - flow selection;
 - baseline/candidate comparison;
 - Markdown summary;
-- JSON и JUnit outputs;
+- JSON and JUnit outputs;
 - generic CI example;
 - optional GitHub Action.
 
-Критерии готовности:
+Completion criteria:
 
-- `not_covered` не становится `pass`;
-- proof содержит точные flow и platform results;
-- каждый finding ведёт к evidence;
-- infrastructure failure отделён от product failure;
-- PR summary укладывается в один экран.
+- `not_covered` does not become `pass`;
+- the proof contains exact flow and platform results;
+- every finding leads to evidence;
+- infrastructure failure is separated from product failure;
+- the PR summary fits on one screen.
 
 ### Phase 6. Explore
 
-Задачи:
+Tasks:
 
 - strategy interface;
 - action and time budgets;
@@ -1875,19 +1875,19 @@ Importer:
 - Atlas-aware exploration;
 - draft flow generation;
 - coverage report;
-- multiple agents через external orchestrator.
+- multiple agents via an external orchestrator.
 
-Критерии готовности:
+Completion criteria:
 
-- Explore нельзя вывести за allowed app и budget;
-- каждое действие журналируется;
-- новые paths воспроизводятся или помечаются non-reproducible;
-- generated flow проходит validator;
+- Explore cannot be pushed beyond the allowed app and budget;
+- every action is journaled;
+- new paths are reproduced or marked non-reproducible;
+- the generated flow passes the validator;
 - destructive UI requires explicit policy.
 
 ### Phase 7. Providers
 
-Задачи:
+Tasks:
 
 - local adapter contract;
 - remote Mac adapter;
@@ -1896,12 +1896,12 @@ Importer:
 - third-party cloud adapter interface;
 - provider capability negotiation.
 
-Критерии готовности:
+Completion criteria:
 
-- один Flow v1 не меняется при смене provider;
-- unsupported capability обнаруживается до run;
-- artifacts возвращаются в единый local format;
-- cloud upload всегда явный.
+- a single Flow v1 does not change when the provider changes;
+- an unsupported capability is detected before the run;
+- artifacts are returned in a unified local format;
+- cloud upload is always explicit.
 
 ---
 
@@ -1951,39 +1951,39 @@ Importer:
 
 ### 18.4 Reliability matrix
 
-Каждый release должен запускать один и тот же smoke suite:
+Every release must run the same smoke suite:
 
-- Android current и previous API;
-- iOS current и previous runtime;
+- Android current and previous API;
+- iOS current and previous runtime;
 - Flutter demo app;
 - Compose demo app;
-- UIKit или SwiftUI demo app;
+- UIKit or SwiftUI demo app;
 - bare host without tools;
 - remote iOS host.
 
 ### 18.5 Flake measurement
 
-Critical flows запускаются минимум 20 раз в controlled environment.
+Critical flows are run at least 20 times in a controlled environment.
 
-Считаются:
+The following are counted:
 
 - pass rate;
 - assertion timeout rate;
 - selector ambiguity rate;
 - transport failure rate;
-- median и p95 duration;
+- median and p95 duration;
 - retry count;
 - evidence completeness.
 
 ---
 
-## 19. Метрики продукта
+## 19. Product metrics
 
 ### North Star
 
-**Verified agent changes:** доля изменений coding agent, для которых Autonom вернул воспроизводимый runtime proof.
+**Verified agent changes:** the share of coding agent changes for which Autonom returned a reproducible runtime proof.
 
-### Основные метрики
+### Core metrics
 
 - time from code change to first device action;
 - time from session to generated flow;
@@ -2000,61 +2000,61 @@ Critical flows запускаются минимум 20 раз в controlled env
 - secret leakage incidents — target 0;
 - unintended mutating retries — target 0.
 
-### Не использовать как основную метрику
+### Not to be used as a primary metric
 
-- число AI actions;
-- число screenshots;
-- число созданных YAML-файлов;
-- число Atlas nodes без verified paths;
-- pass rate без учёта skipped и not-covered.
+- number of AI actions;
+- number of screenshots;
+- number of YAML files created;
+- number of Atlas nodes without verified paths;
+- pass rate that ignores skipped and not-covered.
 
 ---
 
-## 20. Основные риски
+## 20. Key risks
 
-| Риск | Последствие | Мера |
+| Risk | Consequence | Mitigation |
 |---|---|---|
-| Flow DSL становится вторым Maestro | Большая стоимость поддержки | Ограниченный v1 и importer |
-| Слишком много AI semantics | Невоспроизводимые tests | Deterministic core, AI optional |
-| Evidence быстро разрастается | Disk и privacy проблемы | Policies, retention, preview bodies |
-| Atlas создаёт ложное чувство покрытия | Пропущенные paths | Только observed graph и explicit unknown |
-| Retry скрывает bugs | False pass | No implicit mutation retry |
-| Conditions превращают YAML в код | Сложный debug | Ограниченный `when`, separate flows |
-| Secrets попадают в screenshots | Data leak | Sensitive marking, local-only, review tools |
-| Physical devices расширяют scope | Замедление core roadmap | Provider adapter после Flow/Evidence |
-| Cloud features размывают позицию | Потеря local-first moat | Cloud только как optional provider |
-| Compatibility promise с Maestro | Постоянная гонка за parity | Версионированный Core Profile |
+| The Flow DSL becomes a second Maestro | High maintenance cost | A constrained v1 and the importer |
+| Too much AI semantics | Non-reproducible tests | Deterministic core, AI optional |
+| Evidence grows quickly | Disk and privacy problems | Policies, retention, preview bodies |
+| Atlas creates a false sense of coverage | Missed paths | Only the observed graph and explicit unknown |
+| Retry hides bugs | False pass | No implicit mutation retry |
+| Conditions turn YAML into code | Hard debugging | A constrained `when`, separate flows |
+| Secrets end up in screenshots | Data leak | Sensitive marking, local-only, review tools |
+| Physical devices expand the scope | Slows down the core roadmap | Provider adapter after Flow/Evidence |
+| Cloud features dilute the positioning | Loss of the local-first moat | Cloud only as an optional provider |
+| A compatibility promise with Maestro | A perpetual parity race | A versioned Core Profile |
 
 ---
 
-## 21. Зафиксированные продуктовые решения
+## 21. Committed product decisions
 
-1. Autonom остаётся local-first.
-2. CLI остаётся source of truth.
-3. MCP остаётся optional wrapper.
-4. Flow v1 вдохновлён Maestro, но имеет собственную schema.
-5. Maestro import поддерживает только явный Core Profile.
-6. Exact selector match является default.
-7. Duplicate match блокирует action.
-8. Mutating commands не повторяются автоматически.
-9. Assertions выполняют polling вместо sleeps.
-10. JavaScript отсутствует в Flow v1.
-11. Evidence собирается как protocol, а не только HTML.
-12. Session → Flow является первым главным продуктовым workflow.
-13. Atlas-lite хранит только observed graph.
-14. PR Proof различает pass, fail, not covered, blocked и inconclusive.
-15. Explore появляется только после replay, evidence и Atlas.
-16. Cloud и physical devices подключаются через providers.
-17. Telemetry отсутствует по умолчанию.
-18. Любая внешняя передача artifacts является явным действием.
+1. Autonom stays local-first.
+2. The CLI stays the source of truth.
+3. MCP stays an optional wrapper.
+4. Flow v1 is inspired by Maestro but has its own schema.
+5. Maestro import supports only the explicit Core Profile.
+6. Exact selector match is the default.
+7. A duplicate match blocks the action.
+8. Mutating commands are not retried automatically.
+9. Assertions perform polling instead of sleeps.
+10. There is no JavaScript in Flow v1.
+11. Evidence is collected as a protocol, not only HTML.
+12. Session → Flow is the first flagship product workflow.
+13. Atlas-lite stores only the observed graph.
+14. PR Proof distinguishes pass, fail, not covered, blocked, and inconclusive.
+15. Explore arrives only after replay, evidence, and Atlas.
+16. Cloud and physical devices are connected via providers.
+17. There is no telemetry by default.
+18. Any external transfer of artifacts is an explicit action.
 
 ---
 
-## 22. Итоговая рекомендация
+## 22. Final recommendation
 
-Не нужно конкурировать с Revyl по количеству cloud features и не нужно заново реализовывать весь Maestro.
+There is no need to compete with Revyl on the number of cloud features, and no need to reimplement all of Maestro.
 
-Нужно построить компактный, строгий и хорошо связанный продуктовый цикл:
+What is needed is a compact, strict, well-connected product loop:
 
 ```text
 Observe
@@ -2067,24 +2067,24 @@ Observe
   → Prove Change
 ```
 
-Самая сильная версия Autonom выглядит так:
+The strongest version of Autonom looks like this:
 
-- запускается локально;
-- подходит разным coding agents;
-- одинаково управляет Android и iOS;
-- понимает accessibility tree;
-- генерирует короткие читаемые flows;
-- не скрывает ambiguity и flakes;
-- оставляет полный local evidence;
-- показывает, какие части приложения реально проверены;
-- связывает code diff с runtime proof;
-- при необходимости работает на remote Mac, physical device или cloud provider без изменения flow.
+- runs locally;
+- suits different coding agents;
+- drives Android and iOS the same way;
+- understands the accessibility tree;
+- generates short, readable flows;
+- does not hide ambiguity and flakes;
+- leaves complete local evidence;
+- shows which parts of the app have actually been verified;
+- links the code diff to runtime proof;
+- when needed, works on a remote Mac, a physical device, or a cloud provider without changing the flow.
 
-Это не «ещё один mobile test framework». Это **runtime verification layer для автономной разработки мобильных приложений**.
+This is not "yet another mobile test framework." This is a **runtime verification layer for autonomous mobile app development**.
 
 ---
 
-## 23. Основные источники
+## 23. Primary sources
 
 ### Autonom
 

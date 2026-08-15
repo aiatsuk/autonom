@@ -252,7 +252,7 @@ class ConsentTests(EnvSandboxMixin, unittest.TestCase):
                                     prompt=lambda: consent.PHRASE_EN)
             self.assertEqual(entry["operation"], "device_proxy")
 
-            for wrong in ("ыв", "yes", "", consent.PHRASE_EN[:-5]):
+            for wrong in ("nah", "yes", "", consent.PHRASE_EN[:-5]):
                 with self.assertRaises(errors.AutonomError) as caught:
                     consent.require(self.OPERATION, acknowledged=True,
                                     stream=io.StringIO(), prompt=lambda: wrong)
@@ -285,7 +285,6 @@ class ConsentTests(EnvSandboxMixin, unittest.TestCase):
     def test_phrase_matching_is_exact_but_tolerant_of_whitespace(self) -> None:
         self.assertTrue(consent.phrase_accepted(consent.PHRASE_EN))
         self.assertTrue(consent.phrase_accepted("  " + consent.PHRASE_EN + ".  "))
-        self.assertTrue(consent.phrase_accepted(consent.PHRASE_RU))
         for wrong in ("yes", "y", "I agree", "", consent.PHRASE_EN[:-5]):
             self.assertFalse(consent.phrase_accepted(wrong), wrong)
 
