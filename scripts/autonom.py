@@ -17,6 +17,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from autonom_lib import __version__  # noqa: E402
+from autonom_lib import actions as actions_mod  # noqa: E402
 from autonom_lib import adb as adb_mod  # noqa: E402
 from autonom_lib import consent as consent_mod  # noqa: E402
 from autonom_lib import device_state  # noqa: E402
@@ -25,6 +26,7 @@ from autonom_lib import emulator as emulator_mod  # noqa: E402
 from autonom_lib import errors  # noqa: E402
 from autonom_lib import ios_idb  # noqa: E402
 from autonom_lib.flow import canonical as flow_canonical  # noqa: E402
+from autonom_lib.flow import compiler as flow_compiler  # noqa: E402
 from autonom_lib.flow import executor as flow_executor  # noqa: E402
 from autonom_lib.flow import maestro as flow_maestro  # noqa: E402
 from autonom_lib.flow import validator as flow_validator  # noqa: E402
@@ -500,6 +502,17 @@ def cmd_ui_find(args: argparse.Namespace) -> int:
     }
     if target:
         payload.update(target.identity())
+        detail = actions_mod.record_detail(session_mod.load_current(), "find", {
+            "kind": "find",
+            "selector": {
+                **{k: v for k, v in _selectors(args).items() if v is not None},
+                "mode": args.mode, "case_sensitive": args.case_sensitive,
+                "index": args.index,
+            },
+            "count": len(matches),
+        })
+        if detail:
+            payload["detail"] = detail
     if not matches and args.resource_id and not any(node.get("resource_id") for node in nodes):
         payload["warnings"] = [{
             "code": "no_accessibility_identifiers",
@@ -512,11 +525,14 @@ def cmd_ui_find(args: argparse.Namespace) -> int:
 def cmd_ui_tap(args: argparse.Namespace) -> int:
     target = _target(args)
     ref = None
+    node = None
+    nodes: list[dict[str, Any]] = []
     if args.x is not None and args.y is not None:
         x, y = args.x, args.y
     else:
+        nodes = ui_mod.snapshot(target)
         matches = selector_mod.select(
-            ui_mod.snapshot(target),
+            nodes,
             _selectors(args),
             mode=args.mode,
             case_sensitive=args.case_sensitive,
@@ -536,9 +552,24 @@ def cmd_ui_tap(args: argparse.Namespace) -> int:
         ui_mod.long_press(target, x, y, duration)
     else:
         ui_mod.tap(target, x, y)
+    detail = actions_mod.record_detail(session_mod.load_current(), "tap", {
+        "kind": "tap",
+        "coordinate": node is None,
+        "selector": None if node is None else {
+            **{k: v for k, v in _selectors(args).items() if v is not None},
+            "mode": args.mode, "case_sensitive": args.case_sensitive,
+            "index": args.index,
+        },
+        "node": node,
+        "x": x, "y": y,
+        "duration_ms": duration,
+        "nodes": nodes,
+    })
     payload: dict[str, Any] = {"ok": True, "x": x, "y": y, "ref": ref}
     if duration:
         payload["duration_ms"] = duration
+    if detail:
+        payload["detail"] = detail
     return emit({**payload, **target.identity()}, as_json=True)
 
 
@@ -570,7 +601,23 @@ def cmd_ui_gesture(args: argparse.Namespace) -> int:
 def cmd_ui_type(args: argparse.Namespace) -> int:
     target = _target(args)
     ui_mod.type_text(target, args.text)
-    return emit({"ok": True, "typed": args.text, **target.identity()}, as_json=True)
+    sensitive = bool(getattr(args, "sensitive", False))
+    detail = actions_mod.record_detail(session_mod.load_current(), "type", {
+        "kind": "type",
+        "sensitive": sensitive,
+        # Screenshots already capture what the screen shows; the typed value
+        # in an owner-only artifact is the same privacy class — unless the
+        # caller marked it sensitive, in which case only the length is kept.
+        "text": None if sensitive else args.text,
+        "text_len": len(args.text),
+    })
+    payload: dict[str, Any] = {"ok": True, "typed": args.text}
+    if sensitive:
+        payload["typed"] = f"<{len(args.text)} chars>"
+        payload["sensitive"] = True
+    if detail:
+        payload["detail"] = detail
+    return emit({**payload, **target.identity()}, as_json=True)
 
 
 def cmd_ui_key(args: argparse.Namespace) -> int:
@@ -1307,6 +1354,47 @@ def _tag_selected(tags: list[str], include: list[str], exclude: list[str]) -> bo
     return True
 
 
+def _session_by_id(session_id: str) -> dict[str, Any]:
+    if session_id == "current":
+        record = session_mod.load_current()
+        if not record:
+            raise errors.AutonomError(
+                errors.NO_ACTIVE_SESSION, "no active session",
+                "Start one with 'autonom session start', or pass a session id.",
+            )
+        return record
+    path = session_mod.sessions_home() / session_id / "session.json"
+    if not path.is_file():
+        raise errors.AutonomError(
+            errors.SESSION_NOT_FOUND, f"no session {session_id!r}",
+            f"Sessions live under {session_mod.sessions_home()}.",
+        )
+    return session_mod.upgrade(json.loads(path.read_text(encoding="utf-8")))
+
+
+def cmd_flow_create(args: argparse.Namespace) -> int:
+    record = _session_by_id(args.from_session)
+    text, report = flow_compiler.compile_to_text(
+        record, name=args.name, task=args.task)
+    payload: dict[str, Any] = {
+        "ok": True,
+        "session_id": record.get("session_id"),
+        **report,
+    }
+    if args.out:
+        out = Path(args.out)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(text, encoding="utf-8")
+        payload["out"] = args.out
+        secrets = " ".join(f"--secret {name}"
+                           for name in report.get("secrets_required", []))
+        payload["replay"] = f"autonom flow run {args.out}" + (
+            f" {secrets}" if secrets else "")
+    else:
+        payload["canonical"] = text
+    return emit(payload, as_json=True)
+
+
 def cmd_flow_import(args: argparse.Namespace) -> int:
     path = Path(args.path)
     if not path.is_file():
@@ -1614,6 +1702,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = ui_sub.add_parser("type", help="type text into the focused field", parents=[target_flags])
     p.add_argument("text")
+    p.add_argument("--sensitive", action="store_true",
+                   help="a credential: keep only its length in every artifact")
     p.set_defaults(func=cmd_ui_type)
 
     p = ui_sub.add_parser("key", help="send a key or hardware button", parents=[target_flags])
@@ -1751,6 +1841,14 @@ def build_parser() -> argparse.ArgumentParser:
     p = flow_sub.add_parser("list", help="list flows: file, id, name, tags, platforms")
     p.add_argument("path", nargs="?", help="directory to scan (default .autonom/flows)")
     p.set_defaults(func=cmd_flow_list)
+    p = flow_sub.add_parser("create",
+                            help="compile a recorded session into a flow file")
+    p.add_argument("--from-session", required=True, metavar="ID",
+                   help="a session id, or 'current'")
+    p.add_argument("--out", help="write the flow here (else in the JSON)")
+    p.add_argument("--name", help="flow name (default: Recorded <task>)")
+    p.add_argument("--task", help="tag the flow and name it after this task")
+    p.set_defaults(func=cmd_flow_create)
     p = flow_sub.add_parser("import",
                             help="convert a Maestro Core Profile flow to Flow v1")
     p.add_argument("path", help="a Maestro flow file")

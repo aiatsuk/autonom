@@ -38,7 +38,7 @@ _SENSITIVE_VALUE_FLAGS = {
 _SUMMARY_KEYS = (
     "target_id", "platform", "saved", "path", "count", "matched", "gesture",
     "booted", "stopped", "via", "mocks_active", "mocks", "hits", "port",
-    "har", "url", "app_id", "note", "status", "run_id",
+    "har", "url", "app_id", "note", "status", "run_id", "detail",
 )
 
 

@@ -7,6 +7,27 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
 
 ## [Unreleased]
 
+## [0.23.0] - 2026-08-15
+
+The research doc's first flagship workflow: Session → Flow.
+
+### Added
+- Instrumented `ui tap|type|find`: each action writes an owner-only detail
+  record (proven selector, matched node, surrounding tree, typed text or —
+  with the new `ui type --sensitive` — only its length) under
+  `<session>/actions/`, linked from the journal via the `detail` key.
+- `flow create --from-session <id|current>` compiles the journal + details
+  into a validated canonical flow: proven selectors verbatim, explicit
+  `--index` carried as explicit `index`, sensitive input as `${SECRET_n}`
+  (never stored, credential-shaped fields auto-detected), the final
+  verifying `ui find` as the closing assertion, coordinate taps and
+  point swipes reported as warnings instead of approximated; the response
+  includes a quality report and the exact replay command.
+- End-to-end proof in tests: a fake-driver session records, compiles,
+  passes `flow check`, and replays green with `--secret` — with the secret
+  absent from every artifact.
+
+
 ## [0.22.0] - 2026-08-15
 
 ### Added

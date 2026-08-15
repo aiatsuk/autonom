@@ -173,6 +173,21 @@ deferred: waitForIdle extendedWaitUntil runScript evalScript repeat
 - `onFlowComplete` runs after pass *and* fail; a cleanup failure never masks
   the primary failure; evidence is captured before cleanup runs.
 
+## Recording a flow (Session → Flow)
+
+`autonom flow create --from-session current --task login --out
+.autonom/flows/auth/login.yaml` compiles a manual session into a validated
+flow. The instrumented `ui tap|type|find` verbs record per-action detail
+(matched node, proven selector, typed text) under the session's owner-only
+`actions/`; the compiler reuses selectors that were proven unique during
+the session, converts `ui type --sensitive` (and values typed into
+credential-shaped fields) to `${SECRET_n}` placeholders that are never
+stored, turns the final verifying `ui find` into the closing assertion,
+and refuses to approximate what it cannot prove — coordinate taps and
+point-to-point swipes are reported as warnings, not guessed. The response
+carries a quality report and the exact `flow run … --secret …` replay
+command. End recordings with a `ui find` on the success state.
+
 ## Maestro Core Profile
 
 `autonom flow import maestro.yaml` converts a Maestro flow within the

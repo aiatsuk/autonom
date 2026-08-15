@@ -127,6 +127,16 @@ ${TEST_PASSWORD}, never inline), run `flow check` on it, then execute it with
 with the events path.
 ```
 
+## Record a session into a flow automatically
+
+```text
+Walk through the checkout journey on the device with autonom ui verbs
+(finish with a ui find on the success screen), then run
+`autonom flow create --from-session current --task checkout --out
+.autonom/flows/checkout.yaml` and replay it with the command the response
+suggests. Report the quality warnings, if any.
+```
+
 ## Run the smoke suite and explain any failure
 
 ```text

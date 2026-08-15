@@ -29,6 +29,7 @@ BACKEND_FAILED = "backend_failed"
 
 # --- Session -----------------------------------------------------------------
 NO_ACTIVE_SESSION = "no_active_session"
+SESSION_NOT_FOUND = "session_not_found"
 INSTALL_PATH_NOT_FOUND = "install_path_not_found"
 APP_NOT_INSTALLED = "app_not_installed"
 IOS_BOOT_FAILED = "ios_boot_failed"
