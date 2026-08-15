@@ -173,6 +173,25 @@ deferred: waitForIdle extendedWaitUntil runScript evalScript repeat
 - `onFlowComplete` runs after pass *and* fail; a cleanup failure never masks
   the primary failure; evidence is captured before cleanup runs.
 
+## Maestro Core Profile
+
+`autonom flow import maestro.yaml` converts a Maestro flow within the
+documented Core Profile — header `appId`/`name`/`tags`/`env`; `launchApp`
+(`clearState`), `stopApp`, `clearState`, `tapOn`, `longPressOn`,
+`doubleTapOn`, `inputText`, `eraseText`, `pressKey`, `swipe` (direction),
+`back`, `openLink`, `assertVisible`/`assertNotVisible`,
+`extendedWaitUntil`→`waitUntil`, `takeScreenshot`, `runFlow` (`file`, `env`,
+`when`), selectors `text`/`id`/`index`/`enabled` — into validated canonical
+Flow v1. Maestro's regex-by-default matching is preserved honestly: a
+metacharacter-free pattern becomes `match: exact`; a real pattern becomes
+`match: regex` anchored as `^(?:...)$` (our regex is a search, Maestro's is
+a full match). Everything outside the profile — scripts, JS interpolation,
+point coordinates, random input — refuses with `unsupported_flow_command`
+and the file position; an ambiguous conversion never produces a file that
+silently means something else. `flow export --format maestro` goes the
+other way (exact text is regex-escaped; Autonom-only constructs refuse;
+`checkpoint`/`note` become comments).
+
 ## Errors
 
 All Flow DSL codes are new and distinct from network capture's

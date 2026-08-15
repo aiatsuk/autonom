@@ -26,6 +26,7 @@ from autonom_lib import errors  # noqa: E402
 from autonom_lib import ios_idb  # noqa: E402
 from autonom_lib.flow import canonical as flow_canonical  # noqa: E402
 from autonom_lib.flow import executor as flow_executor  # noqa: E402
+from autonom_lib.flow import maestro as flow_maestro  # noqa: E402
 from autonom_lib.flow import validator as flow_validator  # noqa: E402
 from autonom_lib import journal as journal_mod  # noqa: E402
 from autonom_lib import ios_simctl  # noqa: E402
@@ -1306,6 +1307,38 @@ def _tag_selected(tags: list[str], include: list[str], exclude: list[str]) -> bo
     return True
 
 
+def cmd_flow_import(args: argparse.Namespace) -> int:
+    path = Path(args.path)
+    if not path.is_file():
+        raise errors.AutonomError(
+            errors.FLOW_FILE_NOT_FOUND, f"flow file not found: {path}",
+            file=str(path),
+        )
+    canonical_text = flow_maestro.import_flow(
+        path.read_text(encoding="utf-8"), str(path))
+    payload: dict[str, Any] = {"ok": True, "imported": str(path)}
+    if args.out:
+        Path(args.out).write_text(canonical_text, encoding="utf-8")
+        payload["out"] = args.out
+    else:
+        payload["canonical"] = canonical_text
+    return emit(payload, as_json=True)
+
+
+def cmd_flow_export(args: argparse.Namespace) -> int:
+    path = Path(args.path)
+    flow = flow_validator.load_flow(path)
+    exported = flow_maestro.export_flow(flow, str(path))
+    payload: dict[str, Any] = {"ok": True, "exported": str(path),
+                               "format": args.format}
+    if args.out:
+        Path(args.out).write_text(exported, encoding="utf-8")
+        payload["out"] = args.out
+    else:
+        payload["maestro"] = exported
+    return emit(payload, as_json=True)
+
+
 def cmd_flow_run(args: argparse.Namespace) -> int:
     path = Path(args.path)
     include = args.include_tag or []
@@ -1718,6 +1751,16 @@ def build_parser() -> argparse.ArgumentParser:
     p = flow_sub.add_parser("list", help="list flows: file, id, name, tags, platforms")
     p.add_argument("path", nargs="?", help="directory to scan (default .autonom/flows)")
     p.set_defaults(func=cmd_flow_list)
+    p = flow_sub.add_parser("import",
+                            help="convert a Maestro Core Profile flow to Flow v1")
+    p.add_argument("path", help="a Maestro flow file")
+    p.add_argument("--out", help="write the canonical flow here (else in the JSON)")
+    p.set_defaults(func=cmd_flow_import)
+    p = flow_sub.add_parser("export", help="convert a Flow v1 file to Maestro YAML")
+    p.add_argument("path", help="a Flow v1 file")
+    p.add_argument("--format", choices=("maestro",), default="maestro")
+    p.add_argument("--out", help="write the Maestro flow here (else in the JSON)")
+    p.set_defaults(func=cmd_flow_export)
     p = flow_sub.add_parser("run", help="execute flows against the active session",
                             parents=[target_flags])
     p.add_argument("path", help="a flow file, or a directory for a tag-filtered suite")

@@ -89,6 +89,7 @@ FLOW_REQUIREMENTS_UNMET = "flow_requirements_unmet"
 FLOW_ASSERTION_TIMEOUT = "flow_assertion_timeout"
 FLOW_CHECK_FAILED = "flow_check_failed"
 FLOW_NO_FLOWS_FOUND = "flow_no_flows_found"
+UNSUPPORTED_FLOW_COMMAND = "unsupported_flow_command"  # Maestro import/export
 
 
 class AutonomError(RuntimeError):

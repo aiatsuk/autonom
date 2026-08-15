@@ -47,6 +47,7 @@ Legend: ✅ shipped · ⚠️ partial · 🔜 planned · ❌ not planned for nea
 | Flow DSL: check / fmt / list | ✅ | ✅ | strict YAML subset, exact-match selectors by default, positioned errors; `docs/FLOW.md` |
 | Flow DSL: run | ✅ | ✅ | polling assertions, single-fire mutations, `failure_class` + exit 1 for test failures, per-run `events.ndjson`; iOS `eraseText` dispatches HID backspace but is unproven on a real simulator |
 | Flow DSL: runFlow / tags / hooks execution | ✅ | ✅ | subflows inline with inherited appId, isolated `onFlowComplete`, `when:` conditions, tag-filtered directory suites, evidence policy |
+| Flow DSL: Maestro Core Profile import/export | ✅ | ✅ | `flow import`/`flow export --format maestro`; outside-profile constructs refuse with `unsupported_flow_command` |
 | Live session outputs catalog | 🔜 | 🔜 | Phase 4 — `session outputs` + paths for `tail -f`; see `docs/plans/PHASE_4_METRICS.md` §2L |
 | Live follow (session files / device logs) | 🔜 | 🔜 | Phase 4 — `logs follow` (NDJSON, bounded) |
 | Network requests list | ✅ | ✅ | `network requests list --max N`; follow/poll in Phase 4 |
@@ -111,6 +112,8 @@ autonom ui key <keycode>
 autonom flow check <path>
 autonom flow fmt <path> [--write] [--check] [--diff]
 autonom flow list [path]
+autonom flow import <path> [--out PATH]
+autonom flow export <path> [--format maestro] [--out PATH]
 autonom flow run <path> [--include-tag TAG] [--exclude-tag TAG] [--env KEY=VALUE]
                  [--secret NAME] [--default-timeout-ms N] [--events] [--dry-run]
 

@@ -69,6 +69,8 @@ SWEEP: list[tuple[str, list[str], bool]] = [
     ("flow_check_missing", ["flow", "check", "/nonexistent/flow.yaml"], False),
     ("flow_fmt_missing", ["flow", "fmt", "/nonexistent/flow.yaml"], False),
     ("flow_list_missing", ["flow", "list", "/nonexistent"], False),
+    ("flow_import_missing", ["flow", "import", "/nonexistent/maestro.yaml"], False),
+    ("flow_export_missing", ["flow", "export", "/nonexistent/flow.yaml"], False),
     ("crash_list", ["crash", "list"], False),
     ("open_url", ["open", "https://example.com"], False),
     ("permissions", ["permissions", "grant", "photos", "com.example.app"], False),

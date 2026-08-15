@@ -7,6 +7,19 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
 
 ## [Unreleased]
 
+## [0.22.0] - 2026-08-15
+
+### Added
+- Maestro Core Profile import/export (`flow import`, `flow export --format
+  maestro`). Regex-by-default matching converts honestly (metacharacter-free
+  patterns become `match: exact`; real patterns anchor as `^(?:...)$` regex);
+  everything outside the profile — scripts, JS interpolation, point
+  coordinates, random input — refuses with a positioned
+  `unsupported_flow_command`, and an ambiguous conversion never produces a
+  file that silently means something else. Imports validate end-to-end
+  before they are written.
+
+
 ## [0.21.0] - 2026-08-15
 
 Flow v1 surface completion; ten review-confirmed executor/language defects
