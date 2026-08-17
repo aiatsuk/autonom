@@ -149,13 +149,26 @@ def render_html(manifest: dict[str, Any], artifacts_dir: Path) -> str:
 """
 
 
-def render_suite_html(manifests: list[dict[str, Any]]) -> str:
+def _shorten(text: str, base: Path | None) -> str:
+    """Drop a leading base directory so a shared report carries no local paths."""
+    if not base:
+        return text
+    prefix = str(base).rstrip("/") + "/"
+    return text.replace(prefix, "")
+
+
+def render_suite_html(manifests: list[dict[str, Any]],
+                      base: Path | None = None) -> str:
     """One page for a whole suite run: totals, then every flow with its steps.
 
     Same containment rules as the single-run report (no external fetch,
     everything escaped). Screenshots stay in the per-run reports — a suite
     page inlining 46 runs' images would be hundreds of megabytes; each row
     links to its own report instead.
+
+    ``base`` strips that directory prefix from flow paths and reproduction
+    commands, so a report committed to a repository carries repo-relative
+    paths instead of one machine's home directory.
     """
     e = html.escape
     passed = [m for m in manifests if m.get("status") == "passed"]
@@ -198,8 +211,10 @@ def render_suite_html(manifests: list[dict[str, Any]]) -> str:
             f"<b>{e(str(manifest.get('flow_name','flow')))}</b> "
             f"<span class='muted'>{e(str(manifest.get('flow_id') or ''))} · "
             f"{duration/1000:.1f}s · {e(flow_status)}</span></summary>"
-            f"<p class='muted'><code>{e(str(manifest.get('flow_path','')))}</code><br>"
-            f"reproduce: <code>{e(str(manifest.get('reproduction','')))}</code></p>"
+            f"<p class='muted'><code>"
+            f"{e(_shorten(str(manifest.get('flow_path','')), base))}</code><br>"
+            f"reproduce: <code>"
+            f"{e(_shorten(str(manifest.get('reproduction','')), base))}</code></p>"
             "<table><tr><th>#</th><th>command</th><th></th><th>time</th>"
             f"<th>detail</th></tr>{step_rows(manifest)}</table></details>")
 

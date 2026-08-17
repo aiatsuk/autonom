@@ -2203,8 +2203,9 @@ def cmd_report_suite(args: argparse.Namespace) -> int:
     manifests = _suite_manifests(record, args.last)
     out_dir = Path(args.out) if args.out else Path(record["artifacts_dir"]) / "flows"
     out_dir.mkdir(parents=True, exist_ok=True)
+    base = Path(args.relative_to).resolve() if args.relative_to else None
     html_path = out_dir / "suite.html"
-    html_path.write_text(flow_report.render_suite_html(manifests),
+    html_path.write_text(flow_report.render_suite_html(manifests, base=base),
                          encoding="utf-8")
     os.chmod(html_path, 0o600)
     junit_path = out_dir / "suite.xml"
@@ -2718,6 +2719,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--last", type=int,
                    help="only the N most recent runs (default: all)")
     p.add_argument("--out", help="destination directory")
+    p.add_argument("--relative-to", metavar="DIR",
+                   help="strip this directory from paths (share a report "
+                        "without leaking local paths)")
     p.add_argument("--open", action="store_true", help="open it in a browser")
     p.set_defaults(func=cmd_report_suite)
 

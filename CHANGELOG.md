@@ -24,6 +24,10 @@ way to see the run as a whole. Found by dogfooding a real app.
 - The same command writes `suite.xml`, a single JUnit `<testsuites>`
   document with one `<testsuite>` per flow — the shape CI dashboards
   expect. Exits 1 when any flow failed, 0 otherwise.
+- `report suite --relative-to DIR` strips that prefix from flow paths and
+  reproduction commands, so a report committed to a repository carries
+  repo-relative paths (`autonom flow run .autonom/flows/…`) instead of one
+  machine's home directory — found while committing a real report.
 
 ## [0.28.2] - 2026-08-17
 

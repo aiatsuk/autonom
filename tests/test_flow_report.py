@@ -137,6 +137,16 @@ class ReportEndToEndTests(unittest.TestCase):
         self.assertEqual({s.get("name") for s in suites},
                          {"report-demo-001", "report-demo-002"})
 
+    def test_suite_report_relative_to_strips_local_paths(self) -> None:
+        """A report committed to a repo must not carry one machine's paths."""
+        self._run_passing_flow()
+        result = self._cli("report", "suite", "--relative-to", str(self.root))
+        payload = json.loads(result.stdout)
+        html_text = Path(payload["html"]).read_text(encoding="utf-8")
+        self.assertIn("ok.yaml", html_text, "the flow is still named")
+        self.assertNotIn(str(self.root), html_text,
+                         "the base directory must be stripped")
+
     def test_suite_report_last_n(self) -> None:
         self._run_passing_flow()
         self._run_failing_flow()
