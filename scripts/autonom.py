@@ -2181,6 +2181,59 @@ def _resolve_run_dir(record: dict[str, Any], run_id: str | None) -> Path:
     return candidates[-1]
 
 
+def _suite_manifests(record: dict[str, Any], last: int | None) -> list[dict]:
+    """Every run of this session with a manifest, oldest first."""
+    flows_dir = Path(record["artifacts_dir"]) / "flows"
+    paths = sorted(flows_dir.glob("*/manifest.json"),
+                   key=lambda p: p.stat().st_mtime)
+    if not paths:
+        raise errors.AutonomError(
+            errors.FLOW_NO_FLOWS_FOUND,
+            "this session has no flow runs with a manifest",
+            hint="Run a flow first: autonom flow run <file>.",
+        )
+    if last:
+        paths = paths[-last:]
+    return [json.loads(p.read_text(encoding="utf-8")) for p in paths]
+
+
+def cmd_report_suite(args: argparse.Namespace) -> int:
+    """One page for the whole session — the suite view CI and humans read."""
+    record = _session_by_id(args.session)
+    manifests = _suite_manifests(record, args.last)
+    out_dir = Path(args.out) if args.out else Path(record["artifacts_dir"]) / "flows"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    html_path = out_dir / "suite.html"
+    html_path.write_text(flow_report.render_suite_html(manifests),
+                         encoding="utf-8")
+    os.chmod(html_path, 0o600)
+    junit_path = out_dir / "suite.xml"
+    junit_path.write_text(flow_report.render_suite_junit(manifests),
+                          encoding="utf-8")
+    os.chmod(junit_path, 0o600)
+    failed = [m for m in manifests if m.get("status") != "passed"]
+    payload = {
+        "ok": True,
+        "flows": len(manifests),
+        "passed": len(manifests) - len(failed),
+        "failed": len(failed),
+        "html": str(html_path),
+        "junit": str(junit_path),
+        "sensitive": any(m.get("sensitive") for m in manifests),
+    }
+    if failed:
+        payload["failures"] = [
+            {"flow": m.get("flow_name"), "flow_id": m.get("flow_id"),
+             "error_code": (m.get("primary_error") or {}).get("error_code")}
+            for m in failed
+        ]
+    if args.open:
+        import webbrowser
+        payload["opened"] = bool(webbrowser.open(html_path.as_uri()))
+    emit(payload, as_json=True)
+    return 1 if failed else 0
+
+
 def cmd_report_build(args: argparse.Namespace) -> int:
     record = _session_by_id(args.session)
     run_dir = _resolve_run_dir(record, args.run)
@@ -2657,6 +2710,16 @@ def build_parser() -> argparse.ArgumentParser:
             p.add_argument("--format", choices=("html", "junit"), default="html")
             p.add_argument("--out", help="destination path")
         p.set_defaults(func=func)
+
+    p = report_sub.add_parser(
+        "suite", help="one report over every flow run in the session")
+    p.add_argument("--session", default="current",
+                   help="session id (default: current)")
+    p.add_argument("--last", type=int,
+                   help="only the N most recent runs (default: all)")
+    p.add_argument("--out", help="destination directory")
+    p.add_argument("--open", action="store_true", help="open it in a browser")
+    p.set_defaults(func=cmd_report_suite)
 
     network = sub.add_parser("network", help="HTTP(S) capture and mocking")
     network_sub = network.add_subparsers(dest="network_command", required=True)

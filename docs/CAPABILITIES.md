@@ -50,7 +50,7 @@ Legend: ✅ shipped · ⚠️ partial · 🔜 planned · ❌ not planned for nea
 | Flow DSL: Session → Flow compiler | ✅ | ✅ | `flow create --from-session` — proven selectors reused, secrets become `${SECRET_n}`, coordinate taps refuse to compile |
 | PR Proof (local) | ✅ | ✅ | `proof --base` — covers-globs + pull-request tags select the suite; verdicts pass/fail/not_covered/blocked/inconclusive, never upgraded |
 | Atlas-lite: observed screens/transitions graph | ✅ | ✅ | `atlas update|show|coverage|paths|export|diff`; fingerprints ride in run events; observed-only, unknown stays unknown |
-| Evidence: run manifest + HTML/JUnit reports | ✅ | ✅ | `report build|open|export`; self-contained HTML (CSP, inline screenshots), JUnit for CI, failure log window |
+| Evidence: run manifest + HTML/JUnit reports | ✅ | ✅ | `report build|open|export|suite`; self-contained HTML (CSP, inline screenshots), JUnit for CI, failure log window; `suite` renders one page + one JUnit document over every run in the session |
 | Flow DSL: Maestro Core Profile import/export | ✅ | ✅ | `flow import`/`flow export --format maestro`; outside-profile constructs refuse with `unsupported_flow_command` |
 | Live session outputs catalog | ✅ | ✅ | `session outputs` — registered `streams[]` + directory scan, `abs_path`/`shell_hint` for `tail -f` |
 | Live follow (session files / device logs) | ✅ | ✅ | `logs follow` — NDJSON lines, always bounded by `--max-seconds`/`--max-lines`; `journal --follow` for the timeline |
@@ -136,6 +136,7 @@ autonom atlas diff --base <PATH> [--head PATH] [--app-id ID]
 autonom report build [--session ID] [--run ID]
 autonom report open [--session ID] [--run ID]
 autonom report export [--session ID] [--run ID] [--format html|junit] [--out PATH]
+autonom report suite [--session ID] [--last N] [--out DIR] [--open]
 
 autonom screenshot [--label L] [--task T] [--out PATH]
 autonom shots list [--task T] [--grep P] [--mocked-only] [--max N]

@@ -100,6 +100,56 @@ class ReportEndToEndTests(unittest.TestCase):
         self.assertTrue(out.is_file())
         ET.parse(out)  # well-formed
 
+    def _run_passing_flow(self) -> dict:
+        flow = self.root / "ok.yaml"
+        flow.write_text(
+            "schema: autonom.dev/flow/v1\nappId: com.example.app\n"
+            "name: Report demo ok\nid: report-demo-002\n---\n"
+            "- launchApp\n", encoding="utf-8")
+        result = self._cli("flow", "run", str(flow))
+        assert result.returncode == 0, result.stderr
+        return json.loads(result.stdout)
+
+    def test_suite_report_covers_every_run(self) -> None:
+        """One page + one JUnit document for the whole session (Allure-style)."""
+        self._run_passing_flow()
+        self._run_failing_flow()
+
+        result = self._cli("report", "suite")
+        self.assertEqual(result.returncode, 1, "a failing flow fails the suite")
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["flows"], 2)
+        self.assertEqual(payload["passed"], 1)
+        self.assertEqual(payload["failed"], 1)
+        self.assertEqual(payload["failures"][0]["flow_id"], "report-demo-001")
+
+        html_text = Path(payload["html"]).read_text(encoding="utf-8")
+        self.assertIn("Content-Security-Policy", html_text)
+        self.assertIn("Report demo ok", html_text)
+        self.assertIn("Report demo", html_text)
+        self.assertIn("flow_assertion_timeout", html_text)
+        self.assertNotIn("http://", html_text)
+
+        root = ET.fromstring(Path(payload["junit"]).read_text(encoding="utf-8"))
+        self.assertEqual(root.tag, "testsuites")
+        self.assertEqual(root.get("failures"), "1")
+        suites = root.findall("testsuite")
+        self.assertEqual({s.get("name") for s in suites},
+                         {"report-demo-001", "report-demo-002"})
+
+    def test_suite_report_last_n(self) -> None:
+        self._run_passing_flow()
+        self._run_failing_flow()
+        result = self._cli("report", "suite", "--last", "1")
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["flows"], 1, "--last keeps only recent runs")
+
+    def test_suite_report_without_runs_fails_cleanly(self) -> None:
+        result = self._cli("report", "suite")
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(json.loads(result.stderr)["error_code"],
+                         "flow_no_flows_found")
+
     def test_report_without_runs_fails_cleanly(self) -> None:
         result = self._cli("report", "build")
         self.assertEqual(result.returncode, 2)

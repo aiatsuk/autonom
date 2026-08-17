@@ -81,6 +81,7 @@ SWEEP: list[tuple[str, list[str], bool]] = [
     ("report_build", ["report", "build"], False),
     ("report_open", ["report", "open"], False),
     ("report_export", ["report", "export"], False),
+    ("report_suite", ["report", "suite"], False),
     ("crash_list", ["crash", "list"], False),
     ("open_url", ["open", "https://example.com"], False),
     ("permissions", ["permissions", "grant", "photos", "com.example.app"], False),

@@ -149,6 +149,113 @@ def render_html(manifest: dict[str, Any], artifacts_dir: Path) -> str:
 """
 
 
+def render_suite_html(manifests: list[dict[str, Any]]) -> str:
+    """One page for a whole suite run: totals, then every flow with its steps.
+
+    Same containment rules as the single-run report (no external fetch,
+    everything escaped). Screenshots stay in the per-run reports — a suite
+    page inlining 46 runs' images would be hundreds of megabytes; each row
+    links to its own report instead.
+    """
+    e = html.escape
+    passed = [m for m in manifests if m.get("status") == "passed"]
+    failed = [m for m in manifests if m.get("status") != "passed"]
+    total_ms = sum(step.get("duration_ms", 0)
+                   for m in manifests for step in m.get("steps", []))
+    status = "failed" if failed else "passed"
+    color = "#b42318" if failed else "#1a7f37"
+
+    def step_rows(manifest: dict[str, Any]) -> str:
+        rows = []
+        for step in manifest.get("steps", []):
+            badge = {"passed": "✓", "failed": "✗", "skipped": "○"}.get(
+                step.get("status", ""), "·")
+            detail = ""
+            if step.get("label"):
+                detail = e(str(step["label"]))
+            elif step.get("selector"):
+                detail = f"<code>{e(json.dumps(step['selector'], ensure_ascii=False))}</code>"
+            if step.get("error"):
+                detail += (f"<br><b>{e(str(step.get('error_code','')))}</b> "
+                           f"{e(str(step['error']))}")
+            if step.get("skip_reason"):
+                detail += f"<br><i>skipped: {e(str(step['skip_reason']))}</i>"
+            rows.append(
+                f"<tr><td>{step.get('index','')}</td>"
+                f"<td><code>{e(str(step.get('command','')))}</code></td>"
+                f"<td class='s-{e(str(step.get('status','')))}'>{badge}</td>"
+                f"<td>{step.get('duration_ms',0)}&nbsp;ms</td>"
+                f"<td>{detail}</td></tr>")
+        return "".join(rows)
+
+    blocks = []
+    for manifest in manifests:
+        flow_status = manifest.get("status", "unknown")
+        duration = sum(s.get("duration_ms", 0) for s in manifest.get("steps", []))
+        open_attr = " open" if flow_status != "passed" else ""
+        blocks.append(
+            f"<details{open_attr}><summary class='s-{e(flow_status)}'>"
+            f"<b>{e(str(manifest.get('flow_name','flow')))}</b> "
+            f"<span class='muted'>{e(str(manifest.get('flow_id') or ''))} · "
+            f"{duration/1000:.1f}s · {e(flow_status)}</span></summary>"
+            f"<p class='muted'><code>{e(str(manifest.get('flow_path','')))}</code><br>"
+            f"reproduce: <code>{e(str(manifest.get('reproduction','')))}</code></p>"
+            "<table><tr><th>#</th><th>command</th><th></th><th>time</th>"
+            f"<th>detail</th></tr>{step_rows(manifest)}</table></details>")
+
+    failed_list = "".join(
+        f"<li class='s-failed'>{e(str(m.get('flow_name','')))} — "
+        f"{e(str((m.get('primary_error') or {}).get('error_code','')))}</li>"
+        for m in failed) or "<li class='s-passed'>none</li>"
+
+    return f"""<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'none'; img-src data:; style-src 'unsafe-inline'">
+<title>Flow suite — {len(passed)}/{len(manifests)} passed</title>
+<style>
+  body {{ font: 14px/1.5 -apple-system, system-ui, sans-serif; margin: 2rem auto;
+         max-width: 64rem; padding: 0 1rem; color: #1f2328; }}
+  table {{ border-collapse: collapse; width: 100%; margin: .5rem 0 1rem; }}
+  td, th {{ border-bottom: 1px solid #d0d7de; padding: .35rem .5rem;
+            text-align: left; vertical-align: top; }}
+  code {{ background: #f6f8fa; padding: .1em .3em; border-radius: 4px; }}
+  .status {{ color: {color}; font-weight: 700; }}
+  .s-failed {{ color: #b42318; }} .s-passed {{ color: #1a7f37; }}
+  .s-skipped {{ color: #9a6700; }}
+  .muted {{ color: #57606a; font-weight: 400; }}
+  summary {{ cursor: pointer; padding: .35rem 0; }}
+  .totals {{ display: flex; gap: 2rem; margin: 1rem 0; }}
+  .totals div {{ font-size: 1.6rem; font-weight: 700; }}
+  .totals span {{ display: block; font-size: .8rem; font-weight: 400;
+                  color: #57606a; }}
+</style>
+<h1>Flow suite <span class="status">{e(status)}</span></h1>
+<div class="totals">
+  <div>{len(manifests)}<span>flows</span></div>
+  <div class="s-passed">{len(passed)}<span>passed</span></div>
+  <div class="s-failed">{len(failed)}<span>failed</span></div>
+  <div>{total_ms/1000:.0f}s<span>total step time</span></div>
+</div>
+<h2>Failures</h2>
+<ul>{failed_list}</ul>
+<h2>Flows</h2>
+{''.join(blocks)}
+"""
+
+
+def render_suite_junit(manifests: list[dict[str, Any]]) -> str:
+    """One JUnit document with a <testsuite> per flow — what CI expects."""
+    suites = [render_junit(m).split("\n", 1)[1].strip() for m in manifests]
+    tests = sum(len(m.get("steps", [])) for m in manifests)
+    failures = sum(1 for m in manifests for s in m.get("steps", [])
+                   if s.get("status") == "failed")
+    total = sum(s.get("duration_ms", 0)
+                for m in manifests for s in m.get("steps", [])) / 1000
+    return ('<?xml version="1.0" encoding="UTF-8"?>\n'
+            f'<testsuites tests="{tests}" failures="{failures}" '
+            f'time="{total:.3f}">' + "".join(suites) + "</testsuites>\n")
+
+
 def render_junit(manifest: dict[str, Any]) -> str:
     suite_name = manifest.get("flow_id") or manifest.get("flow_name") or "flow"
     steps = manifest.get("steps", [])

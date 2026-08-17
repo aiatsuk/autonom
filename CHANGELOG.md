@@ -7,6 +7,24 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
 
 ## [Unreleased]
 
+## [0.28.3] - 2026-08-17
+
+Suite-level evidence: running 46 flows produced 46 separate reports and no
+way to see the run as a whole. Found by dogfooding a real app.
+
+### Added
+- `autonom report suite [--session ID] [--last N] [--out DIR] [--open]` —
+  one page over every flow run in the session: totals (flows / passed /
+  failed / total step time), a failures-first list, then every flow as an
+  expandable block with its steps, durations and reproduction command
+  (failed flows expanded by default). Same containment rules as the
+  per-run report: no external fetch, everything escaped. Screenshots stay
+  in the per-run reports — inlining dozens of runs would produce a
+  multi-hundred-megabyte page.
+- The same command writes `suite.xml`, a single JUnit `<testsuites>`
+  document with one `<testsuite>` per flow — the shape CI dashboards
+  expect. Exits 1 when any flow failed, 0 otherwise.
+
 ## [0.28.2] - 2026-08-17
 
 Selector fidelity for Maestro import, found by running a real Maestro flow

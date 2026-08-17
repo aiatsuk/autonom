@@ -230,7 +230,11 @@ reproduction command). `autonom report build` renders it as a fully
 self-contained `report.html` (screenshots inlined as data: URIs, a CSP that
 refuses any external fetch, everything escaped) plus a `report.xml` JUnit
 file for CI; `report open` opens the HTML, `report export --format
-html|junit --out` writes it anywhere. A failing step also leaves a
+html|junit --out` writes it anywhere. For a whole suite, `autonom
+report suite` folds every run of the session into one `suite.html`
+(totals, failures first, every flow expandable to its steps; failed
+flows open by default) plus a `suite.xml` `<testsuites>` document —
+the shape CI dashboards expect. It exits 1 when any flow failed. A failing step also leaves a
 screenshot, a hierarchy dump, and a log window beside the events.
 
 ## Proving a diff (PR Proof)
