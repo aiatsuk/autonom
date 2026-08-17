@@ -88,6 +88,13 @@ class StepOutcome:
     failure_class: str | None = None
     error: str | None = None
     skip_reason: str | None = None
+    # manifest v2: wall clock (reports need real time, not just durations),
+    # the selector actually used, and where the step sits in the block tree
+    started_at_ms: int | None = None
+    selector: dict | None = None
+    depth: int = 0
+    parent_index: int | None = None
+    retry_attempt: int | None = None
 
 
 @dataclass
@@ -98,6 +105,11 @@ class RunResult:
     failure: dict | None = None
     hook_failures: list = field(default_factory=list)
     sensitive: bool = False
+    started_at_ms: int | None = None
+    finished_at_ms: int | None = None
+    # composite spans (group/repeat/retry/runFlow) kept OUT of `steps` so
+    # existing consumers keep counting the same leaves
+    blocks: list = field(default_factory=list)
     events_path: str | None = None
 
 
@@ -146,6 +158,13 @@ class Executor:
         self._counter = 0
         self._used_secret_anywhere = False
         self._retry_attempt: int | None = None
+        # indices of the composite steps (group/repeat/retry/runFlow) currently
+        # open, so every leaf knows its parent and depth
+        self._block_stack: list[int] = []
+        # authoritative artifact -> step mapping. Reports must never re-derive
+        # this from filenames: a user-chosen takeScreenshot label can contain
+        # anything, including something that looks like a step number.
+        self._artifact_steps: list[dict] = []
         self._writer_run_id: str | None = None
         self._last_nodes: list | None = None
 
@@ -157,6 +176,7 @@ class Executor:
         self.secret_values = set(self.config.secrets)
         self.runtime_values = {}
         self.sensitive_var_names = set()
+        self._artifact_steps = []
         self._children = {}
         self._collect_children(flow, flow.app_id)
         # Every name declared ANYWHERE in the graph (root env/--env/secrets,
@@ -196,6 +216,8 @@ class Executor:
                         {"status": "passed", "dry_run": True, "steps": 0})
             return result
 
+        result.started_at_ms = self._wall_ms()
+        aborted: errors.AutonomError | None = None
         try:
             if flow.on_flow_start:
                 self._execute_steps(flow.on_flow_start, flow, root_values,
@@ -204,6 +226,12 @@ class Executor:
                                 writer, result, evidence)
         except _Stop:
             result.status = "failed"
+        except errors.AutonomError as exc:
+            # infrastructure / flow-definition failures abort the run — but the
+            # evidence must survive them, or the one case a human most needs to
+            # inspect is the one with no manifest and no report at all.
+            result.status = "failed"
+            aborted = exc
         finally:
             if flow.on_flow_complete and not self.config.dry_run:
                 self._run_complete_hooks(flow, root_values, writer, result,
@@ -221,17 +249,34 @@ class Executor:
                     "failure_class": failed.failure_class,
                     "error": failed.error,
                 }
+        if aborted is not None and result.failure is None:
+            result.failure = {
+                "error_code": aborted.code,
+                "failure_class": failure_class(aborted.code),
+                "error": aborted.message,
+                **{k: v for k, v in (aborted.extra or {}).items()
+                   if k in ("line", "column", "command", "file")},
+            }
         result.sensitive = (self._used_secret_anywhere
                             or self._declares_sensitive(flow)
                             or any(self._declares_sensitive(child)
                                    for child in self._children.values()))
+        result.finished_at_ms = self._wall_ms()
         writer.emit("flow.run.finished", {
             "status": result.status,
             "steps": len(result.steps),
             "failure": result.failure,
         }, sensitive=result.sensitive)
         self._write_manifest(flow, writer, result)
+        if aborted is not None:
+            raise aborted  # evidence is written; the envelope still reaches the CLI
         return result
+
+    @staticmethod
+    def _wall_ms() -> int:
+        """Epoch milliseconds — reports need real time, the injectable clock
+        is monotonic and only good for durations."""
+        return int(time.time() * 1000)
 
     def _write_manifest(self, flow: Flow, writer: EventWriter,
                         result: RunResult) -> None:
@@ -244,7 +289,7 @@ class Executor:
                 for base in (run_dir, shots_dir) if base.is_dir()
                 for p in base.rglob("*") if p.is_file())
             manifest = {
-                "schema_version": 1,
+                "schema_version": 2,
                 "session_id": self.session.get("session_id"),
                 "run_id": writer.run_id,
                 "flow_id": flow.flow_id,
@@ -262,7 +307,21 @@ class Executor:
                     for step in result.steps
                 ],
                 "artifacts": artifacts,
+                "artifact_steps": self._artifact_steps,
                 "reproduction": self._reproduction_command(flow),
+                # --- v2: what reports and exporters need beyond the timeline
+                "started_at_ms": result.started_at_ms,
+                "finished_at_ms": result.finished_at_ms,
+                "blocks": result.blocks,
+                "tags": flow.tags,
+                "properties": flow.properties,
+                "description": flow.description,
+                "env": {**flow.env, **self.config.env},
+                "secret_names": sorted(self.secret_values),
+                "converted_from": flow.converted_from,
+                "workspace_root": str(
+                    flow_validator.workspace_root(Path(flow.path))),
+                "evidence_mode": (flow.evidence or Evidence()).mode,
             }
             path = run_dir / "manifest.json"
             path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2),
@@ -604,7 +663,11 @@ class Executor:
         self._counter += 1
         outcome = StepOutcome(index=self._counter, command="runFlow",
                               label=step.label, line=step.line,
-                              status="passed", flow=flow.path, hook=hook)
+                              status="passed", flow=flow.path, hook=hook,
+                              started_at_ms=self._wall_ms(),
+                              depth=len(self._block_stack),
+                              parent_index=(self._block_stack[-1]
+                                            if self._block_stack else None))
         payload = {"step_index": outcome.index, "command": "runFlow",
                    "label": step.label, "file": flow.path, "line": step.line,
                    "child": "(inline)" if inline else child.path}
@@ -644,6 +707,8 @@ class Executor:
 
         started = self.clock()
         before = len(result.steps)
+        first_index = self._counter + 1
+        self._block_stack.append(outcome.index)
         try:
             self._execute_steps(body, child, child_values,
                                 writer, result, evidence, hook=hook)
@@ -654,9 +719,29 @@ class Executor:
                 outcome.error_code = failed.error_code
                 outcome.failure_class = failed.failure_class
                 outcome.error = failed.error
+            self._block_stack.pop()
+            self._record_runflow_block(result, outcome, child if not inline else None,
+                                       first_index, started)
             self._finish_runflow(outcome, payload, started, writer, result)
             raise
+        self._block_stack.pop()
+        self._record_runflow_block(result, outcome, child if not inline else None,
+                                   first_index, started)
         self._finish_runflow(outcome, payload, started, writer, result)
+
+    def _record_runflow_block(self, result: RunResult, outcome: StepOutcome,
+                              child: Flow | None, first_index: int,
+                              started: float) -> None:
+        result.blocks.append({
+            "index": outcome.index, "command": "runFlow",
+            "label": outcome.label, "line": outcome.line, "flow": outcome.flow,
+            "status": outcome.status, "depth": outcome.depth,
+            "parent_index": outcome.parent_index,
+            "started_at_ms": outcome.started_at_ms,
+            "duration_ms": int((self.clock() - started) * 1000),
+            "child": child.path if child else "(inline)",
+            "children_range": [first_index, self._counter],
+        })
 
     def _finish_runflow(self, outcome: StepOutcome, payload: dict,
                         started: float, writer: EventWriter,
@@ -683,7 +768,11 @@ class Executor:
         })
         index = self._counter
         started = self.clock()
+        started_ms = self._wall_ms()
         status = "passed"
+        parent = self._block_stack[-1] if self._block_stack else None
+        depth = len(self._block_stack)
+        self._block_stack.append(index)
         try:
             self._execute_steps(step.args["commands"], flow, self.values,
                                 writer, result, evidence, hook=hook)
@@ -691,11 +780,19 @@ class Executor:
             status = "failed"
             raise
         finally:
+            self._block_stack.pop()
+            duration = int((self.clock() - started) * 1000)
             writer.emit("flow.step.finished", {
                 "step_index": index, "command": "group", "label": step.label,
                 "file": flow.path, "line": step.line, "status": status,
-                "duration_ms": int((self.clock() - started) * 1000),
+                "duration_ms": duration,
                 "attempts": 1,
+            })
+            result.blocks.append({
+                "index": index, "command": "group", "label": step.label,
+                "line": step.line, "flow": flow.path, "status": status,
+                "depth": depth, "parent_index": parent,
+                "started_at_ms": started_ms, "duration_ms": duration,
             })
 
     def _execute_repeat(self, step: Step, flow: Flow, writer: EventWriter,
@@ -715,9 +812,14 @@ class Executor:
             "file": flow.path, "line": step.line, "times": times,
         })
         started = self.clock()
+        started_ms = self._wall_ms()
+        parent = self._block_stack[-1] if self._block_stack else None
+        depth = len(self._block_stack)
+        iteration_spans: list[dict] = []
         iterations = 0
         status = "passed"
         stop_reason = None
+        self._block_stack.append(block_index)
         try:
             for _ in range(times):
                 if clause is not None:
@@ -728,22 +830,38 @@ class Executor:
                         stop_reason = reason
                         break
                 iterations += 1
+                first_index = self._counter + 1
                 self._execute_steps(step.args["commands"], flow, self.values,
                                     writer, result, evidence, hook=hook)
+                iteration_spans.append({"n": iterations,
+                                        "first_index": first_index,
+                                        "last_index": self._counter})
         except (_Stop, errors.AutonomError):
             status = "failed"
             raise
         finally:
+            self._block_stack.pop()
+            duration = int((self.clock() - started) * 1000)
             finished = {
                 "step_index": block_index, "command": "repeat",
                 "label": step.label, "file": flow.path, "line": step.line,
                 "status": status, "iterations": iterations,
-                "duration_ms": int((self.clock() - started) * 1000),
+                "duration_ms": duration,
                 "attempts": max(iterations, 1),
             }
             if stop_reason:
                 finished["stop_reason"] = stop_reason
             writer.emit("flow.step.finished", finished)
+            block = {
+                "index": block_index, "command": "repeat", "label": step.label,
+                "line": step.line, "flow": flow.path, "status": status,
+                "depth": depth, "parent_index": parent,
+                "started_at_ms": started_ms, "duration_ms": duration,
+                "iterations": iteration_spans,
+            }
+            if stop_reason:
+                block["stop_reason"] = stop_reason
+            result.blocks.append(block)
 
     def _execute_retry(self, step: Step, flow: Flow, writer: EventWriter,
                        result: RunResult, evidence: Evidence,
@@ -772,28 +890,62 @@ class Executor:
                            "block may act on the app more than once",
             })
         started = self.clock()
-        for attempt in range(1, max_attempts + 1):
+        started_ms = self._wall_ms()
+        parent = self._block_stack[-1] if self._block_stack else None
+        depth = len(self._block_stack)
+        self._block_stack.append(block_index)
+        attempt_spans: list[dict] = []
+        try:
+          for attempt in range(1, max_attempts + 1):
             before = len(result.steps)
+            first_index = self._counter + 1
             previous_attempt = self._retry_attempt
             self._retry_attempt = attempt
             try:
                 self._execute_steps(step.args["commands"], flow, self.values,
                                     writer, result, evidence, hook=hook)
+                attempt_spans.append({"n": attempt, "first_index": first_index,
+                                      "last_index": self._counter,
+                                      "status": "passed"})
                 self._emit_retry_finished(step, flow, writer, block_index,
                                           started, "passed", attempt)
+                self._record_retry_block(result, step, flow, block_index,
+                                         started, started_ms, depth, parent,
+                                         "passed", attempt_spans)
                 return
             except _Stop:
                 failed = next((s for s in result.steps[before:]
                                if s.status == "failed"), None)
+                attempt_spans.append({"n": attempt, "first_index": first_index,
+                                      "last_index": self._counter,
+                                      "status": "failed"})
                 retryable = (failed is not None
                              and (not only_on or failed.error_code in only_on)
                              and attempt < max_attempts)
                 if not retryable:
                     self._emit_retry_finished(step, flow, writer, block_index,
                                               started, "failed", attempt)
+                    self._record_retry_block(result, step, flow, block_index,
+                                             started, started_ms, depth, parent,
+                                             "failed", attempt_spans)
                     raise
             finally:
                 self._retry_attempt = previous_attempt
+        finally:
+            self._block_stack.pop()
+
+    def _record_retry_block(self, result: RunResult, step: Step, flow: Flow,
+                            block_index: int, started: float, started_ms: int,
+                            depth: int, parent: int | None, status: str,
+                            attempts: list) -> None:
+        result.blocks.append({
+            "index": block_index, "command": "retry", "label": step.label,
+            "line": step.line, "flow": flow.path, "status": status,
+            "depth": depth, "parent_index": parent,
+            "started_at_ms": started_ms,
+            "duration_ms": int((self.clock() - started) * 1000),
+            "attempts_detail": attempts,
+        })
 
     def _emit_retry_finished(self, step: Step, flow: Flow, writer: EventWriter,
                              block_index: int, started: float, status: str,
@@ -845,7 +997,12 @@ class Executor:
         index = self._counter
         outcome = StepOutcome(index=index, command=step.command,
                               label=step.label, line=step.line,
-                              status="passed", flow=flow.path, hook=hook)
+                              status="passed", flow=flow.path, hook=hook,
+                              started_at_ms=self._wall_ms(),
+                              depth=len(self._block_stack),
+                              parent_index=(self._block_stack[-1]
+                                            if self._block_stack else None),
+                              retry_attempt=self._retry_attempt)
         payload: dict[str, Any] = {
             "step_index": index, "command": step.command, "label": step.label,
             "file": flow.path, "line": step.line,
@@ -856,6 +1013,7 @@ class Executor:
             payload["retry_attempt"] = self._retry_attempt
         if step.selector is not None:
             payload["selector"] = flow_selectors.describe(step.selector)
+            outcome.selector = payload["selector"]
         writer.emit("flow.step.started", payload)
 
         self._auto_evidence(evidence, step, "before", index, writer)
@@ -927,11 +1085,26 @@ class Executor:
             detail = screenshot_mod.capture_evidence(
                 self.target, self.session, label=f"step-{index}-{phase}",
                 task=writer.run_id)
+            self._note_artifact(detail.get("path", ""), index, phase)
             writer.emit("flow.evidence.captured",
                         {"step_index": index, "phase": phase,
                          "screenshot": detail.get("path", "")})
         except Exception:  # noqa: BLE001 — evidence is best-effort
             pass
+
+    def _note_artifact(self, path: str, index: int, kind: str) -> None:
+        """Record which step an artifact belongs to (manifest v2)."""
+        if not path:
+            return
+        try:
+            # resolve both sides: on macOS the session dir may be /var/... while
+            # a capture reports /private/var/... for the very same file
+            base = Path(self.session["artifacts_dir"]).resolve()
+            relative = str(Path(path).resolve().relative_to(base))
+        except (ValueError, KeyError, OSError):
+            relative = path
+        self._artifact_steps.append(
+            {"path": relative, "step_index": index, "kind": kind})
 
     def _dispatch(self, step: Step, flow: Flow, attempts: list) -> bool:
         command = step.command
@@ -1097,8 +1270,12 @@ class Executor:
             return secret
         if command == "takeScreenshot":
             label = step.args.get("label") or "flow"
-            screenshot_mod.capture_evidence(target, self.session, label=label,
-                                             task=self._writer_run_id)
+            detail = screenshot_mod.capture_evidence(
+                target, self.session, label=label, task=self._writer_run_id)
+            # a deliberately labelled frame is evidence like any other: record
+            # which step it belongs to, or the report cannot show it
+            self._note_artifact(detail.get("path", ""),
+                                self._counter, "screenshot")
             return False
         if command == "checkpoint":
             return False  # the step event itself is the checkpoint record
@@ -1371,5 +1548,7 @@ class Executor:
         except Exception:  # noqa: BLE001
             pass
         if captured:
+            for kind, path in captured.items():
+                self._note_artifact(str(path), index, kind)
             writer.emit("flow.evidence.captured",
                         {"step_index": index, **captured})

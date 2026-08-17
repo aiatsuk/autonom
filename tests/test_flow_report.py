@@ -65,8 +65,17 @@ class ReportEndToEndTests(unittest.TestCase):
         summary = self._run_failing_flow()
         run_dir = Path(summary["events"]).parent
         manifest = json.loads((run_dir / "manifest.json").read_text())
-        self.assertEqual(manifest["schema_version"], 1)
+        self.assertEqual(manifest["schema_version"], 2)
         self.assertEqual(manifest["status"], "failed")
+        # v2 additions the exporters depend on
+        self.assertIsInstance(manifest["started_at_ms"], int)
+        self.assertGreaterEqual(manifest["finished_at_ms"],
+                                manifest["started_at_ms"])
+        self.assertIn("blocks", manifest)
+        tapped = next(s for s in manifest["steps"] if s["command"] == "tapOn")
+        self.assertEqual(tapped["selector"]["description"], "Open settings",
+                         "the selector actually used must reach the manifest")
+        self.assertIsInstance(tapped["started_at_ms"], int)
         self.assertEqual(manifest["primary_error"]["error_code"],
                          "flow_assertion_timeout")
         self.assertTrue(any(a.endswith(".png") for a in manifest["artifacts"]),
@@ -90,6 +99,31 @@ class ReportEndToEndTests(unittest.TestCase):
         failures = suite.findall("./testcase/failure")
         self.assertEqual(len(failures), 1)
         self.assertEqual(failures[0].get("type"), "flow_assertion_timeout")
+
+    def test_manifest_survives_an_infrastructure_failure(self) -> None:
+        """The run a human most needs to inspect must not be the one with no
+        evidence: an aborting error still writes the manifest."""
+        flow = self.root / "infra.yaml"
+        flow.write_text(
+            "schema: autonom.dev/flow/v1\nappId: com.example.app\n"
+            "name: Infra demo\nid: infra-001\n---\n"
+            "- launchApp\n- pressKey: KEYCODE_ENTER\n", encoding="utf-8")
+        env = dict(self.env)
+        env["AUTONOM_FAKE_FAIL"] = "input"   # make the backend blow up
+        result = subprocess.run(
+            [sys.executable, str(CLI), "--platform", "android",
+             "--serial", "emulator-5554",
+             "--adb", str(ROOT / "tests/fakes/fake_adb.py"),
+             "flow", "run", str(flow)],
+            cwd=ROOT, env=env, text=True, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, check=False, timeout=120)
+        if result.returncode != 2:
+            self.skipTest("fake adb does not support forced backend failure")
+        runs = sorted((self.root / "home/sessions").rglob("flows/*/manifest.json"))
+        self.assertTrue(runs, "an aborted run must still leave a manifest")
+        manifest = json.loads(runs[-1].read_text(encoding="utf-8"))
+        self.assertEqual(manifest["status"], "failed")
+        self.assertIsNotNone(manifest["primary_error"])
 
     def test_export_junit_to_a_path(self) -> None:
         self._run_failing_flow()
@@ -173,6 +207,38 @@ class ReportEndToEndTests(unittest.TestCase):
         self.assertTrue(copied, "frames are copied next to the report")
         # a passing run contributes no frames under --screenshots failed
         self.assertTrue(all("report-demo-001" not in str(p) or True for p in copied))
+
+    def test_labelled_screenshot_is_shown_under_its_own_step(self) -> None:
+        """A takeScreenshot frame is evidence: it must render, and it must not
+        be filed under a step number its label happens to contain."""
+        flow = self.root / "shots.yaml"
+        flow.write_text(
+            "schema: autonom.dev/flow/v1\nappId: com.example.app\n"
+            "name: Shot demo\nid: shot-001\n---\n"
+            "- launchApp\n"
+            "- takeScreenshot: step-1-decoy\n"
+            "- assertVisible:\n    selector:\n      id: nope\n"
+            "    timeoutMs: 300\n", encoding="utf-8")
+        result = self._cli("flow", "run", str(flow))
+        self.assertEqual(result.returncode, 1, result.stderr)
+        run_dir = Path(json.loads(result.stdout)["events"]).parent
+        manifest = json.loads((run_dir / "manifest.json").read_text())
+        ledger = {e["path"]: e for e in manifest["artifact_steps"]}
+        decoy = next(p for p in ledger if "decoy" in p)
+        self.assertEqual(ledger[decoy]["step_index"], 2,
+                         "the frame belongs to the takeScreenshot step (2), "
+                         "not to step 1 named in its label")
+
+        out = self.root / "site2"
+        self._cli("report", "suite", "--detailed", "--screenshots", "all",
+                  "--out", str(out))
+        page = next(p for p in (out / "runs").glob("*.html")
+                    if "Shot demo" in p.read_text(encoding="utf-8"))
+        text = page.read_text(encoding="utf-8")
+        self.assertIn("decoy", text, "the labelled frame must be rendered")
+        # it renders under step 2's heading, not step 1's
+        step2 = text.split("2. <code>takeScreenshot")[1]
+        self.assertIn("decoy", step2.split("<h3")[0])
 
     def test_screenshots_none_copies_nothing(self) -> None:
         self._run_failing_flow()

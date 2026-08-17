@@ -2206,7 +2206,7 @@ def cmd_report_suite(args: argparse.Namespace) -> int:
     base = Path(args.relative_to).resolve() if args.relative_to else None
     artifacts_dir = Path(record["artifacts_dir"])
     pages: dict[str, str] = {}
-    if args.screenshots != "none" or args.detailed:
+    if args.detailed:
         assets = out_dir / "assets"
         runs_dir = out_dir / "runs"
         runs_dir.mkdir(parents=True, exist_ok=True)

@@ -56,7 +56,10 @@ def select_all(nodes: list, flow_selector: FlowSelector) -> list:
             case_sensitive=case_sensitive, all_matches=True,
         )
     except errors.AutonomError as exc:
-        if exc.code == errors.NO_MATCHING_NODE:  # geometric anchor absent
+        # A geometric anchor that is simply off-screen means "not present" in
+        # an assertion context. An INVALID REGEX shares the same code but is a
+        # flow-definition error and must never read as a clean negative.
+        if exc.code == errors.NO_MATCHING_NODE and "regular expression" not in exc.message:
             return []
         raise
     if flow_selector.index is not None:

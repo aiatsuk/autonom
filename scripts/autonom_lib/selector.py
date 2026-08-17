@@ -68,15 +68,27 @@ def visible_label(node: Mapping[str, Any]) -> str:
 
 def _plain_match(node: Mapping[str, Any], fields: Mapping[str, Any],
                  mode: str, case_sensitive: bool) -> bool:
-    """String + bool field matching for one node (no relational, no errors
-    beyond a bad regex)."""
+    """String + bool field matching for one node (no relational).
+
+    A malformed regex raises the same positioned envelope as the main
+    filter — an anchor pattern must never crash with a raw ``re.error``."""
+    def _match(actual, expected, name):
+        try:
+            return match_string(actual, expected, mode, case_sensitive)
+        except re.error as exc:
+            raise errors.AutonomError(
+                errors.NO_MATCHING_NODE,
+                f"invalid regular expression for {name}: {exc}",
+                "Fix the pattern, or use match: contains.",
+            ) from exc
+
     for name, key in STRING_FIELDS.items():
         expected = fields.get(name)
         if expected is None:
             continue
         if not isinstance(expected, str):
             return False
-        if not match_string(node.get(key), expected, mode, case_sensitive):
+        if not _match(node.get(key), expected, name):
             return False
     expected = fields.get("visible_text")
     if expected is not None:
@@ -84,7 +96,7 @@ def _plain_match(node: Mapping[str, Any], fields: Mapping[str, Any],
             return False
         present = [node.get(source) for source in LABEL_SOURCES
                    if node.get(source)]
-        if not any(match_string(value, expected, mode, case_sensitive)
+        if not any(_match(value, expected, "visible_text")
                    for value in present):
             return False
     for name in BOOL_FIELDS:

@@ -154,6 +154,11 @@ def _step_assets(manifest: dict[str, Any], artifacts_dir: Path,
                  assets: Path, mode: str) -> dict[int, dict[str, Any]]:
     """Copy this run's evidence next to the report and index it by step.
 
+    The step of each artifact comes from the manifest's ``artifact_steps``
+    ledger (v2), which the executor writes at capture time. Filenames are
+    never parsed for a step number: a ``takeScreenshot`` label is arbitrary
+    user text and could impersonate one.
+
     ``mode``: ``all`` copies every screenshot, ``failed`` only the frames of
     a run that failed, ``none`` copies nothing. Files are copied rather than
     inlined — a suite's worth of base64 would be hundreds of megabytes.
@@ -163,35 +168,31 @@ def _step_assets(manifest: dict[str, Any], artifacts_dir: Path,
     run_id = str(manifest.get("run_id") or "run")
     by_step: dict[int, dict[str, Any]] = {}
     target = assets / run_id
+    ledger = {entry.get("path"): entry
+              for entry in manifest.get("artifact_steps", [])
+              if entry.get("path")}
     for relative in manifest.get("artifacts", []):
         source = artifacts_dir / relative
         if not source.is_file():
             continue
+        entry = ledger.get(relative)
+        if entry is None:
+            continue  # v1 manifest or an artifact nobody claimed: see _orphans
+        index = entry.get("step_index")
+        if not isinstance(index, int):
+            continue
         name = source.name
-        index = None
-        for token in ("step-", "failure-step-"):
-            if token in name:
-                tail = name.split(token, 1)[1]
-                digits = ""
-                for char in tail:
-                    if char.isdigit():
-                        digits += char
-                    else:
-                        break
-                if digits:
-                    index = int(digits)
-                break
         if source.suffix == ".png":
             target.mkdir(parents=True, exist_ok=True)
             copy = target / name
             copy.write_bytes(source.read_bytes())
             os.chmod(copy, 0o644)
-            slot = by_step.setdefault(index if index is not None else 0, {})
-            slot.setdefault("shots", []).append(f"assets/{run_id}/{name}")
-        elif name.endswith("-logs.txt") and index is not None:
+            by_step.setdefault(index, {}).setdefault("shots", []).append(
+                f"assets/{run_id}/{name}")
+        elif name.endswith("-logs.txt"):
             text = source.read_text(encoding="utf-8", errors="replace")
             by_step.setdefault(index, {})["logs"] = text[-4000:]
-        elif name.endswith("-hierarchy.json") and index is not None:
+        elif name.endswith("-hierarchy.json"):
             target.mkdir(parents=True, exist_ok=True)
             copy = target / name
             copy.write_bytes(source.read_bytes())

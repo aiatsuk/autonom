@@ -7,6 +7,45 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
 
 ## [Unreleased]
 
+## [0.28.4] - 2026-08-17
+
+Manifest v2 and the evidence-integrity fixes an adversarial validation of the
+whole 0.28.x arc turned up. The manifest is the report protocol, and it was
+missing most of what a real report needs.
+
+### Added
+- **Manifest `schema_version: 2`** (additive; v1 manifests still render):
+  wall-clock `started_at_ms`/`finished_at_ms` on the run and every step, the
+  `selector` actually used per step, block spans for `group`/`repeat`/`retry`/
+  `runFlow` (`blocks`, with iteration and attempt ranges, kept out of `steps`
+  so JUnit keeps counting the same cases), `depth`/`parent_index`/
+  `retry_attempt`, flow metadata (`tags`, `properties`, `description`, `env`,
+  `secret_names`, `converted_from`, `workspace_root`, `evidence_mode`), and
+  `artifact_steps` — the authoritative artifact→step ledger.
+
+### Fixed
+- **An aborted run left no evidence at all.** An infrastructure or
+  flow-definition failure raised straight out of `run()`, so `_write_manifest`
+  never executed: the one run a human most needs to inspect had no manifest and
+  no report. The error is now recorded (status, `primary_error`), the manifest
+  is written, and the envelope still reaches the CLI unchanged (exit 2).
+- **`takeScreenshot` frames were invisible in the suite site.** They carry a
+  user label, not a `step-N` name, so the renderer filed them under step 0 —
+  a bucket no step ever has — copying megabytes to disk that no page
+  referenced. Frames are now mapped through the manifest ledger; the executor
+  records a step for every capture, including `takeScreenshot`, which
+  previously emitted no evidence event at all.
+- **A screenshot label could impersonate a step number.** `takeScreenshot:
+  step-1-decoy` filed its frame under step 1 and rendered it beside an
+  unrelated command. Filenames are no longer parsed for step numbers.
+- `report suite --detailed` was a no-op: the multi-page site was built
+  whenever `--screenshots` was not `none` (its default is `failed`), so the
+  documented single-page default never existed. The flag now gates the site.
+- A malformed `match: regex` no longer reads as a clean negative in
+  assertions (`select_all` shared `no_matching_node` with "invalid regular
+  expression"), and a bad regex inside a **relational anchor** raises the
+  positioned envelope instead of a raw `re.error` traceback.
+
 ## [0.28.3] - 2026-08-17
 
 Suite-level evidence: running 46 flows produced 46 separate reports and no
