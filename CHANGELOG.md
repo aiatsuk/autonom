@@ -7,6 +7,64 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
 
 ## [Unreleased]
 
+## [0.28.0] - 2026-08-17
+
+Maestro Core Profile v2, slice 1 of 4 (`docs/plans/PHASE_6_MAESTRO_COMPAT.md`):
+import courtesy. A real-world Maestro file now runs through Autonom without a
+separate conversion step, and the most common idioms that used to die as raw
+parse errors import cleanly — while the native Flow v1 grammar stays exactly
+as strict as before.
+
+### Added
+- The strict parser accepts single-line flow mappings
+  (`tapOn: {text: X, index: 1}`) in an opt-in mode used only by the Maestro
+  importer — flat, scalar values only, every malformed shape a positioned
+  `flow_parse_error` (new reason slugs `nested_flow_mapping`,
+  `unterminated_flow_mapping`). Hand-written Flow v1 files still refuse
+  `{...}` with reason `flow_mapping`.
+- `flow run|check|fmt|list` execute Maestro files directly: a flow file whose
+  header has no `schema:` field is converted on the fly through the importer
+  (decision D6) — same refusals as `flow import`, nested `runFlow` children
+  convert too. Converted runs carry `converted_from: maestro` in
+  `flow.run.started` and the run summary; `flow fmt` prints the canonical
+  Flow v1 text as the migration path — and `flow fmt --write` never rewrites
+  a Maestro source in place (the entry reports `converted_from` +
+  `write_skipped`; conversion to a file is always the explicit
+  `flow import --out`).
+- Import profile widened: header `properties`/`onFlowStart`/`onFlowComplete`
+  (`url` refuses — no web target); map forms of `inputText` (`text`),
+  `eraseText` (`charactersToErase`), `openLink` (`link`), `takeScreenshot`
+  (`path`); `scrollUntilVisible` (`element`/`direction`; time/speed tunables
+  refuse toward `maxSwipes`); `retry` (`maxRetries`+1→`maxAttempts`, capped
+  at 3 attempts total, mutating children get an explicit
+  `allowMutations: true` because that is Maestro's semantics); Maestro's
+  on-selector `label`/`optional` move to the command (`optional` on tap
+  commands only, with a generated `reason:`; an optional assertion refuses);
+  `label` imports on every mapped command.
+
+### Fixed
+Hardening from the slice's adversarial review, each pinned by a test:
+- Non-integer values where the importer expects a number (`swipe.duration`,
+  `extendedWaitUntil.timeout`, `eraseText`, selector `index`) refuse with a
+  positioned `unsupported_flow_command` instead of an uncaught traceback —
+  and so does every malformed value shape (`properties: oops`, `env: oops`,
+  a list under `retry`/`swipe`/`tapOn`, a scalar under `extendedWaitUntil`),
+  which previously crashed with AttributeError and, through the auto-detect
+  loader, could kill a whole `flow check <dir>` sweep.
+- Maestro's YAML 1.1 boolean spellings (`True`, `yes`, `on`, …) normalize on
+  import for `optional`/`enabled`/`clearState`; unrecognized spellings
+  refuse. Previously `optional: True` silently imported as *not* optional.
+- Convertible-but-invalid constructs (nested retry, negative `maxRetries`,
+  empty `commands`, state-only selectors, malformed env names) refuse at
+  their position in the *source* file; a validation error escaping the
+  canonical rebuild is reported as a conversion failure instead of
+  presenting canonical-text coordinates as source positions.
+- Flow-mapping values keep mid-word apostrophes plain (`{text: Don't
+  allow}`) — a quote is a quote only at value start, as in YAML.
+- `docs/FLOW.md` prose caught up with the shipped surface: relational
+  selectors and `retry` are implemented (not "deferred"), and `optional`
+  applies to all three tap commands, not `tapOn` alone.
+
 ## [0.27.3] - 2026-08-15
 
 ### Fixed

@@ -18,6 +18,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from .. import errors
+from . import maestro as maestro_mod
 from . import parser as parser_mod
 from . import schema as schema_mod
 
@@ -31,7 +32,14 @@ def workspace_root(flow_path: Path) -> Path:
 
 
 def load_flow(path: Path) -> schema_mod.Flow:
-    """Parse + build one file (no subflow traversal)."""
+    """Parse + build one file (no subflow traversal).
+
+    A file whose header carries no ``schema:`` field is a Maestro document
+    (decision D6, Phase 6): it is converted through the Core Profile importer
+    on the fly — same refusals as ``flow import`` — and the returned flow is
+    marked ``converted_from = "maestro"``. Nested ``runFlow`` children go
+    through this same loader, so a Maestro tree converts as a whole.
+    """
     try:
         text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
@@ -45,6 +53,12 @@ def load_flow(path: Path) -> schema_mod.Flow:
             errors.FLOW_FILE_NOT_FOUND, f"{path} is a directory, not a flow file",
             file=str(path),
         )
+    if maestro_mod.is_maestro_document(text):
+        canonical = maestro_mod.import_flow(text, str(path))
+        flow = schema_mod.build_flow(
+            parser_mod.parse_document(canonical, str(path)))
+        flow.converted_from = "maestro"
+        return flow
     document = parser_mod.parse_document(text, str(path))
     return schema_mod.build_flow(document)
 

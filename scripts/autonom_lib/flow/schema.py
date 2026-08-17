@@ -304,6 +304,9 @@ class Flow:
     on_flow_start: list = field(default_factory=list)
     on_flow_complete: list = field(default_factory=list)
     steps: list = field(default_factory=list)
+    # set by the loader when the source file was a Maestro document that was
+    # converted on the fly (never part of the flow's own header)
+    converted_from: str | None = None
 
 
 # --- Coercion helpers --------------------------------------------------------

@@ -135,6 +135,11 @@ class RejectTests(unittest.TestCase):
                 self.assertTrue(str(exc).startswith(f"t.yaml:{line}:{col}:"),
                                 f"message not position-prefixed: {exc}")
 
+    def test_flow_mapping_refused_in_commands_by_default(self) -> None:
+        with self.assertRaises(errors.AutonomError) as caught:
+            _parse(_HEAD + "- tapOn: {text: OK}\n")
+        self.assertEqual(caught.exception.extra.get("reason"), "flow_mapping")
+
     def test_fuzz_mutations_never_traceback(self) -> None:
         """Random single-character mutations must yield a positioned error or
         parse — never an unhandled exception."""
@@ -152,6 +157,73 @@ class RejectTests(unittest.TestCase):
             except errors.AutonomError as exc:
                 self.assertIn("line", exc.extra)
                 self.assertIn("column", exc.extra)
+
+
+class FlowMappingModeTests(unittest.TestCase):
+    """The bounded import-mode exception: single-line ``{key: value, ...}``.
+
+    On only when ``allow_flow_mappings=True`` (the Maestro importer); the
+    native grammar keeps refusing with reason ``flow_mapping``.
+    """
+
+    @staticmethod
+    def _parse_allowed(text: str):
+        return parser.parse_document(text, "t.yaml", allow_flow_mappings=True)
+
+    def test_command_flow_mapping_parses(self) -> None:
+        doc = self._parse_allowed(
+            _HEAD + '- tapOn: {text: "OK, go", index: 1}\n')
+        command = doc.commands.items[0]
+        self.assertIsInstance(command, parser.Mapping)
+        _, value = command.pairs[0]
+        self.assertIsInstance(value, parser.Mapping)
+        self.assertEqual(value.keys(), ["text", "index"])
+        self.assertEqual(value.get("text").text, "OK, go")
+        self.assertEqual(value.get("index").text, "1")
+
+    def test_empty_flow_mapping_parses(self) -> None:
+        doc = self._parse_allowed("a: {}\n---\n- y\n")
+        node = doc.header.get("a")
+        self.assertIsInstance(node, parser.Mapping)
+        self.assertEqual(node.pairs, [])
+
+    def test_mid_word_apostrophe_stays_plain(self) -> None:
+        doc = self._parse_allowed("a: {b: Don't allow, c: ok}\n---\n- y\n")
+        node = doc.header.get("a")
+        self.assertEqual(node.get("b").text, "Don't allow")
+        self.assertEqual(node.get("c").text, "ok")
+
+    REJECTS: list[tuple[str, str, str, int, int]] = [
+        # (name, text, reason, line, col) — header context keeps columns easy
+        ("nested mapping", "a: {b: {c: d}}\n---\n- y\n",
+         "nested_flow_mapping", 1, 8),
+        ("nested list", "a: {b: [1]}\n---\n- y\n",
+         "nested_flow_mapping", 1, 8),
+        ("unterminated", "a: {b: c\n---\n- y\n",
+         "unterminated_flow_mapping", 1, 4),
+        ("duplicate key", "a: {b: 1, b: 2}\n---\n- y\n",
+         "duplicate_key", 1, 11),
+        ("trailing comma", "a: {b: 1,}\n---\n- y\n",
+         "empty_flow_item", 1, 10),
+        ("no colon", "a: {b}\n---\n- y\n", "expected_key", 1, 5),
+        ("no space after colon", "a: {b:1}\n---\n- y\n",
+         "missing_space_after_colon", 1, 7),
+        ("missing value", "a: {b: }\n---\n- y\n", "missing_value", 1, 7),
+        ("unterminated quote", "a: {b: 'x}\n---\n- y\n",
+         "unterminated_quote", 1, 5),  # points at the entry that never closes
+    ]
+
+    def test_rejections_are_positioned(self) -> None:
+        for name, text, reason, line, col in self.REJECTS:
+            with self.subTest(case=name):
+                with self.assertRaises(errors.AutonomError) as caught:
+                    self._parse_allowed(text)
+                exc = caught.exception
+                self.assertEqual(exc.code, errors.FLOW_PARSE_ERROR, name)
+                self.assertEqual(exc.extra.get("reason"), reason, str(exc))
+                self.assertEqual(
+                    (exc.extra.get("line"), exc.extra.get("column")), (line, col),
+                    f"{name}: {exc}")
 
 
 if __name__ == "__main__":

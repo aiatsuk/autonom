@@ -28,12 +28,31 @@ from .. import errors
 from . import FLOW_SCHEMA_ID
 from .canonical import emit_flow
 from .parser import FlowDocument, Mapping, Scalar, Sequence, parse_document
-from .schema import Flow, FlowSelector, Step, build_flow
+from .schema import Flow, FlowSelector, REGISTRY, Step, build_flow
 
 _PLAIN_TEXT_RE = re.compile(r"^[^.^$*+?()\[\]{}|\\]*$")
 _JS_INTERP_RE = re.compile(r"\$\{[^}]*[^A-Za-z0-9_}][^}]*\}")
+_SCHEMA_LINE_RE = re.compile(r"^schema\s*:")
 
-_CORE_HEADER = ("appId", "name", "tags", "env")
+_CORE_HEADER = ("appId", "name", "tags", "env", "properties",
+                "onFlowStart", "onFlowComplete", "url")
+_TAP_COMMANDS = ("tapOn", "longPressOn", "doubleTapOn")
+_IMPORTED_OPTIONAL_REASON = "optional in the Maestro source"
+
+
+def is_maestro_document(text: str) -> bool:
+    """True when the header before ``---`` carries no ``schema:`` field.
+
+    Flow v1 requires ``schema: autonom.dev/flow/v1`` in the header; a Maestro
+    file never has one. A file with no ``---`` at all is left to the strict
+    parser, whose missing-separator error fits both formats.
+    """
+    for line in text.split("\n"):
+        if line.strip() == "---":
+            return True
+        if _SCHEMA_LINE_RE.match(line):
+            return False
+    return False
 
 _UNSUPPORTED_HINTS = {
     "runScript": "Replace runScript with a deterministic subflow or execute it outside Flow v1",
@@ -87,16 +106,37 @@ def _import_pattern(pattern: str) -> tuple[str, str]:
 
 def _selector_from(node, path: str) -> FlowSelector:
     """A Maestro selector: a bare scalar or fields directly on the command."""
+    selector, extras = _selector_with_extras(node, path)
+    if extras:
+        name = next(iter(extras))
+        _refuse(path, node.line, node.col, f"selector field {name}",
+                "label/optional belong on the command, not inside a "
+                "condition selector.")
+    return selector
+
+
+def _selector_with_extras(node, path: str) -> tuple[FlowSelector, dict]:
+    """Split a Maestro selector map into selector fields and command extras.
+
+    Maestro puts ``label``/``optional`` on the same map as the selector
+    fields; Autonom keeps them as command arguments.
+    """
     if isinstance(node, Scalar):
         text, mode = _import_pattern(_no_js(node.text, path, node.line, node.col))
         return FlowSelector(fields={"text": text}, match=mode,
                             source_fields={"text": text},
-                            line=node.line, col=node.col)
+                            line=node.line, col=node.col), {}
+    _require_mapping(node, path, "selector")
     selector = FlowSelector(line=node.line, col=node.col)
+    extras: dict = {}
     modes = set()
     for key, value in node.pairs:
         name = key.text
-        if name in ("text", "id"):
+        if name == "label":
+            extras["label"] = _scalar_text(value, path)
+        elif name == "optional":
+            extras["optional"] = _bool_text(value, path, "optional")
+        elif name in ("text", "id"):
             raw = _scalar_text(value, path)
             pattern, mode = _import_pattern(raw)
             field = "text" if name == "text" else "resource_id"
@@ -105,9 +145,9 @@ def _selector_from(node, path: str) -> FlowSelector:
             selector.source_fields[source] = pattern
             modes.add(mode)
         elif name == "index":
-            selector.index = int(_scalar_text(value, path))
+            selector.index = _int_text(value, path, "selector index")
         elif name == "enabled":
-            flag = _scalar_text(value, path) == "true"
+            flag = _bool_text(value, path, "selector field enabled")
             selector.fields["enabled"] = flag
             selector.source_fields["enabled"] = flag
         else:
@@ -120,7 +160,26 @@ def _selector_from(node, path: str) -> FlowSelector:
     if not selector.fields:
         _refuse(path, node.line, node.col, "empty selector",
                 "Give the element a text or id.")
-    return selector
+    if "text" not in selector.fields and "resource_id" not in selector.fields:
+        _refuse(path, node.line, node.col, "selector without text or id",
+                "State fields alone cannot identify an element; give it a "
+                "text or id.")
+    return selector, extras
+
+
+def _apply_extras(command: str, args: dict, extras: dict, path: str,
+                  line: int, col: int) -> dict:
+    """Fold Maestro label/optional into Autonom command arguments."""
+    if "label" in extras:
+        args["label"] = extras["label"]
+    if extras.get("optional"):
+        if command not in _TAP_COMMANDS:
+            _refuse(path, line, col, f"optional on {command}",
+                    "Autonom allows optional only on tap commands, and an "
+                    "optional assertion is refused by design.")
+        args["optional"] = True
+        args["reason"] = _IMPORTED_OPTIONAL_REASON
+    return args
 
 
 def _scalar_text(node, path: str) -> str:
@@ -132,6 +191,54 @@ def _scalar_text(node, path: str) -> str:
             file=path, line=getattr(node, "line", 0),
         )
     return _no_js(node.text, path, node.line, node.col)
+
+
+def _int_text(node, path: str, what: str) -> int:
+    raw = _scalar_text(node, path)
+    try:
+        return int(raw)
+    except ValueError:
+        _refuse(path, getattr(node, "line", 0), getattr(node, "col", 0), what,
+                f"expected an integer, got {raw!r}")
+    raise AssertionError("unreachable")  # _refuse always raises
+
+
+# Maestro's YAML layer (snakeyaml, YAML 1.1) accepts these boolean spellings;
+# importing `True`/`yes`/`on` as anything but a boolean would silently flip
+# semantics (an optional step becoming required, enabled becoming false).
+_TRUE_WORDS = ("true", "yes", "on")
+_FALSE_WORDS = ("false", "no", "off")
+
+
+def _bool_text(node, path: str, what: str) -> bool:
+    raw = _scalar_text(node, path)
+    lowered = raw.lower()
+    if lowered in _TRUE_WORDS:
+        return True
+    if lowered in _FALSE_WORDS:
+        return False
+    _refuse(path, getattr(node, "line", 0), getattr(node, "col", 0), what,
+            f"expected a boolean, got {raw!r}")
+    raise AssertionError("unreachable")
+
+
+def _require_mapping(node, path: str, what: str) -> Mapping:
+    if not isinstance(node, Mapping):
+        _refuse(path, getattr(node, "line", 0), getattr(node, "col", 0), what,
+                f"{what} takes a mapping of key: value pairs.")
+    return node
+
+
+_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _env_into(target: dict, node, path: str) -> None:
+    for env_key, env_value in _require_mapping(node, path, "env").pairs:
+        if not _ENV_NAME_RE.match(env_key.text):
+            _refuse(path, env_key.line, env_key.col,
+                    f"env name {env_key.text}",
+                    "Env names match [A-Za-z_][A-Za-z0-9_]*.")
+        target[env_key.text] = _scalar_text(env_value, path)
 
 
 def _steps_from(sequence: Sequence, path: str) -> list[Step]:
@@ -160,48 +267,186 @@ def _step_from(item, path: str) -> Step:
     if name in _UNSUPPORTED_HINTS:
         _refuse(path, line, col, name, _UNSUPPORTED_HINTS[name])
 
-    if name in ("tapOn", "longPressOn", "assertVisible", "assertNotVisible"):
-        selector = _selector_from(value, path)
-        return Step(name, {"selector": selector}, line, col)
-    if name == "doubleTapOn":
-        return Step("doubleTapOn", {"selector": _selector_from(value, path)},
-                    line, col)
+    if name in (*_TAP_COMMANDS, "assertVisible", "assertNotVisible"):
+        selector, extras = _selector_with_extras(value, path)
+        args = _apply_extras(name, {"selector": selector}, extras,
+                             path, line, col)
+        return Step(name, args, line, col)
     if name == "inputText":
+        if isinstance(value, Mapping):
+            args = {}
+            for arg_key, arg_value in value.pairs:
+                if arg_key.text == "text":
+                    args["value"] = _scalar_text(arg_value, path)
+                elif arg_key.text == "label":
+                    args["label"] = _scalar_text(arg_value, path)
+                else:
+                    _refuse(path, arg_key.line, arg_key.col,
+                            f"inputText.{arg_key.text}",
+                            "Core Profile inputText supports text and label.")
+            if "value" not in args:
+                _refuse(path, line, col, "inputText without text",
+                        "Give inputText a text value.")
+            return Step("inputText", args, line, col)
         return Step("inputText", {"value": _scalar_text(value, path)}, line, col)
     if name == "openLink":
+        if isinstance(value, Mapping):
+            args = {}
+            for arg_key, arg_value in value.pairs:
+                if arg_key.text == "link":
+                    args["url"] = _scalar_text(arg_value, path)
+                elif arg_key.text == "label":
+                    args["label"] = _scalar_text(arg_value, path)
+                else:
+                    _refuse(path, arg_key.line, arg_key.col,
+                            f"openLink.{arg_key.text}",
+                            "Core Profile openLink supports the link only; "
+                            "browser/autoVerify do not import.")
+            if "url" not in args:
+                _refuse(path, line, col, "openLink without a link",
+                        "Give openLink a link.")
+            return Step("openLink", args, line, col)
         return Step("openLink", {"url": _scalar_text(value, path)}, line, col)
     if name == "takeScreenshot":
+        if isinstance(value, Mapping):
+            args = {}
+            for arg_key, arg_value in value.pairs:
+                if arg_key.text in ("path", "label"):
+                    if "label" in args:
+                        _refuse(path, arg_key.line, arg_key.col,
+                                "takeScreenshot with both path and label",
+                                "Autonom screenshots are evidence-dir owned; "
+                                "the path becomes the label — give one name.")
+                    args["label"] = _scalar_text(arg_value, path)
+                else:
+                    _refuse(path, arg_key.line, arg_key.col,
+                            f"takeScreenshot.{arg_key.text}",
+                            "Core Profile takeScreenshot maps the path to a "
+                            "label; cropOn does not import.")
+            return Step("takeScreenshot", args, line, col)
         return Step("takeScreenshot", {"label": _scalar_text(value, path)},
                     line, col)
     if name == "pressKey":
         return Step("pressKey", {"key": _scalar_text(value, path)}, line, col)
     if name == "eraseText":
-        return Step("eraseText", {"chars": int(_scalar_text(value, path))},
+        if isinstance(value, Mapping):
+            args = {}
+            for arg_key, arg_value in value.pairs:
+                if arg_key.text == "charactersToErase":
+                    args["chars"] = _int_text(arg_value, path,
+                                              "eraseText.charactersToErase")
+                elif arg_key.text == "label":
+                    args["label"] = _scalar_text(arg_value, path)
+                else:
+                    _refuse(path, arg_key.line, arg_key.col,
+                            f"eraseText.{arg_key.text}",
+                            "Core Profile eraseText supports "
+                            "charactersToErase and label.")
+            return Step("eraseText", args, line, col)
+        return Step("eraseText", {"chars": _int_text(value, path, "eraseText")},
                     line, col)
+    if name == "scrollUntilVisible":
+        if isinstance(value, Scalar):
+            _refuse(path, line, col, "scrollUntilVisible shorthand",
+                    "Use the map form with an element selector.")
+        args = {}
+        for arg_key, arg_value in _require_mapping(value, path,
+                                                   "scrollUntilVisible").pairs:
+            if arg_key.text == "element":
+                args["selector"] = _selector_from(arg_value, path)
+            elif arg_key.text == "direction":
+                args["direction"] = _scalar_text(arg_value, path).lower()
+            elif arg_key.text == "label":
+                args["label"] = _scalar_text(arg_value, path)
+            else:
+                _refuse(path, arg_key.line, arg_key.col,
+                        f"scrollUntilVisible.{arg_key.text}",
+                        "Maestro's time-based scrolling maps to Autonom's "
+                        "bounded maxSwipes; tune maxSwipes in the imported "
+                        "flow instead of timeout/speed.")
+        if "selector" not in args:
+            _refuse(path, line, col, "scrollUntilVisible without an element",
+                    "Give scrollUntilVisible an element selector.")
+        return Step("scrollUntilVisible", args, line, col)
+    if name == "retry":
+        if isinstance(value, Scalar):
+            _refuse(path, line, col, "retry shorthand",
+                    "Use the map form with a commands list.")
+        args = {}
+        for arg_key, arg_value in _require_mapping(value, path, "retry").pairs:
+            if arg_key.text == "maxRetries":
+                retries = _int_text(arg_value, path, "retry.maxRetries")
+                if retries < 0:
+                    _refuse(path, arg_key.line, arg_key.col,
+                            f"retry.maxRetries: {retries}",
+                            "maxRetries cannot be negative.")
+                if retries + 1 > 3:
+                    _refuse(path, arg_key.line, arg_key.col,
+                            f"retry.maxRetries: {retries}",
+                            "Autonom caps retry at 3 attempts total "
+                            "(maxRetries 2); retrying more hides defects.")
+                args["maxAttempts"] = retries + 1
+            elif arg_key.text == "commands":
+                if not isinstance(arg_value, Sequence):
+                    _refuse(path, arg_key.line, arg_key.col, "retry.commands",
+                            "retry.commands must be a list of commands.")
+                args["commands"] = _steps_from(arg_value, path)
+            elif arg_key.text == "label":
+                args["label"] = _scalar_text(arg_value, path)
+            else:
+                _refuse(path, arg_key.line, arg_key.col,
+                        f"retry.{arg_key.text}",
+                        "Core Profile retry supports maxRetries, commands, "
+                        "and label; file subflows do not import into retry.")
+        if not args.get("commands"):
+            _refuse(path, line, col, "retry without commands",
+                    "Inline the retried commands; retry over a file does "
+                    "not import.")
+        args.setdefault("maxAttempts", 2)  # Maestro default maxRetries: 1
+        for sub in args["commands"]:
+            if sub.command in ("runFlow", "retry"):
+                _refuse(path, sub.line, sub.col, f"{sub.command} inside retry",
+                        "Autonom retry blocks stay small and atomic; nested "
+                        "retries and retried subflows do not import.")
+            if REGISTRY[sub.command].mutating:
+                # Maestro retries mutations by default; Autonom demands the
+                # intent be explicit — and the imported file shows it.
+                args["allowMutations"] = True
+        return Step("retry", args, line, col)
+    if name in ("stopApp", "clearState") and isinstance(value, Scalar):
+        _refuse(path, line, col, f"{name} with an inline appId",
+                "Set appId in the header; per-step app switching is not "
+                "part of the Core Profile.")
     if name == "launchApp":
         if isinstance(value, Scalar):  # launchApp: com.example — appId override
             _refuse(path, line, col, "launchApp with an inline appId",
                     "Set appId in the header; per-step app switching is not "
                     "part of the Core Profile.")
         args: dict = {}
-        for arg_key, arg_value in value.pairs:
+        for arg_key, arg_value in _require_mapping(value, path,
+                                                   "launchApp").pairs:
             if arg_key.text == "clearState":
-                args["clearState"] = _scalar_text(arg_value, path) == "true"
+                args["clearState"] = _bool_text(arg_value, path,
+                                                "launchApp.clearState")
+            elif arg_key.text == "label":
+                args["label"] = _scalar_text(arg_value, path)
             else:
                 _refuse(path, arg_key.line, arg_key.col,
                         f"launchApp.{arg_key.text}",
-                        "Core Profile launchApp supports clearState only.")
+                        "Core Profile launchApp supports clearState and label.")
         return Step("launchApp", args, line, col)
     if name == "swipe":
         if isinstance(value, Scalar):
             _refuse(path, line, col, "swipe shorthand",
                     "Use swipe with a direction: swipe: {direction: up}.")
         args = {}
-        for arg_key, arg_value in value.pairs:
+        for arg_key, arg_value in _require_mapping(value, path, "swipe").pairs:
             if arg_key.text == "direction":
                 args["direction"] = _scalar_text(arg_value, path).lower()
             elif arg_key.text == "duration":
-                args["durationMs"] = int(_scalar_text(arg_value, path))
+                args["durationMs"] = _int_text(arg_value, path, "swipe.duration")
+            elif arg_key.text == "label":
+                args["label"] = _scalar_text(arg_value, path)
             else:
                 _refuse(path, arg_key.line, arg_key.col,
                         f"swipe.{arg_key.text}",
@@ -213,11 +458,15 @@ def _step_from(item, path: str) -> Step:
         return Step("swipe", args, line, col)
     if name == "extendedWaitUntil":
         args = {}
-        for arg_key, arg_value in value.pairs:
+        for arg_key, arg_value in _require_mapping(value, path,
+                                                   "extendedWaitUntil").pairs:
             if arg_key.text in ("visible", "notVisible"):
                 args[arg_key.text] = _selector_from(arg_value, path)
             elif arg_key.text == "timeout":
-                args["timeoutMs"] = int(_scalar_text(arg_value, path))
+                args["timeoutMs"] = _int_text(arg_value, path,
+                                              "extendedWaitUntil.timeout")
+            elif arg_key.text == "label":
+                args["label"] = _scalar_text(arg_value, path)
             else:
                 _refuse(path, arg_key.line, arg_key.col,
                         f"extendedWaitUntil.{arg_key.text}", "")
@@ -227,20 +476,22 @@ def _step_from(item, path: str) -> Step:
         if isinstance(value, Scalar):
             return Step("runFlow", {"file": _scalar_text(value, path)}, line, col)
         args = {}
-        for arg_key, arg_value in value.pairs:
+        for arg_key, arg_value in _require_mapping(value, path,
+                                                   "runFlow").pairs:
             if arg_key.text == "file":
                 args["file"] = _scalar_text(arg_value, path)
             elif arg_key.text == "env":
-                env = {}
-                for env_key, env_value in arg_value.pairs:
-                    env[env_key.text] = _scalar_text(env_value, path)
+                env: dict = {}
+                _env_into(env, arg_value, path)
                 args["env"] = env
             elif arg_key.text == "when":
                 args["when"] = _when_from(arg_value, path)
+            elif arg_key.text == "label":
+                args["label"] = _scalar_text(arg_value, path)
             else:
                 _refuse(path, arg_key.line, arg_key.col,
                         f"runFlow.{arg_key.text}",
-                        "Core Profile runFlow supports file, env, when.")
+                        "Core Profile runFlow supports file, env, when, label.")
         if "file" not in args:
             _refuse(path, line, col, "runFlow without a file",
                     "Inline commands do not import; use a subflow file.")
@@ -250,6 +501,7 @@ def _step_from(item, path: str) -> Step:
 
 def _when_from(node, path: str):
     from .schema import WhenClause
+    _require_mapping(node, path, "when")
     when = WhenClause(line=node.line, col=node.col)
     for key, value in node.pairs:
         if key.text == "platform":
@@ -278,30 +530,62 @@ def import_flow(text: str, path: str) -> str:
                 hint="Only ${NAME} environment interpolation carries over.",
                 file=path, line=line_number, column=match.start() + 1,
             )
-    document = parse_document(text, path)
+    document = parse_document(text, path, allow_flow_mappings=True)
     flow = Flow(path=path, name="")
     for key, value in document.header.pairs:
         name = key.text
         if name not in _CORE_HEADER:
             _refuse(path, key.line, key.col, f"header field {name}",
-                    "Core Profile header: appId, name, tags, env.")
+                    "Core Profile header: appId, name, tags, env, properties, "
+                    "onFlowStart, onFlowComplete.")
+        if name == "url":
+            _refuse(path, key.line, key.col, "header field url",
+                    "Autonom has no web target; Maestro web flows do not "
+                    "import.")
         if name == "appId":
             flow.app_id = _scalar_text(value, path)
         elif name == "name":
             flow.name = _scalar_text(value, path)
         elif name == "tags":
-            if isinstance(value, Sequence):
-                flow.tags = [_scalar_text(item, path) for item in value.items]
+            if not isinstance(value, Sequence):
+                _refuse(path, key.line, key.col, "header field tags",
+                        "tags must be a list.")
+            flow.tags = [_scalar_text(item, path) for item in value.items]
         elif name == "env":
-            for env_key, env_value in value.pairs:
-                flow.env[env_key.text] = _scalar_text(env_value, path)
+            _env_into(flow.env, value, path)
+        elif name == "properties":
+            for prop_key, prop_value in _require_mapping(
+                    value, path, "header field properties").pairs:
+                flow.properties[prop_key.text] = _scalar_text(prop_value, path)
+        elif name in ("onFlowStart", "onFlowComplete"):
+            if not isinstance(value, Sequence):
+                _refuse(path, key.line, key.col, f"header field {name}",
+                        f"{name} must be a list of commands.")
+            steps = _steps_from(value, path)
+            if name == "onFlowStart":
+                flow.on_flow_start = steps
+            else:
+                flow.on_flow_complete = steps
     if not flow.name:
         flow.name = "Imported Maestro flow"
     flow.steps = _steps_from(document.commands, path)
 
     canonical_text = emit_flow(flow)
-    # The emitted text must stand on its own — parse and build it back.
-    build_flow(parse_document(canonical_text, path))
+    # The emitted text must stand on its own — parse and build it back. An
+    # error escaping here is an importer gap (source-side validation should
+    # have refused first), so never present canonical-text coordinates as if
+    # they were positions in the user's Maestro file.
+    try:
+        build_flow(parse_document(canonical_text, path))
+    except errors.AutonomError as exc:
+        raise errors.AutonomError(
+            errors.UNSUPPORTED_FLOW_COMMAND,
+            f"{path}: the converted flow failed Flow v1 validation: "
+            f"{exc.message}",
+            hint="Positions inside the quoted message refer to the converted "
+                 "text, not the source file.",
+            file=path, detail=exc.message,
+        )
     return canonical_text
 
 

@@ -172,6 +172,8 @@ class Executor:
             "flow": flow.path, "name": flow.name, "app_id": flow.app_id,
             "tags": flow.tags, "steps": len(flow.steps),
             "dry_run": self.config.dry_run,
+            **({"converted_from": flow.converted_from}
+               if flow.converted_from else {}),
             **({"warnings": [{"code": "flow_evidence_kind_unsupported",
                               "kinds": unsupported}]} if unsupported else {}),
         })

@@ -57,8 +57,8 @@ the reason; `onFlowComplete` cleanup is isolated per command and reported as
   opt-in per selector. A selector that matches more than one node refuses to
   act (`ambiguous_selector`) unless `index` disambiguates.
 - **Unknown anything**: an unknown command, header field, selector field, or
-  argument is an error, never ignored. Deferred features (relational
-  selectors, `retry`, `waitForIdle`, script steps…) are rejected with a
+  argument is an error, never ignored. Deferred features (`waitForIdle`,
+  `extendedWaitUntil`, script steps, `repeat`…) are rejected with a
   pointed hint.
 - **Type guessing**: `true` is a boolean only where a boolean belongs;
   a quoted `"true"` in a boolean slot is a positioned type error (so
@@ -168,8 +168,8 @@ deferred: waitForIdle extendedWaitUntil runScript evalScript repeat
 - Mutating commands (taps, input, links, device state) execute **exactly
   once** — never retried implicitly.
 - `optional: true` exists only for external UI that does not define the
-  scenario's success (`tapOn` only), always with a `reason:`; an optional
-  assertion is a contradiction and is refused.
+  scenario's success (the three tap commands only), always with a `reason:`;
+  an optional assertion is a contradiction and is refused.
 - `onFlowComplete` runs after pass *and* fail; a cleanup failure never masks
   the primary failure; evidence is captured before cleanup runs.
 
@@ -226,13 +226,22 @@ impossible.
 ## Maestro Core Profile
 
 `autonom flow import maestro.yaml` converts a Maestro flow within the
-documented Core Profile — header `appId`/`name`/`tags`/`env`; `launchApp`
-(`clearState`), `stopApp`, `clearState`, `tapOn`, `longPressOn`,
-`doubleTapOn`, `inputText`, `eraseText`, `pressKey`, `swipe` (direction),
-`back`, `openLink`, `assertVisible`/`assertNotVisible`,
-`extendedWaitUntil`→`waitUntil`, `takeScreenshot`, `runFlow` (`file`, `env`,
+documented Core Profile — header `appId`/`name`/`tags`/`env`/`properties`/
+`onFlowStart`/`onFlowComplete`; `launchApp` (`clearState`), `stopApp`,
+`clearState`, `tapOn`, `longPressOn`, `doubleTapOn`, `inputText`,
+`eraseText` (`charactersToErase`), `pressKey`, `swipe` (direction),
+`back`, `openLink` (link), `assertVisible`/`assertNotVisible`,
+`extendedWaitUntil`→`waitUntil`, `takeScreenshot`, `scrollUntilVisible`
+(`element`/`direction`), `retry` (`maxRetries`+1→`maxAttempts`, capped at
+3 attempts; mutating children get an explicit `allowMutations: true`
+because that is what Maestro's retry does), `runFlow` (`file`, `env`,
 `when`), selectors `text`/`id`/`index`/`enabled` — into validated canonical
-Flow v1. Maestro's regex-by-default matching is preserved honestly: a
+Flow v1. Import-only courtesies: single-line flow mappings
+(`tapOn: {text: X, index: 1}` — the native grammar still refuses `{...}`),
+and Maestro's on-selector `label`/`optional` move to the command
+(`optional` on the tap commands only, with the generated
+`reason: optional in the Maestro source`; an optional assertion refuses).
+Maestro's regex-by-default matching is preserved honestly: a
 metacharacter-free pattern becomes `match: exact`; a real pattern becomes
 `match: regex` anchored as `^(?:...)$` (our regex is a search, Maestro's is
 a full match). Everything outside the profile — scripts, JS interpolation,
@@ -241,6 +250,17 @@ and the file position; an ambiguous conversion never produces a file that
 silently means something else. `flow export --format maestro` goes the
 other way (exact text is regex-escaped; Autonom-only constructs refuse;
 `checkpoint`/`note` become comments).
+
+A Maestro file also runs **directly**: `flow run|check|fmt|list` treat a
+file whose header has no `schema:` field as a Maestro document and convert
+it on the fly through the same importer — same refusals, nothing new to
+learn. Nested `runFlow` children convert too, so a whole Maestro workspace
+tree works. Converted runs carry `converted_from: maestro` in the
+`flow.run.started` event and the run summary; `flow fmt` prints the
+canonical Flow v1 text, which is also the migration path. `flow fmt
+--write` never rewrites a Maestro source in place (`write_skipped` in the
+entry says so) — converting to a file is always the explicit
+`flow import --out`.
 
 ## Errors
 

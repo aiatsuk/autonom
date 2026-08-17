@@ -1732,6 +1732,8 @@ def cmd_flow_fmt(args: argparse.Namespace) -> int:
         original = file.read_text(encoding="utf-8")
         changed = canonical_text != original
         entry: dict[str, Any] = {"file": str(file), "changed": changed}
+        if flow.converted_from:
+            entry["converted_from"] = flow.converted_from
         if changed and args.diff:
             entry["diff"] = "".join(difflib.unified_diff(
                 original.splitlines(keepends=True),
@@ -1739,8 +1741,15 @@ def cmd_flow_fmt(args: argparse.Namespace) -> int:
                 fromfile=str(file), tofile=f"{file} (canonical)",
             ))
         if changed and args.write:
-            file.write_text(canonical_text, encoding="utf-8")
-            entry["written"] = True
+            if flow.converted_from:
+                # --write must never destroy a Maestro source in place;
+                # conversion to a file is always the explicit flow import.
+                entry["write_skipped"] = (
+                    "a Maestro source is never rewritten in place; use "
+                    "'flow import --out' for an explicit conversion")
+            else:
+                file.write_text(canonical_text, encoding="utf-8")
+                entry["written"] = True
         if not args.write and len(files) == 1:
             entry["canonical"] = canonical_text
         results.append(entry)
@@ -1940,6 +1949,8 @@ def cmd_flow_run(args: argparse.Namespace) -> int:
             "events": result.events_path,
             "sensitive": result.sensitive,
         }
+        if flow.converted_from:
+            summary["converted_from"] = flow.converted_from
         if result.failure:
             summary["failure"] = result.failure
         if result.hook_failures:

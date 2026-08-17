@@ -237,6 +237,23 @@ class AndroidLoginFlowTests(_AndroidRunBase):
         self.assertEqual(lines[0]["schema_version"], 1)
 
 
+class ConvertedRunTests(_AndroidRunBase):
+    """`flow run` on a Maestro file: converted on the fly, marked as such."""
+
+    def test_run_converts_and_marks_summary_and_event(self) -> None:
+        path = self.root / "maestro.yaml"
+        path.write_text("appId: com.example.app\n---\n- back\n",
+                        encoding="utf-8")
+        result = self._cli("flow", "run", str(path))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        summary = json.loads(result.stdout)
+        self.assertEqual(summary["converted_from"], "maestro")
+        events = [json.loads(line) for line in
+                  Path(summary["events"]).read_text(encoding="utf-8").splitlines()]
+        started = next(e for e in events if e["kind"] == "flow.run.started")
+        self.assertEqual(started["payload"]["converted_from"], "maestro")
+
+
 class CompositionTests(_AndroidRunBase):
     """0.20.2: runFlow, hooks, conditions, tags, evidence policy."""
 

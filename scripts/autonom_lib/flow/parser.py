@@ -8,6 +8,11 @@ would tolerate is refused with a positioned error: tabs in indentation,
 anchors, aliases, tags, directives, block scalars, flow mappings, merge keys,
 duplicate keys, multi-line plain scalars.
 
+One bounded exception exists for Maestro import (``allow_flow_mappings``):
+single-line flow mappings ``{key: value, ...}`` with scalar values — the most
+common idiom in real Maestro files (``tapOn: {text: X}``). The native Flow v1
+grammar never accepts them; only the Maestro importer turns the mode on.
+
 Every rejection raises ``AutonomError(FLOW_PARSE_ERROR)`` whose message is
 prefixed ``<file>:<line>:<column>:`` and whose extras carry ``file``,
 ``line``, ``column``, and a machine-stable ``reason`` slug — a flow author
@@ -80,8 +85,10 @@ def _is_item(text: str) -> bool:
 
 
 class _Parser:
-    def __init__(self, raw_lines: list[str], base_line: int, path: str) -> None:
+    def __init__(self, raw_lines: list[str], base_line: int, path: str,
+                 allow_flow_mappings: bool = False) -> None:
         self.path = path
+        self.allow_flow_mappings = allow_flow_mappings
         self.lines: list[_Line] = []
         for offset, raw in enumerate(raw_lines):
             number = base_line + offset
@@ -289,6 +296,8 @@ class _Parser:
         if first == "[":
             return self._parse_flow_sequence(text, lineno, col0)
         if first == "{":
+            if self.allow_flow_mappings:
+                return self._parse_flow_mapping(text, lineno, col0)
             self._err("flow_mapping", "flow mappings ({...}) are not part of Flow v1",
                       lineno, col0 + 1,
                       hint="Use a nested block mapping instead.")
@@ -453,6 +462,111 @@ class _Parser:
         self._err("unterminated_flow_sequence", "inline list has no closing ']'",
                   lineno, col0 + 1)
 
+    def _parse_flow_mapping(self, text: str, lineno: int, col0: int) -> Mapping:
+        """Import-mode courtesy: a single-line ``{key: value, ...}``.
+
+        Values are scalars only — nested collections, block continuations,
+        and everything else stay refused. Reached only when
+        ``allow_flow_mappings`` is on (the Maestro importer)."""
+        pairs: list = []
+        seen: dict[str, int] = {}
+        i = 1
+        current_start = i
+        prev = "{"  # last significant (non-space) top-level char
+        parts: list[tuple[int, str]] = []  # (offset0, raw entry text)
+        while i < len(text):
+            ch = text[i]
+            # A quote opens a region only at a value/entry start (after '{',
+            # ',' or ':'), matching YAML — a mid-word apostrophe (Don't) is
+            # plain-scalar content, not a quote.
+            if ch in "'\"" and prev in "{,:":
+                quote = ch
+                i += 1
+                while i < len(text):
+                    if quote == '"' and text[i] == "\\":
+                        i += 2
+                        continue
+                    if text[i] == quote:
+                        if quote == "'" and i + 1 < len(text) and text[i + 1] == "'":
+                            i += 2
+                            continue
+                        break
+                    i += 1
+                if i >= len(text):
+                    self._err("unterminated_quote",
+                              "unterminated quote in flow mapping",
+                              lineno, col0 + current_start + 1)
+                i += 1
+                prev = quote
+                continue
+            if ch in "[{":
+                self._err("nested_flow_mapping",
+                          "nested inline collections are not part of the "
+                          "flow-mapping form",
+                          lineno, col0 + i + 1,
+                          hint="Use a nested block mapping instead.")
+            if ch == ",":
+                parts.append((current_start, text[current_start:i]))
+                current_start = i + 1
+                i += 1
+                prev = ","
+                continue
+            if ch == "}":
+                parts.append((current_start, text[current_start:i]))
+                self._require_only_comment(text, i + 1, lineno, col0)
+                if len(parts) == 1 and parts[0][1].strip() == "":
+                    return Mapping([], lineno, col0 + 1)  # empty {}
+                for offset0, raw in parts:
+                    entry = raw.strip(" ")
+                    if entry == "":
+                        self._err("empty_flow_item",
+                                  "empty entry in flow mapping",
+                                  lineno, col0 + offset0 + 1)
+                    ecol0 = col0 + offset0 + (len(raw) - len(raw.lstrip(" ")))
+                    match = _KEY_RE.match(entry)
+                    if match is None:
+                        self._err("expected_key",
+                                  "expected 'key: value' in flow mapping",
+                                  lineno, ecol0 + 1,
+                                  hint="Keys are plain identifiers: letters, "
+                                       "digits, '_', '-'.")
+                    key_text = match.group(1)
+                    rest = match.group(2)
+                    if rest != "" and not rest.startswith(" "):
+                        self._err("missing_space_after_colon",
+                                  "':' must be followed by a space",
+                                  lineno, ecol0 + len(key_text) + 2)
+                    if key_text in seen:
+                        self._err("duplicate_key",
+                                  f"duplicate key {key_text!r} in flow mapping",
+                                  lineno, ecol0 + 1)
+                    seen[key_text] = lineno
+                    key = Scalar(key_text, "plain", lineno, ecol0 + 1)
+                    value_text = rest.lstrip(" ")
+                    if value_text == "":
+                        self._err("missing_value",
+                                  f"key {key_text!r} has no value",
+                                  lineno, ecol0 + len(key_text) + 2)
+                    vcol0 = ecol0 + len(key_text) + 1 + (len(rest) - len(value_text))
+                    if value_text[0] in "'\"":
+                        scalar, end = self._parse_quoted(value_text, lineno, vcol0)
+                        if value_text[end:].strip(" "):
+                            self._err("trailing_content",
+                                      "unexpected content after the closing quote",
+                                      lineno, vcol0 + end + 1)
+                        pairs.append((key, scalar))
+                    else:
+                        scalar = Scalar(value_text.rstrip(" "), "plain",
+                                        lineno, vcol0 + 1)
+                        self._check_interpolation(scalar)
+                        pairs.append((key, scalar))
+                return Mapping(pairs, lineno, col0 + 1)
+            if ch != " ":
+                prev = ch
+            i += 1
+        self._err("unterminated_flow_mapping", "flow mapping has no closing '}'",
+                  lineno, col0 + 1)
+
     def _check_interpolation(self, scalar: Scalar) -> None:
         text = scalar.text
         i = 0
@@ -473,7 +587,8 @@ class _Parser:
             i = match.end()
 
 
-def parse_document(text: str, path: str) -> FlowDocument:
+def parse_document(text: str, path: str,
+                   allow_flow_mappings: bool = False) -> FlowDocument:
     """Parse one flow file: header mapping, one ``---``, command sequence."""
     raw_lines = text.split("\n")
     separators = [i for i, line in enumerate(raw_lines) if line.strip() == "---"]
@@ -490,8 +605,10 @@ def parse_document(text: str, path: str) -> FlowDocument:
         scratch._err("multiple_separators", "more than one '---' separator",
                      separators[1] + 1, 1)
     sep = separators[0]
-    header_parser = _Parser(raw_lines[:sep], 1, path)
+    header_parser = _Parser(raw_lines[:sep], 1, path,
+                            allow_flow_mappings=allow_flow_mappings)
     header = header_parser.parse_top_mapping(empty_line=1)
-    commands_parser = _Parser(raw_lines[sep + 1:], sep + 2, path)
+    commands_parser = _Parser(raw_lines[sep + 1:], sep + 2, path,
+                              allow_flow_mappings=allow_flow_mappings)
     commands = commands_parser.parse_top_sequence(empty_line=sep + 2)
     return FlowDocument(header, commands, sep + 1, path)
