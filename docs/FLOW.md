@@ -95,10 +95,17 @@ selector:
 ```
 
 String fields: `id` (resource-id / accessibility identifier), `text`,
-`description`, `role`. State fields: `enabled`, `checked`, `selected`,
-`focused`. **iOS caveat:** UIKit/SwiftUI expose the visible label as
-`description` (`AXLabel`), not `text` (`AXValue`) — cross-platform flows
-should prefer `id`, then `description`.
+`visibleText`, `description`, `role`. State fields: `enabled`, `checked`,
+`selected`, `focused`.
+
+**`visibleText` is the cross-platform label field**: it matches the label a
+user (or a screen reader) actually sees, wherever the platform stored it —
+`text` on Android views, the accessibility label (`description`) on Flutter
+and iOS. Prefer it for flows that must run on both platforms; `text` and
+`description` stay strict, single-attribute matches for when the difference
+matters. It is also the exact equivalent of Maestro's `text`, which matches
+the same union — so an imported Maestro flow means on Autonom what it means
+on Maestro.
 
 Relational constraints narrow a match by another element (the *anchor*):
 
@@ -139,7 +146,7 @@ is not listed here fails the build, and vice versa.
 
 ```text
 header: schema appId name id description tags properties env requires evidence onFlowStart onFlowComplete
-selector-strings: id text description role
+selector-strings: id text visibleText description role
 selector-bools: enabled checked selected focused
 selector-relational: above below leftOf rightOf childOf containsChild containsDescendants
 match-modes: exact caseInsensitiveExact contains regex
@@ -267,7 +274,10 @@ documented Core Profile — header `appId`/`name`/`tags`/`env`/`properties`/
 untouched, exactly like Maestro), `repeat` (finite `times` required, ≤25;
 `while` `visible`/`notVisible`; a JS `true:` refuses), `scroll`, `swipe`
 `from:`, `tapOn` `repeat`/`delay`, selectors `text`/`id`/`index`/`enabled`
-— into validated canonical Flow v1. Import-only courtesies: single-line flow mappings
+— into validated canonical Flow v1. Maestro's `text` imports as
+**`visibleText`**, the same label union it matches upstream (text ∪
+hintText ∪ accessibilityText), so a Flutter or iOS flow keeps finding its
+elements instead of silently matching nothing. Import-only courtesies: single-line flow mappings
 (`tapOn: {text: X, index: 1}` — the native grammar still refuses `{...}`),
 and Maestro's on-selector `label`/`optional` move to the command
 (`optional` on the tap commands only, with the generated

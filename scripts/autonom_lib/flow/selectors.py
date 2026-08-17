@@ -22,6 +22,7 @@ def _engine_keys(flow_selector: FlowSelector) -> dict:
     return {
         "text": selectors.get("text"),
         "desc": selectors.get("desc"),
+        "visible_text": selectors.get("visible_text"),
         "resource_id": selectors.get("resource_id"),
         "role": selectors.get("role"),
         "enabled": selectors.get("enabled"),

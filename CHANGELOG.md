@@ -7,6 +7,28 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
 
 ## [Unreleased]
 
+## [0.28.2] - 2026-08-17
+
+Selector fidelity for Maestro import, found by running a real Maestro flow
+against a real Flutter app: the imported file executed but matched nothing.
+
+### Added
+- New selector field **`visibleText`** — the label a user or screen reader
+  sees, wherever the platform stored it (`text` on Android views, the
+  accessibility label on Flutter/iOS). One cross-platform field for flows
+  that must run on both, while `text`/`description` stay strict
+  single-attribute matches.
+
+### Fixed
+- **Maestro's `text` now imports as `visibleText`, not `text`.** Upstream,
+  `text` matches the union of text / hintText / accessibilityText
+  (`Filters.kt`); importing it as our strict `text` attribute meant every
+  Flutter and iOS flow converted cleanly and then matched nothing —
+  precisely the "parses but means something else" failure the profile
+  exists to prevent. Verified end to end: a hand-written Maestro flow that
+  switches the app language now passes unchanged through `flow run`.
+  `flow export` maps `visibleText` back to Maestro `text`.
+
 ## [0.28.1] - 2026-08-17
 
 Maestro Core Profile v2, slice 2 of 4: engine-only commands — value

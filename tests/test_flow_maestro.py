@@ -41,10 +41,11 @@ class ImportTests(unittest.TestCase):
         flow = self._import(MAESTRO_FIXTURE.read_text(encoding="utf-8"))
         tap = flow.steps[1].selector      # tapOn: Username — no metacharacters
         self.assertEqual(tap.match, "exact")
-        self.assertEqual(tap.fields["text"], "Username")
+        self.assertEqual(tap.fields["visible_text"], "Username",
+                         "Maestro text is the label union, not the strict text attr")
         wait = flow.steps[4].args["visible"]  # Welcome.* — a real pattern
         self.assertEqual(wait.match, "regex")
-        self.assertEqual(wait.fields["text"], "^(?:Welcome.*)$",
+        self.assertEqual(wait.fields["visible_text"], "^(?:Welcome.*)$",
                          "Maestro full-match must anchor for our search regex")
 
     def test_unsupported_commands_refuse_with_position(self) -> None:
@@ -80,7 +81,7 @@ class ImportV2Tests(unittest.TestCase):
         flow = self._import("appId: a.b\n---\n- tapOn: {text: OK, index: 1}\n")
         step = flow.steps[0]
         self.assertEqual(step.command, "tapOn")
-        self.assertEqual(step.selector.fields["text"], "OK")
+        self.assertEqual(step.selector.fields["visible_text"], "OK")
         self.assertEqual(step.selector.match, "exact")
         self.assertEqual(step.selector.index, 1)
 
@@ -256,7 +257,7 @@ class ImportV2Tests(unittest.TestCase):
 
     def test_apostrophe_in_plain_mapping_value(self) -> None:
         flow = self._import("appId: a.b\n---\n- tapOn: {text: Don't allow}\n")
-        self.assertEqual(flow.steps[0].selector.fields["text"], "Don't allow")
+        self.assertEqual(flow.steps[0].selector.fields["visible_text"], "Don't allow")
 
     def test_clipboard_trio_imports(self) -> None:
         flow = self._import(
@@ -267,7 +268,7 @@ class ImportV2Tests(unittest.TestCase):
             "- scroll\n")
         self.assertEqual([s.command for s in flow.steps],
                          ["copyTextFrom", "setClipboard", "pasteText", "scroll"])
-        self.assertEqual(flow.steps[0].selector.fields["text"], "Price")
+        self.assertEqual(flow.steps[0].selector.fields["visible_text"], "Price")
         self.assertEqual(flow.steps[1].args["value"], "hello")
 
     def test_repeat_imports_bounded(self) -> None:
@@ -299,7 +300,7 @@ class ImportV2Tests(unittest.TestCase):
             "- runFlow:\n    commands:\n      - back\n"
             "- swipe:\n    direction: UP\n    from: Cart\n")
         self.assertEqual(flow.steps[0].args["commands"][0].command, "back")
-        self.assertEqual(flow.steps[1].args["from"].fields["text"], "Cart")
+        self.assertEqual(flow.steps[1].args["from"].fields["visible_text"], "Cart")
 
     def test_tap_repeat_and_delay_import(self) -> None:
         flow = self._import(
@@ -385,6 +386,13 @@ class ExportTests(unittest.TestCase):
                     maestro.export_flow(flow, "t.yaml")
                 self.assertEqual(caught.exception.code,
                                  errors.UNSUPPORTED_FLOW_COMMAND)
+
+    def test_visible_text_exports_as_maestro_text(self) -> None:
+        """Round trip: Maestro `text` is our `visibleText`, both ways."""
+        flow = self._flow("- tapOn:\n    selector:\n      visibleText: Profile\n")
+        out = maestro.export_flow(flow, "t.yaml")
+        self.assertIn("text: Profile", out)
+        self.assertNotIn("visibleText", out)
 
     def test_relational_selectors_refuse(self) -> None:
         flow = self._flow("- tapOn:\n    selector:\n      text: a\n"

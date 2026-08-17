@@ -204,6 +204,25 @@ class RelationalSelectorTests(unittest.TestCase):
             mode="exact", case_sensitive=True)
         self.assertEqual(len(containers), 1)
 
+    def test_visible_text_matches_either_label_source(self) -> None:
+        """The cross-platform label field: Android puts it in `text`,
+        Flutter/iOS in the accessibility label (`desc`)."""
+        nodes = [
+            {"ref": "a", "parent": None, "text": "Profile", "desc": None},
+            {"ref": "b", "parent": None, "text": None, "desc": "Профиль"},
+            {"ref": "c", "parent": None, "text": None, "desc": "Other"},
+        ]
+        android = self.selector_mod.select(
+            nodes, {"visible_text": "Profile"}, mode="exact", case_sensitive=True)
+        self.assertEqual(android[0]["ref"], "a")
+        flutter = self.selector_mod.select(
+            nodes, {"visible_text": "Профиль"}, mode="exact", case_sensitive=True)
+        self.assertEqual(flutter[0]["ref"], "b", "must reach the desc label")
+        strict = self.selector_mod.select(
+            nodes, {"text": "Профиль"}, mode="exact", case_sensitive=True,
+            all_matches=True)
+        self.assertEqual(strict, [], "strict text must NOT reach desc")
+
     def test_contains_descendants_matches_any_depth(self) -> None:
         nodes = [
             {"ref": "a", "parent": None, "text": "outer"},

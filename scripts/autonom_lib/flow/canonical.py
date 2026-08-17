@@ -31,7 +31,7 @@ from .schema import (
 _HEADER_ORDER = ("schema", "id", "appId", "name", "description", "tags",
                  "properties", "env", "requires", "evidence",
                  "onFlowStart", "onFlowComplete")
-_SELECTOR_ORDER = ("id", "text", "description", "role",
+_SELECTOR_ORDER = ("id", "text", "visibleText", "description", "role",
                    "enabled", "checked", "selected", "focused")
 _RELATION_ORDER = ("above", "below", "leftOf", "rightOf",
                    "childOf", "containsChild", "containsDescendants")

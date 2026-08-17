@@ -119,8 +119,8 @@ def _selector_with_extras(node, path: str) -> tuple[FlowSelector, dict]:
     """
     if isinstance(node, Scalar):
         text, mode = _import_pattern(_no_js(node.text, path, node.line, node.col))
-        return FlowSelector(fields={"text": text}, match=mode,
-                            source_fields={"text": text},
+        return FlowSelector(fields={"visible_text": text}, match=mode,
+                            source_fields={"visibleText": text},
                             line=node.line, col=node.col), {}
     _require_mapping(node, path, "selector")
     selector = FlowSelector(line=node.line, col=node.col)
@@ -139,8 +139,12 @@ def _selector_with_extras(node, path: str) -> tuple[FlowSelector, dict]:
         elif name in ("text", "id"):
             raw = _scalar_text(value, path)
             pattern, mode = _import_pattern(raw)
-            field = "text" if name == "text" else "resource_id"
-            source = "text" if name == "text" else "id"
+            # Maestro's `text` matches the union of text / hintText /
+            # accessibilityText (Filters.kt) — that is our `visibleText`,
+            # not the strict `text` attribute. Importing it as `text` would
+            # silently fail to match every Flutter/iOS label.
+            field = "visible_text" if name == "text" else "resource_id"
+            source = "visibleText" if name == "text" else "id"
             selector.fields[field] = pattern
             selector.source_fields[source] = pattern
             modes.add(mode)
@@ -160,7 +164,7 @@ def _selector_with_extras(node, path: str) -> tuple[FlowSelector, dict]:
     if not selector.fields:
         _refuse(path, node.line, node.col, "empty selector",
                 "Give the element a text or id.")
-    if "text" not in selector.fields and "resource_id" not in selector.fields:
+    if not ({"visible_text", "text", "resource_id"} & set(selector.fields)):
         _refuse(path, node.line, node.col, "selector without text or id",
                 "State fields alone cannot identify an element; give it a "
                 "text or id.")
@@ -694,7 +698,7 @@ def _export_pattern(selector: FlowSelector, path: str) -> list[tuple[str, str]]:
     """Autonom selector -> Maestro (field, regex) pairs."""
     pairs: list[tuple[str, str]] = []
     for source, value in selector.source_fields.items():
-        if source in ("text", "id"):
+        if source in ("text", "id", "visibleText"):
             if selector.match == "exact":
                 pattern = re.escape(str(value))
             elif selector.match == "caseInsensitiveExact":
@@ -703,7 +707,10 @@ def _export_pattern(selector: FlowSelector, path: str) -> list[tuple[str, str]]:
                 pattern = f".*{re.escape(str(value))}.*"
             else:  # regex — ours is search; anchor for Maestro's full match
                 pattern = f".*(?:{value}).*"
-            pairs.append((source, pattern))
+            # `visibleText` IS Maestro's `text` (the label union); our strict
+            # `text` exports as `text` too — the closest Maestro can express.
+            pairs.append(("text" if source == "visibleText" else source,
+                          pattern))
         elif source in ("enabled",):
             pairs.append((source, "true" if value else "false"))
         else:

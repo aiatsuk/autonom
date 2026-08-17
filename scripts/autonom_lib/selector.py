@@ -20,6 +20,12 @@ STRING_FIELDS = {
     "package": "package",
     "role": "role",
 }
+# `visible_text` is the one field that matches ACROSS node keys: the label a
+# human (or a screen reader) sees, wherever the platform put it — Android
+# usually `text`, Flutter/iOS the accessibility label in `desc`. It is the
+# honest equivalent of Maestro's `text`, which matches the union of
+# text/hintText/accessibilityText (Filters.kt).
+LABEL_SOURCES = ("text", "desc", "hint")
 BOOL_FIELDS = ("clickable", "enabled", "focusable", "focused", "scrollable",
                "selected", "checked")
 MODES = ("exact", "contains", "regex")
@@ -71,6 +77,15 @@ def _plain_match(node: Mapping[str, Any], fields: Mapping[str, Any],
         if not isinstance(expected, str):
             return False
         if not match_string(node.get(key), expected, mode, case_sensitive):
+            return False
+    expected = fields.get("visible_text")
+    if expected is not None:
+        if not isinstance(expected, str):
+            return False
+        present = [node.get(source) for source in LABEL_SOURCES
+                   if node.get(source)]
+        if not any(match_string(value, expected, mode, case_sensitive)
+                   for value in present):
             return False
     for name in BOOL_FIELDS:
         expected = fields.get(name)
@@ -219,6 +234,22 @@ def filter_nodes(
                 ) from exc
         if not matched:
             continue
+        expected = selectors.get("visible_text")
+        if expected is not None:
+            if not isinstance(expected, str):
+                continue
+            present = [node.get(source) for source in LABEL_SOURCES
+                       if node.get(source)]
+            try:
+                if not any(match_string(value, expected, mode, case_sensitive)
+                           for value in present):
+                    continue
+            except re.error as exc:
+                raise errors.AutonomError(
+                    errors.NO_MATCHING_NODE,
+                    f"invalid regular expression for visibleText: {exc}",
+                    "Fix the pattern, or use match: contains.",
+                ) from exc
         for name in BOOL_FIELDS:
             expected = selectors.get(name)
             if expected is None:

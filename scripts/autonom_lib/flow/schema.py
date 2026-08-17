@@ -61,6 +61,10 @@ def failure_class(code: str) -> str:
 SELECTOR_STRING_FIELDS = {
     "id": "resource_id",
     "text": "text",
+    # the label a user/screen reader sees, wherever the platform stores it
+    # (Android `text`, Flutter/iOS accessibility label) — one cross-platform
+    # field, and the exact equivalent of Maestro's `text`
+    "visibleText": "visible_text",
     "description": "desc",
     "role": "role",
 }
