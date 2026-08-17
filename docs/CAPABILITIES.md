@@ -136,7 +136,7 @@ autonom atlas diff --base <PATH> [--head PATH] [--app-id ID]
 autonom report build [--session ID] [--run ID]
 autonom report open [--session ID] [--run ID]
 autonom report export [--session ID] [--run ID] [--format html|junit] [--out PATH]
-autonom report suite [--session ID] [--last N] [--out DIR] [--relative-to DIR] [--open]
+autonom report suite [--session ID] [--last N] [--out DIR] [--relative-to DIR] [--detailed] [--screenshots none|failed|all] [--open]
 
 autonom screenshot [--label L] [--task T] [--out PATH]
 autonom shots list [--task T] [--grep P] [--mocked-only] [--max N]

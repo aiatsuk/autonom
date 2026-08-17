@@ -234,7 +234,14 @@ html|junit --out` writes it anywhere. For a whole suite, `autonom
 report suite` folds every run of the session into one `suite.html`
 (totals, failures first, every flow expandable to its steps; failed
 flows open by default) plus a `suite.xml` `<testsuites>` document —
-the shape CI dashboards expect. It exits 1 when any flow failed. A failing step also leaves a
+the shape CI dashboards expect. It exits 1 when any flow failed.
+`--detailed` turns that into a small site — `index.html` plus
+`runs/<run_id>.html` per flow, each step with its frames, the device-log
+window and a link to the hierarchy dump — with `--screenshots
+none|failed|all` deciding whose frames are copied into `assets/`
+(default `failed`: a full suite's frames run to hundreds of megabytes).
+`--relative-to DIR` strips a local prefix so the whole site can be
+committed and read from a repository. A failing step also leaves a
 screenshot, a hierarchy dump, and a log window beside the events.
 
 ## Proving a diff (PR Proof)

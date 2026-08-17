@@ -2204,10 +2204,30 @@ def cmd_report_suite(args: argparse.Namespace) -> int:
     out_dir = Path(args.out) if args.out else Path(record["artifacts_dir"]) / "flows"
     out_dir.mkdir(parents=True, exist_ok=True)
     base = Path(args.relative_to).resolve() if args.relative_to else None
-    html_path = out_dir / "suite.html"
-    html_path.write_text(flow_report.render_suite_html(manifests, base=base),
-                         encoding="utf-8")
-    os.chmod(html_path, 0o600)
+    artifacts_dir = Path(record["artifacts_dir"])
+    pages: dict[str, str] = {}
+    if args.screenshots != "none" or args.detailed:
+        assets = out_dir / "assets"
+        runs_dir = out_dir / "runs"
+        runs_dir.mkdir(parents=True, exist_ok=True)
+        for manifest in manifests:
+            run_id = str(manifest.get("run_id") or "run")
+            evidence = flow_report._step_assets(
+                manifest, artifacts_dir, assets, args.screenshots)
+            page = runs_dir / f"{run_id}.html"
+            page.write_text(
+                flow_report.render_run_page(manifest, evidence, base=base)
+                .replace('href="index.html"', 'href="../index.html"')
+                .replace("src='assets/", "src='../assets/")
+                .replace("href='assets/", "href='../assets/"),
+                encoding="utf-8")
+            os.chmod(page, 0o644)
+            pages[run_id] = f"runs/{run_id}.html"
+    html_path = out_dir / ("index.html" if pages else "suite.html")
+    html_path.write_text(
+        flow_report.render_suite_html(manifests, base=base, pages=pages or None),
+        encoding="utf-8")
+    os.chmod(html_path, 0o644 if pages else 0o600)
     junit_path = out_dir / "suite.xml"
     junit_path.write_text(flow_report.render_suite_junit(manifests),
                           encoding="utf-8")
@@ -2222,6 +2242,9 @@ def cmd_report_suite(args: argparse.Namespace) -> int:
         "junit": str(junit_path),
         "sensitive": any(m.get("sensitive") for m in manifests),
     }
+    if pages:
+        payload["pages"] = len(pages)
+        payload["screenshots"] = args.screenshots
     if failed:
         payload["failures"] = [
             {"flow": m.get("flow_name"), "flow_id": m.get("flow_id"),
@@ -2722,6 +2745,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--relative-to", metavar="DIR",
                    help="strip this directory from paths (share a report "
                         "without leaking local paths)")
+    p.add_argument("--detailed", action="store_true",
+                   help="also write one page per flow with its steps")
+    p.add_argument("--screenshots", choices=("none", "failed", "all"),
+                   default="failed",
+                   help="which runs' frames to copy next to the report "
+                        "(default: failed)")
     p.add_argument("--open", action="store_true", help="open it in a browser")
     p.set_defaults(func=cmd_report_suite)
 

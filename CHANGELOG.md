@@ -28,6 +28,12 @@ way to see the run as a whole. Found by dogfooding a real app.
   reproduction commands, so a report committed to a repository carries
   repo-relative paths (`autonom flow run .autonom/flows/…`) instead of one
   machine's home directory — found while committing a real report.
+- `report suite --detailed` writes a small static site instead of a single
+  page: `index.html` linking to `runs/<run_id>.html` per flow, each step
+  with its screenshots, the device-log window captured at the failure and a
+  link to the hierarchy dump. `--screenshots none|failed|all` controls whose
+  frames are copied into `assets/` (default `failed`) — a whole suite's
+  frames are ~100 MB, which is why nothing is inlined as base64 here.
 
 ## [0.28.2] - 2026-08-17
 

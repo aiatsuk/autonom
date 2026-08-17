@@ -15,6 +15,7 @@ from __future__ import annotations
 import base64
 import html
 import json
+import os
 from pathlib import Path
 from typing import Any
 from xml.sax.saxutils import escape as xml_escape, quoteattr
@@ -149,6 +150,129 @@ def render_html(manifest: dict[str, Any], artifacts_dir: Path) -> str:
 """
 
 
+def _step_assets(manifest: dict[str, Any], artifacts_dir: Path,
+                 assets: Path, mode: str) -> dict[int, dict[str, Any]]:
+    """Copy this run's evidence next to the report and index it by step.
+
+    ``mode``: ``all`` copies every screenshot, ``failed`` only the frames of
+    a run that failed, ``none`` copies nothing. Files are copied rather than
+    inlined — a suite's worth of base64 would be hundreds of megabytes.
+    """
+    if mode == "none" or (mode == "failed" and manifest.get("status") == "passed"):
+        return {}
+    run_id = str(manifest.get("run_id") or "run")
+    by_step: dict[int, dict[str, Any]] = {}
+    target = assets / run_id
+    for relative in manifest.get("artifacts", []):
+        source = artifacts_dir / relative
+        if not source.is_file():
+            continue
+        name = source.name
+        index = None
+        for token in ("step-", "failure-step-"):
+            if token in name:
+                tail = name.split(token, 1)[1]
+                digits = ""
+                for char in tail:
+                    if char.isdigit():
+                        digits += char
+                    else:
+                        break
+                if digits:
+                    index = int(digits)
+                break
+        if source.suffix == ".png":
+            target.mkdir(parents=True, exist_ok=True)
+            copy = target / name
+            copy.write_bytes(source.read_bytes())
+            os.chmod(copy, 0o644)
+            slot = by_step.setdefault(index if index is not None else 0, {})
+            slot.setdefault("shots", []).append(f"assets/{run_id}/{name}")
+        elif name.endswith("-logs.txt") and index is not None:
+            text = source.read_text(encoding="utf-8", errors="replace")
+            by_step.setdefault(index, {})["logs"] = text[-4000:]
+        elif name.endswith("-hierarchy.json") and index is not None:
+            target.mkdir(parents=True, exist_ok=True)
+            copy = target / name
+            copy.write_bytes(source.read_bytes())
+            os.chmod(copy, 0o644)
+            by_step.setdefault(index, {})["hierarchy"] = f"assets/{run_id}/{name}"
+    return by_step
+
+
+def render_run_page(manifest: dict[str, Any], evidence: dict[int, dict],
+                    base: Path | None = None) -> str:
+    """One page per flow: every step with its frames, logs and hierarchy."""
+    e = html.escape
+    status = manifest.get("status", "unknown")
+    color = {"passed": "#1a7f37", "failed": "#b42318"}.get(status, "#555")
+    blocks = []
+    for step in manifest.get("steps", []):
+        index = step.get("index", 0)
+        found = evidence.get(index, {})
+        badge = {"passed": "✓", "failed": "✗", "skipped": "○"}.get(
+            step.get("status", ""), "·")
+        head = (f"<h3 class='s-{e(str(step.get('status','')))}'>"
+                f"{badge} {index}. <code>{e(str(step.get('command','')))}</code>"
+                f" <span class='muted'>{step.get('duration_ms',0)} ms</span></h3>")
+        bits = []
+        if step.get("label"):
+            bits.append(f"<p>{e(str(step['label']))}</p>")
+        if step.get("selector"):
+            bits.append(f"<p><code>"
+                        f"{e(json.dumps(step['selector'], ensure_ascii=False))}"
+                        f"</code></p>")
+        if step.get("skip_reason"):
+            bits.append(f"<p class='s-skipped'>skipped: "
+                        f"{e(str(step['skip_reason']))}</p>")
+        if step.get("error"):
+            bits.append(f"<p class='s-failed'><b>"
+                        f"{e(str(step.get('error_code','')))}</b> "
+                        f"({e(str(step.get('failure_class','')))})<br>"
+                        f"{e(str(step['error']))}</p>")
+        for shot in found.get("shots", []):
+            bits.append(f"<figure><img src='{e(shot)}' loading='lazy' "
+                        f"alt='step {index}'>"
+                        f"<figcaption>{e(shot.rsplit('/', 1)[-1])}</figcaption>"
+                        f"</figure>")
+        if found.get("hierarchy"):
+            bits.append(f"<p><a href='{e(found['hierarchy'])}'>"
+                        "view hierarchy JSON</a></p>")
+        if found.get("logs"):
+            bits.append("<details><summary>device log around the failure"
+                        f"</summary><pre>{e(found['logs'])}</pre></details>")
+        blocks.append(head + "".join(bits))
+
+    return f"""<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'">
+<title>{e(str(manifest.get('flow_name','flow')))} — {e(status)}</title>
+<style>
+  body {{ font: 14px/1.5 -apple-system, system-ui, sans-serif; margin: 2rem auto;
+         max-width: 60rem; padding: 0 1rem; color: #1f2328; }}
+  code {{ background: #f6f8fa; padding: .1em .3em; border-radius: 4px; }}
+  pre {{ background: #f6f8fa; padding: .6rem; overflow-x: auto;
+         font-size: .82em; }}
+  img {{ max-width: 320px; border: 1px solid #d0d7de; border-radius: 6px; }}
+  figure {{ display: inline-block; margin: .4rem .6rem .4rem 0; }}
+  figcaption {{ font-size: .75em; color: #57606a; }}
+  h3 {{ margin: 1.4rem 0 .3rem; font-size: 1rem; }}
+  .status {{ color: {color}; font-weight: 700; }}
+  .s-failed {{ color: #b42318; }} .s-passed {{ color: #1a7f37; }}
+  .s-skipped {{ color: #9a6700; }} .muted {{ color: #57606a; font-weight: 400; }}
+</style>
+<p><a href="index.html">← all flows</a></p>
+<h1>{e(str(manifest.get('flow_name','flow')))}
+    <span class="status">{e(status)}</span></h1>
+<p class="muted"><code>{e(_shorten(str(manifest.get('flow_path','')), base))}</code><br>
+reproduce: <code>{e(_shorten(str(manifest.get('reproduction','')), base))}</code><br>
+{e(str(manifest.get('platform','')))} {e(str(manifest.get('target_id','')))} ·
+app <code>{e(str(manifest.get('app_id','')))}</code> ·
+run <code>{e(str(manifest.get('run_id','')))}</code></p>
+{''.join(blocks)}
+"""
+
+
 def _shorten(text: str, base: Path | None) -> str:
     """Drop a leading base directory so a shared report carries no local paths."""
     if not base:
@@ -158,7 +282,8 @@ def _shorten(text: str, base: Path | None) -> str:
 
 
 def render_suite_html(manifests: list[dict[str, Any]],
-                      base: Path | None = None) -> str:
+                      base: Path | None = None,
+                      pages: dict[str, str] | None = None) -> str:
     """One page for a whole suite run: totals, then every flow with its steps.
 
     Same containment rules as the single-run report (no external fetch,
@@ -206,11 +331,14 @@ def render_suite_html(manifests: list[dict[str, Any]],
         flow_status = manifest.get("status", "unknown")
         duration = sum(s.get("duration_ms", 0) for s in manifest.get("steps", []))
         open_attr = " open" if flow_status != "passed" else ""
+        page = pages.get(str(manifest.get("run_id"))) if pages else None
+        link = (f" <a href='{e(page)}'>full report →</a>" if page else "")
         blocks.append(
             f"<details{open_attr}><summary class='s-{e(flow_status)}'>"
             f"<b>{e(str(manifest.get('flow_name','flow')))}</b> "
             f"<span class='muted'>{e(str(manifest.get('flow_id') or ''))} · "
             f"{duration/1000:.1f}s · {e(flow_status)}</span></summary>"
+            f"<p>{link}</p>"
             f"<p class='muted'><code>"
             f"{e(_shorten(str(manifest.get('flow_path','')), base))}</code><br>"
             f"reproduce: <code>"

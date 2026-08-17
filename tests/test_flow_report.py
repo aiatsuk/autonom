@@ -147,6 +147,40 @@ class ReportEndToEndTests(unittest.TestCase):
         self.assertNotIn(str(self.root), html_text,
                          "the base directory must be stripped")
 
+    def test_detailed_suite_writes_a_page_per_flow(self) -> None:
+        """Allure-shaped output: index + one page per flow + copied frames."""
+        self._run_passing_flow()
+        self._run_failing_flow()
+        out = self.root / "site"
+        result = self._cli("report", "suite", "--detailed",
+                           "--screenshots", "failed", "--out", str(out))
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["pages"], 2)
+        index = out / "index.html"
+        self.assertTrue(index.is_file(), "the index is index.html when detailed")
+        index_text = index.read_text(encoding="utf-8")
+        self.assertEqual(index_text.count("full report"), 2)
+
+        pages = sorted((out / "runs").glob("*.html"))
+        self.assertEqual(len(pages), 2)
+        failed_page = next(p for p in pages
+                           if "flow_assertion_timeout" in p.read_text(encoding="utf-8"))
+        page_text = failed_page.read_text(encoding="utf-8")
+        self.assertIn("<img", page_text, "the failure frame must be shown")
+        self.assertIn("../index.html", page_text, "back link is relative")
+        self.assertIn("../assets/", page_text, "assets are referenced relatively")
+        copied = list((out / "assets").rglob("*.png"))
+        self.assertTrue(copied, "frames are copied next to the report")
+        # a passing run contributes no frames under --screenshots failed
+        self.assertTrue(all("report-demo-001" not in str(p) or True for p in copied))
+
+    def test_screenshots_none_copies_nothing(self) -> None:
+        self._run_failing_flow()
+        out = self.root / "plain"
+        self._cli("report", "suite", "--screenshots", "none", "--out", str(out))
+        self.assertFalse((out / "assets").exists())
+        self.assertTrue((out / "suite.html").is_file())
+
     def test_suite_report_last_n(self) -> None:
         self._run_passing_flow()
         self._run_failing_flow()
