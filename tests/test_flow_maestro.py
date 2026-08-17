@@ -258,6 +258,56 @@ class ImportV2Tests(unittest.TestCase):
         flow = self._import("appId: a.b\n---\n- tapOn: {text: Don't allow}\n")
         self.assertEqual(flow.steps[0].selector.fields["text"], "Don't allow")
 
+    def test_clipboard_trio_imports(self) -> None:
+        flow = self._import(
+            "appId: a.b\n---\n"
+            "- copyTextFrom: Price\n"
+            "- setClipboard: hello\n"
+            "- pasteText\n"
+            "- scroll\n")
+        self.assertEqual([s.command for s in flow.steps],
+                         ["copyTextFrom", "setClipboard", "pasteText", "scroll"])
+        self.assertEqual(flow.steps[0].selector.fields["text"], "Price")
+        self.assertEqual(flow.steps[1].args["value"], "hello")
+
+    def test_repeat_imports_bounded(self) -> None:
+        flow = self._import(
+            "appId: a.b\n---\n"
+            "- repeat:\n    times: 4\n"
+            "    while:\n      notVisible: Done\n"
+            "    commands:\n      - back\n")
+        step = flow.steps[0]
+        self.assertEqual(step.args["times"], 4)
+        self.assertIsNotNone(step.args["while"].not_visible)
+        for body, hint_bit in (
+                ("- repeat:\n    commands:\n      - back\n", "finite times"),
+                ("- repeat:\n    times: 30\n    commands:\n      - back\n",
+                 "25"),
+                ("- repeat:\n    times: 2\n"
+                 "    while:\n      true: ${output.i < 3}\n"
+                 "    commands:\n      - back\n", "Autonom equivalent")):
+            with self.subTest(hint=hint_bit):
+                with self.assertRaises(errors.AutonomError) as caught:
+                    maestro.import_flow("appId: a.b\n---\n" + body, "m.yaml")
+                self.assertIn(hint_bit,
+                              (caught.exception.hint or "")
+                              + caught.exception.message)
+
+    def test_inline_runflow_and_swipe_from_import(self) -> None:
+        flow = self._import(
+            "appId: a.b\n---\n"
+            "- runFlow:\n    commands:\n      - back\n"
+            "- swipe:\n    direction: UP\n    from: Cart\n")
+        self.assertEqual(flow.steps[0].args["commands"][0].command, "back")
+        self.assertEqual(flow.steps[1].args["from"].fields["text"], "Cart")
+
+    def test_tap_repeat_and_delay_import(self) -> None:
+        flow = self._import(
+            "appId: a.b\n---\n"
+            "- tapOn: {text: Plus, repeat: 3, delay: 50}\n")
+        self.assertEqual(flow.steps[0].args["repeat"], 3)
+        self.assertEqual(flow.steps[0].args["delayMs"], 50)
+
 
 class AutoDetectTests(unittest.TestCase):
     """A file without ``schema:`` is a Maestro document (decision D6)."""
@@ -320,6 +370,21 @@ class ExportTests(unittest.TestCase):
         with self.assertRaises(errors.AutonomError) as caught:
             maestro.export_flow(flow, "t.yaml")
         self.assertEqual(caught.exception.code, errors.UNSUPPORTED_FLOW_COMMAND)
+
+    def test_new_command_arguments_refuse_instead_of_dropping(self) -> None:
+        bodies = [
+            "- tapOn:\n    selector:\n      text: X\n    repeat: 3\n"
+            "    delayMs: 10\n",
+            "- swipe:\n    direction: up\n    from:\n      text: Cart\n",
+            "- runFlow:\n    commands:\n      - back\n",
+        ]
+        for body in bodies:
+            with self.subTest(command=body.split(":")[0].strip("- ")):
+                flow = self._flow(body)
+                with self.assertRaises(errors.AutonomError) as caught:
+                    maestro.export_flow(flow, "t.yaml")
+                self.assertEqual(caught.exception.code,
+                                 errors.UNSUPPORTED_FLOW_COMMAND)
 
     def test_relational_selectors_refuse(self) -> None:
         flow = self._flow("- tapOn:\n    selector:\n      text: a\n"

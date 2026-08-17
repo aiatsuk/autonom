@@ -43,7 +43,6 @@ from typing import Any, Callable
 from .. import device_state, errors, ios_simctl
 from .. import journal as journal_mod
 from .. import screenshot as screenshot_mod
-from .. import selector as selector_engine
 from .. import session as session_mod
 from .. import ui as ui_mod
 from ..platform import ANDROID, IOS, Target
@@ -56,7 +55,6 @@ from .schema import (
     Evidence,
     Flow,
     FlowSelector,
-    MATCH_MODES,
     Step,
     TEST_FAILURE,
     WhenClause,
@@ -140,6 +138,10 @@ class Executor:
         self._screen_fetched = screen is not None
         self.values: dict[str, str] = {}
         self.secret_values: set[str] = set()
+        # run-scoped variables written by copyTextFrom/setClipboard; global to
+        # the run (like the flow journal), resolved after secrets, before env
+        self.runtime_values: dict[str, str] = {}
+        self.sensitive_var_names: set[str] = set()
         self._children: dict[str, Flow] = {}
         self._counter = 0
         self._used_secret_anywhere = False
@@ -153,8 +155,20 @@ class Executor:
         root_values = {**flow.env, **self.config.env, **self.config.secrets}
         self.values = root_values
         self.secret_values = set(self.config.secrets)
+        self.runtime_values = {}
+        self.sensitive_var_names = set()
         self._children = {}
         self._collect_children(flow, flow.app_id)
+        # Every name declared ANYWHERE in the graph (root env/--env/secrets,
+        # child header envs, runFlow env: overlays). A runtime variable may
+        # not collide with any of them — cross-frame shadowing would make
+        # ${NAME} mean different things in different frames.
+        self._declared_names = set(root_values)
+        for child in self._children.values():
+            self._declared_names |= set(child.env)
+        for each in (flow, *self._children.values()):
+            self._collect_env_arg_names(
+                (*each.on_flow_start, *each.steps, *each.on_flow_complete))
         self._preflight_flow(flow, root_values, is_root=True)
 
         run_id = f"fr_{uuid.uuid4().hex[:10]}"
@@ -207,8 +221,10 @@ class Executor:
                     "failure_class": failed.failure_class,
                     "error": failed.error,
                 }
-        result.sensitive = self._used_secret_anywhere or any(
-            step.args.get("sensitive") for step in flow.steps)
+        result.sensitive = (self._used_secret_anywhere
+                            or self._declares_sensitive(flow)
+                            or any(self._declares_sensitive(child)
+                                   for child in self._children.values()))
         writer.emit("flow.run.finished", {
             "status": result.status,
             "steps": len(result.steps),
@@ -265,10 +281,42 @@ class Executor:
 
     # -- pre-flight -----------------------------------------------------------
 
-    def _collect_children(self, flow: Flow, inherited_app_id: str | None) -> None:
-        for step in (*flow.on_flow_start, *flow.steps, *flow.on_flow_complete):
-            if step.command != "runFlow":
+    @staticmethod
+    def _declares_sensitive(flow: Flow) -> bool:
+        """sensitive: true anywhere — hooks and nested command lists too."""
+        def walk(steps) -> bool:
+            for step in steps:
+                if step.args.get("sensitive"):
+                    return True
+                nested = step.args.get("commands")
+                if isinstance(nested, list) and walk(nested):
+                    return True
+            return False
+        return walk((*flow.on_flow_start, *flow.steps, *flow.on_flow_complete))
+
+    def _collect_env_arg_names(self, steps) -> None:
+        for step in steps:
+            if step.command == "runFlow":
+                self._declared_names |= set(step.args.get("env", {}))
+            nested = step.args.get("commands")
+            if isinstance(nested, list):
+                self._collect_env_arg_names(nested)
+
+    @staticmethod
+    def _runflow_file_steps(steps):
+        """Every runFlow step with a file, descending into every nested
+        command list (inline runFlow, group, retry, repeat)."""
+        for step in steps:
+            if step.command == "runFlow" and "file" in step.args:
+                yield step
                 continue
+            nested = step.args.get("commands")
+            if isinstance(nested, list):
+                yield from Executor._runflow_file_steps(nested)
+
+    def _collect_children(self, flow: Flow, inherited_app_id: str | None) -> None:
+        for step in self._runflow_file_steps(
+                (*flow.on_flow_start, *flow.steps, *flow.on_flow_complete)):
             target_path = (Path(flow.path).resolve().parent / step.args["file"]).resolve()
             key = str(target_path)
             if key in self._children:
@@ -283,15 +331,25 @@ class Executor:
         return self._children[str(target_path)]
 
     def _preflight_flow(self, flow: Flow, values: dict, *,
-                        is_root: bool, _seen: set | None = None) -> None:
-        seen = _seen if _seen is not None else set()
+                        is_root: bool, _seen: dict | None = None,
+                        _defined: set | None = None) -> None:
+        seen = _seen if _seen is not None else {}
+        # Runtime-variable names (copyTextFrom/setClipboard into:) available
+        # at this point of execution order. Definitions escape only from
+        # constructs guaranteed to run: plain steps, group, retry, and an
+        # unconditional runFlow — never from repeat (while: may zero-iterate)
+        # or a runFlow guarded by when:.
+        defined = _defined if _defined is not None else set()
         # Keyed on (path, available names): the same subflow can be included
         # twice with different env frames, and only checking the first would
         # let the second inclusion's missing variables escape to run time.
-        key = (flow.path, tuple(sorted(values)))
+        # The memo stores the DELTA of definitions the walk added, so a
+        # cache hit still contributes them to the caller's live set.
+        key = (flow.path, tuple(sorted(values)), tuple(sorted(defined)))
         if key in seen:
+            defined |= seen[key]
             return
-        seen.add(key)
+        before = set(defined)
         if is_root and flow.requires_platforms and \
                 self.target.platform not in flow.requires_platforms:
             raise errors.AutonomError(
@@ -301,29 +359,61 @@ class Executor:
                 hint="Pick a matching target with --platform/--target.",
                 required=flow.requires_platforms, target=self.target.platform,
             )
-        steps = (*flow.on_flow_start, *flow.steps, *flow.on_flow_complete) \
-            if is_root else tuple(flow.steps)
-        for step in steps:
-            self._preflight_step(step, flow, values, seen)
+        if not is_root:
+            for step in flow.steps:
+                self._preflight_step(step, flow, values, seen, defined)
+            seen[key] = frozenset(defined - before)
+            return
+        for step in flow.on_flow_start:
+            self._preflight_step(step, flow, values, seen, defined)
+        # onFlowComplete runs after pass AND fail — a variable set mid-steps
+        # is not guaranteed to exist there, so cleanup sees only what the
+        # start hook (guaranteed to have run) defined; and because each
+        # cleanup step is failure-isolated, one cleanup step's definitions
+        # do not carry into the next.
+        defined_after_start = set(defined)
+        for step in flow.steps:
+            self._preflight_step(step, flow, values, seen, defined)
+        for step in flow.on_flow_complete:
+            self._preflight_step(step, flow, values, seen,
+                                 set(defined_after_start))
+        seen[key] = frozenset(defined - before)
 
     def _preflight_step(self, step: Step, flow: Flow, values: dict,
-                        seen: set) -> None:
+                        seen: dict, defined: set) -> None:
         if step.command == "runFlow":
             # The step's own env: values and when: clause resolve in the
             # PARENT frame — check them here before descending.
             for name in self._step_var_names(step):
-                if name not in values:
-                    self._definition(step, f"${{{name}}} is not defined",
-                                     code=errors.FLOW_VAR_UNDEFINED)
+                if name not in values and name not in defined:
+                    self._var_undefined(step, name)
+            conditional = "when" in step.args
+            child_defined = set(defined) if conditional else defined
+            if "commands" in step.args:
+                # inline subflow: parent frame stays visible, env: overlays
+                inline_values = {**values, **step.args.get("env", {})}
+                for sub in step.args["commands"]:
+                    self._preflight_step(sub, flow, inline_values, seen,
+                                         child_defined)
+                return
             child = self._child_of(flow, step)
             child_values = {**child.env,
                             **{k: v for k, v in step.args.get("env", {}).items()},
                             **self.config.env, **self.config.secrets}
-            self._preflight_flow(child, child_values, is_root=False, _seen=seen)
+            self._preflight_flow(child, child_values, is_root=False,
+                                 _seen=seen, _defined=child_defined)
             return
         if step.command in ("retry", "group"):
             for sub in step.args["commands"]:
-                self._preflight_step(sub, flow, values, seen)
+                self._preflight_step(sub, flow, values, seen, defined)
+            return
+        if step.command == "repeat":
+            for name in self._step_var_names(step):
+                if name not in values and name not in defined:
+                    self._var_undefined(step, name)
+            body_defined = set(defined)  # while: may allow zero iterations
+            for sub in step.args["commands"]:
+                self._preflight_step(sub, flow, values, seen, body_defined)
             return
         if step.command in ("launchApp", "stopApp", "clearState") and not flow.app_id:
             self._definition(step, f"{step.command} needs an appId, and neither "
@@ -337,9 +427,26 @@ class Executor:
                                        "on iOS (no 'pm clear' equivalent)",
                                  code=errors.UNSUPPORTED_ON_PLATFORM)
         for name in self._step_var_names(step):
-            if name not in values:
-                self._definition(step, f"${{{name}}} is not defined",
-                                 code=errors.FLOW_VAR_UNDEFINED)
+            if name not in values and name not in defined:
+                self._var_undefined(step, name)
+        if step.command == "pasteText" and \
+                "COPIED_TEXT" not in defined and "COPIED_TEXT" not in values:
+            self._definition(step, "pasteText needs COPIED_TEXT — run "
+                                   "copyTextFrom or setClipboard first",
+                             code=errors.FLOW_VAR_UNDEFINED)
+        if step.command in ("copyTextFrom", "setClipboard"):
+            name = step.args.get("into") or "COPIED_TEXT"
+            if name in self._declared_names:
+                self._definition(step, f"variable {name!r} collides with an "
+                                       "env/secret name declared somewhere "
+                                       "in this flow graph",
+                                 code=errors.FLOW_VAR_CONFLICT)
+            defined.add(name)
+
+    def _var_undefined(self, step: Step, name: str) -> None:
+        self._definition(
+            step, f"${{{name}}} is not defined at this point",
+            code=errors.FLOW_VAR_UNDEFINED)
 
     def _step_var_names(self, step: Step):
         def from_selector(selector: FlowSelector):
@@ -383,6 +490,13 @@ class Executor:
         def substitute(match: re.Match) -> str:
             nonlocal used_secret
             name = match.group(1)
+            if name in self.secret_values:
+                used_secret = True
+                return self.values[name]
+            if name in self.runtime_values:
+                if name in self.sensitive_var_names:
+                    used_secret = True
+                return self.runtime_values[name]
             if name not in self.values:
                 # pre-flight checks every reference, so reaching this means a
                 # frame bug — still fail as a positioned envelope, never KeyError
@@ -390,8 +504,6 @@ class Executor:
                     errors.FLOW_VAR_UNDEFINED, f"${{{name}}} is not defined",
                     hint="Define it in the flow env, --env, or --secret.",
                 )
-            if name in self.secret_values:
-                used_secret = True
             return self.values[name]
 
         out: list[str] = []
@@ -468,6 +580,10 @@ class Executor:
                     self._execute_retry(step, flow, writer, result,
                                         evidence, hook)
                     continue
+                if step.command == "repeat":
+                    self._execute_repeat(step, flow, writer, result,
+                                         evidence, hook)
+                    continue
                 if step.command == "group":
                     self._execute_group(step, flow, writer, result,
                                         evidence, hook)
@@ -483,14 +599,15 @@ class Executor:
     def _execute_runflow(self, step: Step, flow: Flow, writer: EventWriter,
                          result: RunResult, evidence: Evidence,
                          hook: str | None) -> None:
-        child = self._child_of(flow, step)
+        inline = "file" not in step.args
+        child = flow if inline else self._child_of(flow, step)
         self._counter += 1
         outcome = StepOutcome(index=self._counter, command="runFlow",
                               label=step.label, line=step.line,
                               status="passed", flow=flow.path, hook=hook)
         payload = {"step_index": outcome.index, "command": "runFlow",
                    "label": step.label, "file": flow.path, "line": step.line,
-                   "child": child.path}
+                   "child": "(inline)" if inline else child.path}
         writer.emit("flow.step.started", payload)
 
         when = step.args.get("when")
@@ -513,13 +630,22 @@ class Executor:
         for key, raw in step.args.get("env", {}).items():
             resolved, _secret = self._resolve(raw)
             child_env_arg[key] = resolved
-        child_values = {**child.env, **child_env_arg,
-                        **self.config.env, **self.config.secrets}
+        if inline:
+            # Inline commands are textually part of THIS flow: the parent
+            # frame stays visible and env: overlays it — but never a secret
+            # (secrets always win, exactly as in file subflow frames).
+            body = step.args["commands"]
+            child_values = {**self.values, **child_env_arg,
+                            **self.config.secrets}
+        else:
+            body = child.steps
+            child_values = {**child.env, **child_env_arg,
+                            **self.config.env, **self.config.secrets}
 
         started = self.clock()
         before = len(result.steps)
         try:
-            self._execute_steps(child.steps, child, child_values,
+            self._execute_steps(body, child, child_values,
                                 writer, result, evidence, hook=hook)
         except _Stop:
             failed = result.steps[-1] if len(result.steps) > before else None
@@ -571,6 +697,53 @@ class Executor:
                 "duration_ms": int((self.clock() - started) * 1000),
                 "attempts": 1,
             })
+
+    def _execute_repeat(self, step: Step, flow: Flow, writer: EventWriter,
+                        result: RunResult, evidence: Evidence,
+                        hook: str | None) -> None:
+        """Bounded, declared iteration (Phase 6 D3): `times` is the hard
+        limit, `while:` (visible/notVisible) is checked before each iteration
+        and stops the loop early the moment it no longer holds. Unlike
+        retry, this is not failure recovery — a failing iteration fails the
+        flow, and no gate is needed because every iteration was declared."""
+        times = step.args["times"]
+        clause = step.args.get("while")
+        self._counter += 1
+        block_index = self._counter
+        writer.emit("flow.step.started", {
+            "step_index": block_index, "command": "repeat", "label": step.label,
+            "file": flow.path, "line": step.line, "times": times,
+        })
+        started = self.clock()
+        iterations = 0
+        status = "passed"
+        stop_reason = None
+        try:
+            for _ in range(times):
+                if clause is not None:
+                    met, reason = flow_conditions.evaluate(
+                        self._resolve_when(clause), self.target.platform,
+                        self.values, lambda: ui_mod.snapshot(self.target))
+                    if not met:
+                        stop_reason = reason
+                        break
+                iterations += 1
+                self._execute_steps(step.args["commands"], flow, self.values,
+                                    writer, result, evidence, hook=hook)
+        except (_Stop, errors.AutonomError):
+            status = "failed"
+            raise
+        finally:
+            finished = {
+                "step_index": block_index, "command": "repeat",
+                "label": step.label, "file": flow.path, "line": step.line,
+                "status": status, "iterations": iterations,
+                "duration_ms": int((self.clock() - started) * 1000),
+                "attempts": max(iterations, 1),
+            }
+            if stop_reason:
+                finished["stop_reason"] = stop_reason
+            writer.emit("flow.step.finished", finished)
 
     def _execute_retry(self, step: Step, flow: Flow, writer: EventWriter,
                        result: RunResult, evidence: Evidence,
@@ -789,7 +962,12 @@ class Executor:
             selector, secret = self._resolve_selector(step.selector)
             node = self._poll_for_one(selector, step, attempts)
             x, y = ui_mod.center_of(node)
-            self._tap(x, y)
+            taps = step.args.get("repeat", 1)
+            delay_s = step.args.get("delayMs", 100) / 1000
+            for i in range(taps):
+                if i:
+                    self.sleep(delay_s)
+                self._tap(x, y)
             return secret
         if command == "longPressOn":
             selector, secret = self._resolve_selector(step.selector)
@@ -812,6 +990,46 @@ class Executor:
             value, secret = self._resolve(step.args["value"])
             ui_mod.type_text(target, value)
             return secret
+        if command == "copyTextFrom":
+            selector, secret = self._resolve_selector(step.selector)
+            node = self._poll_for_one(selector, step, attempts)
+            value = node.get("text") or node.get("desc") or ""
+            if not value:
+                raise errors.AutonomError(
+                    errors.FLOW_COPY_EMPTY,
+                    f"matched node carries no text to copy "
+                    f"({flow_selectors.describe(selector)})",
+                    hint="The element matched but has neither text nor "
+                         "description.",
+                )
+            name = step.args.get("into") or "COPIED_TEXT"
+            self.runtime_values[name] = value
+            if step.args.get("sensitive"):
+                self.sensitive_var_names.add(name)
+            return secret or bool(step.args.get("sensitive"))
+        if command == "setClipboard":
+            value, secret = self._resolve(step.args["value"])
+            name = step.args.get("into") or "COPIED_TEXT"
+            self.runtime_values[name] = value
+            if step.args.get("sensitive") or secret:
+                self.sensitive_var_names.add(name)
+            return secret or bool(step.args.get("sensitive"))
+        if command == "pasteText":
+            value = self.runtime_values.get("COPIED_TEXT")
+            sensitive = "COPIED_TEXT" in self.sensitive_var_names
+            if value is None:
+                # env may legitimately declare COPIED_TEXT (pre-flight
+                # accepts it) — same precedence as ${COPIED_TEXT}
+                value = self.values.get("COPIED_TEXT")
+                sensitive = "COPIED_TEXT" in self.secret_values
+            if value is None:
+                raise errors.AutonomError(
+                    errors.FLOW_VAR_UNDEFINED,
+                    "COPIED_TEXT is not set",
+                    hint="copyTextFrom or setClipboard must run first.",
+                )
+            ui_mod.type_text(target, value)
+            return sensitive
         if command == "eraseText":
             key = "KEYCODE_DEL" if target.platform == ANDROID else "42"
             for _ in range(step.args.get("chars", 50)):
@@ -825,7 +1043,18 @@ class Executor:
             ui_mod.press_key(target, "KEYCODE_BACK")
             return False
         if command == "swipe":
+            anchor = step.args.get("from")
+            if anchor is not None:
+                selector, secret = self._resolve_selector(anchor)
+                node = self._poll_for_one(selector, step, attempts)
+                self._swipe_from(ui_mod.center_of(node),
+                                 step.args["direction"],
+                                 step.args.get("durationMs", 300))
+                return secret
             self._swipe(step.args["direction"], step.args.get("durationMs", 300))
+            return False
+        if command == "scroll":
+            self._swipe("up", 300)
             return False
         if command == "scrollUntilVisible":
             return self._scroll_until_visible(step, attempts)
@@ -883,21 +1112,11 @@ class Executor:
     # -- polling --------------------------------------------------------------
 
     def _matches(self, selector: FlowSelector) -> list:
-        mode, case_sensitive = MATCH_MODES[selector.match]
+        """Assertion-style matching — relations included, index narrows to
+        that occurrence (missing = simply "not there", not an error)."""
         nodes = ui_mod.snapshot(self.target)
         self._last_nodes = nodes
-        matches = selector_engine.select(
-            nodes, dict(selector.fields),
-            mode=mode, case_sensitive=case_sensitive, all_matches=True,
-        )
-        if selector.index is not None:
-            # An assertion with index asserts about THAT occurrence; a missing
-            # occurrence is simply "not there", not an error.
-            try:
-                matches = [matches[selector.index]]
-            except IndexError:
-                matches = []
-        return matches
+        return flow_selectors.select_all(nodes, selector)
 
     def _poll_for_one(self, selector: FlowSelector, step: Step, attempts: list):
         """Poll while ZERO nodes match; the moment any match, select once."""
@@ -945,7 +1164,20 @@ class Executor:
         direction = step.args.get("direction", "down")
         for swipes_used in range(max_swipes + 1):
             attempts[0] += 1
-            if self._matches(selector):
+            matches = self._matches(selector)
+            if matches:
+                if step.args.get("centerElement"):
+                    if len(matches) > 1:
+                        raise errors.AutonomError(
+                            errors.AMBIGUOUS_SELECTOR,
+                            f"{flow_selectors.describe(selector)} matched "
+                            f"{len(matches)} nodes; centerElement needs "
+                            "exactly one",
+                            hint="Tighten the selector or add index.",
+                            match_count=len(matches),
+                        )
+                    self._center_node(matches[0], selector, direction,
+                                      attempts)
                 return secret
             if swipes_used == max_swipes:
                 break
@@ -1016,6 +1248,90 @@ class Executor:
             (x1, y1), (x2, y2) = geometry(screen)
             ui_mod.swipe(self.target, x1, y1, x2, y2, duration_ms / 1000,
                          screen=screen)
+
+    def _swipe_from(self, start: tuple[int, int], direction: str,
+                    duration_ms: int) -> None:
+        """Directional swipe anchored at a resolved element's center."""
+        screen = self._screen_size()
+        if not screen:
+            raise errors.AutonomError(
+                errors.BACKEND_FAILED,
+                "cannot determine the screen size for an anchored swipe",
+                hint="The backend did not report a screen size.",
+            )
+        def geometry(dims):
+            width, height = dims
+            x, y = start
+            dx = {"left": -int(width * 0.4), "right": int(width * 0.4)}.get(direction, 0)
+            dy = {"up": -int(height * 0.4), "down": int(height * 0.4)}.get(direction, 0)
+            x2 = min(max(x + dx, int(width * 0.05)), int(width * 0.95))
+            y2 = min(max(y + dy, int(height * 0.05)), int(height * 0.95))
+            return x, y, x2, y2
+
+        try:
+            x, y, x2, y2 = geometry(screen)
+            ui_mod.swipe(self.target, x, y, x2, y2, duration_ms / 1000,
+                         screen=screen)
+        except errors.AutonomError as exc:
+            if exc.code != errors.COORDINATE_SPACE_MISMATCH:
+                raise
+            screen = self._refresh_screen()  # rotated mid-flow; pre-dispatch guard
+            if not screen:
+                raise
+            x, y, x2, y2 = geometry(screen)
+            ui_mod.swipe(self.target, x, y, x2, y2, duration_ms / 1000,
+                         screen=screen)
+
+    def _center_node(self, node, selector: FlowSelector, direction: str,
+                     attempts: list) -> None:
+        """Up to 3 corrective micro-swipes to center a found element along
+        the scroll axis. Best-effort: losing the element mid-correction is a
+        test failure (the list moved under us — smaller swipes, or drop
+        centerElement)."""
+        screen = self._screen_size()
+        if not screen:
+            return
+        width, height = screen
+        vertical = direction in ("up", "down")
+        for _ in range(3):
+            x, y = ui_mod.center_of(node)
+            offset = (y - height // 2) if vertical else (x - width // 2)
+            span = height if vertical else width
+            if abs(offset) <= span * 0.1:
+                return
+            shift = max(min(offset, int(span * 0.3)), -int(span * 0.3))
+            x1, y1 = width // 2, height // 2
+            x2, y2 = (x1, y1 - shift) if vertical else (x1 - shift, y1)
+            try:
+                ui_mod.swipe(self.target, x1, y1, x2, y2, 0.2, screen=screen)
+            except errors.AutonomError as exc:
+                if exc.code != errors.COORDINATE_SPACE_MISMATCH:
+                    raise
+                screen = self._refresh_screen()
+                if not screen:
+                    raise
+                width, height = screen
+                continue  # recompute against the fresh dimensions
+            attempts[0] += 1
+            nodes = ui_mod.snapshot(self.target)
+            self._last_nodes = nodes
+            found = flow_selectors.select_all(nodes, selector)
+            if not found:
+                raise errors.AutonomError(
+                    errors.FLOW_ASSERTION_TIMEOUT,
+                    f"{flow_selectors.describe(selector)} was lost while "
+                    "centering it",
+                    attempts=attempts[0],
+                )
+            if len(found) > 1:
+                raise errors.AutonomError(
+                    errors.AMBIGUOUS_SELECTOR,
+                    f"{flow_selectors.describe(selector)} became ambiguous "
+                    f"while centering ({len(found)} matches)",
+                    hint="Tighten the selector or add index.",
+                    match_count=len(found),
+                )
+            node = found[0]
 
     def _ios_launch_env(self) -> dict:
         from ..network import device_proxy_ios

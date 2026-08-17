@@ -29,7 +29,7 @@ MODES = ("exact", "contains", "regex")
 # UNIQUE anchor (a reference rectangle); the ancestry two are per-candidate
 # predicates and tolerate any number of anchor-shaped nodes.
 GEOMETRIC_RELATIONS = ("above", "below", "left_of", "right_of")
-ANCESTRY_RELATIONS = ("child_of", "contains_child")
+ANCESTRY_RELATIONS = ("child_of", "contains_child", "contains_descendants")
 RELATIONAL_FIELDS = GEOMETRIC_RELATIONS + ANCESTRY_RELATIONS
 
 
@@ -150,7 +150,7 @@ def _apply_relations(
                 return False
 
             candidates = [node for node in candidates if has_matching_ancestor(node)]
-        else:  # contains_child — a DIRECT child matches
+        elif name == "contains_child":  # a DIRECT child matches
             children_of: dict[str, list[Mapping[str, Any]]] = {}
             for node in all_nodes:
                 parent = node.get("parent")
@@ -166,6 +166,27 @@ def _apply_relations(
                 return False
 
             candidates = [node for node in candidates if has_matching_child(node)]
+        else:  # contains_descendants — ANY depth below the candidate matches
+            descendants_of: dict[str, list[Mapping[str, Any]]] = {}
+            for node in all_nodes:
+                seen: set[str] = set()
+                parent = node.get("parent")
+                while parent and parent not in seen:
+                    seen.add(parent)
+                    descendants_of.setdefault(parent, []).append(node)
+                    ancestor = by_ref.get(parent)
+                    parent = ancestor.get("parent") if ancestor else None
+
+            def has_matching_descendant(node: Mapping[str, Any]) -> bool:
+                for descendant in descendants_of.get(node.get("ref"), []):
+                    if _plain_match(descendant, spec["fields"],
+                                    spec.get("mode", "exact"),
+                                    spec.get("case_sensitive", True)):
+                        return True
+                return False
+
+            candidates = [node for node in candidates
+                          if has_matching_descendant(node)]
     return candidates
 
 

@@ -7,6 +7,80 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
 
 ## [Unreleased]
 
+## [0.28.1] - 2026-08-17
+
+Maestro Core Profile v2, slice 2 of 4: engine-only commands — value
+extraction without a script engine, bounded iteration, and composition
+completion. No new device substrate; everything rides on the existing
+selector engine and gesture paths.
+
+### Added
+- **Run-scope variables, no JS**: `copyTextFrom` (selector → node text,
+  description fallback; empty read = new test-failure code
+  `flow_copy_empty`), `setClipboard` (literal), both into `into: NAME` or
+  the implicit `COPIED_TEXT`; `pasteText` types it. Host-side only — the OS
+  clipboard is untouched (exactly Maestro's semantics). Precedence env <
+  variable < secret; `sensitive: true` redacts like secret input.
+  Pre-flight is order-aware: use-before-definition, a name colliding with
+  env/secrets (new code `flow_var_conflict`), and `pasteText` with nothing
+  copied refuse statically; definitions inside `repeat` or a `when:`-guarded
+  `runFlow` do not escape, and cleanup hooks see only `onFlowStart`
+  definitions.
+- **Bounded `repeat`** (leaves the deferred list): mandatory `times` 1–25,
+  `while:` (`visible`/`notVisible`) checked before each iteration, per-block
+  `iterations`/`stop_reason` in events; composition does not nest inside;
+  violations are the new `flow_repeat_invalid`. No `allowMutations` gate —
+  declared iteration is not failure recovery.
+- **Composition completion**: `runFlow` accepts inline `commands:`
+  (anonymous subflow; parent frame visible, `env:` overlays); `swipe`
+  accepts `from: <selector>` (anchored at the element's center, clamped);
+  `scroll` (one upward swipe); `scrollUntilVisible.centerElement` (≤3
+  corrective micro-swipes along the scroll axis); `tapOn.repeat`/`delayMs`
+  (2–10 declared taps); selector relation `containsDescendants` (any-depth,
+  leaves the deferred fields).
+- **Import widened accordingly**: the clipboard trio, `scroll`, bounded
+  `repeat` (unbounded/JS `while` refuses), inline `runFlow.commands`,
+  `swipe.from`, `scrollUntilVisible.centerElement`, `tapOn` `repeat`/`delay`
+  all convert from Maestro files; their `_UNSUPPORTED_HINTS` entries are
+  gone.
+
+### Fixed
+Hardening from the slice's adversarial review, each pinned by a test:
+- **Relational selector constraints were silently dropped in every
+  assertion/condition path** (pre-existing since 0.20.1): `assertVisible`/
+  `assertNotVisible`/`waitUntil`/`scrollUntilVisible` and `when:` conditions
+  matched on plain fields only, so an impossible relation could produce a
+  false PASS (and a true one a false FAIL). All matching now routes through
+  one relations-aware selection (`flow/selectors.select_all`); in an
+  assertion context an absent geometric anchor means "not present", never an
+  error.
+- A `runFlow` file reference nested inside `group` escaped both walkers —
+  `flow check` skipped its existence/cycle/containment checks and `flow run`
+  crashed with a raw KeyError; both walkers now descend into every nested
+  command list.
+- Variable-name conflicts are checked against every name declared anywhere
+  in the flow graph (child header envs, `runFlow env:` overlays), so a
+  runtime variable can never silently shadow a subflow's own env; an inline
+  `runFlow env:` can no longer shadow a secret; `pasteText` honors an
+  env-declared `COPIED_TEXT`; a pre-flight memo hit still contributes the
+  subflow's definitions (valid flows were refused); cleanup-hook definitions
+  no longer leak between failure-isolated cleanup steps.
+- `scrollUntilVisible` + `centerElement` no longer crashes with a raw
+  IndexError when relations filter everything out, and its ambiguity
+  semantics are explicit: centering needs exactly one match
+  (`ambiguous_selector` otherwise, including mid-centering).
+- The run-level `sensitive` flag now sees `sensitive: true` in hooks, nested
+  command lists, and subflows — not just top-level root steps.
+- `_swipe_from`/`_center_node` recover from a mid-flow rotation
+  (COORDINATE_SPACE_MISMATCH refresh-and-retry) like `_tap`/`_swipe` do.
+- Export refuses the new inline `runFlow.commands`, `tapOn.repeat`, and
+  `swipe.from` instead of crashing (KeyError) or silently dropping arguments;
+  `retry` refuses `repeat` inside (it hid mutating children from the
+  `allowMutations` scan).
+- The canonical emitter wrote every `when`-kind argument as `when:` — a
+  `repeat.while` would have round-tripped as `when` (caught by the new
+  round-trip tests before it could ship).
+
 ## [0.28.0] - 2026-08-17
 
 Maestro Core Profile v2, slice 1 of 4 (`docs/plans/PHASE_6_MAESTRO_COMPAT.md`):

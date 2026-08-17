@@ -57,16 +57,12 @@ def is_maestro_document(text: str) -> bool:
 _UNSUPPORTED_HINTS = {
     "runScript": "Replace runScript with a deterministic subflow or execute it outside Flow v1",
     "evalScript": "Flow v1 has no script engine, by design",
-    "repeat": "unbounded loops are not part of Flow v1",
-    "copyTextFrom": "value extraction is not part of the Core Profile",
-    "pasteText": "value extraction is not part of the Core Profile",
     "inputRandomText": "flows are deterministic; pass the value via env or --secret",
     "inputRandomNumber": "flows are deterministic; pass the value via env or --secret",
     "inputRandomEmail": "flows are deterministic; pass the value via env or --secret",
     "inputRandomPersonName": "flows are deterministic; pass the value via env or --secret",
     "hideKeyboard": "no reliable cross-platform substrate; press KEYCODE_BACK on Android",
     "waitForAnimationToEnd": "use waitUntil with an explicit timeoutMs",
-    "scroll": "use swipe with a direction, or scrollUntilVisible",
     "travel": "location simulation imports only as setLocation",
     "startRecording": "recording is session-level: autonom record start",
     "stopRecording": "recording is session-level: autonom record stop",
@@ -136,6 +132,10 @@ def _selector_with_extras(node, path: str) -> tuple[FlowSelector, dict]:
             extras["label"] = _scalar_text(value, path)
         elif name == "optional":
             extras["optional"] = _bool_text(value, path, "optional")
+        elif name == "repeat":
+            extras["repeat"] = _int_text(value, path, "tap repeat")
+        elif name == "delay":
+            extras["delayMs"] = _int_text(value, path, "tap delay")
         elif name in ("text", "id"):
             raw = _scalar_text(value, path)
             pattern, mode = _import_pattern(raw)
@@ -169,7 +169,7 @@ def _selector_with_extras(node, path: str) -> tuple[FlowSelector, dict]:
 
 def _apply_extras(command: str, args: dict, extras: dict, path: str,
                   line: int, col: int) -> dict:
-    """Fold Maestro label/optional into Autonom command arguments."""
+    """Fold Maestro label/optional/repeat/delay into command arguments."""
     if "label" in extras:
         args["label"] = extras["label"]
     if extras.get("optional"):
@@ -179,6 +179,12 @@ def _apply_extras(command: str, args: dict, extras: dict, path: str,
                     "optional assertion is refused by design.")
         args["optional"] = True
         args["reason"] = _IMPORTED_OPTIONAL_REASON
+    for name in ("repeat", "delayMs"):
+        if name in extras:
+            if command != "tapOn":
+                _refuse(path, line, col, f"{name} on {command}",
+                        "Repeated taps import on tapOn only.")
+            args[name] = extras[name]
     return args
 
 
@@ -249,7 +255,7 @@ def _step_from(item, path: str) -> Step:
     if isinstance(item, Scalar):
         name, line, col = item.text, item.line, item.col
         if name in ("launchApp", "stopApp", "clearState", "back",
-                    "takeScreenshot", "eraseText"):
+                    "takeScreenshot", "eraseText", "scroll", "pasteText"):
             return Step(name, {}, line, col)
         if name == "hideKeyboard" or name in _UNSUPPORTED_HINTS:
             _refuse(path, line, col, name,
@@ -267,11 +273,72 @@ def _step_from(item, path: str) -> Step:
     if name in _UNSUPPORTED_HINTS:
         _refuse(path, line, col, name, _UNSUPPORTED_HINTS[name])
 
-    if name in (*_TAP_COMMANDS, "assertVisible", "assertNotVisible"):
+    if name in (*_TAP_COMMANDS, "assertVisible", "assertNotVisible",
+                "copyTextFrom"):
         selector, extras = _selector_with_extras(value, path)
         args = _apply_extras(name, {"selector": selector}, extras,
                              path, line, col)
         return Step(name, args, line, col)
+    if name == "setClipboard":
+        if isinstance(value, Mapping):
+            args = {}
+            for arg_key, arg_value in value.pairs:
+                if arg_key.text == "text":
+                    args["value"] = _scalar_text(arg_value, path)
+                elif arg_key.text == "label":
+                    args["label"] = _scalar_text(arg_value, path)
+                else:
+                    _refuse(path, arg_key.line, arg_key.col,
+                            f"setClipboard.{arg_key.text}",
+                            "Core Profile setClipboard supports text and "
+                            "label.")
+            if "value" not in args:
+                _refuse(path, line, col, "setClipboard without text",
+                        "Give setClipboard a text value.")
+            return Step("setClipboard", args, line, col)
+        return Step("setClipboard", {"value": _scalar_text(value, path)},
+                    line, col)
+    if name == "pasteText":
+        args = {}
+        for arg_key, arg_value in _require_mapping(value, path,
+                                                   "pasteText").pairs:
+            if arg_key.text == "label":
+                args["label"] = _scalar_text(arg_value, path)
+            else:
+                _refuse(path, arg_key.line, arg_key.col,
+                        f"pasteText.{arg_key.text}",
+                        "Core Profile pasteText supports label only.")
+        return Step("pasteText", args, line, col)
+    if name == "repeat":
+        args = {}
+        for arg_key, arg_value in _require_mapping(value, path, "repeat").pairs:
+            if arg_key.text == "times":
+                args["times"] = _int_text(arg_value, path, "repeat.times")
+            elif arg_key.text == "while":
+                args["while"] = _while_from(arg_value, path)
+            elif arg_key.text == "commands":
+                if not isinstance(arg_value, Sequence):
+                    _refuse(path, arg_key.line, arg_key.col, "repeat.commands",
+                            "repeat.commands must be a list of commands.")
+                args["commands"] = _steps_from(arg_value, path)
+            elif arg_key.text == "label":
+                args["label"] = _scalar_text(arg_value, path)
+            else:
+                _refuse(path, arg_key.line, arg_key.col,
+                        f"repeat.{arg_key.text}",
+                        "Core Profile repeat supports times, while, commands, "
+                        "and label.")
+        if "times" not in args:
+            _refuse(path, line, col, "repeat without times",
+                    "An unbounded repeat does not import; give it a finite "
+                    "times (Autonom caps it at 25).")
+        if args["times"] > 25:
+            _refuse(path, line, col, f"repeat.times: {args['times']}",
+                    "Autonom bounds repeat at 25 iterations.")
+        if not args.get("commands"):
+            _refuse(path, line, col, "repeat without commands",
+                    "Give repeat a commands list.")
+        return Step("repeat", args, line, col)
     if name == "inputText":
         if isinstance(value, Mapping):
             args = {}
@@ -356,6 +423,9 @@ def _step_from(item, path: str) -> Step:
                 args["selector"] = _selector_from(arg_value, path)
             elif arg_key.text == "direction":
                 args["direction"] = _scalar_text(arg_value, path).lower()
+            elif arg_key.text == "centerElement":
+                args["centerElement"] = _bool_text(
+                    arg_value, path, "scrollUntilVisible.centerElement")
             elif arg_key.text == "label":
                 args["label"] = _scalar_text(arg_value, path)
             else:
@@ -404,10 +474,10 @@ def _step_from(item, path: str) -> Step:
                     "not import.")
         args.setdefault("maxAttempts", 2)  # Maestro default maxRetries: 1
         for sub in args["commands"]:
-            if sub.command in ("runFlow", "retry"):
+            if sub.command in ("runFlow", "retry", "repeat"):
                 _refuse(path, sub.line, sub.col, f"{sub.command} inside retry",
                         "Autonom retry blocks stay small and atomic; nested "
-                        "retries and retried subflows do not import.")
+                        "composition does not import into retry.")
             if REGISTRY[sub.command].mutating:
                 # Maestro retries mutations by default; Autonom demands the
                 # intent be explicit — and the imported file shows it.
@@ -445,13 +515,15 @@ def _step_from(item, path: str) -> Step:
                 args["direction"] = _scalar_text(arg_value, path).lower()
             elif arg_key.text == "duration":
                 args["durationMs"] = _int_text(arg_value, path, "swipe.duration")
+            elif arg_key.text == "from":
+                args["from"] = _selector_from(arg_value, path)
             elif arg_key.text == "label":
                 args["label"] = _scalar_text(arg_value, path)
             else:
                 _refuse(path, arg_key.line, arg_key.col,
                         f"swipe.{arg_key.text}",
-                        "Core Profile swipe supports direction and duration; "
-                        "start/end points do not import.")
+                        "Core Profile swipe supports direction, from, and "
+                        "duration; start/end points do not import.")
         if "direction" not in args:
             _refuse(path, line, col, "swipe without a direction",
                     "Point-to-point swipes do not import.")
@@ -480,6 +552,12 @@ def _step_from(item, path: str) -> Step:
                                                    "runFlow").pairs:
             if arg_key.text == "file":
                 args["file"] = _scalar_text(arg_value, path)
+            elif arg_key.text == "commands":
+                if not isinstance(arg_value, Sequence):
+                    _refuse(path, arg_key.line, arg_key.col,
+                            "runFlow.commands",
+                            "runFlow.commands must be a list of commands.")
+                args["commands"] = _steps_from(arg_value, path)
             elif arg_key.text == "env":
                 env: dict = {}
                 _env_into(env, arg_value, path)
@@ -492,11 +570,31 @@ def _step_from(item, path: str) -> Step:
                 _refuse(path, arg_key.line, arg_key.col,
                         f"runFlow.{arg_key.text}",
                         "Core Profile runFlow supports file, env, when, label.")
-        if "file" not in args:
-            _refuse(path, line, col, "runFlow without a file",
-                    "Inline commands do not import; use a subflow file.")
+        present = [n for n in ("file", "commands") if n in args]
+        if len(present) != 1:
+            _refuse(path, line, col, "runFlow needs exactly one of file or "
+                                     "commands", "")
+        if "commands" in args and not args["commands"]:
+            _refuse(path, line, col, "runFlow with empty commands",
+                    "Give the inline subflow at least one command.")
         return Step("runFlow", args, line, col)
     _refuse(path, line, col, name, "not a Core Profile command")
+
+
+def _while_from(node, path: str):
+    from .schema import WhenClause
+    _require_mapping(node, path, "while")
+    when = WhenClause(line=node.line, col=node.col)
+    for key, value in node.pairs:
+        if key.text == "visible":
+            when.visible = _selector_from(value, path)
+        elif key.text == "notVisible":
+            when.not_visible = _selector_from(value, path)
+        else:
+            _refuse(path, key.line, key.col, f"while.{key.text}",
+                    "repeat.while imports visible/notVisible only; a JS "
+                    "'true:' condition has no Autonom equivalent.")
+    return when
 
 
 def _when_from(node, path: str):
@@ -660,6 +758,12 @@ def export_flow(flow: Flow, path: str) -> str:
             continue
         if command in ("tapOn", "longPressOn", "assertVisible", "assertNotVisible",
                        "doubleTapOn"):
+            if step.args.get("repeat"):
+                raise errors.AutonomError(
+                    errors.UNSUPPORTED_FLOW_COMMAND,
+                    f"{path}: tapOn repeat/delayMs does not export yet",
+                    file=path, line=step.line, command=command,
+                )
             selector = step.selector
             if selector.relations:
                 raise errors.AutonomError(
@@ -694,12 +798,25 @@ def export_flow(flow: Flow, path: str) -> str:
             lines.append(f"    timeout: {step.args['timeoutMs']}")
             continue
         if command == "swipe":
+            if "from" in step.args:
+                raise errors.AutonomError(
+                    errors.UNSUPPORTED_FLOW_COMMAND,
+                    f"{path}: swipe from: does not export yet",
+                    file=path, line=step.line, command=command,
+                )
             lines.append("- swipe:")
             lines.append(f"    direction: {step.args['direction'].upper()}")
             if "durationMs" in step.args:
                 lines.append(f"    duration: {step.args['durationMs']}")
             continue
         if command == "runFlow":
+            if "commands" in step.args:
+                raise errors.AutonomError(
+                    errors.UNSUPPORTED_FLOW_COMMAND,
+                    f"{path}: inline runFlow commands do not export yet",
+                    hint="Extract the inline body into a subflow file.",
+                    file=path, line=step.line, command=command,
+                )
             if step.args.get("env"):
                 lines.append("- runFlow:")
                 lines.append(f"    file: {step.args['file']}")
@@ -712,8 +829,10 @@ def export_flow(flow: Flow, path: str) -> str:
         raise errors.AutonomError(
             errors.UNSUPPORTED_FLOW_COMMAND,
             f"{path}: {command!r} has no Maestro Core Profile equivalent",
-            hint="retry, group, setOrientation, scrollUntilVisible, and "
-                 "assertEnabled/Checked stay Autonom-only.",
+            hint="retry, group, setOrientation, scrollUntilVisible, "
+                 "assertEnabled/Checked stay Autonom-only; the 0.28.1 "
+                 "commands (scroll, repeat, clipboard variables) do not "
+                 "export yet.",
             file=path, line=step.line, command=command,
         )
     return "\n".join(lines) + "\n"

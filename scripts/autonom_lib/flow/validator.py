@@ -64,9 +64,17 @@ def load_flow(path: Path) -> schema_mod.Flow:
 
 
 def _subflow_steps(flow: schema_mod.Flow):
-    for step in (*flow.on_flow_start, *flow.steps, *flow.on_flow_complete):
-        if step.command == "runFlow":
-            yield step
+    def walk(steps):
+        for step in steps:
+            if step.command == "runFlow" and "file" in step.args:
+                yield step
+                continue
+            # every nested command list may reference subflow files:
+            # inline runFlow bodies, group, retry, repeat
+            nested = step.args.get("commands")
+            if isinstance(nested, list):
+                yield from walk(nested)
+    yield from walk((*flow.on_flow_start, *flow.steps, *flow.on_flow_complete))
 
 
 def validate_tree(path: Path, root: Path | None = None,

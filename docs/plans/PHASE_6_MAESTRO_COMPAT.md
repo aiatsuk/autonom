@@ -1,6 +1,6 @@
 # Phase 6: Maestro Core Profile v2 — near-full import compatibility
 
-**Status:** in progress — 0.28.0 (import courtesy) shipped; 0.28.1–0.28.3 pending
+**Status:** in progress — 0.28.0 (import courtesy) and 0.28.1 (engine commands) shipped; 0.28.2–0.28.3 pending
 **Goal:** run the overwhelming majority of real-world Maestro flows through Autonom — by widening the documented Core Profile from "toy flows" to every Maestro command and argument that can be implemented honestly under Autonom's invariants, and by letting `flow run` execute a Maestro file directly through transparent import. Scope is explicitly bounded: no JavaScript, no AI commands, no random input, no raw coordinates, no pixel assertions, no settle heuristics.
 **Depends on:** `PHASE_5_FLOW_DSL.md` (Flow v1 language, executor, Maestro Core Profile v1 in 0.22.0); research: `docs/AUTONOM_PRODUCT_RESEARCH_REVYL_MAESTRO.md` §15 (versioned Core Profile commitment).
 **Target versions:**
@@ -126,6 +126,34 @@ iOS: existing `ios_simctl.launch` already accepts args and `SIMCTL_CHILD_*` env 
 - Adversarial review pass in the 0.27.3 tradition; CHANGELOG `### Fixed` closing release if needed.
 
 ---
+
+### 2.4 Design notes resolved during 0.28.1 (deviations from the sections above)
+
+- **Sensitivity is an explicit argument** (`sensitive: true` on
+  `copyTextFrom`/`setClipboard`), not inferred from the source field — the
+  session does not mark fields, and inference would be guessing.
+- **Static order analysis** replaces "runtime lookup may fail": pre-flight
+  threads a defined-variables set through execution order; definitions
+  escape only from constructs guaranteed to run (plain steps, `group`,
+  `retry`, unconditional `runFlow`) — never from `repeat` (zero iterations
+  possible) or a `when:`-guarded `runFlow`; `onFlowComplete` sees only
+  `onFlowStart` definitions (it runs after failures too).
+- **`repeat` refuses `runFlow` inside** (stricter than §2.2's silence):
+  keeps the bound analysis local; relaxing later is additive.
+- **Inline `runFlow` keeps the parent frame visible** (`env:` overlays) —
+  unlike a `file:` subflow, whose frame starts from its own header; the
+  inline body is textually part of the calling flow.
+- Maestro's `delay` imports as `delayMs` (house naming); variables resolve
+  after secrets and before env; empty copied text is the new test-failure
+  code `flow_copy_empty`.
+- `containsDescendants` is native-only: Maestro relational selectors still
+  do not import, so the import selector profile is unchanged.
+- `centerElement` demands a **unique** match (plain `scrollUntilVisible`
+  keeps visibility semantics over multiple matches); ambiguity — at entry or
+  mid-centering — refuses with `ambiguous_selector`.
+- The slice's review surfaced and fixed a pre-existing engine gap:
+  assertion/condition paths dropped relational selector constraints
+  entirely; all selection now routes through one relations-aware helper.
 
 ## 5. Error vocabulary
 

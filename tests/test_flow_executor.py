@@ -237,6 +237,237 @@ class AndroidLoginFlowTests(_AndroidRunBase):
         self.assertEqual(lines[0]["schema_version"], 1)
 
 
+class Slice0281Tests(_AndroidRunBase):
+    """0.28.1 engine commands: variables, repeat, scroll, inline runFlow."""
+
+    SETTINGS = "com.example.app:id/settings"
+
+    def _typed(self) -> list[list[str]]:
+        return [argv for argv in self._adb_calls()
+                if argv[2:5] == ["shell", "input", "text"]]
+
+    def _swipes(self) -> list[list[str]]:
+        return [argv for argv in self._adb_calls()
+                if argv[2:5] == ["shell", "input", "swipe"]]
+
+    def test_copy_then_paste_types_the_node_text(self) -> None:
+        path = self._flow(
+            f"- copyTextFrom:\n    selector:\n      id: {self.SETTINGS}\n"
+            "- pasteText\n")
+        result = self._cli("flow", "run", str(path))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        typed = self._typed()
+        self.assertEqual(len(typed), 1)
+        self.assertIn("Settings", " ".join(typed[0]))
+
+    def test_runtime_variable_interpolates(self) -> None:
+        path = self._flow(
+            f"- copyTextFrom:\n    selector:\n      id: {self.SETTINGS}\n"
+            "    into: LABEL\n"
+            "- inputText: got-${LABEL}\n")
+        result = self._cli("flow", "run", str(path))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("got-Settings", " ".join(self._typed()[0]))
+
+    def test_use_before_definition_refuses_statically(self) -> None:
+        path = self._flow(
+            "- inputText: ${LATER}\n"
+            f"- copyTextFrom:\n    selector:\n      id: {self.SETTINGS}\n"
+            "    into: LATER\n")
+        result = self._cli("flow", "run", str(path))
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertIn("flow_var_undefined", result.stderr)
+        self.assertEqual(self._typed(), [], "no device action before refusal")
+
+    def test_paste_without_copy_refuses_statically(self) -> None:
+        result = self._cli("flow", "run", str(self._flow("- pasteText\n")))
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("flow_var_undefined", result.stderr)
+
+    def test_variable_conflict_with_env_refuses(self) -> None:
+        header = _HEAD.replace("---\n", "env:\n  LABEL: fixed\n---\n")
+        path = self._flow(
+            f"- copyTextFrom:\n    selector:\n      id: {self.SETTINGS}\n"
+            "    into: LABEL\n", header=header)
+        result = self._cli("flow", "run", str(path))
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("flow_var_conflict", result.stderr)
+
+    def test_sensitive_copy_marks_run_and_steps(self) -> None:
+        path = self._flow(
+            f"- copyTextFrom:\n    selector:\n      id: {self.SETTINGS}\n"
+            "    sensitive: true\n"
+            "- pasteText\n")
+        result = self._cli("flow", "run", str(path))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        summary = json.loads(result.stdout)
+        self.assertTrue(summary["sensitive"])
+        # The copied VALUE never lands in the summary or journal. (Screen
+        # fingerprints still carry on-screen labels — that text is on the
+        # screen regardless of the copy, and the run is marked sensitive.)
+        self.assertNotIn("Settings", json.dumps(summary))
+        events = [json.loads(line) for line in
+                  Path(summary["events"]).read_text(encoding="utf-8").splitlines()]
+        for event in events:
+            payload = event["payload"]
+            if payload.get("command") in ("copyTextFrom", "pasteText") \
+                    and event["kind"] == "flow.step.finished":
+                self.assertTrue(event["sensitive"], payload)
+        journal = "".join(
+            j.read_text(encoding="utf-8")
+            for j in (self.root / "home/sessions").rglob("journal.ndjson"))
+        self.assertNotIn("Settings", journal)
+
+    def test_repeat_runs_exactly_times(self) -> None:
+        path = self._flow(
+            "- repeat:\n    times: 3\n    commands:\n"
+            f"      - tapOn:\n          selector:\n            id: {self.SETTINGS}\n")
+        result = self._cli("flow", "run", str(path))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self._taps()), 3)
+        summary = json.loads(result.stdout)
+        events = Path(summary["events"]).read_text(encoding="utf-8")
+        block = next(json.loads(line) for line in events.splitlines()
+                     if json.loads(line)["kind"] == "flow.step.finished"
+                     and json.loads(line)["payload"].get("command") == "repeat")
+        self.assertEqual(block["payload"]["iterations"], 3)
+
+    def test_repeat_while_can_stop_before_first_iteration(self) -> None:
+        path = self._flow(
+            "- repeat:\n    times: 5\n"
+            "    while:\n      notVisible:\n        text: Settings\n"
+            "    commands:\n"
+            f"      - tapOn:\n          selector:\n            id: {self.SETTINGS}\n")
+        result = self._cli("flow", "run", str(path))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self._taps(), [], "Settings is visible, so zero runs")
+
+    def test_inline_runflow_sees_parent_env(self) -> None:
+        header = _HEAD.replace("---\n", "env:\n  GREETING: hello\n---\n")
+        path = self._flow(
+            "- runFlow:\n    commands:\n      - inputText: say-${GREETING}\n",
+            header=header)
+        result = self._cli("flow", "run", str(path))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("say-hello", " ".join(self._typed()[0]))
+
+    def test_scroll_is_one_upward_swipe(self) -> None:
+        result = self._cli("flow", "run", str(self._flow("- scroll\n")))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self._swipes()), 1)
+
+    def test_tap_repeat_taps_n_times(self) -> None:
+        path = self._flow(
+            f"- tapOn:\n    selector:\n      id: {self.SETTINGS}\n"
+            "    repeat: 3\n    delayMs: 0\n")
+        result = self._cli("flow", "run", str(path))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self._taps()), 3)
+
+    def test_assertions_honor_relational_selectors(self) -> None:
+        path = self._flow(
+            "- assertVisible:\n    selector:\n      role: framelayout\n"
+            "      containsChild:\n        text: Search input\n")
+        result = self._cli("flow", "run", str(path))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        path = self._flow(
+            f"- assertVisible:\n    selector:\n      id: {self.SETTINGS}\n"
+            "      containsDescendants:\n        text: Nope\n"
+            "    timeoutMs: 300\n")
+        result = self._cli("flow", "run", str(path))
+        self.assertEqual(result.returncode, 1,
+                         "a relation must not be silently dropped")
+        self.assertIn("flow_assertion_timeout", result.stdout)
+
+    def test_center_element_failures_are_honest(self) -> None:
+        path = self._flow(
+            "- scrollUntilVisible:\n    selector:\n"
+            "      id: com.example.app:id/list\n"
+            "      containsDescendants:\n        text: Nope\n"
+            "    centerElement: true\n    maxSwipes: 1\n")
+        result = self._cli("flow", "run", str(path))
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("flow_assertion_timeout", result.stdout)
+        path = self._flow(
+            "- scrollUntilVisible:\n    selector:\n      text: Settings\n"
+            "    centerElement: true\n")
+        result = self._cli("flow", "run", str(path))
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("ambiguous_selector", result.stdout)
+
+    def test_group_nested_runflow_works(self) -> None:
+        (self.root / "sub.yaml").write_text(
+            "schema: autonom.dev/flow/v1\nname: s\n---\n- back\n",
+            encoding="utf-8")
+        path = self._flow(
+            "- group:\n    label: g\n    commands:\n"
+            "      - runFlow: sub.yaml\n")
+        result = self._cli("flow", "run", str(path))
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_inline_env_cannot_shadow_a_secret(self) -> None:
+        path = self._flow(
+            "- runFlow:\n    env:\n      TOKEN: fake\n"
+            "    commands:\n      - inputText: use-${TOKEN}\n")
+        result = self._cli("flow", "run", str(path), "--secret", "TOKEN",
+                           extra_env={"TOKEN": "realvalue"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("use-realvalue", " ".join(self._typed()[0]))
+
+    def test_paste_falls_back_to_declared_env(self) -> None:
+        header = _HEAD.replace("---\n", "env:\n  COPIED_TEXT: fromenv\n---\n")
+        path = self._flow("- pasteText\n", header=header)
+        result = self._cli("flow", "run", str(path))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("fromenv", " ".join(self._typed()[0]))
+
+    def test_conflict_with_a_subflow_env_is_static(self) -> None:
+        (self.root / "sub.yaml").write_text(
+            "schema: autonom.dev/flow/v1\nname: s\nenv:\n  LABEL: theirs\n"
+            "---\n- back\n", encoding="utf-8")
+        path = self._flow(
+            f"- copyTextFrom:\n    selector:\n      id: {self.SETTINGS}\n"
+            "    into: LABEL\n"
+            "- runFlow: sub.yaml\n")
+        result = self._cli("flow", "run", str(path))
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("flow_var_conflict", result.stderr)
+
+    def test_memo_hit_still_contributes_definitions(self) -> None:
+        (self.root / "sub.yaml").write_text(
+            "schema: autonom.dev/flow/v1\nname: s\n---\n"
+            "- copyTextFrom:\n    selector:\n"
+            "      id: com.example.app:id/settings\n    into: GRABBED\n",
+            encoding="utf-8")
+        path = self._flow(
+            "- runFlow:\n    file: sub.yaml\n"
+            "    when:\n      platform: android\n"
+            "- runFlow: sub.yaml\n"
+            "- inputText: v-${GRABBED}\n")
+        result = self._cli("flow", "run", str(path))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("v-Settings", " ".join(self._typed()[0]))
+
+    def test_sensitive_nested_in_group_marks_the_run(self) -> None:
+        path = self._flow(
+            "- group:\n    label: g\n    commands:\n"
+            "      - setClipboard:\n          value: sekret\n"
+            "          sensitive: true\n")
+        result = self._cli("flow", "run", str(path))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(json.loads(result.stdout)["sensitive"])
+
+    def test_swipe_from_anchors_at_the_node(self) -> None:
+        path = self._flow(
+            "- swipe:\n    direction: up\n"
+            "    from:\n      id: com.example.app:id/list\n")
+        result = self._cli("flow", "run", str(path))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        swipe = self._swipes()[0]
+        # list node bounds [0,700][1080,2200] -> center (540, 1450)
+        self.assertEqual(swipe[5:7], ["540", "1450"])
+
+
 class ConvertedRunTests(_AndroidRunBase):
     """`flow run` on a Maestro file: converted on the fly, marked as such."""
 

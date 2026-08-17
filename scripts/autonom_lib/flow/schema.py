@@ -26,6 +26,7 @@ INFRASTRUCTURE = "infrastructure"
 _FAILURE_CLASS_BY_CODE = {
     # The app under test did not behave as the flow asserts.
     errors.FLOW_ASSERTION_TIMEOUT: TEST_FAILURE,
+    errors.FLOW_COPY_EMPTY: TEST_FAILURE,
     errors.NO_MATCHING_NODE: TEST_FAILURE,
     errors.AMBIGUOUS_SELECTOR: TEST_FAILURE,
     errors.SELECTOR_INDEX_OUT_OF_RANGE: TEST_FAILURE,
@@ -39,6 +40,8 @@ _FAILURE_CLASS_BY_CODE = {
     errors.FLOW_SELECTOR_INVALID: FLOW_DEFINITION,
     errors.FLOW_OPTIONAL_ASSERTION_FORBIDDEN: FLOW_DEFINITION,
     errors.FLOW_VAR_UNDEFINED: FLOW_DEFINITION,
+    errors.FLOW_VAR_CONFLICT: FLOW_DEFINITION,
+    errors.FLOW_REPEAT_INVALID: FLOW_DEFINITION,
     errors.FLOW_FILE_NOT_FOUND: FLOW_DEFINITION,
     errors.FLOW_PATH_ESCAPES_WORKSPACE: FLOW_DEFINITION,
     errors.FLOW_CYCLE_DETECTED: FLOW_DEFINITION,
@@ -71,15 +74,17 @@ SELECTOR_RELATIONAL_FIELDS = {
     "rightOf": "right_of",
     "childOf": "child_of",
     "containsChild": "contains_child",
+    "containsDescendants": "contains_descendants",
 }
 # Recognized-but-deferred fields are rejected with a pointed hint so demand is
 # measurable and nothing is silently ignored.
 SELECTOR_DEFERRED_FIELDS = {
-    "containsDescendants": "use containsChild (direct children) or childOf on the target",
     "point": "raw coordinates are not a flow selector; use 'autonom ui tap --x --y' for one-off taps",
     "bounds": "bounds are diagnostic output, not a selector",
 }
 # flow match mode -> (selector.py mode, case_sensitive)
+_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
 MATCH_MODES = {
     "exact": ("exact", True),
     "caseInsensitiveExact": ("exact", False),
@@ -126,6 +131,7 @@ REGISTRY: dict[str, CommandSpec] = {spec.name: spec for spec in [
     # UI actions
     CommandSpec("tapOn", True, shorthand="selector.text", optional_allowed=True,
                 args=(ArgSpec("selector", "selector", required=True),
+                      ArgSpec("repeat", "int"), ArgSpec("delayMs", "int"),
                       _LABEL, _TIMEOUT) + _OPTIONAL),
     CommandSpec("longPressOn", True, shorthand="selector.text",
                 optional_allowed=True, since="0.21.0",
@@ -147,12 +153,24 @@ REGISTRY: dict[str, CommandSpec] = {spec.name: spec for spec in [
     CommandSpec("swipe", True, shorthand="direction",
                 args=(ArgSpec("direction", "str", required=True,
                               choices=("up", "down", "left", "right")),
+                      ArgSpec("from", "selector"),
                       ArgSpec("durationMs", "int"), _LABEL)),
+    CommandSpec("scroll", True, bare=True, since="0.28.1", args=(_LABEL,)),
     CommandSpec("scrollUntilVisible", True, since="0.20.2",
                 args=(ArgSpec("selector", "selector", required=True),
                       ArgSpec("direction", "str",
                               choices=("up", "down", "left", "right")),
-                      ArgSpec("maxSwipes", "int"), _LABEL)),
+                      ArgSpec("maxSwipes", "int"),
+                      ArgSpec("centerElement", "bool"), _LABEL)),
+    CommandSpec("copyTextFrom", False, shorthand="selector.text", since="0.28.1",
+                args=(ArgSpec("selector", "selector", required=True),
+                      ArgSpec("into", "str"), ArgSpec("sensitive", "bool"),
+                      _TIMEOUT, _LABEL)),
+    CommandSpec("setClipboard", False, shorthand="value", since="0.28.1",
+                args=(ArgSpec("value", "str", required=True),
+                      ArgSpec("into", "str"), ArgSpec("sensitive", "bool"),
+                      _LABEL)),
+    CommandSpec("pasteText", True, bare=True, since="0.28.1", args=(_LABEL,)),
     # assertions and waits
     CommandSpec("assertVisible", False, shorthand="selector.text", assertion=True,
                 args=(ArgSpec("selector", "selector", required=True),
@@ -188,8 +206,13 @@ REGISTRY: dict[str, CommandSpec] = {spec.name: spec for spec in [
                       _LABEL)),
     # composition
     CommandSpec("runFlow", True, shorthand="file", since="0.20.2",
-                args=(ArgSpec("file", "str", required=True),
+                args=(ArgSpec("file", "str"),
+                      ArgSpec("commands", "commands"),
                       ArgSpec("env", "env"), ArgSpec("when", "when"), _LABEL)),
+    CommandSpec("repeat", False, since="0.28.1",
+                args=(ArgSpec("commands", "commands", required=True),
+                      ArgSpec("times", "int", required=True),
+                      ArgSpec("while", "when"), _LABEL)),
     CommandSpec("retry", False, since="0.21.0",
                 args=(ArgSpec("commands", "commands", required=True),
                       ArgSpec("maxAttempts", "int"),
@@ -214,7 +237,6 @@ DEFERRED_COMMANDS = {
     "extendedWaitUntil": "use waitUntil with an explicit timeoutMs",
     "runScript": "Flow v1 has no script engine, by design; run scripts outside the flow",
     "evalScript": "Flow v1 has no script engine, by design",
-    "repeat": "unbounded loops are not part of Flow v1",
 }
 
 # --- Header surface ----------------------------------------------------------
@@ -591,6 +613,56 @@ def _finish_step(spec: CommandSpec, args: dict, key: Scalar, path: str) -> Step:
     if "when" in args and spec.name != "runFlow":
         _fail(code, "when is only supported on runFlow in v1",
               path, key.line, key.col)
+    if spec.name == "runFlow":
+        present = [n for n in ("file", "commands") if n in args]
+        if len(present) != 1:
+            _fail(code, "runFlow takes exactly one of file or commands",
+                  path, key.line, key.col,
+                  hint="Reference a subflow file, or inline the commands.")
+        if "commands" in args and not args["commands"]:
+            _fail(code, "runFlow.commands is empty", path, key.line, key.col)
+    if spec.name == "tapOn":
+        taps = args.get("repeat")
+        if taps is not None and not 2 <= taps <= 10:
+            _fail(code, "tapOn.repeat must be between 2 and 10",
+                  path, key.line, key.col,
+                  hint="A single tap needs no repeat; more than 10 declared "
+                       "taps is a loop in disguise — use repeat.")
+        if "delayMs" in args and taps is None:
+            _fail(code, "tapOn.delayMs needs repeat", path, key.line, key.col)
+        if args.get("delayMs", 0) < 0:
+            _fail(code, "tapOn.delayMs cannot be negative",
+                  path, key.line, key.col)
+    if spec.name == "repeat":
+        times = args["times"]
+        if not 1 <= times <= 25:
+            _fail(errors.FLOW_REPEAT_INVALID,
+                  "repeat.times must be between 1 and 25",
+                  path, key.line, key.col,
+                  hint="repeat is bounded, declared iteration — an unbounded "
+                       "loop is not part of Flow v1.")
+        clause = args.get("while")
+        if clause is not None and (clause.platform or clause.env_equals):
+            _fail(errors.FLOW_REPEAT_INVALID,
+                  "repeat.while supports visible/notVisible only",
+                  path, key.line, key.col,
+                  hint="Platform and env conditions do not change between "
+                       "iterations; put them on a runFlow when: instead.")
+        for sub in args["commands"]:
+            if sub.command in ("repeat", "retry", "group", "runFlow"):
+                _fail(errors.FLOW_REPEAT_INVALID,
+                      f"repeat cannot contain {sub.command} — repeated blocks "
+                      "stay small and atomic",
+                      path, sub.line, sub.col)
+        if not args["commands"]:
+            _fail(errors.FLOW_REPEAT_INVALID, "repeat.commands is empty",
+                  path, key.line, key.col)
+    if spec.name in ("copyTextFrom", "setClipboard"):
+        into = args.get("into")
+        if into is not None and not _VAR_NAME_RE.match(into):
+            _fail(errors.FLOW_VAR_CONFLICT,
+                  f"variable name {into!r} must match [A-Za-z_][A-Za-z0-9_]*",
+                  path, key.line, key.col)
     if spec.name == "retry":
         attempts = args.setdefault("maxAttempts", 2)
         if not 1 <= attempts <= 3:
@@ -598,7 +670,7 @@ def _finish_step(spec: CommandSpec, args: dict, key: Scalar, path: str) -> Step:
                   path, key.line, key.col,
                   hint="Retrying a large block hides defects; keep it tight.")
         for sub in args["commands"]:
-            if sub.command in ("retry", "group", "runFlow"):
+            if sub.command in ("retry", "group", "runFlow", "repeat"):
                 _fail(code, f"retry cannot contain {sub.command} — retried "
                             "blocks stay small and atomic",
                       path, sub.line, sub.col)

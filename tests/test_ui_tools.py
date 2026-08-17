@@ -204,6 +204,24 @@ class RelationalSelectorTests(unittest.TestCase):
             mode="exact", case_sensitive=True)
         self.assertEqual(len(containers), 1)
 
+    def test_contains_descendants_matches_any_depth(self) -> None:
+        nodes = [
+            {"ref": "a", "parent": None, "text": "outer"},
+            {"ref": "b", "parent": "a", "text": "row"},
+            {"ref": "c", "parent": "b", "text": "Price"},
+        ]
+        deep = self.selector_mod.select(
+            nodes, {"text": "outer",
+                    "contains_descendants": self._rel({"text": "Price"})},
+            mode="exact", case_sensitive=True)
+        self.assertEqual(len(deep), 1)
+        self.assertEqual(deep[0]["ref"], "a")
+        direct = self.selector_mod.select(
+            nodes, {"text": "outer",
+                    "contains_child": self._rel({"text": "Price"})},
+            mode="exact", case_sensitive=True, all_matches=True)
+        self.assertEqual(direct, [], "grandchild is not a DIRECT child")
+
     def test_parent_annotation_shape(self) -> None:
         roots = [n for n in self.nodes if n["parent"] is None]
         self.assertEqual(len(roots), 1)

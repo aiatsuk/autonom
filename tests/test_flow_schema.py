@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from autonom_lib import errors  # noqa: E402
-from autonom_lib.flow import parser, schema  # noqa: E402
+from autonom_lib.flow import canonical, parser, schema  # noqa: E402
 
 _HEAD = "schema: autonom.dev/flow/v1\nname: x\n---\n"
 
@@ -36,7 +36,8 @@ class RegistryIntegrityTests(unittest.TestCase):
             with self.subTest(command=name):
                 self.assertIsInstance(spec.mutating, bool)
                 self.assertIn(spec.since,
-                              ("0.20.0", "0.20.1", "0.20.2", "0.21.0"))
+                              ("0.20.0", "0.20.1", "0.20.2", "0.21.0",
+                               "0.28.1"))
 
     def test_assertions_are_never_mutating(self) -> None:
         for spec in schema.REGISTRY.values():
@@ -60,6 +61,72 @@ class RegistryIntegrityTests(unittest.TestCase):
         for file in flow_dir.glob("*.py"):
             self.assertNotIn("FLOW_NOT_FOUND", file.read_text(encoding="utf-8"),
                              f"{file.name} references the network-owned code")
+
+
+class Slice0281ValidationTests(unittest.TestCase):
+    """Static rules for the 0.28.1 commands: repeat, variables, composition."""
+
+    def test_repeat_bounds(self) -> None:
+        body = "- repeat:\n    times: {n}\n    commands:\n      - back\n"
+        _rejects(self, _HEAD + body.format(n=0), errors.FLOW_REPEAT_INVALID)
+        _rejects(self, _HEAD + body.format(n=26), errors.FLOW_REPEAT_INVALID)
+        flow = _build(_HEAD + body.format(n=25))
+        self.assertEqual(flow.steps[0].args["times"], 25)
+
+    def test_repeat_requires_times(self) -> None:
+        _rejects(self, _HEAD + "- repeat:\n    commands:\n      - back\n",
+                 errors.FLOW_COMMAND_INVALID, "times")
+
+    def test_repeat_refuses_composition_inside(self) -> None:
+        for inner in ("- runFlow: sub.yaml",
+                      "- repeat:\n          times: 2\n          commands:\n"
+                      "            - back"):
+            with self.subTest(inner=inner.split(":")[0]):
+                _rejects(self, _HEAD + "- repeat:\n    times: 2\n"
+                         f"    commands:\n      {inner}\n",
+                         errors.FLOW_REPEAT_INVALID)
+
+    def test_repeat_while_is_ui_only(self) -> None:
+        _rejects(self, _HEAD + "- repeat:\n    times: 2\n"
+                 "    while:\n      platform: android\n"
+                 "    commands:\n      - back\n",
+                 errors.FLOW_REPEAT_INVALID, "visible/notVisible")
+
+    def test_runflow_takes_exactly_one_of_file_or_commands(self) -> None:
+        _rejects(self, _HEAD + "- runFlow:\n    file: a.yaml\n"
+                 "    commands:\n      - back\n",
+                 errors.FLOW_COMMAND_INVALID, "exactly one")
+        _rejects(self, _HEAD + "- runFlow:\n    env:\n      A: b\n",
+                 errors.FLOW_COMMAND_INVALID, "exactly one")
+
+    def test_tap_repeat_bounds(self) -> None:
+        base = "- tapOn:\n    selector:\n      text: X\n"
+        _rejects(self, _HEAD + base + "    repeat: 1\n",
+                 errors.FLOW_COMMAND_INVALID, "between 2 and 10")
+        _rejects(self, _HEAD + base + "    delayMs: 50\n",
+                 errors.FLOW_COMMAND_INVALID, "needs repeat")
+
+    def test_retry_refuses_repeat_inside(self) -> None:
+        _rejects(self, _HEAD + "- retry:\n    commands:\n"
+                 "      - repeat:\n          times: 2\n"
+                 "          commands:\n            - back\n",
+                 errors.FLOW_COMMAND_INVALID, "cannot contain repeat")
+
+    def test_variable_name_is_validated(self) -> None:
+        _rejects(self, _HEAD + "- setClipboard:\n    value: x\n"
+                 "    into: 9bad\n", errors.FLOW_VAR_CONFLICT)
+
+    def test_contains_descendants_round_trips(self) -> None:
+        text = (_HEAD + "- assertVisible:\n    selector:\n      role: list\n"
+                "      match: exact\n"
+                "      containsDescendants:\n        text: Price\n")
+        flow = _build(text)
+        selector = flow.steps[0].selector
+        self.assertIn("contains_descendants", selector.relations)
+        emitted = canonical.emit_flow(flow)
+        again = schema.build_flow(parser.parse_document(emitted, "t.yaml"))
+        self.assertEqual(canonical.fingerprint(flow),
+                         canonical.fingerprint(again))
 
 
 class HeaderTests(unittest.TestCase):

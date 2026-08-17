@@ -34,7 +34,7 @@ _HEADER_ORDER = ("schema", "id", "appId", "name", "description", "tags",
 _SELECTOR_ORDER = ("id", "text", "description", "role",
                    "enabled", "checked", "selected", "focused")
 _RELATION_ORDER = ("above", "below", "leftOf", "rightOf",
-                   "childOf", "containsChild")
+                   "childOf", "containsChild", "containsDescendants")
 _EVIDENCE_ORDER = ("mode", "beforeMutation", "afterAssertion", "collect", "bodies")
 _PLAIN_SAFE_FIRST = re.compile(r"[^\[\]{}&*!|>#%'\"@`?,\s-]")
 
@@ -132,8 +132,9 @@ def _emit_selector(writer: _Writer, indent: int, key: str,
                            selector.source_relations[name])
 
 
-def _emit_when(writer: _Writer, indent: int, when: WhenClause) -> None:
-    writer.line(indent, "when:")
+def _emit_when(writer: _Writer, indent: int, when: WhenClause,
+               key: str = "when") -> None:
+    writer.line(indent, f"{key}:")
     if when.platform:
         writer.pair(indent + 2, "platform", when.platform)
     if when.visible is not None:
@@ -160,7 +161,7 @@ def _emit_step(writer: _Writer, indent: int, step: Step) -> None:
         elif arg.kind == "env":
             writer.string_map(arg_indent, arg.name, value)
         elif arg.kind == "when":
-            _emit_when(writer, arg_indent, value)
+            _emit_when(writer, arg_indent, value, key=arg.name)
         elif arg.kind == "commands":
             writer.line(arg_indent, f"{arg.name}:")
             for sub in value:

@@ -10,8 +10,7 @@ from __future__ import annotations
 from typing import Callable
 
 from . import selectors as flow_selectors
-from .schema import MATCH_MODES, WhenClause
-from .. import selector as selector_engine
+from .schema import WhenClause
 
 
 def evaluate(when: WhenClause, platform: str, values: dict,
@@ -30,11 +29,7 @@ def evaluate(when: WhenClause, platform: str, values: dict,
             continue
         if nodes is None:
             nodes = snapshot()
-        mode, case_sensitive = MATCH_MODES[selector.match]
-        matches = selector_engine.select(
-            nodes, dict(selector.fields),
-            mode=mode, case_sensitive=case_sensitive, all_matches=True,
-        )
+        matches = flow_selectors.select_all(nodes, selector)
         if bool(matches) != want:
             return False, (f"{label}: {flow_selectors.describe(selector)} "
                            f"{'not found' if want else 'still present'}")

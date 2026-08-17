@@ -71,6 +71,19 @@ Scalars are single-line: plain, `'single-quoted'` (`''` escapes a quote), or
 scalar; `$${` is a literal `${`. Non-secret defaults live in the header
 `env:`; secrets are passed at run time and never stored in the file.
 
+**Run-scope variables** (no scripting involved): `copyTextFrom` reads the
+matched node's text (falling back to its description; an empty read is a
+test failure, `flow_copy_empty`) and `setClipboard` stores a literal — both
+into `into: NAME` or the implicit `COPIED_TEXT`, which `pasteText` types.
+Variables are global to the run, resolve after secrets and before `env`,
+and may carry `sensitive: true` (the value is then redacted like secret
+input). Order is checked **statically** before any device action: a
+`${NAME}` used before its defining step, a name colliding with a declared
+env/secret (`flow_var_conflict`), or a `pasteText` with nothing copied all
+refuse at pre-flight. Definitions inside `repeat` or a `when:`-guarded
+`runFlow` are not guaranteed to run and do not count outside them; cleanup
+hooks see only what `onFlowStart` defined.
+
 ## Selectors
 
 ```yaml
@@ -93,15 +106,16 @@ Relational constraints narrow a match by another element (the *anchor*):
 selector:
   text: Settings
   match: exact
-  leftOf:            # also: above, below, rightOf, childOf, containsChild
-    id: com.example.app:id/settings_secondary
+  leftOf:            # also: above, below, rightOf, childOf, containsChild,
+    id: com.example.app:id/settings_secondary   # containsDescendants
 ```
 
 Geometry is a pure edge comparison (no "nearest" guessing) and the anchor
 of a geometric relation must match exactly one on-screen element; `childOf`
-walks ancestors and `containsChild` checks direct children via the parent
-refs every snapshot carries. Anchors identify by fields alone — no `index`,
-no nested relations.
+walks ancestors, `containsChild` checks direct children, and
+`containsDescendants` checks any depth below, via the parent refs every
+snapshot carries. Anchors identify by fields alone — no `index`, no nested
+relations.
 
 ## Where flow files live
 
@@ -127,21 +141,25 @@ is not listed here fails the build, and vice versa.
 header: schema appId name id description tags properties env requires evidence onFlowStart onFlowComplete
 selector-strings: id text description role
 selector-bools: enabled checked selected focused
-selector-relational: above below leftOf rightOf childOf containsChild
+selector-relational: above below leftOf rightOf childOf containsChild containsDescendants
 match-modes: exact caseInsensitiveExact contains regex
 command launchApp: clearState label
 command stopApp: label
 command clearState: label
 command openLink: url label
-command tapOn: selector label timeoutMs optional reason
+command tapOn: selector repeat delayMs label timeoutMs optional reason
 command longPressOn: selector durationMs label timeoutMs optional reason
 command doubleTapOn: selector label timeoutMs optional reason
 command inputText: value sensitive label
 command eraseText: chars label
 command pressKey: key label
 command back: label
-command swipe: direction durationMs label
-command scrollUntilVisible: selector direction maxSwipes label
+command swipe: direction from durationMs label
+command scroll: label
+command scrollUntilVisible: selector direction maxSwipes centerElement label
+command copyTextFrom: selector into sensitive timeoutMs label
+command setClipboard: value into sensitive label
+command pasteText: label
 command assertVisible: selector timeoutMs label
 command assertNotVisible: selector timeoutMs label
 command assertEnabled: selector timeoutMs label
@@ -151,13 +169,14 @@ command setLocation: latitude longitude label
 command setPermissions: action service appId label
 command addMedia: path label
 command setOrientation: orientation label
-command runFlow: file env when label
+command runFlow: file commands env when label
+command repeat: commands times while label
 command retry: commands maxAttempts onlyOn allowMutations label
 command group: commands label
 command takeScreenshot: label
 command checkpoint: name
 command note: text
-deferred: waitForIdle extendedWaitUntil runScript evalScript repeat
+deferred: waitForIdle extendedWaitUntil runScript evalScript
 ```
 
 ## Semantics fixed by the language (run slice)
@@ -166,7 +185,15 @@ deferred: waitForIdle extendedWaitUntil runScript evalScript repeat
   (exit 1, `failure_class: test_failure`), a dead backend is an
   *infrastructure error* (exit 2).
 - Mutating commands (taps, input, links, device state) execute **exactly
-  once** — never retried implicitly.
+  once** — never retried implicitly. `tapOn` with `repeat:` is N *declared*
+  taps, not recovery.
+- `repeat` is bounded, declared iteration: `times` (1–25) is the hard
+  limit, `while:` (`visible`/`notVisible` only) stops the loop early the
+  moment it no longer holds; a failing iteration fails the flow, and
+  composition (`runFlow`/`retry`/`group`/`repeat`) does not nest inside.
+- `runFlow` with inline `commands:` runs an anonymous subflow: the parent
+  frame stays visible and `env:` overlays it (a `file:` subflow starts
+  from its own header env instead).
 - `optional: true` exists only for external UI that does not define the
   scenario's success (the three tap commands only), always with a `reason:`;
   an optional assertion is a contradiction and is refused.
@@ -232,11 +259,15 @@ documented Core Profile — header `appId`/`name`/`tags`/`env`/`properties`/
 `eraseText` (`charactersToErase`), `pressKey`, `swipe` (direction),
 `back`, `openLink` (link), `assertVisible`/`assertNotVisible`,
 `extendedWaitUntil`→`waitUntil`, `takeScreenshot`, `scrollUntilVisible`
-(`element`/`direction`), `retry` (`maxRetries`+1→`maxAttempts`, capped at
-3 attempts; mutating children get an explicit `allowMutations: true`
-because that is what Maestro's retry does), `runFlow` (`file`, `env`,
-`when`), selectors `text`/`id`/`index`/`enabled` — into validated canonical
-Flow v1. Import-only courtesies: single-line flow mappings
+(`element`/`direction`/`centerElement`), `retry` (`maxRetries`+1→
+`maxAttempts`, capped at 3 attempts; mutating children get an explicit
+`allowMutations: true` because that is what Maestro's retry does),
+`runFlow` (`file` or inline `commands`, `env`, `when`), `copyTextFrom`/
+`setClipboard`/`pasteText` (host-side variables — the OS clipboard is
+untouched, exactly like Maestro), `repeat` (finite `times` required, ≤25;
+`while` `visible`/`notVisible`; a JS `true:` refuses), `scroll`, `swipe`
+`from:`, `tapOn` `repeat`/`delay`, selectors `text`/`id`/`index`/`enabled`
+— into validated canonical Flow v1. Import-only courtesies: single-line flow mappings
 (`tapOn: {text: X, index: 1}` — the native grammar still refuses `{...}`),
 and Maestro's on-selector `label`/`optional` move to the command
 (`optional` on the tap commands only, with the generated
@@ -267,4 +298,9 @@ entry says so) — converting to a file is always the explicit
 All Flow DSL codes are new and distinct from network capture's
 `flow_not_found` (a recorded HTTP request — mitmproxy vocabulary — which that
 subsystem keeps forever; see `docs/COMPATIBILITY.md`). Parse and validation
-failures carry `file`, `line`, `column`, and `reason` extras.
+failures carry `file`, `line`, `column`, and `reason` extras. The variable
+and iteration features add three stable codes: `flow_var_conflict` (an
+`into:` name collides with a declared env/secret name anywhere in the flow
+graph — static), `flow_repeat_invalid` (repeat bounds/nesting violations —
+static), and `flow_copy_empty` (the matched node carries no text — a test
+failure).
