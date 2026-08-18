@@ -16,6 +16,7 @@ import base64
 import html
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any
 from xml.sax.saxutils import escape as xml_escape, quoteattr
@@ -162,6 +163,25 @@ def render_html(manifest: dict[str, Any], artifacts_dir: Path) -> str:
 """
 
 
+_LEGACY_FRAME_RE = re.compile(
+    r"^\d{4}_\d{6}_(?:failure-)?step-(\d+)(?:-(?:before|after))?\.(?:png|json|txt)$")
+_LEGACY_SIDECAR_RE = re.compile(
+    r"^(?:failure-)?step-(\d+)-(?:hierarchy\.json|logs\.txt)$")
+
+
+def _legacy_step_index(name: str) -> int | None:
+    """Step number for a v1 manifest, from the harness's own file naming only.
+
+    Anchored on purpose: an arbitrary `takeScreenshot` label must never be
+    read as a step number (that bug is exactly why the ledger exists).
+    """
+    for pattern in (_LEGACY_FRAME_RE, _LEGACY_SIDECAR_RE):
+        match = pattern.match(name)
+        if match:
+            return int(match.group(1))
+    return None
+
+
 def _step_assets(manifest: dict[str, Any], artifacts_dir: Path,
                  assets: Path, mode: str,
                  file_mode: int = 0o644) -> dict[int, dict[str, Any]]:
@@ -190,8 +210,16 @@ def _step_assets(manifest: dict[str, Any], artifacts_dir: Path,
             continue
         entry = ledger.get(relative)
         if entry is None:
-            continue  # v1 manifest or an artifact nobody claimed: see _orphans
-        index = entry.get("step_index")
+            # v1 manifest (no ledger): fall back to the harness's own naming,
+            # which is machine-generated for auto-captured frames. A label the
+            # user chose is never trusted as a step number — those frames are
+            # listed under "unattached evidence" instead of guessed at.
+            index = _legacy_step_index(source.name) if not ledger else None
+            if index is None:
+                by_step.setdefault(0, {}).setdefault("orphans", []).append(relative)
+                continue
+        else:
+            index = entry.get("step_index")
         if not isinstance(index, int):
             continue
         name = source.name
@@ -260,6 +288,14 @@ def render_run_page(manifest: dict[str, Any], evidence: dict[int, dict],
                         f"</summary><pre>{e(found['logs'])}</pre></details>")
         blocks.append(head + "".join(bits))
 
+    stray = evidence.get(0, {}).get("orphans") or []
+    orphans = ("<h2>Unattached evidence</h2><ul>"
+               + "".join(f"<li><code>{e(str(name))}</code></li>" for name in stray)
+               + "</ul>") if stray else ""
+    stray = evidence.get(0, {}).get("orphans") or []
+    orphans = ("<h2>Unattached evidence</h2><ul>"
+               + "".join(f"<li><code>{e(str(name))}</code></li>" for name in stray)
+               + "</ul>") if stray else ""
     sensitive = ("<p class='sensitive'>⚠ This run used secrets or sensitive "
                  "input; frames may show private data. Share deliberately."
                  "</p>" if manifest.get("sensitive") else "")
@@ -293,6 +329,7 @@ reproduce: <code>{e(_shorten(str(manifest.get('reproduction','')), base))}</code
 app <code>{e(str(manifest.get('app_id','')))}</code> ·
 run <code>{e(str(manifest.get('run_id','')))}</code></p>
 {''.join(blocks)}
+{orphans}
 """
 
 
