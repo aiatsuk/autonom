@@ -209,17 +209,17 @@ class RelationalSelectorTests(unittest.TestCase):
         Flutter/iOS in the accessibility label (`desc`)."""
         nodes = [
             {"ref": "a", "parent": None, "text": "Profile", "desc": None},
-            {"ref": "b", "parent": None, "text": None, "desc": "Профиль"},
+            {"ref": "b", "parent": None, "text": None, "desc": "Profil"},
             {"ref": "c", "parent": None, "text": None, "desc": "Other"},
         ]
         android = self.selector_mod.select(
             nodes, {"visible_text": "Profile"}, mode="exact", case_sensitive=True)
         self.assertEqual(android[0]["ref"], "a")
         flutter = self.selector_mod.select(
-            nodes, {"visible_text": "Профиль"}, mode="exact", case_sensitive=True)
+            nodes, {"visible_text": "Profil"}, mode="exact", case_sensitive=True)
         self.assertEqual(flutter[0]["ref"], "b", "must reach the desc label")
         strict = self.selector_mod.select(
-            nodes, {"text": "Профиль"}, mode="exact", case_sensitive=True,
+            nodes, {"text": "Profil"}, mode="exact", case_sensitive=True,
             all_matches=True)
         self.assertEqual(strict, [], "strict text must NOT reach desc")
 

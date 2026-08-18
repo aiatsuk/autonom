@@ -675,9 +675,20 @@ class Executor:
 
         when = step.args.get("when")
         if when is not None:
-            met, reason = flow_conditions.evaluate(
-                self._resolve_when(when), self.target.platform, self.values,
-                lambda: ui_mod.snapshot(self.target))
+            try:
+                met, reason = flow_conditions.evaluate(
+                    self._resolve_when(when), self.target.platform, self.values,
+                    lambda: ui_mod.snapshot(self.target))
+            except errors.AutonomError as exc:
+                # a broken condition is a failure OF THIS STEP: record it so it
+                # appears in the timeline and the manifest, then unwind
+                outcome.status = "failed"
+                outcome.error_code = exc.code
+                outcome.failure_class = failure_class(exc.code)
+                outcome.error = exc.message
+                self._finish_runflow(outcome, payload, self.clock(),
+                                     writer, result)
+                raise
             if not met:
                 outcome.status = "skipped"
                 outcome.skip_reason = reason
@@ -823,9 +834,13 @@ class Executor:
         try:
             for _ in range(times):
                 if clause is not None:
-                    met, reason = flow_conditions.evaluate(
-                        self._resolve_when(clause), self.target.platform,
-                        self.values, lambda: ui_mod.snapshot(self.target))
+                    try:
+                        met, reason = flow_conditions.evaluate(
+                            self._resolve_when(clause), self.target.platform,
+                            self.values, lambda: ui_mod.snapshot(self.target))
+                    except errors.AutonomError:
+                        status = "failed"   # recorded by the finally block
+                        raise
                     if not met:
                         stop_reason = reason
                         break

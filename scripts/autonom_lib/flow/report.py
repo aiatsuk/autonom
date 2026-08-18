@@ -82,11 +82,23 @@ def render_html(manifest: dict[str, Any], artifacts_dir: Path) -> str:
     for relative in manifest.get("artifacts", []):
         if not relative.endswith(".png"):
             continue
-        uri = _inline_image(artifacts_dir / relative)
+        source = artifacts_dir / relative
+        uri = _inline_image(source)
         if uri:
             images.append(
                 f"<figure><img src='{uri}' alt='{e(relative)}'>"
                 f"<figcaption>{e(relative)}</figcaption></figure>")
+        else:
+            # never let a frame vanish silently — an absent figure reads as
+            # "nothing was captured", which is a lie about the evidence
+            try:
+                size = source.stat().st_size / 1_000_000
+                detail = f"{size:.1f} MB, too large to inline"
+            except OSError:
+                detail = "unreadable"
+            images.append(
+                f"<figure class='missing'><figcaption>{e(relative)} — "
+                f"{e(detail)}; open the file directly</figcaption></figure>")
 
     failure = manifest.get("primary_error")
     failure_html = ""
@@ -151,7 +163,8 @@ def render_html(manifest: dict[str, Any], artifacts_dir: Path) -> str:
 
 
 def _step_assets(manifest: dict[str, Any], artifacts_dir: Path,
-                 assets: Path, mode: str) -> dict[int, dict[str, Any]]:
+                 assets: Path, mode: str,
+                 file_mode: int = 0o644) -> dict[int, dict[str, Any]]:
     """Copy this run's evidence next to the report and index it by step.
 
     The step of each artifact comes from the manifest's ``artifact_steps``
@@ -186,7 +199,7 @@ def _step_assets(manifest: dict[str, Any], artifacts_dir: Path,
             target.mkdir(parents=True, exist_ok=True)
             copy = target / name
             copy.write_bytes(source.read_bytes())
-            os.chmod(copy, 0o644)
+            os.chmod(copy, file_mode)
             by_step.setdefault(index, {}).setdefault("shots", []).append(
                 f"assets/{run_id}/{name}")
         elif name.endswith("-logs.txt"):
@@ -196,7 +209,7 @@ def _step_assets(manifest: dict[str, Any], artifacts_dir: Path,
             target.mkdir(parents=True, exist_ok=True)
             copy = target / name
             copy.write_bytes(source.read_bytes())
-            os.chmod(copy, 0o644)
+            os.chmod(copy, file_mode)
             by_step.setdefault(index, {})["hierarchy"] = f"assets/{run_id}/{name}"
     return by_step
 
@@ -224,9 +237,12 @@ def render_run_page(manifest: dict[str, Any], evidence: dict[int, dict],
                         f"{e(json.dumps(step['selector'], ensure_ascii=False))}"
                         f"</code></p>")
         if step.get("skip_reason"):
+            tolerated = (f" — tolerated {e(str(step.get('error_code','')))}: "
+                         f"{e(str(step.get('error','')))}"
+                         if step.get("error") else "")
             bits.append(f"<p class='s-skipped'>skipped: "
-                        f"{e(str(step['skip_reason']))}</p>")
-        if step.get("error"):
+                        f"{e(str(step['skip_reason']))}{tolerated}</p>")
+        elif step.get("error"):
             bits.append(f"<p class='s-failed'><b>"
                         f"{e(str(step.get('error_code','')))}</b> "
                         f"({e(str(step.get('failure_class','')))})<br>"
@@ -244,6 +260,9 @@ def render_run_page(manifest: dict[str, Any], evidence: dict[int, dict],
                         f"</summary><pre>{e(found['logs'])}</pre></details>")
         blocks.append(head + "".join(bits))
 
+    sensitive = ("<p class='sensitive'>⚠ This run used secrets or sensitive "
+                 "input; frames may show private data. Share deliberately."
+                 "</p>" if manifest.get("sensitive") else "")
     return f"""<meta charset="utf-8">
 <meta http-equiv="Content-Security-Policy"
       content="default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'">
@@ -261,10 +280,13 @@ def render_run_page(manifest: dict[str, Any], evidence: dict[int, dict],
   .status {{ color: {color}; font-weight: 700; }}
   .s-failed {{ color: #b42318; }} .s-passed {{ color: #1a7f37; }}
   .s-skipped {{ color: #9a6700; }} .muted {{ color: #57606a; font-weight: 400; }}
+  .sensitive {{ background: #fff8c5; padding: .5rem .8rem; border-radius: 6px; }}
+  .missing {{ color: #57606a; font-style: italic; }}
 </style>
 <p><a href="index.html">← all flows</a></p>
 <h1>{e(str(manifest.get('flow_name','flow')))}
     <span class="status">{e(status)}</span></h1>
+{sensitive}
 <p class="muted"><code>{e(_shorten(str(manifest.get('flow_path','')), base))}</code><br>
 reproduce: <code>{e(_shorten(str(manifest.get('reproduction','')), base))}</code><br>
 {e(str(manifest.get('platform','')))} {e(str(manifest.get('target_id','')))} ·
@@ -314,11 +336,17 @@ def render_suite_html(manifests: list[dict[str, Any]],
                 detail = e(str(step["label"]))
             elif step.get("selector"):
                 detail = f"<code>{e(json.dumps(step['selector'], ensure_ascii=False))}</code>"
-            if step.get("error"):
+            status = step.get("status")
+            if status == "failed" and step.get("error"):
                 detail += (f"<br><b>{e(str(step.get('error_code','')))}</b> "
                            f"{e(str(step['error']))}")
             if step.get("skip_reason"):
-                detail += f"<br><i>skipped: {e(str(step['skip_reason']))}</i>"
+                # an optional step keeps the error it tolerated — showing it in
+                # failure red would call a deliberate skip a defect
+                tolerated = (f" (tolerated {e(str(step.get('error_code','')))})"
+                             if step.get("error") else "")
+                detail += (f"<br><i class='muted'>skipped: "
+                           f"{e(str(step['skip_reason']))}{tolerated}</i>")
             rows.append(
                 f"<tr><td>{step.get('index','')}</td>"
                 f"<td><code>{e(str(step.get('command','')))}</code></td>"
@@ -347,6 +375,10 @@ def render_suite_html(manifests: list[dict[str, Any]],
             "<table><tr><th>#</th><th>command</th><th></th><th>time</th>"
             f"<th>detail</th></tr>{step_rows(manifest)}</table></details>")
 
+    sensitive_note = (
+        "<p class='sensitive'>⚠ Some runs used secrets or sensitive input; "
+        "their frames may show private data. Share deliberately.</p>"
+        if any(m.get("sensitive") for m in manifests) else "")
     failed_list = "".join(
         f"<li class='s-failed'>{e(str(m.get('flow_name','')))} — "
         f"{e(str((m.get('primary_error') or {}).get('error_code','')))}</li>"
@@ -372,6 +404,7 @@ def render_suite_html(manifests: list[dict[str, Any]],
   .totals div {{ font-size: 1.6rem; font-weight: 700; }}
   .totals span {{ display: block; font-size: .8rem; font-weight: 400;
                   color: #57606a; }}
+  .sensitive {{ background: #fff8c5; padding: .5rem .8rem; border-radius: 6px; }}
 </style>
 <h1>Flow suite <span class="status">{e(status)}</span></h1>
 <div class="totals">
@@ -380,6 +413,7 @@ def render_suite_html(manifests: list[dict[str, Any]],
   <div class="s-failed">{len(failed)}<span>failed</span></div>
   <div>{total_ms/1000:.0f}s<span>total step time</span></div>
 </div>
+{sensitive_note}
 <h2>Failures</h2>
 <ul>{failed_list}</ul>
 <h2>Flows</h2>

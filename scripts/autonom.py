@@ -6,6 +6,7 @@ import argparse
 import difflib
 import json
 import os
+import shutil
 import re
 import subprocess
 import sys
@@ -2205,15 +2206,25 @@ def cmd_report_suite(args: argparse.Namespace) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     base = Path(args.relative_to).resolve() if args.relative_to else None
     artifacts_dir = Path(record["artifacts_dir"])
+    sensitive_run = any(m.get("sensitive") for m in manifests)
+    # a sensitive run's frames may show private data: keep the whole tree
+    # owner-only, exactly as `report build` does for a single run
+    mode = 0o600 if sensitive_run else 0o644
     pages: dict[str, str] = {}
     if args.detailed:
         assets = out_dir / "assets"
         runs_dir = out_dir / "runs"
+        # a stale page or asset dir from a previous, different run must not
+        # survive into this site and be read as current evidence
+        for stale in (runs_dir, assets):
+            if stale.is_dir() and stale.resolve().is_relative_to(out_dir.resolve()):
+                shutil.rmtree(stale)
         runs_dir.mkdir(parents=True, exist_ok=True)
         for manifest in manifests:
             run_id = str(manifest.get("run_id") or "run")
             evidence = flow_report._step_assets(
-                manifest, artifacts_dir, assets, args.screenshots)
+                manifest, artifacts_dir, assets, args.screenshots,
+                file_mode=mode)
             page = runs_dir / f"{run_id}.html"
             page.write_text(
                 flow_report.render_run_page(manifest, evidence, base=base)
@@ -2221,17 +2232,17 @@ def cmd_report_suite(args: argparse.Namespace) -> int:
                 .replace("src='assets/", "src='../assets/")
                 .replace("href='assets/", "href='../assets/"),
                 encoding="utf-8")
-            os.chmod(page, 0o644)
+            os.chmod(page, mode)
             pages[run_id] = f"runs/{run_id}.html"
     html_path = out_dir / ("index.html" if pages else "suite.html")
     html_path.write_text(
         flow_report.render_suite_html(manifests, base=base, pages=pages or None),
         encoding="utf-8")
-    os.chmod(html_path, 0o644 if pages else 0o600)
+    os.chmod(html_path, mode)
     junit_path = out_dir / "suite.xml"
     junit_path.write_text(flow_report.render_suite_junit(manifests),
                           encoding="utf-8")
-    os.chmod(junit_path, 0o600)
+    os.chmod(junit_path, mode)  # CI must be able to read the JUnit it consumes
     failed = [m for m in manifests if m.get("status") != "passed"]
     payload = {
         "ok": True,

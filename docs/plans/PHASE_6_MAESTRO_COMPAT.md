@@ -1,6 +1,6 @@
 # Phase 6: Maestro Core Profile v2 — near-full import compatibility
 
-**Status:** in progress — 0.28.0 (import courtesy) and 0.28.1 (engine commands) shipped; 0.28.2–0.28.3 pending
+**Status:** in progress — shipped: 0.28.0 (import courtesy), 0.28.1 (engine commands), 0.28.2 (`visibleText` selector fidelity), 0.28.3 (suite/detailed reports), 0.28.4 (manifest v2 + evidence integrity). Pending: the device-state commands and launch arguments originally planned as 0.28.2–0.28.3, both gated on on-device spikes
 **Goal:** run the overwhelming majority of real-world Maestro flows through Autonom — by widening the documented Core Profile from "toy flows" to every Maestro command and argument that can be implemented honestly under Autonom's invariants, and by letting `flow run` execute a Maestro file directly through transparent import. Scope is explicitly bounded: no JavaScript, no AI commands, no random input, no raw coordinates, no pixel assertions, no settle heuristics.
 **Depends on:** `PHASE_5_FLOW_DSL.md` (Flow v1 language, executor, Maestro Core Profile v1 in 0.22.0); research: `docs/AUTONOM_PRODUCT_RESEARCH_REVYL_MAESTRO.md` §15 (versioned Core Profile commitment).
 **Target versions:**

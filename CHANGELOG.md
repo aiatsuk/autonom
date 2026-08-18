@@ -24,6 +24,35 @@ missing most of what a real report needs.
   `artifact_steps` — the authoritative artifact→step ledger.
 
 ### Fixed
+- **Reports called deliberate skips failures.** An `optional: true` step keeps
+  the error it tolerated, and both suite renderers printed that error in
+  failure red regardless of the step's status — a skipped step looked like a
+  defect on every page. The error block is now gated on `status: failed`;
+  a skip shows its reason with the tolerated code as muted text.
+- **A frame too large to inline silently disappeared** from the single-run
+  report (`_MAX_INLINE_IMAGE`, 2 MB — an ordinary 1080×2400 emulator frame
+  exceeds it): the report then read as "nothing was captured". Oversized
+  frames now render a placeholder naming the file and its size.
+- **The sensitive guardrail stopped at the single-run report.** The suite and
+  per-flow pages never looked at `sensitive`, and their assets were written
+  0644. Both now carry the ⚠ banner, and a sensitive run keeps the whole
+  output tree owner-only.
+- `suite.xml` was hard-coded 0600 while everything around it was 0644 — the
+  one file CI actually consumes was the one CI could not read.
+- `report suite --detailed` never pruned its output: `runs/` and `assets/`
+  from an earlier, different run survived into the new site and read as
+  current evidence. Both are rebuilt from scratch (inside `--out` only).
+- **`flow export --format maestro` dropped arguments silently** — `optional`,
+  `reason`, `label` and `eraseText.chars` vanished, directly contradicting the
+  profile's "convert faithfully or refuse" contract. They now carry over
+  (Maestro has equivalents for all of them), and a per-command `timeoutMs`,
+  which Maestro cannot express, refuses with a pointer to `extendedWaitUntil`.
+  The refusal hint no longer claims `retry`/`scrollUntilVisible` are
+  Autonom-only — both are Maestro commands that this release imports.
+- An `AutonomError` raised while **evaluating** a `runFlow when:` or a
+  `repeat while:` clause produced no step outcome at all: it unwound past the
+  timeline, so the manifest showed no failing step. The failure now lands on
+  the step that owns the condition.
 - **An aborted run left no evidence at all.** An infrastructure or
   flow-definition failure raised straight out of `run()`, so `_write_manifest`
   never executed: the one run a human most needs to inspect had no manifest and

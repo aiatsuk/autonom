@@ -760,7 +760,14 @@ def export_flow(flow: Flow, path: str) -> str:
             lines.append("- launchApp:")
             lines.append("    clearState: true")
             continue
-        if command in ("stopApp", "clearState", "back", "eraseText"):
+        if command == "eraseText":
+            chars = step.args.get("chars")
+            # Maestro's bare `- eraseText` erases everything; ours erases a
+            # count. Emitting the bare form would silently change the flow.
+            lines.append(f"- eraseText: {chars}" if chars is not None
+                         else "- eraseText")
+            continue
+        if command in ("stopApp", "clearState", "back"):
             lines.append(f"- {command}")
             continue
         if command in ("tapOn", "longPressOn", "assertVisible", "assertNotVisible",
@@ -779,8 +786,26 @@ def export_flow(flow: Flow, path: str) -> str:
                     "Maestro Core Profile",
                     file=path, line=step.line,
                 )
+            if "timeoutMs" in step.args:
+                # Maestro's per-command lookup timeout lives on
+                # extendedWaitUntil, not on tapOn/assertVisible — exporting
+                # without it would quietly change how long the step waits
+                raise errors.AutonomError(
+                    errors.UNSUPPORTED_FLOW_COMMAND,
+                    f"{path}: {command}.timeoutMs has no Maestro equivalent",
+                    hint="Express the wait as extendedWaitUntil, or drop the "
+                         "explicit timeout before exporting.",
+                    file=path, line=step.line, command=command,
+                )
             lines.append(f"- {command}:")
             emit_selector("    ", selector)
+            # Maestro carries these on the selector map itself
+            if step.args.get("label"):
+                lines.append(f"    label: {step.args['label']}")
+            if step.args.get("optional"):
+                lines.append("    optional: true")
+                if step.args.get("reason"):
+                    lines.append(f"    # reason: {step.args['reason']}")
             continue
         if command == "inputText":
             lines.append(f"- inputText: {step.args['value']}")
@@ -836,10 +861,10 @@ def export_flow(flow: Flow, path: str) -> str:
         raise errors.AutonomError(
             errors.UNSUPPORTED_FLOW_COMMAND,
             f"{path}: {command!r} has no Maestro Core Profile equivalent",
-            hint="retry, group, setOrientation, scrollUntilVisible, "
-                 "assertEnabled/Checked stay Autonom-only; the 0.28.1 "
-                 "commands (scroll, repeat, clipboard variables) do not "
-                 "export yet.",
+            hint="group, setOrientation and assertEnabled/Checked are "
+                 "Autonom-only; retry, scrollUntilVisible, scroll, repeat and "
+                 "the clipboard commands exist in Maestro and import, but do "
+                 "not export yet.",
             file=path, line=step.line, command=command,
         )
     return "\n".join(lines) + "\n"

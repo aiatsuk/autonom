@@ -394,6 +394,27 @@ class ExportTests(unittest.TestCase):
         self.assertIn("text: Profile", out)
         self.assertNotIn("visibleText", out)
 
+    def test_export_never_drops_arguments_silently(self) -> None:
+        """The profile's own contract: convert faithfully or refuse."""
+        # eraseText carries a count; Maestro's bare form erases everything
+        flow = self._flow("- eraseText:\n    chars: 5\n")
+        self.assertIn("- eraseText: 5", maestro.export_flow(flow, "t.yaml"))
+
+        # label and optional have Maestro equivalents — they must carry over
+        flow = self._flow("- tapOn:\n    selector:\n      text: Later\n"
+                          "    label: Dismiss\n    optional: true\n"
+                          "    reason: system prompt\n")
+        out = maestro.export_flow(flow, "t.yaml")
+        self.assertIn("label: Dismiss", out)
+        self.assertIn("optional: true", out)
+
+        # a per-command timeout has none — refuse instead of changing the wait
+        flow = self._flow("- assertVisible:\n    selector:\n      text: Done\n"
+                          "    timeoutMs: 30000\n")
+        with self.assertRaises(errors.AutonomError) as caught:
+            maestro.export_flow(flow, "t.yaml")
+        self.assertIn("extendedWaitUntil", caught.exception.hint)
+
     def test_relational_selectors_refuse(self) -> None:
         flow = self._flow("- tapOn:\n    selector:\n      text: a\n"
                           "      childOf:\n        id: list\n")

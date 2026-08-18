@@ -58,7 +58,7 @@ the reason; `onFlowComplete` cleanup is isolated per command and reported as
   act (`ambiguous_selector`) unless `index` disambiguates.
 - **Unknown anything**: an unknown command, header field, selector field, or
   argument is an error, never ignored. Deferred features (`waitForIdle`,
-  `extendedWaitUntil`, script steps, `repeat`…) are rejected with a
+  `extendedWaitUntil`, `runScript`, `evalScript`) are rejected with a
   pointed hint.
 - **Type guessing**: `true` is a boolean only where a boolean belongs;
   a quoted `"true"` in a boolean slot is a positioned type error (so
@@ -300,8 +300,16 @@ a full match). Everything outside the profile — scripts, JS interpolation,
 point coordinates, random input — refuses with `unsupported_flow_command`
 and the file position; an ambiguous conversion never produces a file that
 silently means something else. `flow export --format maestro` goes the
-other way (exact text is regex-escaped; Autonom-only constructs refuse;
-`checkpoint`/`note` become comments).
+other way, over a **narrower** surface than import: exact text is
+regex-escaped, `label`/`optional`/`eraseText.chars` carry over,
+`checkpoint`/`note` become comments, and anything Maestro cannot express
+identically — a per-command `timeoutMs`, relational selectors, `group`,
+`setOrientation`, `assertEnabled`/`assertChecked`, and the commands added in
+0.28.1 (`scroll`, `repeat`, `swipe.from`, the clipboard variables) — refuses
+rather than exporting something that means something else. Note the one
+asymmetry the format forces: our strict `text` exports as Maestro `text`,
+which upstream matches the label union, so an exported flow can match
+slightly more than the original; export `visibleText` when that matters.
 
 A Maestro file also runs **directly**: `flow run|check|fmt|list` treat a
 file whose header has no `schema:` field as a Maestro document and convert
