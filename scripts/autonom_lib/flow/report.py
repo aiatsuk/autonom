@@ -458,12 +458,58 @@ def render_suite_html(manifests: list[dict[str, Any]],
 """
 
 
+def recovered_retry_indexes(manifest: dict[str, Any]) -> set[int]:
+    """Step indexes that failed inside a retry and were later superseded.
+
+    The executor keeps every attempt in ``steps`` on purpose (the timeline
+    is the history). JUnit must not treat those recovered attempts as
+    final ``<failure>`` cases — a passed retry is a passed test.
+    """
+    recovered: set[int] = set()
+    blocks = manifest.get("blocks") or []
+    for block in blocks:
+        if block.get("command") != "retry":
+            continue
+        attempts = block.get("attempts_detail") or []
+        if not attempts:
+            continue
+        superseded = (attempts if block.get("status") == "passed"
+                      else attempts[:-1])
+        for attempt in superseded:
+            if attempt.get("status") != "failed":
+                continue
+            first = attempt.get("first_index")
+            last = attempt.get("last_index")
+            if isinstance(first, int) and isinstance(last, int) and last >= first:
+                recovered.update(range(first, last + 1))
+    if recovered:
+        return recovered
+    # v1 manifests / no ledger: a passed run's failed steps that carry
+    # retry_attempt are recovered history, not the outcome.
+    if manifest.get("status") == "passed":
+        for step in manifest.get("steps") or []:
+            if (step.get("status") == "failed"
+                    and step.get("retry_attempt") is not None
+                    and not step.get("hook")):
+                index = step.get("index")
+                if isinstance(index, int):
+                    recovered.add(index)
+    return recovered
+
+
+def _is_junit_failure(step: dict[str, Any], recovered: set[int]) -> bool:
+    return (step.get("status") == "failed"
+            and step.get("index") not in recovered)
+
+
 def render_suite_junit(manifests: list[dict[str, Any]]) -> str:
     """One JUnit document with a <testsuite> per flow — what CI expects."""
     suites = [render_junit(m).split("\n", 1)[1].strip() for m in manifests]
     tests = sum(len(m.get("steps", [])) for m in manifests)
-    failures = sum(1 for m in manifests for s in m.get("steps", [])
-                   if s.get("status") == "failed")
+    failures = sum(
+        1 for m in manifests
+        for s in m.get("steps", [])
+        if _is_junit_failure(s, recovered_retry_indexes(m)))
     total = sum(s.get("duration_ms", 0)
                 for m in manifests for s in m.get("steps", [])) / 1000
     return ('<?xml version="1.0" encoding="UTF-8"?>\n'
@@ -474,8 +520,11 @@ def render_suite_junit(manifests: list[dict[str, Any]]) -> str:
 def render_junit(manifest: dict[str, Any]) -> str:
     suite_name = manifest.get("flow_id") or manifest.get("flow_name") or "flow"
     steps = manifest.get("steps", [])
-    failures = sum(1 for s in steps if s.get("status") == "failed")
-    skipped = sum(1 for s in steps if s.get("status") == "skipped")
+    recovered = recovered_retry_indexes(manifest)
+    failures = sum(1 for s in steps if _is_junit_failure(s, recovered))
+    skipped = sum(1 for s in steps
+                  if s.get("status") == "skipped"
+                  or (s.get("status") == "failed" and s.get("index") in recovered))
     total_time = sum(s.get("duration_ms", 0) for s in steps) / 1000
     cases = []
     for step in steps:
@@ -484,7 +533,9 @@ def render_junit(manifest: dict[str, Any]) -> str:
             name += f" — {step['label']}"
         time_s = step.get("duration_ms", 0) / 1000
         body = ""
-        if step.get("status") == "failed":
+        if step.get("status") == "failed" and step.get("index") in recovered:
+            body = '<skipped message="retried"/>'
+        elif step.get("status") == "failed":
             message = quoteattr(str(step.get("error", "")))
             code = xml_escape(str(step.get("error_code", "")))
             body = (f'<failure message={message} type="{code}">'

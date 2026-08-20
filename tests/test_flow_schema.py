@@ -147,10 +147,17 @@ class HeaderTests(unittest.TestCase):
         _rejects(self, "schema: autonom.dev/flow/v1\nname: x\n---\n",
                  errors.FLOW_COMMAND_INVALID, "no commands")
 
-    def test_platform_and_evidence_enums(self) -> None:
+    def test_unknown_capability_is_refused(self) -> None:
         _rejects(self, "schema: autonom.dev/flow/v1\nname: x\n"
-                       "requires:\n  platform: [windows]\n---\n- back\n",
-                 errors.FLOW_HEADER_INVALID, "windows")
+                       "requires:\n  capabilities: [telepathy]\n---\n- back\n",
+                 errors.FLOW_HEADER_INVALID, "telepathy")
+        flow = _build("schema: autonom.dev/flow/v1\nname: x\n"
+                      "requires:\n  capabilities: [ui.accessibility, logs]\n"
+                      "---\n- back\n")
+        self.assertEqual(flow.requires_capabilities,
+                         ["ui.accessibility", "logs"])
+
+    def test_platform_and_evidence_enums(self) -> None:
         _rejects(self, "schema: autonom.dev/flow/v1\nname: x\n"
                        "evidence:\n  mode: sometimes\n---\n- back\n",
                  errors.FLOW_HEADER_INVALID, "sometimes")

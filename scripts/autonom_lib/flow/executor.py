@@ -63,6 +63,44 @@ from .schema import (
 
 _VAR_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
+_CAPABILITY_HINTS = {
+    "ui.accessibility": "On iOS, start the session with a working idb "
+                        "(idb + idb_companion). Android needs a ready adb target.",
+    "screenshots": "The resolved target must be able to capture a screenshot.",
+    "logs": "The resolved target must be able to tail device logs.",
+    "network.capture": "Start capture first: autonom network start "
+                       "(requires mitmdump and consent).",
+}
+
+
+def session_capabilities(target: Target, session: dict) -> dict[str, bool]:
+    """What this resolved target + session can actually collect. No device I/O."""
+    android = target.platform == ANDROID
+    tooling = session.get("tooling") or {}
+    idb_state = (tooling.get("idb") or {}).get("state")
+    if target.platform == IOS and idb_state is None:
+        # In-process callers may omit tooling; honour AUTONOM_IDB / PATH.
+        try:
+            from .. import ios_idb
+            ios_idb.find_idb()
+            idb_state = "ready"
+        except errors.AutonomError:
+            idb_state = "missing"
+    ui_ready = android or idb_state == "ready"
+    attached = bool((session.get("network") or {}).get("attached"))
+    return {
+        "ui.accessibility": ui_ready,
+        "screenshots": True,   # adb screencap / simctl io — both ride the target
+        "logs": True,          # logcat / simctl spawn — both ride the target
+        "network.capture": attached,
+    }
+
+
+def _capability_hint(missing: list[str]) -> str:
+    bits = [_CAPABILITY_HINTS[name] for name in missing
+            if name in _CAPABILITY_HINTS]
+    return " ".join(bits) or "Start a session that provides the declared capabilities."
+
 
 @dataclass
 class RunConfig:
@@ -409,15 +447,8 @@ class Executor:
             defined |= seen[key]
             return
         before = set(defined)
-        if is_root and flow.requires_platforms and \
-                self.target.platform not in flow.requires_platforms:
-            raise errors.AutonomError(
-                errors.FLOW_REQUIREMENTS_UNMET,
-                f"flow requires platform {'/'.join(flow.requires_platforms)}, "
-                f"target is {self.target.platform}",
-                hint="Pick a matching target with --platform/--target.",
-                required=flow.requires_platforms, target=self.target.platform,
-            )
+        if is_root:
+            self._preflight_requires(flow)
         if not is_root:
             for step in flow.steps:
                 self._preflight_step(step, flow, values, seen, defined)
@@ -540,6 +571,44 @@ class Executor:
             code, f"step {step.command} (line {step.line}): {message}",
             line=step.line, column=step.col, command=step.command,
         )
+
+    def _preflight_requires(self, flow: Flow) -> None:
+        """Refuse before any mutation when the session cannot honour `requires`."""
+        if flow.requires_platforms and \
+                self.target.platform not in flow.requires_platforms:
+            raise errors.AutonomError(
+                errors.FLOW_REQUIREMENTS_UNMET,
+                f"flow requires platform {'/'.join(flow.requires_platforms)}, "
+                f"target is {self.target.platform}",
+                hint="Pick a matching target with --platform/--target.",
+                required=flow.requires_platforms, target=self.target.platform,
+            )
+        if not flow.requires_capabilities:
+            return
+        available = session_capabilities(self.target, self.session)
+        missing = [name for name in flow.requires_capabilities
+                   if not available.get(name)]
+        if missing:
+            raise errors.AutonomError(
+                errors.FLOW_REQUIREMENTS_UNMET,
+                f"flow requires capabilities {', '.join(missing)} "
+                f"that this session cannot provide",
+                hint=_capability_hint(missing),
+                required=flow.requires_capabilities, missing=missing,
+            )
+
+    def _evaluate_when(self, when: WhenClause, snapshot) -> tuple[bool, str | None]:
+        names, literals = self._redact_secrets()
+        return flow_conditions.evaluate(
+            self._resolve_when(when), self.target.platform, self.values,
+            snapshot, secret_names=names, secret_literals=literals)
+
+    def _redact_secrets(self) -> tuple[set[str], set[str]]:
+        names = set(self.secret_values) | set(self.sensitive_var_names)
+        literals = {self.values[n] for n in names if n in self.values}
+        literals |= {self.runtime_values[n] for n in names
+                     if n in self.runtime_values}
+        return names, literals
 
     # -- interpolation --------------------------------------------------------
 
@@ -676,9 +745,8 @@ class Executor:
         when = step.args.get("when")
         if when is not None:
             try:
-                met, reason = flow_conditions.evaluate(
-                    self._resolve_when(when), self.target.platform, self.values,
-                    lambda: ui_mod.snapshot(self.target))
+                met, reason = self._evaluate_when(
+                    when, lambda: ui_mod.snapshot(self.target))
             except errors.AutonomError as exc:
                 # a broken condition is a failure OF THIS STEP: record it so it
                 # appears in the timeline and the manifest, then unwind
@@ -835,9 +903,8 @@ class Executor:
             for _ in range(times):
                 if clause is not None:
                     try:
-                        met, reason = flow_conditions.evaluate(
-                            self._resolve_when(clause), self.target.platform,
-                            self.values, lambda: ui_mod.snapshot(self.target))
+                        met, reason = self._evaluate_when(
+                            clause, lambda: ui_mod.snapshot(self.target))
                     except errors.AutonomError:
                         status = "failed"   # recorded by the finally block
                         raise

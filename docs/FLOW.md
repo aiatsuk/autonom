@@ -33,12 +33,14 @@ autonom flow run login.yaml            # execute against the active session
 ```
 
 `flow run` needs an active session (`autonom session start`), pre-flights the
-whole flow against the resolved target before any mutation, and exits `0` on
+whole flow against the resolved target before any mutation (`requires.platform`
+and `requires.capabilities` included), and exits `0` on
 pass, `1` on a *test failure* (summary on stdout with
 `failure_class: test_failure`), `2` on definition/infrastructure errors
 (stderr envelope). Events stream to
 `~/.autonom/sessions/<id>/flows/<run_id>/events.ndjson` (or stdout with
-`--events`); secrets pass via `--secret NAME` and never enter artifacts.
+`--events`); secrets pass via `--secret NAME` and never enter artifacts
+(including `when.envEquals` skip reasons).
 Directory runs execute a tag-filtered suite
 (`flow run .autonom/flows --include-tag smoke --exclude-tag flaky`);
 `runFlow` children execute inline with the root `appId` inherited and their
@@ -83,6 +85,14 @@ env/secret (`flow_var_conflict`), or a `pasteText` with nothing copied all
 refuse at pre-flight. Definitions inside `repeat` or a `when:`-guarded
 `runFlow` are not guaranteed to run and do not count outside them; cleanup
 hooks see only what `onFlowStart` defined.
+
+`requires.capabilities` is a frozen list (`ui.accessibility`, `screenshots`,
+`logs`, `network.capture`). Unknown names are a header error. The runner
+checks the resolved session before the first mutation and exits 2 with
+`flow_requirements_unmet` when a declared facility is absent — for example
+`network.capture` without an attached proxy, or `ui.accessibility` on iOS
+without idb. `flow check` still validates names only; it does not probe
+the host.
 
 ## Selectors
 
@@ -184,6 +194,7 @@ command takeScreenshot: label
 command checkpoint: name
 command note: text
 deferred: waitForIdle extendedWaitUntil runScript evalScript
+requires-capabilities: ui.accessibility screenshots logs network.capture
 ```
 
 ## Semantics fixed by the language (run slice)

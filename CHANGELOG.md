@@ -7,6 +7,25 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
 
 ## [Unreleased]
 
+## [0.28.5] - 2026-08-20
+
+Codex review of PR #1: three remaining findings, each pinned by a regression.
+
+### Fixed
+- **`when.envEquals` skip reasons leaked `--secret` values.** A mismatched
+  condition printed both sides verbatim into events, the manifest, HTML, and
+  JUnit. The reason now names the variable only when either side is a secret
+  or a `sensitive:` runtime value.
+- **Recovered `retry` attempts failed CI JUnit.** The executor keeps every
+  attempt in `manifest.steps`; `report export --format junit` (and the suite
+  document) counted those retained failures. Superseded attempts are now
+  `<skipped message="retried"/>` and do not increment `failures`.
+- **`requires.capabilities` was accepted and ignored.** The schema now
+  freezes the research vocabulary (`ui.accessibility`, `screenshots`,
+  `logs`, `network.capture`); preflight raises `flow_requirements_unmet`
+  before the first mutation when the session cannot provide a declared
+  facility.
+
 ## [0.28.4] - 2026-08-17
 
 Manifest v2 and the evidence-integrity fixes an adversarial validation of the
