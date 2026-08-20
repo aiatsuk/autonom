@@ -1113,6 +1113,12 @@ class WhenEnvEqualsRedactionTests(unittest.TestCase):
         self.assertIn("fast", reason)
         self.assertIn("slow", reason)
 
+        matched = flow_schema.WhenClause(env_equals={"MODE": "fast"})
+        met, reason = flow_conditions.evaluate(
+            matched, "android", {"MODE": "fast"}, lambda: [])
+        self.assertTrue(met)
+        self.assertIsNone(reason)
+
     def test_session_capabilities_need_an_attached_proxy_for_capture(self) -> None:
         target = Target("android", "emulator-5554", str(FAKE_ADB),
                         {"serial": "emulator-5554"})
