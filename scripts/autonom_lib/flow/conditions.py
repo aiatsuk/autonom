@@ -32,15 +32,6 @@ def evaluate(when: WhenClause, platform: str, values: dict,
         if actual != expected:
             return False, _env_equals_reason(
                 name, actual, expected, redact_names, redact_values)
-
-
-def _env_equals_reason(name: str, actual, expected,
-                       redact_names: set, redact_values: set) -> str:
-    if (name in redact_names
-            or actual in redact_values
-            or expected in redact_values):
-        return f"envEquals: {name} does not match"
-    return f"envEquals: {name} is {actual!r}, condition wants {expected!r}"
     nodes: list | None = None
     for label, selector, want in (("visible", when.visible, True),
                                   ("notVisible", when.not_visible, False)):
@@ -53,3 +44,12 @@ def _env_equals_reason(name: str, actual, expected,
             return False, (f"{label}: {flow_selectors.describe(selector)} "
                            f"{'not found' if want else 'still present'}")
     return True, None
+
+
+def _env_equals_reason(name: str, actual, expected,
+                       redact_names: set, redact_values: set) -> str:
+    if (name in redact_names
+            or actual in redact_values
+            or expected in redact_values):
+        return f"envEquals: {name} does not match"
+    return f"envEquals: {name} is {actual!r}, condition wants {expected!r}"
