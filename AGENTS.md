@@ -62,15 +62,16 @@ Full docs: `README.md`, `docs/ARCHITECTURE.md`, `docs/USAGE.md`, `docs/INSTALL.m
 - The `autonom` CLI is a **symlink** to `scripts/autonom.py`, so repository edits
  take effect on the next invocation — no reinstall needed after changing CLI code.
 - `~/.local/bin` is on `PATH` in login shells (via `~/.profile`). In a fresh
- non-login shell where `autonom` is not found, either `export
- PATH="$HOME/.local/bin:$PATH"` or run `python3 scripts/autonom.py …` directly.
+ non-login shell where `autonom` is not found, either add that directory to
+ `PATH` (`export PATH="$HOME/.local/bin:$PATH"`) or run
+ `python3 scripts/autonom.py …` directly.
 - **Validation:** `make check` (or `./scripts/run_checks.sh`) runs plugin
  validation, `compileall`, `node --check`, the full Python `unittest` suite
  (~245 tests), Node `--test` suites, and `bash -n`. It takes ~1.5–3 min.
  `shellcheck` is optional; if absent, that lint step is skipped (still passes).
-- **No device in this Linux VM:** Android (`adb`/emulator), iOS (`xcrun
- simctl`/`idb`), and `mitmproxy` are not installed, so `autonom doctor` reports
- them missing and device E2E verbs cannot run. Exercise the core UI-tree/selector
- engine offline against a dump file, e.g.
+- **No device in this Linux VM:** Android (`adb`/emulator), iOS
+ (`xcrun simctl` + `idb`), and `mitmproxy` are not installed, so `autonom doctor`
+ reports them missing and device E2E verbs cannot run. Exercise the core
+ UI-tree/selector engine offline against a dump file, e.g.
  `autonom ui tree --dump tests/fixtures/ui_dump.xml` and
  `autonom ui find --dump tests/fixtures/ui_dump.xml --desc "Flutter Save Button" --mode exact`.
