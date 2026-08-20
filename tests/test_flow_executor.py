@@ -33,6 +33,7 @@ UDID = "AAAAAAAA-1111-2222-3333-BBBBBBBBBBBB"
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from autonom_lib import errors  # noqa: E402
+from autonom_lib.flow import conditions as flow_conditions  # noqa: E402
 from autonom_lib.flow import executor as flow_executor  # noqa: E402
 from autonom_lib.flow import parser as flow_parser  # noqa: E402
 from autonom_lib.flow import schema as flow_schema  # noqa: E402
@@ -673,6 +674,79 @@ class ReviewRegressionTests(_AndroidRunBase):
         self.assertEqual(len(keyevents), 1,
                          "nested runFlow ran once; the ios-only hook skipped")
 
+    def test_env_equals_skip_reason_redacts_secrets(self) -> None:
+        sub = self.root / "sub.yaml"
+        sub.write_text("schema: autonom.dev/flow/v1\nname: child\n---\n- back\n",
+                       encoding="utf-8")
+        flow = self._flow(
+            "- runFlow:\n"
+            "    file: sub.yaml\n"
+            "    when:\n"
+            "      envEquals:\n"
+            "        PASSWORD: wrong\n")
+        result = self._cli("flow", "run", str(flow), "--secret", "PASSWORD",
+                           extra_env={"PASSWORD": "hunter2"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        summary = json.loads(result.stdout)
+        self.assertEqual(summary["steps"][0]["status"], "skipped")
+        reason = summary["steps"][0]["skip_reason"]
+        self.assertIn("PASSWORD", reason)
+        self.assertNotIn("hunter2", reason)
+        self.assertNotIn("wrong", reason)
+        blob = self._artifacts_blob(summary)
+        for manifest in (self.root / "home/sessions").rglob("manifest.json"):
+            blob += manifest.read_text(encoding="utf-8")
+        built = self._cli("report", "build")
+        self.assertEqual(built.returncode, 0, built.stderr)
+        payload = json.loads(built.stdout)
+        blob += Path(payload["html"]).read_text(encoding="utf-8")
+        blob += Path(payload["junit"]).read_text(encoding="utf-8")
+        self.assertNotIn("hunter2", blob, "secret leaked into an artifact")
+
+    def test_env_equals_redacts_interpolated_secret_expected(self) -> None:
+        sub = self.root / "sub.yaml"
+        sub.write_text("schema: autonom.dev/flow/v1\nname: child\n---\n- back\n",
+                       encoding="utf-8")
+        flow = self._flow(
+            "- runFlow:\n"
+            "    file: sub.yaml\n"
+            "    when:\n"
+            "      envEquals:\n"
+            "        MODE: ${PASSWORD}\n",
+            header=("schema: autonom.dev/flow/v1\nappId: com.example.app\n"
+                    "name: t\nenv:\n  MODE: fast\n---\n"))
+        result = self._cli("flow", "run", str(flow), "--secret", "PASSWORD",
+                           extra_env={"PASSWORD": "hunter2"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        summary = json.loads(result.stdout)
+        reason = summary["steps"][0]["skip_reason"]
+        self.assertIn("MODE", reason)
+        self.assertNotIn("hunter2", reason)
+
+    def test_missing_network_capture_fails_preflight(self) -> None:
+        flow = self._flow(
+            "- back\n",
+            header=("schema: autonom.dev/flow/v1\nappId: com.example.app\n"
+                    "name: t\nrequires:\n  capabilities:\n"
+                    "    - network.capture\n---\n"))
+        result = self._cli("flow", "run", str(flow))
+        self.assertEqual(result.returncode, 2, result.stdout)
+        envelope = json.loads(result.stderr)
+        self.assertEqual(envelope["error_code"], "flow_requirements_unmet")
+        self.assertIn("network.capture", envelope["error"])
+        self.assertEqual(len(self._adb_calls()), 0,
+                         "unmet requires must not touch the device")
+
+    def test_declared_local_capabilities_pass_on_fake_android(self) -> None:
+        flow = self._flow(
+            "- back\n",
+            header=("schema: autonom.dev/flow/v1\nappId: com.example.app\n"
+                    "name: t\nrequires:\n  capabilities:\n"
+                    "    - ui.accessibility\n    - screenshots\n"
+                    "    - logs\n---\n"))
+        result = self._cli("flow", "run", str(flow))
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_when_clause_interpolates_variables(self) -> None:
         sub = self.root / "sub.yaml"
         sub.write_text("schema: autonom.dev/flow/v1\nname: child\n---\n- back\n",
@@ -1019,6 +1093,43 @@ class PollCadenceTests(EnvSandboxMixin, unittest.TestCase):
                 runner.run(flow)
         self.assertEqual(caught.exception.code, errors.BACKEND_FAILED)
         self.assertEqual(caught.exception.extra["failure_class"], "infrastructure")
+
+
+class WhenEnvEqualsRedactionTests(unittest.TestCase):
+    def test_secret_name_is_redacted_and_plain_values_are_not(self) -> None:
+        secret = flow_schema.WhenClause(env_equals={"PASSWORD": "wrong"})
+        met, reason = flow_conditions.evaluate(
+            secret, "android", {"PASSWORD": "hunter2"}, lambda: [],
+            secret_names={"PASSWORD"}, secret_literals={"hunter2"})
+        self.assertFalse(met)
+        self.assertEqual(reason, "envEquals: PASSWORD does not match")
+        self.assertNotIn("hunter2", reason)
+        self.assertNotIn("wrong", reason)
+
+        plain = flow_schema.WhenClause(env_equals={"MODE": "slow"})
+        met, reason = flow_conditions.evaluate(
+            plain, "android", {"MODE": "fast"}, lambda: [])
+        self.assertFalse(met)
+        self.assertIn("fast", reason)
+        self.assertIn("slow", reason)
+
+        matched = flow_schema.WhenClause(env_equals={"MODE": "fast"})
+        met, reason = flow_conditions.evaluate(
+            matched, "android", {"MODE": "fast"}, lambda: [])
+        self.assertTrue(met)
+        self.assertIsNone(reason)
+
+    def test_session_capabilities_need_an_attached_proxy_for_capture(self) -> None:
+        target = Target("android", "emulator-5554", str(FAKE_ADB),
+                        {"serial": "emulator-5554"})
+        bare = flow_executor.session_capabilities(target, {})
+        self.assertTrue(bare["ui.accessibility"])
+        self.assertTrue(bare["screenshots"])
+        self.assertTrue(bare["logs"])
+        self.assertFalse(bare["network.capture"])
+        attached = flow_executor.session_capabilities(
+            target, {"network": {"attached": True}})
+        self.assertTrue(attached["network.capture"])
 
 
 if __name__ == "__main__":

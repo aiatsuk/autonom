@@ -252,6 +252,14 @@ EVIDENCE_MODES = ("minimal", "on-failure", "always", "custom")
 EVIDENCE_KINDS = ("screenshot", "hierarchy", "logs", "crashes", "network")
 EVIDENCE_BODIES = ("preview", "full")
 PLATFORMS = ("android", "ios")
+# Frozen vocabulary (research §7.5). Unknown names are a header error;
+# the executor checks these against the resolved session before mutating.
+KNOWN_CAPABILITIES = (
+    "ui.accessibility",
+    "screenshots",
+    "logs",
+    "network.capture",
+)
 
 # --- Typed model -------------------------------------------------------------
 
@@ -757,8 +765,15 @@ def _build_requires(node, path: str, flow: Flow) -> None:
                           hint="Platforms: android, ios.")
             flow.requires_platforms = platforms
         elif key.text == "capabilities":
-            flow.requires_capabilities = _string_list(
+            names = _string_list(
                 value, code, path, "requires.capabilities")
+            for capability in names:
+                if capability not in KNOWN_CAPABILITIES:
+                    _fail(code, f"unknown capability {capability!r}",
+                          path, value.line, value.col,
+                          hint="Capabilities: " + ", ".join(KNOWN_CAPABILITIES)
+                          + ".")
+            flow.requires_capabilities = names
         else:
             _fail(code, f"unknown requires field {key.text!r}",
                   path, key.line, key.col)

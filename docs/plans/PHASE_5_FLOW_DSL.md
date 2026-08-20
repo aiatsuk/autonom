@@ -73,8 +73,8 @@ autonom flow run <file> [target flags] [--env K=V] [--secret NAME]
   `~/.autonom/sessions/<id>/flows/<run_id>/`; the run never stops the session.
 - **Pre-flight:** the typed model is walked against the resolved target
   before the first mutation — `clearState`/`back` on iOS, platform-invalid
-  keys, and `requires.platform` mismatches fail with zero side effects;
-  `--dry-run` stops here.
+  keys, and `requires.platform` / `requires.capabilities` mismatches fail
+  with zero side effects; `--dry-run` stops here.
 - **Polling engine:** assertions and `waitUntil` poll `ui.snapshot` on
   `time.monotonic` (default 10 s timeout, 500 ms interval, per-step
   `timeoutMs`, injectable clock in tests). Timeout →

@@ -267,6 +267,77 @@ class ReportEndToEndTests(unittest.TestCase):
                          "flow_no_flows_found")
 
 
+class RecoveredRetryJunitTests(unittest.TestCase):
+    def _recovered_manifest(self) -> dict:
+        return {
+            "schema_version": 2, "status": "passed",
+            "flow_name": "retry-ok", "flow_id": "retry-ok",
+            "steps": [
+                {"index": 1, "command": "assertVisible", "status": "failed",
+                 "retry_attempt": 1, "error": "timeout",
+                 "error_code": "flow_assertion_timeout",
+                 "failure_class": "test_failure", "duration_ms": 10},
+                {"index": 2, "command": "assertVisible", "status": "passed",
+                 "retry_attempt": 2, "duration_ms": 5},
+            ],
+            "blocks": [{
+                "command": "retry", "status": "passed",
+                "attempts_detail": [
+                    {"n": 1, "first_index": 1, "last_index": 1,
+                     "status": "failed"},
+                    {"n": 2, "first_index": 2, "last_index": 2,
+                     "status": "passed"},
+                ],
+            }],
+        }
+
+    def test_recovered_retry_is_not_a_junit_failure(self) -> None:
+        xml = flow_report.render_junit(self._recovered_manifest())
+        root = ET.fromstring(xml)
+        self.assertEqual(root.get("failures"), "0")
+        self.assertEqual(root.get("skipped"), "1")
+        self.assertFalse(root.findall("./testcase/failure"))
+        skipped = root.findall("./testcase/skipped")
+        self.assertEqual(len(skipped), 1)
+        self.assertEqual(skipped[0].get("message"), "retried")
+
+    def test_suite_junit_does_not_inflate_recovered_retries(self) -> None:
+        xml = flow_report.render_suite_junit([self._recovered_manifest()])
+        root = ET.fromstring(xml)
+        self.assertEqual(root.get("failures"), "0")
+        self.assertFalse(root.findall(".//failure"))
+
+    def test_unrecovered_retry_stays_a_failure(self) -> None:
+        manifest = {
+            "schema_version": 2, "status": "failed",
+            "flow_name": "retry-fail",
+            "steps": [
+                {"index": 1, "command": "assertVisible", "status": "failed",
+                 "retry_attempt": 1, "error": "timeout",
+                 "error_code": "flow_assertion_timeout",
+                 "failure_class": "test_failure", "duration_ms": 10},
+                {"index": 2, "command": "assertVisible", "status": "failed",
+                 "retry_attempt": 2, "error": "timeout",
+                 "error_code": "flow_assertion_timeout",
+                 "failure_class": "test_failure", "duration_ms": 10},
+            ],
+            "blocks": [{
+                "command": "retry", "status": "failed",
+                "attempts_detail": [
+                    {"n": 1, "first_index": 1, "last_index": 1,
+                     "status": "failed"},
+                    {"n": 2, "first_index": 2, "last_index": 2,
+                     "status": "failed"},
+                ],
+            }],
+        }
+        xml = flow_report.render_junit(manifest)
+        root = ET.fromstring(xml)
+        self.assertEqual(root.get("failures"), "1",
+                         "only the last failed attempt is a final failure")
+        self.assertEqual(len(root.findall("./testcase/failure")), 1)
+
+
 class RenderEscapingTests(unittest.TestCase):
     def test_hostile_strings_are_escaped_everywhere(self) -> None:
         manifest = {
