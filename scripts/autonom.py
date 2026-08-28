@@ -1913,6 +1913,19 @@ def cmd_flow_run(args: argparse.Namespace) -> int:
     else:
         files = [path]
 
+    if args.until_step is not None:
+        if args.until_step < 1:
+            raise errors.AutonomError(
+                errors.FLOW_COMMAND_INVALID,
+                "--until-step must be a positive runtime step index",
+            )
+        if len(files) != 1:
+            raise errors.AutonomError(
+                errors.FLOW_COMMAND_INVALID,
+                "--until-step accepts one flow file, not a directory suite",
+                hint="Replay one source run at a time from its detailed report.",
+            )
+
     flows = [flow_validator.validate_tree(file) for file in files]
 
     record = session_mod.load_current()
@@ -1930,6 +1943,9 @@ def cmd_flow_run(args: argparse.Namespace) -> int:
     config = flow_executor.RunConfig(
         env=env_overrides, secrets=secrets,
         default_timeout_ms=args.default_timeout_ms, dry_run=args.dry_run,
+        stop_after_step=args.until_step,
+        evidence_mode=(None if args.evidence == "flow" else args.evidence),
+        evidence_collect=tuple(args.collect) if args.collect else None,
     )
 
     def run_one(flow) -> dict[str, Any]:
@@ -1956,11 +1972,13 @@ def cmd_flow_run(args: argparse.Namespace) -> int:
             summary["failure"] = result.failure
         if result.hook_failures:
             summary["hook_failures"] = result.hook_failures
+        if result.replay_target:
+            summary["replay_target"] = result.replay_target
         return summary
 
     if len(flows) == 1:
         summary = {"ok": True, **run_one(flows[0]), **target.identity()}
-        exit_code = 0 if summary["status"] == "passed" else 1
+        exit_code = 0 if summary["status"] in ("passed", "replayed") else 1
     else:
         runs = []
         for flow in flows:  # a test failure moves on; an AutonomError aborts
@@ -2162,6 +2180,15 @@ def _resolve_run_dir(record: dict[str, Any], run_id: str | None) -> Path:
     flows_dir = Path(record["artifacts_dir"]) / "flows"
     if run_id:
         run_dir = flows_dir / run_id
+        try:
+            contained = run_dir.resolve().is_relative_to(flows_dir.resolve())
+        except OSError:
+            contained = False
+        if not contained or Path(run_id).name != run_id:
+            raise errors.AutonomError(
+                errors.PATH_FORBIDDEN,
+                "report run id must name one run inside this session",
+            )
         if not (run_dir / "manifest.json").is_file():
             raise errors.AutonomError(
                 errors.FLOW_FILE_NOT_FOUND,
@@ -2243,12 +2270,14 @@ def cmd_report_suite(args: argparse.Namespace) -> int:
     junit_path.write_text(flow_report.render_suite_junit(manifests),
                           encoding="utf-8")
     os.chmod(junit_path, mode)  # CI must be able to read the JUnit it consumes
-    failed = [m for m in manifests if m.get("status") != "passed"]
+    failed = [m for m in manifests if m.get("status") == "failed"]
+    replayed = [m for m in manifests if m.get("status") == "replayed"]
     payload = {
         "ok": True,
         "flows": len(manifests),
-        "passed": len(manifests) - len(failed),
+        "passed": sum(1 for m in manifests if m.get("status") == "passed"),
         "failed": len(failed),
+        "replayed": len(replayed),
         "html": str(html_path),
         "junit": str(junit_path),
         "sensitive": any(m.get("sensitive") for m in manifests),
@@ -2324,6 +2353,173 @@ def cmd_report_export(args: argparse.Namespace) -> int:
     os.chmod(out, 0o600)
     return emit({"ok": True, "format": args.format, "out": str(out),
                  "sensitive": manifest.get("sensitive", False)}, as_json=True)
+
+
+def cmd_report_serve(args: argparse.Namespace) -> int:
+    """Serve one local report with narrowly-scoped prefix replay controls."""
+    import html
+    import http.server
+    import secrets as secrets_mod
+    import urllib.parse
+
+    record = _session_by_id(args.session)
+    initial_dir = _resolve_run_dir(record, args.run)
+    initial_manifest = flow_report.load_manifest(initial_dir)
+    target = platform_mod.resolve(args, session_record=record)
+    token = secrets_mod.token_urlsafe(24)
+
+    def page_for(manifest: dict[str, Any]) -> str:
+        evidence = flow_report._inline_step_assets(  # one-file HTTP response
+            manifest, Path(record["artifacts_dir"]))
+        return flow_report.render_run_page(
+            manifest, evidence, standalone=True,
+            control_url="/replay", csrf_token=token)
+
+    def replay(run_id: str, step_index: int) -> dict[str, Any]:
+        run_dir = _resolve_run_dir(record, run_id)
+        source = flow_report.load_manifest(run_dir)
+        step = next((item for item in source.get("steps", [])
+                     if item.get("index") == step_index), None)
+        if step is None:
+            raise errors.AutonomError(
+                errors.FLOW_REPLAY_STEP_NOT_REACHED,
+                f"run {run_id} has no recorded runtime step {step_index}",
+            )
+        path = Path(str(source.get("flow_path") or "")).resolve()
+        root = flow_validator.workspace_root(path).resolve()
+        if not path.is_file() or not path.is_relative_to(root):
+            raise errors.AutonomError(
+                errors.FLOW_PATH_ESCAPES_WORKSPACE,
+                "the source flow is no longer a valid file in its workspace",
+                file=str(path),
+            )
+        secret_values: dict[str, str] = {}
+        missing = []
+        for name in source.get("secret_names") or []:
+            value = os.environ.get(str(name))
+            if value is None:
+                missing.append(str(name))
+            else:
+                secret_values[str(name)] = value
+        if missing:
+            raise errors.AutonomError(
+                errors.FLOW_SECRET_UNDEFINED,
+                "prefix replay needs secret environment variables that are not set",
+                hint="Restart report serve with the required names available in "
+                     "its process environment.",
+                secret_names=missing,
+            )
+        flow = flow_validator.validate_tree(path)
+        config = flow_executor.RunConfig(
+            env=dict(source.get("env") or {}), secrets=secret_values,
+            stop_after_step=step_index,
+            stop_after_step_id=step.get("step_id"),
+            stop_after_expected_status=step.get("status"),
+            evidence_mode="always",
+            evidence_collect=("screenshot", "hierarchy", "logs", "network"),
+        )
+        result = flow_executor.Executor(target, record, config).run(flow)
+        if result.status != "replayed":
+            actual = (result.steps[-1].status if result.steps else result.status)
+            raise errors.AutonomError(
+                errors.FLOW_REPLAY_STEP_NOT_REACHED,
+                "the flow did not reproduce the selected step outcome",
+                hint="Inspect the new failed run; app state or conditional control "
+                     "flow diverged from the source run.",
+                requested_step=step_index,
+                expected_status=step.get("status"), actual_status=actual,
+                replay_run_id=result.run_id,
+            )
+        return {
+            "status": result.status, "run_id": result.run_id,
+            "target": result.replay_target, "events": result.events_path,
+        }
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        server_version = "AutonomReport/1"
+
+        def _send(self, status: int, body: str,
+                  content_type: str = "text/html; charset=utf-8") -> None:
+            blob = body.encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(blob)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.end_headers()
+            self.wfile.write(blob)
+
+        def do_GET(self) -> None:  # noqa: N802 — BaseHTTPRequestHandler API
+            route = urllib.parse.urlsplit(self.path).path
+            try:
+                if route == "/":
+                    manifest = initial_manifest
+                elif route.startswith("/run/"):
+                    run_id = urllib.parse.unquote(route.removeprefix("/run/"))
+                    manifest = flow_report.load_manifest(
+                        _resolve_run_dir(record, run_id))
+                else:
+                    self._send(404, "<h1>Not found</h1>")
+                    return
+                self._send(200, page_for(manifest))
+            except errors.AutonomError as exc:
+                self._send(404, f"<h1>Report unavailable</h1><p>{html.escape(exc.message)}</p>")
+
+        def do_POST(self) -> None:  # noqa: N802 — BaseHTTPRequestHandler API
+            if urllib.parse.urlsplit(self.path).path != "/replay":
+                self._send(404, "<h1>Not found</h1>")
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                length = 0
+            if length < 1 or length > 4096:
+                self._send(400, "<h1>Invalid request</h1>")
+                return
+            form = urllib.parse.parse_qs(
+                self.rfile.read(length).decode("utf-8", errors="replace"),
+                keep_blank_values=True)
+            supplied = (form.get("token") or [""])[0]
+            if not secrets_mod.compare_digest(supplied, token):
+                self._send(403, "<h1>Replay token rejected</h1>")
+                return
+            try:
+                run_id = (form.get("run_id") or [""])[0]
+                step_index = int((form.get("step_index") or [""])[0])
+                result = replay(run_id, step_index)
+            except (ValueError, errors.AutonomError) as exc:
+                message = (exc.message if isinstance(exc, errors.AutonomError)
+                           else "step index must be an integer")
+                self._send(409, "<h1>Replay did not complete</h1>"
+                           f"<p>{html.escape(message)}</p><p><a href='/'>Back</a></p>")
+                return
+            new_run = urllib.parse.quote(str(result["run_id"]), safe="")
+            body = ("<h1>State reconstructed</h1>"
+                    f"<p>Flow replay stopped after step {step_index}; cleanup hooks "
+                    "were skipped so the target remains at that state.</p>"
+                    f"<p><a href='/run/{new_run}'>Open replay evidence</a></p>")
+            self._send(200, body)
+
+        def log_message(self, _format: str, *_args: Any) -> None:
+            return
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
+    server.daemon_threads = True
+    url = f"http://127.0.0.1:{server.server_port}/"
+    emit({"ok": True, "url": url, "run_id": initial_manifest.get("run_id"),
+          "control": "prefix-replay", "bind": "127.0.0.1"}, as_json=True)
+    sys.stdout.flush()
+    if args.open:
+        import webbrowser
+        webbrowser.open(url)
+    try:
+        server.serve_forever(poll_interval=0.25)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+    return 0
 
 
 # --- parser ------------------------------------------------------------------
@@ -2688,6 +2884,16 @@ def build_parser() -> argparse.ArgumentParser:
                    help="stream NDJSON events to stdout instead of one summary doc")
     p.add_argument("--dry-run", action="store_true",
                    help="validate and pre-flight against the target; run nothing")
+    p.add_argument("--until-step", type=int, metavar="N",
+                   help="replay through runtime step N, preserve that device state, "
+                        "and skip cleanup hooks")
+    p.add_argument("--evidence",
+                   choices=("flow", "minimal", "on-failure", "always"),
+                   default="flow",
+                   help="override the flow evidence mode (default: flow header)")
+    p.add_argument("--collect", action="append",
+                   choices=("screenshot", "hierarchy", "logs", "crashes", "network"),
+                   help="override evidence kinds (repeatable)")
     p.set_defaults(func=cmd_flow_run)
 
     p = sub.add_parser("proof",
@@ -2745,6 +2951,17 @@ def build_parser() -> argparse.ArgumentParser:
             p.add_argument("--format", choices=("html", "junit"), default="html")
             p.add_argument("--out", help="destination path")
         p.set_defaults(func=func)
+
+    p = report_sub.add_parser(
+        "serve", help="serve a local report with replay-to-step controls",
+        parents=[target_flags])
+    p.add_argument("--session", default="current",
+                   help="session id (default: current)")
+    p.add_argument("--run", help="run id (default: the latest run)")
+    p.add_argument("--port", type=int, default=0,
+                   help="loopback port (default: choose a free port)")
+    p.add_argument("--open", action="store_true", help="open it in a browser")
+    p.set_defaults(func=cmd_report_serve)
 
     p = report_sub.add_parser(
         "suite", help="one report over every flow run in the session")

@@ -3,10 +3,16 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import socket
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
+import urllib.error
+import urllib.parse
+import urllib.request
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -65,9 +71,9 @@ class ReportEndToEndTests(unittest.TestCase):
         summary = self._run_failing_flow()
         run_dir = Path(summary["events"]).parent
         manifest = json.loads((run_dir / "manifest.json").read_text())
-        self.assertEqual(manifest["schema_version"], 2)
+        self.assertEqual(manifest["schema_version"], 3)
         self.assertEqual(manifest["status"], "failed")
-        # v2 additions the exporters depend on
+        # Timeline additions the exporters depend on.
         self.assertIsInstance(manifest["started_at_ms"], int)
         self.assertGreaterEqual(manifest["finished_at_ms"],
                                 manifest["started_at_ms"])
@@ -76,6 +82,9 @@ class ReportEndToEndTests(unittest.TestCase):
         self.assertEqual(tapped["selector"]["description"], "Open settings",
                          "the selector actually used must reach the manifest")
         self.assertIsInstance(tapped["started_at_ms"], int)
+        self.assertIsInstance(tapped["finished_at_ms"], int)
+        self.assertTrue(tapped["step_id"].startswith("src_"))
+        self.assertTrue(tapped["source_id"].startswith("src_"))
         self.assertEqual(manifest["primary_error"]["error_code"],
                          "flow_assertion_timeout")
         self.assertTrue(any(a.endswith(".png") for a in manifest["artifacts"]),
@@ -91,6 +100,12 @@ class ReportEndToEndTests(unittest.TestCase):
         self.assertNotIn("http://", html_text)
         self.assertNotIn("https://", html_text)
         self.assertIn("flow_assertion_timeout", html_text)
+        self.assertIn("href='#step-1'", html_text)
+        self.assertIn("UI hierarchy diff", html_text)
+        self.assertIn("Network requests", html_text)
+        self.assertIn("--until-step 1", html_text)
+        self.assertNotIn("Unattached evidence", html_text,
+                         "run-level events are not orphaned step evidence")
 
         suite = ET.fromstring(Path(payload["junit"]).read_text(encoding="utf-8"))
         self.assertEqual(suite.tag, "testsuite")
@@ -237,8 +252,8 @@ class ReportEndToEndTests(unittest.TestCase):
         text = page.read_text(encoding="utf-8")
         self.assertIn("decoy", text, "the labelled frame must be rendered")
         # it renders under step 2's heading, not step 1's
-        step2 = text.split("2. <code>takeScreenshot")[1]
-        self.assertIn("decoy", step2.split("<h3")[0])
+        step2 = text.split("id='step-2'")[1]
+        self.assertIn("decoy", step2.split("id='step-3'")[0])
 
     def test_screenshots_none_copies_nothing(self) -> None:
         self._run_failing_flow()
@@ -265,6 +280,69 @@ class ReportEndToEndTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertEqual(json.loads(result.stderr)["error_code"],
                          "flow_no_flows_found")
+
+    def test_local_report_control_replays_to_selected_step(self) -> None:
+        summary = self._run_passing_flow()
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        process = subprocess.Popen(
+            [sys.executable, str(CLI), "--platform", "android",
+             "--serial", "emulator-5554",
+             "--adb", str(ROOT / "tests/fakes/fake_adb.py"),
+             "report", "serve", "--run", summary["run_id"],
+             "--port", str(port)],
+            cwd=ROOT, env=self.env, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        try:
+            url = f"http://127.0.0.1:{port}/"
+            page = None
+            for _ in range(50):
+                try:
+                    with urllib.request.urlopen(url, timeout=1) as response:
+                        page = response.read().decode("utf-8")
+                    break
+                except urllib.error.URLError:
+                    if process.poll() is not None:
+                        break
+                    time.sleep(0.05)
+            self.assertIsNotNone(page, process.stderr.read() if process.poll() else "")
+            self.assertIn("Replay to this step", page)
+            token_match = re.search(r"name='token' value='([^']+)'", page)
+            self.assertIsNotNone(token_match)
+            bad_data = urllib.parse.urlencode({
+                "token": "wrong", "run_id": summary["run_id"],
+                "step_index": 1,
+            }).encode("utf-8")
+            with self.assertRaises(urllib.error.HTTPError) as rejected:
+                urllib.request.urlopen(
+                    urllib.request.Request(url + "replay", data=bad_data,
+                                           method="POST"), timeout=5)
+            self.assertEqual(rejected.exception.code, 403)
+            rejected.exception.close()
+            data = urllib.parse.urlencode({
+                "token": token_match.group(1),
+                "run_id": summary["run_id"],
+                "step_index": 1,
+            }).encode("utf-8")
+            request = urllib.request.Request(url + "replay", data=data,
+                                             method="POST")
+            with urllib.request.urlopen(request, timeout=30) as response:
+                result = response.read().decode("utf-8")
+            self.assertIn("State reconstructed", result)
+            self.assertIn("cleanup hooks were skipped", result)
+        finally:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+            if process.stdout:
+                process.stdout.close()
+            if process.stderr:
+                process.stderr.close()
 
 
 class RecoveredRetryJunitTests(unittest.TestCase):
@@ -337,6 +415,24 @@ class RecoveredRetryJunitTests(unittest.TestCase):
                          "only the last failed attempt is a final failure")
         self.assertEqual(len(root.findall("./testcase/failure")), 1)
 
+    def test_prefix_replay_is_skipped_not_a_partial_test_result(self) -> None:
+        manifest = {
+            "schema_version": 3, "status": "replayed", "flow_name": "debug",
+            "steps": [
+                {"index": 1, "command": "launchApp", "status": "passed",
+                 "duration_ms": 1},
+                {"index": 2, "command": "assertVisible", "status": "failed",
+                 "error": "reproduced", "error_code": "flow_assertion_timeout",
+                 "failure_class": "test_failure", "duration_ms": 2},
+            ],
+        }
+        root = ET.fromstring(flow_report.render_junit(manifest))
+        self.assertEqual(root.get("failures"), "0")
+        self.assertEqual(root.get("skipped"), "2")
+        self.assertEqual(len(root.findall("./testcase/skipped")), 2)
+        suite = ET.fromstring(flow_report.render_suite_junit([manifest]))
+        self.assertEqual(suite.get("failures"), "0")
+
 
 class RenderEscapingTests(unittest.TestCase):
     def test_hostile_strings_are_escaped_everywhere(self) -> None:
@@ -364,6 +460,42 @@ class RenderEscapingTests(unittest.TestCase):
         self.assertNotIn("<b>boom</b>", html_text)
         junit = flow_report.render_junit(manifest)
         ET.fromstring(junit)  # hostile strings stay well-formed XML
+
+    def test_step_page_renders_diff_target_and_scrubbed_requests(self) -> None:
+        manifest = {
+            "schema_version": 3, "status": "passed", "flow_name": "evidence",
+            "flow_path": "flow.yaml", "run_id": "fr_x", "app_id": "app",
+            "platform": "android", "target_id": "emulator-1",
+            "reproduction": "autonom flow run flow.yaml",
+            "steps": [{
+                "index": 1, "command": "tapOn", "status": "passed",
+                "duration_ms": 12, "attempts": 1,
+                "target": {"bounds": [10, 20, 40, 60], "viewport": [100, 200]},
+            }],
+            "network": {"available": True, "requests_by_step": [{
+                "step_index": 1, "requests": [{
+                    "method": "POST", "url": "https://api.example.test/login",
+                    "status": 401, "duration_ms": 22,
+                    "request_headers_preview": {"authorization": "<redacted>"},
+                    "request_body_preview": '{"password":"<redacted>"}',
+                    "response_body_preview": '{"error":"denied"}',
+                }],
+            }]},
+        }
+        evidence = {1: {
+            "shots": [{"src": "data:image/png;base64,eA==", "phase": "after",
+                       "name": "after.png"}],
+            "hierarchies": {}, "logs": {"after": "safe log line"},
+            "hierarchy_diff": {"added": [], "removed": [], "changed": [],
+                               "added_count": 1, "removed_count": 0,
+                               "changed_count": 2, "truncated": False},
+        }}
+        text = flow_report.render_run_page(manifest, evidence, standalone=True)
+        self.assertIn("class='target-box'", text)
+        self.assertIn("1 added · 0 removed · 2 changed", text)
+        self.assertIn("https://api.example.test/login", text)
+        self.assertIn("&lt;redacted&gt;", text)
+        self.assertIn("safe log line", text)
 
 
 if __name__ == "__main__":

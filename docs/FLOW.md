@@ -30,6 +30,7 @@ autonom flow check .autonom/flows      # validates the whole runFlow graph
 autonom flow fmt login.yaml --write    # canonical form (expands shorthand)
 autonom flow list                      # file, id, name, tags, platforms
 autonom flow run login.yaml            # execute against the active session
+autonom flow run login.yaml --until-step 7 --evidence always
 ```
 
 `flow run` needs an active session (`autonom session start`), pre-flights the
@@ -47,6 +48,15 @@ Directory runs execute a tag-filtered suite
 own env frame; a false `when:` skips the step with the failed condition as
 the reason; `onFlowComplete` cleanup is isolated per command and reported as
 `hook_failures` without ever masking the primary outcome.
+
+`--until-step N` is prefix replay for debugging: it executes one flow through
+runtime leaf step `N`, returns status `replayed`, skips `onFlowComplete`, and
+leaves the target at that state. It reconstructs state from the flow start; it
+does not claim that a native application snapshot exists. Prefix runs are
+listed separately in suite totals and exported as skipped JUnit cases, never as
+a complete test result. `--evidence
+minimal|on-failure|always` overrides the header policy, and repeated `--collect
+screenshot|hierarchy|logs|crashes|network` flags override its evidence kinds.
 
 ## What the language refuses, on purpose
 
@@ -217,6 +227,9 @@ requires-capabilities: ui.accessibility screenshots logs network.capture
   an optional assertion is a contradiction and is refused.
 - `onFlowComplete` runs after pass *and* fail; a cleanup failure never masks
   the primary failure; evidence is captured before cleanup runs.
+- `checkpoint` is an addressable replay boundary. Unless evidence mode is
+  `minimal`, it captures the configured screenshot/hierarchy evidence even
+  when the surrounding policy is `on-failure`.
 
 ## Recording a flow (Session → Flow)
 
@@ -236,8 +249,10 @@ command. End recordings with a `ui find` on the success state.
 ## Evidence reports
 
 Every run writes `flows/<run_id>/manifest.json` (schema-versioned: status,
-per-step records with durations/attempts/errors, artifact inventory,
-reproduction command). `autonom report build` renders it as a fully
+stable source/runtime step IDs, source position and redacted canonical args,
+timestamps, matched target/bounds, before/after fingerprints, artifact links,
+step-correlated scrubbed network previews, checkpoints, and reproduction
+commands). `autonom report build` renders it as a fully
 self-contained `report.html` (screenshots inlined as data: URIs, a CSP that
 refuses any external fetch, everything escaped) plus a `report.xml` JUnit
 file for CI; `report open` opens the HTML, `report export --format
@@ -247,13 +262,24 @@ report suite` folds every run of the session into one `suite.html`
 flows open by default) plus a `suite.xml` `<testsuites>` document —
 the shape CI dashboards expect. It exits 1 when any flow failed.
 `--detailed` turns that into a small site — `index.html` plus
-`runs/<run_id>.html` per flow, each step with its frames, the device-log
-window and a link to the hierarchy dump — with `--screenshots
+`runs/<run_id>.html` per flow. Its addressable step timeline exposes the step
+record, before/after frames with matched-target highlighting, UI hierarchy
+diff, per-step device logs, and scrubbed network request/response previews.
+Network capture that was not attached is shown as unavailable, never as an
+empty request list. `--screenshots
 none|failed|all` deciding whose frames are copied into `assets/`
 (default `failed`: a full suite's frames run to hundreds of megabytes).
 `--relative-to DIR` strips a local prefix so the whole site can be
 committed and read from a repository. A failing step also leaves a
 screenshot, a hierarchy dump, and a log window beside the events.
+
+`autonom report serve --run <id> --open` binds only to `127.0.0.1` and adds a
+`Replay to this step` control to the same report. The POST is protected by a
+random page token and accepts only a run and step already present in the
+session manifest; it cannot submit a command or arbitrary path. Replay uses
+the flow's stored non-secret environment, requires secret values to be present
+in the server process environment, collects detailed evidence, and links the
+new replay run. Stop the foreground server with Ctrl-C.
 
 ## Proving a diff (PR Proof)
 

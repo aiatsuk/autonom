@@ -48,119 +48,8 @@ def _inline_image(path: Path) -> str | None:
 
 
 def render_html(manifest: dict[str, Any], artifacts_dir: Path) -> str:
-    e = html.escape
-    status = manifest.get("status", "unknown")
-    color = {"passed": "#1a7f37", "failed": "#b42318"}.get(status, "#555")
-    rows = []
-    for step in manifest.get("steps", []):
-        selector = step.get("selector")
-        detail_bits = []
-        if step.get("label"):
-            detail_bits.append(e(str(step["label"])))
-        if selector:
-            detail_bits.append(f"<code>{e(json.dumps(selector, ensure_ascii=False))}</code>")
-        if step.get("skip_reason"):
-            detail_bits.append(f"skipped: {e(str(step['skip_reason']))}")
-        if step.get("error"):
-            detail_bits.append(
-                f"<b>{e(str(step.get('error_code', '')))}"
-                f"</b> ({e(str(step.get('failure_class', '')))}) — "
-                f"{e(str(step['error']))}")
-        badge = {"passed": "✓", "failed": "✗", "skipped": "○"}.get(
-            step.get("status", ""), "·")
-        rows.append(
-            "<tr>"
-            f"<td>{step.get('index', '')}</td>"
-            f"<td><code>{e(str(step.get('command', '')))}</code>"
-            + (f" <small>({e(str(step.get('hook')))})</small>" if step.get("hook") else "")
-            + "</td>"
-            f"<td class='s-{e(str(step.get('status', '')))}'>{badge} {e(str(step.get('status', '')))}</td>"
-            f"<td>{step.get('duration_ms', 0)}&nbsp;ms ×{step.get('attempts', 1)}</td>"
-            f"<td>{'<br>'.join(detail_bits)}</td>"
-            "</tr>")
-
-    images = []
-    for relative in manifest.get("artifacts", []):
-        if not relative.endswith(".png"):
-            continue
-        source = artifacts_dir / relative
-        uri = _inline_image(source)
-        if uri:
-            images.append(
-                f"<figure><img src='{uri}' alt='{e(relative)}'>"
-                f"<figcaption>{e(relative)}</figcaption></figure>")
-        else:
-            # never let a frame vanish silently — an absent figure reads as
-            # "nothing was captured", which is a lie about the evidence
-            try:
-                size = source.stat().st_size / 1_000_000
-                detail = f"{size:.1f} MB, too large to inline"
-            except OSError:
-                detail = "unreadable"
-            images.append(
-                f"<figure class='missing'><figcaption>{e(relative)} — "
-                f"{e(detail)}; open the file directly</figcaption></figure>")
-
-    failure = manifest.get("primary_error")
-    failure_html = ""
-    if failure:
-        failure_html = (
-            "<h2>Failure</h2><p>"
-            f"step {failure.get('step_index')} "
-            f"<code>{e(str(failure.get('command', '')))}</code> — "
-            f"<b>{e(str(failure.get('error_code', '')))}</b> "
-            f"({e(str(failure.get('failure_class', '')))})<br>"
-            f"{e(str(failure.get('error', '')))}</p>")
-    hooks = manifest.get("hook_failures") or []
-    hooks_html = ""
-    if hooks:
-        items = "".join(
-            f"<li><code>{e(str(h.get('command', '')))}</code> — "
-            f"{e(str(h.get('error_code', '')))}: {e(str(h.get('error', '')))}</li>"
-            for h in hooks)
-        hooks_html = f"<h2>Cleanup failures (did not mask the outcome)</h2><ul>{items}</ul>"
-
-    sensitive = ("<p class='sensitive'>⚠ This run used secrets or sensitive "
-                 "input; screenshots may show private data. Local file — "
-                 "share deliberately.</p>" if manifest.get("sensitive") else "")
-
-    return f"""<meta charset="utf-8">
-<meta http-equiv="Content-Security-Policy"
-      content="default-src 'none'; img-src data:; style-src 'unsafe-inline'">
-<title>{e(str(manifest.get('flow_name', 'flow run')))} — {e(status)}</title>
-<style>
-  body {{ font: 14px/1.5 -apple-system, system-ui, sans-serif; margin: 2rem auto;
-         max-width: 60rem; padding: 0 1rem; color: #1f2328; }}
-  table {{ border-collapse: collapse; width: 100%; }}
-  td, th {{ border-bottom: 1px solid #d0d7de; padding: .4rem .6rem;
-            text-align: left; vertical-align: top; }}
-  code {{ background: #f6f8fa; padding: .1em .3em; border-radius: 4px; }}
-  .status {{ color: {color}; font-weight: 700; }}
-  .s-failed {{ color: #b42318; }} .s-passed {{ color: #1a7f37; }}
-  .s-skipped {{ color: #9a6700; }}
-  figure {{ margin: 1rem 0; }} img {{ max-width: 100%; border: 1px solid #d0d7de; }}
-  figcaption {{ font-size: .85em; color: #57606a; }}
-  .sensitive {{ background: #fff8c5; padding: .5rem .8rem; border-radius: 6px; }}
-</style>
-<h1>{e(str(manifest.get('flow_name', 'flow run')))}
-    <span class="status">{e(status)}</span></h1>
-<p><code>{e(str(manifest.get('flow_path', '')))}</code> ·
-   {e(str(manifest.get('platform', '')))} {e(str(manifest.get('target_id', '')))} ·
-   app <code>{e(str(manifest.get('app_id', '')))}</code> ·
-   run <code>{e(str(manifest.get('run_id', '')))}</code> ·
-   session <code>{e(str(manifest.get('session_id', '')))}</code></p>
-{sensitive}
-{failure_html}
-{hooks_html}
-<h2>Timeline</h2>
-<table><tr><th>#</th><th>command</th><th>status</th><th>time</th><th>detail</th></tr>
-{''.join(rows)}
-</table>
-<h2>Screenshots</h2>
-{''.join(images) or '<p>none captured</p>'}
-<h2>Reproduce</h2>
-<p><code>{e(str(manifest.get('reproduction', '')))}</code></p>
-"""
+    return render_run_page(
+        manifest, _inline_step_assets(manifest, artifacts_dir), standalone=True)
 
 
 _LEGACY_FRAME_RE = re.compile(
@@ -182,13 +71,134 @@ def _legacy_step_index(name: str) -> int | None:
     return None
 
 
+def _artifact_phase(entry: dict[str, Any] | None, name: str) -> str:
+    kind = str((entry or {}).get("kind") or "")
+    for phase in ("before", "after", "failure"):
+        if phase in kind or f"-{phase}-" in name or name.startswith(f"{phase}-"):
+            return phase
+    return "captured"
+
+
+def _looks_like_step_evidence(path: Path) -> bool:
+    return (path.suffix == ".png" or path.name.endswith("hierarchy.json")
+            or path.name.endswith("logs.txt"))
+
+
+def _load_hierarchy(path: Path) -> list[dict[str, Any]]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    nodes = value.get("nodes") if isinstance(value, dict) else value
+    return nodes if isinstance(nodes, list) else []
+
+
+def _node_key(node: dict[str, Any], occurrence: int) -> str:
+    identity = (node.get("resource_id") or node.get("desc") or
+                node.get("text") or node.get("ref") or "node")
+    return f"{identity}|{node.get('role') or node.get('class') or ''}|{occurrence}"
+
+
+def _indexed_nodes(nodes: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    seen: dict[str, int] = {}
+    indexed: dict[str, dict[str, Any]] = {}
+    for node in nodes:
+        base = str(node.get("resource_id") or node.get("desc") or
+                   node.get("text") or node.get("ref") or "node")
+        seen[base] = seen.get(base, 0) + 1
+        indexed[_node_key(node, seen[base])] = node
+    return indexed
+
+
+def _hierarchy_diff(before: list[dict[str, Any]],
+                    after: list[dict[str, Any]]) -> dict[str, Any] | None:
+    if not before or not after:
+        return None
+    left = _indexed_nodes(before)
+    right = _indexed_nodes(after)
+    added = [right[key] for key in sorted(right.keys() - left.keys())]
+    removed = [left[key] for key in sorted(left.keys() - right.keys())]
+    fields = ("text", "desc", "resource_id", "role", "bounds", "enabled",
+              "focused", "selected", "checked")
+    changed = []
+    for key in sorted(left.keys() & right.keys()):
+        changes = {field: {"before": left[key].get(field),
+                           "after": right[key].get(field)}
+                   for field in fields if left[key].get(field) != right[key].get(field)}
+        if changes:
+            changed.append({"node": key, "changes": changes})
+    return {
+        "added": added[:25], "removed": removed[:25], "changed": changed[:25],
+        "added_count": len(added), "removed_count": len(removed),
+        "changed_count": len(changed),
+        "truncated": any(len(items) > 25 for items in (added, removed, changed)),
+    }
+
+
+def _evidence_slot(by_step: dict[int, dict[str, Any]], index: int) -> dict[str, Any]:
+    slot = by_step.setdefault(index, {})
+    slot.setdefault("shots", [])
+    slot.setdefault("hierarchies", {})
+    slot.setdefault("logs", {})
+    return slot
+
+
+def _finalize_evidence(by_step: dict[int, dict[str, Any]]) -> dict[int, dict[str, Any]]:
+    for slot in by_step.values():
+        before = (slot.get("hierarchies") or {}).get("before", {}).get("nodes", [])
+        after = (slot.get("hierarchies") or {}).get("after", {}).get("nodes", [])
+        diff = _hierarchy_diff(before, after)
+        if diff:
+            slot["hierarchy_diff"] = diff
+    return by_step
+
+
+def _inline_step_assets(manifest: dict[str, Any],
+                        artifacts_dir: Path) -> dict[int, dict[str, Any]]:
+    """Build the same step evidence model using data URIs for one-file HTML."""
+    by_step: dict[int, dict[str, Any]] = {}
+    ledger = {entry.get("path"): entry
+              for entry in manifest.get("artifact_steps", [])
+              if entry.get("path")}
+    for relative in manifest.get("artifacts", []):
+        source = artifacts_dir / relative
+        if not source.is_file():
+            continue
+        entry = ledger.get(relative)
+        index = (entry or {}).get("step_index")
+        if not isinstance(index, int):
+            index = _legacy_step_index(source.name) if not ledger else None
+        if not isinstance(index, int):
+            if _looks_like_step_evidence(source):
+                by_step.setdefault(0, {}).setdefault("orphans", []).append(relative)
+            continue
+        slot = _evidence_slot(by_step, index)
+        phase = _artifact_phase(entry, source.name)
+        if source.suffix == ".png":
+            uri = _inline_image(source)
+            slot["shots"].append({
+                "src": uri, "phase": phase, "name": source.name,
+                "missing": None if uri else "too large or unreadable",
+            })
+        elif source.name.endswith("hierarchy.json"):
+            slot["hierarchies"][phase] = {
+                "href": None, "nodes": _load_hierarchy(source),
+                "name": source.name,
+            }
+        elif source.name.endswith("logs.txt"):
+            slot["logs"][phase] = source.read_text(
+                encoding="utf-8", errors="replace")[-12000:]
+    return _finalize_evidence(by_step)
+
+
 def _step_assets(manifest: dict[str, Any], artifacts_dir: Path,
                  assets: Path, mode: str,
-                 file_mode: int = 0o644) -> dict[int, dict[str, Any]]:
+                 file_mode: int = 0o644,
+                 url_prefix: str = "assets") -> dict[int, dict[str, Any]]:
     """Copy this run's evidence next to the report and index it by step.
 
     The step of each artifact comes from the manifest's ``artifact_steps``
-    ledger (v2), which the executor writes at capture time. Filenames are
+    ledger (manifest v2+), which the executor writes at capture time. Filenames are
     never parsed for a step number: a ``takeScreenshot`` label is arbitrary
     user text and could impersonate one.
 
@@ -196,8 +206,6 @@ def _step_assets(manifest: dict[str, Any], artifacts_dir: Path,
     a run that failed, ``none`` copies nothing. Files are copied rather than
     inlined — a suite's worth of base64 would be hundreds of megabytes.
     """
-    if mode == "none" or (mode == "failed" and manifest.get("status") == "passed"):
-        return {}
     run_id = str(manifest.get("run_id") or "run")
     by_step: dict[int, dict[str, Any]] = {}
     target = assets / run_id
@@ -216,120 +224,304 @@ def _step_assets(manifest: dict[str, Any], artifacts_dir: Path,
             # listed under "unattached evidence" instead of guessed at.
             index = _legacy_step_index(source.name) if not ledger else None
             if index is None:
-                by_step.setdefault(0, {}).setdefault("orphans", []).append(relative)
+                if _looks_like_step_evidence(source):
+                    by_step.setdefault(0, {}).setdefault("orphans", []).append(relative)
                 continue
         else:
             index = entry.get("step_index")
         if not isinstance(index, int):
             continue
         name = source.name
+        slot = _evidence_slot(by_step, index)
+        phase = _artifact_phase(entry, name)
         if source.suffix == ".png":
+            if mode == "none" or (mode == "failed"
+                                  and manifest.get("status") == "passed"):
+                continue
             target.mkdir(parents=True, exist_ok=True)
             copy = target / name
             copy.write_bytes(source.read_bytes())
             os.chmod(copy, file_mode)
-            by_step.setdefault(index, {}).setdefault("shots", []).append(
-                f"assets/{run_id}/{name}")
-        elif name.endswith("-logs.txt"):
+            slot["shots"].append({
+                "src": f"{url_prefix}/{run_id}/{name}",
+                "phase": phase, "name": name,
+            })
+        elif name.endswith("logs.txt"):
             text = source.read_text(encoding="utf-8", errors="replace")
-            by_step.setdefault(index, {})["logs"] = text[-4000:]
-        elif name.endswith("-hierarchy.json"):
+            slot["logs"][phase] = text[-12000:]
+        elif name.endswith("hierarchy.json"):
             target.mkdir(parents=True, exist_ok=True)
             copy = target / name
             copy.write_bytes(source.read_bytes())
             os.chmod(copy, file_mode)
-            by_step.setdefault(index, {})["hierarchy"] = f"assets/{run_id}/{name}"
-    return by_step
+            slot["hierarchies"][phase] = {
+                "href": f"{url_prefix}/{run_id}/{name}",
+                "nodes": _load_hierarchy(source), "name": name,
+            }
+    return _finalize_evidence(by_step)
+
+
+def _target_overlay(step: dict[str, Any]) -> str:
+    target = step.get("target") or {}
+    bounds = target.get("bounds")
+    viewport = target.get("viewport")
+    if (not isinstance(bounds, list) or len(bounds) != 4
+            or not isinstance(viewport, list) or len(viewport) != 2
+            or not all(isinstance(value, (int, float)) for value in bounds + viewport)
+            or viewport[0] <= 0 or viewport[1] <= 0):
+        return ""
+    left, top, right, bottom = bounds
+    width, height = viewport
+    style = (f"left:{left / width * 100:.4f}%;top:{top / height * 100:.4f}%;"
+             f"width:{max(0, right-left) / width * 100:.4f}%;"
+             f"height:{max(0, bottom-top) / height * 100:.4f}%")
+    return f"<span class='target-box' style='{style}' aria-label='matched target'></span>"
+
+
+def _render_shots(step: dict[str, Any], found: dict[str, Any]) -> str:
+    e = html.escape
+    figures = []
+    overlay = _target_overlay(step)
+    for shot in found.get("shots", []):
+        phase = str(shot.get("phase") or "captured")
+        src = shot.get("src")
+        if not src:
+            figures.append(
+                f"<figure class='missing'><figcaption>{e(str(shot.get('name','frame')))} "
+                f"— {e(str(shot.get('missing','unreadable')))}</figcaption></figure>")
+            continue
+        figures.append(
+            f"<figure><div class='frame'><img src='{e(str(src))}' loading='lazy' "
+            f"alt='{e(phase)} frame for step {step.get('index','')}'>"
+            f"{overlay if phase in ('after', 'failure', 'captured') else ''}</div>"
+            f"<figcaption><b>{e(phase)}</b> · {e(str(shot.get('name','frame')))}</figcaption>"
+            "</figure>")
+    return ("<div class='shots'>" + "".join(figures) + "</div>"
+            if figures else "<p class='missing'>No screenshots were captured for this step.</p>")
+
+
+def _render_hierarchy(found: dict[str, Any]) -> str:
+    e = html.escape
+    hierarchies = found.get("hierarchies") or {}
+    links = []
+    for phase, item in hierarchies.items():
+        if item.get("href"):
+            links.append(f"<a href='{e(str(item['href']))}'>{e(phase)} hierarchy JSON</a>")
+    diff = found.get("hierarchy_diff")
+    if diff:
+        summary = (f"{diff['added_count']} added · {diff['removed_count']} removed · "
+                   f"{diff['changed_count']} changed")
+        body = e(json.dumps({key: diff[key] for key in ("added", "removed", "changed")},
+                            ensure_ascii=False, indent=2))
+        result = (f"<p><b>{e(summary)}</b></p><pre>{body}</pre>"
+                  + ("<p class='missing'>Diff preview is truncated to 25 entries per group.</p>"
+                     if diff.get("truncated") else ""))
+    elif hierarchies:
+        phases = ", ".join(str(name) for name in hierarchies)
+        result = f"<p class='missing'>Captured {e(phases)} hierarchy; a before/after pair is required for a diff.</p>"
+    else:
+        result = "<p class='missing'>No hierarchy evidence was captured for this step.</p>"
+    if links:
+        result += "<p>" + " · ".join(links) + "</p>"
+    return result
+
+
+def _requests_for_step(manifest: dict[str, Any], index: int) -> list[dict[str, Any]]:
+    for item in (manifest.get("network") or {}).get("requests_by_step", []):
+        if item.get("step_index") == index:
+            return item.get("requests") or []
+    return []
+
+
+def _render_requests(manifest: dict[str, Any], index: int) -> str:
+    e = html.escape
+    network = manifest.get("network") or {}
+    if not network.get("available"):
+        reason = network.get("reason") or "network capture was not attached"
+        return (f"<p class='missing'>{e(str(reason))}; request evidence is "
+                "unavailable, not empty.</p>")
+    requests = _requests_for_step(manifest, index)
+    if not requests:
+        return "<p class='missing'>No requests started during this step.</p>"
+    rows = []
+    for request in requests:
+        mocked = " · mocked" if request.get("mocked") else ""
+        previews = {
+            "request_headers": request.get("request_headers_preview") or {},
+            "request_body": request.get("request_body_preview"),
+            "response_headers": request.get("response_headers_preview") or {},
+            "response_body": request.get("response_body_preview"),
+        }
+        rows.append(
+            "<article class='request'>"
+            f"<p><b>{e(str(request.get('method','')))}</b> "
+            f"<code>{e(str(request.get('url','')))}</code><br>"
+            f"status <b>{e(str(request.get('status','')))}</b> · "
+            f"{e(str(request.get('duration_ms',0)))} ms{e(mocked)}</p>"
+            f"<pre>{e(json.dumps(previews, ensure_ascii=False, indent=2))}</pre>"
+            "</article>")
+    return "".join(rows)
 
 
 def render_run_page(manifest: dict[str, Any], evidence: dict[int, dict],
-                    base: Path | None = None) -> str:
-    """One page per flow: every step with its frames, logs and hierarchy."""
+                    base: Path | None = None, *, standalone: bool = False,
+                    control_url: str | None = None,
+                    csrf_token: str | None = None) -> str:
+    """Interactive evidence page with addressable steps and safe replay forms."""
     e = html.escape
     status = manifest.get("status", "unknown")
-    color = {"passed": "#1a7f37", "failed": "#b42318"}.get(status, "#555")
+    color = {"passed": "#1a7f37", "failed": "#b42318",
+             "replayed": "#9a6700"}.get(status, "#555")
+    nav = []
     blocks = []
-    for step in manifest.get("steps", []):
+    reproduction = _shorten(str(manifest.get("reproduction", "")), base)
+    steps = sorted(manifest.get("steps", []),
+                   key=lambda item: item.get("index", 0))
+    for step in steps:
         index = step.get("index", 0)
         found = evidence.get(index, {})
+        step_status = str(step.get("status", ""))
         badge = {"passed": "✓", "failed": "✗", "skipped": "○"}.get(
-            step.get("status", ""), "·")
-        head = (f"<h3 class='s-{e(str(step.get('status','')))}'>"
-                f"{badge} {index}. <code>{e(str(step.get('command','')))}</code>"
-                f" <span class='muted'>{step.get('duration_ms',0)} ms</span></h3>")
-        bits = []
-        if step.get("label"):
-            bits.append(f"<p>{e(str(step['label']))}</p>")
-        if step.get("selector"):
-            bits.append(f"<p><code>"
-                        f"{e(json.dumps(step['selector'], ensure_ascii=False))}"
-                        f"</code></p>")
+            step_status, "·")
+        label = str(step.get("label")
+                    or (step.get("canonical_args") or {}).get("name")
+                    or step.get("command") or "step")
+        nav.append(
+            f"<a class='nav-step s-{e(step_status)}' href='#step-{index}'>"
+            f"<span>{badge}</span><b>{index}</b> {e(label)}</a>")
+        metadata = {
+            "step_id": step.get("step_id"), "source_id": step.get("source_id"),
+            "source": {"file": _shorten(str(step.get("flow", "")), base),
+                       "line": step.get("line"), "column": step.get("column")},
+            "selector": step.get("selector"), "target": step.get("target"),
+            "arguments": step.get("canonical_args"),
+            "precondition": step.get("precondition_fingerprint"),
+            "postcondition": step.get("postcondition_fingerprint"),
+        }
+        metadata = {key: value for key, value in metadata.items()
+                    if value not in (None, {}, "")}
+        messages = []
         if step.get("skip_reason"):
-            tolerated = (f" — tolerated {e(str(step.get('error_code','')))}: "
-                         f"{e(str(step.get('error','')))}"
-                         if step.get("error") else "")
-            bits.append(f"<p class='s-skipped'>skipped: "
-                        f"{e(str(step['skip_reason']))}{tolerated}</p>")
-        elif step.get("error"):
-            bits.append(f"<p class='s-failed'><b>"
-                        f"{e(str(step.get('error_code','')))}</b> "
-                        f"({e(str(step.get('failure_class','')))})<br>"
-                        f"{e(str(step['error']))}</p>")
-        for shot in found.get("shots", []):
-            bits.append(f"<figure><img src='{e(shot)}' loading='lazy' "
-                        f"alt='step {index}'>"
-                        f"<figcaption>{e(shot.rsplit('/', 1)[-1])}</figcaption>"
-                        f"</figure>")
-        if found.get("hierarchy"):
-            bits.append(f"<p><a href='{e(found['hierarchy'])}'>"
-                        "view hierarchy JSON</a></p>")
-        if found.get("logs"):
-            bits.append("<details><summary>device log around the failure"
-                        f"</summary><pre>{e(found['logs'])}</pre></details>")
-        blocks.append(head + "".join(bits))
+            messages.append(f"<p class='notice s-skipped'>Skipped: "
+                            f"{e(str(step['skip_reason']))}</p>")
+        if step.get("error"):
+            messages.append(
+                f"<p class='notice s-failed'><b>{e(str(step.get('error_code','')))}</b> "
+                f"({e(str(step.get('failure_class','')))})<br>{e(str(step['error']))}</p>")
+        replay_command = f"{reproduction} --until-step {index} --evidence always"
+        for kind in ("screenshot", "hierarchy", "logs", "network"):
+            replay_command += f" --collect {kind}"
+        rendered_logs = "".join(
+            f"<h4>{e(phase)}</h4><pre>{e(text)}</pre>"
+            for phase, text in (found.get("logs") or {}).items()
+        ) or "<p class='missing'>No per-step logs were captured.</p>"
+        if control_url and csrf_token:
+            action = (
+                "<div class='replay'><b>Reconstruct this state</b>"
+                "<p>This explicitly re-executes every mutation in the flow prefix.</p>"
+                f"<form method='post' action='{e(control_url)}'>"
+                f"<input type='hidden' name='token' value='{e(csrf_token)}'>"
+                f"<input type='hidden' name='run_id' value='{e(str(manifest.get('run_id','')))}'>"
+                f"<input type='hidden' name='step_index' value='{index}'>"
+                "<button type='submit'>Replay to this step</button></form></div>")
+        else:
+            action = ("<p class='replay'><b>Replay to this state</b><br>"
+                      f"<code>{e(replay_command)}</code></p>")
+        blocks.append(
+            f"<section class='step-card' id='step-{index}'>"
+            f"<header><h2 class='s-{e(step_status)}'>{badge} Step {index} · "
+            f"<code>{e(str(step.get('command','')))}</code></h2>"
+            f"<span>{step.get('duration_ms',0)} ms · {step.get('attempts',1)} attempt(s)</span></header>"
+            + "".join(messages)
+            + f"<details><summary>Step record</summary><pre>"
+              f"{e(json.dumps(metadata, ensure_ascii=False, indent=2))}</pre></details>"
+            + f"<details open><summary>Screenshots and matched target</summary>"
+              f"{_render_shots(step, found)}</details>"
+            + f"<details><summary>UI hierarchy diff</summary>"
+              f"{_render_hierarchy(found)}</details>"
+            + f"<details><summary>Device logs</summary>"
+              f"{rendered_logs}</details>"
+            + f"<details><summary>Network requests</summary>"
+              f"{_render_requests(manifest, int(index))}</details>"
+            + action + "</section>")
 
     stray = evidence.get(0, {}).get("orphans") or []
-    orphans = ("<h2>Unattached evidence</h2><ul>"
+    orphans = ("<section class='step-card'><h2>Unattached evidence</h2><ul>"
                + "".join(f"<li><code>{e(str(name))}</code></li>" for name in stray)
-               + "</ul>") if stray else ""
-    stray = evidence.get(0, {}).get("orphans") or []
-    orphans = ("<h2>Unattached evidence</h2><ul>"
-               + "".join(f"<li><code>{e(str(name))}</code></li>" for name in stray)
-               + "</ul>") if stray else ""
+               + "</ul></section>") if stray else ""
     sensitive = ("<p class='sensitive'>⚠ This run used secrets or sensitive "
-                 "input; frames may show private data. Share deliberately."
-                 "</p>" if manifest.get("sensitive") else "")
-    return f"""<meta charset="utf-8">
+                 "input; frames may show private data. Share deliberately.</p>"
+                 if manifest.get("sensitive") else "")
+    failure = manifest.get("primary_error") or {}
+    failure_summary = (f"<p class='notice s-failed'><b>Primary failure: "
+                       f"{e(str(failure.get('error_code','')))}</b><br>"
+                       f"{e(str(failure.get('error','')))}</p>" if failure else "")
+    hook_failures = manifest.get("hook_failures") or []
+    hook_summary = ("<details><summary>Cleanup failures</summary><pre>"
+                    + e(json.dumps(hook_failures, ensure_ascii=False, indent=2))
+                    + "</pre></details>" if hook_failures else "")
+    environment = {
+        "environment": manifest.get("environment") or {},
+        "evidence_mode": manifest.get("evidence_mode"),
+        "evidence_collect": manifest.get("evidence_collect") or [],
+        "started_at_ms": manifest.get("started_at_ms"),
+        "finished_at_ms": manifest.get("finished_at_ms"),
+    }
+    back = "" if standalone else '<p><a href="index.html">← all flows</a></p>'
+    restore_note = (
+        "<p class='restore-note'><b>Portable restore:</b> Autonom reconstructs "
+        "the selected state by replaying the flow from its start and stops after "
+        "that step. Cleanup hooks are skipped. This is not presented as a native "
+        "app snapshot.</p>")
+    return f"""<!doctype html><meta charset="utf-8">
 <meta http-equiv="Content-Security-Policy"
-      content="default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'">
+      content="default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; form-action 'self'">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{e(str(manifest.get('flow_name','flow')))} — {e(status)}</title>
 <style>
-  body {{ font: 14px/1.5 -apple-system, system-ui, sans-serif; margin: 2rem auto;
-         max-width: 60rem; padding: 0 1rem; color: #1f2328; }}
-  code {{ background: #f6f8fa; padding: .1em .3em; border-radius: 4px; }}
-  pre {{ background: #f6f8fa; padding: .6rem; overflow-x: auto;
-         font-size: .82em; }}
-  img {{ max-width: 320px; border: 1px solid #d0d7de; border-radius: 6px; }}
-  figure {{ display: inline-block; margin: .4rem .6rem .4rem 0; }}
-  figcaption {{ font-size: .75em; color: #57606a; }}
-  h3 {{ margin: 1.4rem 0 .3rem; font-size: 1rem; }}
-  .status {{ color: {color}; font-weight: 700; }}
-  .s-failed {{ color: #b42318; }} .s-passed {{ color: #1a7f37; }}
-  .s-skipped {{ color: #9a6700; }} .muted {{ color: #57606a; font-weight: 400; }}
-  .sensitive {{ background: #fff8c5; padding: .5rem .8rem; border-radius: 6px; }}
-  .missing {{ color: #57606a; font-style: italic; }}
+  :root {{ color-scheme: light; --line:#d0d7de; --muted:#57606a; --panel:#f6f8fa; }}
+  * {{ box-sizing: border-box; }} body {{ margin:0; color:#1f2328;
+    font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }}
+  .page {{ max-width:1180px; margin:auto; padding:28px 24px; }}
+  .layout {{ display:grid; grid-template-columns:230px minmax(0,1fr); gap:24px; align-items:start; }}
+  aside {{ position:sticky; top:16px; max-height:calc(100vh - 32px); overflow:auto;
+    border:1px solid var(--line); border-radius:10px; padding:10px; }}
+  .nav-step {{ display:grid; grid-template-columns:18px 24px 1fr; gap:5px; padding:7px;
+    color:#1f2328; text-decoration:none; border-radius:6px; }} .nav-step:hover {{ background:var(--panel); }}
+  code {{ background:var(--panel); padding:.1em .3em; border-radius:4px; overflow-wrap:anywhere; }}
+  pre {{ background:var(--panel); border-radius:7px; padding:12px; overflow:auto;
+    max-height:360px; font-size:12px; white-space:pre-wrap; }}
+  .step-card {{ border:1px solid var(--line); border-radius:12px; padding:18px; margin:0 0 18px;
+    scroll-margin-top:18px; }} .step-card>header {{ display:flex; justify-content:space-between;
+    gap:16px; align-items:baseline; border-bottom:1px solid var(--line); margin:-4px 0 10px; }}
+  h1 {{ margin:.2em 0; }} h2 {{ font-size:17px; }} details {{ border-top:1px solid #eaeef2;
+    padding:10px 0; }} summary {{ cursor:pointer; font-weight:650; }}
+  .shots {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:12px; margin-top:10px; }}
+  figure {{ margin:0; }} .frame {{ display:inline-block; position:relative; max-width:100%; }}
+  img {{ display:block; width:auto; max-width:100%; max-height:540px; border:1px solid var(--line); border-radius:8px; }}
+  figcaption {{ color:var(--muted); font-size:12px; padding-top:4px; }}
+  .target-box {{ position:absolute; border:3px solid #ff2d55; background:#ff2d5526;
+    box-shadow:0 0 0 1px #fff; pointer-events:none; }}
+  .status {{ color:{color}; }} .s-failed {{ color:#b42318; }} .s-passed {{ color:#1a7f37; }}
+  .s-skipped,.s-replayed {{ color:#9a6700; }} .muted,.missing {{ color:var(--muted); }}
+  .notice,.sensitive,.restore-note,.replay {{ padding:10px 12px; border-radius:8px; background:var(--panel); }}
+  .sensitive {{ background:#fff8c5; }} .restore-note {{ background:#ddf4ff; }}
+  .request {{ border-left:3px solid #54aeff; padding-left:12px; }} button {{ background:#1f883d;
+    color:white; border:0; border-radius:6px; padding:8px 12px; font-weight:650; cursor:pointer; }}
+  @media(max-width:760px) {{ .layout {{ grid-template-columns:1fr; }} aside {{ position:relative;
+    top:auto; max-height:none; }} }}
 </style>
-<p><a href="index.html">← all flows</a></p>
-<h1>{e(str(manifest.get('flow_name','flow')))}
-    <span class="status">{e(status)}</span></h1>
+<div class="page">{back}
+<h1>{e(str(manifest.get('flow_name','flow')))} <span class="status">{e(status)}</span></h1>
 {sensitive}
+{failure_summary}{hook_summary}
 <p class="muted"><code>{e(_shorten(str(manifest.get('flow_path','')), base))}</code><br>
-reproduce: <code>{e(_shorten(str(manifest.get('reproduction','')), base))}</code><br>
 {e(str(manifest.get('platform','')))} {e(str(manifest.get('target_id','')))} ·
-app <code>{e(str(manifest.get('app_id','')))}</code> ·
-run <code>{e(str(manifest.get('run_id','')))}</code></p>
-{''.join(blocks)}
-{orphans}
+app <code>{e(str(manifest.get('app_id','')))}</code> · run <code>{e(str(manifest.get('run_id','')))}</code></p>
+{restore_note}
+<details><summary>Environment and evidence policy</summary><pre>{e(json.dumps(environment, ensure_ascii=False, indent=2))}</pre></details>
+<div class="layout"><aside><b>Timeline</b>{''.join(nav)}</aside>
+<main>{''.join(blocks)}{orphans}</main></div></div>
 """
 
 
@@ -357,7 +549,8 @@ def render_suite_html(manifests: list[dict[str, Any]],
     """
     e = html.escape
     passed = [m for m in manifests if m.get("status") == "passed"]
-    failed = [m for m in manifests if m.get("status") != "passed"]
+    failed = [m for m in manifests if m.get("status") == "failed"]
+    replayed = [m for m in manifests if m.get("status") == "replayed"]
     total_ms = sum(step.get("duration_ms", 0)
                    for m in manifests for step in m.get("steps", []))
     status = "failed" if failed else "passed"
@@ -365,7 +558,8 @@ def render_suite_html(manifests: list[dict[str, Any]],
 
     def step_rows(manifest: dict[str, Any]) -> str:
         rows = []
-        for step in manifest.get("steps", []):
+        for step in sorted(manifest.get("steps", []),
+                           key=lambda item: item.get("index", 0)):
             badge = {"passed": "✓", "failed": "✗", "skipped": "○"}.get(
                 step.get("status", ""), "·")
             detail = ""
@@ -448,6 +642,7 @@ def render_suite_html(manifests: list[dict[str, Any]],
   <div>{len(manifests)}<span>flows</span></div>
   <div class="s-passed">{len(passed)}<span>passed</span></div>
   <div class="s-failed">{len(failed)}<span>failed</span></div>
+  <div class="s-skipped">{len(replayed)}<span>prefix replays</span></div>
   <div>{total_ms/1000:.0f}s<span>total step time</span></div>
 </div>
 {sensitive_note}
@@ -509,7 +704,8 @@ def render_suite_junit(manifests: list[dict[str, Any]]) -> str:
     failures = sum(
         1 for m in manifests
         for s in m.get("steps", [])
-        if _is_junit_failure(s, recovered_retry_indexes(m)))
+        if (m.get("status") != "replayed"
+            and _is_junit_failure(s, recovered_retry_indexes(m))))
     total = sum(s.get("duration_ms", 0)
                 for m in manifests for s in m.get("steps", [])) / 1000
     return ('<?xml version="1.0" encoding="UTF-8"?>\n'
@@ -520,11 +716,15 @@ def render_suite_junit(manifests: list[dict[str, Any]]) -> str:
 def render_junit(manifest: dict[str, Any]) -> str:
     suite_name = manifest.get("flow_id") or manifest.get("flow_name") or "flow"
     steps = manifest.get("steps", [])
+    prefix_replay = manifest.get("status") == "replayed"
     recovered = recovered_retry_indexes(manifest)
-    failures = sum(1 for s in steps if _is_junit_failure(s, recovered))
-    skipped = sum(1 for s in steps
-                  if s.get("status") == "skipped"
-                  or (s.get("status") == "failed" and s.get("index") in recovered))
+    failures = (0 if prefix_replay else
+                sum(1 for s in steps if _is_junit_failure(s, recovered)))
+    skipped = (len(steps) if prefix_replay else
+               sum(1 for s in steps
+                   if s.get("status") == "skipped"
+                   or (s.get("status") == "failed"
+                       and s.get("index") in recovered)))
     total_time = sum(s.get("duration_ms", 0) for s in steps) / 1000
     cases = []
     for step in steps:
@@ -533,7 +733,9 @@ def render_junit(manifest: dict[str, Any]) -> str:
             name += f" — {step['label']}"
         time_s = step.get("duration_ms", 0) / 1000
         body = ""
-        if step.get("status") == "failed" and step.get("index") in recovered:
+        if prefix_replay:
+            body = '<skipped message="prefix replay"/>'
+        elif step.get("status") == "failed" and step.get("index") in recovered:
             body = '<skipped message="retried"/>'
         elif step.get("status") == "failed":
             message = quoteattr(str(step.get("error", "")))
