@@ -20,7 +20,9 @@ Hybrid repositories can contain several, so route by the layer being changed.
 For **runtime QA / UI debug** on a device, emulator, or simulator, load
 `mobile-session` and `mobile-screen` (Autonom CLI) in addition to the
 stack-specific debugger. Load `mobile-network` when the task mentions an API,
-request, response, mock, HAR, proxy, or "why is this call failing".
+request, response, mock, HAR, proxy, or "why is this call failing". Load
+`mobile-flow` when the task mentions a repeatable flow, regression check,
+smoke suite, replaying a journey, or a `.yaml` flow file.
 
 Once the target app is known (a package/bundle id is in play), load
 `mobile-memory` and read `~/.autonom/apps/<package>/app.md` and any matching

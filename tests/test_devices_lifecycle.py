@@ -24,28 +24,28 @@ UDID = "AAAAAAAA-1111-2222-3333-BBBBBBBBBBBB"
 sys.path.insert(0, str(ROOT / "scripts"))
 from autonom_lib import emulator as emulator_mod, errors  # noqa: E402
 
-ENV_KEYS = ("AUTONOM_FAKE_STATE", "AUTONOM_FAKE_LOG", "AUTONOM_HOME")
+try:
+    from env_isolation import EnvSandboxMixin  # noqa: E402  (discover -s tests)
+except ImportError:  # direct `python3 -m unittest tests.test_...` runs
+    from tests.env_isolation import EnvSandboxMixin  # noqa: E402
 
-
-class LifecycleBase(unittest.TestCase):
+class LifecycleBase(EnvSandboxMixin, unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         root = Path(self.tmp.name)
         self.state = root / "state.json"
         self.log = root / "log.jsonl"
         self.state.write_text("{}", encoding="utf-8")
-        self.env = {
-            **os.environ,
-            "AUTONOM_FAKE_STATE": str(self.state),
-            "AUTONOM_FAKE_LOG": str(self.log),
-            "AUTONOM_HOME": str(root / "home"),
-        }
-        for key in ENV_KEYS:
-            os.environ[key] = self.env[key]
+        self.set_env(
+            AUTONOM_FAKE_STATE=str(self.state),
+            AUTONOM_FAKE_LOG=str(self.log),
+            AUTONOM_HOME=str(root / "home"),
+        )
+        # Snapshotted after set_env so subprocesses see exactly what
+        # in-process code sees — one source of truth, no parallel dict.
+        self.env = dict(os.environ)
 
     def tearDown(self) -> None:
-        for key in ENV_KEYS:
-            os.environ.pop(key, None)
         self.tmp.cleanup()
 
     def set_state(self, **kwargs) -> None:

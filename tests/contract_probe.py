@@ -57,6 +57,10 @@ PROBES: list[tuple[str, tuple[str, ...]]] = [
     ("ui_key", ("ui", "key", "KEYCODE_BACK")),
     ("screenshot", ("screenshot",)),
     ("logs_tail", ("logs", "tail", "--package", "com.example.app", "--max-lines", "20")),
+    ("flow_check", ("flow", "check", str(ROOT / "tests/fixtures/flows/contract_pass.yaml"))),
+    ("flow_run_pass", ("flow", "run", str(ROOT / "tests/fixtures/flows/contract_pass.yaml"))),
+    ("flow_run_test_failure",
+     ("flow", "run", str(ROOT / "tests/fixtures/flows/contract_fail.yaml"))),
     ("session_stop", ("session", "stop")),
 ]
 
@@ -117,7 +121,9 @@ def run(argv: tuple[str, ...], workdir: Path, env: dict[str, str]) -> dict[str, 
         check=False,
     )
     payload: dict[str, Any] = {"exit_code": completed.returncode}
-    stream = completed.stdout if completed.returncode == 0 else completed.stderr
+    # Exit 1 is a *reported* failure (doctor --strict, flow run test failures):
+    # the report lands on stdout. Exit 2 is an error envelope on stderr.
+    stream = completed.stdout if completed.returncode in (0, 1) else completed.stderr
     try:
         payload["body"] = json.loads(stream)
     except json.JSONDecodeError:

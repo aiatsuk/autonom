@@ -1,0 +1,23 @@
+appId: com.example.app
+name: Login
+tags:
+  - smoke
+env:
+  USERNAME: user@example.com
+---
+- launchApp:
+    clearState: true
+- tapOn: Username
+- inputText: ${USERNAME}
+- tapOn:
+    id: login_button
+    enabled: true
+- extendedWaitUntil:
+    visible:
+      text: "Welcome.*"
+    timeout: 15000
+- assertVisible: Welcome back
+- swipe:
+    direction: up
+- takeScreenshot: after-login
+- runFlow: sub/cleanup.yaml

@@ -22,32 +22,25 @@ structured error handling and activity recreation.
 ## Investigate jank
 
 ```text
-Profile the exact scroll flow in Flutter profile mode on the physical device.
-Report UI/raster p90, p99, worst and over-budget frames. Escalate to Perfetto or
-Simpleperf only if Android/plugin work is implicated.
+Profile the exact scroll flow in Flutter profile mode on the physical device;
+summarize with `autonom metrics frames flutter-summary <timings.json>`. On
+Android wrap the flow in `autonom metrics frames reset` / `capture` (or
+`metrics trace --preset gfxinfo-flow --duration 30`). Report UI/raster p90,
+p99, worst and over-budget frames. Escalate to Perfetto or `metrics trace
+--preset simpleperf` only if Android/plugin work is implicated.
 ```
 
 ## Investigate memory growth
 
 ```text
-Repeat the open/close flow five times, return to the same idle state after each
-run, compare Dart snapshots, capture Android meminfo/HPROF where indicated, and
-prove or reject a retained path before patching.
+Take `autonom metrics snapshot --label baseline`, repeat the open/close flow
+five times returning to the same idle state, then `metrics snapshot --label
+after`. If the delta looks interesting, run `autonom metrics series --count 5
+--interval 2` while repeating the flow and read directional_growth_leads.
+A lead is a direction, not a leak: prove or reject a retained path (HPROF /
+Instruments) before patching. Never compare Android total_pss_kb with iOS
+rss_bytes — the payload's metric_semantics and limitations say why.
 ```
-
-> **Roadmap:** memory and CPU have no CLI verb yet — the work goes through the
-> skill helpers above (Android meminfo/HPROF, `xctrace` on iOS). Phase 4
-> ([`docs/plans/PHASE_4_METRICS.md`](plans/PHASE_4_METRICS.md)) adds
-> `autonom metrics …` (snapshot, series, memory capture, simpleperf/xctrace,
-> Flutter frames) plus live observation — `session outputs`, `logs follow`,
-> `network requests follow` — so no one has to memorize
-> `tail -f ~/.autonom/sessions/…/output/….log`. Until then, watch a run with:
->
-> ```bash
-> tail -f ~/.autonom/sessions/<id>/output/flutter_run_mitm.log
-> autonom network requests list --max 50
-> autonom logs tail --package <app-id> --since 60
-> ```
 
 ## See what the app actually sent
 
@@ -115,6 +108,46 @@ artifacts. Report what was measured and what remains uncertain.
 Open the deep link myapp://order/42, grant photo permission, set the location to
 55.751244,37.618423, add a fixture image to the media library, then verify the
 resulting screen with a UI tree and a screenshot.
+```
+
+## Turn a verified journey into a repeatable flow
+
+```text
+The login journey we just walked through works. Write it as an Autonom Flow v1
+file under .autonom/flows/auth/login.yaml (secrets via ${TEST_EMAIL} and
+${TEST_PASSWORD}, never inline), run `flow check` on it, then execute it with
+`flow run --secret TEST_EMAIL --secret TEST_PASSWORD` and report the summary
+with the events path.
+```
+
+## Record a session into a flow automatically
+
+```text
+Walk through the checkout journey on the device with autonom ui verbs
+(finish with a ui find on the success screen), then run
+`autonom flow create --from-session current --task checkout --out
+.autonom/flows/checkout.yaml` and replay it with the command the response
+suggests. Report the quality warnings, if any.
+```
+
+## Run the smoke suite and explain any failure
+
+```text
+Run `autonom flow run .autonom/flows --include-tag smoke --exclude-tag flaky`.
+If a flow fails with failure_class test_failure, read its events.ndjson and
+failure screenshot and tell me what the app actually showed; do not retry the
+flow.
+```
+
+## Watch a session live
+
+```text
+Run `autonom session outputs` and tell me what is followable. While I drive the
+app, stream errors with
+`autonom logs follow --source device --grep 'Exception|Error' --max-seconds 60`
+and new API calls with `autonom network requests follow --max-seconds 60`.
+Every follow must be bounded (--max-seconds / --max-lines); to watch in my own
+terminal give me the `shell_hint` (`tail -f <abs_path>`) from session outputs.
 ```
 
 ## Check what this machine can do

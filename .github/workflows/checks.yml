@@ -1,0 +1,58 @@
+name: checks
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Cancel superseded PR runs, but never a main run: every main commit keeps
+  # a completed verdict even when merges land in quick succession.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  actionlint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Lint workflow files
+        run: docker run --rm -v "$PWD:/repo" --workdir /repo rhysd/actionlint:latest -color
+
+  checks:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python: "3.11"
+          - os: ubuntu-latest
+            python: "3.14"
+          - os: macos-latest
+            python: "3.14"
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: actions/setup-node@v4
+        with:
+          # import.meta.dirname in tests/browser-bridge.test.mjs needs >= 20.11.
+          node-version: "22"
+      - name: Install shellcheck (macOS)
+        if: runner.os == 'macOS'
+        run: command -v shellcheck >/dev/null 2>&1 || brew install shellcheck
+      - name: Tool gates
+        # The suite shells out to openssl with no skip guard, and the lint is
+        # only real when shellcheck exists — fail here, not silently later.
+        run: |
+          shellcheck --version
+          openssl version
+          node --version
+          python3 --version
+      - name: Run the full check suite
+        env:
+          AUTONOM_REQUIRE_SHELLCHECK: "1"
+        run: ./scripts/run_checks.sh

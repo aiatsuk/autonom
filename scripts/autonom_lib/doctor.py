@@ -162,6 +162,17 @@ def collect(args: Any = None) -> dict[str, Any]:
         },
     }
 
+    # Optional profilers never gate `--strict` (is_healthy reads `tools` only):
+    # a missing xctrace narrows what metrics can do, it does not break the host.
+    from .metrics import presets as presets_mod
+
+    metrics_caps = {
+        "android_meminfo": tools["adb"]["state"] == "ok",
+        "ios_host_ps": shutil.which("ps") is not None,
+        "ios_xctrace": presets_mod.xctrace_available(tools["simctl"].get("path")),
+        "flutter_frame_summary": True,
+    }
+
     record = session_mod.load_current()
     session_summary = None
     if record:
@@ -194,6 +205,7 @@ def collect(args: Any = None) -> dict[str, Any]:
         "ok": True,
         "tools": tools,
         "capabilities": capabilities,
+        "metrics": metrics_caps,
         "session": session_summary,
         "network": network_state,
         "mocks": mocks_state,

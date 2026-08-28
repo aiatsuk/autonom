@@ -18,12 +18,17 @@ server is required (optional MCP wrapper is planned).
 **Shipped:** Android emulator + iOS Simulator sessions, UI trees, semantic
 find/tap/gestures, screenshots and recordings, logs and crashes, deep links,
 permissions, location, media and container files, consent-gated HTTP(S) capture
-and mocking, and a per-session journal of every action. Domain packs for
-Flutter, native Kotlin/Jetpack Compose, and iOS.  
-**Roadmap:** live session watch (`session outputs`, `logs follow`), an
-`autonom metrics` family (memory, CPU, frames, traces), Flutter VM Service,
-React Native skills, optional MCP. See
-[`docs/plans/PHASE_4_METRICS.md`](docs/plans/PHASE_4_METRICS.md).
+and mocking, a per-session journal of every action, and **Flow v1** —
+repeatable flow files with exact selectors, polling assertions, and failure
+classes ([`docs/FLOW.md`](docs/FLOW.md)), plus Maestro import/export,
+session→flow compilation (`flow create --from-session`), evidence reports
+(HTML/JUnit), an observed application atlas, local PR proof
+(`autonom proof --base`), live session watch (`session outputs`,
+`logs follow`, `network requests follow`), and an `autonom metrics` family
+(memory, CPU, frames, traces). Domain packs for Flutter, native
+Kotlin/Jetpack Compose, and iOS.  
+**Roadmap:** Flutter VM Service, React Native skills, optional MCP wrapper,
+hosted device providers.
 
 ## Why Autonom
 
@@ -88,6 +93,7 @@ See `docs/CAPABILITIES.md` for the full shipped vs planned matrix.
 - `mobile-session` — explicit target session, global `~/.autonom/sessions/` artifacts, journal
 - `mobile-screen` — accessibility tree, find/tap/gestures, screenshot
 - `mobile-network` — consent-gated HTTP(S) capture, mocking, HAR export
+- `mobile-flow` — repeatable Flow v1 files: strict YAML, exact selectors, polling assertions, failure classes
 - `mobile-memory` — per-app knowledge and flow runbooks under `~/.autonom/apps/`
 
 ### Flutter
@@ -200,10 +206,14 @@ benchmark. Use a physical device plus native profilers for frame-rate review.
 ## Documentation
 
 - `docs/INSTALL.md` — Codex / Claude / Grok / generic install
-- `docs/CAPABILITIES.md` — Android/iOS capability matrix, full CLI surface, roadmap
+- `docs/CAPABILITIES.md` — Android/iOS capability matrix, full CLI surface, environment overrides
 - `docs/ARCHITECTURE.md` — routing, CLI control plane, evidence, security
-- `docs/plans/PHASE_4_METRICS.md` — plan: live session watch + metrics/memory/CPU/traces (Android, iOS, Flutter)
+- `docs/COMPATIBILITY.md` — the frozen CLI contract (error codes, response keys, exit codes)
+- `docs/FLOW.md` — Flow v1: the strict flow language, runner, recording, reports, atlas, proof
+- `docs/plans/PHASE_0_RELEASE_ENGINEERING.md` — shipped: test isolation, CI, tagged releases
+- `docs/plans/PHASE_4_METRICS.md` — shipped as 0.27.x: live session watch + metrics/memory/CPU/traces
 - `docs/USAGE.md` — ready-to-use prompts and workflows
+- `CHANGELOG.md` — release history
 - `SECURITY.md` — the enforced security model (MITM, consent, redaction)
 - `AGENTS.md` — short operating contract for any consuming agent
 

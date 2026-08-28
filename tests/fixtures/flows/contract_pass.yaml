@@ -1,0 +1,12 @@
+schema: autonom.dev/flow/v1
+appId: com.example.app
+name: Contract pass probe
+---
+- launchApp
+- tapOn:
+    selector:
+      description: Flutter Save Button
+      match: exact
+- assertVisible:
+    selector:
+      id: com.example.app:id/search

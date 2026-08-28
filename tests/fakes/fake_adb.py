@@ -159,6 +159,47 @@ def main(argv: list[str]) -> int:
     if args[:1] == ["push"]:
         return 0
 
+    if args[:1] == ["pull"] and len(args) > 2:
+        Path(args[2]).write_bytes(state.get("pull_bytes", "FAKEDATA").encode())
+        return 0
+
+    if args[:2] == ["shell", "which"]:
+        binary = args[2] if len(args) > 2 else ""
+        table = state.get("which", {})
+        if binary in table:
+            sys.stdout.write(table[binary] + "\n")
+            return 0
+        return 1
+
+    if args[:3] == ["shell", "wm", "size"]:
+        sys.stdout.write(state.get("wm_size", "Physical size: 1080x1920") + "\n")
+        return 0
+
+    if args[:3] == ["shell", "dumpsys", "meminfo"]:
+        default = Path(__file__).resolve().parents[1].joinpath(
+            "fixtures/meminfo-1.txt").read_text(encoding="utf-8")
+        sys.stdout.write(state.get("dumpsys_meminfo", default))
+        return 0
+
+    if args[:3] == ["shell", "dumpsys", "cpuinfo"]:
+        default = (
+            "Load: 1.2 / 1.0 / 0.9\n"
+            "CPU usage from 10s to 0s ago:\n"
+            "  12.5% 4321/com.example.app: 8% user + 4.5% kernel\n"
+            "  3% 100/system_server: 2% user + 1% kernel\n"
+        )
+        sys.stdout.write(state.get("dumpsys_cpuinfo", default))
+        return 0
+
+    if args[:3] == ["shell", "dumpsys", "gfxinfo"]:
+        sys.stdout.write(state.get("dumpsys_gfxinfo", ""))
+        return 0
+
+    if args[:2] == ["shell", "cat"] and len(args) > 2 and args[2].startswith("/proc/"):
+        default = "Threads:\t42\nVmRSS:\t8500 kB\nVmSize:\t120000 kB\n"
+        sys.stdout.write(state.get("proc_status", default))
+        return 0
+
     if args[:2] == ["shell", "pidof"]:
         package = args[-1]
         sys.stdout.write((state.get("pidof", {}).get(package, "")) + "\n")

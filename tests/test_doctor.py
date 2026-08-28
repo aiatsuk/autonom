@@ -96,6 +96,9 @@ class DoctorTests(unittest.TestCase):
             broken.chmod(0o755)
             env = dict(os.environ)
             env["AUTONOM_IDB"] = str(broken)
+            # Isolate the machine store like _run does — without this the
+            # probe mkdirs the operator's real ~/.autonom/sessions.
+            env["AUTONOM_HOME"] = tmp
             result = subprocess.run(
                 [sys.executable, str(CLI), "doctor"],
                 cwd=ROOT, env=env, text=True,
@@ -137,12 +140,7 @@ class DoctorTests(unittest.TestCase):
             self.assertIn("device_may_be_left_attached", codes)
 
     def test_installed_tools_are_reported_ok(self) -> None:
-        env_result = subprocess.run(
-            [sys.executable, str(CLI), "doctor", "--adb", str(FAKE_ADB),
-             "--simctl", str(FAKE_SIMCTL)],
-            cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            check=False, timeout=120,
-        )
+        env_result = self._run("--adb", str(FAKE_ADB), "--simctl", str(FAKE_SIMCTL))
         report = json.loads(env_result.stdout)
         self.assertEqual(report["tools"]["adb"]["state"], "ok")
         self.assertEqual(report["capabilities"]["android"]["ready"], True)

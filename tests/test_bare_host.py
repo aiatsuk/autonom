@@ -62,6 +62,26 @@ SWEEP: list[tuple[str, list[str], bool]] = [
     ("network_mock_add", ["network", "mock", "add", "--match", "*"], True),
     ("network_mock_list", ["network", "mock", "list"], True),
     ("network_mock_clear", ["network", "mock", "clear"], True),
+    # Flow static verbs are pure local file ops: a valid file succeeds with no
+    # tools at all; a missing path fails with one machine-readable code.
+    ("flow_check", ["flow", "check",
+                    str(ROOT / "tests/fixtures/flows/settings_smoke.yaml")], True),
+    ("flow_check_missing", ["flow", "check", "/nonexistent/flow.yaml"], False),
+    ("flow_fmt_missing", ["flow", "fmt", "/nonexistent/flow.yaml"], False),
+    ("flow_list_missing", ["flow", "list", "/nonexistent"], False),
+    ("flow_import_missing", ["flow", "import", "/nonexistent/maestro.yaml"], False),
+    ("flow_export_missing", ["flow", "export", "/nonexistent/flow.yaml"], False),
+    # proof without a usable git ref fails as one machine-readable envelope
+    ("proof_bad_ref", ["proof", "--base", "no-such-ref"], False),
+    # atlas/report verbs need an app id or session; they refuse cleanly
+    ("atlas_update", ["atlas", "update"], False),
+    ("atlas_show", ["atlas", "show"], False),
+    ("atlas_diff_missing", ["atlas", "diff", "--base", "/nonexistent.json",
+                            "--app-id", "com.example.app"], False),
+    ("report_build", ["report", "build"], False),
+    ("report_open", ["report", "open"], False),
+    ("report_export", ["report", "export"], False),
+    ("report_suite", ["report", "suite"], False),
     ("crash_list", ["crash", "list"], False),
     ("open_url", ["open", "https://example.com"], False),
     ("permissions", ["permissions", "grant", "photos", "com.example.app"], False),
@@ -78,15 +98,44 @@ SWEEP: list[tuple[str, list[str], bool]] = [
     # empty, never an error. A note needs a session, so it fails cleanly.
     ("journal", ["journal"], True),
     ("note_add", ["note", "add", "a thought"], False),
+    # Live observation needs a session; every follow refuses cleanly and is
+    # bounded so the sweep can never hang on it.
+    ("session_outputs", ["session", "outputs"], False),
+    ("logs_follow", ["logs", "follow", "--path", "output/x.log",
+                     "--max-seconds", "1"], False),
+    ("network_requests_follow", ["network", "requests", "follow",
+                                 "--max-seconds", "1"], False),
+    ("journal_follow", ["journal", "--follow", "--max-seconds", "1"], False),
+    # Metrics need a device backend; list-presets is the honest empty answer.
+    ("metrics_snapshot", ["metrics", "snapshot", "--app-id", "com.example.app"],
+     False),
+    ("metrics_series", ["metrics", "series", "--count", "1",
+                        "--app-id", "com.example.app"], False),
+    ("metrics_list_presets", ["metrics", "list-presets"], True),
+    ("metrics_memory_capture", ["metrics", "memory", "capture",
+                                "--app-id", "com.example.app"], False),
+    ("metrics_memory_analyze", ["metrics", "memory", "analyze"], False),
+    ("metrics_memory_warn", ["metrics", "memory", "warn"], False),
+    ("metrics_frames_reset", ["metrics", "frames", "reset",
+                              "--app-id", "com.example.app"], False),
+    ("metrics_frames_capture", ["metrics", "frames", "capture",
+                                "--app-id", "com.example.app"], False),
+    ("metrics_frames_flutter", ["metrics", "frames", "flutter-summary",
+                                "/nonexistent/timings.json"], False),
+    ("metrics_trace", ["metrics", "trace", "--preset", "simpleperf",
+                       "--app-id", "com.example.app"], False),
 ]
 
 
 class BareHostTests(unittest.TestCase):
-    """VER-011 / INV-08 — the oracle that replaces CI (DEC-012).
+    """VER-011 / INV-08 — the bare-host oracle (DEC-012, superseded by DEC-014).
 
-    Every verb must fail with one machine-readable error code when its backend
-    is absent. A traceback on stdout, or a non-JSON stderr, would leave a host
-    agent with nothing to branch on.
+    Written as the CI substitute when the repository shipped no CI; real CI
+    exists now (DEC-014, docs/plans/PHASE_0_RELEASE_ENGINEERING.md), and this
+    sweep remains as the empty-PATH invariant: every verb must fail with one
+    machine-readable error code when its backend is absent. A traceback on
+    stdout, or a non-JSON stderr, would leave a host agent with nothing to
+    branch on.
     """
 
     @classmethod

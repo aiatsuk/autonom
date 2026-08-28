@@ -120,7 +120,10 @@ def compact_node(element: dict[str, Any], ref: str) -> dict[str, Any]:
         "clickable": role in CLICKABLE_ROLES or "Button" in trait_text
         or _truthy(element, "hittable", "AXHittable"),
         "enabled": _truthy(element, "enabled", "AXEnabled", default=True),
-        "focusable": _truthy(element, "focused", "AXFocused", "has_focus"),
+        # iOS accessibility has no "focusable" concept; AXFocused is the
+        # FOCUSED state and used to be misfiled under focusable — fixed.
+        "focusable": False,
+        "focused": _truthy(element, "focused", "AXFocused", "has_focus"),
         "scrollable": role in {"scroll", "list"},
         "selected": _truthy(element, "selected", "AXSelected"),
         "checked": _truthy(element, "checked", "AXChecked"),

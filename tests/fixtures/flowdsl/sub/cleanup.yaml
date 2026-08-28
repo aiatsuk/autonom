@@ -1,0 +1,4 @@
+schema: autonom.dev/flow/v1
+name: Cleanup
+---
+- stopApp

@@ -17,8 +17,29 @@ from .ui_android import compact_node, is_meaningful, role_for_class  # noqa: F40
 
 COMPACT_FIELDS = (
     "ref", "role", "text", "desc", "resource_id", "class", "package", "bounds",
-    "clickable", "enabled", "focusable", "scrollable", "selected", "checked", "depth",
+    "clickable", "enabled", "focusable", "focused", "scrollable", "selected",
+    "checked", "depth", "parent",
 )
+
+
+def annotate_parents(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Add a ``parent`` ref to each node of a depth-first compact list.
+
+    Both platform parsers emit pre-order depth-first lists with a ``depth``
+    field, so the parent of a node is the most recent node one level
+    shallower. Additive: relational selectors (childOf/containsChild) need
+    ancestry, and the flat list otherwise cannot express it.
+    """
+    stack: list[tuple[int, str]] = []  # (depth, ref)
+    for node in nodes:
+        depth = node.get("depth") or 0
+        while stack and stack[-1][0] >= depth:
+            stack.pop()
+        node["parent"] = stack[-1][1] if stack else None
+        ref = node.get("ref")
+        if ref:
+            stack.append((depth, ref))
+    return nodes
 
 
 # --- offline parsing (fixtures, `--dump`) ------------------------------------
@@ -98,9 +119,10 @@ def _ios():
 def snapshot(target: Target) -> list[dict[str, Any]]:
     """Every node on screen, unfiltered — the search corpus for find/tap."""
     if target.platform == ANDROID:
-        return ui_android.parse_all(ui_android.dump_hierarchy(target.tool, target.target_id))
+        return annotate_parents(
+            ui_android.parse_all(ui_android.dump_hierarchy(target.tool, target.target_id)))
     if target.platform == IOS:
-        return _ios().parse_all(_ios().describe_all(target))
+        return annotate_parents(_ios().parse_all(_ios().describe_all(target)))
     raise errors.AutonomError(errors.UNKNOWN_PLATFORM, f"unknown platform: {target.platform}")
 
 
@@ -135,17 +157,45 @@ def screen_size(target: Target) -> tuple[int, int] | None:
     return _ios().screen_size(target)
 
 
-def tap(target: Target, x: int, y: int) -> None:
-    _guard_point(target, x, y)
+def tap(target: Target, x: int, y: int, *, screen: tuple[int, int] | None = None) -> None:
+    _guard_point(target, x, y, screen=screen)
     if target.platform == ANDROID:
         ui_android.tap(target.tool, target.target_id, x, y)
         return
     _ios().tap(target, x, y)
 
 
-def swipe(target: Target, x1: int, y1: int, x2: int, y2: int, duration: float) -> None:
+def long_press(target: Target, x: int, y: int, duration_ms: int = 600,
+               *, screen: tuple[int, int] | None = None) -> None:
+    _guard_point(target, x, y, screen=screen)
+    if target.platform == ANDROID:
+        ui_android.long_press(target.tool, target.target_id, x, y, duration_ms)
+        return
+    _ios_idb().tap(target, x, y, duration=duration_ms / 1000)
+
+
+def double_tap(target: Target, x: int, y: int,
+               *, screen: tuple[int, int] | None = None) -> None:
+    _guard_point(target, x, y, screen=screen)
+    # Guard once, dispatch twice — the platform helpers skip the guard.
+    if target.platform == ANDROID:
+        ui_android.tap(target.tool, target.target_id, x, y)
+        ui_android.tap(target.tool, target.target_id, x, y)
+        return
+    _ios_idb().tap(target, x, y)
+    _ios_idb().tap(target, x, y)
+
+
+def _ios_idb():
+    from . import ios_idb  # lazy for machines without Xcode
+
+    return ios_idb
+
+
+def swipe(target: Target, x1: int, y1: int, x2: int, y2: int, duration: float,
+          *, screen: tuple[int, int] | None = None) -> None:
     for point in ((x1, y1), (x2, y2)):
-        _guard_point(target, *point)
+        _guard_point(target, *point, screen=screen)
     if target.platform == ANDROID:
         ui_android.swipe(target.tool, target.target_id, x1, y1, x2, y2, duration)
         return
@@ -177,14 +227,19 @@ def gesture(target: Target, name: str, **kwargs: Any) -> None:
     _ios().gesture(target, name, **kwargs)
 
 
-def _guard_point(target: Target, x: int, y: int) -> None:
+def _guard_point(target: Target, x: int, y: int,
+                 *, screen: tuple[int, int] | None = None) -> None:
     """INV-06 — refuse a point outside the screen rather than tapping blind.
 
     A point/pixel mix-up on Retina simulators produces coordinates ~3x too
     large. Dispatching them would 'succeed' while landing nowhere, so the agent
     would report a defect that does not exist (RISK-005).
+
+    ``screen`` lets a caller that already knows the size (the flow executor
+    caches it once per run) skip the lookup — on iOS ``screen_size`` re-runs a
+    full accessibility dump, so the default path costs one extra dump per tap.
     """
-    size = screen_size(target)
+    size = screen if screen is not None else screen_size(target)
     if not size:
         return
     width, height = size

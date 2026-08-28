@@ -1,0 +1,8 @@
+schema: autonom.dev/flow/v1
+appId: com.example.app
+name: Contract failure probe
+---
+- assertVisible:
+    selector:
+      id: does_not_exist
+    timeoutMs: 300

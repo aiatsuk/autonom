@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -14,14 +15,21 @@ FIXTURE = ROOT / "tests/fixtures/ui_dump.xml"
 
 class AutonomCliTests(unittest.TestCase):
     def _run(self, *args: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            [sys.executable, str(CLI), *args],
-            cwd=ROOT,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-        )
+        # Every CLI invocation resolves (and mkdirs) the machine session
+        # store — the journal choke point loads the current session even for
+        # sessionless verbs — so redirect it away from the operator's home.
+        with tempfile.TemporaryDirectory() as home:
+            env = dict(os.environ)
+            env["AUTONOM_HOME"] = home
+            return subprocess.run(
+                [sys.executable, str(CLI), *args],
+                cwd=ROOT,
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
 
     def test_version(self) -> None:
         result = self._run("version")

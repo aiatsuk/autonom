@@ -108,9 +108,12 @@ as four separate categories.
   the app exposes little, not that the screen is blank.
 - Clear app state with `session clear` (uninstall + reinstall). `--strategy privacy`
   resets permissions **only** and leaves data in place.
-- Performance traces (`xctrace`, Instruments) and Flutter VM Service metrics are
-  not part of this skill. Do not present a screenshot or a log line as a
-  performance measurement.
+- Load questions have CLI verbs: `autonom metrics snapshot` (host `ps` view of
+  the Simulator process + data-container size — never comparable to Android
+  PSS), `metrics series` for direction, `metrics memory warn` as a best-effort
+  pressure stimulus, and `metrics trace --preset allocations|time-profiler|
+  leaks|hitches` for real Instruments `.trace` bundles. Do not present a
+  screenshot or a log line as a performance measurement.
 - Simulator behavior differs from a physical device for camera, sensors, push,
   background execution, and memory pressure. Say so when it matters to the finding.
 

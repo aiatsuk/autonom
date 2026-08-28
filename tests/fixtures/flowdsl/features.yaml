@@ -1,0 +1,112 @@
+# Exercises the corners of the grammar the login example does not touch:
+# quoting, escapes, interpolation escapes, inline lists, comments, conditions,
+# optional steps, waits, and every remaining v1 command.
+schema: autonom.dev/flow/v1
+appId: com.example.app
+name: Grammar features
+tags: [regression]
+env:
+  LOCALE: en_US
+  GREETING: "hi there"
+---
+- openLink: https://example.com/path?a=1#frag
+- note: 'it''s quoted # not a comment'
+- inputText:
+    value: "line\nbreak\tand \"quotes\" and é"
+- inputText:
+    value: literal $${NOT_A_VAR} then ${REAL_VAR}
+- tapOn:
+    selector:
+      description: Allow notifications  # trailing comment
+      match: caseInsensitiveExact
+    optional: true
+    reason: System prompt may not appear on a reused simulator
+- tapOn:
+    selector:
+      role: button
+      text: OK
+      match: contains
+      index: -1
+- waitUntil:
+    notVisible:
+      id: spinner
+    timeoutMs: 30000
+- assertNotVisible:
+    selector:
+      text: Error
+      match: contains
+- assertEnabled:
+    selector:
+      id: submit
+- assertChecked:
+    selector:
+      id: remember_me
+- scrollUntilVisible:
+    selector:
+      id: footer
+    direction: down
+    maxSwipes: 5
+- swipe:
+    direction: left
+    durationMs: 300
+- longPressOn:
+    selector:
+      id: row_item
+    durationMs: 800
+- doubleTapOn:
+    selector:
+      description: Zoomable image
+- tapOn:
+    selector:
+      text: Settings
+      match: exact
+      focused: false
+      leftOf:
+        id: settings_secondary
+      childOf:
+        role: framelayout
+        match: caseInsensitiveExact
+- setOrientation: landscape
+- retry:
+    maxAttempts: 3
+    onlyOn:
+      - flow_assertion_timeout
+    commands:
+      - assertVisible:
+          selector:
+            id: retryable_status
+- group:
+    label: wrap-up checks
+    commands:
+      - assertNotVisible:
+          selector:
+            text: Error
+            match: contains
+- pressKey: KEYCODE_BACK
+- back
+- eraseText:
+    chars: 12
+- setLocation:
+    latitude: 37.7749
+    longitude: -122.4194
+- setPermissions:
+    action: grant
+    service: photos
+    appId: com.example.app
+- addMedia: /tmp/seed.png
+- stopApp
+- clearState
+- takeScreenshot:
+    label: end-state
+- runFlow:
+    file: sub/cleanup.yaml
+    label: Cleanup
+    env:
+      USER_ROLE: editor
+    when:
+      platform: android
+      visible:
+        text: Allow
+        match: exact
+      envEquals:
+        LOCALE: en_US

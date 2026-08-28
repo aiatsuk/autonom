@@ -29,8 +29,10 @@ The core design is **routing first, evidence second**.
 5. Helpers (UI Automator parsers, browser bridge, meminfo/frame tools) back the CLI
    and specialized skills.
 6. `./scripts/run_checks.sh` validates manifests, frontmatter, Python/Node syntax,
-   and the unit suite. It is run locally; this repository ships no CI
-   configuration, so "green" means a clean local run.
+   and the unit suite. The same script runs locally and in GitHub Actions:
+   `checks` on every PR and push to main (ubuntu + macOS, pinned Python and
+   Node, shellcheck required), `android-smoke` on main (a real API-30 emulator
+   driven through the CLI), and `release` on `v*` tags. "Green" means CI green.
 
 ## Control plane
 
@@ -78,9 +80,37 @@ scripts/autonom_lib/
   emulator.py                 AVD discovery, emulator boot and kill
   device_state.py             deep links, permissions, location, media, crashes, files, recording
   screenshot.py / logs.py     per-platform dispatch; shots carry provenance metadata in the PNG
+  follow.py                   bounded NDJSON follows: file tail, device-log stream, store poll
+  metrics/
+    meminfo.py                dumpsys meminfo / proc status / cpuinfo parsers
+    process.py                pid resolution with sources_tried on failure
+    snapshot.py               per-platform load summary; iOS is host accounting, and says so
+    series.py                 first/last/delta/slope math; directional leads, never "leak"
+    presets.py                which heavy profilers this host can run
+    android_memory.py         evidence pack: metadata+meminfo+proc+gfxinfo+HPROF, analyze
+    frames.py                 gfxinfo reset/capture (best-effort parse) + Flutter timings
+    trace.py                  simpleperf / gfxinfo-flow / xctrace presets → artifacts
   processes.py                machine-wide process registry, orphan detection, reaping
   doctor.py                   toolchain, capabilities, session, orphans
   paths.py                    locate the bundled skill helper scripts
+  flow/
+    parser.py                 strict YAML-subset parser: text -> positioned nodes, one error code
+    schema.py                 typed model: command registry, selector surface, failure classes
+    validator.py              runFlow graph loading, workspace containment, cycle refusal
+    canonical.py              deterministic emitter behind `flow fmt`
+    executor.py               `flow run`: pre-flight, polling engine, single-fire mutations,
+                              runFlow composition, isolated cleanup hooks, evidence policy
+    events.py                 versioned run events: NDJSON per run + slim journal bridge
+    selectors.py              flow selector -> selector.py translation (never a reimplementation)
+    conditions.py             `when:` evaluation (platform/visible/notVisible/envEquals, AND)
+    compiler.py               Session -> Flow: journal + action details -> canonical YAML
+    maestro.py                Maestro Core Profile import/export, faithful or refused
+    report.py                 run manifest -> self-contained HTML + JUnit renderers
+  atlas/
+    fingerprint.py            volatility-resistant screen identity (structure/state hashes)
+    graph.py                  the observed graph: storage, ingestion, coverage, paths, diff
+  proof.py                    PR proof: git diff -> covering suite -> honest verdict
+  actions.py                  per-action detail records feeding the Session -> Flow compiler
   network/
     proxy.py                  mitmdump lifecycle, machine-level confdir, CA publication
     mitm_addon.py             in-proxy addon: record, redact, serve mocks
@@ -117,9 +147,13 @@ Two rules carry the design.
 | `logs tail`, `crash list\|show` | textual evidence |
 | `open`, `permissions`, `location`, `media`, `file` | drive device state |
 | `network *` | consent-gated HTTP(S) capture, mock, HAR |
+| `atlas update\|show\|coverage\|paths\|export\|diff` | the observed application graph, evidence-linked |
+| `proof --base` | run the covering flow suite for a diff; pass/fail/not_covered/blocked/inconclusive |
+| `report build\|open\|export` | self-contained HTML + JUnit from a run's manifest |
+| `flow check\|fmt\|list\|run` | validate, canonicalize, enumerate, and execute Flow v1 files (`docs/FLOW.md`); `run` polls assertions, fires mutations exactly once, and classifies failures |
 | `processes`, `cleanup` | machine-wide reaping of what Autonom started |
-| `session outputs`, `logs follow`, `network requests follow` | **planned (Phase 4)** — live session watch |
-| `metrics *` | **planned (Phase 4)** — memory/CPU/frames/traces; see `docs/plans/PHASE_4_METRICS.md` |
+| `session outputs`, `logs follow`, `network requests follow`, `journal --follow` | live session watch: stream catalog + bounded NDJSON follows |
+| `metrics *` | snapshot/series, memory pack, frames, trace presets; honest per-platform semantics (`docs/plans/PHASE_4_METRICS.md`) |
 
 Every verb except `note`, `journal`, and `version` passes through one journal
 choke point in `main()`, so the timeline records the failures too — including
@@ -146,14 +180,15 @@ point/pixel mix-up otherwise "succeeds" while landing in the wrong place.
 
 | Surface | Path | Consumers |
 | --- | --- | --- |
-| Portable skills | `plugins/autonom/skills/*/SKILL.md` (23) | All agents |
+| Portable skills | `plugins/autonom/skills/*/SKILL.md` (24) | All agents |
 | CLI | `scripts/autonom.py`, `scripts/autonom_lib/` | Skills + humans |
 | Claude marketplace | `.claude-plugin/marketplace.json` | Claude Code |
 | Codex marketplace | `.agents/plugins/marketplace.json` | Codex |
 | Plugin manifests | `plugins/autonom/.claude-plugin/plugin.json`, `.codex-plugin/plugin.json` | Claude, Codex |
 | One-command installer | `install.sh` (+ `scripts/bootstrap.sh` for device tools) | everyone |
 | Per-layer installers | `install_cli.sh`, `install_claude.sh`, `install_codex.sh`, `install_skills.sh` | Claude, Codex, Grok, generic |
-| Validation | `scripts/validate_plugin.py`, `scripts/run_checks.sh` | local |
+| Validation | `scripts/validate_plugin.py`, `scripts/run_checks.sh` | local + CI (`.github/workflows/`) |
+| Release | `scripts/build_release.sh`, `.github/workflows/release.yml`, `CHANGELOG.md` | tagged GitHub Releases |
 
 The version in `scripts/autonom_lib/__init__.py` is the single source: the
 validator fails the build when a plugin manifest disagrees with it.
@@ -175,8 +210,14 @@ validator fails the build when a plugin manifest disagrees with it.
 - **TTY guard** — the suite is re-run with a stdin that claims to be a terminal
   and raises on read. A consent prompt that would block a developer's terminal
   fails here instead, which a headless run would never catch.
-- **Device-backed** — real simulator or emulator runs are manual and evidenced by
-  before/after artifacts, never by exit codes alone.
+- **Environment hygiene guard** — the alphabetically-first test module snapshots
+  `os.environ`, the alphabetically-last compares it; a test that mutates the
+  environment without restoring it (`tests/env_isolation.py` is the sanctioned
+  idiom) fails the suite instead of silently redirecting later tests to the
+  operator's real `~/.autonom`.
+- **Device-backed** — the `android-smoke` workflow drives a real emulator
+  through the CLI on every push to main; deeper simulator/emulator runs remain
+  manual and evidenced by before/after artifacts, never by exit codes alone.
 
 ## Flutter-first boundary (current domain pack)
 

@@ -38,7 +38,7 @@ def tail_logcat(
         # against the host's. Accurate only while the two agree.
         lines = _filter_recent(lines, since_seconds)
     if package:
-        pid = _pid_for_package(adb, serial, package)
+        pid = pid_for_package(adb, serial, package)
         if pid:
             lines = [line for line in lines if f" {pid} " in f" {line} "]
     if grep:
@@ -49,7 +49,8 @@ def tail_logcat(
     return [{"line": line} for line in lines]
 
 
-def _pid_for_package(adb: str, serial: str, package: str) -> str | None:
+def pid_for_package(adb: str, serial: str, package: str) -> str | None:
+    """The single owner of "what is the app's pid" on Android (pidof -s)."""
     completed = adb_mod.run_adb(
         adb,
         ["shell", "pidof", "-s", package],

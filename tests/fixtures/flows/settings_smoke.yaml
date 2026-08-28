@@ -1,0 +1,25 @@
+schema: autonom.dev/flow/v1
+appId: com.android.settings
+name: Settings smoke
+description: CI smoke against the preinstalled Settings app on the pinned emulator image
+tags:
+  - smoke
+  - ci
+requires:
+  platform:
+    - android
+---
+# Cold-start: the CI script has usually navigated into a subscreen by the
+# time this flow runs, and a monkey relaunch resumes wherever Settings was.
+- stopApp
+- launchApp
+- assertVisible:
+    selector:
+      text: Battery
+      match: exact
+    timeoutMs: 30000
+- tapOn:
+    selector:
+      text: Battery
+      match: exact
+- takeScreenshot

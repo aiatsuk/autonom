@@ -84,13 +84,33 @@ def filter_flows(
     return result
 
 
+def after_id(flows: list[dict[str, Any]], since_id: str,
+             warnings: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Flows appended after `since_id` (store order). An unknown id returns
+    everything with a warning — silently returning nothing would read as
+    'no new traffic' when the truth is 'your cursor is gone'."""
+    for index, flow in enumerate(flows):
+        if flow.get("id") == since_id:
+            return flows[index + 1:]
+    warnings.append({
+        "code": "since_id_not_found",
+        "error": f"no recorded flow with id {since_id}; returning all flows",
+        "hint": "The store may have been cleared; take a new cursor from the "
+                "latest listed id.",
+    })
+    return flows
+
+
 def listing(
     record: dict[str, Any],
     *,
     max_items: int = DEFAULT_MAX,
+    since_id: str | None = None,
     **filters: Any,
 ) -> dict[str, Any]:
     flows, warnings = read_all(record)
+    if since_id:
+        flows = after_id(flows, since_id, warnings)
     matched = filter_flows(flows, **filters)
     limited = matched[-max_items:][::-1] if max_items and max_items > 0 else matched[::-1]
     payload: dict[str, Any] = {

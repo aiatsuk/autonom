@@ -15,6 +15,92 @@
       "ok:bool"
     ]
   },
+  "flow_check": {
+    "argv": [
+      "flow",
+      "check",
+      "tests/fixtures/flows/contract_pass.yaml"
+    ],
+    "exit_code": 0,
+    "keys": [
+      "checked:number",
+      "flows:array",
+      "flows[].file:str",
+      "flows[].id:nullable",
+      "flows[].name:str",
+      "flows[].platforms:array",
+      "flows[].platforms[]:str",
+      "flows[].tags:array",
+      "flows[]:object",
+      "ok:bool"
+    ]
+  },
+  "flow_run_pass": {
+    "argv": [
+      "flow",
+      "run",
+      "tests/fixtures/flows/contract_pass.yaml"
+    ],
+    "exit_code": 0,
+    "keys": [
+      "events:str",
+      "flow:str",
+      "name:str",
+      "ok:bool",
+      "platform:str",
+      "run_id:str",
+      "sensitive:bool",
+      "serial:str",
+      "status:str",
+      "steps:array",
+      "steps[].attempts:number",
+      "steps[].command:str",
+      "steps[].duration_ms:number",
+      "steps[].index:number",
+      "steps[].line:number",
+      "steps[].status:str",
+      "steps[]:object",
+      "target_id:str"
+    ]
+  },
+  "flow_run_test_failure": {
+    "argv": [
+      "flow",
+      "run",
+      "tests/fixtures/flows/contract_fail.yaml"
+    ],
+    "exit_code": 1,
+    "keys": [
+      "events:str",
+      "failure.command:str",
+      "failure.error:str",
+      "failure.error_code:str",
+      "failure.failure_class:str",
+      "failure.line:number",
+      "failure.step_index:number",
+      "failure:object",
+      "flow:str",
+      "name:str",
+      "ok:bool",
+      "platform:str",
+      "run_id:str",
+      "sensitive:bool",
+      "serial:str",
+      "status:str",
+      "steps:array",
+      "steps[].attempts:number",
+      "steps[].command:str",
+      "steps[].duration_ms:number",
+      "steps[].error:str",
+      "steps[].error_code:str",
+      "steps[].failure_class:str",
+      "steps[].index:number",
+      "steps[].line:number",
+      "steps[].status:str",
+      "steps[]:object",
+      "target_id:str"
+    ]
+  },
   "logs_tail": {
     "argv": [
       "logs",

@@ -23,6 +23,11 @@ from autonom_lib.network import (  # noqa: E402
 )
 from autonom_lib.platform import Target  # noqa: E402
 
+try:
+    from env_isolation import EnvSandboxMixin  # noqa: E402  (discover -s tests)
+except ImportError:  # direct `python3 -m unittest tests.test_...` runs
+    from tests.env_isolation import EnvSandboxMixin  # noqa: E402
+
 
 def make_record(root: Path) -> dict:
     artifacts = root / ".autonom" / "s_test"
@@ -232,7 +237,7 @@ class _FakeTty(io.StringIO):
         return True
 
 
-class ConsentTests(unittest.TestCase):
+class ConsentTests(EnvSandboxMixin, unittest.TestCase):
     """CAP-ATTACH-001 / INV-04 — no bypass, no caching, refusal before any action."""
 
     OPERATION = consent.Operation("device_proxy", "android:emulator-5554", "change the proxy",
@@ -270,14 +275,12 @@ class ConsentTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, errors.CONSENT_REQUIRED)
 
     def test_no_environment_variable_can_grant_consent(self) -> None:
-        for name in ("AUTONOM_CONSENT", "AUTONOM_I_UNDERSTAND_MITM", "CI", "AUTONOM_YES"):
-            os.environ[name] = "1"
-        try:
-            with self.assertRaises(errors.AutonomError):
-                consent.require(self.OPERATION, acknowledged=False)
-        finally:
-            for name in ("AUTONOM_CONSENT", "AUTONOM_I_UNDERSTAND_MITM", "CI", "AUTONOM_YES"):
-                os.environ.pop(name, None)
+        # set_env restores the ambient values afterwards — CI itself is set
+        # job-wide on GitHub Actions and must survive this test.
+        self.set_env(AUTONOM_CONSENT="1", AUTONOM_I_UNDERSTAND_MITM="1",
+                     CI="1", AUTONOM_YES="1")
+        with self.assertRaises(errors.AutonomError):
+            consent.require(self.OPERATION, acknowledged=False)
 
     def test_phrase_matching_is_exact_but_tolerant_of_whitespace(self) -> None:
         self.assertTrue(consent.phrase_accepted(consent.PHRASE_EN))
@@ -294,17 +297,16 @@ class ConsentTests(unittest.TestCase):
         self.assertEqual(len(record["consent_log"]), 1)
 
 
-class AndroidAttachTests(unittest.TestCase):
+class AndroidAttachTests(EnvSandboxMixin, unittest.TestCase):
     """CAP-ATTACH-002 / INV-07 — restore the prior value, never a hard-coded one."""
 
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.state = Path(self.tmp.name) / "state.json"
-        os.environ["AUTONOM_FAKE_STATE"] = str(self.state)
+        self.set_env(AUTONOM_FAKE_STATE=str(self.state))
         self.target = Target("android", "emulator-5554", str(FAKE_ADB), {"serial": "emulator-5554"})
 
     def tearDown(self) -> None:
-        os.environ.pop("AUTONOM_FAKE_STATE", None)
         self.tmp.cleanup()
 
     def _round_trip(self, previous: str | None) -> str | None:
@@ -826,7 +828,7 @@ class ConnectivityProbeTests(unittest.TestCase):
         self.assertEqual(argv.count("--ignore-hosts"), 2)
 
 
-class ProxyApplicationTests(unittest.TestCase):
+class ProxyApplicationTests(EnvSandboxMixin, unittest.TestCase):
     """A written proxy setting is not an applied one.
 
     `settings put global http_proxy` only writes a row; ConnectivityService
@@ -840,16 +842,14 @@ class ProxyApplicationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.state = Path(self.tmp.name) / "state.json"
-        os.environ["AUTONOM_FAKE_STATE"] = str(self.state)
         self.log = Path(self.tmp.name) / "argv.jsonl"
-        os.environ["AUTONOM_FAKE_LOG"] = str(self.log)
+        self.set_env(AUTONOM_FAKE_STATE=str(self.state),
+                     AUTONOM_FAKE_LOG=str(self.log))
         self.state.write_text(json.dumps({"settings": {}}), encoding="utf-8")
         self.target = Target("android", "emulator-5554", str(FAKE_ADB),
                              {"serial": "emulator-5554"})
 
     def tearDown(self) -> None:
-        for key in ("AUTONOM_FAKE_STATE", "AUTONOM_FAKE_LOG"):
-            os.environ.pop(key, None)
         self.tmp.cleanup()
 
     def _argv(self) -> list[list[str]]:
@@ -891,7 +891,7 @@ class ProxyApplicationTests(unittest.TestCase):
         self.assertEqual(settings["http_proxy"], "10.0.2.2:8080")
 
 
-class AndroidCaInstallTests(unittest.TestCase):
+class AndroidCaInstallTests(EnvSandboxMixin, unittest.TestCase):
     """Android CA install — scriptable, universal on a rootable image, gated.
 
     The flag shipped as a no-op on Android while iOS had it, so an agent could
@@ -902,11 +902,13 @@ class AndroidCaInstallTests(unittest.TestCase):
 
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
-        os.environ["AUTONOM_HOME"] = self.tmp.name
         self.state = Path(self.tmp.name) / "state.json"
-        os.environ["AUTONOM_FAKE_STATE"] = str(self.state)
         self.log = Path(self.tmp.name) / "argv.jsonl"
-        os.environ["AUTONOM_FAKE_LOG"] = str(self.log)
+        self.set_env(
+            AUTONOM_HOME=self.tmp.name,
+            AUTONOM_FAKE_STATE=str(self.state),
+            AUTONOM_FAKE_LOG=str(self.log),
+        )
         self.state.write_text("{}", encoding="utf-8")
         self.target = Target("android", "emulator-5554", str(FAKE_ADB),
                              {"serial": "emulator-5554"})
@@ -916,8 +918,6 @@ class AndroidCaInstallTests(unittest.TestCase):
         self._write_self_signed(ca)
 
     def tearDown(self) -> None:
-        for key in ("AUTONOM_HOME", "AUTONOM_FAKE_STATE", "AUTONOM_FAKE_LOG"):
-            os.environ.pop(key, None)
         self.tmp.cleanup()
 
     @staticmethod

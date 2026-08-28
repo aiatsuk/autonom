@@ -1,0 +1,70 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Tool gates
+        run: |
+          shellcheck --version
+          openssl version
+
+      - name: Tag must match the library version
+        # Nothing else enforces tag <-> __version__ agreement; validate_plugin
+        # already enforces the three-file agreement underneath this. The
+        # resolver lives in build_release.sh so there is exactly one copy.
+        run: |
+          version="$(./scripts/build_release.sh --print-version)"
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "tag $GITHUB_REF_NAME does not match library version $version" >&2
+            exit 1
+          fi
+
+      - name: Run the full check suite
+        env:
+          AUTONOM_REQUIRE_SHELLCHECK: "1"
+        run: ./scripts/run_checks.sh
+
+      - name: Build the release bundle
+        # Checks already ran as their own step above; --no-check avoids a
+        # second full suite run.
+        run: ./scripts/build_release.sh --no-check
+
+      - name: Extract release notes from CHANGELOG.md
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          python3 - "$version" <<'PY' > release-notes.md
+          import re, sys
+          version = sys.argv[1]
+          text = open("CHANGELOG.md", encoding="utf-8").read()
+          pattern = rf"^## \[{re.escape(version)}\][^\n]*\n(.*?)(?=^## \[|\Z)"
+          match = re.search(pattern, text, re.M | re.S)
+          if not match:
+              sys.exit(f"CHANGELOG.md has no section for {version}")
+          print(match.group(1).strip())
+          PY
+
+      - name: Create the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            dist/autonom-*.tgz dist/SHA256SUMS \
+            --title "Autonom $GITHUB_REF_NAME" \
+            --notes-file release-notes.md

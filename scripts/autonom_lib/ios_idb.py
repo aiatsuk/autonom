@@ -171,9 +171,13 @@ def describe_all(target: Target, *, idb_path: str | None = None) -> str:
     return completed.stdout or ""
 
 
-def tap(target: Target, x: int, y: int, *, idb_path: str | None = None) -> None:
+def tap(target: Target, x: int, y: int, *, duration: float | None = None,
+        idb_path: str | None = None) -> None:
     idb = find_idb(idb_path)
-    run_idb(idb, ["ui", "tap", str(x), str(y)], udid=target.target_id, timeout=10)
+    argv = ["ui", "tap", str(x), str(y)]
+    if duration is not None:
+        argv += ["--duration", str(duration)]  # seconds; idb's long press
+    run_idb(idb, argv, udid=target.target_id, timeout=20)
 
 
 def swipe(target: Target, x1: int, y1: int, x2: int, y2: int, duration: float,

@@ -1,0 +1,79 @@
+schema: autonom.dev/flow/v1
+id: auth-login-001
+appId: com.example.app
+name: Login with email
+description: Verify that an existing user can reach the home screen
+tags:
+  - smoke
+  - auth
+  - pull-request
+
+properties:
+  owner: mobile-platform
+  priority: critical
+
+requires:
+  platform: [android, ios]
+  capabilities:
+    - ui.accessibility
+    - screenshots
+    - logs
+
+evidence:
+  mode: always
+  beforeMutation: true
+  collect:
+    - screenshot
+    - hierarchy
+    - logs
+    - crashes
+
+onFlowStart:
+  - runFlow: ../../subflows/prepare-session.yaml
+
+onFlowComplete:
+  - runFlow: ../../subflows/cleanup-session.yaml
+
+---
+- launchApp:
+    clearState: true
+
+- tapOn:
+    selector:
+      text: Sign in
+      match: exact
+      enabled: true
+    label: Open sign in
+
+- tapOn:
+    selector:
+      id: email
+    label: Focus email
+
+- inputText:
+    value: ${TEST_EMAIL}
+    sensitive: true
+
+- tapOn:
+    selector:
+      id: password
+    label: Focus password
+
+- inputText:
+    value: ${TEST_PASSWORD}
+    sensitive: true
+
+- tapOn:
+    selector:
+      text: Continue
+      match: exact
+      enabled: true
+    label: Submit credentials
+
+- assertVisible:
+    selector:
+      id: home_screen
+    timeoutMs: 7000
+
+- checkpoint:
+    name: logged-in

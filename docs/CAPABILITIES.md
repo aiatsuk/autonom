@@ -44,16 +44,24 @@ Legend: ✅ shipped · ⚠️ partial · 🔜 planned · ❌ not planned for nea
 | Native Android / Compose debug + perf skills | ✅ | — | |
 | Native iOS project skills | — | ✅ | `ios-project-setup`, `ios-debugger-agent` |
 | React Native skills | 🔜 | 🔜 | |
-| Live session outputs catalog | 🔜 | 🔜 | Phase 4 — `session outputs` + paths for `tail -f`; see `docs/plans/PHASE_4_METRICS.md` §2L |
-| Live follow (session files / device logs) | 🔜 | 🔜 | Phase 4 — `logs follow` (NDJSON, bounded) |
-| Network requests list | ✅ | ✅ | `network requests list --max N`; follow/poll in Phase 4 |
-| Network requests follow | 🔜 | 🔜 | Phase 4 — poll new flows as NDJSON |
-| Metrics snapshot (memory/CPU summary) | 🔜 | 🔜 | Phase 4 — `autonom metrics snapshot` |
-| Metrics series (directional growth) | 🔜 | 🔜 | Phase 4 — same plan; Android meminfo series exists as skill script today |
-| Memory capture pack / HPROF | ⚠️ | 🔜 | Android skill helpers; CLI in Phase 4 |
-| Performance traces (simpleperf / xctrace) | ⚠️ | 🔜 | Android skill scripts; iOS xctrace CLI in Phase 4 |
-| Frame stats (gfxinfo / Flutter timings) | ⚠️ | 🔜 | Partial via skills; unified CLI in Phase 4 |
-| Flutter VM Service (widget tree, heap) | 🔜 | 🔜 | Phase 4.4 optional; frames summary earlier |
+| Flow DSL: check / fmt / list | ✅ | ✅ | strict YAML subset, exact-match selectors by default, positioned errors; `docs/FLOW.md` |
+| Flow DSL: run | ✅ | ✅ | polling assertions, single-fire mutations, `failure_class` + exit 1 for test failures, per-run `events.ndjson`; iOS `eraseText` dispatches HID backspace but is unproven on a real simulator |
+| Flow DSL: runFlow / tags / hooks execution | ✅ | ✅ | subflows inline with inherited appId, isolated `onFlowComplete`, `when:` conditions, tag-filtered directory suites, evidence policy |
+| Flow DSL: Session → Flow compiler | ✅ | ✅ | `flow create --from-session` — proven selectors reused, secrets become `${SECRET_n}`, coordinate taps refuse to compile |
+| PR Proof (local) | ✅ | ✅ | `proof --base` — covers-globs + pull-request tags select the suite; verdicts pass/fail/not_covered/blocked/inconclusive, never upgraded |
+| Atlas-lite: observed screens/transitions graph | ✅ | ✅ | `atlas update|show|coverage|paths|export|diff`; fingerprints ride in run events; observed-only, unknown stays unknown |
+| Evidence: run manifest + HTML/JUnit reports | ✅ | ✅ | `report build|open|export|suite`; self-contained HTML (CSP, inline screenshots), JUnit for CI, failure log window; `suite` renders one page + one JUnit document over every run in the session |
+| Flow DSL: Maestro Core Profile import/export | ✅ | ✅ | `flow import`/`flow export --format maestro`; outside-profile constructs refuse with `unsupported_flow_command` |
+| Live session outputs catalog | ✅ | ✅ | `session outputs` — registered `streams[]` + directory scan, `abs_path`/`shell_hint` for `tail -f` |
+| Live follow (session files / device logs) | ✅ | ✅ | `logs follow` — NDJSON lines, always bounded by `--max-seconds`/`--max-lines`; `journal --follow` for the timeline |
+| Network requests list | ✅ | ✅ | `network requests list --max N --since-id F` |
+| Network requests follow | ✅ | ✅ | `network requests follow` — polls the store, emits only new flows as NDJSON |
+| Metrics snapshot (memory/CPU summary) | ✅ | ✅ | `metrics snapshot` — Android meminfo/proc/cpuinfo vs iOS **host** `ps`+container size; `metric_semantics` + `limitations` name the difference, never comparable 1:1 |
+| Metrics series (directional growth) | ✅ | ✅ | `metrics series` — live capture or `--from-dir`; leads are directional only, never called a leak |
+| Memory capture pack / HPROF | ✅ | ⚠️ | `metrics memory capture` (meminfo+proc+gfxinfo+HPROF, `--no-hprof`) + `analyze`; iOS gets `metrics memory warn` (best-effort stimulus) — full heaps go through `trace --preset allocations` |
+| Performance traces (simpleperf / xctrace) | ✅ | ⚠️ | `metrics trace` — simpleperf/gfxinfo-flow proven against the fake adb; xctrace presets build correct argv and are fake-tested, unproven against a real Xcode recording in CI |
+| Frame stats (gfxinfo / Flutter timings) | ✅ | ⚠️ | `metrics frames reset|capture` (best-effort parse, raw always kept) + `flutter-summary`; iOS frames only via `trace --preset hitches` |
+| Flutter VM Service (widget tree, heap) | 🔜 | 🔜 | deliberately unshipped (Phase 4 D4) — profile-mode DevTools workflow stays documented in the Flutter skills |
 | XCUITest execution | — | 🔜 | Separate from metrics |
 | Optional MCP wrapper | 🔜 | 🔜 | CLI is source of truth first |
 
@@ -92,18 +100,43 @@ autonom doctor [--strict] [--mitmdump PATH]
 
 autonom session start [--app-id ID] [--install PATH] [--launch [ID]] [--activity C] [--log-stream]
 autonom session show|stop
+autonom session outputs [--session-id ID]
 autonom session launch <app-id> [--activity C] [--arg A] [--setenv K=V]
 autonom session force-stop|uninstall <app-id>
 autonom session clear <app-id> [--strategy auto|reinstall|privacy]
 
 autonom ui tree [--dump FILE] [--all] [--max-depth N] [--max-nodes N]
-autonom ui find [--text|--desc|--resource-id|--class-name|--package] [--mode exact|contains|regex]
+autonom ui find [--text|--desc|--resource-id|--class-name|--package|--role] [--mode exact|contains|regex]
                 [--case-sensitive] [--index N] [--clickable B] [--enabled B] [--all] [--dump FILE]
-autonom ui tap [selector flags] | [--x X --y Y]
+autonom ui tap [selector flags] | [--x X --y Y] [--duration MS]
 autonom ui swipe --from X,Y --to X,Y [--duration S]
 autonom ui pinch --at X,Y [--scale F] | ui rotate | ui shake   # iOS only
-autonom ui type <text>
+autonom ui type <text> [--sensitive]
 autonom ui key <keycode>
+
+autonom flow check <path>
+autonom flow fmt <path> [--write] [--check] [--diff]
+autonom flow list [path]
+autonom flow create --from-session <ID> [--out PATH] [--name N] [--task T]
+autonom flow import <path> [--out PATH]
+autonom flow export <path> [--format maestro] [--out PATH]
+autonom flow run <path> [--include-tag TAG] [--exclude-tag TAG] [--env KEY=VALUE]
+                 [--secret NAME] [--default-timeout-ms N] [--events] [--dry-run]
+
+autonom proof --base <REF> [--head REF] [--repo PATH] [--flows DIR] [--out DIR]
+              [--env KEY=VALUE] [--secret NAME]
+
+autonom atlas update [--session ID] [--app-id ID]
+autonom atlas show [--app-id ID]
+autonom atlas coverage [--app-id ID]
+autonom atlas paths --from <SCREEN> --to <SCREEN> [--app-id ID]
+autonom atlas export --out <PATH> [--app-id ID]
+autonom atlas diff --base <PATH> [--head PATH] [--app-id ID]
+
+autonom report build [--session ID] [--run ID]
+autonom report open [--session ID] [--run ID]
+autonom report export [--session ID] [--run ID] [--format html|junit] [--out PATH]
+autonom report suite [--session ID] [--last N] [--out DIR] [--relative-to DIR] [--detailed] [--screenshots none|failed|all] [--open]
 
 autonom screenshot [--label L] [--task T] [--out PATH]
 autonom shots list [--task T] [--grep P] [--mocked-only] [--max N]
@@ -111,8 +144,24 @@ autonom shots show <path>
 autonom record start [--name N] | record stop
 autonom note add <text> [--task T] [--tag T] [--author A] | note list [--task --grep --max]
 autonom journal [--kind action|note] [--verb V] [--task T] [--grep P] [--max N]
+                [--follow] [--session-id ID] [--from-start] [--max-seconds N] [--max-lines N]
+
+autonom metrics snapshot [--app-id ID] [--label L] [--task T] [--out PATH]
+autonom metrics series [--app-id ID] [--label L] [--task T] [--out PATH] [--count N]
+                       [--interval S] [--min-growth-kb N] [--from-dir DIR] [--glob G]
+autonom metrics memory capture [--app-id ID] [--label L] [--out DIR] [--no-hprof]
+autonom metrics memory analyze [--dir D] [--glob G] [--min-growth-kb N]
+autonom metrics memory warn
+autonom metrics frames reset [--app-id ID]
+autonom metrics frames capture [--app-id ID] [--label L] [--out DIR]
+autonom metrics frames flutter-summary <file> [--budget-ms F]
+autonom metrics trace --preset <simpleperf|gfxinfo-flow|allocations|time-profiler|leaks|hitches>
+                      [--duration S] [--app-id ID] [--label L] [--out DIR]
+autonom metrics list-presets
 
 autonom logs tail [--package ID] [--since S] [--max-lines N] [--grep P]
+autonom logs follow [--source SRC | --path P] [--session-id ID] [--package ID] [--from-start]
+                    [--max-seconds N] [--max-lines N] [--grep P] [--poll-ms N]
 autonom crash list [--app-id ID] | crash show <name>
 autonom open <url>
 autonom permissions <grant|revoke|reset> <service> [app-id]
@@ -124,7 +173,9 @@ autonom network start --i-understand-mitm [--port N] [--capture-bodies] [--mitmd
                       [--ignore-hosts REGEX] [--intercept-connectivity-checks]
 autonom network attach --i-understand-mitm [--install-ca] [--no-network-cycle]
 autonom network detach|stop|status
-autonom network requests list [--host --method --status --path --since --mocked --max]
+autonom network requests list [--host --method --status --path --since --mocked --max --since-id]
+autonom network requests follow [--host --method --status --path --mocked] [--interval S]
+                                [--max N] [--max-seconds N] [--from-start]
 autonom network requests show <id> [--full]
 autonom network mock add [--url U | --match GLOB] [--method M] [--host H] [--status N]
                          [--header 'K: V'] [--json BODY | --body-file PATH] [--note N]
@@ -153,6 +204,7 @@ exit code 2, so an agent can branch on `error_code` rather than parse prose.
 | `AUTONOM_ADB`, `AUTONOM_SIMCTL`, `AUTONOM_IDB`, `AUTONOM_EMULATOR`, `AUTONOM_MITMDUMP` | Binary paths, equivalent to the matching flag |
 | `AUTONOM_IDB_COMPANION` | `host:port` of an idb companion on another Mac |
 | `AUTONOM_PREFIX`, `AUTONOM_BIN_DIR` | Installer only: bundle home and the directory `autonom` is linked into |
+| `AUTONOM_REQUIRE_SHELLCHECK` | Dev tooling only: `run_checks.sh` fails instead of skipping the shell lint when shellcheck is missing (set by CI) |
 
 ## Evidence ladder (unchanged)
 

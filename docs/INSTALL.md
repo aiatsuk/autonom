@@ -25,7 +25,10 @@ folder can be deleted. The sections below run the same layers one at a time.
 
 ## Prerequisites
 
-- `git`, `python3`, `node` (for the emulator browser bridge and checks)
+- `git`, `python3` ≥ 3.11 (CI tests 3.11 and 3.14), `node` ≥ 20.11 (the
+  browser bridge tests use `import.meta.dirname`)
+- for the test suite: `openssl` on `PATH`; `shellcheck` recommended
+  (mandatory in CI)
 - Android SDK / Flutter only when you run those domain skills against a target
 
 Nothing below is needed to install the skills or run `./scripts/run_checks.sh`.

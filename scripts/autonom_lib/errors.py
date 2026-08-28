@@ -29,6 +29,7 @@ BACKEND_FAILED = "backend_failed"
 
 # --- Session -----------------------------------------------------------------
 NO_ACTIVE_SESSION = "no_active_session"
+SESSION_NOT_FOUND = "session_not_found"
 INSTALL_PATH_NOT_FOUND = "install_path_not_found"
 APP_NOT_INSTALLED = "app_not_installed"
 IOS_BOOT_FAILED = "ios_boot_failed"
@@ -67,6 +68,40 @@ UNSAFE_ARTIFACTS_PERMISSIONS = "unsafe_artifacts_permissions"
 CONSENT_REQUIRED = "consent_required"
 CONSENT_DECLINED = "consent_declined"
 PHYSICAL_DEVICE_ATTACH_UNSUPPORTED = "physical_device_attach_unsupported"
+
+# --- Live observation & metrics (Phase 4) ------------------------------------
+STREAM_NOT_FOUND = "stream_not_found"
+PATH_FORBIDDEN = "path_forbidden"
+APP_NOT_RUNNING = "app_not_running"
+TOOL_MISSING = "tool_missing"  # generic, with a `tool` extra; per-tool codes above stay
+PRESET_UNAVAILABLE = "preset_unavailable"
+TRACE_FAILED = "trace_failed"
+
+# --- Flow DSL ----------------------------------------------------------------
+# The DSL's code family is deliberately distinct from network capture's
+# FLOW_NOT_FOUND above ("flow" there is a recorded HTTP request, mitmproxy's
+# vocabulary). That code stays network-owned forever; the DSL's file-missing
+# code is FLOW_FILE_NOT_FOUND (docs/COMPATIBILITY.md).
+FLOW_PARSE_ERROR = "flow_parse_error"
+FLOW_SCHEMA_UNSUPPORTED = "flow_schema_unsupported"
+FLOW_HEADER_INVALID = "flow_header_invalid"
+FLOW_UNKNOWN_COMMAND = "flow_unknown_command"
+FLOW_COMMAND_INVALID = "flow_command_invalid"
+FLOW_SELECTOR_INVALID = "flow_selector_invalid"
+FLOW_OPTIONAL_ASSERTION_FORBIDDEN = "flow_optional_assertion_forbidden"
+FLOW_VAR_UNDEFINED = "flow_var_undefined"
+FLOW_VAR_CONFLICT = "flow_var_conflict"
+FLOW_COPY_EMPTY = "flow_copy_empty"
+FLOW_REPEAT_INVALID = "flow_repeat_invalid"
+FLOW_SECRET_UNDEFINED = "flow_secret_undefined"
+FLOW_FILE_NOT_FOUND = "flow_file_not_found"
+FLOW_PATH_ESCAPES_WORKSPACE = "flow_path_escapes_workspace"
+FLOW_CYCLE_DETECTED = "flow_cycle_detected"
+FLOW_REQUIREMENTS_UNMET = "flow_requirements_unmet"
+FLOW_ASSERTION_TIMEOUT = "flow_assertion_timeout"
+FLOW_CHECK_FAILED = "flow_check_failed"
+FLOW_NO_FLOWS_FOUND = "flow_no_flows_found"
+UNSUPPORTED_FLOW_COMMAND = "unsupported_flow_command"  # Maestro import/export
 
 
 class AutonomError(RuntimeError):

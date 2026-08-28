@@ -72,6 +72,7 @@ active session is found from any directory, like mocks and per-app knowledge:
 
 ```text
 ~/.autonom/sessions/<session_id>/{shots,trees,logs,network,recordings,crashes,files,journal.ndjson,session.json}
+~/.autonom/sessions/<session_id>/flows/<run_id>/events.ndjson   # per-step flow run evidence (mobile-flow)
 ~/.autonom/sessions/current.json
 ```
 
@@ -121,6 +122,9 @@ export AUTONOM_IDB_COMPANION=mac-farm-01:10882
    Ambiguity is an error listing the candidates, never a silent guess.
 2. Do not print signing secrets, tokens, or `.env` values while installing/launching.
 3. One session per investigation; stop when done so artifacts stay coherent.
+   `autonom session outputs` lists every followable file in the session dir
+   (device log stream, process output, network flows, `metrics/` artifacts)
+   with a `tail -f` hint for a human's second terminal.
 4. `session stop` tears down the log stream, recorder, and proxy best-effort and
    reports each action — it never fails because teardown failed.
 5. If a session died without stopping, `autonom doctor` lists orphaned processes
