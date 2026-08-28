@@ -92,7 +92,7 @@ run_picker() {
   local drawn=0
   local key rest i mark ptr
 
-  printf 'Autonom %s — the `autonom` CLI is installed always. Extras:\n' "$1"
+  printf "Autonom %s — the \`autonom\` CLI is installed always. Extras:\n" "$1"
   printf '  arrows/jk move · space toggles · a all · n none · enter installs · q quits\n\n'
   printf '\033[?25l'
   trap 'printf "\033[?25h"' EXIT

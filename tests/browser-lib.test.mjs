@@ -48,7 +48,7 @@ test("tokens, keycodes, and conservative text encoding", () => {
   assert.equal(isSafeKeyCode("KEYCODE_BACK"), true);
   assert.equal(isSafeKeyCode("KEYCODE_UNKNOWN_INJECTION"), false);
   assert.equal(encodeAdbText("hello world"), "hello%sworld");
-  assert.throws(() => encodeAdbText("привет"), /conservative ASCII/);
+  assert.throws(() => encodeAdbText("こんにちは"), /conservative ASCII/);
 });
 
 test("wm size parsing prefers the active override", () => {

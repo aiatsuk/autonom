@@ -39,8 +39,8 @@ def _minimal_png() -> bytes:
 
 
 class NamingTests(unittest.TestCase):
-    def test_labels_stay_legible_including_cyrillic(self) -> None:
-        self.assertEqual(shot.slugify("Расписание с моком"), "расписание-с-моком")
+    def test_labels_stay_legible_including_unicode(self) -> None:
+        self.assertEqual(shot.slugify("Programación con datos"), "programación-con-datos")
         self.assertEqual(shot.slugify("  Two   words!! "), "two-words")
 
     def test_an_empty_label_still_produces_a_usable_name(self) -> None:
@@ -72,10 +72,10 @@ class EmbeddedMetadataTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_metadata_round_trips_through_the_file(self) -> None:
-        fields = {"label": "Расписание с моком", "mocks_active": 1, "mocks": "m_1"}
+        fields = {"label": "Programación con datos", "mocks_active": 1, "mocks": "m_1"}
         self.assertTrue(shot.embed_metadata(self.png, fields))
         read = shot.read_metadata(self.png)
-        self.assertEqual(read["label"], "Расписание с моком")
+        self.assertEqual(read["label"], "Programación con datos")
         self.assertEqual(read["mocks_active"], "1")
         self.assertEqual(read["mocks"], "m_1")
 
@@ -90,7 +90,7 @@ class EmbeddedMetadataTests(unittest.TestCase):
 
     def test_chunk_crc_is_correct(self) -> None:
         """A bad CRC makes strict decoders reject the whole image."""
-        shot.embed_metadata(self.png, {"label": "проверка"})
+        shot.embed_metadata(self.png, {"label": "vérification"})
         data = self.png.read_bytes()
         offset = len(shot.PNG_SIGNATURE)
         checked = 0
@@ -126,10 +126,10 @@ class IndexTests(unittest.TestCase):
 
     def test_shots_group_under_a_task_directory(self) -> None:
         plain = shot.shots_dir(self.session)
-        grouped = shot.shots_dir(self.session, "Мок предзаказов")
+        grouped = shot.shots_dir(self.session, "Réponses simulées")
         self.assertEqual(plain.name, "shots")
         self.assertEqual(grouped.parent, plain)
-        self.assertEqual(grouped.name, "мок-предзаказов")
+        self.assertEqual(grouped.name, "réponses-simulées")
 
     def test_index_appends_and_survives_a_torn_line(self) -> None:
         shot.append_index(self.session, {"file": "shots/0001_a.png", "label": "one"})
