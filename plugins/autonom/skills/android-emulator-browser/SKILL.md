@@ -1,23 +1,25 @@
 ---
 name: android-emulator-browser
-description: Mirror and lightly control an Android emulator or device inside the visible Codex browser using a token-protected localhost MJPEG bridge with accelerated and fallback transports.
+description: Mirror and lightly control an Android target or iOS Simulator in the visible Codex browser through the authenticated Autonom Mobile Canvas.
 ---
 
-# Android Emulator Browser
+# Mobile Canvas browser
 
-Stream the device into a localhost MJPEG bridge for visual proof and light
-control. Install and launch the app first, then start the bridge on one serial.
+Stream one explicit target into a localhost browser for visual proof and light
+control. Install and launch the app first. Canvas actions use the same Autonom
+action pipeline and journal as CLI input; the browser is not a second runner.
 
 ## Launch
 
 ```bash
-node <skill-root>/scripts/android-emulator-browser.mjs \
-  --serial <adb-serial> \
-  --transport auto
+autonom canvas serve --platform android --serial <adb-serial> --transport auto
+
+autonom canvas serve --platform ios --target <simulator-udid> --transport screencap
 ```
 
-Open the printed tokenized URL in the agent browser panel. Leave the process
-running and confirm frames are advancing before calling the setup successful.
+Open the printed fragment-token URL in the agent browser panel. The page
+exchanges it for an HttpOnly cookie and removes the fragment. Leave the process
+running and confirm frames advance before calling the setup successful.
 
 ## Transport modes
 
@@ -27,20 +29,25 @@ running and confirm frames are advancing before calling the setup successful.
 | `screenrecord` | Require accelerated path; fail loudly when prerequisites missing |
 | `screencap` | Multipart JPEG screenshots; no ffmpeg |
 
+Android also exposes authenticated Annex-B H.264 at `/stream.h264`. iOS uses
+public `simctl` screenshots with idb input and always chooses the screenshot
+fallback; pixel-to-point mapping is handled by the Canvas status channel.
+
 The UI shows active transport and frame health. Use Reconnect after rotation or
 when device-side recording stops.
 
 ## Input surface
 
-Tap, long-press, drag, wheel-as-swipe, Back/Home/Enter/Delete/D-pad/wake, and
-conservative ASCII typing. Structural selection still belongs to UI Automator /
-Autonom `ui` commands — this bridge is visual proof, not a test runner.
+Tap, drag, wheel-as-swipe, Back/Home/Enter/Delete/D-pad/wake, and conservative
+ASCII typing. Every action records `human`, `agent`, `replay`, or `system`
+origin. The control endpoint supports pause, resume, takeover, and release.
+Structural selection still belongs to Autonom `ui` commands.
 
 ## Security
 
 Binds to `127.0.0.1` with a random token by default. Do not expose publicly.
-Anyone with a forwarded port and the token can drive the device. `--no-auth`
-is for isolated local debugging only.
+Anyone with a forwarded port and the bootstrap token can drive the device.
+`--no-auth` is for isolated local debugging only.
 
 ## Performance boundary
 
@@ -49,5 +56,5 @@ review and Macrobenchmark / Perfetto / Flutter profile mode for claims.
 
 ## Evidence to record
 
-Side-panel screenshot, adb serial, transport, package/activity, variant, and
-the exact flow replayed.
+Side-panel screenshot, platform and target id, transport, package/activity,
+variant, control owner, and the exact flow replayed.

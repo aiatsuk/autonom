@@ -20,7 +20,7 @@ async function waitForPreview(child, timeoutMs = 8000) {
     const timer = setTimeout(() => reject(new Error(`bridge did not start; output: ${output}`)), timeoutMs);
     child.stdout.on("data", (chunk) => {
       output += chunk.toString();
-      const match = output.match(/Preview at (http:\/\/127\.0\.0\.1:\d+\/\?token=[^\s]+)/);
+      const match = output.match(/Preview at (http:\/\/127\.0\.0\.1:\d+\/#token=[^\s]+)/);
       if (match) {
         clearTimeout(timer);
         resolvePromise(match[1]);
@@ -87,7 +87,8 @@ else:
     ],
     {
       cwd: ROOT,
-      env: { ...process.env, FAKE_ADB_LOG: adbLog },
+      env: { ...process.env, FAKE_ADB_LOG: adbLog,
+        AUTONOM_HOME: join(directory, "autonom-home") },
       stdio: ["ignore", "pipe", "pipe"],
     },
   );
@@ -100,34 +101,46 @@ else:
   const preview = await waitForPreview(child);
   const parsed = new URL(preview);
   const origin = parsed.origin;
-  const token = parsed.searchParams.get("token");
+  const token = new URLSearchParams(parsed.hash.slice(1)).get("token");
   assert.equal(token, "bridge-test-token");
 
   const unauthorized = await fetch(`${origin}/status`);
   assert.equal(unauthorized.status, 401);
 
-  const status = await fetch(`${origin}/status?token=${encodeURIComponent(token)}`);
+  const auth = await fetch(`${origin}/auth`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ token }),
+  });
+  assert.equal(auth.status, 200);
+  const authBody = await auth.json();
+  const cookie = auth.headers.get("set-cookie").split(";", 1)[0];
+  assert.ok(authBody.csrf);
+
+  const status = await fetch(`${origin}/status`, { headers: { Cookie: cookie } });
   assert.equal(status.status, 200, stderr);
   const statusBody = await status.json();
   assert.equal(statusBody.serial, "emulator-5554");
   assert.equal(statusBody.transport, "screencap");
   assert.deepEqual(statusBody.display, { width: 1080, height: 2400 });
 
-  const frame = await fetch(`${origin}/frame?token=${encodeURIComponent(token)}`);
+  const frame = await fetch(`${origin}/frame`, { headers: { Cookie: cookie } });
   assert.equal(frame.status, 200);
   const frameBytes = new Uint8Array(await frame.arrayBuffer());
   assert.deepEqual([...frameBytes.slice(0, 8)], [137, 80, 78, 71, 13, 10, 26, 10]);
 
-  const tap = await fetch(`${origin}/tap?token=${encodeURIComponent(token)}`, {
+  const tap = await fetch(`${origin}/tap`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", Cookie: cookie,
+      "X-Autonom-CSRF": authBody.csrf, "X-Autonom-Origin": "human" },
     body: JSON.stringify({ x: 120, y: 340 }),
   });
   assert.equal(tap.status, 200);
   assert.deepEqual(await tap.json(), { ok: true, x: 120, y: 340 });
 
   const controller = new AbortController();
-  const stream = await fetch(`${origin}/stream.mjpeg?token=${encodeURIComponent(token)}`, {
+  const stream = await fetch(`${origin}/stream.mjpeg`, {
+    headers: { Cookie: cookie },
     signal: controller.signal,
   });
   assert.equal(stream.status, 200);

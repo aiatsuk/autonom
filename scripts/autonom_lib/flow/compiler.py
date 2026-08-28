@@ -28,6 +28,7 @@ from .. import journal as journal_mod
 from .canonical import emit_flow
 from .parser import parse_document
 from .schema import Flow, FlowSelector, Step, build_flow
+from ..contracts import stable_id
 
 _CREDENTIAL_HINT = re.compile(
     r"pass(word)?|pwd|pin\b|secret|token|otp|cvv|card", re.IGNORECASE)
@@ -104,13 +105,22 @@ def _looks_credential(previous_tap_node: dict[str, Any] | None) -> bool:
 
 
 def compile_session(session: dict[str, Any], *, name: str | None = None,
-                    task: str | None = None) -> tuple[Flow, dict[str, Any]]:
+                    task: str | None = None,
+                    start_seq: int | None = None,
+                    end_seq: int | None = None) -> tuple[Flow, dict[str, Any]]:
     """Journal + details -> (validated Flow, quality report)."""
     entries, _total = journal_mod.read(session, max_entries=10_000)
+    if start_seq is not None:
+        entries = [entry for entry in entries if int(entry.get("seq", 0)) >= start_seq]
+    if end_seq is not None:
+        entries = [entry for entry in entries if int(entry.get("seq", 0)) <= end_seq]
     details = actions_mod.read_details(session)
 
     flow = Flow(path="<generated>", name=name or f"Recorded {task or 'session'}",
                 app_id=session.get("app_id"))
+    flow.flow_id = stable_id(
+        "flow", flow.app_id or "unknown", task or flow.name,
+        start_seq or "start", end_seq or "end")
     if task:
         flow.tags = [task]
     warnings: list[dict[str, Any]] = []
@@ -267,14 +277,30 @@ def compile_session(session: dict[str, Any], *, name: str | None = None,
     quality["steps"] = len(flow.steps)
 
     env_hint = {f"SECRET_{i}": "" for i in range(1, secret_count + 1)}
+    total_selectors = sum(quality["selectors"].values())
+    stable_selectors = (quality["selectors"]["id"]
+                        + quality["selectors"]["recorded"])
+    confidence = 1.0 if total_selectors == 0 else min(
+        1.0, stable_selectors / total_selectors)
     report = {"warnings": warnings, "quality": quality,
-              "secrets_required": list(env_hint)}
+              "secrets_required": list(env_hint),
+              "range": {"start_seq": start_seq, "end_seq": end_seq},
+              "provenance": {
+                  "session_id": session.get("session_id"),
+                  "journal": str(journal_mod.journal_path(session)),
+                  "compiler": "autonom.teach/v1",
+              },
+              "confidence": round(confidence, 3),
+              "review_required": bool(warnings or confidence < 1.0)}
     return flow, report
 
 
 def compile_to_text(session: dict[str, Any], *, name: str | None = None,
-                    task: str | None = None) -> tuple[str, dict[str, Any]]:
-    flow, report = compile_session(session, name=name, task=task)
+                    task: str | None = None,
+                    start_seq: int | None = None,
+                    end_seq: int | None = None) -> tuple[str, dict[str, Any]]:
+    flow, report = compile_session(session, name=name, task=task,
+                                   start_seq=start_seq, end_seq=end_seq)
     text = emit_flow(flow)
     build_flow(parse_document(text, "<generated>"))  # never emit the unparseable
     return text, report

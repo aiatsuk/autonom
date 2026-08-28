@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from . import FLOW_SCHEMA_ID
 from .. import errors
 from .parser import FlowDocument, Mapping, Scalar, Sequence
+from ..providers import SEMANTIC_CAPABILITIES
 
 # --- Failure classes ---------------------------------------------------------
 TEST_FAILURE = "test_failure"
@@ -123,50 +124,52 @@ class CommandSpec:
 
 _LABEL = ArgSpec("label", "str")
 _TIMEOUT = ArgSpec("timeoutMs", "int")
+_POSTCONDITION = ArgSpec("postcondition", "selector")
 _OPTIONAL = (ArgSpec("optional", "bool"), ArgSpec("reason", "str"))
 
 REGISTRY: dict[str, CommandSpec] = {spec.name: spec for spec in [
     # lifecycle
     CommandSpec("launchApp", True, bare=True,
-                args=(ArgSpec("clearState", "bool"), _LABEL)),
-    CommandSpec("stopApp", True, bare=True, args=(_LABEL,)),
-    CommandSpec("clearState", True, bare=True, args=(_LABEL,)),
+                args=(ArgSpec("clearState", "bool"), _LABEL, _POSTCONDITION)),
+    CommandSpec("stopApp", True, bare=True, args=(_LABEL, _POSTCONDITION)),
+    CommandSpec("clearState", True, bare=True, args=(_LABEL, _POSTCONDITION)),
     CommandSpec("openLink", True, shorthand="url",
-                args=(ArgSpec("url", "str", required=True), _LABEL)),
+                args=(ArgSpec("url", "str", required=True), _LABEL, _POSTCONDITION)),
     # UI actions
     CommandSpec("tapOn", True, shorthand="selector.text", optional_allowed=True,
                 args=(ArgSpec("selector", "selector", required=True),
                       ArgSpec("repeat", "int"), ArgSpec("delayMs", "int"),
-                      _LABEL, _TIMEOUT) + _OPTIONAL),
+                      _LABEL, _TIMEOUT, _POSTCONDITION) + _OPTIONAL),
     CommandSpec("longPressOn", True, shorthand="selector.text",
                 optional_allowed=True, since="0.21.0",
                 args=(ArgSpec("selector", "selector", required=True),
                       ArgSpec("durationMs", "int"),
-                      _LABEL, _TIMEOUT) + _OPTIONAL),
+                      _LABEL, _TIMEOUT, _POSTCONDITION) + _OPTIONAL),
     CommandSpec("doubleTapOn", True, shorthand="selector.text",
                 optional_allowed=True, since="0.21.0",
                 args=(ArgSpec("selector", "selector", required=True),
-                      _LABEL, _TIMEOUT) + _OPTIONAL),
+                      _LABEL, _TIMEOUT, _POSTCONDITION) + _OPTIONAL),
     CommandSpec("inputText", True, shorthand="value",
                 args=(ArgSpec("value", "str", required=True),
-                      ArgSpec("sensitive", "bool"), _LABEL)),
+                      ArgSpec("sensitive", "bool"), _LABEL, _POSTCONDITION)),
     CommandSpec("eraseText", True, bare=True,
-                args=(ArgSpec("chars", "int"), _LABEL)),
+                args=(ArgSpec("chars", "int"), _LABEL, _POSTCONDITION)),
     CommandSpec("pressKey", True, shorthand="key",
-                args=(ArgSpec("key", "str", required=True), _LABEL)),
-    CommandSpec("back", True, bare=True, args=(_LABEL,)),
+                args=(ArgSpec("key", "str", required=True), _LABEL, _POSTCONDITION)),
+    CommandSpec("back", True, bare=True, args=(_LABEL, _POSTCONDITION)),
     CommandSpec("swipe", True, shorthand="direction",
                 args=(ArgSpec("direction", "str", required=True,
                               choices=("up", "down", "left", "right")),
                       ArgSpec("from", "selector"),
-                      ArgSpec("durationMs", "int"), _LABEL)),
-    CommandSpec("scroll", True, bare=True, since="0.28.1", args=(_LABEL,)),
+                      ArgSpec("durationMs", "int"), _LABEL, _POSTCONDITION)),
+    CommandSpec("scroll", True, bare=True, since="0.28.1",
+                args=(_LABEL, _POSTCONDITION)),
     CommandSpec("scrollUntilVisible", True, since="0.20.2",
                 args=(ArgSpec("selector", "selector", required=True),
                       ArgSpec("direction", "str",
                               choices=("up", "down", "left", "right")),
                       ArgSpec("maxSwipes", "int"),
-                      ArgSpec("centerElement", "bool"), _LABEL)),
+                      ArgSpec("centerElement", "bool"), _LABEL, _POSTCONDITION)),
     CommandSpec("copyTextFrom", False, shorthand="selector.text", since="0.28.1",
                 args=(ArgSpec("selector", "selector", required=True),
                       ArgSpec("into", "str"), ArgSpec("sensitive", "bool"),
@@ -175,7 +178,8 @@ REGISTRY: dict[str, CommandSpec] = {spec.name: spec for spec in [
                 args=(ArgSpec("value", "str", required=True),
                       ArgSpec("into", "str"), ArgSpec("sensitive", "bool"),
                       _LABEL)),
-    CommandSpec("pasteText", True, bare=True, since="0.28.1", args=(_LABEL,)),
+    CommandSpec("pasteText", True, bare=True, since="0.28.1",
+                args=(_LABEL, _POSTCONDITION)),
     # assertions and waits
     CommandSpec("assertVisible", False, shorthand="selector.text", assertion=True,
                 args=(ArgSpec("selector", "selector", required=True),
@@ -196,19 +200,21 @@ REGISTRY: dict[str, CommandSpec] = {spec.name: spec for spec in [
     # device state
     CommandSpec("setLocation", True, since="0.20.2",
                 args=(ArgSpec("latitude", "float", required=True),
-                      ArgSpec("longitude", "float", required=True), _LABEL)),
+                      ArgSpec("longitude", "float", required=True), _LABEL,
+                      _POSTCONDITION)),
     CommandSpec("setPermissions", True, since="0.20.2",
                 args=(ArgSpec("action", "str", required=True,
                               choices=("grant", "revoke", "reset")),
                       ArgSpec("service", "str", required=True),
-                      ArgSpec("appId", "str"), _LABEL)),
+                      ArgSpec("appId", "str"), _LABEL, _POSTCONDITION)),
     CommandSpec("addMedia", True, shorthand="path", since="0.20.2",
-                args=(ArgSpec("path", "str", required=True), _LABEL)),
+                args=(ArgSpec("path", "str", required=True), _LABEL,
+                      _POSTCONDITION)),
     CommandSpec("setOrientation", True, shorthand="orientation", since="0.21.0",
                 args=(ArgSpec("orientation", "str", required=True,
                               choices=("portrait", "landscape",
                                        "portrait-reversed", "landscape-reversed")),
-                      _LABEL)),
+                      _LABEL, _POSTCONDITION)),
     # composition
     CommandSpec("runFlow", True, shorthand="file", since="0.20.2",
                 args=(ArgSpec("file", "str"),
@@ -247,7 +253,8 @@ DEFERRED_COMMANDS = {
 # --- Header surface ----------------------------------------------------------
 HEADER_FIELDS = (
     "schema", "appId", "name", "id", "description", "tags", "properties",
-    "env", "requires", "evidence", "onFlowStart", "onFlowComplete",
+    "env", "requires", "sideEffects", "setup", "evidence",
+    "onFlowStart", "onFlowComplete",
 )
 EVIDENCE_MODES = ("minimal", "on-failure", "always", "custom")
 EVIDENCE_KINDS = ("screenshot", "hierarchy", "logs", "crashes", "network")
@@ -255,11 +262,14 @@ EVIDENCE_BODIES = ("preview", "full")
 PLATFORMS = ("android", "ios")
 # Frozen vocabulary (research §7.5). Unknown names are a header error;
 # the executor checks these against the resolved session before mutating.
-KNOWN_CAPABILITIES = (
-    "ui.accessibility",
-    "screenshots",
-    "logs",
-    "network.capture",
+KNOWN_CAPABILITIES = SEMANTIC_CAPABILITIES
+SIDE_EFFECTS = (
+    "none", "app-data", "device-state", "network", "external-system",
+    "credentials", "media", "clipboard",
+)
+SETUP_FIELDS = (
+    "profile", "fixtures", "mocks", "permissions", "location",
+    "orientation", "appearance", "locale", "network", "reset",
 )
 
 # --- Typed model -------------------------------------------------------------
@@ -335,6 +345,8 @@ class Flow:
     env: dict = field(default_factory=dict)
     requires_platforms: list = field(default_factory=list)
     requires_capabilities: list = field(default_factory=list)
+    side_effects: list = field(default_factory=list)
+    setup: dict = field(default_factory=dict)
     evidence: Evidence | None = None
     on_flow_start: list = field(default_factory=list)
     on_flow_complete: list = field(default_factory=list)
@@ -405,6 +417,46 @@ def _string_map(node, code: str, path: str, what: str) -> dict:
                   path, key.line, key.col)
         out[key.text] = value.text
     return out
+
+
+def _literal(node, code: str, path: str, what: str):
+    """Convert the YAML subset AST into a JSON-compatible setup value."""
+    if isinstance(node, Scalar):
+        if node.style == "plain" and node.text in ("true", "false"):
+            return node.text == "true"
+        if node.style == "plain" and re.fullmatch(r"-?[0-9]+", node.text):
+            return int(node.text)
+        if node.style == "plain" and re.fullmatch(r"-?[0-9]+\.[0-9]+", node.text):
+            return float(node.text)
+        return node.text
+    if isinstance(node, Sequence):
+        return [_literal(item, code, path, what) for item in node.items]
+    if isinstance(node, Mapping):
+        result = {}
+        for key, value in node.pairs:
+            if key.text in result:
+                _fail(code, f"duplicate {what} field {key.text!r}",
+                      path, key.line, key.col)
+            result[key.text] = _literal(value, code, path,
+                                        f"{what}.{key.text}")
+        return result
+    _fail(code, f"{what} has an unsupported value", path,
+          getattr(node, "line", 0), getattr(node, "col", 0))
+
+
+def _build_setup(node, path: str) -> dict:
+    code = errors.FLOW_HEADER_INVALID
+    if not isinstance(node, Mapping):
+        _fail(code, "setup must be a mapping", path,
+              getattr(node, "line", 0), getattr(node, "col", 0))
+    result = {}
+    for key, value in node.pairs:
+        if key.text not in SETUP_FIELDS:
+            _fail(code, f"unknown setup field {key.text!r}",
+                  path, key.line, key.col,
+                  hint="Setup fields: " + ", ".join(SETUP_FIELDS) + ".")
+        result[key.text] = _literal(value, code, path, f"setup.{key.text}")
+    return result
 
 
 # --- Selector ----------------------------------------------------------------
@@ -834,6 +886,19 @@ def build_flow(document: FlowDocument) -> Flow:
             flow.env = env
         elif name == "requires":
             _build_requires(value, path, flow)
+        elif name == "sideEffects":
+            effects = _string_list(value, code, path, "sideEffects")
+            unknown = [item for item in effects if item not in SIDE_EFFECTS]
+            if unknown:
+                _fail(code, f"unknown side effect {unknown[0]!r}",
+                      path, value.line, value.col,
+                      hint="Side effects: " + ", ".join(SIDE_EFFECTS) + ".")
+            if "none" in effects and len(effects) > 1:
+                _fail(code, "sideEffects 'none' cannot be combined with other values",
+                      path, value.line, value.col)
+            flow.side_effects = effects
+        elif name == "setup":
+            flow.setup = _build_setup(value, path)
         elif name == "evidence":
             flow.evidence = _build_evidence(value, path)
         elif name == "onFlowStart":

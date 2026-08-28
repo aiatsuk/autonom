@@ -42,7 +42,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from .. import device_state, errors, ios_simctl
+from .. import device_state, errors, ios_simctl, providers, simulator as simulator_mod
 from .. import journal as journal_mod
 from .. import screenshot as screenshot_mod
 from .. import session as session_mod
@@ -77,25 +77,8 @@ _CAPABILITY_HINTS = {
 
 def session_capabilities(target: Target, session: dict) -> dict[str, bool]:
     """What this resolved target + session can actually collect. No device I/O."""
-    android = target.platform == ANDROID
-    tooling = session.get("tooling") or {}
-    idb_state = (tooling.get("idb") or {}).get("state")
-    if target.platform == IOS and idb_state is None:
-        # In-process callers may omit tooling; honour AUTONOM_IDB / PATH.
-        try:
-            from .. import ios_idb
-            ios_idb.find_idb()
-            idb_state = "ready"
-        except errors.AutonomError:
-            idb_state = "missing"
-    ui_ready = android or idb_state == "ready"
-    attached = bool((session.get("network") or {}).get("attached"))
-    return {
-        "ui.accessibility": ui_ready,
-        "screenshots": True,   # adb screencap / simctl io — both ride the target
-        "logs": True,          # logcat / simctl spawn — both ride the target
-        "network.capture": attached,
-    }
+    snapshot = providers.open_session(target, session).capabilities()
+    return {item.name: item.available for item in snapshot.capabilities}
 
 
 def _capability_hint(missing: list[str]) -> str:
@@ -121,6 +104,10 @@ class RunConfig:
     # CLI/report replay may ask for stronger evidence than the flow header.
     evidence_mode: str | None = None
     evidence_collect: tuple[str, ...] | None = None
+    parent_attempt_id: str | None = None
+    retry_of: str | None = None
+    campaign_id: str | None = None
+    shard_id: str | None = None
 
 
 @dataclass
@@ -236,6 +223,10 @@ class Executor:
         self._last_nodes: list | None = None
         self._last_match: dict | None = None
         self._source_occurrences: dict[str, int] = {}
+        self._setup_catalog: dict[str, list] = {
+            "available": [], "selected": [], "applied": [],
+            "verified": [], "used": [],
+        }
 
     # -- public ---------------------------------------------------------------
 
@@ -247,6 +238,10 @@ class Executor:
         self.sensitive_var_names = set()
         self._artifact_steps = []
         self._source_occurrences = {}
+        self._setup_catalog = {
+            "available": [], "selected": [], "applied": [],
+            "verified": [], "used": [],
+        }
         self._children = {}
         self._collect_children(flow, flow.app_id)
         # Every name declared ANYWHERE in the graph (root env/--env/secrets,
@@ -267,6 +262,9 @@ class Executor:
             self.target.platform, self.target.target_id,
             serial=self.target.serial, stdout_stream=self.stdout_stream,
         )
+        capability_snapshot = providers.open_session(
+            self.target, self.session).capabilities()
+        self._capability_snapshot = capability_snapshot.as_dict()
         self._writer_run_id = run_id
         result = RunResult(run_id=run_id, status="passed",
                            events_path=str(writer.path))
@@ -290,6 +288,7 @@ class Executor:
         aborted: errors.AutonomError | None = None
         replay_reached = False
         try:
+            self._apply_setup(flow)
             if flow.on_flow_start:
                 self._execute_steps(flow.on_flow_start, flow, root_values,
                                     writer, result, evidence, hook="onFlowStart")
@@ -386,17 +385,41 @@ class Executor:
                 str(p.relative_to(self.session["artifacts_dir"]))
                 for base in (run_dir, shots_dir) if base.is_dir()
                 for p in base.rglob("*") if p.is_file())
+            workspace = flow_validator.workspace_root(Path(flow.path))
+            source_paths = [Path(flow.path), *[Path(path) for path in self._children]]
+            flow_sources = []
+            for source in source_paths:
+                try:
+                    relative = source.resolve().relative_to(workspace.resolve())
+                except (OSError, ValueError):
+                    continue
+                flow_sources.append({"path": str(source.resolve()),
+                                     "relative": relative.as_posix()})
             manifest = {
                 "schema_version": 3,
                 "session_id": self.session.get("session_id"),
                 "run_id": writer.run_id,
+                "attempt_id": writer.attempt_id,
+                "parent_attempt_id": self.config.parent_attempt_id,
+                "retry_of": self.config.retry_of,
+                "campaign_id": self.config.campaign_id,
+                "shard_id": self.config.shard_id,
                 "flow_id": flow.flow_id,
                 "flow_name": flow.name,
                 "flow_path": flow.path,
+                "flow_sources": flow_sources,
                 "app_id": flow.app_id,
                 "platform": self.target.platform,
                 "target_id": self.target.target_id,
                 "status": result.status,
+                "execution_status": (
+                    "passed" if result.status in ("passed", "replayed") else
+                    "failed" if (result.failure or {}).get("failure_class")
+                    in (None, "test_failure") else "broken"),
+                "proof_verdict": (
+                    "pass" if result.status in ("passed", "replayed") else
+                    "fail" if (result.failure or {}).get("failure_class")
+                    in (None, "test_failure") else "inconclusive"),
                 "sensitive": result.sensitive,
                 "primary_error": result.failure,
                 "hook_failures": result.hook_failures,
@@ -420,12 +443,13 @@ class Executor:
                 "blocks": result.blocks,
                 "tags": flow.tags,
                 "properties": flow.properties,
+                "side_effects": flow.side_effects,
+                "setup": self._setup_catalog,
                 "description": flow.description,
                 "env": {**flow.env, **self.config.env},
                 "secret_names": sorted(self.secret_values),
                 "converted_from": flow.converted_from,
-                "workspace_root": str(
-                    flow_validator.workspace_root(Path(flow.path))),
+                "workspace_root": str(workspace),
                 "environment": {
                     "platform": self.target.platform,
                     "target_id": self.target.target_id,
@@ -435,6 +459,7 @@ class Executor:
                     "network_capture": (self.session.get("network") or {}).get(
                         "attached", False),
                 },
+                "capability_snapshot": self._capability_snapshot,
                 "evidence_mode": self._effective_evidence(flow).mode,
                 "evidence_collect": self._effective_evidence(flow).collect,
                 "network": self._network_evidence(result),
@@ -754,19 +779,91 @@ class Executor:
                 hint="Pick a matching target with --platform/--target.",
                 required=flow.requires_platforms, target=self.target.platform,
             )
-        if not flow.requires_capabilities:
-            return
-        available = session_capabilities(self.target, self.session)
-        missing = [name for name in flow.requires_capabilities
-                   if not available.get(name)]
-        if missing:
-            raise errors.AutonomError(
-                errors.FLOW_REQUIREMENTS_UNMET,
-                f"flow requires capabilities {', '.join(missing)} "
-                f"that this session cannot provide",
-                hint=_capability_hint(missing),
-                required=flow.requires_capabilities, missing=missing,
-            )
+        inferred = {
+            "location": "simulator.location",
+            "permissions": "simulator.permissions",
+            "orientation": "ui.input",
+            "appearance": "simulator.appearance",
+            "network": "simulator.network",
+        }
+        required = list(dict.fromkeys(
+            list(flow.requires_capabilities)
+            + [capability for field, capability in inferred.items()
+               if field in flow.setup]))
+        providers.preflight(self.target, self.session, required)
+
+    def _apply_setup(self, flow: Flow) -> None:
+        """Apply provider-owned setup before the first flow mutation.
+
+        Knowledge-only entries stay explicit as externally selected; the
+        report never upgrades a declaration into a fake applied/verified state.
+        """
+        snapshot = providers.open_session(self.target, self.session).capabilities()
+        self._setup_catalog["available"] = [item.as_dict()
+                                             for item in snapshot.capabilities]
+        for kind, value in flow.setup.items():
+            selected = {"kind": kind, "value": value}
+            self._setup_catalog["selected"].append(selected)
+            result: dict[str, Any]
+            if kind == "location":
+                if not isinstance(value, dict) or "latitude" not in value or "longitude" not in value:
+                    raise errors.AutonomError(
+                        errors.FLOW_HEADER_INVALID,
+                        "setup.location needs latitude and longitude")
+                result = device_state.set_location(
+                    self.target, f"{value['latitude']},{value['longitude']}")
+            elif kind == "orientation":
+                result = device_state.set_orientation(self.target, str(value))
+            elif kind == "appearance":
+                result = simulator_mod.apply(
+                    self.target, "appearance", str(value), {})
+            elif kind == "network" and isinstance(value, str):
+                result = simulator_mod.apply(self.target, "network", value, {})
+            elif kind == "permissions":
+                results = []
+                if isinstance(value, dict):
+                    for service, action in value.items():
+                        results.append(device_state.permissions(
+                            self.target, str(action), str(service), flow.app_id))
+                elif isinstance(value, list):
+                    for service in value:
+                        results.append(device_state.permissions(
+                            self.target, "grant", str(service), flow.app_id))
+                else:
+                    raise errors.AutonomError(
+                        errors.FLOW_HEADER_INVALID,
+                        "setup.permissions must be a list or service-to-action mapping")
+                result = {"permissions": results}
+            elif kind == "reset" and value is True:
+                if not flow.app_id:
+                    raise errors.AutonomError(
+                        errors.FLOW_HEADER_INVALID, "setup.reset needs appId")
+                if self.target.platform == ANDROID:
+                    session_mod.clear_data(
+                        self.target.tool, self.target.target_id, flow.app_id)
+                    result = {"cleared": flow.app_id, "strategy": "pm-clear"}
+                else:
+                    install_path = self.session.get("install_path")
+                    if not install_path:
+                        raise errors.AutonomError(
+                            errors.IOS_CLEAR_REQUIRES_INSTALL_PATH,
+                            "setup.reset on iOS needs the recorded .app install path")
+                    ios_simctl.uninstall(self.target.tool, self.target.target_id, flow.app_id)
+                    ios_simctl.install(self.target.tool, self.target.target_id,
+                                       Path(install_path))
+                    result = {"cleared": flow.app_id, "strategy": "reinstall"}
+            else:
+                self._setup_catalog["applied"].append({
+                    **selected, "status": "external",
+                    "reason": "resolved by App Skills, fixtures, mocks, or the runner",
+                })
+                continue
+            applied = {**selected, "status": "applied", "result": result}
+            self._setup_catalog["applied"].append(applied)
+            self._setup_catalog["verified"].append(
+                {"kind": kind, "status": "verified", "receipt": result})
+            self._setup_catalog["used"].append(
+                {"kind": kind, "status": "used-by-attempt"})
 
     def _evaluate_when(self, when: WhenClause, snapshot) -> tuple[bool, str | None]:
         names, literals = self._redact_secrets()
@@ -1380,6 +1477,13 @@ class Executor:
         try:
             secret_used = self._dispatch(step, flow, attempts)
             sensitive = sensitive or secret_used
+            postcondition = step.args.get("postcondition")
+            if postcondition is not None:
+                resolved, post_secret = self._resolve_selector(postcondition)
+                sensitive = sensitive or post_secret
+                self._poll_condition(
+                    resolved, step.args.get("timeoutMs"), attempts,
+                    lambda matches: bool(matches), "postcondition visible")
         except errors.AutonomError as exc:
             outcome.error_code = exc.code
             outcome.failure_class = failure_class(exc.code)

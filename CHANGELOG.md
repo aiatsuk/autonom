@@ -7,6 +7,43 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
 
 ## [Unreleased]
 
+## [0.30.0] - 2026-08-28
+
+Autonom now implements the end-to-end product blueprint: strict portable
+flows, semantic provider preflight, teaching and reusable app skills,
+continuous step evidence, immutable report bundles, deterministic replay,
+campaign-level CI, and one Android/iOS Mobile Canvas control plane.
+
+### Added
+- **Report Model v2 and immutable bundles:** canonical run, case, attempt,
+  action, artifact, environment, setup, and replay records; content-addressed
+  blobs; integrity verification; separate mutable annotations; complete
+  per-step screenshot, hierarchy, log, and request deltas.
+- **First-class exports and gates:** Allure 3 result files, compact agent JSON,
+  JUnit, CSV, metrics, explicit gate rules, retry/flaky history, supervised CI
+  shards, deterministic pack/merge/finalize, and independent publication.
+- **Teach and App Skills:** marked journal ranges compile into reviewed flows;
+  promotion requires three clean replays and stores only the fixed portable
+  `.autonom/apps/<app-id>` contract.
+- **Provider and setup contracts:** immutable semantic capability snapshots,
+  preflight before mutation, a recorded Setup Catalog, explicit side effects,
+  postconditions, simulator controls, and typed unsupported combinations.
+- **Unified Mobile Canvas:** authenticated browser bootstrap, HttpOnly session
+  cookies, CSRF checks, persistent journaled input, Android H.264 streaming,
+  screenshot fallback, iOS Simulator point/pixel mapping, and explicit
+  human/agent/replay control ownership.
+- **Portable replay and Runtime Map:** bundle-contained flow graphs, replay to
+  a stable step or checkpoint, and a descriptive `runtime-map` alias for the
+  observed-only Atlas graph.
+
+### Changed
+- The event stream uses the ordered `autonom.event/v1` envelope with stable
+  identity, monotonic and wall clocks, origin, attempt linkage, and
+  pre-persistence redaction.
+- The HTML evidence report has keyboard navigation, filtering, stable step
+  anchors, first-causal-failure links, setup/capability inspection, and clear
+  separation between execution status and proof verdict.
+
 ## [0.29.0] - 2026-08-28
 
 The evidence report now implements the step-level debugging loop promised by

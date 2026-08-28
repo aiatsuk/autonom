@@ -1,7 +1,7 @@
 {
   "name": "autonom",
   "displayName": "Autonom",
-  "version": "0.29.0",
+  "version": "0.30.0",
   "description": "Universal mobile test and debug harness for AI agents: portable skills plus a JSON CLI for device sessions, UI trees, screenshots, logs, crashes, device state, and consent-gated HTTP(S) capture and mocking across Android and the iOS Simulator.",
   "author": {
     "name": "Andrei Iatsuk",

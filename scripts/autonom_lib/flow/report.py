@@ -377,6 +377,9 @@ def render_run_page(manifest: dict[str, Any], evidence: dict[int, dict],
     reproduction = _shorten(str(manifest.get("reproduction", "")), base)
     steps = sorted(manifest.get("steps", []),
                    key=lambda item: item.get("index", 0))
+    first_causal_failure = next(
+        (step for step in steps if step.get("status") == "failed"
+         and step.get("failure_class") == "test_failure"), None)
     for step in steps:
         index = step.get("index", 0)
         found = evidence.get(index, {})
@@ -387,7 +390,8 @@ def render_run_page(manifest: dict[str, Any], evidence: dict[int, dict],
                     or (step.get("canonical_args") or {}).get("name")
                     or step.get("command") or "step")
         nav.append(
-            f"<a class='nav-step s-{e(step_status)}' href='#step-{index}'>"
+            f"<a class='nav-step s-{e(step_status)}' href='#step-{index}' "
+            f"data-search='{e((label + ' ' + str(step.get('command',''))).lower())}'>"
             f"<span>{badge}</span><b>{index}</b> {e(label)}</a>")
         metadata = {
             "step_id": step.get("step_id"), "source_id": step.get("source_id"),
@@ -428,7 +432,9 @@ def render_run_page(manifest: dict[str, Any], evidence: dict[int, dict],
             action = ("<p class='replay'><b>Replay to this state</b><br>"
                       f"<code>{e(replay_command)}</code></p>")
         blocks.append(
-            f"<section class='step-card' id='step-{index}'>"
+            f"<section class='step-card' id='step-{index}' tabindex='-1' "
+            f"data-step-id='{e(str(step.get('step_id') or ''))}'>"
+            f"<a class='stable-anchor' id='{e(str(step.get('step_id') or ''))}'></a>"
             f"<header><h2 class='s-{e(step_status)}'>{badge} Step {index} · "
             f"<code>{e(str(step.get('command','')))}</code></h2>"
             f"<span>{step.get('duration_ms',0)} ms · {step.get('attempts',1)} attempt(s)</span></header>"
@@ -461,7 +467,15 @@ def render_run_page(manifest: dict[str, Any], evidence: dict[int, dict],
                     + e(json.dumps(hook_failures, ensure_ascii=False, indent=2))
                     + "</pre></details>" if hook_failures else "")
     environment = {
+        "identity": {
+            "attempt_id": manifest.get("attempt_id"),
+            "execution_status": manifest.get("execution_status") or manifest.get("status"),
+            "proof_verdict": manifest.get("proof_verdict"),
+        },
         "environment": manifest.get("environment") or {},
+        "capability_snapshot": manifest.get("capability_snapshot"),
+        "setup_catalog": manifest.get("setup") or {},
+        "side_effects": manifest.get("side_effects") or [],
         "evidence_mode": manifest.get("evidence_mode"),
         "evidence_collect": manifest.get("evidence_collect") or [],
         "started_at_ms": manifest.get("started_at_ms"),
@@ -473,9 +487,15 @@ def render_run_page(manifest: dict[str, Any], evidence: dict[int, dict],
         "the selected state by replaying the flow from its start and stops after "
         "that step. Cleanup hooks are skipped. This is not presented as a native "
         "app snapshot.</p>")
+    causal = (
+        f"<p class='notice s-failed'><b>First causal failure:</b> "
+        f"<a href='#step-{first_causal_failure.get('index')}'>step "
+        f"{first_causal_failure.get('index')}</a> · "
+        f"{e(str(first_causal_failure.get('error_code') or 'failure'))}</p>"
+        if first_causal_failure else "")
     return f"""<!doctype html><meta charset="utf-8">
 <meta http-equiv="Content-Security-Policy"
-      content="default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; form-action 'self'">
+      content="default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; form-action 'self'">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{e(str(manifest.get('flow_name','flow')))} — {e(status)}</title>
 <style>
@@ -486,8 +506,11 @@ def render_run_page(manifest: dict[str, Any], evidence: dict[int, dict],
   .layout {{ display:grid; grid-template-columns:230px minmax(0,1fr); gap:24px; align-items:start; }}
   aside {{ position:sticky; top:16px; max-height:calc(100vh - 32px); overflow:auto;
     border:1px solid var(--line); border-radius:10px; padding:10px; }}
+  .nav-filter {{ width:100%; margin:8px 0; padding:7px; border:1px solid var(--line);
+    border-radius:6px; }} .shortcuts {{ font-size:11px; color:var(--muted); margin:8px 4px 2px; }}
   .nav-step {{ display:grid; grid-template-columns:18px 24px 1fr; gap:5px; padding:7px;
     color:#1f2328; text-decoration:none; border-radius:6px; }} .nav-step:hover {{ background:var(--panel); }}
+  .nav-step:focus-visible,button:focus-visible,input:focus-visible {{ outline:3px solid #0969da; outline-offset:2px; }}
   code {{ background:var(--panel); padding:.1em .3em; border-radius:4px; overflow-wrap:anywhere; }}
   pre {{ background:var(--panel); border-radius:7px; padding:12px; overflow:auto;
     max-height:360px; font-size:12px; white-space:pre-wrap; }}
@@ -508,20 +531,34 @@ def render_run_page(manifest: dict[str, Any], evidence: dict[int, dict],
   .sensitive {{ background:#fff8c5; }} .restore-note {{ background:#ddf4ff; }}
   .request {{ border-left:3px solid #54aeff; padding-left:12px; }} button {{ background:#1f883d;
     color:white; border:0; border-radius:6px; padding:8px 12px; font-weight:650; cursor:pointer; }}
+  .stable-anchor {{ position:relative; top:-12px; }}
   @media(max-width:760px) {{ .layout {{ grid-template-columns:1fr; }} aside {{ position:relative;
     top:auto; max-height:none; }} }}
 </style>
 <div class="page">{back}
 <h1>{e(str(manifest.get('flow_name','flow')))} <span class="status">{e(status)}</span></h1>
 {sensitive}
-{failure_summary}{hook_summary}
+{failure_summary}{causal}{hook_summary}
 <p class="muted"><code>{e(_shorten(str(manifest.get('flow_path','')), base))}</code><br>
 {e(str(manifest.get('platform','')))} {e(str(manifest.get('target_id','')))} ·
-app <code>{e(str(manifest.get('app_id','')))}</code> · run <code>{e(str(manifest.get('run_id','')))}</code></p>
+app <code>{e(str(manifest.get('app_id','')))}</code> · run <code>{e(str(manifest.get('run_id','')))}</code> ·
+execution <b>{e(str(manifest.get('execution_status') or status))}</b> ·
+proof <b>{e(str(manifest.get('proof_verdict') or 'not evaluated'))}</b></p>
 {restore_note}
-<details><summary>Environment and evidence policy</summary><pre>{e(json.dumps(environment, ensure_ascii=False, indent=2))}</pre></details>
-<div class="layout"><aside><b>Timeline</b>{''.join(nav)}</aside>
+<details><summary>Setup, capabilities, environment, and evidence policy</summary><pre>{e(json.dumps(environment, ensure_ascii=False, indent=2))}</pre></details>
+<div class="layout"><aside aria-label="Step navigator"><b>Timeline</b>
+<input class="nav-filter" id="nav-filter" aria-label="Filter steps" placeholder="Filter steps (/)" />
+{''.join(nav)}<p class="shortcuts">Keyboard: j/k next/previous · / filter · Enter open</p></aside>
 <main>{''.join(blocks)}{orphans}</main></div></div>
+<script type="module">
+(()=>{{const links=[...document.querySelectorAll('.nav-step')],filter=document.getElementById('nav-filter');
+let current=Math.max(0,links.findIndex(link=>link.hash===location.hash));
+function visible(){{return links.filter(link=>link.hidden===false)}}
+function go(delta){{const choices=visible();if(!choices.length)return;const active=choices.indexOf(document.activeElement);const index=(active>=0?active:Math.max(0,choices.findIndex(link=>link.hash===location.hash)));const next=choices[(index+delta+choices.length)%choices.length];next.focus();next.click()}}
+filter.addEventListener('input',()=>{{const query=filter.value.trim().toLowerCase();for(const link of links)link.hidden=query&&!link.dataset.search.includes(query)}});
+document.addEventListener('keydown',event=>{{if(event.target===filter){{if(event.key==='Escape'){{filter.value='';filter.dispatchEvent(new Event('input'));filter.blur()}}return}}if(event.key==='/'){{event.preventDefault();filter.focus()}}else if(event.key==='j'){{event.preventDefault();go(1)}}else if(event.key==='k'){{event.preventDefault();go(-1)}}}});
+}})();
+</script>
 """
 
 

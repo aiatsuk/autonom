@@ -2,9 +2,10 @@
 import { access, constants } from "node:fs/promises";
 import { createServer } from "node:http";
 import { homedir } from "node:os";
-import { delimiter, join } from "node:path";
+import { delimiter, join, resolve } from "node:path";
 import { env, exit, platform } from "node:process";
 import { execFile, spawn } from "node:child_process";
+import { createInterface } from "node:readline";
 import { promisify } from "node:util";
 
 import {
@@ -33,13 +34,18 @@ async function main() {
     return;
   }
 
-  const adbPath = options.adb ?? await findAdb();
-  const serial = options.serial ?? await inferSingleDevice(adbPath);
-  await assertDevice(adbPath, serial);
+  const isIos = options.platform === "ios";
+  const adbPath = isIos
+    ? (options.simctl ?? await findExecutable("xcrun"))
+    : (options.adb ?? await findAdb());
+  const serial = options.target ?? options.serial ?? (isIos
+    ? await inferSingleSimulator(adbPath) : await inferSingleDevice(adbPath));
+  if (isIos) await assertSimulator(adbPath, serial);
+  else await assertDevice(adbPath, serial);
 
   let ffmpegPath = options.ffmpeg;
   if (!ffmpegPath) ffmpegPath = await findExecutable("ffmpeg").catch(() => null);
-  const screenrecordSupported = await supportsScreenrecord(adbPath, serial);
+  const screenrecordSupported = isIos ? false : await supportsScreenrecord(adbPath, serial);
   if (options.transport === "screenrecord" && (!ffmpegPath || !screenrecordSupported)) {
     throw new Error("screenrecord transport requires device H.264 output support and ffmpeg on PATH");
   }
@@ -52,8 +58,11 @@ async function main() {
     streamClients: 0,
     acceleratedFailed: false,
     lastError: null,
+    controlOwner: "shared",
+    inputPaused: false,
   };
   let inputQueue = Promise.resolve();
+  const actionBridge = createActionBridge(options, adbPath, serial);
 
   const context = {
     options,
@@ -63,6 +72,8 @@ async function main() {
     screenrecordSupported,
     token,
     state,
+    sessions: new Map(),
+    actionBridge,
     enqueueInput(task) {
       inputQueue = inputQueue.catch(() => {}).then(task);
       return inputQueue;
@@ -83,9 +94,9 @@ async function main() {
   server.listen(options.port, "127.0.0.1", () => {
     const address = server.address();
     const port = typeof address === "object" && address ? address.port : options.port;
-    const query = token ? `?token=${encodeURIComponent(token)}` : "";
-    const url = `http://127.0.0.1:${port}/${query}`;
-    console.log(`android-emulator-browser ready for ${serial}`);
+    const fragment = token ? `#token=${encodeURIComponent(token)}` : "";
+    const url = `http://127.0.0.1:${port}/${fragment}`;
+    console.log(`autonom Canvas ready for ${options.platform}:${serial}`);
     console.log(`Transport preference: ${options.transport}`);
     console.log(`Preview at ${url}`);
     console.log(`Open this exact URL in the visible Codex side-panel browser: ${url}`);
@@ -96,6 +107,7 @@ async function main() {
   const shutdown = () => {
     if (shuttingDown) return;
     shuttingDown = true;
+    actionBridge.close();
     server.close(() => exit(0));
     server.closeAllConnections?.();
     setTimeout(() => exit(0), 1000).unref();
@@ -108,14 +120,19 @@ async function main() {
 function printHelp() {
   console.log(`android-emulator-browser
 
-Token-protected Android device preview and input bridge for the Codex side-panel browser.
+Token-protected Android/iOS device preview and input bridge for the Codex side-panel browser.
 
 Usage:
-  android-emulator-browser --serial <adb-serial> [options]
+  android-emulator-browser --platform android --serial <adb-serial> [options]
+  android-emulator-browser --platform ios --target <simulator-udid> [options]
 
 Options:
   --serial, -s SERIAL          Explicit adb serial.
+  --platform android|ios       Canvas platform (default: android).
+  --target ID                  adb serial or iOS Simulator UDID.
   --adb PATH                  adb executable path.
+  --simctl PATH               xcrun executable path for iOS screenshots.
+  --idb PATH                  idb executable path for iOS input.
   --ffmpeg PATH               ffmpeg executable path.
   --port, -p PORT             Localhost port (default: 3277; 0 chooses a free port).
   --transport MODE            auto, screenrecord, or screencap (default: auto).
@@ -123,43 +140,92 @@ Options:
   --max-size PX               Maximum accelerated video width (default: 1280).
   --bit-rate BPS              H.264 bitrate (default: 8000000).
   --token TOKEN               Use a supplied access token.
+  --python PATH               Python executable for the persistent action bridge.
+  --bridge PATH               Override autonom_canvas_bridge.py.
   --no-auth                   Disable token protection (isolated local use only).
 `);
 }
 
 async function handleRequest(context, request, response) {
   const url = new URL(request.url ?? "/", "http://127.0.0.1");
-  if (!isAuthorized(context, request, url)) {
+  if (request.method === "POST" && url.pathname === "/auth") {
+    await exchangeToken(context, request, response);
+    return;
+  }
+  // The shell contains no device data or secret. The fragment token is
+  // exchanged by its script, then removed from browser history.
+  if (request.method === "GET" && url.pathname === "/") {
+    sendHtml(response, renderPage(context));
+    return;
+  }
+  const authorization = authorize(context, request, url);
+  if (!authorization.ok) {
     sendJson(response, 401, { error: "Unauthorized" });
     return;
   }
-  if (request.method === "GET" && url.pathname === "/") {
-    sendHtml(response, renderPage(context));
-  } else if (request.method === "GET" && url.pathname === "/status") {
+  if (request.method === "POST" && authorization.csrf &&
+      request.headers["x-autonom-csrf"] !== authorization.csrf) {
+    sendJson(response, 403, { error: "CSRF token rejected" });
+    return;
+  }
+  const origin = normalizeOrigin(request.headers["x-autonom-origin"]);
+  if (request.method === "GET" && url.pathname === "/status") {
     await sendStatus(context, response);
   } else if (request.method === "GET" && url.pathname === "/frame") {
     await sendFrame(context, response);
   } else if (request.method === "GET" && url.pathname === "/stream.mjpeg") {
     await sendStream(context, request, response);
+  } else if (request.method === "GET" && url.pathname === "/stream.h264") {
+    await sendH264(context, request, response);
   } else if (request.method === "POST" && url.pathname === "/tap") {
-    await tap(context, response, await readJsonBody(request));
+    await tap(context, response, await readJsonBody(request), origin);
   } else if (request.method === "POST" && url.pathname === "/swipe") {
-    await swipe(context, response, await readJsonBody(request));
+    await swipe(context, response, await readJsonBody(request), origin);
   } else if (request.method === "POST" && url.pathname === "/key") {
-    await key(context, response, await readJsonBody(request));
+    await key(context, response, await readJsonBody(request), origin);
   } else if (request.method === "POST" && url.pathname === "/text") {
-    await text(context, response, await readJsonBody(request));
+    await text(context, response, await readJsonBody(request), origin);
+  } else if (request.method === "POST" && url.pathname === "/control") {
+    await control(context, response, await readJsonBody(request), origin);
   } else {
     sendJson(response, 404, { error: "Not found" });
   }
 }
 
-function isAuthorized(context, request, url) {
-  if (!context.token) return true;
+function authorize(context, request, url) {
+  if (!context.token) return { ok: true, csrf: null };
   const queryToken = url.searchParams.get("token");
   const authorization = request.headers.authorization ?? "";
   const bearer = authorization.startsWith("Bearer ") ? authorization.slice(7) : "";
-  return queryToken === context.token || bearer === context.token;
+  if (queryToken === context.token || bearer === context.token) {
+    return { ok: true, csrf: null }; // retained for non-browser API clients
+  }
+  const cookies = Object.fromEntries(String(request.headers.cookie ?? "").split(";")
+    .map((part) => part.trim().split("=", 2)).filter((part) => part.length === 2));
+  const session = context.sessions.get(cookies.autonom_session);
+  return session ? { ok: true, csrf: session.csrf } : { ok: false, csrf: null };
+}
+
+async function exchangeToken(context, request, response) {
+  if (!context.token) {
+    sendJson(response, 200, { ok: true, csrf: null });
+    return;
+  }
+  const body = await readJsonBody(request);
+  if (body.token !== context.token) {
+    sendJson(response, 401, { error: "Unauthorized" });
+    return;
+  }
+  const sessionId = generateToken(18);
+  const csrf = generateToken(18);
+  context.sessions.set(sessionId, { csrf, createdAt: Date.now() });
+  sendJson(response, 200, { ok: true, csrf }, {
+    "Set-Cookie": `autonom_session=${sessionId}; HttpOnly; SameSite=Strict; Path=/; Max-Age=28800`,
+  });
+}
+
+function normalizeOrigin(value) {
+  return ["human", "agent", "replay", "system"].includes(value) ? value : "human";
 }
 
 function chooseTransport(context) {
@@ -171,27 +237,28 @@ function chooseTransport(context) {
 }
 
 async function sendStatus(context, response) {
-  const { stdout } = await runAdb(context, ["shell", "wm", "size"], { timeout: 3000 });
+  const measured = await context.actionBridge.call("screen-size", {}, "system");
   sendJson(response, 200, {
+    platform: context.options.platform,
     serial: context.serial,
-    display: parseWmSize(stdout),
+    display: measured.display,
     transport: chooseTransport(context),
     requested_transport: context.options.transport,
     ffmpeg: Boolean(context.ffmpegPath),
     screenrecord_h264: context.screenrecordSupported,
+    direct_h264_url: context.screenrecordSupported ? "/stream.h264" : null,
     frames_sent: context.state.framesSent,
     last_frame_at: context.state.lastFrameAt,
     stream_clients: context.state.streamClients,
     uptime_seconds: Math.round((Date.now() - context.state.startedAt) / 1000),
     last_error: context.state.lastError,
+    control_owner: context.state.controlOwner,
+    input_paused: context.state.inputPaused,
   });
 }
 
 async function sendFrame(context, response) {
-  const { stdout } = await runAdb(context, ["exec-out", "screencap", "-p"], {
-    timeout: 8000,
-    encoding: "buffer",
-  });
+  const stdout = await capturePng(context);
   if (!isPng(stdout)) throw httpError(502, "adb screencap did not return PNG data");
   response.writeHead(200, {
     "Content-Type": "image/png",
@@ -222,6 +289,36 @@ async function sendStream(context, request, response) {
   }
 }
 
+async function sendH264(context, request, response) {
+  if (context.options.platform !== "android" || !context.screenrecordSupported) {
+    throw httpError(409, "device screenrecord does not expose H.264 output");
+  }
+  response.writeHead(200, {
+    "Content-Type": "video/h264",
+    "Cache-Control": "no-store",
+    "Connection": "keep-alive",
+    "X-Autonom-Transport": "annex-b",
+  });
+  const child = spawn(context.adbPath, [
+    "-s", context.serial, "exec-out", "screenrecord", "--output-format=h264",
+    "--bit-rate", String(context.options.bitRate), "-",
+  ], { stdio: ["ignore", "pipe", "pipe"] });
+  child.stdout.pipe(response);
+  let stderr = "";
+  child.stderr.on("data", (chunk) => { stderr = (stderr + chunk.toString()).slice(-2000); });
+  const close = () => child.kill("SIGTERM");
+  request.once("close", close);
+  response.once("close", close);
+  await new Promise((resolvePromise, reject) => {
+    child.once("error", reject);
+    child.once("close", (code) => {
+      if (code && !response.destroyed) context.state.lastError =
+        `direct H.264 stream exited ${code}: ${stderr.trim()}`;
+      resolvePromise();
+    });
+  });
+}
+
 function writeJpeg(context, response, frame) {
   if (response.destroyed || response.writableEnded) return false;
   response.write(`--${BOUNDARY}\r\n`);
@@ -242,10 +339,7 @@ async function streamScreencap(context, request, response) {
   while (!closed && !response.destroyed) {
     const started = Date.now();
     try {
-      const { stdout } = await runAdb(context, ["exec-out", "screencap", "-p"], {
-        timeout: 8000,
-        encoding: "buffer",
-      });
+      const stdout = await capturePng(context);
       if (!isPng(stdout)) throw new Error("screencap returned invalid PNG");
       // Browsers accept PNG frames in a multipart image stream despite the endpoint name.
       response.write(`--${BOUNDARY}\r\nContent-Type: image/png\r\nContent-Length: ${stdout.length}\r\n\r\n`);
@@ -260,6 +354,19 @@ async function streamScreencap(context, request, response) {
     const remaining = interval - (Date.now() - started);
     if (remaining > 0) await sleep(remaining);
   }
+}
+
+async function capturePng(context) {
+  if (context.options.platform === "ios") {
+    const result = await execFileAsync(context.adbPath, [
+      "simctl", "io", context.serial, "screenshot", "--type=png", "-",
+    ], { timeout: 8000, maxBuffer: 32 * 1024 * 1024, encoding: null });
+    return result.stdout;
+  }
+  const { stdout } = await runAdb(context, ["exec-out", "screencap", "-p"], {
+    timeout: 8000, encoding: "buffer",
+  });
+  return stdout;
 }
 
 async function streamScreenrecord(context, request, response) {
@@ -314,41 +421,103 @@ async function streamScreenrecord(context, request, response) {
   });
 }
 
-async function tap(context, response, body) {
-  const x = normalizeCoordinate(body.x, "x");
-  const y = normalizeCoordinate(body.y, "y");
-  await context.enqueueInput(() => runAdb(context, ["shell", "input", "tap", String(x), String(y)]));
-  sendJson(response, 200, { ok: true, x, y });
+function assertControl(context, origin) {
+  if (context.state.inputPaused) throw httpError(409, "Canvas input is paused");
+  if (context.state.controlOwner !== "shared" && context.state.controlOwner !== origin) {
+    throw httpError(409, `Canvas control is owned by ${context.state.controlOwner}`);
+  }
 }
 
-async function swipe(context, response, body) {
+async function tap(context, response, body, origin) {
+  assertControl(context, origin);
+  const x = normalizeCoordinate(body.x, "x");
+  const y = normalizeCoordinate(body.y, "y");
+  const result = await context.enqueueInput(
+    () => context.actionBridge.call("tap", { x, y }, origin));
+  sendJson(response, 200, result);
+}
+
+async function swipe(context, response, body, origin) {
+  assertControl(context, origin);
   const x1 = normalizeCoordinate(body.x1, "x1");
   const y1 = normalizeCoordinate(body.y1, "y1");
   const x2 = normalizeCoordinate(body.x2, "x2");
   const y2 = normalizeCoordinate(body.y2, "y2");
   const duration = Math.min(5000, Math.max(1, normalizeCoordinate(body.duration ?? 250, "duration")));
-  await context.enqueueInput(() => runAdb(context, [
-    "shell", "input", "swipe", String(x1), String(y1), String(x2), String(y2), String(duration),
-  ]));
-  sendJson(response, 200, { ok: true, x1, y1, x2, y2, duration });
+  const result = await context.enqueueInput(() => context.actionBridge.call(
+    "swipe", { x1, y1, x2, y2, duration }, origin));
+  sendJson(response, 200, result);
 }
 
-async function key(context, response, body) {
+async function key(context, response, body, origin) {
+  assertControl(context, origin);
   const value = String(body.key ?? "");
   if (!isSafeKeyCode(value)) throw httpError(400, "Unsupported key code");
-  await context.enqueueInput(() => runAdb(context, ["shell", "input", "keyevent", value]));
-  sendJson(response, 200, { ok: true, key: value });
+  const result = await context.enqueueInput(
+    () => context.actionBridge.call("key", { key: value }, origin));
+  sendJson(response, 200, result);
 }
 
-async function text(context, response, body) {
-  let encoded;
+async function text(context, response, body, origin) {
+  assertControl(context, origin);
   try {
-    encoded = encodeAdbText(String(body.text ?? ""));
+    encodeAdbText(String(body.text ?? ""));
   } catch (error) {
     throw httpError(400, error.message);
   }
-  await context.enqueueInput(() => runAdb(context, ["shell", "input", "text", encoded]));
-  sendJson(response, 200, { ok: true });
+  const result = await context.enqueueInput(() => context.actionBridge.call(
+    "text", { text: String(body.text ?? ""), sensitive: Boolean(body.sensitive) }, origin));
+  sendJson(response, 200, result);
+}
+
+async function control(context, response, body, origin) {
+  const mode = String(body.mode ?? "");
+  if (mode === "pause") context.state.inputPaused = true;
+  else if (mode === "resume") context.state.inputPaused = false;
+  else if (mode === "takeover") context.state.controlOwner = origin;
+  else if (mode === "release") context.state.controlOwner = "shared";
+  else throw httpError(400, "Control mode must be pause, resume, takeover, or release");
+  sendJson(response, 200, { ok: true, control_owner: context.state.controlOwner,
+    input_paused: context.state.inputPaused });
+}
+
+function createActionBridge(options, adbPath, serial) {
+  const python = options.python ?? env.PYTHON ?? "python3";
+  const bridgePath = options.bridge ?? resolve(
+    import.meta.dirname, "../../../../../scripts/autonom_canvas_bridge.py");
+  const childEnv = { ...env };
+  if (options.idb) childEnv.AUTONOM_IDB = options.idb;
+  const child = spawn(python, [bridgePath, "--platform", options.platform, "--target", serial,
+    "--tool", adbPath], { stdio: ["pipe", "pipe", "pipe"], env: childEnv });
+  const pending = new Map();
+  let nextId = 0;
+  let stderr = "";
+  child.stderr.on("data", (chunk) => { stderr = (stderr + chunk.toString()).slice(-4000); });
+  createInterface({ input: child.stdout }).on("line", (line) => {
+    let message;
+    try { message = JSON.parse(line); } catch { return; }
+    const waiter = pending.get(message.id);
+    if (!waiter) return;
+    pending.delete(message.id);
+    if (message.ok) waiter.resolve(message.result);
+    else waiter.reject(httpError(502, message.error ?? "Canvas action failed"));
+  });
+  child.on("exit", (code) => {
+    for (const waiter of pending.values()) {
+      waiter.reject(httpError(502, `Canvas action bridge exited ${code}: ${stderr}`));
+    }
+    pending.clear();
+  });
+  return {
+    call(op, payload, origin) {
+      const id = ++nextId;
+      return new Promise((resolvePromise, reject) => {
+        pending.set(id, { resolve: resolvePromise, reject });
+        child.stdin.write(`${JSON.stringify({ id, op, payload, origin })}\n`);
+      });
+    },
+    close() { child.kill("SIGTERM"); },
+  };
 }
 
 async function readJsonBody(request) {
@@ -394,6 +563,28 @@ async function assertDevice(adbPath, serial) {
   if (stdout.trim() !== "device") throw new Error(`adb target is not ready: ${serial}`);
 }
 
+async function assertSimulator(xcrunPath, udid) {
+  const { stdout } = await execFileAsync(
+    xcrunPath, ["simctl", "list", "devices", "--json"],
+    { timeout: 5000, encoding: "utf8" });
+  const devices = Object.values(JSON.parse(stdout).devices ?? {}).flat();
+  const match = devices.find((device) => device.udid === udid);
+  if (!match || match.state !== "Booted" || match.isAvailable === false) {
+    throw new Error(`iOS Simulator target is not booted and available: ${udid}`);
+  }
+}
+
+async function inferSingleSimulator(xcrunPath) {
+  const { stdout } = await execFileAsync(
+    xcrunPath, ["simctl", "list", "devices", "--json"],
+    { timeout: 5000, encoding: "utf8" });
+  const devices = Object.values(JSON.parse(stdout).devices ?? {}).flat()
+    .filter((device) => device.state === "Booted" && device.isAvailable !== false);
+  if (devices.length === 1) return devices[0].udid;
+  if (!devices.length) throw new Error("No booted iOS Simulator is available. Pass --target after booting one.");
+  throw new Error(`Multiple iOS Simulators are booted (${devices.map((item) => item.udid).join(", ")}). Pass --target.`);
+}
+
 async function inferSingleDevice(adbPath) {
   const { stdout } = await execFileAsync(adbPath, ["devices"], { timeout: 5000, encoding: "utf8" });
   const devices = stdout.split(/\r?\n/).slice(1)
@@ -437,7 +628,6 @@ async function findExecutable(name) {
 }
 
 function renderPage(context) {
-  const token = JSON.stringify(context.token);
   const serial = escapeHtml(context.serial);
   return `<!doctype html>
 <html lang="en">
@@ -470,43 +660,47 @@ aside{display:flex;flex-direction:column;gap:12px;min-width:0}h1{font-size:20px;
   <div class="status" id="status">Connecting…</div>
 </aside>
 <script>
-const token=${token};
+const fragmentParams=new URLSearchParams(location.hash.slice(1));
+const bootstrapToken=fragmentParams.get("token")||"";
+history.replaceState(null,"",location.pathname+location.search);
+let csrf=null;
 function url(path, cacheBust=false){
   const params=new URLSearchParams();
-  if(token)params.set("token",token);
   if(cacheBust)params.set("ts",String(Date.now()));
   const query=params.toString();
   return path+(query?"?"+query:"");
 }
 const screen=document.getElementById("screen"),statusEl=document.getElementById("status");
-let pointer=null,reconnectTimer=null;
+let pointer=null,reconnectTimer=null,logicalDisplay=null;
 function setStatus(value){statusEl.textContent=value}
 function restart(){clearTimeout(reconnectTimer);screen.src=url("/stream.mjpeg",true)}
-async function post(path,body){const response=await fetch(url(path),{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});const payload=await response.json().catch(()=>({}));if(!response.ok)throw new Error(payload.error||response.statusText);return payload}
-function point(event){const rect=screen.getBoundingClientRect(),nw=screen.naturalWidth,nh=screen.naturalHeight;if(!nw||!nh)return null;const ratio=Math.min(rect.width/nw,rect.height/nh),rw=nw*ratio,rh=nh*ratio,xoff=(rect.width-rw)/2,yoff=(rect.height-rh)/2,x=Math.round((event.clientX-rect.left-xoff)/ratio),y=Math.round((event.clientY-rect.top-yoff)/ratio);if(x<0||y<0||x>nw||y>nh)return null;return{x,y}}
+async function post(path,body){const headers={"Content-Type":"application/json","X-Autonom-Origin":"human"};if(csrf)headers["X-Autonom-CSRF"]=csrf;const response=await fetch(url(path),{method:"POST",headers,body:JSON.stringify(body)});const payload=await response.json().catch(()=>({}));if(!response.ok)throw new Error(payload.error||response.statusText);return payload}
+function point(event){const rect=screen.getBoundingClientRect(),nw=screen.naturalWidth,nh=screen.naturalHeight;if(!nw||!nh)return null;const ratio=Math.min(rect.width/nw,rect.height/nh),rw=nw*ratio,rh=nh*ratio,xoff=(rect.width-rw)/2,yoff=(rect.height-rh)/2,px=(event.clientX-rect.left-xoff)/ratio,py=(event.clientY-rect.top-yoff)/ratio,dw=logicalDisplay?.width||nw,dh=logicalDisplay?.height||nh,x=Math.round(px*dw/nw),y=Math.round(py*dh/nh);if(x<0||y<0||x>dw||y>dh)return null;return{x,y}}
 screen.addEventListener("load",()=>setStatus("Video connected"));screen.addEventListener("error",()=>{setStatus("Stream reconnecting…");reconnectTimer=setTimeout(restart,600)});
 screen.addEventListener("pointerdown",event=>{const p=point(event);if(!p)return;screen.setPointerCapture(event.pointerId);pointer={...p,time:Date.now(),id:event.pointerId}});
 screen.addEventListener("pointerup",async event=>{if(!pointer)return;const end=point(event)||pointer,start=pointer;pointer=null;const duration=Math.max(1,Date.now()-start.time),distance=Math.hypot(end.x-start.x,end.y-start.y);try{if(distance<12&&duration<500)await post("/tap",{x:end.x,y:end.y});else await post("/swipe",{x1:start.x,y1:start.y,x2:end.x,y2:end.y,duration:Math.min(5000,duration)});}catch(error){setStatus(error.message)}});
 screen.addEventListener("pointercancel",()=>{pointer=null});
-screen.addEventListener("wheel",async event=>{event.preventDefault();if(!screen.naturalWidth)return;const x=Math.round(screen.naturalWidth/2),y1=Math.round(screen.naturalHeight*.55),y2=Math.round(screen.naturalHeight*(event.deltaY>0?.25:.78));try{await post("/swipe",{x1:x,y1,x2:x,y2,duration:220})}catch(error){setStatus(error.message)}},{passive:false});
+screen.addEventListener("wheel",async event=>{event.preventDefault();if(!screen.naturalWidth)return;const width=logicalDisplay?.width||screen.naturalWidth,height=logicalDisplay?.height||screen.naturalHeight,x=Math.round(width/2),y1=Math.round(height*.55),y2=Math.round(height*(event.deltaY>0?.25:.78));try{await post("/swipe",{x1:x,y1,x2:x,y2,duration:220})}catch(error){setStatus(error.message)}},{passive:false});
 for(const button of document.querySelectorAll("[data-key]")){button.addEventListener("click",()=>post("/key",{key:button.dataset.key}).catch(error=>setStatus(error.message)))}
 document.getElementById("wake").onclick=()=>post("/key",{key:"KEYCODE_WAKEUP"}).catch(error=>setStatus(error.message));
 document.getElementById("refresh").onclick=restart;
 async function sendText(){const input=document.getElementById("text");try{await post("/text",{text:input.value});input.value=""}catch(error){setStatus(error.message)}}
 document.getElementById("sendText").onclick=sendText;document.getElementById("text").addEventListener("keydown",event=>{if(event.key==="Enter")sendText()});
-async function poll(){try{const response=await fetch(url("/status")),data=await response.json();if(!response.ok)throw new Error(data.error||response.statusText);const display=data.display?data.display.width+"x"+data.display.height:"unknown";const lastError=data.last_error?"\nlast error: "+data.last_error:"";setStatus("transport: "+data.transport+"\nframes: "+data.frames_sent+"\nclients: "+data.stream_clients+"\ndisplay: "+display+lastError)}catch(error){setStatus(error.message)}finally{setTimeout(poll,1200)}}
-restart();poll();
+async function poll(){try{const response=await fetch(url("/status")),data=await response.json();if(!response.ok)throw new Error(data.error||response.statusText);logicalDisplay=data.display;const display=data.display?data.display.width+"x"+data.display.height:"unknown";const lastError=data.last_error?"\nlast error: "+data.last_error:"";setStatus("platform: "+data.platform+"\ntransport: "+data.transport+"\nframes: "+data.frames_sent+"\nclients: "+data.stream_clients+"\ndisplay: "+display+"\ncontrol: "+data.control_owner+(data.input_paused?" (paused)":"")+lastError)}catch(error){setStatus(error.message)}finally{setTimeout(poll,1200)}}
+async function bootstrap(){if(bootstrapToken){const response=await fetch("/auth",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({token:bootstrapToken})});const payload=await response.json().catch(()=>({}));if(!response.ok)throw new Error(payload.error||"Authentication failed");csrf=payload.csrf}restart();poll()}
+bootstrap().catch(error=>setStatus(error.message));
 </script>
 </body>
 </html>`;
 }
 
-function sendJson(response, status, value) {
+function sendJson(response, status, value, headers = {}) {
   const body = Buffer.from(JSON.stringify(value));
   response.writeHead(status, {
     "Content-Type": "application/json; charset=utf-8",
     "Cache-Control": "no-store",
     "Content-Length": body.length,
+    ...headers,
   });
   response.end(body);
 }

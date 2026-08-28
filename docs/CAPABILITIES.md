@@ -97,6 +97,7 @@ autonom devices [list] [--platform android|ios]
 autonom devices boot [--avd NAME | --target ID] [--no-wait] [--timeout S] [--emulator PATH]
 autonom devices shutdown [--target ID]
 autonom doctor [--strict] [--mitmdump PATH]
+autonom capabilities
 
 autonom session start [--app-id ID] [--install PATH] [--launch [ID]] [--activity C] [--log-stream]
 autonom session show|stop
@@ -125,6 +126,12 @@ autonom flow run <path> [--include-tag TAG] [--exclude-tag TAG] [--env KEY=VALUE
                  [--until-step N] [--evidence flow|minimal|on-failure|always]
                  [--collect screenshot|hierarchy|logs|crashes|network]
 
+autonom teach start <name> | teach mark <name> | teach stop | teach show
+autonom teach compile --out PATH [--recording ID] [--from MARK] [--to MARK]
+autonom teach approve <flow> [--minimum-runs N]
+autonom app-skill validate <app-id> [--workspace DIR]
+autonom app-skill promote <app-id> <flow> [--approval FILE] [--workspace DIR]
+
 autonom proof --base <REF> [--head REF] [--repo PATH] [--flows DIR] [--out DIR]
               [--env KEY=VALUE] [--secret NAME]
 
@@ -134,12 +141,38 @@ autonom atlas coverage [--app-id ID]
 autonom atlas paths --from <SCREEN> --to <SCREEN> [--app-id ID]
 autonom atlas export --out <PATH> [--app-id ID]
 autonom atlas diff --base <PATH> [--head PATH] [--app-id ID]
+autonom runtime-map update [--session ID] [--app-id ID]
+autonom runtime-map show [--app-id ID]
+autonom runtime-map coverage [--app-id ID]
+autonom runtime-map paths --from <SCREEN> --to <SCREEN> [--app-id ID]
+autonom runtime-map export --out <PATH> [--app-id ID]
+autonom runtime-map diff --base <PATH> [--head PATH] [--app-id ID]
 
 autonom report build [--session ID] [--run ID]
 autonom report open [--session ID] [--run ID]
-autonom report export [--session ID] [--run ID] [--format html|junit] [--out PATH]
+autonom report export [--session ID] [--run ID] [--format html|junit|allure|agent|csv|metrics] [--out PATH]
 autonom report suite [--session ID] [--last N] [--out DIR] [--relative-to DIR] [--detailed] [--screenshots none|failed|all] [--open]
 autonom report serve [--session ID] [--run ID] [--port N] [--open]
+autonom report model [--session ID] [--run ID] [--out PATH]
+autonom report bundle [--session ID] [--run ID] [--out DIR]
+autonom report verify <bundle>
+autonom report annotate <bundle> <text> [--author NAME] [--step ID]
+autonom report gate [--session ID] [--run ID] [--rules FILE] [--out FILE]
+autonom report history [--session ID] [--last N] [--out FILE]
+autonom report watch [--session ID] [--interval-ms N] [--max-seconds N] [--max-runs N]
+autonom report pack <bundle> --out FILE [--shard-id ID]
+autonom report merge <packs...> --out DIR [--expected-shards N]
+autonom report finalize <campaign> [--rules FILE] [--publish DEST]
+autonom replay [--bundle DIR | --run ID] [--session ID] [--to-step STEP]
+
+autonom ci run <path> --out DIR [--campaign-id ID] [--shard-id ID] [--expected-shards N]
+               [--env KEY=VALUE] [--secret NAME] [--rules FILE] [--publish DEST]
+autonom ci pack <bundle> --out FILE [--shard-id ID]
+autonom ci merge <packs...> --out DIR [--expected-shards N]
+autonom ci finalize <campaign> [--rules FILE] [--publish DEST]
+autonom ci publish <campaign> <destination>
+autonom agent export [--bundle DIR] [--session ID] [--run ID] --out FILE
+autonom agent inspect [--bundle DIR] [--session ID] [--run ID] --step STEP
 
 autonom screenshot [--label L] [--task T] [--out PATH]
 autonom shots list [--task T] [--grep P] [--mocked-only] [--max N]
@@ -169,6 +202,17 @@ autonom crash list [--app-id ID] | crash show <name>
 autonom open <url>
 autonom permissions <grant|revoke|reset> <service> [app-id]
 autonom location set <LAT,LON> | location get | location clear
+autonom simulator battery <action> [--value KEY=VALUE] [--json OBJECT]
+autonom simulator network <action> [--value KEY=VALUE] [--json OBJECT]
+autonom simulator push <action> [--value KEY=VALUE] [--json OBJECT]
+autonom simulator sms <action> [--value KEY=VALUE] [--json OBJECT]
+autonom simulator call <action> [--value KEY=VALUE] [--json OBJECT]
+autonom simulator biometric <action> [--value KEY=VALUE] [--json OBJECT]
+autonom simulator clipboard <action> [--value KEY=VALUE] [--json OBJECT]
+autonom simulator appearance <action> [--value KEY=VALUE] [--json OBJECT]
+autonom simulator text-size <action> [--value KEY=VALUE] [--json OBJECT]
+autonom simulator status-bar <action> [--value KEY=VALUE] [--json OBJECT]
+autonom canvas serve [--port N] [--transport auto|screenrecord|screencap] [--fps N] [--token TOKEN] [--no-auth]
 autonom media add <path>
 autonom file ls [remote] [--app-id ID] | file pull <remote> [--app-id ID] [--out PATH]
 
