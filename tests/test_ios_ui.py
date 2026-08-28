@@ -263,10 +263,10 @@ class KeyAndGestureTests(unittest.TestCase):
                 self.assertEqual(self._calls()[before:], [], "nothing may reach idb")
 
     def test_type_passes_unicode_through_unmangled(self) -> None:
-        result = self._run("ui", "type", "привет@example.com")
+        result = self._run("ui", "type", "café@example.com")
         self.assertEqual(result.returncode, 0, result.stderr)
         texts = [call for call in self._calls() if call[:2] == ["ui", "text"]]
-        self.assertEqual(texts[0][2], "привет@example.com")
+        self.assertEqual(texts[0][2], "café@example.com")
 
 
 if __name__ == "__main__":

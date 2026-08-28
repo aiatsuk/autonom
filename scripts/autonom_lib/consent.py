@@ -27,11 +27,7 @@ PHRASE_EN = (
     "As the user, I explicitly agree to the described certificate, key, signing, "
     "or network configuration change"
 )
-PHRASE_RU = (
-    "Я, пользователь, явно согласен на описанное изменение сертификатов, ключей, "
-    "подписей или сетевых настроек"
-)
-ACCEPTED_PHRASES = (PHRASE_EN, PHRASE_RU)
+ACCEPTED_PHRASES = (PHRASE_EN,)
 
 
 @dataclass(frozen=True)
@@ -87,8 +83,7 @@ def require(
         reader = prompt or (lambda: sys.stdin.readline())
         print(f"\nAutonom is about to perform a privileged change:\n"
               f"  {operation.describe()}\n\n"
-              f"To proceed, type exactly:\n  {PHRASE_EN}\n"
-              f"or:\n  {PHRASE_RU}\n", file=out)
+              f"To proceed, type exactly:\n  {PHRASE_EN}\n", file=out)
         answer = reader()
         if not phrase_accepted(answer):
             raise errors.AutonomError(
