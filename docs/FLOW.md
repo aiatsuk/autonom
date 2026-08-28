@@ -165,37 +165,37 @@ The block below is machine-checked against the command registry
 is not listed here fails the build, and vice versa.
 
 ```text
-header: schema appId name id description tags properties env requires evidence onFlowStart onFlowComplete
+header: schema appId name id description tags properties env requires sideEffects setup evidence onFlowStart onFlowComplete
 selector-strings: id text visibleText description role
 selector-bools: enabled checked selected focused
 selector-relational: above below leftOf rightOf childOf containsChild containsDescendants
 match-modes: exact caseInsensitiveExact contains regex
-command launchApp: clearState label
-command stopApp: label
-command clearState: label
-command openLink: url label
-command tapOn: selector repeat delayMs label timeoutMs optional reason
-command longPressOn: selector durationMs label timeoutMs optional reason
-command doubleTapOn: selector label timeoutMs optional reason
-command inputText: value sensitive label
-command eraseText: chars label
-command pressKey: key label
-command back: label
-command swipe: direction from durationMs label
-command scroll: label
-command scrollUntilVisible: selector direction maxSwipes centerElement label
+command launchApp: clearState label postcondition
+command stopApp: label postcondition
+command clearState: label postcondition
+command openLink: url label postcondition
+command tapOn: selector repeat delayMs label timeoutMs postcondition optional reason
+command longPressOn: selector durationMs label timeoutMs postcondition optional reason
+command doubleTapOn: selector label timeoutMs postcondition optional reason
+command inputText: value sensitive label postcondition
+command eraseText: chars label postcondition
+command pressKey: key label postcondition
+command back: label postcondition
+command swipe: direction from durationMs label postcondition
+command scroll: label postcondition
+command scrollUntilVisible: selector direction maxSwipes centerElement label postcondition
 command copyTextFrom: selector into sensitive timeoutMs label
 command setClipboard: value into sensitive label
-command pasteText: label
+command pasteText: label postcondition
 command assertVisible: selector timeoutMs label
 command assertNotVisible: selector timeoutMs label
 command assertEnabled: selector timeoutMs label
 command assertChecked: selector timeoutMs label
 command waitUntil: visible notVisible timeoutMs label
-command setLocation: latitude longitude label
-command setPermissions: action service appId label
-command addMedia: path label
-command setOrientation: orientation label
+command setLocation: latitude longitude label postcondition
+command setPermissions: action service appId label postcondition
+command addMedia: path label postcondition
+command setOrientation: orientation label postcondition
 command runFlow: file commands env when label
 command repeat: commands times while label
 command retry: commands maxAttempts onlyOn allowMutations label
@@ -204,8 +204,20 @@ command takeScreenshot: label
 command checkpoint: name
 command note: text
 deferred: waitForIdle extendedWaitUntil runScript evalScript
-requires-capabilities: ui.accessibility screenshots logs network.capture
+requires-capabilities: ui.accessibility ui.input screenshots screen.stream logs network.capture checkpoint.create checkpoint.restore simulator.location simulator.permissions simulator.clipboard simulator.appearance simulator.text_size simulator.status_bar simulator.battery simulator.network simulator.push simulator.sms simulator.call simulator.biometric
 ```
+
+`sideEffects` declares the mutation classes a reviewer should expect:
+`none`, `app-data`, `device-state`, `network`, `external-system`,
+`credentials`, `media`, and `clipboard`. `none` cannot be combined with another
+class.
+
+`setup` is a strict mapping with `profile`, `fixtures`, `mocks`, `permissions`,
+`location`, `orientation`, `appearance`, `locale`, `network`, and `reset`.
+Provider-owned values are preflighted and applied before `onFlowStart`; external
+App Skill/fixture selections remain visible as external instead of being
+reported as successfully applied. The run manifest records available, selected,
+applied, verified, and used setup entries separately.
 
 ## Semantics fixed by the language (run slice)
 

@@ -31,7 +31,9 @@ def _timestamp() -> str:
 class EventWriter:
     def __init__(self, session_record: dict, run_id: str, flow_id: str | None,
                  platform: str, target_id: str, serial: str | None = None,
-                 stdout_stream: Any | None = None) -> None:
+                 stdout_stream: Any | None = None,
+                 attempt_id: str | None = None,
+                 source: str = "executor") -> None:
         self.session = session_record
         self.run_id = run_id
         self.flow_id = flow_id
@@ -39,6 +41,9 @@ class EventWriter:
         self.target_id = target_id
         self.serial = serial
         self.stdout_stream = stdout_stream
+        self.attempt_id = attempt_id or f"attempt_{uuid.uuid4().hex[:16]}"
+        self.source = source
+        self._sequence = 0
         self.path = session_mod.artifact_path(session_record, "flows", run_id,
                                               "events.ndjson")
         self.path.touch()
@@ -49,13 +54,27 @@ class EventWriter:
 
     def emit(self, kind: str, payload: dict[str, Any],
              sensitive: bool = False) -> dict[str, Any]:
+        self._sequence += 1
+        wall_time = _timestamp()
         event: dict[str, Any] = {
+            "schema": "autonom.event/v1",
             "schema_version": EVENT_SCHEMA_VERSION,
             "event_id": f"evt_{uuid.uuid4().hex[:12]}",
             "run_id": self.run_id,
+            "attempt_id": self.attempt_id,
+            "step_id": payload.get("step_id"),
+            "sequence": self._sequence,
+            "monotonic_ns": time.monotonic_ns(),
+            "wall_time": wall_time,
+            "source": self.source,
+            "redaction": {
+                "applied": True,
+                "sensitive": sensitive,
+                "policy": "pre-persistence",
+            },
             "session_id": self.session.get("session_id"),
             "flow_id": self.flow_id,
-            "timestamp": _timestamp(),
+            "timestamp": wall_time,
             "kind": kind,
             "platform": self.platform,
             "target_id": self.target_id,

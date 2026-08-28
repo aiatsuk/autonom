@@ -35,6 +35,15 @@ from autonom_lib.flow import maestro as flow_maestro  # noqa: E402
 from autonom_lib.flow import report as flow_report  # noqa: E402
 from autonom_lib.flow import validator as flow_validator  # noqa: E402
 from autonom_lib import journal as journal_mod  # noqa: E402
+from autonom_lib import providers as providers_mod  # noqa: E402
+from autonom_lib import report_model as report_model_mod  # noqa: E402
+from autonom_lib import report_bundle as report_bundle_mod  # noqa: E402
+from autonom_lib import report_export as report_export_mod  # noqa: E402
+from autonom_lib import gates as gates_mod  # noqa: E402
+from autonom_lib import campaign as campaign_mod  # noqa: E402
+from autonom_lib import teach as teach_mod  # noqa: E402
+from autonom_lib import app_skills as app_skills_mod  # noqa: E402
+from autonom_lib import simulator as simulator_mod  # noqa: E402
 from autonom_lib import ios_simctl  # noqa: E402
 from autonom_lib.metrics import android_memory as metrics_memory  # noqa: E402
 from autonom_lib.metrics import artifacts as metrics_artifacts  # noqa: E402
@@ -2225,6 +2234,131 @@ def _suite_manifests(record: dict[str, Any], last: int | None) -> list[dict]:
     return [json.loads(p.read_text(encoding="utf-8")) for p in paths]
 
 
+def _report_model(record: dict[str, Any], run_id: str | None) -> tuple[Path, dict, dict]:
+    run_dir = _resolve_run_dir(record, run_id)
+    manifest = flow_report.load_manifest(run_dir)
+    return run_dir, manifest, report_model_mod.compile_manifest(manifest)
+
+
+def cmd_report_model(args: argparse.Namespace) -> int:
+    record = _session_by_id(args.session)
+    run_dir, _manifest, model = _report_model(record, args.run)
+    out = Path(args.out) if args.out else run_dir / "report-model-v2.json"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(model, ensure_ascii=False, indent=2) + "\n",
+                   encoding="utf-8")
+    os.chmod(out, 0o600)
+    return emit({"ok": True, "schema": model["schema"],
+                 "run_id": model["attempt"]["run_id"], "out": str(out)},
+                as_json=True)
+
+
+def cmd_report_bundle(args: argparse.Namespace) -> int:
+    record = _session_by_id(args.session)
+    run_dir = _resolve_run_dir(record, args.run)
+    manifest = flow_report.load_manifest(run_dir)
+    out = Path(args.out) if args.out else run_dir / "bundle-v2"
+    result = report_bundle_mod.build(
+        manifest, artifacts_root=Path(record["artifacts_dir"]), out=out)
+    return emit({"ok": True, **result}, as_json=True)
+
+
+def cmd_report_verify(args: argparse.Namespace) -> int:
+    return emit(report_bundle_mod.verify(Path(args.bundle)), as_json=True)
+
+
+def cmd_report_annotate(args: argparse.Namespace) -> int:
+    return emit({"ok": True, **report_bundle_mod.annotate(
+        Path(args.bundle), args.text, author=args.author, step_id=args.step)},
+        as_json=True)
+
+
+def cmd_report_gate(args: argparse.Namespace) -> int:
+    record = _session_by_id(args.session)
+    _run_dir, _manifest, model = _report_model(record, args.run)
+    result = gates_mod.evaluate(
+        model, gates_mod.load_rules(Path(args.rules) if args.rules else None))
+    if args.out:
+        out = Path(args.out)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n",
+                       encoding="utf-8")
+        result["out"] = str(out)
+    emit({"ok": True, **result}, as_json=True)
+    return 0 if result["passed"] else 1
+
+
+def cmd_report_history(args: argparse.Namespace) -> int:
+    record = _session_by_id(args.session)
+    manifests = _suite_manifests(record, args.last)
+    result = gates_mod.history([
+        report_model_mod.compile_manifest(manifest) for manifest in manifests])
+    if args.out:
+        out = Path(args.out)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n",
+                       encoding="utf-8")
+        result["out"] = str(out)
+    return emit({"ok": True, **result}, as_json=True)
+
+
+def cmd_report_pack(args: argparse.Namespace) -> int:
+    bundle = Path(args.bundle)
+    out = Path(args.out)
+    return emit(campaign_mod.pack(bundle, out, shard_id=args.shard_id),
+                as_json=True)
+
+
+def cmd_report_merge(args: argparse.Namespace) -> int:
+    result = campaign_mod.merge(
+        [Path(path) for path in args.packs], Path(args.out),
+        expected_shards=args.expected_shards)
+    emit({"ok": True, **result}, as_json=True)
+    return 0 if result["missing_shards"] == 0 else 1
+
+
+def cmd_report_finalize(args: argparse.Namespace) -> int:
+    result = campaign_mod.finalize(
+        Path(args.campaign),
+        rules_path=Path(args.rules) if args.rules else None)
+    publication = None
+    if args.publish:
+        try:
+            publication = campaign_mod.publish(Path(args.campaign), args.publish)
+        except errors.AutonomError as exc:
+            publication = {"publication_status": "failed", "error_code": exc.code,
+                           "error": exc.message}
+    result["publication"] = publication
+    emit({"ok": True, **result}, as_json=True)
+    return 0 if result["status"] == "passed" else 1
+
+
+def cmd_report_watch(args: argparse.Namespace) -> int:
+    """Incrementally emit newly finalized run summaries as NDJSON."""
+    record = _session_by_id(args.session)
+    flows_dir = Path(record["artifacts_dir"]) / "flows"
+    seen: set[str] = set()
+    deadline = time.monotonic() + args.max_seconds if args.max_seconds else None
+    emitted = 0
+    while True:
+        for path in sorted(flows_dir.glob("*/manifest.json"),
+                           key=lambda item: item.stat().st_mtime):
+            key = str(path.resolve())
+            if key in seen:
+                continue
+            seen.add(key)
+            manifest = json.loads(path.read_text(encoding="utf-8"))
+            model = report_model_mod.compile_manifest(manifest)
+            print(json.dumps(report_model_mod.summary(model), ensure_ascii=False),
+                  flush=True)
+            emitted += 1
+            if args.max_runs and emitted >= args.max_runs:
+                return 0
+        if deadline is not None and time.monotonic() >= deadline:
+            return 0
+        time.sleep(max(0.05, args.interval_ms / 1000))
+
+
 def cmd_report_suite(args: argparse.Namespace) -> int:
     """One page for the whole session — the suite view CI and humans read."""
     record = _session_by_id(args.session)
@@ -2310,12 +2444,16 @@ def cmd_report_build(args: argparse.Namespace) -> int:
     junit_path = run_dir / "report.xml"
     junit_path.write_text(flow_report.render_junit(manifest), encoding="utf-8")
     os.chmod(junit_path, 0o600)
+    bundle = report_bundle_mod.build(
+        manifest, artifacts_root=artifacts_dir, out=run_dir / "bundle-v2")
     return emit({
         "ok": True,
         "run_id": manifest.get("run_id"),
         "status": manifest.get("status"),
         "html": str(html_path),
         "junit": str(junit_path),
+        "bundle": bundle["bundle"],
+        "report_model": str(Path(bundle["bundle"]) / "model/report.json"),
         "sensitive": manifest.get("sensitive", False),
     }, as_json=True)
 
@@ -2340,6 +2478,22 @@ def cmd_report_export(args: argparse.Namespace) -> int:
     record = _session_by_id(args.session)
     run_dir = _resolve_run_dir(record, args.run)
     manifest = flow_report.load_manifest(run_dir)
+    if args.format in ("allure", "agent", "csv", "metrics"):
+        bundle_dir = run_dir / "bundle-v2"
+        report_bundle_mod.build(
+            manifest, artifacts_root=Path(record["artifacts_dir"]), out=bundle_dir)
+        model = report_model_mod.load(bundle_dir / "model/report.json")
+        defaults = {
+            "allure": run_dir / "allure-results",
+            "agent": run_dir / "agent-report.json",
+            "csv": run_dir / "steps.csv",
+            "metrics": run_dir / "metrics.json",
+        }
+        out = Path(args.out) if args.out else defaults[args.format]
+        result = report_export_mod.export(
+            model, args.format, out, bundle_root=bundle_dir)
+        return emit({"ok": True, **result,
+                     "sensitive": manifest.get("sensitive", False)}, as_json=True)
     if args.format == "junit":
         rendered = flow_report.render_junit(manifest)
         default_name = "report.xml"
@@ -2520,6 +2674,309 @@ def cmd_report_serve(args: argparse.Namespace) -> int:
     finally:
         server.server_close()
     return 0
+
+
+# --- blueprint control surfaces ---------------------------------------------
+
+
+def cmd_capabilities(args: argparse.Namespace) -> int:
+    record = session_mod.require_current()
+    target = _target(args)
+    snapshot = providers_mod.open_session(target, record).capabilities()
+    return emit({"ok": True, **snapshot.as_dict()}, as_json=True)
+
+
+def cmd_teach_start(args: argparse.Namespace) -> int:
+    return emit({"ok": True, **teach_mod.start(
+        session_mod.require_current(), args.name)}, as_json=True)
+
+
+def cmd_teach_mark(args: argparse.Namespace) -> int:
+    return emit({"ok": True, **teach_mod.mark(
+        session_mod.require_current(), args.name)}, as_json=True)
+
+
+def cmd_teach_stop(args: argparse.Namespace) -> int:
+    return emit({"ok": True, **teach_mod.stop(
+        session_mod.require_current())}, as_json=True)
+
+
+def cmd_teach_show(args: argparse.Namespace) -> int:
+    state = teach_mod.load(session_mod.require_current())
+    return emit({"ok": True, **state}, as_json=True)
+
+
+def cmd_teach_compile(args: argparse.Namespace) -> int:
+    result = teach_mod.compile_recording(
+        session_mod.require_current(), out=Path(args.out),
+        recording_id=args.recording, from_marker=args.from_marker,
+        to_marker=args.to_marker)
+    return emit({"ok": True, **result}, as_json=True)
+
+
+def cmd_teach_approve(args: argparse.Namespace) -> int:
+    result = teach_mod.approve(
+        session_mod.require_current(), Path(args.flow),
+        minimum_runs=args.minimum_runs)
+    return emit({"ok": True, **result}, as_json=True)
+
+
+def cmd_app_skill_validate(args: argparse.Namespace) -> int:
+    return emit(app_skills_mod.validate(Path(args.workspace).resolve(), args.app_id),
+                as_json=True)
+
+
+def cmd_app_skill_promote(args: argparse.Namespace) -> int:
+    return emit(app_skills_mod.promote(
+        Path(args.workspace).resolve(), args.app_id, Path(args.flow),
+        approval=Path(args.approval) if args.approval else None), as_json=True)
+
+
+def _source_for_replay(args: argparse.Namespace) -> tuple[dict, dict]:
+    if args.bundle:
+        bundle = Path(args.bundle)
+        report_bundle_mod.verify(bundle)
+        source = json.loads((bundle / "run.json").read_text(encoding="utf-8"))
+        source["_bundle_root"] = str(bundle.resolve())
+        return source, report_model_mod.load(bundle / "model/report.json")
+    record = _session_by_id(args.session)
+    run_dir = _resolve_run_dir(record, args.run)
+    manifest = flow_report.load_manifest(run_dir)
+    return manifest, report_model_mod.compile_manifest(manifest)
+
+
+def cmd_replay(args: argparse.Namespace) -> int:
+    source, model = _source_for_replay(args)
+    raw_flow_path = Path(str(source.get("flow_path") or ""))
+    flow_path = ((Path(source["_bundle_root"]) / raw_flow_path).resolve()
+                 if source.get("_bundle_root") and not raw_flow_path.is_absolute()
+                 else raw_flow_path.resolve())
+    if not flow_path.is_file():
+        raise errors.AutonomError(
+            errors.REPLAY_MANIFEST_INVALID,
+            "the pinned replay flow is unavailable",
+            hint="Restore the source checkout or keep the flow beside the bundle.",
+            flow=str(flow_path))
+    step = None
+    if args.to_step:
+        needle = str(args.to_step)
+        step = next((item for item in model.get("steps") or []
+                     if str(item.get("index")) == needle
+                     or item.get("step_id") == needle
+                     or (item.get("command") == "checkpoint"
+                         and item.get("name") == needle)), None)
+        if step is None:
+            raise errors.AutonomError(
+                errors.FLOW_REPLAY_STEP_NOT_REACHED,
+                f"source attempt has no step or checkpoint {needle!r}")
+    secret_values: dict[str, str] = {}
+    missing = []
+    for name in source.get("secret_names") or []:
+        if os.environ.get(name) is None:
+            missing.append(name)
+        else:
+            secret_values[name] = os.environ[name]
+    if missing:
+        raise errors.AutonomError(
+            errors.FLOW_SECRET_UNDEFINED,
+            "replay requires secret environment variables that are not set",
+            secret_names=missing)
+    record = session_mod.require_current()
+    target = _target(args)
+    flow = flow_validator.validate_tree(flow_path)
+    config = flow_executor.RunConfig(
+        env=dict(source.get("env") or {}), secrets=secret_values,
+        stop_after_step=step.get("index") if step else None,
+        stop_after_step_id=step.get("step_id") if step else None,
+        stop_after_expected_status=(
+            "passed" if step and step.get("status") == "passed"
+            else "failed" if step and step.get("status") in ("failed", "broken")
+            else None),
+        evidence_mode="always",
+        evidence_collect=("screenshot", "hierarchy", "logs", "network"),
+        parent_attempt_id=model["attempt"]["attempt_id"],
+        retry_of=model["attempt"]["attempt_id"],
+    )
+    result = flow_executor.Executor(target, record, config).run(flow)
+    payload = {
+        "ok": True, "status": result.status, "run_id": result.run_id,
+        "parent_attempt_id": model["attempt"]["attempt_id"],
+        "strategy": "baseline", "target": result.replay_target,
+        "events": result.events_path,
+    }
+    emit(payload, as_json=True)
+    return 0 if result.status in ("passed", "replayed") else 1
+
+
+def cmd_simulator(args: argparse.Namespace) -> int:
+    values: dict[str, Any] = {}
+    if args.json:
+        parsed = json.loads(args.json)
+        if not isinstance(parsed, dict):
+            raise errors.AutonomError(errors.FLOW_COMMAND_INVALID,
+                                      "--json must be an object")
+        values.update(parsed)
+    for pair in args.value or []:
+        if "=" not in pair:
+            raise errors.AutonomError(errors.FLOW_COMMAND_INVALID,
+                                      f"--value takes KEY=VALUE, got {pair!r}")
+        key, value = pair.split("=", 1)
+        values[key] = value
+    target = _target(args)
+    result = simulator_mod.apply(target, args.control, args.action, values)
+    return emit({"ok": True, **result, **target.identity()}, as_json=True)
+
+
+def cmd_ci_run(args: argparse.Namespace) -> int:
+    """Supervise capture → bundle → shard → merge → gate → publish."""
+    path = Path(args.path)
+    files = _flow_files(path) if path.is_dir() else [path]
+    if not files:
+        raise errors.AutonomError(errors.FLOW_NO_FLOWS_FOUND,
+                                  f"no flows under {path}")
+    flows = [flow_validator.validate_tree(item) for item in files]
+    record = session_mod.require_current()
+    target = _target(args)
+    out = Path(args.out).resolve()
+    out.mkdir(parents=True, exist_ok=True)
+    campaign = campaign_mod.create_campaign(
+        out / "campaign-spec.json",
+        expected_shards=args.expected_shards or len(flows),
+        campaign_id=args.campaign_id)
+    phase_path = out / "ci-state.json"
+    state: dict[str, Any] = {
+        "schema": "autonom.ci-state/v1", "campaign_id": campaign["campaign_id"],
+        "phase": "capture", "runs": [], "errors": [],
+        "spool": str(out), "resumable": True,
+    }
+
+    def save_state() -> None:
+        phase_path.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n",
+                              encoding="utf-8")
+
+    save_state()
+    packs: list[Path] = []
+    for index, flow in enumerate(flows, 1):
+        config = flow_executor.RunConfig(
+            env=_flow_env_overrides(args), secrets=_flow_secrets(args),
+            evidence_mode="always",
+            evidence_collect=("screenshot", "hierarchy", "logs", "network"),
+            campaign_id=campaign["campaign_id"],
+            shard_id=f"{args.shard_id}-{index}",
+        )
+        try:
+            result = flow_executor.Executor(target, record, config).run(flow)
+            run_dir = Path(result.events_path).parent
+            manifest = flow_report.load_manifest(run_dir)
+            bundle_dir = out / "bundles" / result.run_id
+            bundle = report_bundle_mod.build(
+                manifest, artifacts_root=Path(record["artifacts_dir"]), out=bundle_dir)
+            pack_path = out / "packs" / f"{args.shard_id}-{index}.zip"
+            packed = campaign_mod.pack(bundle_dir, pack_path,
+                                       shard_id=f"{args.shard_id}-{index}")
+            packs.append(pack_path)
+            state["runs"].append({"flow": flow.path, "run_id": result.run_id,
+                                  "status": result.status, "bundle": bundle["bundle"],
+                                  "pack": packed["out"]})
+        except errors.AutonomError as exc:
+            state["errors"].append(exc.as_dict())
+            save_state()
+            break
+        save_state()
+
+    state["phase"] = "merge"
+    save_state()
+    merged = campaign_mod.merge(
+        packs, out / "campaign",
+        expected_shards=args.expected_shards or len(flows))
+    state["phase"] = "finalize"
+    save_state()
+    final = campaign_mod.finalize(
+        out / "campaign", rules_path=Path(args.rules) if args.rules else None)
+    publication = {"publication_status": "not_requested"}
+    if args.publish:
+        state["phase"] = "publish"
+        save_state()
+        try:
+            publication = campaign_mod.publish(out / "campaign", args.publish)
+        except errors.AutonomError as exc:
+            publication = {"publication_status": "failed",
+                           "error_code": exc.code, "error": exc.message}
+    state.update({"phase": "complete", "final": final,
+                  "publication": publication})
+    save_state()
+    payload = {"ok": True, "campaign_id": campaign["campaign_id"],
+               "status": final["status"], "execution": merged["summary"],
+               "missing_shards": merged["missing_shards"],
+               "publication": publication, "out": str(out),
+               "state": str(phase_path)}
+    emit(payload, as_json=True)
+    if publication.get("publication_status") == "failed":
+        return 2
+    return 0 if final["status"] == "passed" and not state["errors"] else 1
+
+
+def cmd_ci_publish(args: argparse.Namespace) -> int:
+    return emit({"ok": True, **campaign_mod.publish(
+        Path(args.campaign), args.destination)}, as_json=True)
+
+
+def _agent_model(args: argparse.Namespace) -> tuple[dict[str, Any], Path | None]:
+    if args.bundle:
+        bundle = Path(args.bundle)
+        report_bundle_mod.verify(bundle)
+        return report_model_mod.load(bundle / "model/report.json"), bundle
+    record = _session_by_id(args.session)
+    _run_dir, _manifest, model = _report_model(record, args.run)
+    return model, None
+
+
+def cmd_agent_export(args: argparse.Namespace) -> int:
+    model, bundle = _agent_model(args)
+    out = Path(args.out)
+    return emit({"ok": True, **report_export_mod.agent(model, out)}, as_json=True)
+
+
+def cmd_agent_inspect(args: argparse.Namespace) -> int:
+    model, _bundle = _agent_model(args)
+    needle = str(args.step)
+    step = next((item for item in model.get("steps") or []
+                 if item.get("step_id") == needle
+                 or str(item.get("index")) == needle), None)
+    if step is None:
+        raise errors.AutonomError(errors.FLOW_REPLAY_STEP_NOT_REACHED,
+                                  f"report has no step {needle!r}")
+    attachment_ids = set(step.get("attachment_ids") or [])
+    attachments = [item for item in model.get("attachments") or []
+                   if item["attachment_id"] in attachment_ids]
+    return emit({"ok": True, "attempt": model["attempt"], "step": step,
+                 "attachments": attachments}, as_json=True)
+
+
+def cmd_canvas_serve(args: argparse.Namespace) -> int:
+    target = _target(args)
+    node = shutil.which("node")
+    if not node:
+        raise errors.AutonomError(
+            errors.TOOL_MISSING, "node is required to serve Mobile Canvas",
+            hint="Install Node.js or run the browser bridge on a host that has it.",
+            tool="node")
+    script = (ROOT.parent / "plugins/autonom/skills/android-emulator-browser/scripts/"
+              "android-emulator-browser.mjs")
+    command = [node, str(script), "--platform", target.platform,
+               "--target", target.target_id, "--port", str(args.port),
+               "--transport", args.transport, "--fps", str(args.fps)]
+    if target.platform == ANDROID:
+        command += ["--adb", target.tool]
+    else:
+        command += ["--simctl", target.tool]
+        if getattr(args, "idb", None):
+            command += ["--idb", args.idb]
+    if args.no_auth:
+        command.append("--no-auth")
+    if args.token:
+        command += ["--token", args.token]
+    return subprocess.run(command, check=False).returncode
 
 
 # --- parser ------------------------------------------------------------------
@@ -2765,6 +3222,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--strict", action="store_true", help="exit 1 when any tool is missing")
     p.set_defaults(func=cmd_doctor)
 
+    p = sub.add_parser("capabilities", help="immutable semantic capability snapshot",
+                       parents=[target_flags])
+    p.set_defaults(func=cmd_capabilities)
+
     p = sub.add_parser("processes", help="list Autonom-spawned processes machine-wide")
     p.set_defaults(func=cmd_processes)
 
@@ -2795,6 +3256,28 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_location)
     p = location_sub.add_parser("clear", parents=[target_flags])
     p.set_defaults(func=cmd_location)
+
+    simulator = sub.add_parser(
+        "simulator", help="battery, network, push, telephony, biometric, and UI state")
+    simulator_sub = simulator.add_subparsers(dest="simulator_command", required=True)
+    for control in ("battery", "network", "push", "sms", "call", "biometric",
+                    "clipboard", "appearance", "text-size", "status-bar"):
+        p = simulator_sub.add_parser(control, parents=[target_flags])
+        p.add_argument("action")
+        p.add_argument("--value", action="append", metavar="KEY=VALUE")
+        p.add_argument("--json", help="JSON object of control values")
+        p.set_defaults(func=cmd_simulator, control=control)
+
+    canvas = sub.add_parser("canvas", help="shared human/agent mobile control surface")
+    canvas_sub = canvas.add_subparsers(dest="canvas_command", required=True)
+    p = canvas_sub.add_parser("serve", parents=[target_flags])
+    p.add_argument("--port", type=int, default=3277)
+    p.add_argument("--transport", choices=("auto", "screenrecord", "screencap"),
+                   default="auto")
+    p.add_argument("--fps", type=int, default=15)
+    p.add_argument("--token")
+    p.add_argument("--no-auth", action="store_true")
+    p.set_defaults(func=cmd_canvas_serve)
 
     media = sub.add_parser("media", help="device media library")
     media_sub = media.add_subparsers(dest="media_command", required=True)
@@ -2856,6 +3339,42 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--name", help="flow name (default: Recorded <task>)")
     p.add_argument("--task", help="tag the flow and name it after this task")
     p.set_defaults(func=cmd_flow_create)
+
+    teach = sub.add_parser("teach", help="record, compile, validate, and approve journeys")
+    teach_sub = teach.add_subparsers(dest="teach_command", required=True)
+    p = teach_sub.add_parser("start", help="start a marked recording range")
+    p.add_argument("name")
+    p.set_defaults(func=cmd_teach_start)
+    p = teach_sub.add_parser("mark", help="add a named range marker")
+    p.add_argument("name")
+    p.set_defaults(func=cmd_teach_mark)
+    p = teach_sub.add_parser("stop", help="finish the active recording range")
+    p.set_defaults(func=cmd_teach_stop)
+    p = teach_sub.add_parser("show", help="show recordings, ranges, and review state")
+    p.set_defaults(func=cmd_teach_show)
+    p = teach_sub.add_parser("compile", help="compile a recording or marker range")
+    p.add_argument("--out", required=True)
+    p.add_argument("--recording")
+    p.add_argument("--from", dest="from_marker")
+    p.add_argument("--to", dest="to_marker")
+    p.set_defaults(func=cmd_teach_compile)
+    p = teach_sub.add_parser("approve", help="approve after consecutive clean replays")
+    p.add_argument("flow")
+    p.add_argument("--minimum-runs", type=int, default=3)
+    p.set_defaults(func=cmd_teach_approve)
+
+    app_skill = sub.add_parser("app-skill", help="validate and promote portable app knowledge")
+    app_skill_sub = app_skill.add_subparsers(dest="app_skill_command", required=True)
+    p = app_skill_sub.add_parser("validate")
+    p.add_argument("app_id")
+    p.add_argument("--workspace", default=".")
+    p.set_defaults(func=cmd_app_skill_validate)
+    p = app_skill_sub.add_parser("promote")
+    p.add_argument("app_id")
+    p.add_argument("flow")
+    p.add_argument("--approval")
+    p.add_argument("--workspace", default=".")
+    p.set_defaults(func=cmd_app_skill_promote)
     p = flow_sub.add_parser("import",
                             help="convert a Maestro Core Profile flow to Flow v1")
     p.add_argument("path", help="a Maestro flow file")
@@ -2908,7 +3427,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--secret", action="append", metavar="NAME")
     p.set_defaults(func=cmd_proof)
 
-    atlas = sub.add_parser("atlas", help="the observed application graph")
+    atlas = sub.add_parser("atlas", aliases=["runtime-map"],
+                           help="the observed Runtime Map application graph")
     atlas_sub = atlas.add_subparsers(dest="atlas_command", required=True)
     p = atlas_sub.add_parser("update", help="ingest a session's runs and actions")
     p.add_argument("--session", default="current", help="session id (default: current)")
@@ -2948,7 +3468,9 @@ def build_parser() -> argparse.ArgumentParser:
                        help="session id (default: current)")
         p.add_argument("--run", help="run id (default: the latest run)")
         if verb == "export":
-            p.add_argument("--format", choices=("html", "junit"), default="html")
+            p.add_argument("--format",
+                           choices=("html", "junit", "allure", "agent", "csv", "metrics"),
+                           default="html")
             p.add_argument("--out", help="destination path")
         p.set_defaults(func=func)
 
@@ -2981,6 +3503,114 @@ def build_parser() -> argparse.ArgumentParser:
                         "(default: failed)")
     p.add_argument("--open", action="store_true", help="open it in a browser")
     p.set_defaults(func=cmd_report_suite)
+
+    for verb, func, help_text in (
+        ("model", cmd_report_model, "compile canonical Report Model v2"),
+        ("bundle", cmd_report_bundle, "finalize a portable Report Bundle v2"),
+    ):
+        p = report_sub.add_parser(verb, help=help_text)
+        p.add_argument("--session", default="current")
+        p.add_argument("--run")
+        p.add_argument("--out")
+        p.set_defaults(func=func)
+    p = report_sub.add_parser("verify", help="verify every Report Bundle digest")
+    p.add_argument("bundle")
+    p.set_defaults(func=cmd_report_verify)
+    p = report_sub.add_parser("annotate", help="add a mutable note beside finalized evidence")
+    p.add_argument("bundle")
+    p.add_argument("text")
+    p.add_argument("--author", default="human")
+    p.add_argument("--step")
+    p.set_defaults(func=cmd_report_annotate)
+    p = report_sub.add_parser("gate", help="evaluate explicit report quality gates")
+    p.add_argument("--session", default="current")
+    p.add_argument("--run")
+    p.add_argument("--rules", help="JSON gate rules")
+    p.add_argument("--out")
+    p.set_defaults(func=cmd_report_gate)
+    p = report_sub.add_parser("history", help="aggregate retries and flaky history")
+    p.add_argument("--session", default="current")
+    p.add_argument("--last", type=int)
+    p.add_argument("--out")
+    p.set_defaults(func=cmd_report_history)
+    p = report_sub.add_parser("watch", help="stream newly finalized summaries as NDJSON")
+    p.add_argument("--session", default="current")
+    p.add_argument("--interval-ms", type=int, default=250)
+    p.add_argument("--max-seconds", type=float, default=0)
+    p.add_argument("--max-runs", type=int, default=0)
+    p.set_defaults(func=cmd_report_watch)
+    p = report_sub.add_parser("pack", help="pack one verified bundle for a CI shard")
+    p.add_argument("bundle")
+    p.add_argument("--out", required=True)
+    p.add_argument("--shard-id", default="shard-1")
+    p.set_defaults(func=cmd_report_pack)
+    p = report_sub.add_parser("merge", help="idempotently merge CI shard packs")
+    p.add_argument("packs", nargs="+")
+    p.add_argument("--out", required=True)
+    p.add_argument("--expected-shards", type=int)
+    p.set_defaults(func=cmd_report_merge)
+    p = report_sub.add_parser("finalize", help="evaluate campaign gates and publish")
+    p.add_argument("campaign")
+    p.add_argument("--rules")
+    p.add_argument("--publish", help="empty directory or HTTP PUT endpoint")
+    p.set_defaults(func=cmd_report_finalize)
+
+    p = sub.add_parser("replay", help="replay a pinned attempt or restore a selected step",
+                       parents=[target_flags])
+    source = p.add_mutually_exclusive_group()
+    source.add_argument("--bundle")
+    source.add_argument("--run")
+    p.add_argument("--session", default="current")
+    p.add_argument("--to-step", help="runtime index, stable step id, or checkpoint name")
+    p.set_defaults(func=cmd_replay)
+
+    ci = sub.add_parser("ci", help="supervised run, spool, shard, merge, finalize, publish")
+    ci_sub = ci.add_subparsers(dest="ci_command", required=True)
+    p = ci_sub.add_parser("run", parents=[target_flags])
+    p.add_argument("path")
+    p.add_argument("--out", required=True)
+    p.add_argument("--campaign-id")
+    p.add_argument("--shard-id", default="shard")
+    p.add_argument("--expected-shards", type=int)
+    p.add_argument("--env", action="append", metavar="KEY=VALUE")
+    p.add_argument("--secret", action="append", metavar="NAME")
+    p.add_argument("--rules")
+    p.add_argument("--publish")
+    p.set_defaults(func=cmd_ci_run)
+    p = ci_sub.add_parser("pack")
+    p.add_argument("bundle")
+    p.add_argument("--out", required=True)
+    p.add_argument("--shard-id", default="shard-1")
+    p.set_defaults(func=cmd_report_pack)
+    p = ci_sub.add_parser("merge")
+    p.add_argument("packs", nargs="+")
+    p.add_argument("--out", required=True)
+    p.add_argument("--expected-shards", type=int)
+    p.set_defaults(func=cmd_report_merge)
+    p = ci_sub.add_parser("finalize")
+    p.add_argument("campaign")
+    p.add_argument("--rules")
+    p.add_argument("--publish")
+    p.set_defaults(func=cmd_report_finalize)
+    p = ci_sub.add_parser("publish")
+    p.add_argument("campaign")
+    p.add_argument("destination")
+    p.set_defaults(func=cmd_ci_publish)
+
+    agent = sub.add_parser("agent", help="compact machine report access")
+    agent_sub = agent.add_subparsers(dest="agent_command", required=True)
+    p = agent_sub.add_parser("export")
+    p.add_argument("--bundle")
+    p.add_argument("--session", default="current")
+    p.add_argument("--run")
+    p.add_argument("--out", required=True)
+    p.set_defaults(func=cmd_agent_export)
+    p = agent_sub.add_parser("inspect")
+    p.add_argument("--bundle")
+    p.add_argument("--session", default="current")
+    p.add_argument("--run")
+    p.add_argument("--step", required=True)
+    p.set_defaults(func=cmd_agent_inspect)
 
     network = sub.add_parser("network", help="HTTP(S) capture and mocking")
     network_sub = network.add_subparsers(dest="network_command", required=True)
@@ -3205,7 +3835,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 # Verbs whose own handler writes the journal, or that only read it — never
 # journaled by the choke point, to avoid double entries and read-noise.
-_JOURNAL_SKIP = {"note", "journal", "version"}
+_JOURNAL_SKIP = {"note", "journal", "version", "teach"}
 
 # Sub-command dests, in priority order, for reconstructing a verb string.
 _SUBCOMMAND_DESTS = (
@@ -3213,7 +3843,8 @@ _SUBCOMMAND_DESTS = (
     "report_command", "network_command", "requests_command", "mock_command",
     "location_command", "media_command", "crash_command", "file_command",
     "record_command", "shots_command", "devices_command", "note_command",
-    "logs_command", "metrics_command",
+    "logs_command", "metrics_command", "teach_command", "app_skill_command",
+    "simulator_command", "canvas_command", "ci_command", "agent_command",
 )
 
 

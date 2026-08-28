@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autonom.dev/schemas/report-v2.schema.json",
+  "title": "Autonom Report Model v2",
+  "type": "object",
+  "required": ["schema", "revision", "launch", "test_case", "attempt", "steps", "action_attempts", "attachments", "setup_catalog", "replay"],
+  "properties": {
+    "schema": {"const": "autonom.report/v2"},
+    "revision": {"type": "integer", "minimum": 1},
+    "launch": {"type": "object", "required": ["launch_id"]},
+    "test_case": {
+      "type": "object",
+      "required": ["case_id", "history_id", "flow_id", "name"]
+    },
+    "attempt": {
+      "type": "object",
+      "required": ["attempt_id", "run_id", "status", "proof_verdict"],
+      "properties": {
+        "status": {"enum": ["passed", "failed", "broken", "skipped", "unknown"]},
+        "proof_verdict": {"enum": ["pass", "fail", "not_covered", "blocked", "inconclusive", "not_applicable"]}
+      }
+    },
+    "steps": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["step_id", "name", "status", "delta", "attachment_ids"]
+      }
+    },
+    "action_attempts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["action_attempt_id", "attempt_id", "step_id", "status", "attachment_ids"]
+      }
+    },
+    "attachments": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["attachment_id", "type", "path", "mime_type", "availability"]
+      }
+    },
+    "setup_catalog": {"type": "object"},
+    "replay": {"type": "object"},
+    "gates": {"type": "array"},
+    "annotations": {"type": "array"}
+  }
+}

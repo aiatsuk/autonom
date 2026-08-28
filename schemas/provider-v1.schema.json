@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autonom.dev/schemas/provider-v1.schema.json",
+  "title": "Autonom Provider Capability Snapshot v1",
+  "type": "object",
+  "required": ["schema", "provider", "target_id", "device_class", "captured_at", "capabilities"],
+  "properties": {
+    "schema": {"const": "autonom.provider/v1"},
+    "provider": {"type": "string"},
+    "target_id": {"type": "string"},
+    "device_class": {"enum": ["simulator", "physical", "remote", "unknown"]},
+    "captured_at": {"type": "string", "format": "date-time"},
+    "capabilities": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "state"],
+        "properties": {
+          "name": {"type": "string"},
+          "state": {"enum": ["available", "unavailable", "degraded", "unknown"]},
+          "reason": {"type": "string"},
+          "details": {"type": "object"}
+        }
+      }
+    }
+  }
+}

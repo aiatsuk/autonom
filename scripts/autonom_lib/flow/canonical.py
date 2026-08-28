@@ -29,7 +29,7 @@ from .schema import (
 )
 
 _HEADER_ORDER = ("schema", "id", "appId", "name", "description", "tags",
-                 "properties", "env", "requires", "evidence",
+                 "properties", "env", "requires", "sideEffects", "setup", "evidence",
                  "onFlowStart", "onFlowComplete")
 _SELECTOR_ORDER = ("id", "text", "visibleText", "description", "role",
                    "enabled", "checked", "selected", "focused")
@@ -115,6 +115,28 @@ class _Writer:
 
     def text(self) -> str:
         return "\n".join(self.lines) + "\n"
+
+    def literal(self, indent: int, key: str, value) -> None:
+        if isinstance(value, dict):
+            if not value:
+                self.line(indent, f"{key}: {{}}")
+                return
+            self.line(indent, f"{key}:")
+            for child_key, child in value.items():
+                self.literal(indent + 2, child_key, child)
+        elif isinstance(value, list):
+            if not value:
+                self.line(indent, f"{key}: []")
+                return
+            self.line(indent, f"{key}:")
+            for child in value:
+                if isinstance(child, (dict, list)):
+                    # Setup lists are deliberately scalar in v1.  Refuse an
+                    # ambiguous structure rather than emitting invalid YAML.
+                    raise ValueError(f"setup list {key} must contain scalars")
+                self.line(indent + 2, f"- {_scalar(child, item_context=True)}")
+        else:
+            self.pair(indent, key, value)
 
 
 def _emit_selector(writer: _Writer, indent: int, key: str,
@@ -218,6 +240,12 @@ def emit_flow(flow: Flow) -> str:
                 writer.string_list(2, "platform", flow.requires_platforms)
             if flow.requires_capabilities:
                 writer.string_list(2, "capabilities", flow.requires_capabilities)
+        elif name == "sideEffects" and flow.side_effects:
+            writer.string_list(0, "sideEffects", flow.side_effects)
+        elif name == "setup" and flow.setup:
+            writer.line(0, "setup:")
+            for key, value in flow.setup.items():
+                writer.literal(2, key, value)
         elif name == "evidence" and flow.evidence is not None:
             _emit_evidence(writer, 0, flow.evidence)
         elif name == "onFlowStart" and flow.on_flow_start:
@@ -286,6 +314,8 @@ def fingerprint(flow: Flow):
         "env": tuple(sorted(flow.env.items())),
         "requires": (tuple(flow.requires_platforms),
                      tuple(flow.requires_capabilities)),
+        "side_effects": tuple(flow.side_effects),
+        "setup": flow.setup,
         "evidence": None if evidence is None else (
             evidence.mode, evidence.before_mutation, evidence.after_assertion,
             tuple(evidence.collect), evidence.bodies, tuple(sorted(set(evidence.explicit)))),

@@ -21,8 +21,10 @@ permissions, location, media and container files, consent-gated HTTP(S) capture
 and mocking, a per-session journal of every action, and **Flow v1** —
 repeatable flow files with exact selectors, polling assertions, and failure
 classes ([`docs/FLOW.md`](docs/FLOW.md)), plus Maestro import/export,
-session→flow compilation (`flow create --from-session`), addressable per-step
-evidence reports (HTML/JUnit) with loopback replay controls, an observed application atlas, local PR proof
+Teach recording and approved App Skills, addressable per-step evidence reports
+(HTML/JUnit/Allure/agent/CSV/metrics), portable integrity-checked Report Bundle
+v2, baseline replay/checkpoints, supervised CI campaigns, Mobile Canvas, an
+observed Runtime Map, local PR proof
 (`autonom proof --base`), live session watch (`session outputs`,
 `logs follow`, `network requests follow`), and an `autonom metrics` family
 (memory, CPU, frames, traces). Domain packs for Flutter, native
@@ -38,7 +40,7 @@ hosted device providers.
 - **Routing first** — `project-router` loads the smallest relevant skill set.
 - **Evidence second** — code → tests → device flow → tree/shot/logs → before/after.
 - **Runtime-honest tooling** — inspect local SDKs; never hard-code “latest”.
-- **Safe device bridge** — token-protected localhost emulator browser (Android).
+- **Safe Mobile Canvas** — fragment-bootstrap localhost control for Android and iOS.
 
 ## Control plane
 
@@ -208,6 +210,7 @@ benchmark. Use a physical device plus native profilers for frame-rate review.
 - `docs/INSTALL.md` — Codex / Claude / Grok / generic install
 - `docs/CAPABILITIES.md` — Android/iOS capability matrix, full CLI surface, environment overrides
 - `docs/ARCHITECTURE.md` — routing, CLI control plane, evidence, security
+- `docs/PRODUCT_BLUEPRINT.md` — providers, Teach, Report Model v2, replay, CI, Canvas, Runtime Map
 - `docs/COMPATIBILITY.md` — the frozen CLI contract (error codes, response keys, exit codes)
 - `docs/FLOW.md` — Flow v1: the strict flow language, runner, recording, reports, atlas, proof
 - `docs/plans/PHASE_0_RELEASE_ENGINEERING.md` — shipped: test isolation, CI, tagged releases

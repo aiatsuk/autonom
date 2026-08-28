@@ -104,6 +104,19 @@ FLOW_NO_FLOWS_FOUND = "flow_no_flows_found"
 FLOW_REPLAY_STEP_NOT_REACHED = "flow_replay_step_not_reached"
 UNSUPPORTED_FLOW_COMMAND = "unsupported_flow_command"  # Maestro import/export
 
+# --- Blueprint contracts ----------------------------------------------------
+UNSUPPORTED_CAPABILITY = "unsupported_capability"
+REPORT_MODEL_INVALID = "report_model_invalid"
+REPORT_BUNDLE_FINALIZED = "report_bundle_finalized"
+REPORT_INTEGRITY_FAILED = "report_integrity_failed"
+REPORT_MERGE_CONFLICT = "report_merge_conflict"
+GATE_FAILED = "gate_failed"
+TEACH_RANGE_INVALID = "teach_range_invalid"
+TEACH_APPROVAL_BLOCKED = "teach_approval_blocked"
+APP_SKILL_INVALID = "app_skill_invalid"
+REPLAY_MANIFEST_INVALID = "replay_manifest_invalid"
+CI_DESTINATION_FAILED = "ci_destination_failed"
+
 
 class AutonomError(RuntimeError):
     """An expected failure with a stable code and an actionable hint."""

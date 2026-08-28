@@ -63,6 +63,7 @@ function asInt(flag, raw) {
 
 export function parseArgs(argv) {
   const options = {
+    platform: "android",
     port: DEFAULT_PORT,
     fps: DEFAULT_FPS,
     maxSize: DEFAULT_MAX_SIZE,
@@ -82,8 +83,20 @@ export function parseArgs(argv) {
       case "-s":
         options.serial = requireFlagValue(argv, ++i, flag);
         break;
+      case "--target":
+        options.target = requireFlagValue(argv, ++i, flag);
+        break;
+      case "--platform":
+        options.platform = requireFlagValue(argv, ++i, flag);
+        break;
       case "--adb":
         options.adb = requireFlagValue(argv, ++i, flag);
+        break;
+      case "--simctl":
+        options.simctl = requireFlagValue(argv, ++i, flag);
+        break;
+      case "--idb":
+        options.idb = requireFlagValue(argv, ++i, flag);
         break;
       case "--ffmpeg":
         options.ffmpeg = requireFlagValue(argv, ++i, flag);
@@ -107,6 +120,12 @@ export function parseArgs(argv) {
       case "--token":
         options.token = requireFlagValue(argv, ++i, flag);
         break;
+      case "--python":
+        options.python = requireFlagValue(argv, ++i, flag);
+        break;
+      case "--bridge":
+        options.bridge = requireFlagValue(argv, ++i, flag);
+        break;
       case "--no-auth":
         options.noAuth = true;
         break;
@@ -117,6 +136,9 @@ export function parseArgs(argv) {
 
   if (!Number.isInteger(options.port) || options.port < 0 || options.port > 65535) {
     throw new Error("--port must be an integer from 0 to 65535 (0 selects an available port).");
+  }
+  if (!["android", "ios"].includes(options.platform)) {
+    throw new Error("--platform must be android or ios.");
   }
   if (!Number.isFinite(options.fps) || options.fps < 1 || options.fps > 60) {
     throw new Error("--fps must be between 1 and 60.");

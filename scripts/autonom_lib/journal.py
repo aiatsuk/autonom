@@ -31,7 +31,7 @@ JOURNAL_FILE = "journal.ndjson"
 
 # Flags whose *value* (the next argv token) can carry a credential.
 _SENSITIVE_VALUE_FLAGS = {
-    "--json", "--header", "--setenv", "--data", "--body", "--raw",
+    "--json", "--header", "--setenv", "--data", "--body", "--raw", "--value",
 }
 # Fields worth lifting from a command's result into the timeline summary.
 # Deliberately excludes anything free-form or body-shaped ("typed", previews).
@@ -111,12 +111,14 @@ def record_action(
     payload: dict[str, Any] | None,
     ok: bool,
     error_code: str | None = None,
+    origin: str = "agent",
 ) -> None:
     entry: dict[str, Any] = {
         "kind": "action",
         "verb": verb,
         "argv": scrub_argv(argv),
         "ok": ok,
+        "origin": origin,
     }
     summary = _summary(payload)
     if summary:

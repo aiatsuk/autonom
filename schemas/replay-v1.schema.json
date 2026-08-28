@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autonom.dev/schemas/replay-v1.schema.json",
+  "title": "Autonom Replay Manifest v1",
+  "type": "object",
+  "required": ["schema", "source_run_id", "source_attempt_id", "flow_id", "strategy", "verification"],
+  "properties": {
+    "schema": {"const": "autonom.replay/v1"},
+    "source_run_id": {"type": "string"},
+    "source_attempt_id": {"type": "string"},
+    "flow_id": {"type": "string"},
+    "app_id": {"type": ["string", "null"]},
+    "command": {"type": ["string", "null"]},
+    "strategy": {"enum": ["baseline", "checkpoint-suffix"]},
+    "environment": {"type": "object"},
+    "setup": {"type": "object"},
+    "capability_snapshot": {"type": ["object", "null"]},
+    "checkpoints": {"type": "array", "items": {"type": "object"}},
+    "verification": {"type": "array", "items": {"type": "object"}}
+  }
+}
