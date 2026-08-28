@@ -53,7 +53,7 @@ assert_json "$OUT/devices.json" 'p["ok"] and len([d for d in p["devices"] if d["
 step "2. session start"
 "${CLI[@]}" session start >"$OUT/session.json"
 assert_json "$OUT/session.json" 'p["ok"]'
-SESSION_ID="$(jget "$OUT/session.json" 'p["session_id"]')"
+SESSION_ID="$(jget "$OUT/session.json" 'p["session"]["session_id"]')"
 SESSION_DIR="$AUTONOM_HOME/sessions/$SESSION_ID"
 echo "session: $SESSION_ID"
 

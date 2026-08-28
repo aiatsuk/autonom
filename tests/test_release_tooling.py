@@ -10,6 +10,7 @@ than validation checks.
 from __future__ import annotations
 
 import importlib.util
+import stat
 import subprocess
 import sys
 import unittest
@@ -61,6 +62,19 @@ class BundlePreflightTests(unittest.TestCase):
         for name in ("LICENSE", "CHANGELOG.md", "README.md", "install.sh"):
             with self.subTest(file=name):
                 self.assertTrue((ROOT / name).exists(), f"{name} is required by build_release.sh")
+
+
+class AndroidSmokeScriptTests(unittest.TestCase):
+    def test_script_matches_session_start_contract(self) -> None:
+        script_path = ROOT / "scripts/ci/android_smoke.sh"
+        script = script_path.read_text(encoding="utf-8")
+
+        self.assertIn('p["session"]["session_id"]', script)
+        self.assertNotIn('p["session_id"]', script)
+
+    def test_script_is_executable(self) -> None:
+        mode = (ROOT / "scripts/ci/android_smoke.sh").stat().st_mode
+        self.assertTrue(mode & stat.S_IXUSR)
 
 
 if __name__ == "__main__":
