@@ -78,7 +78,7 @@ def capture_target(target: Target, output: Path) -> Path:
 
 
 def slugify(text: str | None, limit: int = 48) -> str:
-    """Readable, not ASCII-only: an accented label stays legible in `ls`."""
+    """Readable, not ASCII-only: Unicode labels stay legible in `ls`."""
     cleaned = re.sub(r"[^\w\-]+", "-", (text or "").strip(), flags=re.UNICODE)
     cleaned = re.sub(r"-{2,}", "-", cleaned).strip("-").lower()
     return cleaned[:limit] or "shot"
@@ -106,7 +106,7 @@ def build_filename(index: int, label: str | None, moment: float | None = None) -
 def _itxt_chunk(keyword: str, value: str) -> bytes:
     """A UTF-8 PNG text chunk.
 
-    `tEXt` is Latin-1 only, which would mangle any non-Latin label; `iTXt`
+    `tEXt` is Latin-1 only, which would mangle many Unicode labels; `iTXt`
     carries UTF-8 and is just as widely readable (`exiftool`, Preview, PIL).
     """
     payload = (

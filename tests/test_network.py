@@ -252,7 +252,7 @@ class ConsentTests(EnvSandboxMixin, unittest.TestCase):
                                     prompt=lambda: consent.PHRASE_EN)
             self.assertEqual(entry["operation"], "device_proxy")
 
-            for wrong in ("nah", "yes", "", consent.PHRASE_EN[:-5]):
+            for wrong in ("同意します", "yes", "", consent.PHRASE_EN[:-5]):
                 with self.assertRaises(errors.AutonomError) as caught:
                     consent.require(self.OPERATION, acknowledged=True,
                                     stream=io.StringIO(), prompt=lambda: wrong)
