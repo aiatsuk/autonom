@@ -136,6 +136,83 @@ class AndroidLoginFlowTests(_AndroidRunBase):
         self.assertEqual(kinds[-1], "flow.run.finished")
         self.assertEqual(kinds.count("flow.step.finished"), 5)
 
+    def test_prefix_replay_stops_at_step_and_preserves_state(self) -> None:
+        flow = self._flow(
+            "- launchApp\n"
+            "- tapOn:\n"
+            "    selector:\n"
+            "      description: Open settings\n"
+            "      match: exact\n"
+            "- pressKey: KEYCODE_ENTER\n",
+            header=("schema: autonom.dev/flow/v1\nappId: com.example.app\n"
+                    "name: replay\nid: replay-001\n"
+                    "onFlowComplete:\n  - back\n---\n"),
+        )
+        result = self._cli(
+            "flow", "run", str(flow), "--until-step", "2",
+            "--evidence", "always", "--collect", "screenshot",
+            "--collect", "hierarchy",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        summary = json.loads(result.stdout)
+        self.assertEqual(summary["status"], "replayed")
+        self.assertEqual([step["command"] for step in summary["steps"]],
+                         ["launchApp", "tapOn"])
+        self.assertEqual(summary["replay_target"]["step_index"], 2)
+        self.assertNotIn("onFlowComplete", json.dumps(summary))
+
+        manifest = json.loads(
+            (Path(summary["events"]).parent / "manifest.json")
+            .read_text(encoding="utf-8"))
+        self.assertEqual(manifest["schema_version"], 3)
+        self.assertEqual(manifest["status"], "replayed")
+        self.assertEqual(manifest["replay"]["portable_restore"],
+                         "replay-from-flow-start")
+        self.assertTrue(manifest["replay"]["cleanup_hooks_skipped"])
+        kinds = {entry["kind"] for entry in manifest["artifact_steps"]}
+        self.assertIn("screenshot-before", kinds)
+        self.assertIn("screenshot-after", kinds)
+        self.assertIn("hierarchy-before", kinds)
+        self.assertIn("hierarchy-after", kinds)
+
+    def test_checkpoint_is_an_evidence_boundary_and_replay_target(self) -> None:
+        flow = self._flow(
+            "- launchApp\n- checkpoint: ready\n- pressKey: KEYCODE_ENTER\n",
+            header=("schema: autonom.dev/flow/v1\nappId: com.example.app\n"
+                    "name: checkpoint\nid: checkpoint-001\n---\n"),
+        )
+        result = self._cli("flow", "run", str(flow))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        summary = json.loads(result.stdout)
+        manifest = json.loads(
+            (Path(summary["events"]).parent / "manifest.json")
+            .read_text(encoding="utf-8"))
+        checkpoint = manifest["checkpoints"][0]
+        self.assertEqual(checkpoint["step_index"], 2)
+        self.assertEqual(checkpoint["name"], "ready")
+        evidence = [entry for entry in manifest["artifact_steps"]
+                    if entry["step_index"] == 2]
+        self.assertEqual({entry["kind"] for entry in evidence},
+                         {"screenshot-after", "hierarchy-after"})
+
+    def test_prefix_replay_can_target_a_reproduced_failed_assertion(self) -> None:
+        flow = self._flow(
+            "- assertVisible:\n"
+            "    selector:\n"
+            "      id: never-present\n"
+            "    timeoutMs: 200\n"
+            "- pressKey: KEYCODE_ENTER\n",
+        )
+        result = self._cli("flow", "run", str(flow), "--until-step", "1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        summary = json.loads(result.stdout)
+        self.assertEqual(summary["status"], "replayed")
+        self.assertEqual(summary["steps"][0]["status"], "failed")
+        self.assertEqual(summary["replay_target"]["status"], "failed")
+        self.assertEqual(summary["replay_target"]["error_code"],
+                         "flow_assertion_timeout")
+        self.assertEqual(len(summary["steps"]), 1)
+
     def test_duplicate_selector_taps_nothing(self) -> None:
         flow = self._flow(
             "- tapOn:\n    selector:\n      text: Settings\n      match: exact\n")
@@ -507,6 +584,24 @@ class CompositionTests(_AndroidRunBase):
         monkey = [a for a in self._adb_calls() if "monkey" in " ".join(a)]
         self.assertEqual(len(monkey), 1, "child launchApp must use the root appId")
 
+    def test_prefix_replay_can_stop_after_a_runflow_block(self) -> None:
+        sub = self.root / "sub.yaml"
+        sub.write_text("schema: autonom.dev/flow/v1\nname: child\n---\n"
+                       "- launchApp\n- back\n", encoding="utf-8")
+        flow = self._flow("- runFlow: sub.yaml\n"
+                          "- pressKey: KEYCODE_ENTER\n")
+        result = self._cli("flow", "run", str(flow), "--until-step", "1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        summary = json.loads(result.stdout)
+        self.assertEqual(summary["status"], "replayed")
+        self.assertEqual(summary["replay_target"]["command"], "runFlow")
+        self.assertEqual(summary["replay_target"]["step_index"], 1)
+        self.assertEqual([step["command"] for step in summary["steps"]],
+                         ["launchApp", "back", "runFlow"])
+        runflow = summary["steps"][-1]
+        self.assertTrue(runflow["step_id"].startswith("src_"))
+        self.assertIsInstance(runflow["finished_at_ms"], int)
+
     def test_runflow_when_condition_skips_with_reason(self) -> None:
         sub = self.root / "sub.yaml"
         sub.write_text("schema: autonom.dev/flow/v1\nname: child\n---\n- back\n",
@@ -574,7 +669,8 @@ class CompositionTests(_AndroidRunBase):
         events = [json.loads(line)
                   for line in Path(summary["events"]).read_text().splitlines()]
         captured = [e for e in events if e["kind"] == "flow.evidence.captured"]
-        self.assertEqual(len(captured), 2, "one capture per executed step")
+        self.assertEqual(len(captured), 4,
+                         "always mode captures before and after each step")
 
     def test_scroll_until_visible_bounded_and_failing(self) -> None:
         flow = self._flow(

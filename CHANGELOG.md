@@ -7,6 +7,39 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
 
 ## [Unreleased]
 
+## [0.29.0] - 2026-08-28
+
+The evidence report now implements the step-level debugging loop promised by
+the product roadmap.
+
+### Added
+- **Manifest v3 step records:** stable source/runtime IDs, source columns,
+  redacted canonical arguments, start/end timestamps, matched accessibility
+  target bounds, pre/postcondition fingerprints, checkpoint indexes, exact
+  execution commands, and step-correlated scrubbed network previews.
+- **Addressable evidence UI:** every step has a direct timeline anchor and
+  panels for before/after screenshots, matched-target highlighting, UI
+  hierarchy diff, device logs, and request/response previews. An unattached
+  network capture is explicitly unavailable instead of looking like an empty
+  request list.
+- **Portable prefix replay:** `flow run --until-step N` reconstructs state
+  from the flow start, stops after the selected runtime step with status
+  `replayed`, and skips cleanup hooks so the state remains inspectable.
+  `--evidence` and repeatable `--collect` flags control the replay bundle.
+- **Local report controls:** `report serve` binds to loopback and adds a
+  token-protected replay button to each recorded step. Browser input is
+  restricted to an existing run and step; it cannot provide a command or
+  arbitrary path.
+- `checkpoint` now captures its configured screenshot and hierarchy evidence
+  and is recorded as an addressable replay boundary.
+
+### Changed
+- Evidence mode `always` captures both sides of every step so screenshot and
+  hierarchy comparisons have a real before/after pair.
+- Network records include millisecond boundaries for honest step correlation;
+  headers and bodies remain scrubbed before they reach disk or the report.
+- Prefix replay runs are reported separately and do not fail a session suite.
+
 ## [0.28.5] - 2026-08-20
 
 Codex review of PR #1: three remaining findings, each pinned by a regression.

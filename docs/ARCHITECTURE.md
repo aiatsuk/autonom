@@ -149,8 +149,9 @@ Two rules carry the design.
 | `network *` | consent-gated HTTP(S) capture, mock, HAR |
 | `atlas update\|show\|coverage\|paths\|export\|diff` | the observed application graph, evidence-linked |
 | `proof --base` | run the covering flow suite for a diff; pass/fail/not_covered/blocked/inconclusive |
-| `report build\|open\|export` | self-contained HTML + JUnit from a run's manifest |
-| `flow check\|fmt\|list\|run` | validate, canonicalize, enumerate, and execute Flow v1 files (`docs/FLOW.md`); `run` polls assertions, fires mutations exactly once, and classifies failures |
+| `report build\|open\|export\|suite` | addressable per-step evidence UI, self-contained HTML, and JUnit |
+| `report serve` | loopback-only, token-protected replay-to-step controls over recorded runs |
+| `flow check\|fmt\|list\|run` | validate, canonicalize, enumerate, and execute Flow v1 files (`docs/FLOW.md`); `run` polls assertions, fires mutations once, and supports prefix replay |
 | `processes`, `cleanup` | machine-wide reaping of what Autonom started |
 | `session outputs`, `logs follow`, `network requests follow`, `journal --follow` | live session watch: stream catalog + bounded NDJSON follows |
 | `metrics *` | snapshot/series, memory pack, frames, trace presets; honest per-platform semantics (`docs/plans/PHASE_4_METRICS.md`) |

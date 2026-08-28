@@ -33,6 +33,8 @@ docs/plans/PHASE_5_FLOW_DSL.md):
 from __future__ import annotations
 
 import json
+import hashlib
+import calendar
 import re
 import time
 import uuid
@@ -109,6 +111,16 @@ class RunConfig:
     default_timeout_ms: int = 10_000
     interval_ms: int = 500
     dry_run: bool = False
+    # Prefix replay stops immediately after this runtime leaf-step index and
+    # deliberately skips onFlowComplete so the device remains at that state.
+    stop_after_step: int | None = None
+    # A report replay also pins the stable runtime ID from the source run so
+    # a diverged conditional/retry cannot make the same integer mean another step.
+    stop_after_step_id: str | None = None
+    stop_after_expected_status: str | None = None
+    # CLI/report replay may ask for stronger evidence than the flow header.
+    evidence_mode: str | None = None
+    evidence_collect: tuple[str, ...] | None = None
 
 
 @dataclass
@@ -126,13 +138,21 @@ class StepOutcome:
     failure_class: str | None = None
     error: str | None = None
     skip_reason: str | None = None
-    # manifest v2: wall clock (reports need real time, not just durations),
+    # Manifest timeline fields: wall clock (reports need real time, not just durations),
     # the selector actually used, and where the step sits in the block tree
     started_at_ms: int | None = None
     selector: dict | None = None
     depth: int = 0
     parent_index: int | None = None
     retry_attempt: int | None = None
+    step_id: str | None = None
+    source_id: str | None = None
+    column: int | None = None
+    canonical_args: dict | None = None
+    target: dict | None = None
+    precondition_fingerprint: dict | None = None
+    postcondition_fingerprint: dict | None = None
+    finished_at_ms: int | None = None
 
 
 @dataclass
@@ -149,6 +169,7 @@ class RunResult:
     # existing consumers keep counting the same leaves
     blocks: list = field(default_factory=list)
     events_path: str | None = None
+    replay_target: dict | None = None
 
 
 def _iter_var_names(text: str):
@@ -170,6 +191,14 @@ def _iter_var_names(text: str):
 
 class _Stop(Exception):
     """Internal: a step failed as a test failure; unwind to the run loop."""
+
+
+class _ReplayReached(Exception):
+    """Internal: the requested prefix is complete; preserve device state."""
+
+    def __init__(self, outcome: StepOutcome) -> None:
+        super().__init__(str(outcome.index))
+        self.outcome = outcome
 
 
 class Executor:
@@ -205,6 +234,8 @@ class Executor:
         self._artifact_steps: list[dict] = []
         self._writer_run_id: str | None = None
         self._last_nodes: list | None = None
+        self._last_match: dict | None = None
+        self._source_occurrences: dict[str, int] = {}
 
     # -- public ---------------------------------------------------------------
 
@@ -215,6 +246,7 @@ class Executor:
         self.runtime_values = {}
         self.sensitive_var_names = set()
         self._artifact_steps = []
+        self._source_occurrences = {}
         self._children = {}
         self._collect_children(flow, flow.app_id)
         # Every name declared ANYWHERE in the graph (root env/--env/secrets,
@@ -238,8 +270,8 @@ class Executor:
         self._writer_run_id = run_id
         result = RunResult(run_id=run_id, status="passed",
                            events_path=str(writer.path))
-        evidence = flow.evidence or Evidence()
-        unsupported = [k for k in evidence.collect if k in ("logs", "crashes", "network")]
+        evidence = self._effective_evidence(flow)
+        unsupported = [k for k in evidence.collect if k == "crashes"]
         writer.emit("flow.run.started", {
             "flow": flow.path, "name": flow.name, "app_id": flow.app_id,
             "tags": flow.tags, "steps": len(flow.steps),
@@ -256,12 +288,38 @@ class Executor:
 
         result.started_at_ms = self._wall_ms()
         aborted: errors.AutonomError | None = None
+        replay_reached = False
         try:
             if flow.on_flow_start:
                 self._execute_steps(flow.on_flow_start, flow, root_values,
                                     writer, result, evidence, hook="onFlowStart")
             self._execute_steps(flow.steps, flow, root_values,
                                 writer, result, evidence)
+            if (self.config.stop_after_step is not None
+                    or self.config.stop_after_step_id is not None):
+                raise errors.AutonomError(
+                    errors.FLOW_REPLAY_STEP_NOT_REACHED,
+                    f"flow finished before runtime step "
+                    f"{self.config.stop_after_step} was reached",
+                    hint="Choose a step from the source run. Conditional or "
+                         "retry control flow may have diverged during replay.",
+                    requested_step=self.config.stop_after_step,
+                    requested_step_id=self.config.stop_after_step_id,
+                    last_step=self._counter,
+                )
+        except _ReplayReached as reached:
+            replay_reached = True
+            result.status = "replayed"
+            result.replay_target = {
+                "step_index": reached.outcome.index,
+                "step_id": reached.outcome.step_id,
+                "source_id": reached.outcome.source_id,
+                "command": reached.outcome.command,
+                "line": reached.outcome.line,
+                "status": reached.outcome.status,
+                "error_code": reached.outcome.error_code,
+                "error": reached.outcome.error,
+            }
         except _Stop:
             result.status = "failed"
         except errors.AutonomError as exc:
@@ -271,7 +329,8 @@ class Executor:
             result.status = "failed"
             aborted = exc
         finally:
-            if flow.on_flow_complete and not self.config.dry_run:
+            if (flow.on_flow_complete and not self.config.dry_run
+                    and not replay_reached):
                 self._run_complete_hooks(flow, root_values, writer, result,
                                          evidence)
 
@@ -304,6 +363,7 @@ class Executor:
             "status": result.status,
             "steps": len(result.steps),
             "failure": result.failure,
+            "replay_target": result.replay_target,
         }, sensitive=result.sensitive)
         self._write_manifest(flow, writer, result)
         if aborted is not None:
@@ -327,7 +387,7 @@ class Executor:
                 for base in (run_dir, shots_dir) if base.is_dir()
                 for p in base.rglob("*") if p.is_file())
             manifest = {
-                "schema_version": 2,
+                "schema_version": 3,
                 "session_id": self.session.get("session_id"),
                 "run_id": writer.run_id,
                 "flow_id": flow.flow_id,
@@ -344,10 +404,17 @@ class Executor:
                     {k: v for k, v in vars(step).items() if v is not None}
                     for step in result.steps
                 ],
+                "checkpoints": [
+                    {"step_index": step.index, "step_id": step.step_id,
+                     "source_id": step.source_id,
+                     "name": (step.canonical_args or {}).get("name")}
+                    for step in result.steps if step.command == "checkpoint"
+                ],
                 "artifacts": artifacts,
                 "artifact_steps": self._artifact_steps,
                 "reproduction": self._reproduction_command(flow),
-                # --- v2: what reports and exporters need beyond the timeline
+                "execution_command": self._execution_command(flow),
+                # What reports and exporters need beyond the timeline.
                 "started_at_ms": result.started_at_ms,
                 "finished_at_ms": result.finished_at_ms,
                 "blocks": result.blocks,
@@ -359,7 +426,24 @@ class Executor:
                 "converted_from": flow.converted_from,
                 "workspace_root": str(
                     flow_validator.workspace_root(Path(flow.path))),
-                "evidence_mode": (flow.evidence or Evidence()).mode,
+                "environment": {
+                    "platform": self.target.platform,
+                    "target_id": self.target.target_id,
+                    "serial": self.target.serial,
+                    "app_id": flow.app_id,
+                    "tooling": self.session.get("tooling") or {},
+                    "network_capture": (self.session.get("network") or {}).get(
+                        "attached", False),
+                },
+                "evidence_mode": self._effective_evidence(flow).mode,
+                "evidence_collect": self._effective_evidence(flow).collect,
+                "network": self._network_evidence(result),
+                "replay": ({
+                    "mode": "prefix",
+                    "portable_restore": "replay-from-flow-start",
+                    "target": result.replay_target,
+                    "cleanup_hooks_skipped": True,
+                } if result.replay_target else None),
             }
             path = run_dir / "manifest.json"
             path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2),
@@ -375,6 +459,93 @@ class Executor:
         for key, value in self.config.env.items():
             parts.append(f"--env {key}={value}")
         return " ".join(parts)
+
+    def _execution_command(self, flow: Flow) -> str:
+        command = self._reproduction_command(flow)
+        if self.config.stop_after_step is not None:
+            command += f" --until-step {self.config.stop_after_step}"
+        if self.config.evidence_mode:
+            command += f" --evidence {self.config.evidence_mode}"
+        for kind in self.config.evidence_collect or ():
+            command += f" --collect {kind}"
+        return command
+
+    def _effective_evidence(self, flow: Flow) -> Evidence:
+        source = flow.evidence or Evidence()
+        return Evidence(
+            mode=self.config.evidence_mode or source.mode,
+            before_mutation=(source.before_mutation
+                             or self.config.evidence_mode == "always"),
+            after_assertion=(source.after_assertion
+                             or self.config.evidence_mode == "always"),
+            collect=list(self.config.evidence_collect or source.collect),
+            bodies=source.bodies,
+            explicit=list(source.explicit),
+        )
+
+    @staticmethod
+    def _request_started_ms(request: dict[str, Any]) -> int | None:
+        value = request.get("started_at_ms")
+        if isinstance(value, int):
+            return value
+        text = request.get("started_at")
+        if not isinstance(text, str):
+            return None
+        try:
+            return int(calendar.timegm(
+                time.strptime(text, "%Y-%m-%dT%H:%M:%SZ")) * 1000)
+        except ValueError:
+            return None
+
+    def _network_evidence(self, result: RunResult) -> dict[str, Any]:
+        """Correlate already-scrubbed session traffic with step wall times."""
+        attached_state = (self.session.get("network") or {}).get("attached")
+        capture = ("attached" if attached_state is True else
+                   "unknown" if attached_state == "unknown" else "not-attached")
+        payload: dict[str, Any] = {
+            "available": False,
+            "capture": capture,
+            "requests_by_step": [],
+        }
+        try:
+            from ..network import store as network_store
+            requests, warnings = network_store.read_all(self.session)
+        except Exception:  # noqa: BLE001 — supplementary evidence only
+            payload.update({"available": False,
+                            "reason": "network evidence could not be read"})
+            return payload
+        if warnings:
+            payload["warnings"] = warnings
+        run_start = result.started_at_ms or 0
+        run_end = result.finished_at_ms or self._wall_ms()
+        in_run = []
+        for request in requests:
+            started = self._request_started_ms(request)
+            if started is not None and run_start <= started <= run_end:
+                in_run.append((started, request))
+        for step in result.steps:
+            start = step.started_at_ms
+            end = step.finished_at_ms
+            if start is None or end is None:
+                continue
+            matched = [request for stamp, request in in_run
+                       if start <= stamp <= end]
+            if matched:
+                payload["requests_by_step"].append({
+                    "step_index": step.index,
+                    "step_id": step.step_id,
+                    "requests": matched[-50:],
+                    "truncated": len(matched) > 50,
+                })
+        payload["captured"] = sum(
+            len(item["requests"]) for item in payload["requests_by_step"])
+        payload["available"] = attached_state is True or payload["captured"] > 0
+        if not payload["available"]:
+            payload["reason"] = (
+                "network attachment was not confirmed and no traffic was observed"
+                if attached_state == "unknown"
+                else "network capture was not attached for this run")
+        return payload
 
     # -- pre-flight -----------------------------------------------------------
 
@@ -693,6 +864,88 @@ class Executor:
 
     # -- execution ------------------------------------------------------------
 
+    def _step_identifiers(self, flow: Flow, step: Step) -> tuple[str, str]:
+        """Stable source identity plus a deterministic runtime occurrence."""
+        try:
+            root = flow_validator.workspace_root(Path(flow.path)).resolve()
+            source_path = str(Path(flow.path).resolve().relative_to(root))
+        except (OSError, ValueError):
+            source_path = Path(flow.path).name
+        scope = flow.flow_id or source_path
+        raw = f"{scope}:{step.line}:{step.col}:{step.command}"
+        source_id = "src_" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
+        occurrence = self._source_occurrences.get(source_id, 0) + 1
+        self._source_occurrences[source_id] = occurrence
+        return source_id, f"{source_id}.{occurrence}"
+
+    @staticmethod
+    def _canonical_args(step: Step) -> dict[str, Any]:
+        """JSON-safe source arguments; sensitive literal values stay redacted."""
+        sensitive = bool(step.args.get("sensitive"))
+
+        def convert(value: Any, key: str | None = None) -> Any:
+            if sensitive and key in {
+                    "value", "text", "url", "path", "latitude", "longitude"}:
+                return "<redacted>"
+            if isinstance(value, FlowSelector):
+                return flow_selectors.describe(value)
+            if isinstance(value, WhenClause):
+                result: dict[str, Any] = {}
+                if value.platform:
+                    result["platform"] = value.platform
+                if value.visible:
+                    result["visible"] = flow_selectors.describe(value.visible)
+                if value.not_visible:
+                    result["notVisible"] = flow_selectors.describe(value.not_visible)
+                if value.env_equals:
+                    result["envEquals"] = dict(value.env_equals)
+                return result
+            if isinstance(value, Step):
+                return {"command": value.command,
+                        "args": {name: convert(item, name)
+                                 for name, item in value.args.items()}}
+            if isinstance(value, dict):
+                return {str(name): convert(item, str(name))
+                        for name, item in value.items()}
+            if isinstance(value, (list, tuple)):
+                return [convert(item) for item in value]
+            return value
+
+        return {name: convert(value, name) for name, value in step.args.items()}
+
+    def _target_record(self, *, sensitive: bool = False) -> dict[str, Any] | None:
+        node = self._last_match
+        if not node:
+            return None
+        fields = ("ref", "role", "text", "desc", "resource_id", "bounds")
+        target = {name: node.get(name) for name in fields
+                  if node.get(name) not in (None, "")}
+        if sensitive:
+            # The matched label may be the value copied by copyTextFrom. Bounds
+            # and stable accessibility identity still support highlighting.
+            target.pop("text", None)
+            target.pop("desc", None)
+        if node.get("bounds"):
+            try:
+                screen = self._screen_size()
+            except errors.AutonomError:
+                screen = None
+            if screen:
+                target["viewport"] = list(screen)
+        return target or None
+
+    def _is_replay_target(self, outcome: StepOutcome) -> bool:
+        reached = (
+            outcome.step_id == self.config.stop_after_step_id
+            if self.config.stop_after_step_id is not None
+            else (self.config.stop_after_step is not None
+                  and outcome.index == self.config.stop_after_step)
+        )
+        if (reached and self.config.stop_after_expected_status is not None
+                and outcome.status != self.config.stop_after_expected_status):
+            return False
+        return reached
+
     def _execute_steps(self, steps: list, flow: Flow, values: dict,
                        writer: EventWriter, result: RunResult,
                        evidence: Evidence, hook: str | None = None) -> None:
@@ -719,6 +972,8 @@ class Executor:
                 outcome = self._execute_step(step, flow, writer, evidence,
                                              hook=hook)
                 result.steps.append(outcome)
+                if self._is_replay_target(outcome):
+                    raise _ReplayReached(outcome)
                 if outcome.status == "failed":
                     raise _Stop()
         finally:
@@ -730,15 +985,21 @@ class Executor:
         inline = "file" not in step.args
         child = flow if inline else self._child_of(flow, step)
         self._counter += 1
+        source_id, step_id = self._step_identifiers(flow, step)
         outcome = StepOutcome(index=self._counter, command="runFlow",
                               label=step.label, line=step.line,
                               status="passed", flow=flow.path, hook=hook,
                               started_at_ms=self._wall_ms(),
                               depth=len(self._block_stack),
                               parent_index=(self._block_stack[-1]
-                                            if self._block_stack else None))
+                                            if self._block_stack else None),
+                              step_id=step_id, source_id=source_id,
+                              column=step.col,
+                              canonical_args=self._canonical_args(step))
         payload = {"step_index": outcome.index, "command": "runFlow",
                    "label": step.label, "file": flow.path, "line": step.line,
+                   "column": step.col, "step_id": step_id,
+                   "source_id": source_id,
                    "child": "(inline)" if inline else child.path}
         writer.emit("flow.step.started", payload)
 
@@ -765,7 +1026,10 @@ class Executor:
                                  "duration_ms": 0, "attempts": 1})
                 event = writer.emit("flow.step.finished", finished)
                 writer.journal_step(event)
+                outcome.finished_at_ms = self._wall_ms()
                 result.steps.append(outcome)
+                if self._is_replay_target(outcome):
+                    raise _ReplayReached(outcome)
                 return
 
         child_env_arg = {}
@@ -807,6 +1071,8 @@ class Executor:
         self._record_runflow_block(result, outcome, child if not inline else None,
                                    first_index, started)
         self._finish_runflow(outcome, payload, started, writer, result)
+        if self._is_replay_target(outcome):
+            raise _ReplayReached(outcome)
 
     def _record_runflow_block(self, result: RunResult, outcome: StepOutcome,
                               child: Flow | None, first_index: int,
@@ -826,6 +1092,7 @@ class Executor:
                         started: float, writer: EventWriter,
                         result: RunResult) -> None:
         outcome.duration_ms = int((self.clock() - started) * 1000)
+        outcome.finished_at_ms = self._wall_ms()
         finished = dict(payload)
         finished.update({"status": outcome.status,
                          "duration_ms": outcome.duration_ms, "attempts": 1})
@@ -1077,6 +1344,7 @@ class Executor:
                       evidence: Evidence, hook: str | None = None) -> StepOutcome:
         self._counter += 1
         index = self._counter
+        source_id, step_id = self._step_identifiers(flow, step)
         outcome = StepOutcome(index=index, command=step.command,
                               label=step.label, line=step.line,
                               status="passed", flow=flow.path, hook=hook,
@@ -1084,10 +1352,14 @@ class Executor:
                               depth=len(self._block_stack),
                               parent_index=(self._block_stack[-1]
                                             if self._block_stack else None),
-                              retry_attempt=self._retry_attempt)
+                              retry_attempt=self._retry_attempt,
+                              step_id=step_id, source_id=source_id,
+                              column=step.col,
+                              canonical_args=self._canonical_args(step))
         payload: dict[str, Any] = {
             "step_index": index, "command": step.command, "label": step.label,
-            "file": flow.path, "line": step.line,
+            "file": flow.path, "line": step.line, "column": step.col,
+            "step_id": step_id, "source_id": source_id,
         }
         if hook:
             payload["hook"] = hook
@@ -1098,10 +1370,12 @@ class Executor:
             outcome.selector = payload["selector"]
         writer.emit("flow.step.started", payload)
 
-        self._auto_evidence(evidence, step, "before", index, writer)
+        outcome.precondition_fingerprint = self._auto_evidence(
+            evidence, step, "before", index, writer)
         sensitive = bool(step.args.get("sensitive"))
         started = self.clock()
         self._last_nodes = None
+        self._last_match = None
         attempts = [0]
         try:
             secret_used = self._dispatch(step, flow, attempts)
@@ -1118,9 +1392,12 @@ class Executor:
                 if evidence.mode != "minimal":
                     self._capture_failure_evidence(index, writer)
         else:
-            self._auto_evidence(evidence, step, "after", index, writer)
+            outcome.target = self._target_record(sensitive=sensitive)
+            outcome.postcondition_fingerprint = self._auto_evidence(
+                evidence, step, "after", index, writer)
         outcome.duration_ms = int((self.clock() - started) * 1000)
         outcome.attempts = max(attempts[0], 1)
+        outcome.finished_at_ms = self._wall_ms()
 
         finished = dict(payload)
         finished.update({
@@ -1137,6 +1414,8 @@ class Executor:
             # nearly free: the snapshot is already in memory, and the Atlas
             # ingests these fingerprints into the observed graph
             finished["screen"] = atlas_fingerprint.fingerprint(self._last_nodes)
+        if outcome.target:
+            finished["target"] = outcome.target
         event = writer.emit("flow.step.finished", finished, sensitive=sensitive)
         writer.journal_step(event)
 
@@ -1151,31 +1430,63 @@ class Executor:
         return outcome
 
     def _auto_evidence(self, evidence: Evidence, step: Step, phase: str,
-                       index: int, writer: EventWriter) -> None:
-        if evidence.mode == "minimal" or "screenshot" not in evidence.collect:
-            return
+                       index: int, writer: EventWriter) -> dict | None:
+        if evidence.mode == "minimal":
+            return None
         wanted = (
-            (phase == "after" and evidence.mode == "always")
+            evidence.mode == "always"
+            or (phase == "after" and step.command == "checkpoint"
+                and evidence.mode != "minimal")
             or (phase == "before" and evidence.before_mutation
                 and step.spec.mutating and evidence.mode != "on-failure")
             or (phase == "after" and evidence.after_assertion
                 and step.spec.assertion and evidence.mode != "on-failure")
         )
         if not wanted:
-            return
-        try:
-            detail = screenshot_mod.capture_evidence(
-                self.target, self.session, label=f"step-{index}-{phase}",
-                task=writer.run_id)
-            self._note_artifact(detail.get("path", ""), index, phase)
+            return None
+        captured: dict[str, str] = {}
+        nodes: list[dict[str, Any]] | None = None
+        if "screenshot" in evidence.collect:
+            try:
+                detail = screenshot_mod.capture_evidence(
+                    self.target, self.session, label=f"step-{index}-{phase}",
+                    task=writer.run_id)
+                captured["screenshot"] = detail.get("path", "")
+            except Exception:  # noqa: BLE001 — evidence is best-effort
+                pass
+        if "hierarchy" in evidence.collect:
+            try:
+                nodes, warnings = ui_mod.tree(self.target)
+                path = writer.run_dir() / f"step-{index}-{phase}-hierarchy.json"
+                path.write_text(json.dumps({"nodes": nodes, "warnings": warnings},
+                                           ensure_ascii=False, indent=2),
+                                encoding="utf-8")
+                captured["hierarchy"] = str(path)
+            except Exception:  # noqa: BLE001
+                pass
+        if phase == "after" and "logs" in evidence.collect:
+            try:
+                from .. import logs as logs_mod
+                entries, _warnings = logs_mod.tail(
+                    self.target, package=self.session.get("app_id"),
+                    since_seconds=30, max_lines=200)
+                if entries:
+                    path = writer.run_dir() / f"step-{index}-after-logs.txt"
+                    path.write_text(
+                        "\n".join(entry.get("line", "") for entry in entries) + "\n",
+                        encoding="utf-8")
+                    captured["logs"] = str(path)
+            except Exception:  # noqa: BLE001
+                pass
+        if captured:
+            for kind, path in captured.items():
+                self._note_artifact(path, index, f"{kind}-{phase}")
             writer.emit("flow.evidence.captured",
-                        {"step_index": index, "phase": phase,
-                         "screenshot": detail.get("path", "")})
-        except Exception:  # noqa: BLE001 — evidence is best-effort
-            pass
+                        {"step_index": index, "phase": phase, **captured})
+        return atlas_fingerprint.fingerprint(nodes) if nodes else None
 
     def _note_artifact(self, path: str, index: int, kind: str) -> None:
-        """Record which step an artifact belongs to (manifest v2)."""
+        """Record which step an artifact belongs to (manifest v2+)."""
         if not path:
             return
         try:
@@ -1360,7 +1671,10 @@ class Executor:
                                 self._counter, "screenshot")
             return False
         if command == "checkpoint":
-            return False  # the step event itself is the checkpoint record
+            # Evidence is captured by _auto_evidence after dispatch. The
+            # checkpoint is therefore both an addressable replay target and a
+            # concrete screenshot/hierarchy boundary, not an empty marker.
+            return False
         if command == "note":
             text, secret = self._resolve(step.args["text"])
             if not secret:  # a secret-bearing note must not reach the journal
@@ -1375,7 +1689,9 @@ class Executor:
         that occurrence (missing = simply "not there", not an error)."""
         nodes = ui_mod.snapshot(self.target)
         self._last_nodes = nodes
-        return flow_selectors.select_all(nodes, selector)
+        matches = flow_selectors.select_all(nodes, selector)
+        self._last_match = matches[0] if len(matches) == 1 else None
+        return matches
 
     def _poll_for_one(self, selector: FlowSelector, step: Step, attempts: list):
         """Poll while ZERO nodes match; the moment any match, select once."""
@@ -1387,6 +1703,7 @@ class Executor:
             self._last_nodes = nodes
             candidates = flow_selectors.select(nodes, selector)
             if candidates:
+                self._last_match = candidates[0]
                 return candidates[0]  # >1 already raised ambiguous_selector
             if self.clock() >= deadline:
                 raise errors.AutonomError(

@@ -21,8 +21,8 @@ permissions, location, media and container files, consent-gated HTTP(S) capture
 and mocking, a per-session journal of every action, and **Flow v1** —
 repeatable flow files with exact selectors, polling assertions, and failure
 classes ([`docs/FLOW.md`](docs/FLOW.md)), plus Maestro import/export,
-session→flow compilation (`flow create --from-session`), evidence reports
-(HTML/JUnit), an observed application atlas, local PR proof
+session→flow compilation (`flow create --from-session`), addressable per-step
+evidence reports (HTML/JUnit) with loopback replay controls, an observed application atlas, local PR proof
 (`autonom proof --base`), live session watch (`session outputs`,
 `logs follow`, `network requests follow`), and an `autonom metrics` family
 (memory, CPU, frames, traces). Domain packs for Flutter, native

@@ -215,6 +215,10 @@ class AutonomRecorder:
         record = {
             "id": identifier,
             "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(started)),
+            # Millisecond boundaries let a flow report correlate requests to
+            # individual steps. Keep the ISO field for human/CLI compatibility.
+            "started_at_ms": int(started * 1000),
+            "finished_at_ms": int(ended * 1000),
             "method": flow.request.method,
             "url": flow.request.pretty_url,
             "host": flow.request.host,

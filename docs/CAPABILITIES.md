@@ -50,7 +50,7 @@ Legend: ✅ shipped · ⚠️ partial · 🔜 planned · ❌ not planned for nea
 | Flow DSL: Session → Flow compiler | ✅ | ✅ | `flow create --from-session` — proven selectors reused, secrets become `${SECRET_n}`, coordinate taps refuse to compile |
 | PR Proof (local) | ✅ | ✅ | `proof --base` — covers-globs + pull-request tags select the suite; verdicts pass/fail/not_covered/blocked/inconclusive, never upgraded |
 | Atlas-lite: observed screens/transitions graph | ✅ | ✅ | `atlas update|show|coverage|paths|export|diff`; fingerprints ride in run events; observed-only, unknown stays unknown |
-| Evidence: run manifest + HTML/JUnit reports | ✅ | ✅ | `report build|open|export|suite`; self-contained HTML (CSP, inline screenshots), JUnit for CI, failure log window; `suite` renders one page + one JUnit document over every run in the session |
+| Evidence: step debugger + HTML/JUnit reports | ✅ | ✅ | manifest v3; addressable screenshots, hierarchy diff, logs, scrubbed requests; `report build|open|export|suite|serve`; loopback replay controls; JUnit for CI |
 | Flow DSL: Maestro Core Profile import/export | ✅ | ✅ | `flow import`/`flow export --format maestro`; outside-profile constructs refuse with `unsupported_flow_command` |
 | Live session outputs catalog | ✅ | ✅ | `session outputs` — registered `streams[]` + directory scan, `abs_path`/`shell_hint` for `tail -f` |
 | Live follow (session files / device logs) | ✅ | ✅ | `logs follow` — NDJSON lines, always bounded by `--max-seconds`/`--max-lines`; `journal --follow` for the timeline |
@@ -122,6 +122,8 @@ autonom flow import <path> [--out PATH]
 autonom flow export <path> [--format maestro] [--out PATH]
 autonom flow run <path> [--include-tag TAG] [--exclude-tag TAG] [--env KEY=VALUE]
                  [--secret NAME] [--default-timeout-ms N] [--events] [--dry-run]
+                 [--until-step N] [--evidence flow|minimal|on-failure|always]
+                 [--collect screenshot|hierarchy|logs|crashes|network]
 
 autonom proof --base <REF> [--head REF] [--repo PATH] [--flows DIR] [--out DIR]
               [--env KEY=VALUE] [--secret NAME]
@@ -137,6 +139,7 @@ autonom report build [--session ID] [--run ID]
 autonom report open [--session ID] [--run ID]
 autonom report export [--session ID] [--run ID] [--format html|junit] [--out PATH]
 autonom report suite [--session ID] [--last N] [--out DIR] [--relative-to DIR] [--detailed] [--screenshots none|failed|all] [--open]
+autonom report serve [--session ID] [--run ID] [--port N] [--open]
 
 autonom screenshot [--label L] [--task T] [--out PATH]
 autonom shots list [--task T] [--grep P] [--mocked-only] [--max N]
