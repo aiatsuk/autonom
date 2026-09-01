@@ -74,6 +74,100 @@ def list_avds(emulator_bin: str) -> list[str]:
     return names
 
 
+# --- AVD hardware profiles --------------------------------------------------
+#
+# `-list-avds` gives names only. Which of them is the phone with the 1080x2400
+# screen, or the tablet, lives in each AVD's `config.ini` — and an agent asked
+# to "test on a phone-sized emulator" has to read it, or guess from the name.
+
+_INI_LINE = re.compile(r"^\s*([^#=\s][^=]*?)\s*=\s*(.*?)\s*$")
+
+
+def avd_home() -> Path:
+    """Where AVDs live: `$ANDROID_AVD_HOME`, else `~/.android/avd`."""
+    override = os.environ.get("ANDROID_AVD_HOME")
+    return Path(override).expanduser() if override else Path.home() / ".android" / "avd"
+
+
+def _read_ini(path: Path) -> dict[str, str]:
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return {}
+    values: dict[str, str] = {}
+    for line in text.splitlines():
+        match = _INI_LINE.match(line)
+        if match:
+            values[match.group(1)] = match.group(2)
+    return values
+
+
+def _as_int(value: str | None) -> int | None:
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def describe_avd(name: str) -> dict[str, Any]:
+    """The hardware profile behind one AVD, from its ini files.
+
+    `<home>/<name>.ini` holds the API target and the path of the `.avd`
+    directory (AVDs can live outside the home); `<dir>/config.ini` holds the
+    `hw.*` profile. Anything unreadable is reported as null, never guessed.
+    """
+    home = avd_home()
+    pointer = _read_ini(home / f"{name}.ini")
+    directory = Path(pointer["path"]).expanduser() if pointer.get("path") else home / f"{name}.avd"
+    config = _read_ini(directory / "config.ini")
+    width = _as_int(config.get("hw.lcd.width"))
+    height = _as_int(config.get("hw.lcd.height"))
+    api = None
+    target = pointer.get("target") or config.get("image.sysdir.1") or ""
+    match = re.search(r"android-(\d+)", target)
+    if match:
+        api = int(match.group(1))
+    return {
+        "name": name,
+        "device": config.get("hw.device.name") or None,
+        "screen": (
+            {"width": width, "height": height,
+             "density": _as_int(config.get("hw.lcd.density"))}
+            if width and height else None
+        ),
+        "api": api,
+        "abi": config.get("abi.type") or None,
+        "path": str(directory) if config else None,
+    }
+
+
+def describe_avds(names: list[str]) -> list[dict[str, Any]]:
+    return [describe_avd(name) for name in names]
+
+
+def running_avd_name(adb_path: str, serial: str) -> str | None:
+    """The AVD a running emulator was booted from, via its console.
+
+    `adb emu avd name` answers only on `emulator-<port>` serials; hardware is
+    skipped without an adb call. Best-effort: None when the console is
+    unreachable, so the inventory never fails on it.
+    """
+    if not EMULATOR_SERIAL.match(serial):
+        return None
+    try:
+        completed = adb_mod.run_adb(
+            adb_path, ["emu", "avd", "name"], serial=serial, timeout=10, check=False,
+        )
+    except errors.AutonomError:
+        return None
+    output = completed.stdout if isinstance(completed.stdout, str) else ""
+    for line in output.splitlines():
+        line = line.strip()
+        if line and line not in ("OK", "KO") and not line.startswith("KO:") and AVD_NAME.match(line):
+            return line
+    return None
+
+
 def boot_avd(
     emulator_bin: str,
     adb_path: str,

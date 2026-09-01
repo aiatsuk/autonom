@@ -23,7 +23,15 @@ python3 <autonom-root>/scripts/autonom.py doctor           # what this machine c
 
 Each device carries `running` (true when Booted / `device`), so you can tell a
 live target from a cold one without knowing each platform's wording. The
-Android listing also reports `avds`: bootable emulator images not yet started.
+Android listing also reports `avds` (bootable emulator images not yet started)
+and `avd_profiles` — each AVD's hardware profile, screen size and density, and
+API level read from its `config.ini` — so "the phone-sized emulator" is a
+lookup, not a guess from the name. A running emulator names the `avd` it
+booted from.
+
+`doctor` lists every active `AUTONOM_*` override under `overrides` and warns
+with `override_path_missing` when one points at a binary that does not exist —
+the usual reason a tool reads as missing while `which` finds it.
 
 ### Boot and shut down a target
 
@@ -138,6 +146,8 @@ export AUTONOM_IDB_COMPANION=mac-farm-01:10882
 | `idb_required` | iOS `ui` verbs need idb; `screenshot`/`logs`/`open` still work |
 | `ios_boot_failed` | simulator never reached `Booted`; try `xcrun simctl erase <udid>` |
 | `no_active_session` | start one with `session start` |
+| `simulator_must_be_shutdown` | `simulator keyboard pin` needs a shut-down simulator; pass `--value reboot=true` or shut it down first |
+| `simulator_data_not_found` | the simulator has no data directory yet — boot it once, or set `AUTONOM_CORESIMULATOR_DEVICES` |
 
 ## Related skills
 

@@ -139,6 +139,33 @@ class DoctorTests(unittest.TestCase):
             codes = {warning["code"] for warning in report["warnings"]}
             self.assertIn("device_may_be_left_attached", codes)
 
+    def test_active_overrides_are_named(self) -> None:
+        """A `--adb` flag is promoted to AUTONOM_ADB; doctor must say so."""
+        report = json.loads(self._run("--adb", str(FAKE_ADB)).stdout)
+        self.assertEqual(report["overrides"]["AUTONOM_ADB"],
+                         {"value": str(FAKE_ADB), "exists": True})
+        # The test harness's own AUTONOM_HOME redirect is an override too.
+        self.assertIn("AUTONOM_HOME", report["overrides"])
+        self.assertNotIn("AUTONOM_SIMCTL", report["overrides"])
+
+    def test_override_pointing_at_nothing_is_warned_by_name(self) -> None:
+        """The stale-env trap: adb reads as missing while `which adb` finds it."""
+        with tempfile.TemporaryDirectory() as home:
+            env = dict(os.environ)
+            env["AUTONOM_HOME"] = home
+            env["AUTONOM_ADB"] = str(Path(home) / "nonexistent-adb")
+            result = subprocess.run(
+                [sys.executable, str(CLI), "doctor"],
+                cwd=ROOT, env=env, text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, timeout=120,
+            )
+            report = json.loads(result.stdout)
+            self.assertFalse(report["overrides"]["AUTONOM_ADB"]["exists"])
+            warning = next(w for w in report["warnings"] if w["code"] == "override_path_missing")
+            self.assertEqual(warning["variable"], "AUTONOM_ADB")
+            self.assertIn("unset AUTONOM_ADB", warning["hint"])
+            self.assertNotEqual(report["tools"]["adb"]["state"], "ok")
+
     def test_installed_tools_are_reported_ok(self) -> None:
         env_result = self._run("--adb", str(FAKE_ADB), "--simctl", str(FAKE_SIMCTL))
         report = json.loads(env_result.stdout)

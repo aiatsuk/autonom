@@ -42,6 +42,24 @@ Instruments) before patching. Never compare Android total_pss_kb with iOS
 rss_bytes — the payload's metric_semantics and limitations say why.
 ```
 
+## Prove a UI change with before/after screenshots
+
+```text
+Pin the status bar on the simulator, pin the keyboard to en-US, take a
+screenshot of the settings screen, flip the dark-mode toggle, take another,
+and report only the differences the app itself made. Then clear the status
+bar and reset the keyboard.
+```
+
+## Repair a flow the app outgrew
+
+```text
+Run flows/checkout.yaml. If it fails with a test failure, follow the
+`repair` block in order: replay the prefix with --until-step, dump the tree,
+run the widened ui find, and tell me the label or identifier the button has
+now. Propose the YAML edit; do not apply it without showing me the diff.
+```
+
 ## See what the app actually sent
 
 ```text

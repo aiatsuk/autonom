@@ -7,6 +7,47 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
 
 ## [Unreleased]
 
+Deterministic capture state and a repair hand-off, borrowed from
+[goldie](https://github.com/kacperkapusciak/goldie) — an App Store screenshot
+generator that replays flows on the same simulators and emulators and had
+already solved the noise that makes two captures of one screen differ.
+
+### Added
+- **`simulator status-bar pin`** on both platforms: 9:41, full battery and
+  signal, no notifications — `simctl status_bar override` on iOS, SystemUI
+  demo mode on Android — so a before/after screenshot diff shows only what
+  the app changed. Given keys override the preset; `clear` restores the bar.
+- **`simulator keyboard pin|reset|show`** (iOS): autocorrect, prediction, and
+  auto-capitalisation off and the locale set, written with `plistlib` into
+  the shut-down simulator's preference store and read back for `verified`.
+  `reboot=true` cycles a booted device; a booted one without it is refused
+  with the new `simulator_must_be_shutdown`; a device with no data directory
+  with `simulator_data_not_found`. Android refuses with
+  `unsupported_capability` because the settings live inside Gboard.
+  `AUTONOM_CORESIMULATOR_DEVICES` relocates the Devices directory.
+- **Flow repair brief:** a test failure in `flow run` carries `repair` — the
+  `--until-step` prefix replay, `ui tree`, the old selector as a widened
+  `ui find … --mode contains --all`, a labelled screenshot, and the
+  re-verification commands, plus advice keyed by the error code and the
+  events path as evidence. Definition/infrastructure failures get none.
+- `screenshot`, `shots show`, and the shot index report `width`/`height`
+  from the PNG header, so an agent knows the capture's coordinate space.
+- `devices` adds `avd_profiles` (hardware profile, screen size and density,
+  API level, ABI from each AVD's ini files; nulls when unreadable) and names
+  the `avd` a running emulator booted from via its console.
+- `doctor` reports every active `AUTONOM_*` override under `overrides` and
+  warns with `override_path_missing` when a binary override points at
+  nothing — the stale-environment trap that made a present tool read as
+  missing.
+
+### Changed
+- `simulator status-bar override` on Android now enters demo mode explicitly
+  and accepts `battery`, `plugged`, `wifi`, `wifi_level`, `mobile`,
+  `mobile_level`, `datatype`, and `notifications` alongside `hhmm`; an unknown
+  key is refused before anything is broadcast.
+- The fake `simctl` now moves a device to `Shutdown` on `shutdown`, so a
+  shutdown/write/boot sequence is proven by the device list.
+
 ## [0.30.0] - 2026-08-28
 
 Autonom now implements the end-to-end product blueprint: strict portable

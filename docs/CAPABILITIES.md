@@ -9,9 +9,9 @@ Legend: ✅ shipped · ⚠️ partial · 🔜 planned · ❌ not planned for nea
 | Agent-portable skills (Codex / Claude / Grok) | ✅ | ✅ | install via marketplace or `install_skills.sh` |
 | Unified device listing | ✅ | ✅ | `autonom devices`; each entry has a `running` flag |
 | Boot / shut down a target | ✅ | ✅ | `devices boot --avd`/`--udid`, `devices shutdown`; refuses hardware |
-| Bootable AVD discovery | ✅ | — | `devices` reports an `avds` array on Android |
+| Bootable AVD discovery | ✅ | — | `devices` reports an `avds` array on Android, plus `avd_profiles` (hardware profile, screen, density, API) and the `avd` a running emulator booted from |
 | Explicit multi-target selection | ✅ | ✅ | `--platform` / `--target`; `--serial` and `--udid` are aliases |
-| Environment diagnosis | ✅ | ✅ | `autonom doctor` |
+| Environment diagnosis | ✅ | ✅ | `autonom doctor` — tools, capabilities, orphans, and every active `AUTONOM_*` override (`override_path_missing` names a stale one) |
 | Session + artifact dirs | ✅ | ✅ | machine-global `~/.autonom/sessions/<id>/`; `autonom session *` |
 | Session journal (actions + notes) | ✅ | ✅ | `journal.ndjson`; `autonom journal` / `note`; secret-safe |
 | Boot / install / launch / terminate | ✅ | ✅ | simulator boots automatically on session start |
@@ -23,6 +23,9 @@ Legend: ✅ shipped · ⚠️ partial · 🔜 planned · ❌ not planned for nea
 | Screenshot | ✅ | ✅ | iOS uses `simctl`, so it works without idb |
 | Screenshot provenance | ✅ | ✅ | metadata embedded in the PNG; shots taken under an active mock are flagged `screenshot_shows_mocked_data` |
 | Screenshot index / browse | ✅ | ✅ | `autonom shots list [--task --grep --mocked-only]`, `shots show <path>` |
+| Screenshot dimensions | ✅ | ✅ | `width`/`height` read from the PNG header on `screenshot`, `shots show`, and the index — the capture's coordinate space, stated rather than guessed |
+| Deterministic status bar | ✅ | ✅ | `simulator status-bar pin` — 9:41, full battery and signal, no notifications (simctl override / SystemUI demo mode); `override` takes single keys; `clear` restores the live bar |
+| Keyboard / locale pinning | ❌ | ✅ | `simulator keyboard pin\|reset\|show` — autocorrect, prediction, and auto-capitalisation off, locale set, on the shut-down simulator's preference store (`reboot=true` cycles it). Android keeps these inside Gboard; refused with `unsupported_capability` |
 | Screen recording artifact | ✅ | ✅ | `autonom record start\|stop` |
 | Logs | ⚠️ | ⚠️ | logcat; `log stream`/`log show` with a bundle predicate |
 | Crash reports | ⚠️ | ✅ | Android: crash logcat buffer; iOS: idb crash store |
@@ -46,6 +49,7 @@ Legend: ✅ shipped · ⚠️ partial · 🔜 planned · ❌ not planned for nea
 | React Native skills | 🔜 | 🔜 | |
 | Flow DSL: check / fmt / list | ✅ | ✅ | strict YAML subset, exact-match selectors by default, positioned errors; `docs/FLOW.md` |
 | Flow DSL: run | ✅ | ✅ | polling assertions, single-fire mutations, `failure_class` + exit 1 for test failures, per-run `events.ndjson`; iOS `eraseText` dispatches HID backspace but is unproven on a real simulator |
+| Flow repair brief | ✅ | ✅ | a test failure in `flow run` carries `repair`: the `--until-step` prefix replay, a widened `ui find`, and the re-verification commands, plus advice keyed by the error code |
 | Flow DSL: runFlow / tags / hooks execution | ✅ | ✅ | subflows inline with inherited appId, isolated `onFlowComplete`, `when:` conditions, tag-filtered directory suites, evidence policy |
 | Flow DSL: Session → Flow compiler | ✅ | ✅ | `flow create --from-session` — proven selectors reused, secrets become `${SECRET_n}`, coordinate taps refuse to compile |
 | PR Proof (local) | ✅ | ✅ | `proof --base` — covers-globs + pull-request tags select the suite; verdicts pass/fail/not_covered/blocked/inconclusive, never upgraded |
@@ -212,6 +216,7 @@ autonom simulator clipboard <action> [--value KEY=VALUE] [--json OBJECT]
 autonom simulator appearance <action> [--value KEY=VALUE] [--json OBJECT]
 autonom simulator text-size <action> [--value KEY=VALUE] [--json OBJECT]
 autonom simulator status-bar <action> [--value KEY=VALUE] [--json OBJECT]
+autonom simulator keyboard <action> [--value KEY=VALUE] [--json OBJECT]
 autonom canvas serve [--port N] [--transport auto|screenrecord|screencap] [--fps N] [--token TOKEN] [--no-auth]
 autonom media add <path>
 autonom file ls [remote] [--app-id ID] | file pull <remote> [--app-id ID] [--out PATH]
@@ -250,6 +255,7 @@ exit code 2, so an agent can branch on `error_code` rather than parse prose.
 | `XDG_STATE_HOME` | Machine state root when `AUTONOM_HOME` is unset (else `~/.local/state/autonom`) |
 | `AUTONOM_ADB`, `AUTONOM_SIMCTL`, `AUTONOM_IDB`, `AUTONOM_EMULATOR`, `AUTONOM_MITMDUMP` | Binary paths, equivalent to the matching flag |
 | `AUTONOM_IDB_COMPANION` | `host:port` of an idb companion on another Mac |
+| `AUTONOM_CORESIMULATOR_DEVICES` | The CoreSimulator `Devices` directory `simulator keyboard` edits (default `~/Library/Developer/CoreSimulator/Devices`); point it at a mounted tree to pin a remote Mac's simulator |
 | `AUTONOM_PREFIX`, `AUTONOM_BIN_DIR` | Installer only: bundle home and the directory `autonom` is linked into |
 | `AUTONOM_REQUIRE_SHELLCHECK` | Dev tooling only: `run_checks.sh` fails instead of skipping the shell lint when shellcheck is missing (set by CI) |
 
@@ -277,6 +283,8 @@ What each earlier limitation cost, and what replaced it.
 | Project-local artifacts, invisible from elsewhere | Machine-global `~/.autonom/`: the session, its mocks, and orphaned processes are found and reaped from any directory |
 | No record of what an agent did | Append-only `journal.ndjson` — every verb, its scrubbed argv, the result, and the failures, plus agent notes |
 | A screenshot that silently showed mocked data | Provenance embedded in the PNG; captures taken under an active rule are flagged `screenshot_shows_mocked_data` |
+| Before/after captures that differed by the clock, the battery glyph, or an autocorrected word | `simulator status-bar pin` and `simulator keyboard pin` fix the state the app does not own, so a diff shows only what the app changed |
+| A failed flow that named the broken step and nothing else | The `repair` block: reconstruct the state, inspect the live tree, edit, re-verify — in the CLI's own commands |
 
 The harness intentionally does not claim that trend analysis proves a memory
 leak or that a browser preview proves performance. Those require retained-path

@@ -33,6 +33,7 @@ from autonom_lib.flow import compiler as flow_compiler  # noqa: E402
 from autonom_lib.flow import executor as flow_executor  # noqa: E402
 from autonom_lib.flow import maestro as flow_maestro  # noqa: E402
 from autonom_lib.flow import report as flow_report  # noqa: E402
+from autonom_lib.flow import repair as flow_repair  # noqa: E402
 from autonom_lib.flow import validator as flow_validator  # noqa: E402
 from autonom_lib import journal as journal_mod  # noqa: E402
 from autonom_lib import providers as providers_mod  # noqa: E402
@@ -119,14 +120,26 @@ def cmd_devices(args: argparse.Namespace) -> int:
     if args.platform in (None, ANDROID):
         # Bootable-but-not-running AVDs are part of the inventory too; a
         # missing emulator binary just means the key is absent.
+        adb_path = None
         try:
             adb_path = adb_mod.find_adb(getattr(args, "adb", None))
             emulator_bin = emulator_mod.find_emulator(
                 getattr(args, "emulator", None), adb_path=adb_path
             )
             payload["avds"] = emulator_mod.list_avds(emulator_bin)
+            # Names alone do not say which AVD is the phone and which the
+            # tablet; the hardware profile does (`avd_profiles`, additive).
+            payload["avd_profiles"] = emulator_mod.describe_avds(payload["avds"])
         except errors.AutonomError:
             pass
+        # A running emulator names the AVD it booted from, so a serial can be
+        # matched to a profile instead of guessed from `product:`. Best-effort.
+        if adb_path:
+            for device in devices:
+                if device.get("platform") == ANDROID and device.get("running"):
+                    name = emulator_mod.running_avd_name(adb_path, device["target_id"])
+                    if name:
+                        device["avd"] = name
     if warnings and not devices:
         payload["next_action"] = "run 'autonom doctor' to see what is missing"
     return emit(payload, as_json=True)
@@ -808,7 +821,10 @@ def cmd_shots_show(args: argparse.Namespace) -> int:
             errors.BODY_FILE_NOT_FOUND, f"no such file: {path}",
             "Pass a path from 'autonom shots list'.",
         )
+    size = shot_mod.png_size(path)
     return emit({"ok": True, "path": str(path),
+                 "width": size[0] if size else None,
+                 "height": size[1] if size else None,
                  "metadata": shot_mod.read_metadata(path)}, as_json=True)
 
 
@@ -1979,6 +1995,11 @@ def cmd_flow_run(args: argparse.Namespace) -> int:
             summary["converted_from"] = flow.converted_from
         if result.failure:
             summary["failure"] = result.failure
+            brief = flow_repair.repair_brief(
+                flow.path, result.failure, summary["steps"],
+                events_path=result.events_path)
+            if brief:
+                summary["repair"] = brief
         if result.hook_failures:
             summary["hook_failures"] = result.hook_failures
         if result.replay_target:
@@ -3258,10 +3279,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_location)
 
     simulator = sub.add_parser(
-        "simulator", help="battery, network, push, telephony, biometric, and UI state")
+        "simulator", help="battery, network, push, telephony, biometric, UI state, "
+                          "status-bar pin, and keyboard/locale pin")
     simulator_sub = simulator.add_subparsers(dest="simulator_command", required=True)
     for control in ("battery", "network", "push", "sms", "call", "biometric",
-                    "clipboard", "appearance", "text-size", "status-bar"):
+                    "clipboard", "appearance", "text-size", "status-bar", "keyboard"):
         p = simulator_sub.add_parser(control, parents=[target_flags])
         p.add_argument("action")
         p.add_argument("--value", action="append", metavar="KEY=VALUE")

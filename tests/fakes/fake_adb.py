@@ -15,6 +15,7 @@ State keys (all optional):
 ``settings``        mapping of setting name -> current value
 ``clock_skew``      seconds the fake device clock lags the host (default 0)
 ``fail``            mapping of "joined argv prefix" -> [exit_code, message]
+``avd_names``       mapping of serial -> AVD name for ``emu avd name``
 """
 from __future__ import annotations
 
@@ -137,6 +138,16 @@ def main(argv: list[str]) -> int:
         if state.get("geo_fix_fails"):
             sys.stdout.write("KO: unable to reach the emulator console\n")
             return 1
+        sys.stdout.write("OK\n")
+        return 0
+
+    if args[:3] == ["emu", "avd", "name"]:
+        # The console answers with the AVD name then "OK"; a serial with no
+        # mapping answers "OK" alone, which is what a hardware serial does.
+        serial = argv[1] if argv[:1] == ["-s"] and len(argv) >= 2 else ""
+        name = (state.get("avd_names") or {}).get(serial)
+        if name:
+            sys.stdout.write(name + "\n")
         sys.stdout.write("OK\n")
         return 0
 

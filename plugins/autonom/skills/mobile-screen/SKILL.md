@@ -97,13 +97,47 @@ rectangle is refused with `coordinate_space_mismatch` rather than dispatched —
 3x device a pixel mix-up would otherwise land silently in the wrong place and make
 the agent report a defect that does not exist.
 
+## Deterministic captures
+
+Two screenshots of the same screen differ by the clock, the battery glyph, and
+the signal bars unless the status bar is pinned — and a before/after
+comparison then reports a change the app never made. Pin it once per session,
+on either platform, before the first capture you intend to compare:
+
+```bash
+python3 <autonom-root>/scripts/autonom.py simulator status-bar pin        # 9:41, full battery, full signal, no notifications
+python3 <autonom-root>/scripts/autonom.py simulator status-bar pin --value hhmm=1230   # Android key; iOS uses time=12:30
+python3 <autonom-root>/scripts/autonom.py simulator status-bar clear      # restore the live bar when done
+```
+
+`ui type` on iOS is at the mercy of autocorrect: a non-English keyboard
+rewrote "Sync conflicts when editing offline" into something else mid-flow.
+Pin the keyboard and locale on the **shut-down** simulator before typed text
+must be exact (`reboot=true` lets the verb cycle a booted one):
+
+```bash
+python3 <autonom-root>/scripts/autonom.py simulator keyboard pin --value locale=en-US --value reboot=true
+python3 <autonom-root>/scripts/autonom.py simulator keyboard show          # pinned: true|false, per key
+python3 <autonom-root>/scripts/autonom.py simulator keyboard reset
+```
+
+Android has no host-level keyboard store (the settings live inside Gboard), so
+`simulator keyboard` refuses there with `unsupported_capability`; turn
+suggestions off in the field or the keyboard app instead.
+
+Every `screenshot` (and `shots show`) reports `width` and `height` from the
+PNG itself. On iOS that is **pixels** while the tree and `ui tap` speak
+points; on Android it is whatever the AVD's screen is. State the space you
+computed in when you report a coordinate.
+
 ## Agent workflow
 
 1. `session start` so the target and artifacts are explicit.
 2. `ui tree` → read labels, roles, enabled state. Note which field holds the label.
 3. `ui find` / `ui tap` for the next action.
 4. `screenshot` after state changes that need visual proof — **compare before/after**;
-   an exit code of 0 does not prove the screen changed.
+   an exit code of 0 does not prove the screen changed. Pin the status bar first
+   so the diff shows only what the app changed.
 5. Re-dump the tree after navigation; never reuse stale refs.
 6. Report **measured** on-screen text and tree facts separately from hypotheses.
 

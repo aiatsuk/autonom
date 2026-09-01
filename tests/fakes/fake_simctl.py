@@ -100,6 +100,17 @@ def main(argv: list[str]) -> int:
         write_state(state)
         return 0
 
+    if args[:1] == ["shutdown"]:
+        # Mirror the real state machine so a shutdown-write-boot sequence can
+        # be proven by the device list rather than assumed from exit codes.
+        devices = state.setdefault("simctl_devices", json.loads(json.dumps(DEFAULT_DEVICES)))
+        for entries in devices["devices"].values():
+            for entry in entries:
+                if args[1:2] == ["all"] or entry["udid"] == args[1]:
+                    entry["state"] = "Shutdown"
+        write_state(state)
+        return 0
+
     if args[:1] == ["listapps"]:
         installed = state.get("installed", ["com.example.app"])
         sys.stdout.write("{" + " ".join(f'"{app}" = {{}};' for app in installed) + "}")

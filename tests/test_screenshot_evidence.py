@@ -62,6 +62,24 @@ class NamingTests(unittest.TestCase):
         self.assertNotEqual(first, second)
 
 
+class PngSizeTests(unittest.TestCase):
+    def test_size_comes_from_the_header_alone(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            png = Path(tmp) / "shot.png"
+            png.write_bytes(_minimal_png())
+            self.assertEqual(shot.png_size(png), (1, 1))
+
+    def test_anything_that_is_not_a_png_reads_as_unknown(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            other = Path(tmp) / "notes.txt"
+            other.write_bytes(b"not a png at all, but long enough to read 24 bytes")
+            self.assertIsNone(shot.png_size(other))
+            truncated = Path(tmp) / "short.png"
+            truncated.write_bytes(shot.PNG_SIGNATURE + b"\x00\x00")
+            self.assertIsNone(shot.png_size(truncated))
+            self.assertIsNone(shot.png_size(Path(tmp) / "missing.png"))
+
+
 class EmbeddedMetadataTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()

@@ -27,7 +27,9 @@ v2, baseline replay/checkpoints, supervised CI campaigns, Mobile Canvas, an
 observed Runtime Map, local PR proof
 (`autonom proof --base`), live session watch (`session outputs`,
 `logs follow`, `network requests follow`), and an `autonom metrics` family
-(memory, CPU, frames, traces). Domain packs for Flutter, native
+(memory, CPU, frames, traces), and deterministic capture state — a pinned
+status bar on both platforms and a pinned keyboard/locale on iOS — with a
+`repair` hand-off on every failed flow step. Domain packs for Flutter, native
 Kotlin/Jetpack Compose, and iOS.  
 **Roadmap:** Flutter VM Service, React Native skills, optional MCP wrapper,
 hosted device providers.
@@ -64,7 +66,8 @@ autonom session start --platform ios --target <UDID> \
 autonom ui tree
 autonom ui find --desc "Log In" --mode exact
 autonom ui tap --desc "Continue"
-autonom screenshot --label "after login"
+autonom simulator status-bar pin            # 9:41, full battery: diff-stable screenshots
+autonom screenshot --label "after login"    # reports width/height too
 autonom logs tail --package com.example.app --since 60
 autonom location get                        # current position (Android)
 autonom crash list

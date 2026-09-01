@@ -117,6 +117,12 @@ APP_SKILL_INVALID = "app_skill_invalid"
 REPLAY_MANIFEST_INVALID = "replay_manifest_invalid"
 CI_DESTINATION_FAILED = "ci_destination_failed"
 
+# --- Deterministic capture state --------------------------------------------
+# Keyboard/locale pinning edits the simulator's on-disk preference store, which
+# cfprefsd only reads at boot; a booted device must be shut down first.
+SIMULATOR_MUST_BE_SHUTDOWN = "simulator_must_be_shutdown"
+SIMULATOR_DATA_NOT_FOUND = "simulator_data_not_found"
+
 
 class AutonomError(RuntimeError):
     """An expected failure with a stable code and an actionable hint."""

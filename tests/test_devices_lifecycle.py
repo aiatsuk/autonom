@@ -183,6 +183,54 @@ class InventoryTests(LifecycleBase):
         self.assertEqual(running, {"emulator-5554": True, "emulator-5560": False})
         self.assertEqual(payload["avds"], ["Pixel_9", "Tablet"])
 
+    def test_avd_profiles_come_from_the_ini_files(self) -> None:
+        """Names alone cannot tell the phone from the tablet; config.ini can."""
+        home = Path(self.tmp.name) / "avd"
+        (home / "Pixel_9.avd").mkdir(parents=True)
+        (home / "Pixel_9.ini").write_text(
+            f"avd.ini.encoding=UTF-8\npath={home / 'Pixel_9.avd'}\ntarget=android-35\n",
+            encoding="utf-8")
+        (home / "Pixel_9.avd" / "config.ini").write_text(
+            "hw.device.name=pixel_9\nhw.lcd.width=1080\nhw.lcd.height=2424\n"
+            "hw.lcd.density=420\nabi.type=arm64-v8a\n", encoding="utf-8")
+        self.set_state(devices=[], avds=["Pixel_9", "Ghost"])
+        self.env["AUTONOM_EMULATOR"] = str(FAKE_EMULATOR)
+        self.env["ANDROID_AVD_HOME"] = str(home)
+        code, payload = self.run_cli(
+            "devices", "--platform", "android", "--adb", str(FAKE_ADB)
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["avds"], ["Pixel_9", "Ghost"])
+        pixel, ghost = payload["avd_profiles"]
+        self.assertEqual(pixel["device"], "pixel_9")
+        self.assertEqual(pixel["screen"], {"width": 1080, "height": 2424, "density": 420})
+        self.assertEqual(pixel["api"], 35)
+        self.assertEqual(pixel["abi"], "arm64-v8a")
+        # An AVD with no readable ini reports nulls, never a guess.
+        self.assertEqual(ghost, {"name": "Ghost", "device": None, "screen": None,
+                                 "api": None, "abi": None, "path": None})
+
+    def test_running_emulator_names_the_avd_it_booted_from(self) -> None:
+        self.set_state(
+            devices=[["emulator-5554", "device", ""], ["R58M123ABC", "device", ""]],
+            avd_names={"emulator-5554": "Pixel_9"},
+        )
+        code, payload = self.run_cli(
+            "devices", "--platform", "android", "--adb", str(FAKE_ADB)
+        )
+        self.assertEqual(code, 0)
+        by_id = {d["target_id"]: d for d in payload["devices"]}
+        self.assertEqual(by_id["emulator-5554"]["avd"], "Pixel_9")
+        self.assertNotIn("avd", by_id["R58M123ABC"])
+        asked = [entry["argv"] for entry in self.argv_log()
+                 if entry["tool"] == "adb" and entry["argv"][-3:] == ["emu", "avd", "name"]]
+        self.assertEqual(asked, [["-s", "emulator-5554", "emu", "avd", "name"]],
+                         "hardware must never be asked; it has no console")
+
+    def test_running_avd_name_skips_hardware_without_an_adb_call(self) -> None:
+        self.assertIsNone(emulator_mod.running_avd_name(str(FAKE_ADB), "R58M123ABC"))
+        self.assertEqual(self.argv_log(), [])
+
     def test_missing_emulator_binary_just_omits_avds(self) -> None:
         self.set_state(devices=[["emulator-5554", "device", ""]])
         # Force discovery to fail regardless of the host's real SDK: a bogus

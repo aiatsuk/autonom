@@ -33,6 +33,42 @@ BREW_TRUST_HINT = (
     "brew trust --formula facebook/fb/idb-companion && brew install idb-companion"
 )
 
+# Environment overrides the resolvers honour. A host-wide override is the
+# classic invisible trap: a stale AUTONOM_ADB makes every probe report adb as
+# missing while `which adb` in the same shell finds it, and nothing in the old
+# report said why. Doctor now names every active override, and warns when a
+# binary override points at nothing.
+BINARY_OVERRIDES = (
+    "AUTONOM_ADB", "AUTONOM_SIMCTL", "AUTONOM_IDB", "AUTONOM_EMULATOR", "AUTONOM_MITMDUMP",
+)
+OVERRIDE_VARS = BINARY_OVERRIDES + (
+    "AUTONOM_IDB_COMPANION", "AUTONOM_HOME", "AUTONOM_CORESIMULATOR_DEVICES",
+)
+
+
+def _overrides() -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    active: dict[str, Any] = {}
+    warnings: list[dict[str, Any]] = []
+    for name in OVERRIDE_VARS:
+        value = os.environ.get(name)
+        if not value:
+            continue
+        entry: dict[str, Any] = {"value": value}
+        if name in BINARY_OVERRIDES:
+            exists = Path(value).expanduser().is_file() or shutil.which(value) is not None
+            entry["exists"] = exists
+            if not exists:
+                warnings.append({
+                    "code": "override_path_missing",
+                    "variable": name,
+                    "error": f"{name}={value} points at no executable",
+                    "hint": f"unset {name} (or the matching flag) or point it at an "
+                            "existing binary; the tool it overrides reads as missing "
+                            "until then.",
+                })
+        active[name] = entry
+    return active, warnings
+
 
 def _probe_binary(name: str, resolver, version_fn) -> dict[str, Any]:
     entry: dict[str, Any] = {"state": "missing", "path": None, "version": None}
@@ -186,6 +222,9 @@ def collect(args: Any = None) -> dict[str, Any]:
 
     network_state, orphans, warnings = _runtime_state(record)
 
+    overrides, override_warnings = _overrides()
+    warnings.extend(override_warnings)
+
     # The mock registry outlives every session, so doctor is the one place
     # guaranteed to reveal a rule left enabled days ago.
     from .network import mocks as mocks_mod
@@ -209,6 +248,7 @@ def collect(args: Any = None) -> dict[str, Any]:
         "session": session_summary,
         "network": network_state,
         "mocks": mocks_state,
+        "overrides": overrides,
         "orphans": orphans,
         "warnings": warnings,
     }

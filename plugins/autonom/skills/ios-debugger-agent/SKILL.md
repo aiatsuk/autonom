@@ -70,7 +70,19 @@ python3 <autonom-root>/scripts/autonom.py crash list --app-id <bundle-id>
 ```
 
 **Compare the two screenshots.** A tap that exits 0 has not been proven to do
-anything; a changed screen (or a changed tree) is the proof.
+anything; a changed screen (or a changed tree) is the proof. Pin the status
+bar first (`simulator status-bar pin`) so the clock and battery glyphs do not
+show up as a difference, and pin the keyboard before typed text must be exact:
+
+```bash
+python3 <autonom-root>/scripts/autonom.py simulator status-bar pin
+python3 <autonom-root>/scripts/autonom.py simulator keyboard pin --value locale=en-US --value reboot=true
+```
+
+The keyboard pin writes the simulator's preference store (autocorrect,
+prediction, auto-capitalisation off; locale set) and needs the device shut
+down — `reboot=true` cycles it for you. Undo with `keyboard reset` and
+`status-bar clear`.
 
 ## 4. Drive state the UI cannot reach
 

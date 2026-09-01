@@ -76,6 +76,11 @@ tags: [smoke, auth]
   a failing step leaves a screenshot and a hierarchy dump automatically.
 - `onFlowComplete` cleanup always runs; its failures are reported separately
   (`hook_failures`) and never mask the primary outcome.
+- A test failure also carries `repair`: the `--until-step` command that
+  reconstructs the state the failed step assumed, `ui tree`, the old selector
+  as a widened `ui find … --mode contains --all`, and the re-verification
+  commands, with advice keyed by the error code. Run them in order, edit the
+  YAML, and re-run — the brief never rewrites the flow for you.
 
 ## Rules
 

@@ -371,6 +371,40 @@ canonical Flow v1 text, which is also the migration path. `flow fmt
 entry says so) — converting to a file is always the explicit
 `flow import --out`.
 
+## Repairing a failed flow
+
+Flows replay without a model, so when the app moves a button or renames a
+label the run fails loudly and the YAML has to be fixed by hand. A *test*
+failure in `flow run` therefore carries a `repair` block next to `failure`:
+
+```json
+"repair": {
+  "step_index": 3, "command": "tapOn", "line": 12, "flow": "flows/login.yaml",
+  "selector": {"description": "Log In", "match": "exact"},
+  "commands": [
+    "autonom flow run flows/login.yaml --until-step 2",
+    "autonom ui tree",
+    "autonom ui find --desc 'Log In' --mode contains --all",
+    "autonom screenshot --label 'repair tapOn line 12'",
+    "autonom flow check flows/login.yaml",
+    "autonom flow run flows/login.yaml"
+  ],
+  "advice": "The element the step targets was not on screen when the step ran. …",
+  "evidence": "~/.autonom/sessions/<id>/flows/<run_id>/events.ndjson",
+  "note": "The corrected flow is a reviewed edit, never an automatic rewrite."
+}
+```
+
+The commands are the repair loop in order: replay the prefix so the device
+sits in the state the failed step assumed, dump what is on screen now, query
+the old selector *widened* (`contains`, `--all`) to see what it nearly
+matched, keep a screenshot, then re-validate and re-run. `advice` is keyed by
+the error code (`no_matching_node`, `flow_assertion_timeout`,
+`ambiguous_selector`, `selector_index_out_of_range`,
+`coordinate_space_mismatch`). Definition and infrastructure failures abort
+with their own envelope and get no brief. Nothing rewrites the flow: the
+edit is yours to review and commit.
+
 ## Errors
 
 All Flow DSL codes are new and distinct from network capture's
