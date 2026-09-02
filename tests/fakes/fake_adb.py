@@ -16,6 +16,7 @@ State keys (all optional):
 ``clock_skew``      seconds the fake device clock lags the host (default 0)
 ``fail``            mapping of "joined argv prefix" -> [exit_code, message]
 ``avd_names``       mapping of serial -> AVD name for ``emu avd name``
+``run_as_refused``  text run-as prints instead of a listing (system / release app)
 ``battery_level``   level ``dumpsys battery`` reports (``set level`` updates it)
 """
 from __future__ import annotations
@@ -87,6 +88,16 @@ def main(argv: list[str]) -> int:
         dump = state.get("ui_dump")
         if dump:
             sys.stdout.write(Path(dump).read_text(encoding="utf-8"))
+        return 0
+
+    if args[:2] == ["exec-out", "run-as"]:
+        # A non-debuggable package: run-as complains on the same stream the
+        # listing would use, which is exactly how the complaint became a "file".
+        refused = state.get("run_as_refused")
+        if refused:
+            sys.stdout.write(refused + "\n")
+            return 1
+        sys.stdout.write("files\nshared_prefs\n")
         return 0
 
     if args[:2] == ["exec-out", "screencap"]:

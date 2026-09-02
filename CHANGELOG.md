@@ -52,6 +52,48 @@ already solved the noise that makes two captures of one screen differ.
   nothing — the stale-environment trap that made a present tool read as
   missing.
 
+- **Device sweep fixes (every verb exercised on a real emulator and
+  simulator, 2026-09-02):**
+  - Argument errors are one JSON envelope with `error_code: usage_error`
+    and the usage line in `hint`, at every parser level — never argparse
+    prose (an unknown verb, `ui tap --all`, `session launch --arg --es`).
+  - `simulator biometric` on iOS works: `xcrun simctl` has no `biometric`
+    subcommand (it had never worked); enroll/unenroll/match/nonmatch now
+    post the Simulator's Darwin notifications through `simctl spawn
+    notifyutil`.
+  - `ui type` warns `no_focused_field` when nothing on screen reports
+    keyboard focus, and the flow `inputText` command polls for a focused
+    node (up to `timeoutMs`) and fails with `flow_no_focused_field`
+    instead of typing into nothing and passing. `requireFocus: false` opts
+    out.
+  - idb verbs that die with a companion "Connection refused" prune stale
+    companion registrations (`idb list-targets`) and retry once — the
+    failure mode that took every idb verb down for the rest of a session.
+  - `file ls`/`file pull` on a release or system app refuse with
+    `app_not_debuggable` instead of listing run-as's complaint as a file.
+  - `ui tap` with neither a selector nor coordinates refuses with
+    `selector_required` instead of `ambiguous_selector: matched 78 nodes`.
+  - `capabilities` no longer needs a session: with `--serial`/`--udid` (or a
+    sole ready target) it snapshots that target.
+  - `doctor` warns `device_attached_to_foreign_proxy` for a running
+    emulator whose global proxy points at another session's live proxy —
+    the one case `device_may_be_left_attached` cannot see because the proxy
+    is alive.
+  - `ui tree` reports `truncated` when `--max-nodes` cut the list and
+    `screen` (the bounds' coordinate space) for live trees; the
+    `coordinate_space_mismatch` hint is per platform.
+  - `flow run --dry-run` lists `planned` steps; flow error messages and the
+    repair brief show resolved env values (`text: bluetooth`, not
+    `text: ${QUERY}`) unless a secret is involved.
+  - `location set` on the Android emulator says `delivery:
+    on_subscription`: the fix reaches the location manager only once an app
+    subscribes, so `location get` cannot confirm it.
+  - `record stop` with nothing recording answers `was_recording: false`
+    with `path: null` instead of a phantom `latest.mp4`; `devices shutdown`
+    on a stopped simulator reports `already_stopped`; `network requests
+    list --mocked` is a bare flag; the xctrace "not supported on this
+    platform" failure says to use a physical device.
+
 ### Changed
 - `simulator status-bar override` on Android now enters demo mode explicitly
   and accepts `battery`, `plugged`, `wifi`, `wifi_level`, `mobile`,

@@ -177,7 +177,7 @@ command openLink: url label postcondition
 command tapOn: selector repeat delayMs label timeoutMs postcondition optional reason
 command longPressOn: selector durationMs label timeoutMs postcondition optional reason
 command doubleTapOn: selector label timeoutMs postcondition optional reason
-command inputText: value sensitive label postcondition
+command inputText: value sensitive requireFocus timeoutMs label postcondition
 command eraseText: chars label postcondition
 command pressKey: key label postcondition
 command back: label postcondition
@@ -227,6 +227,19 @@ applied, verified, and used setup entries separately.
 - Mutating commands (taps, input, links, device state) execute **exactly
   once** — never retried implicitly. `tapOn` with `repeat:` is N *declared*
   taps, not recovery.
+- `inputText` first polls (up to `timeoutMs`, default 10 s) for a node that
+  reports keyboard focus and fails with `flow_no_focused_field` (a test
+  failure) when none appears: on real devices a `tapOn` that opens the
+  field's activity followed by an immediate `inputText` typed into nothing
+  and passed. iOS accessibility dumps carry no focus attribute (verified on
+  a Simulator), so there the bar is "a text field is on screen".
+  `requireFocus: false` opts out for a UI whose field never reports focus.
+- `launchApp` brings the app's launcher task to the front (`monkey` on
+  Android, `simctl launch` on iOS); it does **not** reset navigation. An app
+  left on a subscreen — or, as Android Settings does, in a search activity of
+  another package — resumes there. Start flows with `stopApp` (and
+  `clearState: true` when data may change) to make the first selector
+  deterministic.
 - `repeat` is bounded, declared iteration: `times` (1–25) is the hard
   limit, `while:` (`visible`/`notVisible` only) stops the loop early the
   moment it no longer holds; a failing iteration fails the flow, and

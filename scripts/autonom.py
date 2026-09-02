@@ -196,8 +196,12 @@ def cmd_devices_boot(args: argparse.Namespace) -> int:
 def cmd_devices_shutdown(args: argparse.Namespace) -> int:
     target = platform_mod.resolve(args)
     if target.platform == IOS:
-        ios_simctl.shutdown(target.tool, target.target_id)
-        return emit({"ok": True, "stopped": True, **target.identity()}, as_json=True)
+        simulator = ios_simctl.find_simulator(target.tool, target.target_id)
+        already = simulator is not None and simulator.state == "Shutdown"
+        if not already:
+            ios_simctl.shutdown(target.tool, target.target_id)
+        return emit({"ok": True, "stopped": True, "already_stopped": already,
+                     **target.identity()}, as_json=True)
     detail = emulator_mod.kill_emulator(target.tool, target.target_id)
     return emit({"ok": True, "platform": ANDROID, **detail}, as_json=True)
 
@@ -471,6 +475,25 @@ def cmd_ui_tree(args: argparse.Namespace) -> int:
         "nodes": nodes,
         **identity,
     }
+    # `--max-nodes` used to cut the list silently; an agent reading 5 nodes
+    # could not tell a 5-node screen from a 200-node one. Cheap and honest.
+    if args.max_nodes is not None and len(nodes) >= args.max_nodes:
+        payload["truncated"] = True
+    if not dump:
+        # The coordinate space the bounds live in (pixels on Android, points
+        # on iOS) — the same number the tap guard checks against. Android's
+        # `wm size` is one cheap call; on iOS the tree's own root frame is
+        # used, since the alternative is a second full accessibility dump.
+        size = None
+        if target.platform == ANDROID:
+            try:
+                size = ui_mod.screen_size(target)
+            except errors.AutonomError:
+                size = None
+        else:
+            size = ui_mod.screen_from_nodes(nodes)
+        if size:
+            payload["screen"] = list(size)
     if warnings:
         payload["warnings"] = warnings
     current = session_mod.load_current()
@@ -683,6 +706,15 @@ def cmd_ui_tap(args: argparse.Namespace) -> int:
     if args.x is not None and args.y is not None:
         x, y = args.x, args.y
     else:
+        if not any(value is not None for value in _selectors(args).values()):
+            # An empty selector matches every node, which used to surface as
+            # "ambiguous_selector: matched 78 nodes" — true, but not the point.
+            raise errors.AutonomError(
+                errors.SELECTOR_REQUIRED,
+                "ui tap needs a selector (--text/--desc/--resource-id/...) or --x/--y",
+                "Run 'autonom ui tree', then tap by --desc/--text/--resource-id, or "
+                "pass --x and --y for a point.",
+            )
         nodes = ui_mod.snapshot(target)
         matches = selector_mod.select(
             nodes,
@@ -753,6 +785,24 @@ def cmd_ui_gesture(args: argparse.Namespace) -> int:
 
 def cmd_ui_type(args: argparse.Namespace) -> int:
     target = _target(args)
+    # Typing with nothing focused "succeeds" on both platforms while every
+    # character lands nowhere (seen on an iOS Settings screen with no field).
+    # The CLI is exploratory, so it still types — but says what it saw.
+    focus_warning: dict[str, Any] | None = None
+    certainty = "unknown"
+    try:
+        focused, certainty = ui_mod.typing_target(target.platform, ui_mod.snapshot(target))
+    except errors.AutonomError:
+        focused = None  # no tree backend (idb missing): nothing to check against
+    else:
+        if focused is None:
+            focus_warning = {
+                "code": "no_focused_field",
+                "error": "no node on screen reports keyboard focus; the text may "
+                         "have been swallowed",
+                "hint": "Tap the field first (ui tap), wait for it to appear, then "
+                        "type; confirm with ui find on the typed text.",
+            }
     ui_mod.type_text(target, args.text)
     sensitive = bool(getattr(args, "sensitive", False))
     detail = actions_mod.record_detail(session_mod.load_current(), "type", {
@@ -770,6 +820,14 @@ def cmd_ui_type(args: argparse.Namespace) -> int:
         payload["sensitive"] = True
     if detail:
         payload["detail"] = detail
+    if focused is not None:
+        payload["focused"] = {key: focused.get(key)
+                              for key in ("ref", "role", "resource_id", "desc")}
+        # iOS trees carry no focus attribute: the field is on screen, whether
+        # it has the keyboard is not knowable from the dump.
+        payload["focus"] = "verified" if certainty == "focused" else "unverified"
+    if focus_warning:
+        payload["warnings"] = [focus_warning]
     return emit({**payload, **target.identity()}, as_json=True)
 
 
@@ -1220,6 +1278,10 @@ def cmd_record_stop(args: argparse.Namespace) -> int:
     target = _target(args)
     record = session_mod.require_current()
     background = record.setdefault("background", {})
+    if not background.get("recorder_pid"):
+        # Nothing to stop: say so without inventing a `latest.mp4` path.
+        return emit({"ok": True, "was_recording": False, "path": None, "bytes": 0,
+                     **target.identity()}, as_json=True)
     destination = Path(background.get("recorder_path") or
                        session_mod.artifact_path(record, "recordings", "latest.mp4"))
     detail = device_state.record_stop(target, background.get("recorder_pid"), destination)
@@ -1991,6 +2053,15 @@ def cmd_flow_run(args: argparse.Namespace) -> int:
             "events": result.events_path,
             "sensitive": result.sensitive,
         }
+        if args.dry_run:
+            # A dry run executes nothing, so `steps` is empty by definition;
+            # list what *would* run so the answer is more than "passed".
+            summary["dry_run"] = True
+            summary["planned"] = [
+                {"index": index, "command": step.command, "line": step.line,
+                 **({"label": step.label} if getattr(step, "label", None) else {})}
+                for index, step in enumerate(flow.steps, start=1)
+            ]
         if flow.converted_from:
             summary["converted_from"] = flow.converted_from
         if result.failure:
@@ -2701,10 +2772,17 @@ def cmd_report_serve(args: argparse.Namespace) -> int:
 
 
 def cmd_capabilities(args: argparse.Namespace) -> int:
-    record = session_mod.require_current()
+    # A capability snapshot describes a target, not a session: with no
+    # session it is taken against the explicit (or sole ready) target, from a
+    # record that declares nothing attached and no tooling probed yet.
+    record = session_mod.load_current()
     target = _target(args)
+    if record is None or record.get("target_id") != target.target_id:
+        record = {"platform": target.platform, "target_id": target.target_id,
+                  "tooling": {}, "network": {}, "session_id": None}
     snapshot = providers_mod.open_session(target, record).capabilities()
-    return emit({"ok": True, **snapshot.as_dict()}, as_json=True)
+    return emit({"ok": True, "session_id": record.get("session_id"),
+                 **snapshot.as_dict()}, as_json=True)
 
 
 def cmd_teach_start(args: argparse.Namespace) -> int:
@@ -3048,8 +3126,28 @@ def _add_selector_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--index", type=int)
 
 
+class _JsonArgumentParser(argparse.ArgumentParser):
+    """argparse that fails the way every other Autonom failure does.
+
+    An unknown verb, a misspelt flag, or `--arg --es` (a value that looks like
+    an option) used to print argparse prose on stderr — the one place a host
+    agent branching on `error_code` had nothing to read. Subparsers inherit
+    this class, so the envelope covers every level.
+    """
+
+    def error(self, message: str) -> None:  # type: ignore[override]
+        payload = {
+            "ok": False,
+            "error_code": errors.USAGE_ERROR,
+            "error": message or "invalid arguments",
+            "hint": self.format_usage().strip(),  # already begins with "usage:"
+        }
+        print(json.dumps(payload, ensure_ascii=False), file=sys.stderr)
+        raise SystemExit(2)
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = _JsonArgumentParser(
         prog="autonom",
         description="Universal mobile test/debug control plane for AI agents (Android + iOS).",
     )
@@ -3679,7 +3777,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--status", type=int)
     p.add_argument("--path", help="glob over path or url")
     p.add_argument("--since", type=float, help="seconds")
-    p.add_argument("--mocked", type=lambda v: v.lower() in {"1", "true", "yes"}, default=None)
+    p.add_argument("--mocked", nargs="?", const=True, default=None,
+                   type=lambda v: v.lower() in {"1", "true", "yes"})
     p.add_argument("--max", type=int, default=store_mod.DEFAULT_MAX)
     p.add_argument("--since-id", help="only flows recorded after this id")
     p.set_defaults(func=cmd_network_requests_list)
@@ -3689,7 +3788,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--method")
     p.add_argument("--status", type=int)
     p.add_argument("--path", help="glob over path or url")
-    p.add_argument("--mocked", type=lambda v: v.lower() in {"1", "true", "yes"}, default=None)
+    p.add_argument("--mocked", nargs="?", const=True, default=None,
+                   type=lambda v: v.lower() in {"1", "true", "yes"})
     p.add_argument("--interval", type=float, default=1.0, help="poll seconds")
     p.add_argument("--max", type=int, default=0, help="stop after N new flows")
     p.add_argument("--max-seconds", type=float, default=0,

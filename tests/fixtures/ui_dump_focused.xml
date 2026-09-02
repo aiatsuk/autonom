@@ -1,0 +1,12 @@
+UI hierchary dumped to: /dev/tty
+<?xml version="1.0" encoding="UTF-8" standalone="yes" ?>
+<hierarchy rotation="0">
+  <node index="0" text="" resource-id="" class="android.widget.FrameLayout" package="com.example.app" content-desc="" clickable="false" enabled="true" focusable="false" scrollable="false" bounds="[0,0][1080,2400]">
+    <node index="0" text="Settings" resource-id="com.example.app:id/settings" class="android.widget.TextView" package="com.example.app" content-desc="Open settings" clickable="true" enabled="true" focusable="true" scrollable="false" bounds="[40,100][440,220]" />
+    <node index="1" text="Settings" resource-id="com.example.app:id/settings_secondary" class="android.widget.TextView" package="com.example.app" content-desc="Secondary settings" clickable="true" enabled="true" focusable="true" scrollable="false" bounds="[500,100][980,220]" />
+    <node index="2" text="" resource-id="" class="android.view.View" package="com.example.app" content-desc="Flutter Save Button" clickable="true" enabled="true" focusable="true" scrollable="false" bounds="[100,300][500,420]" />
+    <node index="3" text="Search input" resource-id="com.example.app:id/search" class="android.widget.EditText" package="com.example.app" content-desc="" clickable="true" enabled="true" focusable="true" focused="true" scrollable="false" bounds="[80,500][1000,620]" />
+    <node index="4" text="" resource-id="com.example.app:id/list" class="android.widget.ScrollView" package="com.example.app" content-desc="" clickable="false" enabled="true" focusable="false" scrollable="true" bounds="[0,700][1080,2200]" />
+  </node>
+</hierarchy>
+trailing adb noise

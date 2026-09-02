@@ -185,7 +185,15 @@ def set_location(target: Target, value: str) -> dict[str, Any]:
         ["emu", "geo", "fix", f"{longitude:.7f}", f"{latitude:.7f}"],
         serial=target.target_id,
     )
-    return {"latitude": latitude, "longitude": longitude, "via": "emulator_console"}
+    # Seen on a real API-37 emulator: the console answers OK, but the location
+    # manager keeps reporting its last delivered fix and the GNSS provider
+    # stays inactive until some app subscribes to location updates. Say so,
+    # or `location get` right after `set` reads like a failure of `set`.
+    return {"latitude": latitude, "longitude": longitude, "via": "emulator_console",
+            "delivery": "on_subscription",
+            "note": "The fix is injected into the emulator GNSS; the system's last known "
+                    "location (what 'location get' reads) updates only once an app "
+                    "requests location updates."}
 
 
 _LAST_LOCATION = re.compile(
@@ -370,9 +378,13 @@ def file_pull(target: Target, app_id: str, remote: str, destination: Path) -> di
         completed = adb_mod.run_adb(
             target.tool,
             ["exec-out", "run-as", app_id, "cat", relative],
-            serial=target.target_id, timeout=60, check=True, binary=True,
+            serial=target.target_id, timeout=60, check=False, binary=True,
         )
         assert isinstance(completed.stdout, bytes)
+        stderr = (completed.stderr or b"").decode("utf-8", "replace")
+        _raise_if_run_as_refused(app_id, stderr or completed.stdout.decode("utf-8", "replace"))
+        if completed.returncode != 0:
+            raise adb_mod.AdbError(stderr.strip() or f"run-as {app_id} cat {relative} failed")
         destination.write_bytes(completed.stdout)
 
     # Contents are deliberately not echoed: pulled app data can hold PII.
@@ -397,7 +409,33 @@ def file_ls(target: Target, app_id: str, remote: str = ".") -> list[str]:
         serial=target.target_id, timeout=30, check=False,
     )
     text = completed.stdout if isinstance(completed.stdout, str) else ""
+    # `exec-out` merges run-as's complaint into the listing, so a system app
+    # used to come back as one "file" named `run-as: package not an
+    # application` with ok: true. Refuse by name instead.
+    _raise_if_run_as_refused(app_id, text)
+    if completed.returncode != 0:
+        raise adb_mod.AdbError(text.strip() or f"run-as {app_id} ls {relative} failed")
     return [line.strip() for line in text.splitlines() if line.strip()]
+
+
+_RUN_AS_REFUSALS = (
+    "package not an application", "not debuggable", "run-as: unknown package",
+    "run-as: could not", "run-as: package", "run-as: Could not",
+)
+
+
+def _raise_if_run_as_refused(app_id: str, output: str) -> None:
+    lowered = (output or "").lower()
+    if not lowered.startswith("run-as:") and "run-as:" not in lowered[:200]:
+        return
+    if any(marker.lower() in lowered for marker in _RUN_AS_REFUSALS):
+        raise errors.AutonomError(
+            errors.APP_NOT_DEBUGGABLE,
+            f"run-as refused {app_id}: {output.strip().splitlines()[0][:160]}",
+            "Container files are readable only for debuggable builds (release and "
+            "system apps refuse run-as). Install a debug build, or pull app data "
+            "through the app's own export.",
+        )
 
 
 # --- screen recording --------------------------------------------------------

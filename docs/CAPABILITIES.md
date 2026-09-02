@@ -11,15 +11,15 @@ Legend: ✅ shipped · ⚠️ partial · 🔜 planned · ❌ not planned for nea
 | Boot / shut down a target | ✅ | ✅ | `devices boot --avd`/`--udid`, `devices shutdown`; refuses hardware |
 | Bootable AVD discovery | ✅ | — | `devices` reports an `avds` array on Android, plus `avd_profiles` (hardware profile, screen, density, API) and the `avd` a running emulator booted from |
 | Explicit multi-target selection | ✅ | ✅ | `--platform` / `--target`; `--serial` and `--udid` are aliases |
-| Environment diagnosis | ✅ | ✅ | `autonom doctor` — tools, capabilities, orphans, and every active `AUTONOM_*` override (`override_path_missing` names a stale one) |
+| Environment diagnosis | ✅ | ✅ | `autonom doctor` — tools, capabilities, orphans, every active `AUTONOM_*` override (`override_path_missing`), and emulators still routed through another session's live proxy (`device_attached_to_foreign_proxy`) |
 | Session + artifact dirs | ✅ | ✅ | machine-global `~/.autonom/sessions/<id>/`; `autonom session *` |
 | Session journal (actions + notes) | ✅ | ✅ | `journal.ndjson`; `autonom journal` / `note`; secret-safe |
 | Boot / install / launch / terminate | ✅ | ✅ | simulator boots automatically on session start |
 | Clear app data | ✅ | ⚠️ | Android `pm clear`; iOS uninstall+reinstall, or `--strategy privacy` for permissions only |
-| Compact UI / accessibility tree | ✅ | ✅ | UIAutomator; idb `describe-all` |
+| Compact UI / accessibility tree | ✅ | ✅ | UIAutomator; idb `describe-all`; live trees carry `screen` (the bounds' coordinate space) and `truncated` when `--max-nodes` cut the list |
 | Semantic find / tap | ✅ | ✅ | text, desc/label, resource-id / accessibility identifier |
 | Gestures | ⚠️ | ⚠️ | tap/swipe on both; `ui pinch\|rotate\|shake` have no backend on either and are refused — see below |
-| Text and hardware keys | ✅ | ✅ | Android `KEYCODE_*`; iOS `HOME`/`LOCK`/`SIRI`/`SIDE_BUTTON` |
+| Text and hardware keys | ✅ | ✅ | Android `KEYCODE_*`; iOS `HOME`/`LOCK`/`SIRI`/`SIDE_BUTTON`; `ui type` warns `no_focused_field` when nothing on screen has keyboard focus |
 | Screenshot | ✅ | ✅ | iOS uses `simctl`, so it works without idb |
 | Screenshot provenance | ✅ | ✅ | metadata embedded in the PNG; shots taken under an active mock are flagged `screenshot_shows_mocked_data` |
 | Screenshot index / browse | ✅ | ✅ | `autonom shots list [--task --grep --mocked-only]`, `shots show <path>` |
@@ -33,7 +33,7 @@ Legend: ✅ shipped · ⚠️ partial · 🔜 planned · ❌ not planned for nea
 | Permissions | ✅ | ✅ | `pm grant/revoke/reset`; `simctl privacy` |
 | Simulated location | ⚠️ | ✅ | set: iOS simctl / Android emulator `geo fix`; `location get` reads the fix on Android (iOS has no read-back) |
 | Media library seeding | ✅ | ✅ | `autonom media add` |
-| App-container file access | ✅ | ✅ | `autonom file ls\|pull`, confined to the container |
+| App-container file access | ✅ | ✅ | `autonom file ls\|pull`, confined to the container; a release/system app refuses with `app_not_debuggable` |
 | Remote target host | — | ✅ | idb client can drive a companion on another Mac |
 | Emulator browser mirror | ✅ | ❌ | `android-emulator-browser` |
 | Network capture (HTTP/HTTPS) | ✅ | ⚠️ | mitmproxy, loopback-only, consent-gated |

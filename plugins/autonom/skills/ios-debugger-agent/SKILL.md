@@ -95,6 +95,7 @@ python3 <autonom-root>/scripts/autonom.py media add fixtures/photo.png
 python3 <autonom-root>/scripts/autonom.py file ls Documents --app-id <bundle-id>
 python3 <autonom-root>/scripts/autonom.py file pull Documents/state.json --app-id <bundle-id>
 python3 <autonom-root>/scripts/autonom.py session launch <bundle-id> --setenv FLAVOR=staging
+python3 <autonom-root>/scripts/autonom.py simulator biometric enroll     # then match | nonmatch | unenroll
 ```
 
 File access is confined to the app container; a path that escapes it is refused.

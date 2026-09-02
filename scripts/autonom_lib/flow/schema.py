@@ -32,6 +32,7 @@ _FAILURE_CLASS_BY_CODE = {
     errors.AMBIGUOUS_SELECTOR: TEST_FAILURE,
     errors.SELECTOR_INDEX_OUT_OF_RANGE: TEST_FAILURE,
     errors.COORDINATE_SPACE_MISMATCH: TEST_FAILURE,
+    errors.FLOW_NO_FOCUSED_FIELD: TEST_FAILURE,
     # The flow file itself is wrong for this target or malformed.
     errors.FLOW_PARSE_ERROR: FLOW_DEFINITION,
     errors.FLOW_SCHEMA_UNSUPPORTED: FLOW_DEFINITION,
@@ -151,7 +152,13 @@ REGISTRY: dict[str, CommandSpec] = {spec.name: spec for spec in [
                       _LABEL, _TIMEOUT, _POSTCONDITION) + _OPTIONAL),
     CommandSpec("inputText", True, shorthand="value",
                 args=(ArgSpec("value", "str", required=True),
-                      ArgSpec("sensitive", "bool"), _LABEL, _POSTCONDITION)),
+                      ArgSpec("sensitive", "bool"),
+                      # Typing needs a focused field or the characters vanish
+                      # while the step "passes"; requireFocus: false opts out
+                      # for the rare UI whose field never reports focus.
+                      ArgSpec("requireFocus", "bool"),
+                      ArgSpec("timeoutMs", "int"),
+                      _LABEL, _POSTCONDITION)),
     CommandSpec("eraseText", True, bare=True,
                 args=(ArgSpec("chars", "int"), _LABEL, _POSTCONDITION)),
     CommandSpec("pressKey", True, shorthand="key",

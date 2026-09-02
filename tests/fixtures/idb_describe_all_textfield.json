@@ -1,0 +1,340 @@
+[
+  {
+    "AXFrame": "{{0, 0}, {402, 874}}",
+    "AXUniqueId": null,
+    "frame": {
+      "y": 0,
+      "x": 0,
+      "width": 402,
+      "height": 874
+    },
+    "role_description": "application",
+    "AXLabel": "Settings",
+    "content_required": false,
+    "type": "Application",
+    "title": null,
+    "help": null,
+    "custom_actions": [],
+    "AXValue": null,
+    "enabled": true,
+    "role": "AXApplication",
+    "subrole": null,
+    "children": [
+      {
+        "AXFrame": "{{16, 168}, {370, 90.333333333333314}}",
+        "AXUniqueId": "search_field",
+        "frame": {
+          "y": 168,
+          "x": 16,
+          "width": 370,
+          "height": 90.33333333333331
+        },
+        "role_description": "button",
+        "AXLabel": "Search",
+        "content_required": false,
+        "type": "TextField",
+        "title": null,
+        "help": null,
+        "custom_actions": [],
+        "AXValue": "",
+        "enabled": true,
+        "role": "AXButton",
+        "subrole": null
+      }
+    ]
+  },
+  {
+    "AXFrame": "{{16, 119.66666666666667}, {133, 40.666666666666671}}",
+    "AXUniqueId": null,
+    "frame": {
+      "y": 119.66666666666667,
+      "x": 16,
+      "width": 133,
+      "height": 40.66666666666667
+    },
+    "role_description": "heading",
+    "AXLabel": "Settings",
+    "content_required": false,
+    "type": "Heading",
+    "title": null,
+    "help": null,
+    "custom_actions": [],
+    "AXValue": null,
+    "enabled": true,
+    "role": "AXHeading",
+    "subrole": null
+  },
+  {
+    "AXFrame": "{{0, 0}, {402, 874}}",
+    "AXUniqueId": null,
+    "frame": {
+      "y": 0,
+      "x": 0,
+      "width": 402,
+      "height": 874
+    },
+    "role_description": "Group",
+    "AXLabel": null,
+    "content_required": false,
+    "type": "Group",
+    "title": null,
+    "help": null,
+    "custom_actions": [],
+    "AXValue": null,
+    "enabled": true,
+    "role": "AXGroup",
+    "subrole": null
+  },
+  {
+    "AXFrame": "{{16, 168}, {370, 90.333333333333314}}",
+    "AXUniqueId": "com.apple.settings.primaryAppleAccount",
+    "frame": {
+      "y": 168,
+      "x": 16,
+      "width": 370,
+      "height": 90.33333333333331
+    },
+    "role_description": "button",
+    "AXLabel": "Apple Account, Sign in to access your iCloud data, the App Store, Apple services, and more.",
+    "content_required": false,
+    "type": "Button",
+    "title": null,
+    "help": null,
+    "custom_actions": [],
+    "AXValue": null,
+    "enabled": true,
+    "role": "AXButton",
+    "subrole": null
+  },
+  {
+    "AXFrame": "{{16, 293.33333333333331}, {370, 52}}",
+    "AXUniqueId": "com.apple.settings.followUpItem.com.apple.icloud.gm",
+    "frame": {
+      "y": 293.3333333333333,
+      "x": 16,
+      "width": 370,
+      "height": 52
+    },
+    "role_description": "button",
+    "AXLabel": "Ready for Apple Intelligence",
+    "content_required": false,
+    "type": "Button",
+    "title": null,
+    "help": null,
+    "custom_actions": [],
+    "AXValue": null,
+    "enabled": true,
+    "role": "AXButton",
+    "subrole": null
+  },
+  {
+    "AXFrame": "{{16, 380.33333333333337}, {370, 52}}",
+    "AXUniqueId": "com.apple.settings.general",
+    "frame": {
+      "y": 380.33333333333337,
+      "x": 16,
+      "width": 370,
+      "height": 52
+    },
+    "role_description": "button",
+    "AXLabel": "General",
+    "content_required": false,
+    "type": "Button",
+    "title": null,
+    "help": null,
+    "custom_actions": [],
+    "AXValue": null,
+    "enabled": true,
+    "role": "AXButton",
+    "subrole": null
+  },
+  {
+    "AXFrame": "{{16, 432.33333333333331}, {370, 52}}",
+    "AXUniqueId": "com.apple.settings.accessibility",
+    "frame": {
+      "y": 432.3333333333333,
+      "x": 16,
+      "width": 370,
+      "height": 52
+    },
+    "role_description": "button",
+    "AXLabel": "Accessibility",
+    "content_required": false,
+    "type": "Button",
+    "title": null,
+    "help": null,
+    "custom_actions": [],
+    "AXValue": null,
+    "enabled": true,
+    "role": "AXButton",
+    "subrole": null
+  },
+  {
+    "AXFrame": "{{16, 484.33333333333331}, {370, 51.999999999999943}}",
+    "AXUniqueId": "com.apple.settings.actionButton",
+    "frame": {
+      "y": 484.3333333333333,
+      "x": 16,
+      "width": 370,
+      "height": 51.99999999999994
+    },
+    "role_description": "button",
+    "AXLabel": "Action Button",
+    "content_required": false,
+    "type": "Button",
+    "title": null,
+    "help": null,
+    "custom_actions": [],
+    "AXValue": null,
+    "enabled": true,
+    "role": "AXButton",
+    "subrole": null
+  },
+  {
+    "AXFrame": "{{16, 536.33333333333326}, {370, 52}}",
+    "AXUniqueId": "com.apple.settings.siri",
+    "frame": {
+      "y": 536.3333333333333,
+      "x": 16,
+      "width": 370,
+      "height": 52
+    },
+    "role_description": "button",
+    "AXLabel": "Apple Intelligence & Siri",
+    "content_required": false,
+    "type": "Button",
+    "title": null,
+    "help": null,
+    "custom_actions": [],
+    "AXValue": null,
+    "enabled": true,
+    "role": "AXButton",
+    "subrole": null
+  },
+  {
+    "AXFrame": "{{16, 588.33333333333326}, {370, 52}}",
+    "AXUniqueId": "com.apple.settings.camera",
+    "frame": {
+      "y": 588.3333333333333,
+      "x": 16,
+      "width": 370,
+      "height": 52
+    },
+    "role_description": "button",
+    "AXLabel": "Camera",
+    "content_required": false,
+    "type": "Button",
+    "title": null,
+    "help": null,
+    "custom_actions": [],
+    "AXValue": null,
+    "enabled": true,
+    "role": "AXButton",
+    "subrole": null
+  },
+  {
+    "AXFrame": "{{16, 640.33333333333326}, {370, 52}}",
+    "AXUniqueId": "com.apple.settings.homeScreen",
+    "frame": {
+      "y": 640.3333333333333,
+      "x": 16,
+      "width": 370,
+      "height": 52
+    },
+    "role_description": "button",
+    "AXLabel": "Home Screen & App Library",
+    "content_required": false,
+    "type": "Button",
+    "title": null,
+    "help": null,
+    "custom_actions": [],
+    "AXValue": null,
+    "enabled": true,
+    "role": "AXButton",
+    "subrole": null
+  },
+  {
+    "AXFrame": "{{16, 692.33333333333337}, {370, 52}}",
+    "AXUniqueId": "com.apple.settings.search",
+    "frame": {
+      "y": 692.3333333333334,
+      "x": 16,
+      "width": 370,
+      "height": 52
+    },
+    "role_description": "button",
+    "AXLabel": "Search",
+    "content_required": false,
+    "type": "Button",
+    "title": null,
+    "help": null,
+    "custom_actions": [],
+    "AXValue": null,
+    "enabled": true,
+    "role": "AXButton",
+    "subrole": null
+  },
+  {
+    "AXFrame": "{{16, 744.33333333333337}, {370, 52}}",
+    "AXUniqueId": "com.apple.settings.standBy",
+    "frame": {
+      "y": 744.3333333333334,
+      "x": 16,
+      "width": 370,
+      "height": 52
+    },
+    "role_description": "button",
+    "AXLabel": "StandBy",
+    "content_required": false,
+    "type": "Button",
+    "title": null,
+    "help": null,
+    "custom_actions": [],
+    "AXValue": null,
+    "enabled": true,
+    "role": "AXButton",
+    "subrole": null
+  },
+  {
+    "AXFrame": "{{16, 831.33333333333337}, {370, 52}}",
+    "AXUniqueId": "com.apple.settings.screenTime",
+    "frame": {
+      "y": 831.3333333333334,
+      "x": 16,
+      "width": 370,
+      "height": 52
+    },
+    "role_description": "button",
+    "AXLabel": "Screen Time",
+    "content_required": false,
+    "type": "Button",
+    "title": null,
+    "help": null,
+    "custom_actions": [],
+    "AXValue": null,
+    "enabled": true,
+    "role": "AXButton",
+    "subrole": null
+  },
+  {
+    "AXFrame": "{{0, 798}, {402, 76}}",
+    "AXUniqueId": "Toolbar",
+    "frame": {
+      "y": 798,
+      "x": 0,
+      "width": 402,
+      "height": 76
+    },
+    "role_description": "group",
+    "AXLabel": "Toolbar",
+    "content_required": false,
+    "type": "Group",
+    "title": null,
+    "help": null,
+    "custom_actions": [],
+    "AXValue": null,
+    "enabled": true,
+    "role": "AXGroup",
+    "subrole": null
+  }
+]

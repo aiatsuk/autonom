@@ -204,10 +204,33 @@ def _telephony(target: Target, control: str, action: str,
             "verified": True}
 
 
+# `xcrun simctl` has no biometric subcommand (checked on Xcode 26: "Unrecognized
+# subcommand: biometric"), so this control had never worked on iOS. The
+# Simulator's Face ID / Touch ID menu is driven by Darwin notifications, which
+# `simctl spawn <udid> notifyutil` can post from the host.
+IOS_BIOMETRIC_NOTIFICATIONS = {
+    "enroll": ("com.apple.BiometricKit.enrollmentChanged", "1"),
+    "unenroll": ("com.apple.BiometricKit.enrollmentChanged", "0"),
+    "match": ("com.apple.BiometricKit_Sim.fingerTouch.match", None),
+    "nonmatch": ("com.apple.BiometricKit_Sim.fingerTouch.nomatch", None),
+}
+
+
 def _biometric(target: Target, action: str) -> dict[str, Any]:
     if target.platform == IOS:
-        _simctl(target, ["biometric", target.target_id,
-                         "match" if action == "match" else "nonmatch"])
+        if action not in IOS_BIOMETRIC_NOTIFICATIONS:
+            raise errors.AutonomError(
+                errors.FLOW_COMMAND_INVALID,
+                f"unknown biometric action {action!r}",
+                "Actions: " + ", ".join(IOS_BIOMETRIC_NOTIFICATIONS) + ".")
+        name, state = IOS_BIOMETRIC_NOTIFICATIONS[action]
+        args = ["spawn", target.target_id, "notifyutil"]
+        if state is not None:
+            args += ["-s", name, state]
+        args += ["-p", name]
+        _simctl(target, args)
+        return {"control": "biometric", "action": action, "notification": name,
+                "verified": True}
     else:
         if action != "match":
             raise errors.AutonomError(

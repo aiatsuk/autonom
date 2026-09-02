@@ -117,6 +117,12 @@ APP_SKILL_INVALID = "app_skill_invalid"
 REPLAY_MANIFEST_INVALID = "replay_manifest_invalid"
 CI_DESTINATION_FAILED = "ci_destination_failed"
 
+# --- Found by the 2026-09-02 device sweep -----------------------------------
+USAGE_ERROR = "usage_error"                  # argparse rejected the argv
+SELECTOR_REQUIRED = "selector_required"      # ui tap with neither selector nor x/y
+APP_NOT_DEBUGGABLE = "app_not_debuggable"    # run-as refused the package
+FLOW_NO_FOCUSED_FIELD = "flow_no_focused_field"  # inputText with nothing focused
+
 # --- Deterministic capture state --------------------------------------------
 # Keyboard/locale pinning edits the simulator's on-disk preference store, which
 # cfprefsd only reads at boot; a booted device must be shut down first.

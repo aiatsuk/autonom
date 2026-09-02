@@ -91,6 +91,11 @@ tags: [smoke, auth]
    selector.
 3. Do not fight a `test_failure` by retrying the flow — read the failure
    evidence first; the app state, not the harness, is what changed.
+   Two first-step failures seen on real devices are authoring, not app,
+   problems: `launchApp` resumes the app wherever it was (start with
+   `stopApp`), and `inputText` right after the `tapOn` that opens a field
+   finds nothing focused yet (add `waitUntil` on the field, or rely on the
+   built-in focus poll and its `timeoutMs`).
 4. Keep subflows atomic (login, dismiss-permissions) and let `runFlow`
    compose them; recursion and paths escaping the workspace are refused.
 5. Flow files are source — commit them. If the repository blanket-ignores
@@ -105,6 +110,7 @@ tags: [smoke, auth]
 | `flow_selector_invalid` | unknown or deferred selector field, bad match mode |
 | `flow_file_not_found` / `flow_path_escapes_workspace` / `flow_cycle_detected` | runFlow graph problems |
 | `flow_assertion_timeout` | test failure: the asserted state never held |
+| `flow_no_focused_field` | test failure: `inputText` found nothing with keyboard focus to type into (`requireFocus: false` opts out) |
 | `flow_var_undefined` / `flow_secret_undefined` | `${VAR}` unresolved / `--secret` not in the environment |
 | `flow_no_flows_found` | no flow files (or none match the tag filters) |
 | `no_active_session` | run `session start` first (see mobile-session) |

@@ -333,7 +333,67 @@ def _runtime_state(record: dict[str, Any] | None) -> tuple[dict[str, Any], list,
     if dangling:
         warnings.append(dangling)
 
+    warnings.extend(_foreign_attachments(record, machine["live"]))
+
     return network, orphans, warnings
+
+
+def _foreign_attachments(record: dict[str, Any] | None,
+                         live: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Emulators whose global proxy points at an Autonom proxy nobody here owns.
+
+    Found on a real machine: a session from three days earlier had attached
+    the emulator to its proxy and never detached; the proxy was still alive,
+    so `device_may_be_left_attached` (which needs a *dead* proxy) stayed
+    silent while every request from the emulator was routed through a
+    capture nobody was reading. This looks at every running emulator, not
+    just the session's target, because the attachment outlives the session.
+    """
+    if not live:
+        return []
+    try:
+        adb_path = adb_mod.find_adb()
+        devices = adb_mod.list_devices(adb_path)
+    except errors.AutonomError:
+        return []
+    ports_by_pid = {entry.get("pid"): entry for entry in live if entry.get("port")}
+    current_port = ((record or {}).get("network") or {}).get("proxy_port")
+    found: list[dict[str, Any]] = []
+    for device in devices:
+        if device.state != "device" or not device.serial.startswith("emulator-"):
+            continue
+        try:
+            completed = adb_mod.run_adb(
+                adb_path, ["shell", "settings", "get", "global", "http_proxy"],
+                serial=device.serial, timeout=10, check=False,
+            )
+        except errors.AutonomError:
+            continue
+        value = (completed.stdout if isinstance(completed.stdout, str) else "").strip()
+        if not value or value in ("null", ":0"):
+            continue
+        host, _, port_text = value.rpartition(":")
+        if host != "10.0.2.2" or not port_text.isdigit():
+            continue
+        port = int(port_text)
+        if current_port and port == int(current_port):
+            continue
+        owner = next((entry for entry in ports_by_pid.values() if entry.get("port") == port), None)
+        if owner is None:
+            continue
+        found.append({
+            "code": "device_attached_to_foreign_proxy",
+            "target_id": device.serial,
+            "device_proxy": value,
+            "pid": owner.get("pid"),
+            "session_id": owner.get("session_id"),
+            "error": f"{device.serial} routes all traffic through Autonom proxy pid "
+                     f"{owner.get('pid')} (session {owner.get('session_id')}), which "
+                     "this session does not own",
+            "hint": "Run 'autonom network detach' from that session's context, or "
+                    "'adb shell settings put global http_proxy :0' to clear it by hand.",
+        })
+    return found
 
 
 def _latest_proxy_file(record: dict[str, Any] | None) -> Path | None:

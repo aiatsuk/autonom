@@ -89,6 +89,15 @@ on the Simulator window (Device > Rotate).
 
 iOS has no global Back button; tap the navigation bar's back control instead.
 
+**Typing needs focus.** `ui type` sends keystrokes to whatever has keyboard
+focus; with no focused field the characters vanish while the command still
+exits 0. The response carries `focused` (the node that will receive the text) with
+`focus: verified` on Android or `unverified` on iOS — idb's dump has no focus
+attribute, so on iOS the check degrades to "a text field is on screen" — or a
+`no_focused_field` warning. Tap the field, wait for it, type, then confirm
+with `ui find` on the typed text. In flows, `inputText` refuses to type into
+nothing (`flow_no_focused_field`).
+
 ## Coordinate space
 
 iOS accessibility frames and `idb ui tap` both use **points**, not pixels. Never

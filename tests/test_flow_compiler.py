@@ -17,7 +17,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 CLI = ROOT / "scripts/autonom.py"
-UI_DUMP = ROOT / "tests/fixtures/ui_dump.xml"
+# The focused variant: these flows tap the search field and then type, and a
+# real device reports that field focused. `inputText` refuses to type into
+# a tree with no focus (flow_no_focused_field), which the plain dump would trip.
+UI_DUMP = ROOT / "tests/fixtures/ui_dump_focused.xml"
 
 sys.path.insert(0, str(ROOT / "scripts"))
 

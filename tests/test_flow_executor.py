@@ -26,7 +26,10 @@ CLI = ROOT / "scripts/autonom.py"
 FAKE_ADB = ROOT / "tests/fakes/fake_adb.py"
 FAKE_SIMCTL = ROOT / "tests/fakes/fake_simctl.py"
 FAKE_IDB = ROOT / "tests/fakes/fake_idb.py"
-UI_DUMP = ROOT / "tests/fixtures/ui_dump.xml"
+# The focused variant: these flows tap the search field and then type, and a
+# real device reports that field focused. `inputText` refuses to type into
+# a tree with no focus (flow_no_focused_field), which the plain dump would trip.
+UI_DUMP = ROOT / "tests/fixtures/ui_dump_focused.xml"
 IOS_TREE = ROOT / "tests/fixtures/idb_describe_all_sample.json"
 UDID = "AAAAAAAA-1111-2222-3333-BBBBBBBBBBBB"
 

@@ -74,6 +74,10 @@ python3 <autonom-root>/scripts/autonom.py session stop
 Target flags work before or after the subcommand. A shutdown simulator is booted
 automatically and the response reports `"booted": true` when this call did it.
 
+Intent extras that start with `--` must be attached to the flag, or argparse
+reads them as options: `session launch com.example.app --arg=--es --arg=key=value`.
+Argument mistakes come back as `error_code: usage_error` with the usage line.
+
 All commands print JSON. `session start` writes, **machine-globally** under
 `~/.autonom/sessions/` (honouring `AUTONOM_HOME`) — not in the project, so the
 active session is found from any directory, like mocks and per-app knowledge:
@@ -135,8 +139,9 @@ export AUTONOM_IDB_COMPANION=mac-farm-01:10882
    with a `tail -f` hint for a human's second terminal.
 4. `session stop` tears down the log stream, recorder, and proxy best-effort and
    reports each action — it never fails because teardown failed.
-5. If a session died without stopping, `autonom doctor` lists orphaned processes
-   and any device left pointing at a dead proxy.
+5. If a session died without stopping, `autonom doctor` lists orphaned processes,
+   any device left pointing at a dead proxy, and any emulator still routed
+   through another session's *live* proxy (`device_attached_to_foreign_proxy`).
 
 ## Failure codes worth knowing
 
@@ -146,6 +151,8 @@ export AUTONOM_IDB_COMPANION=mac-farm-01:10882
 | `idb_required` | iOS `ui` verbs need idb; `screenshot`/`logs`/`open` still work |
 | `ios_boot_failed` | simulator never reached `Booted`; try `xcrun simctl erase <udid>` |
 | `no_active_session` | start one with `session start` |
+| `usage_error` | argparse rejected the argv; `hint` carries the usage line |
+| `app_not_debuggable` | `file ls`/`pull` need a debuggable build; release and system apps refuse run-as |
 | `simulator_must_be_shutdown` | `simulator keyboard pin` needs a shut-down simulator; pass `--value reboot=true` or shut it down first |
 | `simulator_data_not_found` | the simulator has no data directory yet — boot it once, or set `AUTONOM_CORESIMULATOR_DEVICES` |
 
