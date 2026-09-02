@@ -1,7 +1,7 @@
 schema: autonom.dev/flow/v1
 appId: com.apple.Preferences
 name: Tour — iOS Settings
-description: Launch Settings fresh, open General, then About, and come back - three screens deep; iOS puts the visible label in description, so every selector uses it
+description: Launch Settings fresh, open General, then About, and come back - automatic evidence stays attached to each action; iOS puts the visible label in description, so every selector uses it
 tags:
   - tour
 requires:
@@ -15,8 +15,6 @@ requires:
       description: General
     timeoutMs: 15000
     label: The Settings home screen is up
-- takeScreenshot:
-    label: Settings home
 - tapOn:
     selector:
       description: General
@@ -26,8 +24,6 @@ requires:
       description: About
     timeoutMs: 10000
     label: The "General" screen is up
-- takeScreenshot:
-    label: General
 - tapOn:
     selector:
       description: About
@@ -38,8 +34,6 @@ requires:
       match: regex
     timeoutMs: 10000
     label: The "About" screen shows the device facts
-- takeScreenshot:
-    label: About — three levels deep
 - tapOn:
     selector:
       description: General

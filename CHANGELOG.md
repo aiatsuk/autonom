@@ -131,6 +131,10 @@ already solved the noise that makes two captures of one screen differ.
     platform" failure says to use a physical device.
 
 ### Changed
+- `autonom tour` relies on `evidence=always` for its screenshots instead of
+  inserting separate `takeScreenshot` phases. Before/after frames, hierarchy,
+  and logs stay attached to the action that produced them, so a click is one
+  report step rather than a click followed by a duplicate screenshot step.
 - `simulator status-bar override` on Android now enters demo mode explicitly
   and accepts `battery`, `plugged`, `wifi`, `wifi_level`, `mobile`,
   `mobile_level`, `datatype`, and `notifications` alongside `hhmm`; an unknown
