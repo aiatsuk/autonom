@@ -170,14 +170,14 @@ selector-strings: id text visibleText description role
 selector-bools: enabled checked selected focused
 selector-relational: above below leftOf rightOf childOf containsChild containsDescendants
 match-modes: exact caseInsensitiveExact contains regex
-command launchApp: clearState label postcondition
+command launchApp: clearState resume label postcondition
 command stopApp: label postcondition
 command clearState: label postcondition
 command openLink: url label postcondition
 command tapOn: selector repeat delayMs label timeoutMs postcondition optional reason
 command longPressOn: selector durationMs label timeoutMs postcondition optional reason
 command doubleTapOn: selector label timeoutMs postcondition optional reason
-command inputText: value sensitive label postcondition
+command inputText: value sensitive requireFocus timeoutMs label postcondition
 command eraseText: chars label postcondition
 command pressKey: key label postcondition
 command back: label postcondition
@@ -227,6 +227,20 @@ applied, verified, and used setup entries separately.
 - Mutating commands (taps, input, links, device state) execute **exactly
   once** — never retried implicitly. `tapOn` with `repeat:` is N *declared*
   taps, not recovery.
+- `inputText` first polls (up to `timeoutMs`, default 10 s) for a node that
+  reports keyboard focus and fails with `flow_no_focused_field` (a test
+  failure) when none appears: on real devices a `tapOn` that opens the
+  field's activity followed by an immediate `inputText` typed into nothing
+  and passed. iOS accessibility dumps carry no focus attribute (verified on
+  a Simulator), so there the bar is "a text field is on screen".
+  `requireFocus: false` opts out for a UI whose field never reports focus.
+- `launchApp` starts the app **fresh**: the launcher activity on a cleared
+  task on Android (`am start --activity-clear-task`), terminate-then-launch
+  on iOS. Data is untouched (`clearState: true` wipes it). Measured on real
+  devices, a resumed task put a flow's first selector on a subscreen — or,
+  with Android Settings, in a search activity of another package that
+  `stopApp` never touches. `resume: true` restores the old behaviour for a
+  flow that continues a journey.
 - `repeat` is bounded, declared iteration: `times` (1–25) is the hard
   limit, `while:` (`visible`/`notVisible` only) stops the loop early the
   moment it no longer holds; a failing iteration fails the flow, and
@@ -370,6 +384,40 @@ canonical Flow v1 text, which is also the migration path. `flow fmt
 --write` never rewrites a Maestro source in place (`write_skipped` in the
 entry says so) — converting to a file is always the explicit
 `flow import --out`.
+
+## Repairing a failed flow
+
+Flows replay without a model, so when the app moves a button or renames a
+label the run fails loudly and the YAML has to be fixed by hand. A *test*
+failure in `flow run` therefore carries a `repair` block next to `failure`:
+
+```json
+"repair": {
+  "step_index": 3, "command": "tapOn", "line": 12, "flow": "flows/login.yaml",
+  "selector": {"description": "Log In", "match": "exact"},
+  "commands": [
+    "autonom flow run flows/login.yaml --until-step 2",
+    "autonom ui tree",
+    "autonom ui find --desc 'Log In' --mode contains --all",
+    "autonom screenshot --label 'repair tapOn line 12'",
+    "autonom flow check flows/login.yaml",
+    "autonom flow run flows/login.yaml"
+  ],
+  "advice": "The element the step targets was not on screen when the step ran. …",
+  "evidence": "~/.autonom/sessions/<id>/flows/<run_id>/events.ndjson",
+  "note": "The corrected flow is a reviewed edit, never an automatic rewrite."
+}
+```
+
+The commands are the repair loop in order: replay the prefix so the device
+sits in the state the failed step assumed, dump what is on screen now, query
+the old selector *widened* (`contains`, `--all`) to see what it nearly
+matched, keep a screenshot, then re-validate and re-run. `advice` is keyed by
+the error code (`no_matching_node`, `flow_assertion_timeout`,
+`ambiguous_selector`, `selector_index_out_of_range`,
+`coordinate_space_mismatch`). Definition and infrastructure failures abort
+with their own envelope and get no brief. Nothing rewrites the flow: the
+edit is yours to review and commit.
 
 ## Errors
 

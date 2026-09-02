@@ -1,0 +1,50 @@
+schema: autonom.dev/flow/v1
+appId: com.android.settings
+name: Tour — Android Settings
+description: Launch Settings fresh, open Network & internet, then Internet, and come back - three screens deep, one screenshot per screen
+tags:
+  - tour
+requires:
+  platform:
+    - android
+---
+- launchApp:
+    label: Launch Settings on a cleared task
+- assertVisible:
+    selector:
+      text: ^Network (&|and) [Ii]nternet$
+      match: regex
+    timeoutMs: 15000
+    label: The Settings home screen is up
+- takeScreenshot:
+    label: Settings home
+- tapOn:
+    selector:
+      text: ^Network (&|and) [Ii]nternet$
+      match: regex
+    label: Open "Network & internet"
+- assertVisible:
+    selector:
+      text: ^(Internet|Wi.?Fi)$
+      match: regex
+    timeoutMs: 10000
+    label: The "Network & internet" screen is up
+- takeScreenshot:
+    label: Network & internet
+- tapOn:
+    selector:
+      text: ^(Internet|Wi.?Fi)$
+      match: regex
+    label: Open "Internet"
+- assertNotVisible:
+    selector:
+      text: ^Network (&|and) [Ii]nternet$
+      match: regex
+    timeoutMs: 10000
+    label: The "Internet" screen replaced the list
+- takeScreenshot:
+    label: Internet — three levels deep
+- back:
+    label: Back to "Network & internet"
+- back:
+    label: Back to the Settings home

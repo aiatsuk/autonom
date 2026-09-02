@@ -171,8 +171,16 @@ def _require_android_emulator(target: Target, verb: str) -> None:
         )
 
 
-def set_location(target: Target, value: str) -> dict[str, Any]:
+def set_location(target: Target, value: str,
+                 session: dict[str, Any] | None = None) -> dict[str, Any]:
     latitude, longitude = parse_coordinates(value)
+    if session is not None:
+        # Remembered so `location get` can say "you asked for X, the system
+        # reports Y" instead of leaving the mismatch to look like a failed set.
+        session["location_requested"] = {
+            "latitude": latitude, "longitude": longitude,
+            "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
     if target.platform == IOS:
         ios_simctl.set_location(target.tool, target.target_id, latitude, longitude)
         return {"latitude": latitude, "longitude": longitude, "via": "simctl"}
@@ -185,7 +193,15 @@ def set_location(target: Target, value: str) -> dict[str, Any]:
         ["emu", "geo", "fix", f"{longitude:.7f}", f"{latitude:.7f}"],
         serial=target.target_id,
     )
-    return {"latitude": latitude, "longitude": longitude, "via": "emulator_console"}
+    # Seen on a real API-37 emulator: the console answers OK, but the location
+    # manager keeps reporting its last delivered fix and the GNSS provider
+    # stays inactive until some app subscribes to location updates. Say so,
+    # or `location get` right after `set` reads like a failure of `set`.
+    return {"latitude": latitude, "longitude": longitude, "via": "emulator_console",
+            "delivery": "on_subscription",
+            "note": "The fix is injected into the emulator GNSS; the system's last known "
+                    "location (what 'location get' reads) updates only once an app "
+                    "requests location updates."}
 
 
 _LAST_LOCATION = re.compile(
@@ -195,7 +211,26 @@ _LAST_LOCATION = re.compile(
 _PROVIDER_PRIORITY = ("fused", "gps", "network", "passive")
 
 
-def get_location(target: Target) -> dict[str, Any]:
+def _with_delivery(observed: dict[str, Any],
+                   session: dict[str, Any] | None) -> dict[str, Any]:
+    """Annotate an observed fix with what this session asked for, if anything."""
+    requested = (session or {}).get("location_requested")
+    if not requested:
+        return observed
+    close = (
+        observed.get("latitude") is not None
+        and abs(observed["latitude"] - requested["latitude"]) < 1e-4
+        and abs(observed["longitude"] - requested["longitude"]) < 1e-4
+    )
+    annotated = {**observed, "requested": requested, "delivered": close}
+    if not close:
+        annotated["note"] = ("The system's last known location differs from the fix this "
+                             "session set; the emulator delivers a fix only to an app that "
+                             "subscribes to location updates.")
+    return annotated
+
+
+def get_location(target: Target, session: dict[str, Any] | None = None) -> dict[str, Any]:
     """Read the current (last known) location.
 
     Android reads it from `dumpsys location`, preferring the fused provider.
@@ -222,11 +257,11 @@ def get_location(target: Target) -> dict[str, Any]:
         })
     for provider in _PROVIDER_PRIORITY:
         if provider in fixes:
-            return fixes[provider]
+            return _with_delivery(fixes[provider], session)
     if fixes:
-        return next(iter(fixes.values()))
-    return {"latitude": None, "longitude": None, "provider": None,
-            "note": "no last known location on the device"}
+        return _with_delivery(next(iter(fixes.values())), session)
+    return _with_delivery({"latitude": None, "longitude": None, "provider": None,
+                           "note": "no last known location on the device"}, session)
 
 
 def clear_location(target: Target) -> None:
@@ -370,9 +405,13 @@ def file_pull(target: Target, app_id: str, remote: str, destination: Path) -> di
         completed = adb_mod.run_adb(
             target.tool,
             ["exec-out", "run-as", app_id, "cat", relative],
-            serial=target.target_id, timeout=60, check=True, binary=True,
+            serial=target.target_id, timeout=60, check=False, binary=True,
         )
         assert isinstance(completed.stdout, bytes)
+        stderr = (completed.stderr or b"").decode("utf-8", "replace")
+        _raise_if_run_as_refused(app_id, stderr or completed.stdout.decode("utf-8", "replace"))
+        if completed.returncode != 0:
+            raise adb_mod.AdbError(stderr.strip() or f"run-as {app_id} cat {relative} failed")
         destination.write_bytes(completed.stdout)
 
     # Contents are deliberately not echoed: pulled app data can hold PII.
@@ -386,18 +425,55 @@ def file_ls(target: Target, app_id: str, remote: str = ".") -> list[str]:
         if not container:
             raise errors.AutonomError(
                 errors.APP_NOT_INSTALLED, f"no data container for {app_id}",
-                "Check the bundle id with 'xcrun simctl listapps <udid>'.",
+                "System apps (com.apple.*) expose no data container; for your own app "
+                "check the bundle id with 'xcrun simctl listapps <udid>'.",
+            )
+        if not container.is_dir():
+            raise errors.AutonomError(
+                errors.APP_NOT_INSTALLED,
+                f"data container for {app_id} is not on disk: {container}",
+                "The simulator may need a boot, or the app a reinstall.",
             )
         base = container if relative == "." else container / relative
         if not base.exists():
-            return []
+            raise errors.AutonomError(
+                errors.PATH_OUTSIDE_CONTAINER if ".." in relative else errors.BODY_FILE_NOT_FOUND,
+                f"no such path in the {app_id} container: {relative}",
+                "List the container root first: 'autonom file ls --app-id <id>'.",
+            )
         return sorted(entry.name + ("/" if entry.is_dir() else "") for entry in base.iterdir())
     completed = adb_mod.run_adb(
         target.tool, ["exec-out", "run-as", app_id, "ls", "-1", relative],
         serial=target.target_id, timeout=30, check=False,
     )
     text = completed.stdout if isinstance(completed.stdout, str) else ""
+    # `exec-out` merges run-as's complaint into the listing, so a system app
+    # used to come back as one "file" named `run-as: package not an
+    # application` with ok: true. Refuse by name instead.
+    _raise_if_run_as_refused(app_id, text)
+    if completed.returncode != 0:
+        raise adb_mod.AdbError(text.strip() or f"run-as {app_id} ls {relative} failed")
     return [line.strip() for line in text.splitlines() if line.strip()]
+
+
+_RUN_AS_REFUSALS = (
+    "package not an application", "not debuggable", "run-as: unknown package",
+    "run-as: could not", "run-as: package", "run-as: Could not",
+)
+
+
+def _raise_if_run_as_refused(app_id: str, output: str) -> None:
+    lowered = (output or "").lower()
+    if not lowered.startswith("run-as:") and "run-as:" not in lowered[:200]:
+        return
+    if any(marker.lower() in lowered for marker in _RUN_AS_REFUSALS):
+        raise errors.AutonomError(
+            errors.APP_NOT_DEBUGGABLE,
+            f"run-as refused {app_id}: {output.strip().splitlines()[0][:160]}",
+            "Container files are readable only for debuggable builds (release and "
+            "system apps refuse run-as). Install a debug build, or pull app data "
+            "through the app's own export.",
+        )
 
 
 # --- screen recording --------------------------------------------------------

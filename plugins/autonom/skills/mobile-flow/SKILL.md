@@ -76,6 +76,11 @@ tags: [smoke, auth]
   a failing step leaves a screenshot and a hierarchy dump automatically.
 - `onFlowComplete` cleanup always runs; its failures are reported separately
   (`hook_failures`) and never mask the primary outcome.
+- A test failure also carries `repair`: the `--until-step` command that
+  reconstructs the state the failed step assumed, `ui tree`, the old selector
+  as a widened `ui find … --mode contains --all`, and the re-verification
+  commands, with advice keyed by the error code. Run them in order, edit the
+  YAML, and re-run — the brief never rewrites the flow for you.
 
 ## Rules
 
@@ -86,6 +91,11 @@ tags: [smoke, auth]
    selector.
 3. Do not fight a `test_failure` by retrying the flow — read the failure
    evidence first; the app state, not the harness, is what changed.
+   `launchApp` starts the app fresh (cleared task; `resume: true` to
+   continue where it was), and `inputText` polls for a focused field before
+   typing (`timeoutMs`), so the two first-step failures seen on real devices
+   — a resumed subscreen and typing before the field existed — no longer
+   need hand-written waits.
 4. Keep subflows atomic (login, dismiss-permissions) and let `runFlow`
    compose them; recursion and paths escaping the workspace are refused.
 5. Flow files are source — commit them. If the repository blanket-ignores
@@ -100,6 +110,7 @@ tags: [smoke, auth]
 | `flow_selector_invalid` | unknown or deferred selector field, bad match mode |
 | `flow_file_not_found` / `flow_path_escapes_workspace` / `flow_cycle_detected` | runFlow graph problems |
 | `flow_assertion_timeout` | test failure: the asserted state never held |
+| `flow_no_focused_field` | test failure: `inputText` found nothing with keyboard focus to type into (`requireFocus: false` opts out) |
 | `flow_var_undefined` / `flow_secret_undefined` | `${VAR}` unresolved / `--secret` not in the environment |
 | `flow_no_flows_found` | no flow files (or none match the tag filters) |
 | `no_active_session` | run `session start` first (see mobile-session) |

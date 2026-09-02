@@ -43,6 +43,12 @@ def record(argv: list[str]) -> None:
         handle.write(json.dumps({"tool": "idb", "argv": argv}) + "\n")
 
 
+def write_state(state: dict) -> None:
+    path = os.environ.get("AUTONOM_FAKE_STATE")
+    if path:
+        Path(path).write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+
+
 # `idb --help` and `idb ui --help`, fb-idb 1.1.7.
 COMMANDS = frozenset({
     "add-media", "approve", "boot", "clear-keychain", "clone", "companion",
@@ -98,6 +104,19 @@ def main(argv: list[str]) -> int:
             code, message = outcome
             sys.stderr.write(message + "\n")
             return int(code)
+
+    # A failure that clears itself once `list-targets` has run — the stale
+    # companion registration seen on a real Mac, which `list-targets` prunes.
+    once = state.get("idb_fail_until_pruned") or {}
+    if argv[:1] == ["list-targets"] and once:
+        state.pop("idb_fail_until_pruned", None)
+        write_state(state)
+    else:
+        for prefix, outcome in once.items():
+            if " ".join(argv).startswith(prefix):
+                code, message = outcome
+                sys.stderr.write(message + "\n")
+                return int(code)
 
     if argv[:1] == ["--version"]:
         sys.stdout.write(state.get("idb_version", "1.1.7") + "\n")

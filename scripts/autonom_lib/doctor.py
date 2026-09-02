@@ -33,6 +33,42 @@ BREW_TRUST_HINT = (
     "brew trust --formula facebook/fb/idb-companion && brew install idb-companion"
 )
 
+# Environment overrides the resolvers honour. A host-wide override is the
+# classic invisible trap: a stale AUTONOM_ADB makes every probe report adb as
+# missing while `which adb` in the same shell finds it, and nothing in the old
+# report said why. Doctor now names every active override, and warns when a
+# binary override points at nothing.
+BINARY_OVERRIDES = (
+    "AUTONOM_ADB", "AUTONOM_SIMCTL", "AUTONOM_IDB", "AUTONOM_EMULATOR", "AUTONOM_MITMDUMP",
+)
+OVERRIDE_VARS = BINARY_OVERRIDES + (
+    "AUTONOM_IDB_COMPANION", "AUTONOM_HOME", "AUTONOM_CORESIMULATOR_DEVICES",
+)
+
+
+def _overrides() -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    active: dict[str, Any] = {}
+    warnings: list[dict[str, Any]] = []
+    for name in OVERRIDE_VARS:
+        value = os.environ.get(name)
+        if not value:
+            continue
+        entry: dict[str, Any] = {"value": value}
+        if name in BINARY_OVERRIDES:
+            exists = Path(value).expanduser().is_file() or shutil.which(value) is not None
+            entry["exists"] = exists
+            if not exists:
+                warnings.append({
+                    "code": "override_path_missing",
+                    "variable": name,
+                    "error": f"{name}={value} points at no executable",
+                    "hint": f"unset {name} (or the matching flag) or point it at an "
+                            "existing binary; the tool it overrides reads as missing "
+                            "until then.",
+                })
+        active[name] = entry
+    return active, warnings
+
 
 def _probe_binary(name: str, resolver, version_fn) -> dict[str, Any]:
     entry: dict[str, Any] = {"state": "missing", "path": None, "version": None}
@@ -186,6 +222,9 @@ def collect(args: Any = None) -> dict[str, Any]:
 
     network_state, orphans, warnings = _runtime_state(record)
 
+    overrides, override_warnings = _overrides()
+    warnings.extend(override_warnings)
+
     # The mock registry outlives every session, so doctor is the one place
     # guaranteed to reveal a rule left enabled days ago.
     from .network import mocks as mocks_mod
@@ -209,6 +248,7 @@ def collect(args: Any = None) -> dict[str, Any]:
         "session": session_summary,
         "network": network_state,
         "mocks": mocks_state,
+        "overrides": overrides,
         "orphans": orphans,
         "warnings": warnings,
     }
@@ -229,6 +269,16 @@ def _runtime_state(record: dict[str, Any] | None) -> tuple[dict[str, Any], list,
     warnings: list[dict[str, Any]] = []
     network = {"running": False, "proxy_port": None, "attached": False}
 
+    # Machine-wide sweep first: it decides whether a proxy is *owned* (its
+    # session directory and proxy.json are intact) or orphaned. The block
+    # below used to call the newest proxy an orphan merely because no session
+    # was current, while `processes` listed the same pid as live and owned —
+    # one process, two contradictory answers in one report.
+    from . import processes as processes_mod
+
+    machine = processes_mod.scan()
+    owned_pids = {entry.get("pid") for entry in machine["live"]}
+
     proxy_file = _latest_proxy_file(record)
     if proxy_file and proxy_file.exists():
         try:
@@ -239,7 +289,7 @@ def _runtime_state(record: dict[str, Any] | None) -> tuple[dict[str, Any], list,
         alive = session_mod.pid_alive(pid)
         network = {"running": alive, "proxy_port": proxy.get("port"),
                    "attached": bool((record or {}).get("network", {}).get("attached"))}
-        if alive and not record:
+        if alive and not record and pid not in owned_pids:
             orphans.append({"kind": "proxy", "pid": pid, "port": proxy.get("port"),
                             "hint": "autonom network stop"})
 
@@ -251,12 +301,9 @@ def _runtime_state(record: dict[str, Any] | None) -> tuple[dict[str, Any], list,
                 warnings.append({"code": "stale_background_pid", "kind": kind, "pid": pid,
                                  "hint": "The session records a pid that is no longer running."})
 
-    # Machine-wide sweep. The block above can only see what the current working
-    # directory knows about, which is exactly how a proxy started elsewhere held
-    # a port for hours while doctor reported a clean machine.
-    from . import processes as processes_mod
-
-    machine = processes_mod.scan()
+    # The block above can only see what the current working directory knows
+    # about, which is exactly how a proxy started elsewhere held a port for
+    # hours while doctor reported a clean machine; the sweep fills the rest in.
     seen = {item.get("pid") for item in orphans}
     for entry in machine["orphans"]:
         if entry.get("pid") in seen:
@@ -293,7 +340,67 @@ def _runtime_state(record: dict[str, Any] | None) -> tuple[dict[str, Any], list,
     if dangling:
         warnings.append(dangling)
 
+    warnings.extend(_foreign_attachments(record, machine["live"]))
+
     return network, orphans, warnings
+
+
+def _foreign_attachments(record: dict[str, Any] | None,
+                         live: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Emulators whose global proxy points at an Autonom proxy nobody here owns.
+
+    Found on a real machine: a session from three days earlier had attached
+    the emulator to its proxy and never detached; the proxy was still alive,
+    so `device_may_be_left_attached` (which needs a *dead* proxy) stayed
+    silent while every request from the emulator was routed through a
+    capture nobody was reading. This looks at every running emulator, not
+    just the session's target, because the attachment outlives the session.
+    """
+    if not live:
+        return []
+    try:
+        adb_path = adb_mod.find_adb()
+        devices = adb_mod.list_devices(adb_path)
+    except errors.AutonomError:
+        return []
+    ports_by_pid = {entry.get("pid"): entry for entry in live if entry.get("port")}
+    current_port = ((record or {}).get("network") or {}).get("proxy_port")
+    found: list[dict[str, Any]] = []
+    for device in devices:
+        if device.state != "device" or not device.serial.startswith("emulator-"):
+            continue
+        try:
+            completed = adb_mod.run_adb(
+                adb_path, ["shell", "settings", "get", "global", "http_proxy"],
+                serial=device.serial, timeout=10, check=False,
+            )
+        except errors.AutonomError:
+            continue
+        value = (completed.stdout if isinstance(completed.stdout, str) else "").strip()
+        if not value or value in ("null", ":0"):
+            continue
+        host, _, port_text = value.rpartition(":")
+        if host != "10.0.2.2" or not port_text.isdigit():
+            continue
+        port = int(port_text)
+        if current_port and port == int(current_port):
+            continue
+        owner = next((entry for entry in ports_by_pid.values() if entry.get("port") == port), None)
+        if owner is None:
+            continue
+        found.append({
+            "code": "device_attached_to_foreign_proxy",
+            "target_id": device.serial,
+            "device_proxy": value,
+            "pid": owner.get("pid"),
+            "session_id": owner.get("session_id"),
+            "error": f"{device.serial} routes all traffic through Autonom proxy pid "
+                     f"{owner.get('pid')} (session {owner.get('session_id')}), which "
+                     "this session does not own",
+            "hint": "Run 'autonom network detach' from that session's context, or "
+                    "'adb shell settings put global http_proxy :0' to clear it by hand.",
+        })
+    return found
 
 
 def _latest_proxy_file(record: dict[str, Any] | None) -> Path | None:

@@ -91,7 +91,9 @@ reads it back — the record you use to re-check or hand off a flow.
 | Discover | `doctor`, `devices`, `devices boot/shutdown` |
 | Session | `session start/show/stop/launch/force-stop/clear/uninstall` |
 | Screen | `ui tree/find/tap/swipe/pinch/rotate/shake/type/key` |
-| Evidence | `screenshot`, `shots list/show`, `record start/stop`, `note add/list`, `journal` |
+| First run | `tour` — overview, the workflow, this machine's targets, and `--run` to walk three screens into Settings with evidence at every step and a written account |
+| Evidence | `screenshot` (with `width`/`height`), `shots list/show`, `record start/stop`, `note add/list`, `journal` |
+| Deterministic state | `simulator status-bar pin\|clear` (both platforms), `simulator keyboard pin\|reset\|show` (iOS) — remove clock, battery, and autocorrect noise from before/after comparisons |
 | Device state | `open` (deep link), `permissions`, `location` (iOS + Android emulator), `media add`, `file ls/pull` |
 | Diagnostics | `logs tail`, `crash list/show` |
 | Live observation | `session outputs`, `logs follow`, `network requests follow`, `journal --follow` — bounded NDJSON streams |

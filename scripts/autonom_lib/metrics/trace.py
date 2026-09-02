@@ -136,6 +136,12 @@ def _xctrace(target: Target, app_id: str, preset: str, duration: float,
         raise errors.AutonomError(errors.TOOL_MISSING, str(exc), tool="xctrace")
     if completed.returncode != 0 or not output.exists():
         tail = (completed.stderr or completed.stdout or "").strip()[-400:]
+        if "not supported on this platform" in tail:
+            raise errors.AutonomError(
+                errors.TRACE_FAILED, f"xctrace record failed: {tail}",
+                "This instrument does not run against the Simulator; record it on a "
+                "physical device, or pick a preset the Simulator supports "
+                "(time-profiler, allocations, leaks).")
         raise errors.AutonomError(
             errors.TRACE_FAILED, f"xctrace record failed: {tail}",
             "SIP or a privacy prompt can block recording; run once "

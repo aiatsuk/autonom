@@ -9,6 +9,7 @@ from __future__ import annotations
 from typing import Any
 
 from . import adb as adb_mod
+from . import errors
 from .paths import ensure_ui_scripts_on_path
 
 ROLE_BY_CLASS = {
@@ -112,16 +113,37 @@ def parse_tree(
 # --- actuation ---------------------------------------------------------------
 
 
-def dump_hierarchy(adb: str, serial: str) -> str:
-    completed = adb_mod.run_adb(
-        adb,
-        ["exec-out", "uiautomator", "dump", "/dev/tty"],
-        serial=serial,
-        timeout=20,
-        check=True,
+def dump_hierarchy(adb: str, serial: str, *, retries: int = 1) -> str:
+    """One UIAutomator dump, complete or refused by name.
+
+    Mid-transition (an activity switching in), `uiautomator dump` returns a
+    truncated document; that used to surface as a bare ValueError with no
+    `error_code`. Retry once after a short settle, then fail as the backend
+    failure it is.
+    """
+    import time as _time
+
+    last = ""
+    for attempt in range(retries + 1):
+        completed = adb_mod.run_adb(
+            adb,
+            ["exec-out", "uiautomator", "dump", "/dev/tty"],
+            serial=serial,
+            timeout=20,
+            check=True,
+        )
+        assert isinstance(completed.stdout, str)
+        last = completed.stdout
+        if "</hierarchy>" in last:
+            return last
+        if attempt < retries:
+            _time.sleep(0.5)
+    raise errors.AutonomError(
+        errors.BACKEND_FAILED,
+        "UIAutomator returned an incomplete hierarchy (the screen was probably "
+        "mid-transition)",
+        "Wait for the screen to settle and retry; 'ui find' polls, 'ui tree' does not.",
     )
-    assert isinstance(completed.stdout, str)
-    return completed.stdout
 
 
 def screen_size(adb: str, serial: str) -> tuple[int, int] | None:

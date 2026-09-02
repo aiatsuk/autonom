@@ -33,6 +33,7 @@ from autonom_lib.flow import compiler as flow_compiler  # noqa: E402
 from autonom_lib.flow import executor as flow_executor  # noqa: E402
 from autonom_lib.flow import maestro as flow_maestro  # noqa: E402
 from autonom_lib.flow import report as flow_report  # noqa: E402
+from autonom_lib.flow import repair as flow_repair  # noqa: E402
 from autonom_lib.flow import validator as flow_validator  # noqa: E402
 from autonom_lib import journal as journal_mod  # noqa: E402
 from autonom_lib import providers as providers_mod  # noqa: E402
@@ -44,6 +45,7 @@ from autonom_lib import campaign as campaign_mod  # noqa: E402
 from autonom_lib import teach as teach_mod  # noqa: E402
 from autonom_lib import app_skills as app_skills_mod  # noqa: E402
 from autonom_lib import simulator as simulator_mod  # noqa: E402
+from autonom_lib import tour as tour_mod  # noqa: E402
 from autonom_lib import ios_simctl  # noqa: E402
 from autonom_lib.metrics import android_memory as metrics_memory  # noqa: E402
 from autonom_lib.metrics import artifacts as metrics_artifacts  # noqa: E402
@@ -119,14 +121,26 @@ def cmd_devices(args: argparse.Namespace) -> int:
     if args.platform in (None, ANDROID):
         # Bootable-but-not-running AVDs are part of the inventory too; a
         # missing emulator binary just means the key is absent.
+        adb_path = None
         try:
             adb_path = adb_mod.find_adb(getattr(args, "adb", None))
             emulator_bin = emulator_mod.find_emulator(
                 getattr(args, "emulator", None), adb_path=adb_path
             )
             payload["avds"] = emulator_mod.list_avds(emulator_bin)
+            # Names alone do not say which AVD is the phone and which the
+            # tablet; the hardware profile does (`avd_profiles`, additive).
+            payload["avd_profiles"] = emulator_mod.describe_avds(payload["avds"])
         except errors.AutonomError:
             pass
+        # A running emulator names the AVD it booted from, so a serial can be
+        # matched to a profile instead of guessed from `product:`. Best-effort.
+        if adb_path:
+            for device in devices:
+                if device.get("platform") == ANDROID and device.get("running"):
+                    name = emulator_mod.running_avd_name(adb_path, device["target_id"])
+                    if name:
+                        device["avd"] = name
     if warnings and not devices:
         payload["next_action"] = "run 'autonom doctor' to see what is missing"
     return emit(payload, as_json=True)
@@ -183,8 +197,12 @@ def cmd_devices_boot(args: argparse.Namespace) -> int:
 def cmd_devices_shutdown(args: argparse.Namespace) -> int:
     target = platform_mod.resolve(args)
     if target.platform == IOS:
-        ios_simctl.shutdown(target.tool, target.target_id)
-        return emit({"ok": True, "stopped": True, **target.identity()}, as_json=True)
+        simulator = ios_simctl.find_simulator(target.tool, target.target_id)
+        already = simulator is not None and simulator.state == "Shutdown"
+        if not already:
+            ios_simctl.shutdown(target.tool, target.target_id)
+        return emit({"ok": True, "stopped": True, "already_stopped": already,
+                     **target.identity()}, as_json=True)
     detail = emulator_mod.kill_emulator(target.tool, target.target_id)
     return emit({"ok": True, "platform": ANDROID, **detail}, as_json=True)
 
@@ -329,12 +347,21 @@ def cmd_session_launch(args: argparse.Namespace) -> int:
         if current:
             for key, value in _ios_proxy.launch_environment(current).items():
                 env.setdefault(key, value)
+        if getattr(args, "fresh", False):
+            ios_simctl.terminate(target.tool, target.target_id, args.app_id)
         pid = ios_simctl.launch(
             target.tool, target.target_id, args.app_id, args=args.arg or [], env=env
         )
-        return emit({"ok": True, "launched": args.app_id, "pid": pid, **target.identity()}, as_json=True)
+        return emit({"ok": True, "launched": args.app_id, "pid": pid,
+                     "mode": "fresh" if getattr(args, "fresh", False) else "resume",
+                     **target.identity()}, as_json=True)
+    if getattr(args, "fresh", False) and not args.activity:
+        detail = session_mod.launch_app_fresh(target.tool, target.target_id, args.app_id)
+        return emit({"ok": True, "launched": args.app_id, **detail, **target.identity()},
+                    as_json=True)
     session_mod.launch_app(target.tool, target.target_id, args.app_id, activity=args.activity)
-    return emit({"ok": True, "launched": args.app_id, **target.identity()}, as_json=True)
+    return emit({"ok": True, "launched": args.app_id, "mode": "resume",
+                 **target.identity()}, as_json=True)
 
 
 def cmd_session_stop_app(args: argparse.Namespace) -> int:
@@ -458,6 +485,25 @@ def cmd_ui_tree(args: argparse.Namespace) -> int:
         "nodes": nodes,
         **identity,
     }
+    # `--max-nodes` used to cut the list silently; an agent reading 5 nodes
+    # could not tell a 5-node screen from a 200-node one. Cheap and honest.
+    if args.max_nodes is not None and len(nodes) >= args.max_nodes:
+        payload["truncated"] = True
+    if not dump:
+        # The coordinate space the bounds live in (pixels on Android, points
+        # on iOS) — the same number the tap guard checks against. Android's
+        # `wm size` is one cheap call; on iOS the tree's own root frame is
+        # used, since the alternative is a second full accessibility dump.
+        size = None
+        if target.platform == ANDROID:
+            try:
+                size = ui_mod.screen_size(target)
+            except errors.AutonomError:
+                size = None
+        else:
+            size = ui_mod.screen_from_nodes(nodes)
+        if size:
+            payload["screen"] = list(size)
     if warnings:
         payload["warnings"] = warnings
     current = session_mod.load_current()
@@ -670,6 +716,15 @@ def cmd_ui_tap(args: argparse.Namespace) -> int:
     if args.x is not None and args.y is not None:
         x, y = args.x, args.y
     else:
+        if not any(value is not None for value in _selectors(args).values()):
+            # An empty selector matches every node, which used to surface as
+            # "ambiguous_selector: matched 78 nodes" — true, but not the point.
+            raise errors.AutonomError(
+                errors.SELECTOR_REQUIRED,
+                "ui tap needs a selector (--text/--desc/--resource-id/...) or --x/--y",
+                "Run 'autonom ui tree', then tap by --desc/--text/--resource-id, or "
+                "pass --x and --y for a point.",
+            )
         nodes = ui_mod.snapshot(target)
         matches = selector_mod.select(
             nodes,
@@ -740,6 +795,24 @@ def cmd_ui_gesture(args: argparse.Namespace) -> int:
 
 def cmd_ui_type(args: argparse.Namespace) -> int:
     target = _target(args)
+    # Typing with nothing focused "succeeds" on both platforms while every
+    # character lands nowhere (seen on an iOS Settings screen with no field).
+    # The CLI is exploratory, so it still types — but says what it saw.
+    focus_warning: dict[str, Any] | None = None
+    certainty = "unknown"
+    try:
+        focused, certainty = ui_mod.typing_target(target.platform, ui_mod.snapshot(target))
+    except errors.AutonomError:
+        focused = None  # no tree backend (idb missing): nothing to check against
+    else:
+        if focused is None:
+            focus_warning = {
+                "code": "no_focused_field",
+                "error": "no node on screen reports keyboard focus; the text may "
+                         "have been swallowed",
+                "hint": "Tap the field first (ui tap), wait for it to appear, then "
+                        "type; confirm with ui find on the typed text.",
+            }
     ui_mod.type_text(target, args.text)
     sensitive = bool(getattr(args, "sensitive", False))
     detail = actions_mod.record_detail(session_mod.load_current(), "type", {
@@ -757,6 +830,14 @@ def cmd_ui_type(args: argparse.Namespace) -> int:
         payload["sensitive"] = True
     if detail:
         payload["detail"] = detail
+    if focused is not None:
+        payload["focused"] = {key: focused.get(key)
+                              for key in ("ref", "role", "resource_id", "desc")}
+        # iOS trees carry no focus attribute: the field is on screen, whether
+        # it has the keyboard is not knowable from the dump.
+        payload["focus"] = "verified" if certainty == "focused" else "unverified"
+    if focus_warning:
+        payload["warnings"] = [focus_warning]
     return emit({**payload, **target.identity()}, as_json=True)
 
 
@@ -808,7 +889,10 @@ def cmd_shots_show(args: argparse.Namespace) -> int:
             errors.BODY_FILE_NOT_FOUND, f"no such file: {path}",
             "Pass a path from 'autonom shots list'.",
         )
+    size = shot_mod.png_size(path)
     return emit({"ok": True, "path": str(path),
+                 "width": size[0] if size else None,
+                 "height": size[1] if size else None,
                  "metadata": shot_mod.read_metadata(path)}, as_json=True)
 
 
@@ -1122,10 +1206,13 @@ def cmd_location(args: argparse.Namespace) -> int:
     if args.location_command == "clear":
         device_state.clear_location(target)
         return emit({"ok": True, "location": None, **target.identity()}, as_json=True)
+    session = session_mod.load_current()
     if args.location_command == "get":
-        detail = device_state.get_location(target)
+        detail = device_state.get_location(target, session)
         return emit({"ok": True, **detail, **target.identity()}, as_json=True)
-    detail = device_state.set_location(target, args.coordinates)
+    detail = device_state.set_location(target, args.coordinates, session)
+    if session is not None:
+        session_mod.save(session)
     return emit({"ok": True, **detail, **target.identity()}, as_json=True)
 
 
@@ -1204,6 +1291,10 @@ def cmd_record_stop(args: argparse.Namespace) -> int:
     target = _target(args)
     record = session_mod.require_current()
     background = record.setdefault("background", {})
+    if not background.get("recorder_pid"):
+        # Nothing to stop: say so without inventing a `latest.mp4` path.
+        return emit({"ok": True, "was_recording": False, "path": None, "bytes": 0,
+                     **target.identity()}, as_json=True)
     destination = Path(background.get("recorder_path") or
                        session_mod.artifact_path(record, "recordings", "latest.mp4"))
     detail = device_state.record_stop(target, background.get("recorder_pid"), destination)
@@ -1975,10 +2066,24 @@ def cmd_flow_run(args: argparse.Namespace) -> int:
             "events": result.events_path,
             "sensitive": result.sensitive,
         }
+        if args.dry_run:
+            # A dry run executes nothing, so `steps` is empty by definition;
+            # list what *would* run so the answer is more than "passed".
+            summary["dry_run"] = True
+            summary["planned"] = [
+                {"index": index, "command": step.command, "line": step.line,
+                 **({"label": step.label} if getattr(step, "label", None) else {})}
+                for index, step in enumerate(flow.steps, start=1)
+            ]
         if flow.converted_from:
             summary["converted_from"] = flow.converted_from
         if result.failure:
             summary["failure"] = result.failure
+            brief = flow_repair.repair_brief(
+                flow.path, result.failure, summary["steps"],
+                events_path=result.events_path)
+            if brief:
+                summary["repair"] = brief
         if result.hook_failures:
             summary["hook_failures"] = result.hook_failures
         if result.replay_target:
@@ -2680,10 +2785,29 @@ def cmd_report_serve(args: argparse.Namespace) -> int:
 
 
 def cmd_capabilities(args: argparse.Namespace) -> int:
-    record = session_mod.require_current()
+    # A capability snapshot describes a target, not a session: with no
+    # session it is taken against the explicit (or sole ready) target, from a
+    # record that declares nothing attached and no tooling probed yet.
+    record = session_mod.load_current()
     target = _target(args)
+    if record is None or record.get("target_id") != target.target_id:
+        record = {"platform": target.platform, "target_id": target.target_id,
+                  "tooling": {}, "network": {}, "session_id": None}
     snapshot = providers_mod.open_session(target, record).capabilities()
-    return emit({"ok": True, **snapshot.as_dict()}, as_json=True)
+    return emit({"ok": True, "session_id": record.get("session_id"),
+                 **snapshot.as_dict()}, as_json=True)
+
+
+def cmd_tour(args: argparse.Namespace) -> int:
+    payload, text = tour_mod.command(args)
+    if getattr(args, "human", False):
+        # The one verb written for a person first: --human prints the
+        # Markdown account to stdout instead of the JSON envelope.
+        print(text)
+        global _LAST_EMIT
+        _LAST_EMIT = {k: v for k, v in payload.items() if k != "run"}
+        return 0
+    return emit(payload, as_json=True)
 
 
 def cmd_teach_start(args: argparse.Namespace) -> int:
@@ -2715,10 +2839,32 @@ def cmd_teach_compile(args: argparse.Namespace) -> int:
 
 
 def cmd_teach_approve(args: argparse.Namespace) -> int:
-    result = teach_mod.approve(
-        session_mod.require_current(), Path(args.flow),
-        minimum_runs=args.minimum_runs)
-    return emit({"ok": True, **result}, as_json=True)
+    record = session_mod.require_current()
+    replays: list[dict[str, Any]] = []
+    if getattr(args, "run", False):
+        # `approve` only counts replays that already happened; with --run it
+        # performs them here, against the session's target, and stops at the
+        # first failure — an approval is a claim about consecutive passes.
+        target = _target(args)
+        flow = flow_validator.validate_tree(Path(args.flow))
+        for _ in range(args.minimum_runs):
+            runner = flow_executor.Executor(target, record, flow_executor.RunConfig())
+            result = runner.run(flow)
+            replays.append({"run_id": result.run_id, "status": result.status})
+            if result.status not in ("passed", "replayed"):
+                raise errors.AutonomError(
+                    errors.TEACH_APPROVAL_BLOCKED,
+                    f"replay {len(replays)} of {args.minimum_runs} failed; approval "
+                    "needs consecutive clean passes",
+                    hint="Read the failure in the run's events, fix the flow, and "
+                         "re-run 'teach approve --run'.",
+                    flow_id=flow.flow_id, replays=replays, failure=result.failure,
+                )
+    result = teach_mod.approve(record, Path(args.flow), minimum_runs=args.minimum_runs)
+    payload = {"ok": True, **result}
+    if replays:
+        payload["replays"] = replays
+    return emit(payload, as_json=True)
 
 
 def cmd_app_skill_validate(args: argparse.Namespace) -> int:
@@ -3027,8 +3173,28 @@ def _add_selector_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--index", type=int)
 
 
+class _JsonArgumentParser(argparse.ArgumentParser):
+    """argparse that fails the way every other Autonom failure does.
+
+    An unknown verb, a misspelt flag, or `--arg --es` (a value that looks like
+    an option) used to print argparse prose on stderr — the one place a host
+    agent branching on `error_code` had nothing to read. Subparsers inherit
+    this class, so the envelope covers every level.
+    """
+
+    def error(self, message: str) -> None:  # type: ignore[override]
+        payload = {
+            "ok": False,
+            "error_code": errors.USAGE_ERROR,
+            "error": message or "invalid arguments",
+            "hint": self.format_usage().strip(),  # already begins with "usage:"
+        }
+        print(json.dumps(payload, ensure_ascii=False), file=sys.stderr)
+        raise SystemExit(2)
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = _JsonArgumentParser(
         prog="autonom",
         description="Universal mobile test/debug control plane for AI agents (Android + iOS).",
     )
@@ -3100,6 +3266,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--activity")
     p.add_argument("--arg", action="append", help="launch argument (repeatable, iOS)")
     p.add_argument("--setenv", action="append", help="KEY=VALUE child environment (iOS)")
+    p.add_argument("--fresh", action="store_true",
+                   help="start on a cleared task (Android) / after terminate (iOS) "
+                        "instead of resuming where the app was")
     p.set_defaults(func=cmd_session_launch)
 
     p = session_sub.add_parser("force-stop", help="force-stop an app", parents=[target_flags])
@@ -3216,6 +3385,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("path")
     p.set_defaults(func=cmd_shots_show)
 
+    p = sub.add_parser(
+        "tour", help="what Autonom has, how to use it, and a guided walk on your own device",
+        parents=[target_flags])
+    p.add_argument("--run", action="store_true",
+                   help="perform the walk (without it: overview + offer; a TTY is asked)")
+    p.add_argument("--avd", help="the AVD to boot when no emulator is running")
+    p.add_argument("--flow", help="walk this Flow v1 file instead of the built-in Settings tour")
+    p.add_argument("--human", action="store_true",
+                   help="print the Markdown account to stdout instead of JSON")
+    p.add_argument("--shutdown", action="store_true",
+                   help="power off a device the tour booted, when the walk is over")
+    p.set_defaults(func=cmd_tour)
+
     p = sub.add_parser("doctor", help="report toolchain, capabilities, session, and orphans",
                        parents=[target_flags])
     p.add_argument("--mitmdump", help="path to mitmdump binary")
@@ -3258,10 +3440,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_location)
 
     simulator = sub.add_parser(
-        "simulator", help="battery, network, push, telephony, biometric, and UI state")
+        "simulator", help="battery, network, push, telephony, biometric, UI state, "
+                          "status-bar pin, and keyboard/locale pin")
     simulator_sub = simulator.add_subparsers(dest="simulator_command", required=True)
     for control in ("battery", "network", "push", "sms", "call", "biometric",
-                    "clipboard", "appearance", "text-size", "status-bar"):
+                    "clipboard", "appearance", "text-size", "status-bar", "keyboard"):
         p = simulator_sub.add_parser(control, parents=[target_flags])
         p.add_argument("action")
         p.add_argument("--value", action="append", metavar="KEY=VALUE")
@@ -3358,9 +3541,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--from", dest="from_marker")
     p.add_argument("--to", dest="to_marker")
     p.set_defaults(func=cmd_teach_compile)
-    p = teach_sub.add_parser("approve", help="approve after consecutive clean replays")
+    p = teach_sub.add_parser("approve", help="approve after consecutive clean replays",
+                             parents=[target_flags])
     p.add_argument("flow")
     p.add_argument("--minimum-runs", type=int, default=3)
+    p.add_argument("--run", action="store_true",
+                   help="perform the replays now instead of counting past ones")
     p.set_defaults(func=cmd_teach_approve)
 
     app_skill = sub.add_parser("app-skill", help="validate and promote portable app knowledge")
@@ -3657,7 +3843,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--status", type=int)
     p.add_argument("--path", help="glob over path or url")
     p.add_argument("--since", type=float, help="seconds")
-    p.add_argument("--mocked", type=lambda v: v.lower() in {"1", "true", "yes"}, default=None)
+    p.add_argument("--mocked", nargs="?", const=True, default=None,
+                   type=lambda v: v.lower() in {"1", "true", "yes"})
     p.add_argument("--max", type=int, default=store_mod.DEFAULT_MAX)
     p.add_argument("--since-id", help="only flows recorded after this id")
     p.set_defaults(func=cmd_network_requests_list)
@@ -3667,7 +3854,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--method")
     p.add_argument("--status", type=int)
     p.add_argument("--path", help="glob over path or url")
-    p.add_argument("--mocked", type=lambda v: v.lower() in {"1", "true", "yes"}, default=None)
+    p.add_argument("--mocked", nargs="?", const=True, default=None,
+                   type=lambda v: v.lower() in {"1", "true", "yes"})
     p.add_argument("--interval", type=float, default=1.0, help="poll seconds")
     p.add_argument("--max", type=int, default=0, help="stop after N new flows")
     p.add_argument("--max-seconds", type=float, default=0,
@@ -3915,8 +4103,12 @@ def main(argv: list[str] | None = None) -> int:
         ok = False
         return fail(str(exc))
     except (IndexError, ValueError) as exc:
-        ok = False
-        return fail(str(exc))
+        # A bare ValueError used to leave the envelope without an error_code.
+        ok, error_code = False, errors.INVALID_VALUE
+        return fail_error(errors.AutonomError(
+            errors.INVALID_VALUE, str(exc) or exc.__class__.__name__,
+            "Check the argument values; run the verb with --help for the expected forms.",
+        ))
     except KeyboardInterrupt:
         ok = False
         return fail("interrupted", code=130)

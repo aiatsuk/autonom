@@ -15,6 +15,10 @@ State keys (all optional):
 ``settings``        mapping of setting name -> current value
 ``clock_skew``      seconds the fake device clock lags the host (default 0)
 ``fail``            mapping of "joined argv prefix" -> [exit_code, message]
+``avd_names``       mapping of serial -> AVD name for ``emu avd name``
+``run_as_refused``  text run-as prints instead of a listing (system / release app)
+``ui_dump_incomplete`` number of truncated dumps to return before a complete one
+``battery_level``   level ``dumpsys battery`` reports (``set level`` updates it)
 """
 from __future__ import annotations
 
@@ -83,8 +87,26 @@ def main(argv: list[str]) -> int:
 
     if args[:3] == ["exec-out", "uiautomator", "dump"]:
         dump = state.get("ui_dump")
-        if dump:
-            sys.stdout.write(Path(dump).read_text(encoding="utf-8"))
+        text = Path(dump).read_text(encoding="utf-8") if dump else ""
+        # `ui_dump_incomplete`: N dumps come back truncated (a screen
+        # mid-transition) before a complete one — what a real emulator did.
+        pending = int(state.get("ui_dump_incomplete", 0) or 0)
+        if pending > 0:
+            state["ui_dump_incomplete"] = pending - 1
+            write_state(state)
+            sys.stdout.write(text[: len(text) // 2])
+            return 0
+        sys.stdout.write(text)
+        return 0
+
+    if args[:2] == ["exec-out", "run-as"]:
+        # A non-debuggable package: run-as complains on the same stream the
+        # listing would use, which is exactly how the complaint became a "file".
+        refused = state.get("run_as_refused")
+        if refused:
+            sys.stdout.write(refused + "\n")
+            return 1
+        sys.stdout.write("files\nshared_prefs\n")
         return 0
 
     if args[:2] == ["exec-out", "screencap"]:
@@ -94,6 +116,19 @@ def main(argv: list[str]) -> int:
     if args[:1] == ["logcat"]:
         for line in state.get("logcat", []):
             sys.stdout.write(line + "\n")
+        return 0
+
+    if args[:3] == ["shell", "dumpsys", "battery"]:
+        # The battery service remembers `set level`, so a pin can be read back.
+        if args[3:5] == ["set", "level"] and len(args) > 5:
+            state["battery_level"] = args[5]
+            write_state(state)
+            return 0
+        if args[3:4] in (["set"], ["unplug"], ["reset"]):
+            return 0
+        sys.stdout.write(
+            "Current Battery Service state:\n  AC powered: false\n  USB powered: false\n"
+            f"  status: 4\n  level: {state.get('battery_level', '100')}\n")
         return 0
 
     if args[:3] == ["shell", "dumpsys", "location"]:
@@ -140,6 +175,16 @@ def main(argv: list[str]) -> int:
         sys.stdout.write("OK\n")
         return 0
 
+    if args[:3] == ["emu", "avd", "name"]:
+        # The console answers with the AVD name then "OK"; a serial with no
+        # mapping answers "OK" alone, which is what a hardware serial does.
+        serial = argv[1] if argv[:1] == ["-s"] and len(argv) >= 2 else ""
+        name = (state.get("avd_names") or {}).get(serial)
+        if name:
+            sys.stdout.write(name + "\n")
+        sys.stdout.write("OK\n")
+        return 0
+
     if args[:2] == ["emu", "kill"]:
         # The serial travels in the stripped-off selector; consume it from the
         # raw argv so the killed emulator disappears from later `devices` calls.
@@ -148,6 +193,16 @@ def main(argv: list[str]) -> int:
         state["devices"] = [row for row in rows if killed is None or row[0] != killed]
         write_state(state)
         sys.stdout.write("OK: killing emulator, bye bye\n")
+        return 0
+
+    if args[:4] == ["shell", "cmd", "package", "resolve-activity"]:
+        # `--brief` prints a priority line and then the component; a package
+        # with no launcher activity prints "No activity found".
+        package = args[-1]
+        if package in (state.get("no_launcher") or []):
+            sys.stdout.write("No activity found\n")
+            return 0
+        sys.stdout.write(f"priority=0 preferredOrder=0 match=0x108000\n{package}/.MainActivity\n")
         return 0
 
     if args[:2] == ["shell", "getprop"]:

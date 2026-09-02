@@ -26,7 +26,10 @@ CLI = ROOT / "scripts/autonom.py"
 FAKE_ADB = ROOT / "tests/fakes/fake_adb.py"
 FAKE_SIMCTL = ROOT / "tests/fakes/fake_simctl.py"
 FAKE_IDB = ROOT / "tests/fakes/fake_idb.py"
-UI_DUMP = ROOT / "tests/fixtures/ui_dump.xml"
+# The focused variant: these flows tap the search field and then type, and a
+# real device reports that field focused. `inputText` refuses to type into
+# a tree with no focus (flow_no_focused_field), which the plain dump would trip.
+UI_DUMP = ROOT / "tests/fixtures/ui_dump_focused.xml"
 IOS_TREE = ROOT / "tests/fixtures/idb_describe_all_sample.json"
 UDID = "AAAAAAAA-1111-2222-3333-BBBBBBBBBBBB"
 
@@ -581,8 +584,11 @@ class CompositionTests(_AndroidRunBase):
         self.assertEqual([c for c, _ in commands],
                          ["launchApp", "back", "runFlow", "assertVisible"])
         self.assertIn("sub.yaml", commands[0][1])
-        monkey = [a for a in self._adb_calls() if "monkey" in " ".join(a)]
-        self.assertEqual(len(monkey), 1, "child launchApp must use the root appId")
+        launches = [a for a in self._adb_calls() if "0x10008000" in a]
+        self.assertEqual(len(launches), 1, "child launchApp must launch once")
+        component = launches[0][launches[0].index("-n") + 1]
+        self.assertTrue(component.startswith("com.example.app/"),
+                        "child launchApp must use the root appId")
 
     def test_prefix_replay_can_stop_after_a_runflow_block(self) -> None:
         sub = self.root / "sub.yaml"

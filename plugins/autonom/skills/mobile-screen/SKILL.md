@@ -89,6 +89,15 @@ on the Simulator window (Device > Rotate).
 
 iOS has no global Back button; tap the navigation bar's back control instead.
 
+**Typing needs focus.** `ui type` sends keystrokes to whatever has keyboard
+focus; with no focused field the characters vanish while the command still
+exits 0. The response carries `focused` (the node that will receive the text) with
+`focus: verified` on Android or `unverified` on iOS — idb's dump has no focus
+attribute, so on iOS the check degrades to "a text field is on screen" — or a
+`no_focused_field` warning. Tap the field, wait for it, type, then confirm
+with `ui find` on the typed text. In flows, `inputText` refuses to type into
+nothing (`flow_no_focused_field`).
+
 ## Coordinate space
 
 iOS accessibility frames and `idb ui tap` both use **points**, not pixels. Never
@@ -97,13 +106,58 @@ rectangle is refused with `coordinate_space_mismatch` rather than dispatched —
 3x device a pixel mix-up would otherwise land silently in the wrong place and make
 the agent report a defect that does not exist.
 
+## Deterministic captures
+
+Two screenshots of the same screen differ by the battery glyph and the
+signal bars unless the status bar is pinned — and a before/after comparison
+then reports a change the app never made. Pin it once per session, on either
+platform, before the first capture you intend to compare. The clock stays
+real, because evidence should say when it was taken; the marketing 9:41 is
+one key away:
+
+```bash
+python3 <autonom-root>/scripts/autonom.py simulator status-bar pin        # full battery, full signal, no notification icons, real clock
+python3 <autonom-root>/scripts/autonom.py simulator status-bar pin --value hhmm=0941   # Android: 9:41 via demo mode (clock frozen); iOS: time=9:41
+python3 <autonom-root>/scripts/autonom.py simulator status-bar clear      # restore the live bar when done
+```
+
+On Android the default pin never enters SystemUI demo mode, because demo mode
+freezes the clock at the moment it is entered; `hhmm=`, `wifi=`, `mobile=`, or
+`mode=demo` opt into it when a fixed clock or shaped Wi-Fi bars matter more
+than a ticking one. `values.mode` in the response says which path ran.
+
+`ui type` on iOS is at the mercy of autocorrect: a non-English keyboard
+rewrote "Sync conflicts when editing offline" into something else mid-flow.
+Pin the keyboard and locale on the **shut-down** simulator before typed text
+must be exact (`reboot=true` lets the verb cycle a booted one):
+
+```bash
+python3 <autonom-root>/scripts/autonom.py simulator keyboard pin --value locale=en-US --value reboot=true
+python3 <autonom-root>/scripts/autonom.py simulator keyboard show          # pinned: true|false, per key; backup: true while pinned
+python3 <autonom-root>/scripts/autonom.py simulator keyboard reset         # restores the values pin replaced
+```
+
+`pin` snapshots the keys it overwrites (a region-override locale, a keyboard
+setting a human chose) and `reset` puts them back, so a shared simulator
+leaves a test the way it entered it. Always pair a pin with a reset.
+
+Android has no host-level keyboard store (the settings live inside Gboard), so
+`simulator keyboard` refuses there with `unsupported_capability`; turn
+suggestions off in the field or the keyboard app instead.
+
+Every `screenshot` (and `shots show`) reports `width` and `height` from the
+PNG itself. On iOS that is **pixels** while the tree and `ui tap` speak
+points; on Android it is whatever the AVD's screen is. State the space you
+computed in when you report a coordinate.
+
 ## Agent workflow
 
 1. `session start` so the target and artifacts are explicit.
 2. `ui tree` → read labels, roles, enabled state. Note which field holds the label.
 3. `ui find` / `ui tap` for the next action.
 4. `screenshot` after state changes that need visual proof — **compare before/after**;
-   an exit code of 0 does not prove the screen changed.
+   an exit code of 0 does not prove the screen changed. Pin the status bar first
+   so the diff shows only what the app changed.
 5. Re-dump the tree after navigation; never reuse stale refs.
 6. Report **measured** on-screen text and tree facts separately from hypotheses.
 

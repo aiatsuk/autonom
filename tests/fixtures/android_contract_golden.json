@@ -83,6 +83,19 @@
       "name:str",
       "ok:bool",
       "platform:str",
+      "repair.advice:str",
+      "repair.command:str",
+      "repair.commands:array",
+      "repair.commands[]:str",
+      "repair.evidence:str",
+      "repair.flow:str",
+      "repair.line:number",
+      "repair.note:str",
+      "repair.selector.id:str",
+      "repair.selector.match:str",
+      "repair.selector:object",
+      "repair.step_index:number",
+      "repair:object",
       "run_id:str",
       "sensitive:bool",
       "serial:str",
@@ -127,9 +140,11 @@
     ],
     "exit_code": 0,
     "keys": [
+      "height:number",
       "ok:bool",
       "path:str",
-      "serial:str"
+      "serial:str",
+      "width:number"
     ]
   },
   "session_show": {

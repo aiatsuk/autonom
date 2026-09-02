@@ -950,11 +950,18 @@ class Executor:
             name: {**spec, "fields": resolve_fields(spec["fields"])}
             for name, spec in selector.relations.items()
         }
-        clone = FlowSelector(fields=resolve_fields(selector.fields),
+        fields = resolve_fields(selector.fields)
+        # Error messages and the repair brief describe `source_fields`. Keep
+        # the raw `${VAR}` text only when a secret was involved; a plain env
+        # value in the message (`text: bluetooth`, not `text: ${QUERY}`) is
+        # what makes the widened `ui find` in the brief runnable.
+        source_fields = (selector.source_fields if used
+                         else resolve_fields(selector.source_fields))
+        clone = FlowSelector(fields=fields,
                              match=selector.match,
                              index=selector.index, line=selector.line,
                              col=selector.col,
-                             source_fields=selector.source_fields,
+                             source_fields=source_fields,
                              relations=relations,
                              source_relations=selector.source_relations)
         return clone, used
@@ -1463,7 +1470,14 @@ class Executor:
         if self._retry_attempt is not None:
             payload["retry_attempt"] = self._retry_attempt
         if step.selector is not None:
-            payload["selector"] = flow_selectors.describe(step.selector)
+            # The recorded selector feeds the repair brief's `ui find`; show
+            # env values resolved (never secrets) so the command is runnable.
+            try:
+                resolved, used_secret = self._resolve_selector(step.selector)
+            except errors.AutonomError:
+                resolved, used_secret = step.selector, True
+            payload["selector"] = flow_selectors.describe(
+                step.selector if used_secret else resolved)
             outcome.selector = payload["selector"]
         writer.emit("flow.step.started", payload)
 
@@ -1609,11 +1623,20 @@ class Executor:
         if command == "launchApp":
             if step.args.get("clearState"):
                 session_mod.clear_data(target.tool, target.target_id, flow.app_id)
+            # Fresh by default: on real devices a resumed task put the first
+            # selector on a subscreen (Android Settings: a search activity of
+            # another package that stopApp never touches). `resume: true`
+            # keeps the old behaviour for flows that continue a journey.
+            resume = bool(step.args.get("resume"))
             if target.platform == IOS:
+                if not resume:
+                    ios_simctl.terminate(target.tool, target.target_id, flow.app_id)
                 ios_simctl.launch(target.tool, target.target_id, flow.app_id,
                                   env=self._ios_launch_env())
-            else:
+            elif resume:
                 session_mod.launch_app(target.tool, target.target_id, flow.app_id)
+            else:
+                session_mod.launch_app_fresh(target.tool, target.target_id, flow.app_id)
             return False
         if command == "stopApp":
             if target.platform == IOS:
@@ -1658,6 +1681,13 @@ class Executor:
             return False
         if command == "inputText":
             value, secret = self._resolve(step.args["value"])
+            if step.args.get("requireFocus", True):
+                # Measured on real devices: `tapOn` a search box then
+                # `inputText` at once typed into nothing and passed, because
+                # the field's activity was still coming up. Poll for a focused
+                # node the way assertions poll, then fail as a test failure —
+                # a green step that verifiably did nothing is the worst outcome.
+                self._require_focused_field(step, attempts)
             ui_mod.type_text(target, value)
             return secret
         if command == "copyTextFrom":
@@ -1816,6 +1846,31 @@ class Executor:
                     f"within {timeout_ms} ms",
                     hint="The element never appeared. If it renders late, "
                          "raise timeoutMs; if the selector is wrong, fix it.",
+                    timeout_ms=timeout_ms, attempts=attempts[0],
+                )
+            self.sleep(self.config.interval_ms / 1000)
+
+    def _require_focused_field(self, step: Step, attempts: list) -> None:
+        timeout_ms = step.args.get("timeoutMs") or self.config.default_timeout_ms
+        deadline = self.clock() + timeout_ms / 1000
+        while True:
+            attempts[0] += 1
+            nodes = ui_mod.snapshot(self.target)
+            self._last_nodes = nodes
+            # Android trees say which node has focus; iOS trees do not, so
+            # there the bar is "a text field is on screen" — still enough to
+            # catch the case that passed on a real device with no field at all.
+            node, certainty = ui_mod.typing_target(self.target.platform, nodes)
+            if node is not None:
+                self._last_match = node
+                return
+            if self.clock() >= deadline:
+                raise errors.AutonomError(
+                    errors.FLOW_NO_FOCUSED_FIELD,
+                    f"no field had keyboard focus within {timeout_ms} ms; typed text "
+                    "would have been swallowed",
+                    hint="tapOn the field first and let it appear (waitUntil), or set "
+                         "requireFocus: false if this UI never reports focus.",
                     timeout_ms=timeout_ms, attempts=attempts[0],
                 )
             self.sleep(self.config.interval_ms / 1000)

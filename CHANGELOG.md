@@ -7,6 +7,137 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
 
 ## [Unreleased]
 
+Deterministic capture state and a repair hand-off, borrowed from
+[goldie](https://github.com/kacperkapusciak/goldie) — an App Store screenshot
+generator that replays flows on the same simulators and emulators and had
+already solved the noise that makes two captures of one screen differ.
+
+### Added
+- **`autonom tour`** — the guided first run: what the harness has (verb
+  families), the usual workflow, an inventory of this Mac's emulators and
+  simulators, and an offer to boot one, own a session, and walk three
+  screens into the Settings app (Android: Network & internet → Internet;
+  iOS: General → About) with a screenshot, UI hierarchy and device log at
+  every step, an HTML/JUnit report, an integrity bundle, and a written
+  account (`tour.md`). `--run` performs it (a TTY is asked first), `--human`
+  prints the Markdown instead of JSON, `--flow` walks your own flow,
+  `--shutdown` powers off what the tour booted. The walk is an ordinary
+  Flow v1 file under `scripts/autonom_lib/tours/`, run with evidence mode
+  `always`.
+- **`simulator status-bar pin`** on both platforms: full battery and
+  signal, no notification icons, and the real ticking clock, so a
+  before/after screenshot diff shows only what the app changed. iOS uses
+  `simctl status_bar override` (no `--time` unless `time=9:41` is given).
+  Android defaults to a *live* mode — battery through `dumpsys battery`,
+  cellular bars through the emulator console, notification icons through
+  `cmd statusbar send-disable-flag` — because SystemUI demo mode freezes
+  the clock at the moment it is entered (measured: 73 s later the bar still
+  showed the entry minute). `hhmm=0941`, `wifi=`, `mobile=`, `datatype=`, or
+  `mode=demo` switch to demo mode knowingly; `override` always uses it.
+  `clear` undoes both modes. A SystemUI without the disable flag is reported
+  with `status_bar_notification_icons_unsupported` rather than assumed.
+- **`simulator keyboard pin|reset|show`** (iOS): autocorrect, prediction, and
+  auto-capitalisation off and the locale set, written with `plistlib` into
+  the shut-down simulator's preference store and read back for `verified`.
+  `pin` snapshots the values it replaces under
+  `$AUTONOM_HOME/simulator-prefs/<udid>.json` and `reset` restores them
+  (a region-override locale such as `en_US@rg=nlzzzz` survives a pin/reset
+  round trip); without a snapshot, `reset` deletes the owned keys.
+  `reboot=true` cycles a booted device; a booted one without it is refused
+  with the new `simulator_must_be_shutdown`; a device with no data directory
+  with `simulator_data_not_found`. Android refuses with
+  `unsupported_capability` because the settings live inside Gboard.
+  `AUTONOM_CORESIMULATOR_DEVICES` relocates the Devices directory.
+- **Flow repair brief:** a test failure in `flow run` carries `repair` — the
+  `--until-step` prefix replay, `ui tree`, the old selector as a widened
+  `ui find … --mode contains --all`, a labelled screenshot, and the
+  re-verification commands, plus advice keyed by the error code and the
+  events path as evidence. Definition/infrastructure failures get none.
+- `screenshot`, `shots show`, and the shot index report `width`/`height`
+  from the PNG header, so an agent knows the capture's coordinate space.
+- `devices` adds `avd_profiles` (hardware profile, screen size and density,
+  API level, ABI from each AVD's ini files; nulls when unreadable) and names
+  the `avd` a running emulator booted from via its console.
+- `doctor` reports every active `AUTONOM_*` override under `overrides` and
+  warns with `override_path_missing` when a binary override points at
+  nothing — the stale-environment trap that made a present tool read as
+  missing.
+
+- **Device sweep fixes (every verb exercised on a real emulator and
+  simulator, 2026-09-02):**
+  - Argument errors are one JSON envelope with `error_code: usage_error`
+    and the usage line in `hint`, at every parser level — never argparse
+    prose (an unknown verb, `ui tap --all`, `session launch --arg --es`).
+  - `simulator biometric` on iOS works: `xcrun simctl` has no `biometric`
+    subcommand (it had never worked); enroll/unenroll/match/nonmatch now
+    post the Simulator's Darwin notifications through `simctl spawn
+    notifyutil`.
+  - `ui type` warns `no_focused_field` when nothing on screen reports
+    keyboard focus, and the flow `inputText` command polls for a focused
+    node (up to `timeoutMs`) and fails with `flow_no_focused_field`
+    instead of typing into nothing and passing. `requireFocus: false` opts
+    out.
+  - idb verbs that die with a companion "Connection refused" prune stale
+    companion registrations (`idb list-targets`) and retry once — the
+    failure mode that took every idb verb down for the rest of a session.
+  - `file ls`/`file pull` on a release or system app refuse with
+    `app_not_debuggable` instead of listing run-as's complaint as a file.
+  - `ui tap` with neither a selector nor coordinates refuses with
+    `selector_required` instead of `ambiguous_selector: matched 78 nodes`.
+  - `capabilities` no longer needs a session: with `--serial`/`--udid` (or a
+    sole ready target) it snapshots that target.
+  - `doctor` warns `device_attached_to_foreign_proxy` for a running
+    emulator whose global proxy points at another session's live proxy —
+    the one case `device_may_be_left_attached` cannot see because the proxy
+    is alive.
+  - `ui tree` reports `truncated` when `--max-nodes` cut the list and
+    `screen` (the bounds' coordinate space) for live trees; the
+    `coordinate_space_mismatch` hint is per platform.
+  - `flow run --dry-run` lists `planned` steps; flow error messages and the
+    repair brief show resolved env values (`text: bluetooth`, not
+    `text: ${QUERY}`) unless a secret is involved.
+  - `location set` on the Android emulator says `delivery:
+    on_subscription`: the fix reaches the location manager only once an app
+    subscribes, so `location get` cannot confirm it.
+  - Flow `launchApp` starts the app fresh (launcher activity on a cleared
+    task on Android, terminate-then-launch on iOS); `resume: true` keeps the
+    old resume-where-it-was behaviour. `session launch --fresh` does the
+    same from the CLI. Measured cause: a resumed task put a flow's first
+    selector on a subscreen or, with Android Settings, in another package's
+    search activity that `stopApp` never touches.
+  - `teach approve --run` performs the required consecutive replays itself
+    instead of only counting past ones.
+  - `flow export --format maestro` exports a timed `assertVisible` /
+    `assertNotVisible` as `extendedWaitUntil` with the timeout instead of
+    refusing.
+  - `location get` on Android reports `requested` and `delivered` against
+    the fix this session set, so a Googleplex answer after `location set`
+    reads as "not delivered yet", not as a broken set.
+  - A UIAutomator dump cut short by a screen transition is retried once and
+    then refused as `backend_failed`; any remaining bare `ValueError` in a
+    verb answers with `error_code: invalid_value` instead of no code at all.
+  - `metrics snapshot` on Android reads the app's CPU line even when
+    `dumpsys cpuinfo` prefixes the percentage with a sign (` +0% pid/app`),
+    which an API-37 emulator does; it used to report `cpu_unavailable`.
+  - `file ls` on iOS names a system app's missing data container
+    (`app_not_installed`, simctl's literal `(null)`) and a missing path
+    inside a real container, instead of listing nothing.
+  - `doctor` no longer reports a live proxy owned by another session as an
+    orphan *and* as foreign at the same time.
+  - `record stop` with nothing recording answers `was_recording: false`
+    with `path: null` instead of a phantom `latest.mp4`; `devices shutdown`
+    on a stopped simulator reports `already_stopped`; `network requests
+    list --mocked` is a bare flag; the xctrace "not supported on this
+    platform" failure says to use a physical device.
+
+### Changed
+- `simulator status-bar override` on Android now enters demo mode explicitly
+  and accepts `battery`, `plugged`, `wifi`, `wifi_level`, `mobile`,
+  `mobile_level`, `datatype`, and `notifications` alongside `hhmm`; an unknown
+  key is refused before anything is broadcast.
+- The fake `simctl` now moves a device to `Shutdown` on `shutdown`, so a
+  shutdown/write/boot sequence is proven by the device list.
+
 ## [0.30.0] - 2026-08-28
 
 Autonom now implements the end-to-end product blueprint: strict portable

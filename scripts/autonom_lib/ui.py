@@ -245,11 +245,67 @@ def _guard_point(target: Target, x: int, y: int,
     width, height = size
     if 0 <= x <= width and 0 <= y <= height:
         return
+    if target.platform == ANDROID:
+        hint = ("Android coordinates are pixels of the reported screen size; a screenshot "
+                "of this target has the same size. Re-dump the tree and use the reported "
+                "bounds.")
+    else:
+        hint = ("On iOS the accessibility tree reports points, not pixels — do not scale "
+                "by the display factor. Re-dump the tree and use the reported bounds.")
     raise errors.AutonomError(
         errors.COORDINATE_SPACE_MISMATCH,
         f"point ({x}, {y}) is outside the {width}x{height} screen of {target.target_id}",
-        "On iOS the accessibility tree reports points, not pixels — do not scale by the display "
-        "factor. Re-dump the tree and use the reported bounds.",
+        hint,
         point=[x, y],
         screen=[width, height],
     )
+
+
+def screen_from_nodes(nodes: list[dict[str, Any]]) -> tuple[int, int] | None:
+    """The screen rectangle a compact tree already carries, without another
+    device round-trip: the root application/window node's bounds. None when
+    the tree has no such root (a dump filtered down to leaves)."""
+    for node in nodes:
+        if node.get("role") in {"app", "window"} and node.get("bounds"):
+            left, top, right, bottom = node["bounds"]
+            if right > left and bottom > top:
+                return right - left, bottom - top
+    return None
+
+
+_TEXT_ROLES = ("textfield", "searchfield", "textview", "edittext", "textarea", "securetextfield")
+
+
+def typing_target(platform: str, nodes: list[dict[str, Any]]) -> tuple[dict[str, Any] | None, str]:
+    """Where typed text will land, and how sure that is.
+
+    Returns `(node, certainty)`: `("focused", node)` when a node reports
+    keyboard focus; on iOS, where idb's accessibility dump carries no focus
+    attribute at all (verified on a Simulator: Spotlight's active field reads
+    `AXFocused: None`), `("field_present", node)` when a text field is on
+    screen; `(None, "none")` when nothing could take the text.
+    """
+    focused = focused_node(nodes)
+    if focused is not None:
+        return focused, "focused"
+    if platform == IOS:
+        for node in nodes:
+            role = str(node.get("role") or "").lower()
+            if any(marker in role for marker in _TEXT_ROLES):
+                return node, "field_present"
+    return None, "none"
+
+
+def focused_node(nodes: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """The node that will receive typed text, if the tree exposes one.
+
+    Typing goes to whatever has keyboard focus; when nothing does, `input
+    text` on Android and `idb ui text` on iOS both "succeed" while the
+    characters land nowhere. Both trees carry `focused` (UIAutomator's
+    attribute, AXFocused on iOS), so the absence of a focused node is the
+    only signal there is that a type would be swallowed.
+    """
+    for node in nodes:
+        if node.get("focused"):
+            return node
+    return None

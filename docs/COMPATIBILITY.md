@@ -37,14 +37,17 @@ strengthened, never silently weakened.
 
 - `0` success · `2` expected failure (`AutonomError` as one JSON object on
   **stderr**: `{"ok": false, "error_code", "error", "hint"}`) · `130`
-  interrupt. `doctor` exits `0` unless `--strict` (then `1` when unhealthy) —
+  interrupt. Argument errors (unknown verb, misspelt flag, a value that
+  looks like an option) are the same envelope with `error_code:
+  usage_error` and the usage line in `hint` — never argparse prose. `doctor` exits `0` unless `--strict` (then `1` when unhealthy) —
   a diagnostic that fails is useless in a pipeline (`scripts/autonom.py`).
 - stdout carries exactly **one pretty-printed JSON document** per invocation;
   human prose and consent prompts go to stderr. Documented exceptions are
   opt-in streaming modes — `flow run --events`, `logs follow`,
   `network requests follow`, `journal --follow` — which emit NDJSON (one JSON
   object per line, ending with a `{"kind": "eof"}` line) and are never used by
-  the repository's own gates.
+  the repository's own gates — and `tour --human`, which prints the Markdown
+  account for a person instead of the envelope.
 
 ## Documentation gates
 

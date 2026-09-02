@@ -66,6 +66,7 @@ def run_idb(
     timeout: float | None = 30,
     check: bool = True,
     binary: bool = False,
+    _retry: bool = True,
 ) -> subprocess.CompletedProcess:
     command = [idb, *args]
     if udid:
@@ -89,12 +90,33 @@ def run_idb(
             if "companion" in message.lower() or "connect" in message.lower()
             else errors.BACKEND_FAILED
         )
+        if code == errors.IDB_COMPANION_UNAVAILABLE and _retry and _prune_companions(idb):
+            # Seen on a real Mac: the client kept a companion entry from an
+            # earlier boot (a dead pid and its socket), so every verb died with
+            # "Connection refused" until `idb list-targets` noticed and dropped
+            # it. Prune the same way, once, and re-dispatch.
+            return run_idb(idb, args, udid=udid, timeout=timeout, check=check,
+                           binary=binary, _retry=False)
         raise errors.AutonomError(
             code,
             message,
             "Check 'idb list-targets'; run 'autonom doctor' for the whole environment.",
         )
     return completed
+
+
+def _prune_companions(idb: str) -> bool:
+    """`idb list-targets` drops companion registrations whose process is gone.
+    Returns False when even that cannot run, so the caller reports the
+    original failure instead of a second one."""
+    try:
+        completed = subprocess.run(
+            [idb, "list-targets"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            check=False, timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return completed.returncode == 0
 
 
 def version(idb: str) -> str | None:

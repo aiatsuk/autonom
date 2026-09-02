@@ -65,7 +65,8 @@ Teach implements the full recording lifecycle:
 4. `teach compile` derives semantic selectors, secrets, confidence, and
    provenance, then parses the result back through the strict Flow compiler.
 5. A human reviews and runs the candidate.
-6. `teach approve` requires three consecutive clean replays by default.
+6. `teach approve` requires three consecutive clean replays by default; it counts
+   past runs, or performs them itself with `--run`.
 
 Approved knowledge can be promoted to
 `.autonom/apps/<app-id>/` with `app-skill promote`. The fixed portable layout

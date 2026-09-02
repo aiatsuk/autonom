@@ -9,28 +9,32 @@ Legend: ✅ shipped · ⚠️ partial · 🔜 planned · ❌ not planned for nea
 | Agent-portable skills (Codex / Claude / Grok) | ✅ | ✅ | install via marketplace or `install_skills.sh` |
 | Unified device listing | ✅ | ✅ | `autonom devices`; each entry has a `running` flag |
 | Boot / shut down a target | ✅ | ✅ | `devices boot --avd`/`--udid`, `devices shutdown`; refuses hardware |
-| Bootable AVD discovery | ✅ | — | `devices` reports an `avds` array on Android |
+| Bootable AVD discovery | ✅ | — | `devices` reports an `avds` array on Android, plus `avd_profiles` (hardware profile, screen, density, API) and the `avd` a running emulator booted from |
 | Explicit multi-target selection | ✅ | ✅ | `--platform` / `--target`; `--serial` and `--udid` are aliases |
-| Environment diagnosis | ✅ | ✅ | `autonom doctor` |
+| Guided first run | ✅ | ✅ | `autonom tour` — what the harness has, the workflow, this Mac's targets, and an offer to boot one and walk three screens into Settings with per-step screenshots, hierarchies and logs, an HTML report and a written account (`--run`, `--human`) |
+| Environment diagnosis | ✅ | ✅ | `autonom doctor` — tools, capabilities, orphans, every active `AUTONOM_*` override (`override_path_missing`), and emulators still routed through another session's live proxy (`device_attached_to_foreign_proxy`) |
 | Session + artifact dirs | ✅ | ✅ | machine-global `~/.autonom/sessions/<id>/`; `autonom session *` |
 | Session journal (actions + notes) | ✅ | ✅ | `journal.ndjson`; `autonom journal` / `note`; secret-safe |
 | Boot / install / launch / terminate | ✅ | ✅ | simulator boots automatically on session start |
 | Clear app data | ✅ | ⚠️ | Android `pm clear`; iOS uninstall+reinstall, or `--strategy privacy` for permissions only |
-| Compact UI / accessibility tree | ✅ | ✅ | UIAutomator; idb `describe-all` |
+| Compact UI / accessibility tree | ✅ | ✅ | UIAutomator; idb `describe-all`; live trees carry `screen` (the bounds' coordinate space) and `truncated` when `--max-nodes` cut the list |
 | Semantic find / tap | ✅ | ✅ | text, desc/label, resource-id / accessibility identifier |
 | Gestures | ⚠️ | ⚠️ | tap/swipe on both; `ui pinch\|rotate\|shake` have no backend on either and are refused — see below |
-| Text and hardware keys | ✅ | ✅ | Android `KEYCODE_*`; iOS `HOME`/`LOCK`/`SIRI`/`SIDE_BUTTON` |
+| Text and hardware keys | ✅ | ✅ | Android `KEYCODE_*`; iOS `HOME`/`LOCK`/`SIRI`/`SIDE_BUTTON`; `ui type` warns `no_focused_field` when nothing on screen has keyboard focus |
 | Screenshot | ✅ | ✅ | iOS uses `simctl`, so it works without idb |
 | Screenshot provenance | ✅ | ✅ | metadata embedded in the PNG; shots taken under an active mock are flagged `screenshot_shows_mocked_data` |
 | Screenshot index / browse | ✅ | ✅ | `autonom shots list [--task --grep --mocked-only]`, `shots show <path>` |
+| Screenshot dimensions | ✅ | ✅ | `width`/`height` read from the PNG header on `screenshot`, `shots show`, and the index — the capture's coordinate space, stated rather than guessed |
+| Deterministic status bar | ✅ | ✅ | `simulator status-bar pin` — full battery and signal, no notification icons, the real ticking clock. iOS: `simctl status_bar override`. Android: *live* mode (battery service, emulator `gsm signal-profile`, `cmd statusbar send-disable-flag`) because SystemUI demo mode freezes the clock; `hhmm=0941`, `wifi=`, `mobile=`, `mode=demo`, and `override` use demo mode knowingly. `clear` undoes both |
+| Keyboard / locale pinning | ❌ | ✅ | `simulator keyboard pin\|reset\|show` — autocorrect, prediction, and auto-capitalisation off, locale set, on the shut-down simulator's preference store (`reboot=true` cycles it); `pin` snapshots what it replaces and `reset` restores it. Android keeps these inside Gboard; refused with `unsupported_capability` |
 | Screen recording artifact | ✅ | ✅ | `autonom record start\|stop` |
 | Logs | ⚠️ | ⚠️ | logcat; `log stream`/`log show` with a bundle predicate |
 | Crash reports | ⚠️ | ✅ | Android: crash logcat buffer; iOS: idb crash store |
 | Deep links | ✅ | ✅ | `autonom open <url>` |
 | Permissions | ✅ | ✅ | `pm grant/revoke/reset`; `simctl privacy` |
-| Simulated location | ⚠️ | ✅ | set: iOS simctl / Android emulator `geo fix`; `location get` reads the fix on Android (iOS has no read-back) |
+| Simulated location | ⚠️ | ✅ | set: iOS simctl / Android emulator `geo fix`; `location get` reads the system's last fix on Android and reports `requested` + `delivered` against what the session set (iOS has no read-back) |
 | Media library seeding | ✅ | ✅ | `autonom media add` |
-| App-container file access | ✅ | ✅ | `autonom file ls\|pull`, confined to the container |
+| App-container file access | ✅ | ✅ | `autonom file ls\|pull`, confined to the container; a release/system app refuses with `app_not_debuggable` |
 | Remote target host | — | ✅ | idb client can drive a companion on another Mac |
 | Emulator browser mirror | ✅ | ❌ | `android-emulator-browser` |
 | Network capture (HTTP/HTTPS) | ✅ | ⚠️ | mitmproxy, loopback-only, consent-gated |
@@ -46,12 +50,13 @@ Legend: ✅ shipped · ⚠️ partial · 🔜 planned · ❌ not planned for nea
 | React Native skills | 🔜 | 🔜 | |
 | Flow DSL: check / fmt / list | ✅ | ✅ | strict YAML subset, exact-match selectors by default, positioned errors; `docs/FLOW.md` |
 | Flow DSL: run | ✅ | ✅ | polling assertions, single-fire mutations, `failure_class` + exit 1 for test failures, per-run `events.ndjson`; iOS `eraseText` dispatches HID backspace but is unproven on a real simulator |
+| Flow repair brief | ✅ | ✅ | a test failure in `flow run` carries `repair`: the `--until-step` prefix replay, a widened `ui find`, and the re-verification commands, plus advice keyed by the error code |
 | Flow DSL: runFlow / tags / hooks execution | ✅ | ✅ | subflows inline with inherited appId, isolated `onFlowComplete`, `when:` conditions, tag-filtered directory suites, evidence policy |
 | Flow DSL: Session → Flow compiler | ✅ | ✅ | `flow create --from-session` — proven selectors reused, secrets become `${SECRET_n}`, coordinate taps refuse to compile |
 | PR Proof (local) | ✅ | ✅ | `proof --base` — covers-globs + pull-request tags select the suite; verdicts pass/fail/not_covered/blocked/inconclusive, never upgraded |
 | Atlas-lite: observed screens/transitions graph | ✅ | ✅ | `atlas update|show|coverage|paths|export|diff`; fingerprints ride in run events; observed-only, unknown stays unknown |
 | Evidence: step debugger + HTML/JUnit reports | ✅ | ✅ | manifest v3; addressable screenshots, hierarchy diff, logs, scrubbed requests; `report build|open|export|suite|serve`; loopback replay controls; JUnit for CI |
-| Flow DSL: Maestro Core Profile import/export | ✅ | ✅ | `flow import`/`flow export --format maestro`; outside-profile constructs refuse with `unsupported_flow_command` |
+| Flow DSL: Maestro Core Profile import/export | ✅ | ✅ | `flow import`/`flow export --format maestro`; a timed `assertVisible`/`assertNotVisible` exports as `extendedWaitUntil`; outside-profile constructs refuse with `unsupported_flow_command` |
 | Live session outputs catalog | ✅ | ✅ | `session outputs` — registered `streams[]` + directory scan, `abs_path`/`shell_hint` for `tail -f` |
 | Live follow (session files / device logs) | ✅ | ✅ | `logs follow` — NDJSON lines, always bounded by `--max-seconds`/`--max-lines`; `journal --follow` for the timeline |
 | Network requests list | ✅ | ✅ | `network requests list --max N --since-id F` |
@@ -97,12 +102,13 @@ autonom devices [list] [--platform android|ios]
 autonom devices boot [--avd NAME | --target ID] [--no-wait] [--timeout S] [--emulator PATH]
 autonom devices shutdown [--target ID]
 autonom doctor [--strict] [--mitmdump PATH]
+autonom tour [--run] [--avd NAME] [--flow PATH] [--human] [--shutdown]
 autonom capabilities
 
 autonom session start [--app-id ID] [--install PATH] [--launch [ID]] [--activity C] [--log-stream]
 autonom session show|stop
 autonom session outputs [--session-id ID]
-autonom session launch <app-id> [--activity C] [--arg A] [--setenv K=V]
+autonom session launch <app-id> [--activity C] [--arg A] [--setenv K=V] [--fresh]
 autonom session force-stop|uninstall <app-id>
 autonom session clear <app-id> [--strategy auto|reinstall|privacy]
 
@@ -128,7 +134,7 @@ autonom flow run <path> [--include-tag TAG] [--exclude-tag TAG] [--env KEY=VALUE
 
 autonom teach start <name> | teach mark <name> | teach stop | teach show
 autonom teach compile --out PATH [--recording ID] [--from MARK] [--to MARK]
-autonom teach approve <flow> [--minimum-runs N]
+autonom teach approve <flow> [--minimum-runs N] [--run]
 autonom app-skill validate <app-id> [--workspace DIR]
 autonom app-skill promote <app-id> <flow> [--approval FILE] [--workspace DIR]
 
@@ -212,6 +218,7 @@ autonom simulator clipboard <action> [--value KEY=VALUE] [--json OBJECT]
 autonom simulator appearance <action> [--value KEY=VALUE] [--json OBJECT]
 autonom simulator text-size <action> [--value KEY=VALUE] [--json OBJECT]
 autonom simulator status-bar <action> [--value KEY=VALUE] [--json OBJECT]
+autonom simulator keyboard <action> [--value KEY=VALUE] [--json OBJECT]
 autonom canvas serve [--port N] [--transport auto|screenrecord|screencap] [--fps N] [--token TOKEN] [--no-auth]
 autonom media add <path>
 autonom file ls [remote] [--app-id ID] | file pull <remote> [--app-id ID] [--out PATH]
@@ -246,10 +253,11 @@ exit code 2, so an agent can branch on `error_code` rather than parse prose.
 
 | Variable | Effect |
 | --- | --- |
-| `AUTONOM_HOME` | Overrides both state roots: sessions land in `$AUTONOM_HOME/sessions`, registries and the mitmproxy confdir directly beneath it |
+| `AUTONOM_HOME` | Overrides both state roots: sessions land in `$AUTONOM_HOME/sessions`, registries, the mitmproxy confdir, and `simulator-prefs/` snapshots directly beneath it |
 | `XDG_STATE_HOME` | Machine state root when `AUTONOM_HOME` is unset (else `~/.local/state/autonom`) |
 | `AUTONOM_ADB`, `AUTONOM_SIMCTL`, `AUTONOM_IDB`, `AUTONOM_EMULATOR`, `AUTONOM_MITMDUMP` | Binary paths, equivalent to the matching flag |
 | `AUTONOM_IDB_COMPANION` | `host:port` of an idb companion on another Mac |
+| `AUTONOM_CORESIMULATOR_DEVICES` | The CoreSimulator `Devices` directory `simulator keyboard` edits (default `~/Library/Developer/CoreSimulator/Devices`); point it at a mounted tree to pin a remote Mac's simulator |
 | `AUTONOM_PREFIX`, `AUTONOM_BIN_DIR` | Installer only: bundle home and the directory `autonom` is linked into |
 | `AUTONOM_REQUIRE_SHELLCHECK` | Dev tooling only: `run_checks.sh` fails instead of skipping the shell lint when shellcheck is missing (set by CI) |
 
@@ -277,6 +285,8 @@ What each earlier limitation cost, and what replaced it.
 | Project-local artifacts, invisible from elsewhere | Machine-global `~/.autonom/`: the session, its mocks, and orphaned processes are found and reaped from any directory |
 | No record of what an agent did | Append-only `journal.ndjson` — every verb, its scrubbed argv, the result, and the failures, plus agent notes |
 | A screenshot that silently showed mocked data | Provenance embedded in the PNG; captures taken under an active rule are flagged `screenshot_shows_mocked_data` |
+| Before/after captures that differed by the battery glyph, the signal bars, or an autocorrected word | `simulator status-bar pin` and `simulator keyboard pin` fix the state the app does not own, so a diff shows only what the app changed; the clock stays real unless pinned on purpose |
+| A failed flow that named the broken step and nothing else | The `repair` block: reconstruct the state, inspect the live tree, edit, re-verify — in the CLI's own commands |
 
 The harness intentionally does not claim that trend analysis proves a memory
 leak or that a browser preview proves performance. Those require retained-path

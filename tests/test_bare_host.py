@@ -20,6 +20,10 @@ SWEEP: list[tuple[str, list[str], bool]] = [
     ("version", ["version"], True),
     ("devices", ["devices"], True),
     ("doctor", ["doctor"], True),
+    # The tour's overview is read-only and must work before anything is set up;
+    # the walk needs a target and refuses cleanly without one.
+    ("tour", ["tour"], True),
+    ("tour_run", ["tour", "--run"], False),
     ("devices_list", ["devices", "list"], True),
     ("devices_android", ["devices", "--platform", "android"], False),
     ("devices_ios", ["devices", "--platform", "ios"], False),
@@ -88,6 +92,9 @@ SWEEP: list[tuple[str, list[str], bool]] = [
     ("location_set", ["location", "set", "1,2"], False),
     ("location_get", ["location", "get"], False),
     ("media_add", ["media", "add", "/dev/null"], False),
+    ("simulator_status_bar_pin", ["simulator", "status-bar", "pin"], False),
+    ("simulator_keyboard_pin", ["simulator", "keyboard", "pin", "--udid", UDID], False),
+    ("simulator_keyboard_show", ["simulator", "keyboard", "show", "--udid", UDID], False),
     ("file_ls", ["file", "ls"], False),
     ("record_start", ["record", "start"], False),
     ("record_stop", ["record", "stop"], False),

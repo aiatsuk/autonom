@@ -23,7 +23,15 @@ python3 <autonom-root>/scripts/autonom.py doctor           # what this machine c
 
 Each device carries `running` (true when Booted / `device`), so you can tell a
 live target from a cold one without knowing each platform's wording. The
-Android listing also reports `avds`: bootable emulator images not yet started.
+Android listing also reports `avds` (bootable emulator images not yet started)
+and `avd_profiles` — each AVD's hardware profile, screen size and density, and
+API level read from its `config.ini` — so "the phone-sized emulator" is a
+lookup, not a guess from the name. A running emulator names the `avd` it
+booted from.
+
+`doctor` lists every active `AUTONOM_*` override under `overrides` and warns
+with `override_path_missing` when one points at a binary that does not exist —
+the usual reason a tool reads as missing while `which` finds it.
 
 ### Boot and shut down a target
 
@@ -44,7 +52,8 @@ is not `emulator-<port>` — it never powers off physical hardware.
 
 ```bash
 python3 <autonom-root>/scripts/autonom.py session start --serial emulator-5554 --app-id com.example.app
-python3 <autonom-root>/scripts/autonom.py session launch com.example.app
+python3 <autonom-root>/scripts/autonom.py session launch com.example.app            # resume where it was
+python3 <autonom-root>/scripts/autonom.py session launch com.example.app --fresh    # launcher activity on a cleared task
 python3 <autonom-root>/scripts/autonom.py session force-stop com.example.app
 python3 <autonom-root>/scripts/autonom.py session clear com.example.app
 python3 <autonom-root>/scripts/autonom.py session stop
@@ -65,6 +74,10 @@ python3 <autonom-root>/scripts/autonom.py session stop
 
 Target flags work before or after the subcommand. A shutdown simulator is booted
 automatically and the response reports `"booted": true` when this call did it.
+
+Intent extras that start with `--` must be attached to the flag, or argparse
+reads them as options: `session launch com.example.app --arg=--es --arg=key=value`.
+Argument mistakes come back as `error_code: usage_error` with the usage line.
 
 All commands print JSON. `session start` writes, **machine-globally** under
 `~/.autonom/sessions/` (honouring `AUTONOM_HOME`) — not in the project, so the
@@ -127,8 +140,9 @@ export AUTONOM_IDB_COMPANION=mac-farm-01:10882
    with a `tail -f` hint for a human's second terminal.
 4. `session stop` tears down the log stream, recorder, and proxy best-effort and
    reports each action — it never fails because teardown failed.
-5. If a session died without stopping, `autonom doctor` lists orphaned processes
-   and any device left pointing at a dead proxy.
+5. If a session died without stopping, `autonom doctor` lists orphaned processes,
+   any device left pointing at a dead proxy, and any emulator still routed
+   through another session's *live* proxy (`device_attached_to_foreign_proxy`).
 
 ## Failure codes worth knowing
 
@@ -138,6 +152,10 @@ export AUTONOM_IDB_COMPANION=mac-farm-01:10882
 | `idb_required` | iOS `ui` verbs need idb; `screenshot`/`logs`/`open` still work |
 | `ios_boot_failed` | simulator never reached `Booted`; try `xcrun simctl erase <udid>` |
 | `no_active_session` | start one with `session start` |
+| `usage_error` | argparse rejected the argv; `hint` carries the usage line |
+| `app_not_debuggable` | `file ls`/`pull` need a debuggable build; release and system apps refuse run-as |
+| `simulator_must_be_shutdown` | `simulator keyboard pin` needs a shut-down simulator; pass `--value reboot=true` or shut it down first |
+| `simulator_data_not_found` | the simulator has no data directory yet — boot it once, or set `AUTONOM_CORESIMULATOR_DEVICES` |
 
 ## Related skills
 

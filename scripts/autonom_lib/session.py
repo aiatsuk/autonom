@@ -321,6 +321,58 @@ def launch_app(adb: str, serial: str, app_id: str, activity: str | None = None) 
     )
 
 
+FRESH_TASK_FLAGS = "0x10008000"  # FLAG_ACTIVITY_NEW_TASK | FLAG_ACTIVITY_CLEAR_TASK
+
+
+def resolve_launcher_activity(adb: str, serial: str, app_id: str) -> str | None:
+    """The component the launcher would start, or None when the package has
+    no launcher activity (a service-only app, a wrong id)."""
+    from . import adb as adb_mod
+
+    completed = adb_mod.run_adb(
+        adb,
+        ["shell", "cmd", "package", "resolve-activity", "--brief",
+         "-c", "android.intent.category.LAUNCHER", app_id],
+        serial=serial, timeout=30, check=False,
+    )
+    text = completed.stdout if isinstance(completed.stdout, str) else ""
+    for line in reversed(text.splitlines()):
+        line = line.strip()
+        if "/" in line and line.startswith(app_id):
+            return line
+    return None
+
+
+def launch_app_fresh(adb: str, serial: str, app_id: str) -> dict:
+    """Start the launcher activity on a cleared task.
+
+    `monkey` (what `launch_app` uses) resumes whatever the app's task holds,
+    which on a real device meant a flow's first selector met a subscreen —
+    or, with Android Settings, a search activity of *another* package that
+    `force-stop` never touches. Clearing the task starts the app where a
+    user launching it from the home screen would land, without wiping data.
+    """
+    from . import adb as adb_mod
+
+    component = resolve_launcher_activity(adb, serial, app_id)
+    if component is None:
+        launch_app(adb, serial, app_id)
+        return {"mode": "resume", "component": None,
+                "note": "no launcher activity resolved; resumed via monkey"}
+    # FLAG_ACTIVITY_NEW_TASK | FLAG_ACTIVITY_CLEAR_TASK as a raw flag value:
+    # `am start` has no `--activity-new-task` option, and measured on an
+    # API-37 emulator `--activity-clear-task` alone left Settings on its
+    # SubSettings screen — CLEAR_TASK only clears when paired with NEW_TASK.
+    adb_mod.run_adb(
+        adb,
+        ["shell", "am", "start", "-W", "-n", component,
+         "-a", "android.intent.action.MAIN", "-c", "android.intent.category.LAUNCHER",
+         "-f", FRESH_TASK_FLAGS],
+        serial=serial, timeout=60, check=True,
+    )
+    return {"mode": "fresh", "component": component}
+
+
 def force_stop(adb: str, serial: str, app_id: str) -> None:
     from . import adb as adb_mod
 

@@ -74,6 +74,28 @@ def capture_target(target: Target, output: Path) -> Path:
         return ios_idb.screenshot(target, output)
 
 
+# --- geometry -----------------------------------------------------------------
+
+
+def png_size(path: Path) -> tuple[int, int] | None:
+    """Pixel width and height from the IHDR chunk, without a PNG library.
+
+    An agent that plans a tap from a screenshot needs to know the image's
+    coordinate space: an iOS capture is in pixels while the accessibility tree
+    speaks points, and an Android emulator's capture size depends on the AVD.
+    The size is always the first chunk, so 24 bytes answer the question.
+    """
+    try:
+        with path.open("rb") as handle:
+            head = handle.read(24)
+    except OSError:
+        return None
+    if len(head) < 24 or not head.startswith(PNG_SIGNATURE) or head[12:16] != b"IHDR":
+        return None
+    width, height = struct.unpack(">II", head[16:24])
+    return width, height
+
+
 # --- naming -------------------------------------------------------------------
 
 
@@ -291,14 +313,18 @@ def capture_evidence(
         extra.write_bytes(path.read_bytes())
         copies.append(str(extra))
 
+    size = png_size(path)
     result: dict[str, Any] = {"path": str(path), "copies": copies,
-                              "metadata": meta, "metadata_embedded": embedded}
+                              "metadata": meta, "metadata_embedded": embedded,
+                              "width": size[0] if size else None,
+                              "height": size[1] if size else None}
     if session:
         # Resolve both sides: the capture path is resolved, but artifacts_dir is
         # stored as written, so under a symlinked root (macOS /var -> /private/var,
         # or a global session home on one) relative_to would wrongly reject it.
         artifacts = Path(session["artifacts_dir"]).resolve()
-        append_index(session, {**meta, "file": str(path.resolve().relative_to(artifacts))})
+        append_index(session, {**meta, "file": str(path.resolve().relative_to(artifacts)),
+                               "width": result["width"], "height": result["height"]})
     if mocks["active"]:
         result["warnings"] = [{
             "code": "screenshot_shows_mocked_data",

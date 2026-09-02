@@ -64,7 +64,11 @@ def parse_cpuinfo(text: str, package: str) -> float | None:
 
     The package must end exactly at `:` or whitespace — a bare word boundary
     would let `com.example.app` claim `com.example.app.dev`'s line."""
+    # Recent SystemUI prefixes the percentage of a process that was not in
+    # the previous window with a sign (` +0% 12772/ru.skywool.knix: …`, seen
+    # on an API-37 emulator); the old pattern demanded a digit first and
+    # reported the app as absent from cpuinfo.
     pattern = re.compile(
-        rf"^\s*([\d.]+)%\s+\d+/{re.escape(package)}(?=[:\s]|$)", re.MULTILINE)
+        rf"^\s*[+-]?([\d.]+)%\s+\d+/{re.escape(package)}(?=[:\s]|$)", re.MULTILINE)
     hit = pattern.search(text)
     return float(hit.group(1)) if hit else None
