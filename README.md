@@ -66,7 +66,7 @@ autonom session start --platform ios --target <UDID> \
 autonom ui tree
 autonom ui find --desc "Log In" --mode exact
 autonom ui tap --desc "Continue"
-autonom simulator status-bar pin            # 9:41, full battery: diff-stable screenshots
+autonom simulator status-bar pin            # full battery and signal: diff-stable screenshots
 autonom screenshot --label "after login"    # reports width/height too
 autonom logs tail --package com.example.app --since 60
 autonom location get                        # current position (Android)

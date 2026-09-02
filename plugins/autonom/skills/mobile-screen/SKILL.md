@@ -99,16 +99,23 @@ the agent report a defect that does not exist.
 
 ## Deterministic captures
 
-Two screenshots of the same screen differ by the clock, the battery glyph, and
-the signal bars unless the status bar is pinned — and a before/after
-comparison then reports a change the app never made. Pin it once per session,
-on either platform, before the first capture you intend to compare:
+Two screenshots of the same screen differ by the battery glyph and the
+signal bars unless the status bar is pinned — and a before/after comparison
+then reports a change the app never made. Pin it once per session, on either
+platform, before the first capture you intend to compare. The clock stays
+real, because evidence should say when it was taken; the marketing 9:41 is
+one key away:
 
 ```bash
-python3 <autonom-root>/scripts/autonom.py simulator status-bar pin        # 9:41, full battery, full signal, no notifications
-python3 <autonom-root>/scripts/autonom.py simulator status-bar pin --value hhmm=1230   # Android key; iOS uses time=12:30
+python3 <autonom-root>/scripts/autonom.py simulator status-bar pin        # full battery, full signal, no notification icons, real clock
+python3 <autonom-root>/scripts/autonom.py simulator status-bar pin --value hhmm=0941   # Android: 9:41 via demo mode (clock frozen); iOS: time=9:41
 python3 <autonom-root>/scripts/autonom.py simulator status-bar clear      # restore the live bar when done
 ```
+
+On Android the default pin never enters SystemUI demo mode, because demo mode
+freezes the clock at the moment it is entered; `hhmm=`, `wifi=`, `mobile=`, or
+`mode=demo` opt into it when a fixed clock or shaped Wi-Fi bars matter more
+than a ticking one. `values.mode` in the response says which path ran.
 
 `ui type` on iOS is at the mercy of autocorrect: a non-English keyboard
 rewrote "Sync conflicts when editing offline" into something else mid-flow.

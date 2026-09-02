@@ -11,12 +11,13 @@ from . import adb as adb_mod
 from . import errors, ios_prefs, ios_simctl
 from .platform import ANDROID, IOS, Target
 
-# The deterministic "marketing" status bar: 9:41, full battery, full signal,
-# no notifications. Pinning it before a screenshot removes the clock, battery
-# and signal glyphs from a before/after diff, so two captures of the same
-# screen differ only where the app itself changed.
+# The deterministic status bar: full battery, full signal, no notifications.
+# Pinning it before a screenshot removes the battery and signal glyphs from a
+# before/after diff, so two captures of the same screen differ only where the
+# app itself changed. The clock is deliberately NOT part of the preset — a
+# tester wants the real time in evidence — and is pinned only on request:
+# `time=9:41` on iOS, `hhmm=0941` on Android (the marketing convention).
 IOS_STATUS_BAR_PIN: dict[str, str] = {
-    "time": "9:41",
     "batteryState": "charged",
     "batteryLevel": "100",
     "wifiMode": "active",
@@ -25,12 +26,17 @@ IOS_STATUS_BAR_PIN: dict[str, str] = {
     "cellularBars": "4",
     "dataNetwork": "5g",
 }
-# SystemUI demo mode is the Android equivalent of `simctl status_bar`. The
-# mobile icon is hidden rather than shaped: recent SystemUI ignores demo-mode
-# mobile overrides when the emulator reports its virtual radio, so a stray
-# "3G" glyph survives `datatype` — hiding it matches Play screenshot conventions.
+# Android has two ways to pin the bar, and they differ on the clock.
+#
+# SystemUI *demo mode* is the Android equivalent of `simctl status_bar`, but
+# entering it freezes the clock at that moment (verified on a real emulator:
+# a capture taken 73 s after `enter` still showed the entry minute). It is
+# therefore used only when the caller asks for a fixed clock (`hhmm=`) or for
+# a glyph only demo mode can shape (`wifi`, `mobile`, `datatype`), and by
+# `override`. The mobile icon is hidden there rather than shaped: recent
+# SystemUI ignores demo-mode mobile overrides when the emulator reports its
+# virtual radio, so a stray "3G" glyph survives `datatype`.
 ANDROID_STATUS_BAR_PIN: dict[str, str] = {
-    "hhmm": "0941",
     "battery": "100",
     "plugged": "false",
     "wifi": "show",
@@ -42,6 +48,13 @@ ANDROID_STATUS_BAR_KEYS = (
     "hhmm", "battery", "plugged", "wifi", "wifi_level", "mobile", "mobile_level",
     "datatype", "notifications",
 )
+# The default `pin` is the *live* mode: the real, ticking clock, with the
+# battery pinned through the battery service, the cellular bars through the
+# emulator console, and notification icons hidden through StatusBarManager.
+# Wi-Fi bars cannot be shaped here; the emulator's virtual Wi-Fi is full.
+ANDROID_LIVE_KEYS = ("battery", "plugged", "mobile_level", "notifications")
+ANDROID_DEMO_ONLY_KEYS = ("hhmm", "wifi", "wifi_level", "mobile", "datatype")
+ANDROID_DEFAULT_SIGNAL_PROFILE = "4"  # what a fresh emulator boots with
 
 
 def _require_simulator(target: Target) -> None:
@@ -267,13 +280,82 @@ def _status_bar(target: Target, action: str,
         return {"control": "status-bar", "action": action,
                 "values": applied, "verified": True}
     if action == "clear":
-        _demo(target, "exit")
-        applied = {}
-    else:
-        applied = {**ANDROID_STATUS_BAR_PIN, **values} if action == "pin" else dict(values)
-        applied = _android_status_bar(target, applied)
+        _android_status_bar_clear(target)
+        return {"control": "status-bar", "action": action, "values": {},
+                "verified": True}
+    mode = str(values.pop("mode", "")).lower() or None
+    if mode not in (None, "live", "demo"):
+        raise errors.AutonomError(errors.FLOW_COMMAND_INVALID,
+                                  "status-bar mode must be live or demo")
+    demo_keys = sorted(set(values) & set(ANDROID_DEMO_ONLY_KEYS))
+    if action == "pin" and mode == "live" and demo_keys:
+        raise errors.AutonomError(
+            errors.FLOW_COMMAND_INVALID,
+            f"{', '.join(demo_keys)} need demo mode, which freezes the clock",
+            "Drop mode=live, or drop those keys to keep the real clock.")
+    if action == "pin" and mode != "demo" and not demo_keys:
+        return _android_live_pin(target, values)
+    applied = {**ANDROID_STATUS_BAR_PIN, **values} if action == "pin" else dict(values)
+    applied = _android_status_bar(target, applied)
     return {"control": "status-bar", "action": action,
-            "values": applied, "verified": True}
+            "values": {"mode": "demo", **applied}, "verified": True}
+
+
+def _android_live_pin(target: Target, values: dict[str, Any]) -> dict[str, Any]:
+    """Pin battery, cellular bars, and notification icons; leave the clock alone."""
+    unknown = sorted(set(values) - set(ANDROID_LIVE_KEYS))
+    if unknown:
+        raise errors.AutonomError(
+            errors.FLOW_COMMAND_INVALID,
+            f"unknown live status-bar key(s): {', '.join(unknown)}",
+            "Live keys: " + ", ".join(ANDROID_LIVE_KEYS) + ". Demo-mode keys ("
+            + ", ".join(ANDROID_DEMO_ONLY_KEYS) + ") switch to demo mode and "
+            "freeze the clock.")
+    level = _int(values, "battery", 100, 0, 100)
+    plugged = _truthy(values.get("plugged", "false"))
+    _adb(target, ["shell", "dumpsys", "battery", "set", "level", str(level)])
+    if plugged:
+        _adb(target, ["shell", "dumpsys", "battery", "set", "ac", "1"])
+    else:
+        _adb(target, ["shell", "dumpsys", "battery", "unplug"])
+    signal = _int(values, "mobile_level", 4, 0, 4)
+    _adb(target, ["emu", "gsm", "signal-profile", str(signal)])
+    hide = not _truthy(values.get("notifications", "false"))
+    warnings: list[dict[str, Any]] = []
+    completed = adb_mod.run_adb(
+        target.tool, ["shell", "cmd", "statusbar", "send-disable-flag",
+                      "notification-icons" if hide else "none"],
+        serial=target.target_id, timeout=30, check=False)
+    output = (completed.stdout or "") if isinstance(completed.stdout, str) else ""
+    icons_ok = completed.returncode == 0 and "rror" not in output and "nknown" not in output
+    if not icons_ok:
+        warnings.append({
+            "code": "status_bar_notification_icons_unsupported",
+            "error": "this SystemUI has no 'cmd statusbar send-disable-flag'; "
+                     "notification icons stay visible",
+            "hint": "Pass hhmm=<HHMM> to use demo mode instead (fixed clock).",
+        })
+    observed = _adb(target, ["shell", "dumpsys", "battery"])
+    applied: dict[str, Any] = {
+        "mode": "live", "battery": level, "plugged": "true" if plugged else "false",
+        "mobile_level": signal,
+        "notifications": ("hidden" if hide and icons_ok else "visible"),
+    }
+    result: dict[str, Any] = {"control": "status-bar", "action": "pin", "values": applied,
+                              "verified": f"level: {level}" in observed}
+    if warnings:
+        result["warnings"] = warnings
+    return result
+
+
+def _android_status_bar_clear(target: Target) -> None:
+    """Undo both modes: leave demo mode, restore the real battery, the
+    emulator's default signal profile, and every status-bar component."""
+    _demo(target, "exit")
+    _adb(target, ["shell", "dumpsys", "battery", "reset"])
+    _adb(target, ["emu", "gsm", "signal-profile", ANDROID_DEFAULT_SIGNAL_PROFILE])
+    adb_mod.run_adb(target.tool, ["shell", "cmd", "statusbar", "send-disable-flag", "none"],
+                    serial=target.target_id, timeout=30, check=False)
 
 
 def _demo(target: Target, command: str, *pairs: tuple[str, Any]) -> None:

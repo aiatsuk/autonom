@@ -71,7 +71,7 @@ python3 <autonom-root>/scripts/autonom.py crash list --app-id <bundle-id>
 
 **Compare the two screenshots.** A tap that exits 0 has not been proven to do
 anything; a changed screen (or a changed tree) is the proof. Pin the status
-bar first (`simulator status-bar pin`) so the clock and battery glyphs do not
+bar first (`simulator status-bar pin`) so the battery and signal glyphs do not
 show up as a difference, and pin the keyboard before typed text must be exact:
 
 ```bash

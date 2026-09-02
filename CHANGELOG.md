@@ -13,10 +13,18 @@ generator that replays flows on the same simulators and emulators and had
 already solved the noise that makes two captures of one screen differ.
 
 ### Added
-- **`simulator status-bar pin`** on both platforms: 9:41, full battery and
-  signal, no notifications — `simctl status_bar override` on iOS, SystemUI
-  demo mode on Android — so a before/after screenshot diff shows only what
-  the app changed. Given keys override the preset; `clear` restores the bar.
+- **`simulator status-bar pin`** on both platforms: full battery and
+  signal, no notification icons, and the real ticking clock, so a
+  before/after screenshot diff shows only what the app changed. iOS uses
+  `simctl status_bar override` (no `--time` unless `time=9:41` is given).
+  Android defaults to a *live* mode — battery through `dumpsys battery`,
+  cellular bars through the emulator console, notification icons through
+  `cmd statusbar send-disable-flag` — because SystemUI demo mode freezes
+  the clock at the moment it is entered (measured: 73 s later the bar still
+  showed the entry minute). `hhmm=0941`, `wifi=`, `mobile=`, `datatype=`, or
+  `mode=demo` switch to demo mode knowingly; `override` always uses it.
+  `clear` undoes both modes. A SystemUI without the disable flag is reported
+  with `status_bar_notification_icons_unsupported` rather than assumed.
 - **`simulator keyboard pin|reset|show`** (iOS): autocorrect, prediction, and
   auto-capitalisation off and the locale set, written with `plistlib` into
   the shut-down simulator's preference store and read back for `verified`.

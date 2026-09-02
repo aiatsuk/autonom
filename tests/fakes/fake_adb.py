@@ -16,6 +16,7 @@ State keys (all optional):
 ``clock_skew``      seconds the fake device clock lags the host (default 0)
 ``fail``            mapping of "joined argv prefix" -> [exit_code, message]
 ``avd_names``       mapping of serial -> AVD name for ``emu avd name``
+``battery_level``   level ``dumpsys battery`` reports (``set level`` updates it)
 """
 from __future__ import annotations
 
@@ -95,6 +96,19 @@ def main(argv: list[str]) -> int:
     if args[:1] == ["logcat"]:
         for line in state.get("logcat", []):
             sys.stdout.write(line + "\n")
+        return 0
+
+    if args[:3] == ["shell", "dumpsys", "battery"]:
+        # The battery service remembers `set level`, so a pin can be read back.
+        if args[3:5] == ["set", "level"] and len(args) > 5:
+            state["battery_level"] = args[5]
+            write_state(state)
+            return 0
+        if args[3:4] in (["set"], ["unplug"], ["reset"]):
+            return 0
+        sys.stdout.write(
+            "Current Battery Service state:\n  AC powered: false\n  USB powered: false\n"
+            f"  status: 4\n  level: {state.get('battery_level', '100')}\n")
         return 0
 
     if args[:3] == ["shell", "dumpsys", "location"]:

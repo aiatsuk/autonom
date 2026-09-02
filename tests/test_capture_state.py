@@ -86,10 +86,54 @@ class CaptureStateBase(EnvSandboxMixin, unittest.TestCase):
 
 
 class AndroidStatusBarTests(CaptureStateBase):
-    def test_pin_sends_the_whole_deterministic_preset_in_order(self) -> None:
+    def shell_calls(self) -> list[str]:
+        return [" ".join(argv[2:]) for argv in self.argv_log("adb")]
+
+    def test_pin_is_live_by_default_and_never_enters_demo_mode(self) -> None:
+        """Demo mode freezes the clock (measured on a real emulator), so the
+        default pin goes through the battery service, the emulator console,
+        and StatusBarManager instead — the clock keeps ticking."""
         code, payload = self.android("simulator", "status-bar", "pin")
         self.assertEqual(code, 0, payload)
+        self.assertEqual(payload["values"], {
+            "mode": "live", "battery": 100, "plugged": "false",
+            "mobile_level": 4, "notifications": "hidden"})
+        self.assertTrue(payload["verified"], "battery level is read back")
+        self.assertEqual(self.demo_broadcasts(), [])
+        calls = self.shell_calls()
+        self.assertIn("shell dumpsys battery set level 100", calls)
+        self.assertIn("shell dumpsys battery unplug", calls)
+        self.assertIn("emu gsm signal-profile 4", calls)
+        self.assertIn("shell cmd statusbar send-disable-flag notification-icons", calls)
+        self.assertNotIn("warnings", payload)
+
+    def test_live_pin_values(self) -> None:
+        code, payload = self.android("simulator", "status-bar", "pin", "--value", "battery=80",
+                                     "--value", "plugged=true", "--value", "mobile_level=2",
+                                     "--value", "notifications=true")
+        self.assertEqual(code, 0, payload)
+        self.assertEqual(payload["values"]["notifications"], "visible")
+        calls = self.shell_calls()
+        self.assertIn("shell dumpsys battery set level 80", calls)
+        self.assertIn("shell dumpsys battery set ac 1", calls)
+        self.assertIn("emu gsm signal-profile 2", calls)
+        self.assertIn("shell cmd statusbar send-disable-flag none", calls)
+
+    def test_live_pin_reports_an_old_systemui_without_the_disable_flag(self) -> None:
+        self.set_state(fail={"-s emulator-5554 shell cmd statusbar": [1, "Unknown command"]})
+        code, payload = self.android("simulator", "status-bar", "pin")
+        self.assertEqual(code, 0, payload)
+        self.assertEqual(payload["values"]["notifications"], "visible")
+        self.assertEqual(payload["warnings"][0]["code"],
+                         "status_bar_notification_icons_unsupported")
+
+    def test_hhmm_switches_to_demo_mode_with_the_full_preset(self) -> None:
+        """The marketing clock is one key away, and it is demo mode territory."""
+        code, payload = self.android("simulator", "status-bar", "pin", "--value", "hhmm=0941")
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["values"]["mode"], "demo")
         self.assertEqual(payload["values"]["hhmm"], "0941")
+        self.assertEqual(payload["values"]["battery"], 100)
         self.assertEqual(self.demo_broadcasts(), [
             "enter",
             "clock -e hhmm 0941",
@@ -100,12 +144,23 @@ class AndroidStatusBarTests(CaptureStateBase):
         ])
         allowed = [argv for argv in self.argv_log("adb") if "sysui_demo_allowed" in argv]
         self.assertEqual(len(allowed), 1, "demo mode must be allowed before it is entered")
-
-    def test_pin_values_override_the_preset(self) -> None:
         code, payload = self.android("simulator", "status-bar", "pin", "--value", "hhmm=12:30")
-        self.assertEqual(code, 0)
         self.assertEqual(payload["values"]["hhmm"], "1230")
-        self.assertIn("clock -e hhmm 1230", self.demo_broadcasts())
+
+    def test_mode_demo_without_a_clock_freezes_the_clock_knowingly(self) -> None:
+        code, payload = self.android("simulator", "status-bar", "pin", "--value", "mode=demo")
+        self.assertEqual(code, 0, payload)
+        self.assertEqual(payload["values"]["mode"], "demo")
+        self.assertNotIn("hhmm", payload["values"])
+        self.assertEqual(self.demo_broadcasts()[0], "enter")
+
+    def test_live_mode_refuses_demo_only_keys(self) -> None:
+        code, payload = self.android("simulator", "status-bar", "pin", "--value", "mode=live",
+                                     "--value", "wifi=hide")
+        self.assertEqual(code, 2)
+        self.assertEqual(payload["error_code"], errors.FLOW_COMMAND_INVALID)
+        self.assertIn("freezes the clock", payload["error"])
+        self.assertEqual(self.argv_log("adb"), [])
 
     def test_override_sends_only_the_given_keys(self) -> None:
         code, payload = self.android("simulator", "status-bar", "override",
@@ -113,7 +168,8 @@ class AndroidStatusBarTests(CaptureStateBase):
         self.assertEqual(code, 0)
         self.assertEqual(self.demo_broadcasts(),
                          ["enter", "network -e wifi hide", "notifications -e visible false"])
-        self.assertEqual(payload["values"], {"wifi": "hide", "notifications": "false"})
+        self.assertEqual(payload["values"],
+                         {"mode": "demo", "wifi": "hide", "notifications": "false"})
 
     def test_override_still_accepts_the_original_hhmm_key(self) -> None:
         """0.30 callers passed only hhmm; that must keep working unchanged."""
@@ -127,17 +183,25 @@ class AndroidStatusBarTests(CaptureStateBase):
         self.assertEqual(payload["error_code"], errors.FLOW_COMMAND_INVALID)
         self.assertIn("hhmm", payload["hint"])
         self.assertEqual(self.demo_broadcasts(), [])
+        code, payload = self.android("simulator", "status-bar", "pin", "--value", "bogus=1")
+        self.assertEqual(code, 2)
+        self.assertIn("Live keys", payload["hint"])
+        self.assertEqual(self.argv_log("adb"), [])
 
     def test_bad_clock_is_refused(self) -> None:
         code, payload = self.android("simulator", "status-bar", "pin", "--value", "hhmm=noon")
         self.assertEqual(code, 2)
         self.assertEqual(payload["error_code"], errors.FLOW_COMMAND_INVALID)
 
-    def test_clear_exits_demo_mode(self) -> None:
+    def test_clear_undoes_both_modes(self) -> None:
         code, payload = self.android("simulator", "status-bar", "clear")
         self.assertEqual(code, 0)
         self.assertEqual(self.demo_broadcasts(), ["exit"])
         self.assertEqual(payload["values"], {})
+        calls = self.shell_calls()
+        self.assertIn("shell dumpsys battery reset", calls)
+        self.assertIn("emu gsm signal-profile 4", calls)
+        self.assertIn("shell cmd statusbar send-disable-flag none", calls)
 
     def test_unknown_action_is_refused(self) -> None:
         code, payload = self.android("simulator", "status-bar", "freeze")
@@ -156,7 +220,7 @@ class IosStatusBarTests(CaptureStateBase):
     def _status_bar_calls(self) -> list[list[str]]:
         return [argv for argv in self.argv_log("simctl") if argv[1:2] == ["status_bar"]]
 
-    def test_pin_overrides_time_battery_and_signal(self) -> None:
+    def test_pin_overrides_battery_and_signal_but_leaves_the_clock_real(self) -> None:
         code, payload = self.ios("simulator", "status-bar", "pin")
         self.assertEqual(code, 0, payload)
         calls = self._status_bar_calls()
@@ -164,19 +228,20 @@ class IosStatusBarTests(CaptureStateBase):
         argv = calls[0]
         self.assertEqual(argv[:4], ["simctl", "status_bar", UDID, "override"])
         flags = dict(zip(argv[4::2], argv[5::2]))
-        self.assertEqual(flags["--time"], "9:41")
+        self.assertNotIn("--time", flags, "the real clock stays unless asked")
         self.assertEqual(flags["--batteryState"], "charged")
         self.assertEqual(flags["--batteryLevel"], "100")
         self.assertEqual(flags["--wifiMode"], "active")
         self.assertEqual(flags["--cellularBars"], "4")
         self.assertEqual(flags["--dataNetwork"], "5g")
 
-    def test_pin_values_override_the_preset(self) -> None:
-        code, payload = self.ios("simulator", "status-bar", "pin", "--value", "time=10:00")
+    def test_pin_values_extend_the_preset(self) -> None:
+        code, payload = self.ios("simulator", "status-bar", "pin", "--value", "time=9:41")
         self.assertEqual(code, 0)
-        self.assertEqual(payload["values"]["time"], "10:00")
+        self.assertEqual(payload["values"]["time"], "9:41")
         argv = self._status_bar_calls()[0]
-        self.assertEqual(argv[argv.index("--time") + 1], "10:00")
+        self.assertEqual(argv[argv.index("--time") + 1], "9:41")
+        self.assertIn("--batteryLevel", argv)
 
     def test_clear_restores_the_live_bar(self) -> None:
         code, _ = self.ios("simulator", "status-bar", "clear")

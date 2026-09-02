@@ -24,7 +24,7 @@ Legend: ✅ shipped · ⚠️ partial · 🔜 planned · ❌ not planned for nea
 | Screenshot provenance | ✅ | ✅ | metadata embedded in the PNG; shots taken under an active mock are flagged `screenshot_shows_mocked_data` |
 | Screenshot index / browse | ✅ | ✅ | `autonom shots list [--task --grep --mocked-only]`, `shots show <path>` |
 | Screenshot dimensions | ✅ | ✅ | `width`/`height` read from the PNG header on `screenshot`, `shots show`, and the index — the capture's coordinate space, stated rather than guessed |
-| Deterministic status bar | ✅ | ✅ | `simulator status-bar pin` — 9:41, full battery and signal, no notifications (simctl override / SystemUI demo mode); `override` takes single keys; `clear` restores the live bar |
+| Deterministic status bar | ✅ | ✅ | `simulator status-bar pin` — full battery and signal, no notification icons, the real ticking clock. iOS: `simctl status_bar override`. Android: *live* mode (battery service, emulator `gsm signal-profile`, `cmd statusbar send-disable-flag`) because SystemUI demo mode freezes the clock; `hhmm=0941`, `wifi=`, `mobile=`, `mode=demo`, and `override` use demo mode knowingly. `clear` undoes both |
 | Keyboard / locale pinning | ❌ | ✅ | `simulator keyboard pin\|reset\|show` — autocorrect, prediction, and auto-capitalisation off, locale set, on the shut-down simulator's preference store (`reboot=true` cycles it); `pin` snapshots what it replaces and `reset` restores it. Android keeps these inside Gboard; refused with `unsupported_capability` |
 | Screen recording artifact | ✅ | ✅ | `autonom record start\|stop` |
 | Logs | ⚠️ | ⚠️ | logcat; `log stream`/`log show` with a bundle predicate |
@@ -283,7 +283,7 @@ What each earlier limitation cost, and what replaced it.
 | Project-local artifacts, invisible from elsewhere | Machine-global `~/.autonom/`: the session, its mocks, and orphaned processes are found and reaped from any directory |
 | No record of what an agent did | Append-only `journal.ndjson` — every verb, its scrubbed argv, the result, and the failures, plus agent notes |
 | A screenshot that silently showed mocked data | Provenance embedded in the PNG; captures taken under an active rule are flagged `screenshot_shows_mocked_data` |
-| Before/after captures that differed by the clock, the battery glyph, or an autocorrected word | `simulator status-bar pin` and `simulator keyboard pin` fix the state the app does not own, so a diff shows only what the app changed |
+| Before/after captures that differed by the battery glyph, the signal bars, or an autocorrected word | `simulator status-bar pin` and `simulator keyboard pin` fix the state the app does not own, so a diff shows only what the app changed; the clock stays real unless pinned on purpose |
 | A failed flow that named the broken step and nothing else | The `repair` block: reconstruct the state, inspect the live tree, edit, re-verify — in the CLI's own commands |
 
 The harness intentionally does not claim that trend analysis proves a memory
