@@ -5,9 +5,9 @@ how do I drive it, and can it show me on *my* machine. The tour answers all
 three with one verb: an overview of the verb families, the workflow they
 compose into, an inventory of the Android emulators and iOS simulators this
 Mac has, and an offer — boot one, own a session, walk three screens into the
-Settings app with a screenshot, a UI hierarchy and the device log captured
-at every step, then hand back the session directory, the HTML report and a
-written account of what happened.
+Settings app with screenshots, a UI hierarchy and the device log captured
+on each action itself, then hand back the session directory, the HTML report
+and a written account of what happened.
 
 The walk is an ordinary Flow v1 file shipped next to this module, run with
 evidence mode `always`, so everything the tour produces is the same
@@ -211,7 +211,7 @@ def proposal(choice: dict[str, Any] | None, flow_override: Path | None,
         "title": built_in["title"] if flow_override is None else flow.name,
         "flow": str(flow_path),
         "steps": flow_labels(flow_path),
-        "evidence": "screenshot + UI hierarchy + device log before and after every step",
+        "evidence": "screenshots + UI hierarchy + device log attached to every step",
         "run_command": " ".join(command),
     }
 

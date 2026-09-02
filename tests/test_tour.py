@@ -37,7 +37,6 @@ FIXTURE_FLOW = (
     "schema: autonom.dev/flow/v1\nappId: com.example.app\nname: Fixture walk\n---\n"
     "- launchApp:\n    label: Launch the app\n"
     "- assertVisible:\n    selector:\n      text: Settings\n    label: The home screen is up\n"
-    "- takeScreenshot:\n    label: Home\n"
     "- tapOn:\n    selector:\n      description: Flutter Save Button\n    label: Tap Save\n"
 )
 
@@ -83,8 +82,11 @@ class BuiltInFlowTests(unittest.TestCase):
                 self.assertEqual(flow.app_id, spec["app_id"])
                 self.assertTrue(all(step.label for step in flow.steps),
                                 "every tour step must explain itself")
+                self.assertNotIn(
+                    "takeScreenshot", [step.command for step in flow.steps],
+                    "automatic per-step evidence must not create screenshot-only phases")
                 self.assertGreaterEqual(
-                    sum(1 for s in flow.steps if s.command == "takeScreenshot"), 3)
+                    sum(1 for step in flow.steps if step.command == "tapOn"), 2)
 
 
 class OverviewTests(TourBase):
@@ -157,10 +159,15 @@ class WalkTests(TourBase):
         self.assertEqual(run["status"], "passed")
         self.assertEqual(run["title"], "Fixture walk")
         self.assertEqual([s["label"] for s in run["steps"]],
-                         ["Launch the app", "The home screen is up", "Home", "Tap Save"])
+                         ["Launch the app", "The home screen is up", "Tap Save"])
         for step in run["steps"]:
             self.assertTrue(Path(step["screenshot"]).exists(), step)
             self.assertTrue(Path(step["hierarchy"]).exists(), step)
+        tap = next(step for step in run["steps"] if step["command"] == "tapOn")
+        self.assertTrue(Path(tap["screenshot_before"]).exists(), tap)
+        self.assertTrue(Path(tap["screenshot"]).exists(), tap)
+        self.assertTrue(Path(tap["hierarchy"]).exists(), tap)
+        self.assertTrue(Path(tap["logs"]).exists(), tap)
         logs = [step for step in run["steps"] if step.get("logs")]
         self.assertTrue(logs, "the fake logcat lines must reach at least one step's log")
         self.assertTrue(all(Path(step["logs"]).exists() for step in logs))
