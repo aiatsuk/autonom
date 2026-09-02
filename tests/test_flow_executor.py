@@ -584,8 +584,11 @@ class CompositionTests(_AndroidRunBase):
         self.assertEqual([c for c, _ in commands],
                          ["launchApp", "back", "runFlow", "assertVisible"])
         self.assertIn("sub.yaml", commands[0][1])
-        monkey = [a for a in self._adb_calls() if "monkey" in " ".join(a)]
-        self.assertEqual(len(monkey), 1, "child launchApp must use the root appId")
+        launches = [a for a in self._adb_calls() if "0x10008000" in a]
+        self.assertEqual(len(launches), 1, "child launchApp must launch once")
+        component = launches[0][launches[0].index("-n") + 1]
+        self.assertTrue(component.startswith("com.example.app/"),
+                        "child launchApp must use the root appId")
 
     def test_prefix_replay_can_stop_after_a_runflow_block(self) -> None:
         sub = self.root / "sub.yaml"

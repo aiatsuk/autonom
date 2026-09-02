@@ -1623,11 +1623,20 @@ class Executor:
         if command == "launchApp":
             if step.args.get("clearState"):
                 session_mod.clear_data(target.tool, target.target_id, flow.app_id)
+            # Fresh by default: on real devices a resumed task put the first
+            # selector on a subscreen (Android Settings: a search activity of
+            # another package that stopApp never touches). `resume: true`
+            # keeps the old behaviour for flows that continue a journey.
+            resume = bool(step.args.get("resume"))
             if target.platform == IOS:
+                if not resume:
+                    ios_simctl.terminate(target.tool, target.target_id, flow.app_id)
                 ios_simctl.launch(target.tool, target.target_id, flow.app_id,
                                   env=self._ios_launch_env())
-            else:
+            elif resume:
                 session_mod.launch_app(target.tool, target.target_id, flow.app_id)
+            else:
+                session_mod.launch_app_fresh(target.tool, target.target_id, flow.app_id)
             return False
         if command == "stopApp":
             if target.platform == IOS:

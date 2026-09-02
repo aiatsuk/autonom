@@ -31,7 +31,7 @@ Legend: ✅ shipped · ⚠️ partial · 🔜 planned · ❌ not planned for nea
 | Crash reports | ⚠️ | ✅ | Android: crash logcat buffer; iOS: idb crash store |
 | Deep links | ✅ | ✅ | `autonom open <url>` |
 | Permissions | ✅ | ✅ | `pm grant/revoke/reset`; `simctl privacy` |
-| Simulated location | ⚠️ | ✅ | set: iOS simctl / Android emulator `geo fix`; `location get` reads the fix on Android (iOS has no read-back) |
+| Simulated location | ⚠️ | ✅ | set: iOS simctl / Android emulator `geo fix`; `location get` reads the system's last fix on Android and reports `requested` + `delivered` against what the session set (iOS has no read-back) |
 | Media library seeding | ✅ | ✅ | `autonom media add` |
 | App-container file access | ✅ | ✅ | `autonom file ls\|pull`, confined to the container; a release/system app refuses with `app_not_debuggable` |
 | Remote target host | — | ✅ | idb client can drive a companion on another Mac |
@@ -55,7 +55,7 @@ Legend: ✅ shipped · ⚠️ partial · 🔜 planned · ❌ not planned for nea
 | PR Proof (local) | ✅ | ✅ | `proof --base` — covers-globs + pull-request tags select the suite; verdicts pass/fail/not_covered/blocked/inconclusive, never upgraded |
 | Atlas-lite: observed screens/transitions graph | ✅ | ✅ | `atlas update|show|coverage|paths|export|diff`; fingerprints ride in run events; observed-only, unknown stays unknown |
 | Evidence: step debugger + HTML/JUnit reports | ✅ | ✅ | manifest v3; addressable screenshots, hierarchy diff, logs, scrubbed requests; `report build|open|export|suite|serve`; loopback replay controls; JUnit for CI |
-| Flow DSL: Maestro Core Profile import/export | ✅ | ✅ | `flow import`/`flow export --format maestro`; outside-profile constructs refuse with `unsupported_flow_command` |
+| Flow DSL: Maestro Core Profile import/export | ✅ | ✅ | `flow import`/`flow export --format maestro`; a timed `assertVisible`/`assertNotVisible` exports as `extendedWaitUntil`; outside-profile constructs refuse with `unsupported_flow_command` |
 | Live session outputs catalog | ✅ | ✅ | `session outputs` — registered `streams[]` + directory scan, `abs_path`/`shell_hint` for `tail -f` |
 | Live follow (session files / device logs) | ✅ | ✅ | `logs follow` — NDJSON lines, always bounded by `--max-seconds`/`--max-lines`; `journal --follow` for the timeline |
 | Network requests list | ✅ | ✅ | `network requests list --max N --since-id F` |
@@ -106,7 +106,7 @@ autonom capabilities
 autonom session start [--app-id ID] [--install PATH] [--launch [ID]] [--activity C] [--log-stream]
 autonom session show|stop
 autonom session outputs [--session-id ID]
-autonom session launch <app-id> [--activity C] [--arg A] [--setenv K=V]
+autonom session launch <app-id> [--activity C] [--arg A] [--setenv K=V] [--fresh]
 autonom session force-stop|uninstall <app-id>
 autonom session clear <app-id> [--strategy auto|reinstall|privacy]
 
@@ -132,7 +132,7 @@ autonom flow run <path> [--include-tag TAG] [--exclude-tag TAG] [--env KEY=VALUE
 
 autonom teach start <name> | teach mark <name> | teach stop | teach show
 autonom teach compile --out PATH [--recording ID] [--from MARK] [--to MARK]
-autonom teach approve <flow> [--minimum-runs N]
+autonom teach approve <flow> [--minimum-runs N] [--run]
 autonom app-skill validate <app-id> [--workspace DIR]
 autonom app-skill promote <app-id> <flow> [--approval FILE] [--workspace DIR]
 

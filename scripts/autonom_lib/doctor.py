@@ -269,6 +269,16 @@ def _runtime_state(record: dict[str, Any] | None) -> tuple[dict[str, Any], list,
     warnings: list[dict[str, Any]] = []
     network = {"running": False, "proxy_port": None, "attached": False}
 
+    # Machine-wide sweep first: it decides whether a proxy is *owned* (its
+    # session directory and proxy.json are intact) or orphaned. The block
+    # below used to call the newest proxy an orphan merely because no session
+    # was current, while `processes` listed the same pid as live and owned —
+    # one process, two contradictory answers in one report.
+    from . import processes as processes_mod
+
+    machine = processes_mod.scan()
+    owned_pids = {entry.get("pid") for entry in machine["live"]}
+
     proxy_file = _latest_proxy_file(record)
     if proxy_file and proxy_file.exists():
         try:
@@ -279,7 +289,7 @@ def _runtime_state(record: dict[str, Any] | None) -> tuple[dict[str, Any], list,
         alive = session_mod.pid_alive(pid)
         network = {"running": alive, "proxy_port": proxy.get("port"),
                    "attached": bool((record or {}).get("network", {}).get("attached"))}
-        if alive and not record:
+        if alive and not record and pid not in owned_pids:
             orphans.append({"kind": "proxy", "pid": pid, "port": proxy.get("port"),
                             "hint": "autonom network stop"})
 
@@ -291,12 +301,9 @@ def _runtime_state(record: dict[str, Any] | None) -> tuple[dict[str, Any], list,
                 warnings.append({"code": "stale_background_pid", "kind": kind, "pid": pid,
                                  "hint": "The session records a pid that is no longer running."})
 
-    # Machine-wide sweep. The block above can only see what the current working
-    # directory knows about, which is exactly how a proxy started elsewhere held
-    # a port for hours while doctor reported a clean machine.
-    from . import processes as processes_mod
-
-    machine = processes_mod.scan()
+    # The block above can only see what the current working directory knows
+    # about, which is exactly how a proxy started elsewhere held a port for
+    # hours while doctor reported a clean machine; the sweep fills the rest in.
     seen = {item.get("pid") for item in orphans}
     for entry in machine["orphans"]:
         if entry.get("pid") in seen:

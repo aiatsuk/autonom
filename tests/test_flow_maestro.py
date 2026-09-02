@@ -408,8 +408,15 @@ class ExportTests(unittest.TestCase):
         self.assertIn("label: Dismiss", out)
         self.assertIn("optional: true", out)
 
-        # a per-command timeout has none — refuse instead of changing the wait
+        # a timed visibility assertion IS Maestro's extendedWaitUntil — export
+        # it as one, timeout intact, instead of refusing
         flow = self._flow("- assertVisible:\n    selector:\n      text: Done\n"
+                          "    timeoutMs: 30000\n")
+        out = maestro.export_flow(flow, "t.yaml")
+        self.assertIn("- extendedWaitUntil:", out)
+        self.assertIn("timeout: 30000", out)
+        # a timed tap has no equivalent — refuse instead of changing the wait
+        flow = self._flow("- tapOn:\n    selector:\n      text: Done\n"
                           "    timeoutMs: 30000\n")
         with self.assertRaises(errors.AutonomError) as caught:
             maestro.export_flow(flow, "t.yaml")

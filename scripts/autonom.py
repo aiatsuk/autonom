@@ -346,12 +346,21 @@ def cmd_session_launch(args: argparse.Namespace) -> int:
         if current:
             for key, value in _ios_proxy.launch_environment(current).items():
                 env.setdefault(key, value)
+        if getattr(args, "fresh", False):
+            ios_simctl.terminate(target.tool, target.target_id, args.app_id)
         pid = ios_simctl.launch(
             target.tool, target.target_id, args.app_id, args=args.arg or [], env=env
         )
-        return emit({"ok": True, "launched": args.app_id, "pid": pid, **target.identity()}, as_json=True)
+        return emit({"ok": True, "launched": args.app_id, "pid": pid,
+                     "mode": "fresh" if getattr(args, "fresh", False) else "resume",
+                     **target.identity()}, as_json=True)
+    if getattr(args, "fresh", False) and not args.activity:
+        detail = session_mod.launch_app_fresh(target.tool, target.target_id, args.app_id)
+        return emit({"ok": True, "launched": args.app_id, **detail, **target.identity()},
+                    as_json=True)
     session_mod.launch_app(target.tool, target.target_id, args.app_id, activity=args.activity)
-    return emit({"ok": True, "launched": args.app_id, **target.identity()}, as_json=True)
+    return emit({"ok": True, "launched": args.app_id, "mode": "resume",
+                 **target.identity()}, as_json=True)
 
 
 def cmd_session_stop_app(args: argparse.Namespace) -> int:
@@ -1196,10 +1205,13 @@ def cmd_location(args: argparse.Namespace) -> int:
     if args.location_command == "clear":
         device_state.clear_location(target)
         return emit({"ok": True, "location": None, **target.identity()}, as_json=True)
+    session = session_mod.load_current()
     if args.location_command == "get":
-        detail = device_state.get_location(target)
+        detail = device_state.get_location(target, session)
         return emit({"ok": True, **detail, **target.identity()}, as_json=True)
-    detail = device_state.set_location(target, args.coordinates)
+    detail = device_state.set_location(target, args.coordinates, session)
+    if session is not None:
+        session_mod.save(session)
     return emit({"ok": True, **detail, **target.identity()}, as_json=True)
 
 
@@ -2814,10 +2826,32 @@ def cmd_teach_compile(args: argparse.Namespace) -> int:
 
 
 def cmd_teach_approve(args: argparse.Namespace) -> int:
-    result = teach_mod.approve(
-        session_mod.require_current(), Path(args.flow),
-        minimum_runs=args.minimum_runs)
-    return emit({"ok": True, **result}, as_json=True)
+    record = session_mod.require_current()
+    replays: list[dict[str, Any]] = []
+    if getattr(args, "run", False):
+        # `approve` only counts replays that already happened; with --run it
+        # performs them here, against the session's target, and stops at the
+        # first failure — an approval is a claim about consecutive passes.
+        target = _target(args)
+        flow = flow_validator.validate_tree(Path(args.flow))
+        for _ in range(args.minimum_runs):
+            runner = flow_executor.Executor(target, record, flow_executor.RunConfig())
+            result = runner.run(flow)
+            replays.append({"run_id": result.run_id, "status": result.status})
+            if result.status not in ("passed", "replayed"):
+                raise errors.AutonomError(
+                    errors.TEACH_APPROVAL_BLOCKED,
+                    f"replay {len(replays)} of {args.minimum_runs} failed; approval "
+                    "needs consecutive clean passes",
+                    hint="Read the failure in the run's events, fix the flow, and "
+                         "re-run 'teach approve --run'.",
+                    flow_id=flow.flow_id, replays=replays, failure=result.failure,
+                )
+    result = teach_mod.approve(record, Path(args.flow), minimum_runs=args.minimum_runs)
+    payload = {"ok": True, **result}
+    if replays:
+        payload["replays"] = replays
+    return emit(payload, as_json=True)
 
 
 def cmd_app_skill_validate(args: argparse.Namespace) -> int:
@@ -3219,6 +3253,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--activity")
     p.add_argument("--arg", action="append", help="launch argument (repeatable, iOS)")
     p.add_argument("--setenv", action="append", help="KEY=VALUE child environment (iOS)")
+    p.add_argument("--fresh", action="store_true",
+                   help="start on a cleared task (Android) / after terminate (iOS) "
+                        "instead of resuming where the app was")
     p.set_defaults(func=cmd_session_launch)
 
     p = session_sub.add_parser("force-stop", help="force-stop an app", parents=[target_flags])
@@ -3478,9 +3515,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--from", dest="from_marker")
     p.add_argument("--to", dest="to_marker")
     p.set_defaults(func=cmd_teach_compile)
-    p = teach_sub.add_parser("approve", help="approve after consecutive clean replays")
+    p = teach_sub.add_parser("approve", help="approve after consecutive clean replays",
+                             parents=[target_flags])
     p.add_argument("flow")
     p.add_argument("--minimum-runs", type=int, default=3)
+    p.add_argument("--run", action="store_true",
+                   help="perform the replays now instead of counting past ones")
     p.set_defaults(func=cmd_teach_approve)
 
     app_skill = sub.add_parser("app-skill", help="validate and promote portable app knowledge")
@@ -4037,8 +4077,12 @@ def main(argv: list[str] | None = None) -> int:
         ok = False
         return fail(str(exc))
     except (IndexError, ValueError) as exc:
-        ok = False
-        return fail(str(exc))
+        # A bare ValueError used to leave the envelope without an error_code.
+        ok, error_code = False, errors.INVALID_VALUE
+        return fail_error(errors.AutonomError(
+            errors.INVALID_VALUE, str(exc) or exc.__class__.__name__,
+            "Check the argument values; run the verb with --help for the expected forms.",
+        ))
     except KeyboardInterrupt:
         ok = False
         return fail("interrupted", code=130)

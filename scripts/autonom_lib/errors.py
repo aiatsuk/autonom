@@ -122,6 +122,7 @@ USAGE_ERROR = "usage_error"                  # argparse rejected the argv
 SELECTOR_REQUIRED = "selector_required"      # ui tap with neither selector nor x/y
 APP_NOT_DEBUGGABLE = "app_not_debuggable"    # run-as refused the package
 FLOW_NO_FOCUSED_FIELD = "flow_no_focused_field"  # inputText with nothing focused
+INVALID_VALUE = "invalid_value"              # a value the verb could not use (was a bare ValueError)
 
 # --- Deterministic capture state --------------------------------------------
 # Keyboard/locale pinning edits the simulator's on-disk preference store, which

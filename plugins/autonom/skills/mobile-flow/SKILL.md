@@ -91,11 +91,11 @@ tags: [smoke, auth]
    selector.
 3. Do not fight a `test_failure` by retrying the flow — read the failure
    evidence first; the app state, not the harness, is what changed.
-   Two first-step failures seen on real devices are authoring, not app,
-   problems: `launchApp` resumes the app wherever it was (start with
-   `stopApp`), and `inputText` right after the `tapOn` that opens a field
-   finds nothing focused yet (add `waitUntil` on the field, or rely on the
-   built-in focus poll and its `timeoutMs`).
+   `launchApp` starts the app fresh (cleared task; `resume: true` to
+   continue where it was), and `inputText` polls for a focused field before
+   typing (`timeoutMs`), so the two first-step failures seen on real devices
+   — a resumed subscreen and typing before the field existed — no longer
+   need hand-written waits.
 4. Keep subflows atomic (login, dismiss-permissions) and let `runFlow`
    compose them; recursion and paths escaping the workspace are refused.
 5. Flow files are source — commit them. If the repository blanket-ignores

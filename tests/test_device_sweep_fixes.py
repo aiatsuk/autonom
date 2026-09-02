@@ -169,6 +169,31 @@ class TapAndTypeTests(SweepBase):
         self.assertIn("points, not pixels", ios["hint"])
 
 
+class IncompleteDumpTests(SweepBase):
+    def test_a_mid_transition_dump_is_retried_once(self) -> None:
+        self.set_state(ui_dump=str(UI_FIXTURE), ui_dump_incomplete=1)
+        code, payload = self.android("ui", "tree")
+        self.assertEqual(code, 0, payload)
+        self.assertGreaterEqual(payload["count"], 4)
+        dumps = [a for a in self.argv_log("adb") if "uiautomator" in a]
+        self.assertEqual(len(dumps), 2)
+
+    def test_a_dump_that_stays_incomplete_fails_by_name(self) -> None:
+        self.set_state(ui_dump=str(UI_FIXTURE), ui_dump_incomplete=5)
+        code, payload = self.android("ui", "tree")
+        self.assertEqual(code, 2)
+        self.assertEqual(payload["error_code"], errors.BACKEND_FAILED)
+        self.assertIn("mid-transition", payload["error"])
+
+    def test_a_bare_value_error_carries_a_code(self) -> None:
+        """`ui tree --dump` on a truncated file used to answer without error_code."""
+        broken = Path(self.tmp.name) / "half.xml"
+        broken.write_text(UI_FIXTURE.read_text(encoding="utf-8")[:200], encoding="utf-8")
+        code, payload = self.run_cli("ui", "tree", "--dump", str(broken))
+        self.assertEqual(code, 2)
+        self.assertEqual(payload["error_code"], errors.INVALID_VALUE)
+
+
 class TreeTests(SweepBase):
     def test_max_nodes_says_it_truncated_and_names_the_screen(self) -> None:
         self.set_state(ui_dump=str(UI_FIXTURE))
@@ -191,6 +216,28 @@ class FileAndLocationTests(SweepBase):
         code, pull = self.android("file", "pull", "files/x", "--app-id", "com.android.settings",
                                   "--out", str(Path(self.tmp.name) / "x"))
         self.assertEqual(pull["error_code"], errors.APP_NOT_DEBUGGABLE)
+
+    def test_ios_system_app_without_a_data_container_is_named(self) -> None:
+        """simctl prints the literal "(null)" with exit 0 for a system app; that
+        used to become a Path that exists nowhere and an empty listing."""
+        self.set_state(container="(null)", simctl_devices={"devices": {
+            "com.apple.CoreSimulator.SimRuntime.iOS-26-0": [
+                {"udid": UDID, "name": "iPhone 17 Pro", "state": "Booted", "isAvailable": True}]}})
+        code, payload = self.ios("file", "ls", "--app-id", "com.apple.Preferences")
+        self.assertEqual(code, 2)
+        self.assertEqual(payload["error_code"], errors.APP_NOT_INSTALLED)
+        self.assertIn("System apps", payload["hint"])
+
+    def test_ios_missing_path_inside_a_real_container_is_named(self) -> None:
+        container = Path(self.tmp.name) / "container"
+        (container / "Documents").mkdir(parents=True)
+        self.set_state(container=str(container))
+        code, payload = self.ios("file", "ls", "--app-id", "com.example.app")
+        self.assertEqual(code, 0, payload)
+        self.assertEqual(payload["entries"], ["Documents/"])
+        code, payload = self.ios("file", "ls", "Library", "--app-id", "com.example.app")
+        self.assertEqual(code, 2)
+        self.assertEqual(payload["error_code"], errors.BODY_FILE_NOT_FOUND)
 
     def test_debuggable_app_lists_normally(self) -> None:
         code, payload = self.android("file", "ls", "--app-id", "com.example.app")
@@ -297,6 +344,22 @@ class DoctorForeignProxyTests(SweepBase):
         self.assertEqual(warning["session_id"], "s_old")
         self.assertIn("network detach", warning["hint"])
 
+    def test_an_owned_live_proxy_is_not_also_an_orphan(self) -> None:
+        """One process, one answer: a proxy whose session directory and
+        proxy.json are intact is `foreign` (live, not ours), never an orphan —
+        doctor used to say both when no session was current."""
+        network = self.home / "sessions" / "s_old" / "network"
+        network.mkdir(parents=True)
+        (network / "proxy.json").write_text(json.dumps({"pid": os.getpid(), "port": 8080}),
+                                            encoding="utf-8")
+        processes.register("proxy", os.getpid(), port=8080, session_id="s_old",
+                           artifacts_dir=str(network))
+        self.set_state(devices=[], settings={"http_proxy": ":0"})
+        code, report = self.run_cli("doctor", "--adb", str(FAKE_ADB))
+        self.assertEqual(code, 0)
+        self.assertEqual([o for o in report["orphans"] if o["kind"] == "proxy"], [])
+        self.assertIn("foreign_proxy_running", [w["code"] for w in report["warnings"]])
+
     def test_no_proxy_setting_means_no_warning(self) -> None:
         self.set_state(devices=[["emulator-5554", "device", ""]], settings={"http_proxy": ":0"})
         code, report = self.run_cli("doctor", "--adb", str(FAKE_ADB))
@@ -389,6 +452,155 @@ class FlowSweepTests(SweepBase):
         code, payload = self.android("flow", "run", str(flow), "--secret", "PIN")
         self.assertEqual(code, 1, payload)
         self.assertNotIn("123456", json.dumps(payload))
+
+
+class CpuinfoTests(unittest.TestCase):
+    def test_signed_percentages_are_parsed(self) -> None:
+        """` +0% 12772/ru.skywool.knix` is what an API-37 emulator prints for a
+        process new to the sampling window; it read as "no line for the app"."""
+        from autonom_lib.metrics import meminfo
+        text = ("CPU usage from 421923ms to 121917ms ago:\n"
+                "  9.6% 449/android.hardware.graphics.composer3-service.ranchu: 0.5% user\n"
+                " +0% 12772/ru.skywool.knix: 0% user + 0% kernel\n"
+                " +1.5% 3982/com.android.settings: 1% user + 0.5% kernel / faults: 3 minor\n")
+        self.assertEqual(meminfo.parse_cpuinfo(text, "ru.skywool.knix"), 0.0)
+        self.assertEqual(meminfo.parse_cpuinfo(text, "com.android.settings"), 1.5)
+        self.assertIsNone(meminfo.parse_cpuinfo(text, "com.android.settings.dev"))
+
+
+class FreshLaunchTests(SweepBase):
+    def _flow(self, body: str, name: str = "f.yaml") -> Path:
+        path = Path(self.tmp.name) / name
+        path.write_text("schema: autonom.dev/flow/v1\nappId: com.example.app\nname: t\n---\n"
+                        + body, encoding="utf-8")
+        return path
+
+    def test_launch_app_clears_the_task_by_default(self) -> None:
+        self.set_state(ui_dump=str(UI_FIXTURE))
+        self.android("session", "start", "--app-id", "com.example.app")
+        code, payload = self.android("flow", "run", str(self._flow("- launchApp\n")))
+        self.assertEqual(code, 0, payload)
+        starts = [a for a in self.argv_log("adb") if "0x10008000" in a]
+        self.assertEqual(len(starts), 1)
+        self.assertIn("com.example.app/.MainActivity", starts[0])
+        self.assertNotIn("--activity-new-task", starts[0], "not an am option")
+        self.assertEqual([a for a in self.argv_log("adb") if "monkey" in a], [])
+
+    def test_resume_true_keeps_the_old_behaviour(self) -> None:
+        self.set_state(ui_dump=str(UI_FIXTURE))
+        self.android("session", "start", "--app-id", "com.example.app")
+        code, payload = self.android("flow", "run",
+                                     str(self._flow("- launchApp:\n    resume: true\n")))
+        self.assertEqual(code, 0, payload)
+        self.assertEqual(len([a for a in self.argv_log("adb") if "monkey" in a]), 1)
+        self.assertEqual([a for a in self.argv_log("adb") if "0x10008000" in a], [])
+
+    def test_no_launcher_activity_falls_back_to_resume(self) -> None:
+        self.set_state(ui_dump=str(UI_FIXTURE), no_launcher=["com.example.app"])
+        self.android("session", "start", "--app-id", "com.example.app")
+        code, payload = self.android("flow", "run", str(self._flow("- launchApp\n")))
+        self.assertEqual(code, 0, payload)
+        self.assertEqual(len([a for a in self.argv_log("adb") if "monkey" in a]), 1)
+
+    def test_ios_launch_app_terminates_first(self) -> None:
+        booted = {"devices": {"com.apple.CoreSimulator.SimRuntime.iOS-26-0": [
+            {"udid": UDID, "name": "iPhone 17 Pro", "state": "Booted", "isAvailable": True}]}}
+        self.set_state(idb_describe_all=str(IOS_FIXTURE), simctl_devices=booted)
+        self.ios("session", "start", "--app-id", "com.example.app")
+        code, payload = self.ios("flow", "run", str(self._flow("- launchApp\n")))
+        self.assertEqual(code, 0, payload)
+        verbs = [a[1] for a in self.argv_log("simctl") if a[1:2] in (["terminate"], ["launch"])]
+        self.assertEqual(verbs[-2:], ["terminate", "launch"])
+
+    def test_session_launch_fresh_flag(self) -> None:
+        code, payload = self.android("session", "launch", "com.example.app", "--fresh")
+        self.assertEqual(code, 0, payload)
+        self.assertEqual(payload["mode"], "fresh")
+        self.assertEqual(payload["component"], "com.example.app/.MainActivity")
+        code, payload = self.android("session", "launch", "com.example.app")
+        self.assertEqual(payload["mode"], "resume")
+
+
+class TeachApproveRunTests(SweepBase):
+    def test_run_performs_the_replays_and_approves(self) -> None:
+        self.set_state(ui_dump=str(UI_FIXTURE))
+        self.android("session", "start", "--app-id", "com.example.app")
+        flow = Path(self.tmp.name) / "taught.yaml"
+        flow.write_text("schema: autonom.dev/flow/v1\nid: flow_deep_taught\n"
+                        "appId: com.example.app\nname: taught\n---\n"
+                        "- assertVisible:\n    selector:\n      text: Settings\n",
+                        encoding="utf-8")
+        code, payload = self.android("teach", "approve", str(flow), "--minimum-runs", "2")
+        self.assertEqual(code, 2)
+        self.assertEqual(payload["error_code"], errors.TEACH_APPROVAL_BLOCKED)
+        code, payload = self.android("teach", "approve", str(flow), "--minimum-runs", "2", "--run")
+        self.assertEqual(code, 0, payload)
+        self.assertEqual([r["status"] for r in payload["replays"]], ["passed", "passed"])
+        self.assertEqual(len(payload["clean_replays"]), 2)
+        self.assertTrue(Path(payload["receipt"]).exists())
+
+    def test_run_stops_at_the_first_failed_replay(self) -> None:
+        self.set_state(ui_dump=str(UI_FIXTURE))
+        self.android("session", "start", "--app-id", "com.example.app")
+        flow = Path(self.tmp.name) / "broken.yaml"
+        flow.write_text("schema: autonom.dev/flow/v1\nid: flow_deep_broken\n"
+                        "appId: com.example.app\nname: broken\n---\n"
+                        "- assertVisible:\n    selector:\n      text: Nope\n    timeoutMs: 200\n",
+                        encoding="utf-8")
+        code, payload = self.android("teach", "approve", str(flow), "--minimum-runs", "3", "--run")
+        self.assertEqual(code, 2)
+        self.assertEqual(payload["error_code"], errors.TEACH_APPROVAL_BLOCKED)
+        self.assertEqual(len(payload["replays"]), 1)
+        self.assertEqual(payload["failure"]["error_code"], errors.FLOW_ASSERTION_TIMEOUT)
+
+
+class MaestroExportTests(SweepBase):
+    def test_timed_visibility_assertion_exports_as_extended_wait(self) -> None:
+        flow = Path(self.tmp.name) / "wait.yaml"
+        flow.write_text("schema: autonom.dev/flow/v1\nappId: com.example.app\nname: w\n---\n"
+                        "- assertVisible:\n    selector:\n      text: Settings\n    timeoutMs: 8000\n"
+                        "- assertNotVisible:\n    selector:\n      id: spinner\n    timeoutMs: 3000\n",
+                        encoding="utf-8")
+        out = Path(self.tmp.name) / "wait.maestro.yaml"
+        code, payload = self.run_cli("flow", "export", str(flow), "--format", "maestro",
+                                     "--out", str(out))
+        self.assertEqual(code, 0, payload)
+        text = out.read_text(encoding="utf-8")
+        self.assertIn("- extendedWaitUntil:", text)
+        self.assertIn("    visible:", text)
+        self.assertIn("    notVisible:", text)
+        self.assertIn("    timeout: 8000", text)
+        self.assertIn("    timeout: 3000", text)
+
+    def test_timed_tap_still_refuses(self) -> None:
+        flow = Path(self.tmp.name) / "tap.yaml"
+        flow.write_text("schema: autonom.dev/flow/v1\nappId: com.example.app\nname: t\n---\n"
+                        "- tapOn:\n    selector:\n      text: Go\n    timeoutMs: 8000\n",
+                        encoding="utf-8")
+        code, payload = self.run_cli("flow", "export", str(flow), "--format", "maestro",
+                                     "--out", str(Path(self.tmp.name) / "tap.m.yaml"))
+        self.assertEqual(code, 2)
+        self.assertEqual(payload["error_code"], errors.UNSUPPORTED_FLOW_COMMAND)
+
+
+class LocationDeliveryTests(SweepBase):
+    def test_get_reports_requested_versus_delivered(self) -> None:
+        self.android("session", "start", "--app-id", "com.example.app")
+        self.android("location", "set", "48.8566,2.3522")  # Paris; the fake reports Moscow
+        code, payload = self.android("location", "get")
+        self.assertEqual(code, 0, payload)
+        self.assertEqual(payload["requested"]["latitude"], 48.8566)
+        self.assertFalse(payload["delivered"])
+        self.assertIn("subscribes", payload["note"])
+        self.android("location", "set", "55.751244,37.618423")  # what the fake reports
+        code, payload = self.android("location", "get")
+        self.assertTrue(payload["delivered"])
+        self.assertNotIn("note", payload)
+
+    def test_get_without_a_request_is_unannotated(self) -> None:
+        code, payload = self.android("location", "get")
+        self.assertEqual(code, 0, payload)
+        self.assertNotIn("requested", payload)
 
 
 class TraceHintTests(SweepBase):

@@ -88,6 +88,31 @@ already solved the noise that makes two captures of one screen differ.
   - `location set` on the Android emulator says `delivery:
     on_subscription`: the fix reaches the location manager only once an app
     subscribes, so `location get` cannot confirm it.
+  - Flow `launchApp` starts the app fresh (launcher activity on a cleared
+    task on Android, terminate-then-launch on iOS); `resume: true` keeps the
+    old resume-where-it-was behaviour. `session launch --fresh` does the
+    same from the CLI. Measured cause: a resumed task put a flow's first
+    selector on a subscreen or, with Android Settings, in another package's
+    search activity that `stopApp` never touches.
+  - `teach approve --run` performs the required consecutive replays itself
+    instead of only counting past ones.
+  - `flow export --format maestro` exports a timed `assertVisible` /
+    `assertNotVisible` as `extendedWaitUntil` with the timeout instead of
+    refusing.
+  - `location get` on Android reports `requested` and `delivered` against
+    the fix this session set, so a Googleplex answer after `location set`
+    reads as "not delivered yet", not as a broken set.
+  - A UIAutomator dump cut short by a screen transition is retried once and
+    then refused as `backend_failed`; any remaining bare `ValueError` in a
+    verb answers with `error_code: invalid_value` instead of no code at all.
+  - `metrics snapshot` on Android reads the app's CPU line even when
+    `dumpsys cpuinfo` prefixes the percentage with a sign (` +0% pid/app`),
+    which an API-37 emulator does; it used to report `cpu_unavailable`.
+  - `file ls` on iOS names a system app's missing data container
+    (`app_not_installed`, simctl's literal `(null)`) and a missing path
+    inside a real container, instead of listing nothing.
+  - `doctor` no longer reports a live proxy owned by another session as an
+    orphan *and* as foreign at the same time.
   - `record stop` with nothing recording answers `was_recording: false`
     with `path: null` instead of a phantom `latest.mp4`; `devices shutdown`
     on a stopped simulator reports `already_stopped`; `network requests

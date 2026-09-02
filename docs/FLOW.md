@@ -170,7 +170,7 @@ selector-strings: id text visibleText description role
 selector-bools: enabled checked selected focused
 selector-relational: above below leftOf rightOf childOf containsChild containsDescendants
 match-modes: exact caseInsensitiveExact contains regex
-command launchApp: clearState label postcondition
+command launchApp: clearState resume label postcondition
 command stopApp: label postcondition
 command clearState: label postcondition
 command openLink: url label postcondition
@@ -234,12 +234,13 @@ applied, verified, and used setup entries separately.
   and passed. iOS accessibility dumps carry no focus attribute (verified on
   a Simulator), so there the bar is "a text field is on screen".
   `requireFocus: false` opts out for a UI whose field never reports focus.
-- `launchApp` brings the app's launcher task to the front (`monkey` on
-  Android, `simctl launch` on iOS); it does **not** reset navigation. An app
-  left on a subscreen — or, as Android Settings does, in a search activity of
-  another package — resumes there. Start flows with `stopApp` (and
-  `clearState: true` when data may change) to make the first selector
-  deterministic.
+- `launchApp` starts the app **fresh**: the launcher activity on a cleared
+  task on Android (`am start --activity-clear-task`), terminate-then-launch
+  on iOS. Data is untouched (`clearState: true` wipes it). Measured on real
+  devices, a resumed task put a flow's first selector on a subscreen — or,
+  with Android Settings, in a search activity of another package that
+  `stopApp` never touches. `resume: true` restores the old behaviour for a
+  flow that continues a journey.
 - `repeat` is bounded, declared iteration: `times` (1–25) is the hard
   limit, `while:` (`visible`/`notVisible` only) stops the loop early the
   moment it no longer holds; a failing iteration fails the flow, and

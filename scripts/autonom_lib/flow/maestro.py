@@ -788,15 +788,26 @@ def export_flow(flow: Flow, path: str) -> str:
                 )
             if "timeoutMs" in step.args:
                 # Maestro's per-command lookup timeout lives on
-                # extendedWaitUntil, not on tapOn/assertVisible — exporting
-                # without it would quietly change how long the step waits
-                raise errors.AutonomError(
-                    errors.UNSUPPORTED_FLOW_COMMAND,
-                    f"{path}: {command}.timeoutMs has no Maestro equivalent",
-                    hint="Express the wait as extendedWaitUntil, or drop the "
-                         "explicit timeout before exporting.",
-                    file=path, line=step.line, command=command,
-                )
+                # extendedWaitUntil, not on tapOn/assertVisible. A visibility
+                # assertion *is* an extendedWaitUntil, so export it as one and
+                # keep the timeout; a tap has no equivalent, so refuse rather
+                # than quietly change how long the step waits.
+                arm = {"assertVisible": "visible", "assertNotVisible": "notVisible"}.get(command)
+                if arm is None:
+                    raise errors.AutonomError(
+                        errors.UNSUPPORTED_FLOW_COMMAND,
+                        f"{path}: {command}.timeoutMs has no Maestro equivalent",
+                        hint="Express the wait as extendedWaitUntil, or drop the "
+                             "explicit timeout before exporting.",
+                        file=path, line=step.line, command=command,
+                    )
+                lines.append("- extendedWaitUntil:")
+                lines.append(f"    {arm}:")
+                emit_selector("        ", selector)
+                lines.append(f"    timeout: {step.args['timeoutMs']}")
+                if step.args.get("label"):
+                    lines.append(f"    label: {step.args['label']}")
+                continue
             lines.append(f"- {command}:")
             emit_selector("    ", selector)
             # Maestro carries these on the selector map itself

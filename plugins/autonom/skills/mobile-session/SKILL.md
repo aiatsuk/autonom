@@ -52,7 +52,8 @@ is not `emulator-<port>` — it never powers off physical hardware.
 
 ```bash
 python3 <autonom-root>/scripts/autonom.py session start --serial emulator-5554 --app-id com.example.app
-python3 <autonom-root>/scripts/autonom.py session launch com.example.app
+python3 <autonom-root>/scripts/autonom.py session launch com.example.app            # resume where it was
+python3 <autonom-root>/scripts/autonom.py session launch com.example.app --fresh    # launcher activity on a cleared task
 python3 <autonom-root>/scripts/autonom.py session force-stop com.example.app
 python3 <autonom-root>/scripts/autonom.py session clear com.example.app
 python3 <autonom-root>/scripts/autonom.py session stop

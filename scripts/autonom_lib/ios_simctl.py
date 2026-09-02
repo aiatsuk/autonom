@@ -254,7 +254,12 @@ def app_container(xcrun: str, udid: str, bundle_id: str, kind: str = "data") -> 
     if completed.returncode != 0:
         return None
     value = (completed.stdout or "").strip()
-    return Path(value) if value else None
+    # simctl prints the literal "(null)" with exit 0 for an app that has no
+    # such container — system apps have no data container — and that string
+    # used to become a Path that "exists" nowhere, read as an empty listing.
+    if not value or value == "(null)":
+        return None
+    return Path(value)
 
 
 # --- device state ------------------------------------------------------------

@@ -17,6 +17,7 @@ State keys (all optional):
 ``fail``            mapping of "joined argv prefix" -> [exit_code, message]
 ``avd_names``       mapping of serial -> AVD name for ``emu avd name``
 ``run_as_refused``  text run-as prints instead of a listing (system / release app)
+``ui_dump_incomplete`` number of truncated dumps to return before a complete one
 ``battery_level``   level ``dumpsys battery`` reports (``set level`` updates it)
 """
 from __future__ import annotations
@@ -86,8 +87,16 @@ def main(argv: list[str]) -> int:
 
     if args[:3] == ["exec-out", "uiautomator", "dump"]:
         dump = state.get("ui_dump")
-        if dump:
-            sys.stdout.write(Path(dump).read_text(encoding="utf-8"))
+        text = Path(dump).read_text(encoding="utf-8") if dump else ""
+        # `ui_dump_incomplete`: N dumps come back truncated (a screen
+        # mid-transition) before a complete one — what a real emulator did.
+        pending = int(state.get("ui_dump_incomplete", 0) or 0)
+        if pending > 0:
+            state["ui_dump_incomplete"] = pending - 1
+            write_state(state)
+            sys.stdout.write(text[: len(text) // 2])
+            return 0
+        sys.stdout.write(text)
         return 0
 
     if args[:2] == ["exec-out", "run-as"]:
@@ -184,6 +193,16 @@ def main(argv: list[str]) -> int:
         state["devices"] = [row for row in rows if killed is None or row[0] != killed]
         write_state(state)
         sys.stdout.write("OK: killing emulator, bye bye\n")
+        return 0
+
+    if args[:4] == ["shell", "cmd", "package", "resolve-activity"]:
+        # `--brief` prints a priority line and then the component; a package
+        # with no launcher activity prints "No activity found".
+        package = args[-1]
+        if package in (state.get("no_launcher") or []):
+            sys.stdout.write("No activity found\n")
+            return 0
+        sys.stdout.write(f"priority=0 preferredOrder=0 match=0x108000\n{package}/.MainActivity\n")
         return 0
 
     if args[:2] == ["shell", "getprop"]:

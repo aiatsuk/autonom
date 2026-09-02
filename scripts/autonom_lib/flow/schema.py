@@ -131,7 +131,10 @@ _OPTIONAL = (ArgSpec("optional", "bool"), ArgSpec("reason", "str"))
 REGISTRY: dict[str, CommandSpec] = {spec.name: spec for spec in [
     # lifecycle
     CommandSpec("launchApp", True, bare=True,
-                args=(ArgSpec("clearState", "bool"), _LABEL, _POSTCONDITION)),
+                # A fresh launch (cleared task) by default; `resume: true`
+                # brings the app back exactly where it was.
+                args=(ArgSpec("clearState", "bool"), ArgSpec("resume", "bool"),
+                      _LABEL, _POSTCONDITION)),
     CommandSpec("stopApp", True, bare=True, args=(_LABEL, _POSTCONDITION)),
     CommandSpec("clearState", True, bare=True, args=(_LABEL, _POSTCONDITION)),
     CommandSpec("openLink", True, shorthand="url",
