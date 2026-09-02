@@ -20,6 +20,10 @@ already solved the noise that makes two captures of one screen differ.
 - **`simulator keyboard pin|reset|show`** (iOS): autocorrect, prediction, and
   auto-capitalisation off and the locale set, written with `plistlib` into
   the shut-down simulator's preference store and read back for `verified`.
+  `pin` snapshots the values it replaces under
+  `$AUTONOM_HOME/simulator-prefs/<udid>.json` and `reset` restores them
+  (a region-override locale such as `en_US@rg=nlzzzz` survives a pin/reset
+  round trip); without a snapshot, `reset` deletes the owned keys.
   `reboot=true` cycles a booted device; a booted one without it is refused
   with the new `simulator_must_be_shutdown`; a device with no data directory
   with `simulator_data_not_found`. Android refuses with

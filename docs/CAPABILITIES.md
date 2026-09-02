@@ -25,7 +25,7 @@ Legend: ✅ shipped · ⚠️ partial · 🔜 planned · ❌ not planned for nea
 | Screenshot index / browse | ✅ | ✅ | `autonom shots list [--task --grep --mocked-only]`, `shots show <path>` |
 | Screenshot dimensions | ✅ | ✅ | `width`/`height` read from the PNG header on `screenshot`, `shots show`, and the index — the capture's coordinate space, stated rather than guessed |
 | Deterministic status bar | ✅ | ✅ | `simulator status-bar pin` — 9:41, full battery and signal, no notifications (simctl override / SystemUI demo mode); `override` takes single keys; `clear` restores the live bar |
-| Keyboard / locale pinning | ❌ | ✅ | `simulator keyboard pin\|reset\|show` — autocorrect, prediction, and auto-capitalisation off, locale set, on the shut-down simulator's preference store (`reboot=true` cycles it). Android keeps these inside Gboard; refused with `unsupported_capability` |
+| Keyboard / locale pinning | ❌ | ✅ | `simulator keyboard pin\|reset\|show` — autocorrect, prediction, and auto-capitalisation off, locale set, on the shut-down simulator's preference store (`reboot=true` cycles it); `pin` snapshots what it replaces and `reset` restores it. Android keeps these inside Gboard; refused with `unsupported_capability` |
 | Screen recording artifact | ✅ | ✅ | `autonom record start\|stop` |
 | Logs | ⚠️ | ⚠️ | logcat; `log stream`/`log show` with a bundle predicate |
 | Crash reports | ⚠️ | ✅ | Android: crash logcat buffer; iOS: idb crash store |
@@ -251,7 +251,7 @@ exit code 2, so an agent can branch on `error_code` rather than parse prose.
 
 | Variable | Effect |
 | --- | --- |
-| `AUTONOM_HOME` | Overrides both state roots: sessions land in `$AUTONOM_HOME/sessions`, registries and the mitmproxy confdir directly beneath it |
+| `AUTONOM_HOME` | Overrides both state roots: sessions land in `$AUTONOM_HOME/sessions`, registries, the mitmproxy confdir, and `simulator-prefs/` snapshots directly beneath it |
 | `XDG_STATE_HOME` | Machine state root when `AUTONOM_HOME` is unset (else `~/.local/state/autonom`) |
 | `AUTONOM_ADB`, `AUTONOM_SIMCTL`, `AUTONOM_IDB`, `AUTONOM_EMULATOR`, `AUTONOM_MITMDUMP` | Binary paths, equivalent to the matching flag |
 | `AUTONOM_IDB_COMPANION` | `host:port` of an idb companion on another Mac |

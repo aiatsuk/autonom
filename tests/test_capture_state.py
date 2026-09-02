@@ -27,9 +27,9 @@ sys.path.insert(0, str(ROOT / "scripts"))
 from autonom_lib import errors, ios_prefs  # noqa: E402
 
 try:
-    from env_isolation import EnvSandboxMixin  # noqa: E402  (discover -s tests)
+    from env_isolation import EnvSandbox, EnvSandboxMixin  # noqa: E402  (discover -s tests)
 except ImportError:  # direct `python3 -m unittest tests.test_...` runs
-    from tests.env_isolation import EnvSandboxMixin  # noqa: E402
+    from tests.env_isolation import EnvSandbox, EnvSandboxMixin  # noqa: E402
 
 
 class CaptureStateBase(EnvSandboxMixin, unittest.TestCase):
@@ -284,6 +284,59 @@ class KeyboardPinTests(CaptureStateBase):
                          {"AppleKeyboards": ["en_US@sw=QWERTY"]})
         self.assertEqual(self.read_plist("com.apple.Preferences"), {})
 
+    def test_reset_restores_the_values_pin_replaced(self) -> None:
+        """The first real device carried a region override the pin flattened."""
+        with (self.prefs_dir() / ".GlobalPreferences.plist").open("wb") as handle:
+            plistlib.dump({"AppleLocale": "en_US@rg=nlzzzz", "AppleLanguages": ["en-US"],
+                           "AppleKeyboards": ["en_US@sw=QWERTY"]}, handle)
+        with (self.prefs_dir() / "com.apple.Preferences.plist").open("wb") as handle:
+            plistlib.dump({"KeyboardPrediction": True}, handle)
+        code, pinned = self.ios("simulator", "keyboard", "pin", "--value", "locale=en-US")
+        self.assertEqual(code, 0, pinned)
+        self.assertTrue(Path(pinned["backup"]).exists())
+        self.assertEqual(self.read_plist(".GlobalPreferences")["AppleLocale"], "en_US")
+        code, shown = self.ios("simulator", "keyboard", "show")
+        self.assertTrue(shown["backup"])
+        code, reset = self.ios("simulator", "keyboard", "reset")
+        self.assertEqual(code, 0, reset)
+        self.assertTrue(reset["backup"])
+        self.assertTrue(reset["verified"])
+        self.assertEqual(reset["restored"][".GlobalPreferences"],
+                         {"AppleLocale": "en_US@rg=nlzzzz", "AppleLanguages": ["en-US"]})
+        self.assertEqual(reset["restored"]["com.apple.Preferences"],
+                         {"KeyboardPrediction": True})
+        self.assertEqual(sorted(reset["removed"]["com.apple.Preferences"]),
+                         ["KeyboardAutocapitalization", "KeyboardAutocorrection"])
+        self.assertEqual(self.read_plist(".GlobalPreferences"), {
+            "AppleLocale": "en_US@rg=nlzzzz", "AppleLanguages": ["en-US"],
+            "AppleKeyboards": ["en_US@sw=QWERTY"]})
+        self.assertEqual(self.read_plist("com.apple.Preferences"), {"KeyboardPrediction": True})
+        self.assertFalse(Path(pinned["backup"]).exists(), "the backup is consumed by reset")
+        code, shown = self.ios("simulator", "keyboard", "show")
+        self.assertFalse(shown["backup"])
+
+    def test_a_second_pin_keeps_the_original_snapshot(self) -> None:
+        with (self.prefs_dir() / ".GlobalPreferences.plist").open("wb") as handle:
+            plistlib.dump({"AppleLocale": "de_DE"}, handle)
+        self.ios("simulator", "keyboard", "pin", "--value", "locale=en-US")
+        self.ios("simulator", "keyboard", "pin", "--value", "locale=fr-FR")
+        self.assertEqual(self.read_plist(".GlobalPreferences")["AppleLocale"], "fr_FR")
+        code, reset = self.ios("simulator", "keyboard", "reset")
+        self.assertEqual(reset["restored"][".GlobalPreferences"]["AppleLocale"], "de_DE")
+        self.assertEqual(self.read_plist(".GlobalPreferences"), {"AppleLocale": "de_DE"})
+
+    def test_reset_without_a_backup_falls_back_to_deleting(self) -> None:
+        """A pin made by hand (or a lost state root) still resets cleanly."""
+        with (self.prefs_dir() / "com.apple.Preferences.plist").open("wb") as handle:
+            plistlib.dump({"KeyboardAutocorrection": False, "Other": 1}, handle)
+        code, reset = self.ios("simulator", "keyboard", "reset")
+        self.assertEqual(code, 0, reset)
+        self.assertFalse(reset["backup"])
+        self.assertEqual(reset["restored"], {})
+        self.assertEqual(reset["removed"], {"com.apple.Preferences": ["KeyboardAutocorrection"]})
+        self.assertTrue(reset["verified"])
+        self.assertEqual(self.read_plist("com.apple.Preferences"), {"Other": 1})
+
     def test_invalid_locale_is_refused(self) -> None:
         self.prefs_dir()
         code, payload = self.ios("simulator", "keyboard", "pin", "--value", "locale=nope!")
@@ -326,6 +379,18 @@ class IosPrefsUnitTests(unittest.TestCase):
     def test_owned_keys_always_include_the_locale_pair(self) -> None:
         owned = ios_prefs.owned_keys(ios_prefs.keyboard_pins(None))
         self.assertEqual(owned[ios_prefs.GLOBAL_DOMAIN], ios_prefs.LOCALE_KEYS)
+
+    def test_backups_live_under_the_machine_state_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            sandbox = EnvSandbox()
+            sandbox.set_env(AUTONOM_HOME=tmp, XDG_STATE_HOME=None)
+            try:
+                self.assertEqual(ios_prefs.backup_path("X"),
+                                 Path(tmp) / "simulator-prefs" / "X.json")
+                sandbox.set_env(AUTONOM_HOME=None, XDG_STATE_HOME=tmp)
+                self.assertEqual(ios_prefs.state_root(), Path(tmp) / "autonom")
+            finally:
+                sandbox.doCleanups()
 
 
 class ScreenshotSizeTests(CaptureStateBase):

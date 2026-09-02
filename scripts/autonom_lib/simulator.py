@@ -365,6 +365,7 @@ def _keyboard(target: Target, action: str, values: dict[str, Any]) -> dict[str, 
         observed = ios_prefs.observe(udid, pins)
         return {"control": "keyboard", "action": action,
                 "observed": observed, "pinned": ios_prefs.is_pinned(observed, pins),
+                "backup": ios_prefs.read_backup(udid) is not None,
                 "verified": True}
 
     # A device with no data directory is refused before any lifecycle churn:
@@ -389,14 +390,22 @@ def _keyboard(target: Target, action: str, values: dict[str, Any]) -> dict[str, 
                               "locale": pins.get(ios_prefs.GLOBAL_DOMAIN, {}).get("AppleLocale")}
     try:
         if action == "pin":
+            backup = ios_prefs.record_backup(udid, pins)
             result["preferences"] = ios_prefs.apply_pins(udid, pins)
+            result["backup"] = str(backup) if backup else str(ios_prefs.backup_path(udid))
             observed = ios_prefs.observe(udid, pins)
             result["verified"] = ios_prefs.is_pinned(observed, pins)
         else:
-            result["removed"] = ios_prefs.remove_pins(udid, pins)
+            undone = ios_prefs.remove_pins(udid, pins)
+            result.update(undone)
             observed = ios_prefs.observe(udid, pins)
-            result["verified"] = all(value is None for domain in observed.values()
-                                     for value in domain.values())
+            # Verified means the store now reads exactly what reset intended:
+            # restored keys hold their previous value, the rest are gone.
+            result["verified"] = all(
+                observed.get(domain, {}).get(key) == (
+                    undone["restored"].get(domain, {}).get(key))
+                for domain, keys in ios_prefs.owned_keys(pins).items()
+                for key in keys)
     finally:
         # The caller asked for a running simulator back; a failed write must
         # not leave it dark.

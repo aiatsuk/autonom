@@ -117,9 +117,13 @@ must be exact (`reboot=true` lets the verb cycle a booted one):
 
 ```bash
 python3 <autonom-root>/scripts/autonom.py simulator keyboard pin --value locale=en-US --value reboot=true
-python3 <autonom-root>/scripts/autonom.py simulator keyboard show          # pinned: true|false, per key
-python3 <autonom-root>/scripts/autonom.py simulator keyboard reset
+python3 <autonom-root>/scripts/autonom.py simulator keyboard show          # pinned: true|false, per key; backup: true while pinned
+python3 <autonom-root>/scripts/autonom.py simulator keyboard reset         # restores the values pin replaced
 ```
+
+`pin` snapshots the keys it overwrites (a region-override locale, a keyboard
+setting a human chose) and `reset` puts them back, so a shared simulator
+leaves a test the way it entered it. Always pair a pin with a reset.
 
 Android has no host-level keyboard store (the settings live inside Gboard), so
 `simulator keyboard` refuses there with `unsupported_capability`; turn
