@@ -42,6 +42,13 @@ Instruments) before patching. Never compare Android total_pss_kb with iOS
 rss_bytes — the payload's metric_semantics and limitations say why.
 ```
 
+## First contact
+
+```text
+Run autonom tour, tell me what this machine can do, and if it offers a walk,
+run it and give me the report directory and a step-by-step account.
+```
+
 ## Prove a UI change with before/after screenshots
 
 ```text

@@ -13,6 +13,17 @@ generator that replays flows on the same simulators and emulators and had
 already solved the noise that makes two captures of one screen differ.
 
 ### Added
+- **`autonom tour`** — the guided first run: what the harness has (verb
+  families), the usual workflow, an inventory of this Mac's emulators and
+  simulators, and an offer to boot one, own a session, and walk three
+  screens into the Settings app (Android: Network & internet → Internet;
+  iOS: General → About) with a screenshot, UI hierarchy and device log at
+  every step, an HTML/JUnit report, an integrity bundle, and a written
+  account (`tour.md`). `--run` performs it (a TTY is asked first), `--human`
+  prints the Markdown instead of JSON, `--flow` walks your own flow,
+  `--shutdown` powers off what the tour booted. The walk is an ordinary
+  Flow v1 file under `scripts/autonom_lib/tours/`, run with evidence mode
+  `always`.
 - **`simulator status-bar pin`** on both platforms: full battery and
   signal, no notification icons, and the real ticking clock, so a
   before/after screenshot diff shows only what the app changed. iOS uses

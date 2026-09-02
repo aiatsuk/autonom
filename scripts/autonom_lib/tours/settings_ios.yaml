@@ -1,0 +1,52 @@
+schema: autonom.dev/flow/v1
+appId: com.apple.Preferences
+name: Tour — iOS Settings
+description: Launch Settings fresh, open General, then About, and come back - three screens deep; iOS puts the visible label in description, so every selector uses it
+tags:
+  - tour
+requires:
+  platform:
+    - ios
+---
+- launchApp:
+    label: Launch Settings fresh
+- assertVisible:
+    selector:
+      description: General
+    timeoutMs: 15000
+    label: The Settings home screen is up
+- takeScreenshot:
+    label: Settings home
+- tapOn:
+    selector:
+      description: General
+    label: Open "General"
+- assertVisible:
+    selector:
+      description: About
+    timeoutMs: 10000
+    label: The "General" screen is up
+- takeScreenshot:
+    label: General
+- tapOn:
+    selector:
+      description: About
+    label: Open "About"
+- assertVisible:
+    selector:
+      description: ^Model Name, 
+      match: regex
+    timeoutMs: 10000
+    label: The "About" screen shows the device facts
+- takeScreenshot:
+    label: About — three levels deep
+- tapOn:
+    selector:
+      description: General
+      role: button
+    label: Back to "General"
+- tapOn:
+    selector:
+      description: Settings
+      role: button
+    label: Back to the Settings home

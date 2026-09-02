@@ -20,6 +20,10 @@ SWEEP: list[tuple[str, list[str], bool]] = [
     ("version", ["version"], True),
     ("devices", ["devices"], True),
     ("doctor", ["doctor"], True),
+    # The tour's overview is read-only and must work before anything is set up;
+    # the walk needs a target and refuses cleanly without one.
+    ("tour", ["tour"], True),
+    ("tour_run", ["tour", "--run"], False),
     ("devices_list", ["devices", "list"], True),
     ("devices_android", ["devices", "--platform", "android"], False),
     ("devices_ios", ["devices", "--platform", "ios"], False),

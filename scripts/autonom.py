@@ -45,6 +45,7 @@ from autonom_lib import campaign as campaign_mod  # noqa: E402
 from autonom_lib import teach as teach_mod  # noqa: E402
 from autonom_lib import app_skills as app_skills_mod  # noqa: E402
 from autonom_lib import simulator as simulator_mod  # noqa: E402
+from autonom_lib import tour as tour_mod  # noqa: E402
 from autonom_lib import ios_simctl  # noqa: E402
 from autonom_lib.metrics import android_memory as metrics_memory  # noqa: E402
 from autonom_lib.metrics import artifacts as metrics_artifacts  # noqa: E402
@@ -2797,6 +2798,18 @@ def cmd_capabilities(args: argparse.Namespace) -> int:
                  **snapshot.as_dict()}, as_json=True)
 
 
+def cmd_tour(args: argparse.Namespace) -> int:
+    payload, text = tour_mod.command(args)
+    if getattr(args, "human", False):
+        # The one verb written for a person first: --human prints the
+        # Markdown account to stdout instead of the JSON envelope.
+        print(text)
+        global _LAST_EMIT
+        _LAST_EMIT = {k: v for k, v in payload.items() if k != "run"}
+        return 0
+    return emit(payload, as_json=True)
+
+
 def cmd_teach_start(args: argparse.Namespace) -> int:
     return emit({"ok": True, **teach_mod.start(
         session_mod.require_current(), args.name)}, as_json=True)
@@ -3371,6 +3384,19 @@ def build_parser() -> argparse.ArgumentParser:
     p = shots_sub.add_parser("show", parents=[target_flags])
     p.add_argument("path")
     p.set_defaults(func=cmd_shots_show)
+
+    p = sub.add_parser(
+        "tour", help="what Autonom has, how to use it, and a guided walk on your own device",
+        parents=[target_flags])
+    p.add_argument("--run", action="store_true",
+                   help="perform the walk (without it: overview + offer; a TTY is asked)")
+    p.add_argument("--avd", help="the AVD to boot when no emulator is running")
+    p.add_argument("--flow", help="walk this Flow v1 file instead of the built-in Settings tour")
+    p.add_argument("--human", action="store_true",
+                   help="print the Markdown account to stdout instead of JSON")
+    p.add_argument("--shutdown", action="store_true",
+                   help="power off a device the tour booted, when the walk is over")
+    p.set_defaults(func=cmd_tour)
 
     p = sub.add_parser("doctor", help="report toolchain, capabilities, session, and orphans",
                        parents=[target_flags])

@@ -50,6 +50,7 @@ Installed as `autonom` (or run `python3 scripts/autonom.py …` from a checkout
 without installing):
 
 ```bash
+autonom tour              # what Autonom has, how to use it, and a guided walk on your device
 autonom doctor            # what can this machine actually do?
 autonom devices           # Android + iOS in one list (each has a `running` flag)
 autonom devices boot --avd Pixel_9          # start an emulator and wait for boot

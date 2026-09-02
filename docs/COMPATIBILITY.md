@@ -46,7 +46,8 @@ strengthened, never silently weakened.
   opt-in streaming modes — `flow run --events`, `logs follow`,
   `network requests follow`, `journal --follow` — which emit NDJSON (one JSON
   object per line, ending with a `{"kind": "eof"}` line) and are never used by
-  the repository's own gates.
+  the repository's own gates — and `tour --human`, which prints the Markdown
+  account for a person instead of the envelope.
 
 ## Documentation gates
 

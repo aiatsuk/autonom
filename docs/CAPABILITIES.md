@@ -11,6 +11,7 @@ Legend: ✅ shipped · ⚠️ partial · 🔜 planned · ❌ not planned for nea
 | Boot / shut down a target | ✅ | ✅ | `devices boot --avd`/`--udid`, `devices shutdown`; refuses hardware |
 | Bootable AVD discovery | ✅ | — | `devices` reports an `avds` array on Android, plus `avd_profiles` (hardware profile, screen, density, API) and the `avd` a running emulator booted from |
 | Explicit multi-target selection | ✅ | ✅ | `--platform` / `--target`; `--serial` and `--udid` are aliases |
+| Guided first run | ✅ | ✅ | `autonom tour` — what the harness has, the workflow, this Mac's targets, and an offer to boot one and walk three screens into Settings with per-step screenshots, hierarchies and logs, an HTML report and a written account (`--run`, `--human`) |
 | Environment diagnosis | ✅ | ✅ | `autonom doctor` — tools, capabilities, orphans, every active `AUTONOM_*` override (`override_path_missing`), and emulators still routed through another session's live proxy (`device_attached_to_foreign_proxy`) |
 | Session + artifact dirs | ✅ | ✅ | machine-global `~/.autonom/sessions/<id>/`; `autonom session *` |
 | Session journal (actions + notes) | ✅ | ✅ | `journal.ndjson`; `autonom journal` / `note`; secret-safe |
@@ -101,6 +102,7 @@ autonom devices [list] [--platform android|ios]
 autonom devices boot [--avd NAME | --target ID] [--no-wait] [--timeout S] [--emulator PATH]
 autonom devices shutdown [--target ID]
 autonom doctor [--strict] [--mitmdump PATH]
+autonom tour [--run] [--avd NAME] [--flow PATH] [--human] [--shutdown]
 autonom capabilities
 
 autonom session start [--app-id ID] [--install PATH] [--launch [ID]] [--activity C] [--log-stream]
