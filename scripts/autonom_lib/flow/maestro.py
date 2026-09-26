@@ -19,6 +19,14 @@ Semantics preserved on import:
 On export, ``match: exact`` text is regex-escaped so Maestro's regex
 matching stays exact; Autonom-only commands refuse (evidence commands
 ``checkpoint``/``note`` become comments instead — they carry no behavior).
+Export collects **every** refusal (each with its line) before failing, so
+one pass shows the whole gap, and every scalar is YAML-quoted when plain
+YAML would read it as something else.
+
+Round trips are stable: an escape-only pattern (``Sign\\ in``,
+``Save \\(draft\\)``) imports as the exact text it spells, and export
+strips the importer's own ``^(?:...)$`` wrapper instead of wrapping it again,
+so import → export → import yields the same selector every time.
 """
 from __future__ import annotations
 
@@ -93,11 +101,44 @@ def _no_js(text: str, path: str, line: int, col: int) -> str:
     return text
 
 
+# A pattern made only of literal characters and backslash-escaped
+# punctuation (`Sign\ in`, `Price: \$5`) is a literal in disguise — our own
+# export writes exact text that way. `\d`, `\w`, `\1` are real regex.
+_ESCAPED_LITERAL_RE = re.compile(r"^(?:[^.^$*+?()\[\]{}|\\]|\\[^A-Za-z0-9])*$")
+_ESCAPE_RE = re.compile(r"\\(.)", re.S)
+
+
+def _literal_of(pattern: str) -> str | None:
+    """The plain text a regex spells when it is literal-only, else None."""
+    if _PLAIN_TEXT_RE.match(pattern):
+        return pattern
+    if _ESCAPED_LITERAL_RE.match(pattern):
+        return _ESCAPE_RE.sub(r"\1", pattern)
+    return None
+
+
+def _anchored(pattern: str) -> str:
+    """Maestro full match -> our search regex (a leading (?i) stays first)."""
+    if pattern.startswith("(?i)"):
+        return f"(?i)^(?:{pattern[4:]})$"
+    return f"^(?:{pattern})$"
+
+
 def _import_pattern(pattern: str) -> tuple[str, str]:
     """Maestro full-match regex -> (autonom text, match mode)."""
-    if _PLAIN_TEXT_RE.match(pattern):
-        return pattern, "exact"
-    return f"^(?:{pattern})$", "regex"
+    literal = _literal_of(pattern)
+    if literal is not None:
+        return literal, "exact"
+    # the shapes our own export writes for the other literal modes
+    if pattern.startswith("(?i)"):
+        literal = _literal_of(pattern[4:])
+        if literal is not None:
+            return literal, "caseInsensitiveExact"
+    if pattern.startswith(".*") and pattern.endswith(".*") and len(pattern) > 4:
+        literal = _literal_of(pattern[2:-2])
+        if literal:
+            return literal, "contains"
+    return _anchored(pattern), "regex"
 
 
 def _selector_from(node, path: str) -> FlowSelector:
@@ -126,6 +167,7 @@ def _selector_with_extras(node, path: str) -> tuple[FlowSelector, dict]:
     selector = FlowSelector(line=node.line, col=node.col)
     extras: dict = {}
     modes = set()
+    raw_patterns: dict = {}  # engine field -> (source field, Maestro pattern)
     for key, value in node.pairs:
         name = key.text
         if name == "label":
@@ -147,6 +189,7 @@ def _selector_with_extras(node, path: str) -> tuple[FlowSelector, dict]:
             source = "visibleText" if name == "text" else "id"
             selector.fields[field] = pattern
             selector.source_fields[source] = pattern
+            raw_patterns[field] = (source, raw)
             modes.add(mode)
         elif name == "index":
             selector.index = _int_text(value, path, "selector index")
@@ -157,8 +200,16 @@ def _selector_with_extras(node, path: str) -> tuple[FlowSelector, dict]:
         else:
             _refuse(path, key.line, key.col, f"selector field {name}",
                     "Core Profile selectors: text, id, index, enabled.")
-    if "regex" in modes:
+    if len(modes) == 1:
+        selector.match = modes.pop()
+    elif modes:
+        # One selector carries one match mode. Mixed fields (an exact id
+        # beside a regex text) all fall back to anchored regex so the exact
+        # one keeps its full-match meaning instead of becoming a search.
         selector.match = "regex"
+        for field, (source, raw) in raw_patterns.items():
+            selector.fields[field] = _anchored(raw)
+            selector.source_fields[source] = _anchored(raw)
     else:
         selector.match = "exact"
     if not selector.fields:
@@ -502,12 +553,18 @@ def _step_from(item, path: str) -> Step:
             if arg_key.text == "clearState":
                 args["clearState"] = _bool_text(arg_value, path,
                                                 "launchApp.clearState")
+            elif arg_key.text == "stopApp":
+                # Maestro stops the app before launching by default — that
+                # is our fresh launch; `stopApp: false` is our resume.
+                if not _bool_text(arg_value, path, "launchApp.stopApp"):
+                    args["resume"] = True
             elif arg_key.text == "label":
                 args["label"] = _scalar_text(arg_value, path)
             else:
                 _refuse(path, arg_key.line, arg_key.col,
                         f"launchApp.{arg_key.text}",
-                        "Core Profile launchApp supports clearState and label.")
+                        "Core Profile launchApp supports clearState, stopApp, "
+                        "and label.")
         return Step("launchApp", args, line, col)
     if name == "swipe":
         if isinstance(value, Scalar):
@@ -693,189 +750,434 @@ def import_flow(text: str, path: str) -> str:
 
 # --- export ------------------------------------------------------------------
 
-
-def _export_pattern(selector: FlowSelector, path: str) -> list[tuple[str, str]]:
-    """Autonom selector -> Maestro (field, regex) pairs."""
-    pairs: list[tuple[str, str]] = []
-    for source, value in selector.source_fields.items():
-        if source in ("text", "id", "visibleText"):
-            if selector.match == "exact":
-                pattern = re.escape(str(value))
-            elif selector.match == "caseInsensitiveExact":
-                pattern = f"(?i){re.escape(str(value))}"
-            elif selector.match == "contains":
-                pattern = f".*{re.escape(str(value))}.*"
-            else:  # regex — ours is search; anchor for Maestro's full match
-                pattern = f".*(?:{value}).*"
-            # `visibleText` IS Maestro's `text` (the label union); our strict
-            # `text` exports as `text` too — the closest Maestro can express.
-            pairs.append(("text" if source == "visibleText" else source,
-                          pattern))
-        elif source in ("enabled",):
-            pairs.append((source, "true" if value else "false"))
-        else:
-            raise errors.AutonomError(
-                errors.UNSUPPORTED_FLOW_COMMAND,
-                f"{path}: selector field {source!r} has no Maestro Core "
-                "Profile equivalent",
-                hint="description/role/state/relational selectors do not export.",
-                file=path,
-            )
-    return pairs
+_REGEX_META_RE = re.compile(r"([.^$*+?()\[\]{}|\\])")
+# YAML 1.1 (Maestro's snakeyaml) resolves these plain scalars to non-strings
+_YAML_SPECIAL_WORDS = {"y", "n", "yes", "no", "true", "false", "on", "off",
+                       "null", "~", "=", "<<"}
+_YAML_NUMBERISH_RE = re.compile(r"^[-+]?(?:\d|\.\d|\.inf$|\.nan$)", re.I)
+_YAML_UNSAFE_FIRST = set("-?:,[]{}#&*!|>'\"%@`")
 
 
-def export_flow(flow: Flow, path: str) -> str:
-    """Autonom Flow -> Maestro Core Profile YAML."""
-    lines: list[str] = [f"appId: {flow.app_id or 'com.example.app'}"]
-    if flow.name:
-        lines.append(f"name: {flow.name}")
-    if flow.tags:
-        lines.append("tags:")
-        lines.extend(f"  - {tag}" for tag in flow.tags)
-    if flow.env:
-        lines.append("env:")
-        lines.extend(f"  {key}: {value}" for key, value in flow.env.items())
-    lines.append("---")
+def _yaml(value) -> str:
+    """One scalar in a form every YAML reader (and our parser) reads back
+    as exactly this string. Quoting is minimal: plain when plain is safe."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    text = str(value)
+    if any(ch in text for ch in "\n\r\t"):
+        escaped = (text.replace("\\", "\\\\").replace('"', '\\"')
+                   .replace("\n", "\\n").replace("\r", "\\r")
+                   .replace("\t", "\\t"))
+        return f'"{escaped}"'
+    needs = (
+        text == "" or text != text.strip(" ")
+        or text[0] in _YAML_UNSAFE_FIRST
+        or ": " in text or text.endswith(":") or " #" in text
+        or text.lower() in _YAML_SPECIAL_WORDS
+        or bool(_YAML_NUMBERISH_RE.match(text))
+    )
+    if not needs:
+        return text
+    return "'" + text.replace("'", "''") + "'"
 
-    def emit_selector(indent: str, selector: FlowSelector) -> None:
-        for field, pattern in _export_pattern(selector, path):
-            if any(ch in pattern for ch in ":#'\""):
-                quoted = pattern.replace("'", "''")
-                lines.append(f"{indent}{field}: '{quoted}'")
+
+def _comment(text) -> str:
+    """A value folded into a single comment line."""
+    return " ".join(str(text).split())
+
+
+def _escape_literal(text: str) -> str:
+    """Regex-escape only real metacharacters: `Sign in` stays `Sign in`
+    (Python's re.escape also escapes the space, which then looked like a
+    pattern on the way back in)."""
+    return _REGEX_META_RE.sub(r"\\\1", text)
+
+
+def _group_end(pattern: str, open_index: int) -> int | None:
+    """Index of the ')' closing the group opened at ``open_index``."""
+    depth = 0
+    i = open_index
+    in_class = False
+    while i < len(pattern):
+        ch = pattern[i]
+        if ch == "\\":
+            i += 2
+            continue
+        if in_class:
+            if ch == "]":
+                in_class = False
+        elif ch == "[":
+            in_class = True
+            if pattern[i + 1:i + 2] == "]":
+                i += 1  # a leading ']' is a literal inside the class
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return None
+
+
+def _unanchored(value: str) -> str | None:
+    """The Maestro pattern inside our importer's ``^(?:...)$`` wrapper."""
+    flags = ""
+    body = value
+    if body.startswith("(?i)"):
+        flags, body = "(?i)", body[4:]
+    if not (body.startswith("^(?:") and body.endswith(")$")):
+        return None
+    if _group_end(body, 1) != len(body) - 2:
+        return None  # `^(?:a)|(?:b)$` is not one wrapped group
+    return flags + body[4:-2]
+
+
+def _export_value(match: str, value) -> str:
+    text = str(value)
+    if match == "exact":
+        return _escape_literal(text)
+    if match == "caseInsensitiveExact":
+        return f"(?i){_escape_literal(text)}"
+    if match == "contains":
+        return f".*{_escape_literal(text)}.*"
+    # regex — ours is a search. The importer's own full-match wrapper goes
+    # back to the pattern Maestro wrote; any other regex is widened to a
+    # full match so it keeps meaning "found anywhere".
+    inner = _unanchored(text)
+    if inner is not None:
+        return inner
+    return f".*(?:{text}).*"
+
+
+class _Refusals:
+    """Every export refusal in one pass, each with its source line."""
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self.items: list[dict] = []
+
+    def add(self, line: int, command: str, message: str, hint: str = "") -> None:
+        self.items.append({"line": line, "command": command,
+                           "message": f"{self.path}:{line}: {message}",
+                           "hint": hint})
+
+    def raise_if_any(self) -> None:
+        if not self.items:
+            return
+        first = self.items[0]
+        message = first["message"]
+        if len(self.items) > 1:
+            message += (f" (and {len(self.items) - 1} more refusal(s); "
+                        "see 'refusals')")
+        raise errors.AutonomError(
+            errors.UNSUPPORTED_FLOW_COMMAND, message, hint=first["hint"],
+            file=self.path, line=first["line"], command=first["command"],
+            refusals=self.items,
+        )
+
+
+_TIMED_ARMS = {"assertVisible": "visible", "assertNotVisible": "notVisible"}
+_PLATFORMS = {"android": "Android", "ios": "iOS"}
+
+
+class _Exporter:
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self.lines: list[str] = []
+        self.refusals = _Refusals(path)
+
+    # -- pieces ---------------------------------------------------------------
+
+    def selector(self, indent: str, selector: FlowSelector, line: int,
+                 command: str) -> list[str] | None:
+        """Selector lines, or None after recording a refusal."""
+        if selector.relations:
+            self.refusals.add(line, command,
+                              "relational selectors do not export to the "
+                              "Maestro Core Profile",
+                              "Maestro Core Profile selectors are text, id, "
+                              "index, and enabled.")
+            return None
+        out: list[str] = []
+        written: set = set()
+        for source, value in selector.source_fields.items():
+            if source in ("text", "id", "visibleText"):
+                # `visibleText` IS Maestro's `text` (the label union); our
+                # strict `text` exports as `text` too — the closest Maestro
+                # can express.
+                field = "id" if source == "id" else "text"
+                if field in written:
+                    self.refusals.add(line, command,
+                                      "a selector with both text and "
+                                      "visibleText has no Maestro form",
+                                      "Maestro has one text field; keep one "
+                                      "of the two before exporting.")
+                    return None
+                written.add(field)
+                out.append(f"{indent}{field}: "
+                           f"{_yaml(_export_value(selector.match, value))}")
+            elif source == "enabled":
+                out.append(f"{indent}enabled: {'true' if value else 'false'}")
             else:
-                lines.append(f"{indent}{field}: {pattern}")
+                self.refusals.add(line, command,
+                                  f"selector field {source!r} has no Maestro "
+                                  "Core Profile equivalent",
+                                  "description/role/state/relational "
+                                  "selectors do not export.")
+                return None
         if selector.index is not None:
-            lines.append(f"{indent}index: {selector.index}")
+            out.append(f"{indent}index: {selector.index}")
+        return out
 
-    for step in flow.steps:
-        command = step.command
+    def mapping(self, prefix: str, command: str, fields: list[str]) -> None:
+        if not fields:
+            self.lines.append(f"{prefix}- {command}")
+            return
+        self.lines.append(f"{prefix}- {command}:")
+        self.lines.extend(f"{prefix}    {item}" for item in fields)
+
+    def when(self, indent: str, when, line: int, command: str) -> list[str] | None:
+        out = [f"{indent}when:"]
+        inner = indent + "  "
+        if when.env_equals:
+            self.refusals.add(line, command,
+                              "runFlow.when.envEquals has no Maestro "
+                              "Core Profile equivalent",
+                              "Maestro conditions on env are JavaScript; "
+                              "Core Profile conditions are platform, "
+                              "visible, notVisible.")
+            return None
+        if when.platform:
+            out.append(f"{inner}platform: "
+                       f"{_PLATFORMS.get(when.platform, when.platform)}")
+        for arm, selector in (("visible", when.visible),
+                              ("notVisible", when.not_visible)):
+            if selector is None:
+                continue
+            body = self.selector(inner + "  ", selector, line, command)
+            if body is None:
+                return None
+            out.append(f"{inner}{arm}:")
+            out.extend(body)
+        return out
+
+    # -- steps ----------------------------------------------------------------
+
+    def step(self, prefix: str, step: Step) -> None:
+        command, args, line = step.command, step.args, step.line
+        lines = self.lines
+        body = prefix + "    "
+
+        def refuse(message: str, hint: str = "") -> None:
+            self.refusals.add(line, command, message, hint)
+
         if command in ("checkpoint", "note"):
-            detail = step.args.get("name") or step.args.get("text") or ""
-            lines.append(f"# autonom {command}: {detail}")
-            continue
-        if command in ("launchApp",) and not step.args.get("clearState"):
-            lines.append("- launchApp")
-            continue
+            detail = args.get("name") or args.get("text") or ""
+            lines.append(f"{prefix}# autonom {command}: {_comment(detail)}")
+            return
+        if "postcondition" in args:
+            refuse(f"{command}.postcondition has no Maestro equivalent",
+                   "Maestro cannot verify a postcondition on the command "
+                   "itself; follow it with an assertVisible, or drop the "
+                   "postcondition before exporting.")
+            return
+        label = args.get("label")
+        label_field = [f"label: {_yaml(label)}"] if label else []
+
         if command == "launchApp":
-            lines.append("- launchApp:")
-            lines.append("    clearState: true")
-            continue
+            fields = []
+            if args.get("clearState"):
+                fields.append("clearState: true")
+            if args.get("resume"):
+                # Maestro's launchApp stops the app first (stopApp: true) —
+                # our fresh launch. A bare `- launchApp` would silently turn
+                # a resume into a restart.
+                fields.append("stopApp: false")
+            self.mapping(prefix, command, fields + label_field)
+            return
         if command == "eraseText":
-            chars = step.args.get("chars")
+            chars = args.get("chars")
             # Maestro's bare `- eraseText` erases everything; ours erases a
             # count. Emitting the bare form would silently change the flow.
-            lines.append(f"- eraseText: {chars}" if chars is not None
-                         else "- eraseText")
-            continue
+            if label:
+                fields = ([f"charactersToErase: {chars}"]
+                          if chars is not None else [])
+                self.mapping(prefix, command, fields + label_field)
+            else:
+                lines.append(f"{prefix}- eraseText: {chars}" if chars is not None
+                             else f"{prefix}- eraseText")
+            return
         if command in ("stopApp", "clearState", "back"):
-            lines.append(f"- {command}")
-            continue
-        if command in ("tapOn", "longPressOn", "assertVisible", "assertNotVisible",
-                       "doubleTapOn"):
-            if step.args.get("repeat"):
-                raise errors.AutonomError(
-                    errors.UNSUPPORTED_FLOW_COMMAND,
-                    f"{path}: tapOn repeat/delayMs does not export yet",
-                    file=path, line=step.line, command=command,
-                )
-            selector = step.selector
-            if selector.relations:
-                raise errors.AutonomError(
-                    errors.UNSUPPORTED_FLOW_COMMAND,
-                    f"{path}: relational selectors do not export to the "
-                    "Maestro Core Profile",
-                    file=path, line=step.line,
-                )
-            if "timeoutMs" in step.args:
+            lines.append(f"{prefix}- {command}")
+            if label:
+                lines.append(f"{prefix}  # label: {_comment(label)}")
+            return
+        if command in ("tapOn", "longPressOn", "assertVisible",
+                       "assertNotVisible", "doubleTapOn"):
+            if args.get("repeat") or "delayMs" in args:
+                refuse("tapOn repeat/delayMs does not export yet",
+                       "Unroll the repeated tap into separate tapOn steps "
+                       "before exporting.")
+                return
+            if command == "longPressOn" and "durationMs" in args:
+                refuse("longPressOn.durationMs has no Maestro equivalent",
+                       "Maestro long-presses for its own fixed duration; drop "
+                       "durationMs before exporting.")
+                return
+            if "timeoutMs" in args:
                 # Maestro's per-command lookup timeout lives on
                 # extendedWaitUntil, not on tapOn/assertVisible. A visibility
                 # assertion *is* an extendedWaitUntil, so export it as one and
                 # keep the timeout; a tap has no equivalent, so refuse rather
                 # than quietly change how long the step waits.
-                arm = {"assertVisible": "visible", "assertNotVisible": "notVisible"}.get(command)
+                arm = _TIMED_ARMS.get(command)
                 if arm is None:
-                    raise errors.AutonomError(
-                        errors.UNSUPPORTED_FLOW_COMMAND,
-                        f"{path}: {command}.timeoutMs has no Maestro equivalent",
-                        hint="Express the wait as extendedWaitUntil, or drop the "
-                             "explicit timeout before exporting.",
-                        file=path, line=step.line, command=command,
-                    )
-                lines.append("- extendedWaitUntil:")
-                lines.append(f"    {arm}:")
-                emit_selector("        ", selector)
-                lines.append(f"    timeout: {step.args['timeoutMs']}")
-                if step.args.get("label"):
-                    lines.append(f"    label: {step.args['label']}")
-                continue
-            lines.append(f"- {command}:")
-            emit_selector("    ", selector)
+                    refuse(f"{command}.timeoutMs has no Maestro equivalent",
+                           "Express the wait as extendedWaitUntil, or drop the "
+                           "explicit timeout before exporting.")
+                    return
+                selector = self.selector(body + "    ", step.selector, line,
+                                         command)
+                if selector is None:
+                    return
+                lines.append(f"{prefix}- extendedWaitUntil:")
+                lines.append(f"{body}{arm}:")
+                lines.extend(selector)
+                lines.append(f"{body}timeout: {args['timeoutMs']}")
+                lines.extend(f"{body}{item}" for item in label_field)
+                return
+            selector = self.selector(body, step.selector, line, command)
+            if selector is None:
+                return
+            lines.append(f"{prefix}- {command}:")
+            lines.extend(selector)
             # Maestro carries these on the selector map itself
-            if step.args.get("label"):
-                lines.append(f"    label: {step.args['label']}")
-            if step.args.get("optional"):
-                lines.append("    optional: true")
-                if step.args.get("reason"):
-                    lines.append(f"    # reason: {step.args['reason']}")
-            continue
+            lines.extend(f"{body}{item}" for item in label_field)
+            if args.get("optional"):
+                lines.append(f"{body}optional: true")
+                if args.get("reason"):
+                    lines.append(f"{body}# reason: {_comment(args['reason'])}")
+            return
         if command == "inputText":
-            lines.append(f"- inputText: {step.args['value']}")
-            continue
-        if command == "openLink":
-            lines.append(f"- openLink: {step.args['url']}")
-            continue
-        if command == "pressKey":
-            lines.append(f"- pressKey: {step.args['key']}")
-            continue
-        if command == "takeScreenshot":
-            label = step.args.get("label")
-            lines.append(f"- takeScreenshot: {label}" if label
-                         else "- takeScreenshot")
-            continue
-        if command == "waitUntil":
-            lines.append("- extendedWaitUntil:")
-            for arm in ("visible", "notVisible"):
-                if arm in step.args:
-                    lines.append(f"    {arm}:")
-                    emit_selector("        ", step.args[arm])
-            lines.append(f"    timeout: {step.args['timeoutMs']}")
-            continue
-        if command == "swipe":
-            if "from" in step.args:
-                raise errors.AutonomError(
-                    errors.UNSUPPORTED_FLOW_COMMAND,
-                    f"{path}: swipe from: does not export yet",
-                    file=path, line=step.line, command=command,
-                )
-            lines.append("- swipe:")
-            lines.append(f"    direction: {step.args['direction'].upper()}")
-            if "durationMs" in step.args:
-                lines.append(f"    duration: {step.args['durationMs']}")
-            continue
-        if command == "runFlow":
-            if "commands" in step.args:
-                raise errors.AutonomError(
-                    errors.UNSUPPORTED_FLOW_COMMAND,
-                    f"{path}: inline runFlow commands do not export yet",
-                    hint="Extract the inline body into a subflow file.",
-                    file=path, line=step.line, command=command,
-                )
-            if step.args.get("env"):
-                lines.append("- runFlow:")
-                lines.append(f"    file: {step.args['file']}")
-                lines.append("    env:")
-                lines.extend(f"      {k}: {v}"
-                             for k, v in step.args["env"].items())
+            if "timeoutMs" in args:
+                refuse("inputText.timeoutMs has no Maestro equivalent",
+                       "timeoutMs bounds Autonom's focused-field wait; Maestro "
+                       "types without waiting for focus. Drop it before "
+                       "exporting.")
+                return
+            # requireFocus needs no mapping: Maestro never checks focus, which
+            # is exactly what `requireFocus: false` asks for, and the default
+            # focus check is an Autonom-side safety net with no Maestro form.
+            if args.get("sensitive"):
+                lines.append(f"{prefix}# autonom: sensitive input — Maestro "
+                             "does not redact it")
+            if label:
+                self.mapping(prefix, command,
+                             [f"text: {_yaml(args['value'])}"] + label_field)
             else:
-                lines.append(f"- runFlow: {step.args['file']}")
-            continue
-        raise errors.AutonomError(
-            errors.UNSUPPORTED_FLOW_COMMAND,
-            f"{path}: {command!r} has no Maestro Core Profile equivalent",
-            hint="group, setOrientation and assertEnabled/Checked are "
-                 "Autonom-only; retry, scrollUntilVisible, scroll, repeat and "
-                 "the clipboard commands exist in Maestro and import, but do "
-                 "not export yet.",
-            file=path, line=step.line, command=command,
-        )
+                lines.append(f"{prefix}- inputText: {_yaml(args['value'])}")
+            return
+        if command == "openLink":
+            if label:
+                self.mapping(prefix, command,
+                             [f"link: {_yaml(args['url'])}"] + label_field)
+            else:
+                lines.append(f"{prefix}- openLink: {_yaml(args['url'])}")
+            return
+        if command == "pressKey":
+            lines.append(f"{prefix}- pressKey: {_yaml(args['key'])}")
+            if label:
+                lines.append(f"{prefix}  # label: {_comment(label)}")
+            return
+        if command == "takeScreenshot":
+            lines.append(f"{prefix}- takeScreenshot: {_yaml(label)}" if label
+                         else f"{prefix}- takeScreenshot")
+            return
+        if command == "waitUntil":
+            arms: list[str] = []
+            for arm in ("visible", "notVisible"):
+                if arm in args:
+                    selector = self.selector(body + "    ", args[arm], line,
+                                             command)
+                    if selector is None:
+                        return
+                    arms.append(f"{body}{arm}:")
+                    arms.extend(selector)
+            lines.append(f"{prefix}- extendedWaitUntil:")
+            lines.extend(arms)
+            lines.append(f"{body}timeout: {args['timeoutMs']}")
+            lines.extend(f"{body}{item}" for item in label_field)
+            return
+        if command == "swipe":
+            if "from" in args:
+                refuse("swipe from: does not export yet",
+                       "Swipe by direction only, or drop 'from' before "
+                       "exporting.")
+                return
+            fields = [f"direction: {args['direction'].upper()}"]
+            if "durationMs" in args:
+                fields.append(f"duration: {args['durationMs']}")
+            self.mapping(prefix, command, fields + label_field)
+            return
+        if command == "runFlow":
+            if "commands" in args:
+                refuse("inline runFlow commands do not export yet",
+                       "Extract the inline body into a subflow file.")
+                return
+            fields = [f"file: {_yaml(args['file'])}"]
+            if args.get("env"):
+                fields.append("env:")
+                fields.extend(f"  {key}: {_yaml(value)}"
+                              for key, value in args["env"].items())
+            if args.get("when") is not None:
+                when = self.when("", args["when"], line, command)
+                if when is None:
+                    return
+                fields.extend(when)
+            if len(fields) == 1 and not label:
+                lines.append(f"{prefix}- runFlow: {_yaml(args['file'])}")
+            else:
+                self.mapping(prefix, command, fields + label_field)
+            return
+        refuse(f"{command!r} has no Maestro Core Profile equivalent",
+               "group, setOrientation and assertEnabled/Checked are "
+               "Autonom-only; retry, scrollUntilVisible, scroll, repeat and "
+               "the clipboard commands exist in Maestro and import, but do "
+               "not export yet.")
+
+
+def export_flow(flow: Flow, path: str) -> str:
+    """Autonom Flow -> Maestro Core Profile YAML.
+
+    Every step is examined before failing: the refusal names the first
+    problem, and ``refusals`` in the error carries all of them with lines.
+    """
+    exporter = _Exporter(path)
+    lines = exporter.lines
+    lines.append(f"appId: {_yaml(flow.app_id or 'com.example.app')}")
+    if flow.name:
+        lines.append(f"name: {_yaml(flow.name)}")
+    if flow.tags:
+        lines.append("tags:")
+        lines.extend(f"  - {_yaml(tag)}" for tag in flow.tags)
+    if flow.env:
+        lines.append("env:")
+        lines.extend(f"  {key}: {_yaml(value)}" for key, value in flow.env.items())
+    if flow.properties:
+        lines.append("properties:")
+        lines.extend(f"  {key}: {_yaml(value)}"
+                     for key, value in flow.properties.items())
+    for hook, steps in (("onFlowStart", flow.on_flow_start),
+                        ("onFlowComplete", flow.on_flow_complete)):
+        if steps:
+            lines.append(f"{hook}:")
+            for step in steps:
+                exporter.step("  ", step)
+    lines.append("---")
+    for step in flow.steps:
+        exporter.step("", step)
+    exporter.refusals.raise_if_any()
     return "\n".join(lines) + "\n"

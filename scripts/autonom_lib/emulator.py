@@ -191,7 +191,11 @@ def boot_avd(
         stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
-    processes.register("emulator", child.pid, avd=name)
+    # Owned by the harness, not by a session: `devices boot` has no session
+    # directory to point at, and an entry without one used to be classified
+    # an orphan — so `cleanup` would have killed an emulator a session was
+    # using. `devices shutdown` removes the entry.
+    processes.register("emulator", child.pid, avd=name, owner=processes.HARNESS_OWNER)
     detail: dict[str, Any] = {"avd": name, "pid": child.pid}
     if not wait:
         return {**detail, "booted": False, "waited": False}
@@ -212,8 +216,13 @@ def boot_avd(
                 adb_path, ["shell", "getprop", "sys.boot_completed"], serial=serial, check=False
             )
             if (completed.stdout or "").strip() == "1":
+                processes.update(child.pid, serial=serial)
+                # A pin recorded for an earlier emulator on this port must
+                # never be replayed onto the one just booted.
+                dropped = _forget_device_state(serial)
                 return {**detail, "booted": True, "waited": True,
-                        "serial": serial, "target_id": serial}
+                        "serial": serial, "target_id": serial,
+                        "stale_pin_dropped": dropped}
         if child.poll() is not None and serial is None and time.monotonic() - started > 3:
             raise errors.AutonomError(
                 errors.BACKEND_FAILED,
@@ -235,6 +244,13 @@ def kill_emulator(adb_path: str, serial: str, *, timeout: float = 15.0) -> dict[
             f"'{serial}' is not an emulator; refusing to power off hardware",
             "Only emulator-<port> targets can be shut down; unplug physical devices by hand.",
         )
+    # Asked before the kill: once the console is gone the AVD name is too, and
+    # an entry booted with --no-wait carries only the AVD name.
+    avd = running_avd_name(adb_path, serial)
+    # Also before the kill: `emu kill` saves a quickboot snapshot, so a pin
+    # left on the device would come back on its next boot with no record
+    # left to undo it. A refused or failed restore never stops the shutdown.
+    restore = _restore_pins(adb_path, serial)
     adb_mod.run_adb(adb_path, ["emu", "kill"], serial=serial, check=False)
     deadline = time.monotonic() + timeout
     gone = False
@@ -243,4 +259,57 @@ def kill_emulator(adb_path: str, serial: str, *, timeout: float = 15.0) -> dict[
             gone = True
             break
         time.sleep(0.5)
-    return {"serial": serial, "target_id": serial, "stopped": True, "gone": gone}
+    released = forget_emulator(serial, avd) if gone else []
+    # The serial's status-bar/animation record describes this emulator; the
+    # next one to take the port must not inherit it (re-asserted before every
+    # capture, restored by clear/reset). Dropped even when the kill has not
+    # finished yet: the emulator is on its way out either way.
+    dropped = _forget_device_state(serial) or bool(restore.get("record_found"))
+    detail: dict[str, Any] = {"serial": serial, "target_id": serial, "stopped": True,
+                              "gone": gone, "registry_released": released,
+                              "pin_record_dropped": dropped,
+                              "pins_restored": restore["pins_restored"]}
+    if restore["warnings"]:
+        detail["warnings"] = restore["warnings"]
+    return detail
+
+
+def _restore_pins(adb_path: str, serial: str) -> dict[str, Any]:
+    # Lazy for the same reason as `_forget_device_state`.
+    from . import simulator
+    from .platform import ANDROID, Target
+    target = Target(ANDROID, serial, adb_path, {"serial": serial})
+    try:
+        return simulator.restore_before_shutdown(target)
+    except (errors.AutonomError, OSError, ValueError) as exc:
+        return {"pins_restored": [], "warnings": [{
+            "code": "pin_restore_failed",
+            "error": f"the recorded pins could not be restored before shutdown: {exc}",
+            "hint": "Boot the emulator and run 'autonom simulator status-bar clear' "
+                    "and 'autonom simulator animations reset'.",
+        }]}
+
+
+def _forget_device_state(serial: str) -> bool:
+    # Imported lazily: the lifecycle module stays independent of the
+    # simulator-control layer at import time.
+    from . import simulator
+    return simulator.forget_device(serial)
+
+
+def forget_emulator(serial: str, avd: str | None = None) -> list[int]:
+    """Drop the registry entries of an emulator that has been shut down.
+
+    Matched by serial (recorded once boot completed) or, for an entry that
+    never learned its serial, by AVD name. Without this the dead pid lingered
+    and every later `doctor` warned about stale process entries.
+    """
+    released = []
+    for entry in processes.entries():
+        if entry.get("kind") != "emulator" or not entry.get("pid"):
+            continue
+        if entry.get("serial") == serial or (
+                avd and not entry.get("serial") and entry.get("avd") == avd):
+            processes.deregister(int(entry["pid"]))
+            released.append(int(entry["pid"]))
+    return released

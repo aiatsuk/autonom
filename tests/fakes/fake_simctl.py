@@ -4,6 +4,13 @@
 Invoked exactly as the real driver is: ``<this> simctl <subcommand> …``.
 Records every invocation to ``$AUTONOM_FAKE_LOG`` and reads canned state from
 ``$AUTONOM_FAKE_STATE``.
+
+State keys used by the simulator controls (all optional):
+
+``shutdown_ignored`` ``shutdown`` exits 0 but leaves the device state unchanged
+``ui``               ``{"appearance": ..., "content_size": ...}`` that ``simctl ui``
+                     reports and updates
+``pasteboard``       what ``pbcopy`` stored and ``pbpaste`` prints
 """
 from __future__ import annotations
 
@@ -24,6 +31,7 @@ DEFAULT_DEVICES = {
             {
                 "udid": "AAAAAAAA-1111-2222-3333-BBBBBBBBBBBB",
                 "name": "iPhone 17 Pro",
+                "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.iPhone-17-Pro",
                 "state": "Shutdown",
                 "isAvailable": True,
             }
@@ -103,12 +111,36 @@ def main(argv: list[str]) -> int:
     if args[:1] == ["shutdown"]:
         # Mirror the real state machine so a shutdown-write-boot sequence can
         # be proven by the device list rather than assumed from exit codes.
+        # `shutdown_ignored` reproduces a shutdown that returned 0 and left
+        # the device Booted.
+        if state.get("shutdown_ignored"):
+            return 0
         devices = state.setdefault("simctl_devices", json.loads(json.dumps(DEFAULT_DEVICES)))
         for entries in devices["devices"].values():
             for entry in entries:
                 if args[1:2] == ["all"] or entry["udid"] == args[1]:
                     entry["state"] = "Shutdown"
         write_state(state)
+        return 0
+
+    if args[:1] == ["ui"] and len(args) >= 3:
+        # `ui <udid> appearance|content_size [value]`: set, or print the current.
+        ui = state.setdefault("ui", {})
+        defaults = {"appearance": "light", "content_size": "large"}
+        if len(args) > 3:
+            ui[args[2]] = args[3]
+            write_state(state)
+            return 0
+        sys.stdout.write(str(ui.get(args[2], defaults.get(args[2], ""))) + "\n")
+        return 0
+
+    if args[:1] == ["pbcopy"]:
+        state["pasteboard"] = sys.stdin.read()
+        write_state(state)
+        return 0
+
+    if args[:1] == ["pbpaste"]:
+        sys.stdout.write(state.get("pasteboard", ""))
         return 0
 
     if args[:1] == ["listapps"]:

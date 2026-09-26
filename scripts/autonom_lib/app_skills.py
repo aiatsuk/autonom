@@ -1,13 +1,13 @@
 """Portable application knowledge packs under .autonom/apps/<app-id>."""
 from __future__ import annotations
 
+import hashlib
 import json
 import re
-import shutil
 from pathlib import Path
 from typing import Any
 
-from . import errors
+from . import errors, teach
 from .contracts import canonical_json, utc_now
 from .flow import validator
 
@@ -67,6 +67,44 @@ def promote(workspace: Path, app_id: str, flow_path: Path,
         raise errors.AutonomError(errors.TEACH_APPROVAL_BLOCKED,
                                   "flow has no Teach approval receipt",
                                   hint="Run 'autonom teach approve <flow>'.")
+    try:
+        receipt = json.loads(approval.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        receipt = None
+    if not isinstance(receipt, dict):
+        raise errors.AutonomError(errors.TEACH_APPROVAL_BLOCKED,
+                                  "the Teach approval receipt is unreadable",
+                                  hint="Re-run 'autonom teach approve <flow>'.",
+                                  approval=str(approval))
+    # The receipt approves bytes, not a name: read the flow once, hash what
+    # was read, and copy exactly those bytes — an edit after approval (or
+    # between the check and the copy) can never be promoted.
+    flow_bytes = flow_path.read_bytes()
+    current = hashlib.sha256(flow_bytes).hexdigest()
+    approved = receipt.get("flow_sha256")
+    if not approved:
+        raise errors.AutonomError(
+            errors.TEACH_APPROVAL_BLOCKED,
+            "the Teach approval receipt does not bind the flow content",
+            hint="The receipt predates content binding; re-run "
+                 "'autonom teach approve <flow>' to approve these bytes.",
+            approval=str(approval))
+    if approved != current:
+        raise errors.AutonomError(
+            errors.FLOW_SOURCE_CHANGED,
+            "the flow file changed after it was approved",
+            hint="Replay and re-approve the edited flow with 'autonom teach "
+                 "approve <flow> --run' before promoting it.",
+            flow=str(flow_path), approved_sha256=approved,
+            current_sha256=current)
+    # The root bytes matching is not enough: an approval covers every runFlow
+    # child too, and a child edited since would promote unapproved steps.
+    teach.verify_subflows(receipt, flow=str(flow_path))
+    if receipt.get("flow_id") != flow.flow_id:
+        raise errors.AutonomError(
+            errors.TEACH_APPROVAL_BLOCKED,
+            "the Teach approval receipt belongs to another flow",
+            receipt_flow_id=receipt.get("flow_id"), flow_id=flow.flow_id)
     app_root = root(workspace, app_id)
     (app_root / "subflows").mkdir(parents=True, exist_ok=True)
     defaults = {
@@ -80,8 +118,7 @@ def promote(workspace: Path, app_id: str, flow_path: Path,
         if not path.exists():
             path.write_text(content, encoding="utf-8")
     destination = app_root / "subflows" / flow_path.name
-    shutil.copyfile(flow_path, destination)
-    receipt = json.loads(approval.read_text(encoding="utf-8"))
+    destination.write_bytes(flow_bytes)
     catalog_path = app_root / "catalog.json"
     catalog = (json.loads(catalog_path.read_text(encoding="utf-8"))
                if catalog_path.is_file() else

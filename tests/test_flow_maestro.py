@@ -351,7 +351,8 @@ class ExportTests(unittest.TestCase):
     def test_exact_text_is_regex_escaped(self) -> None:
         flow = self._flow("- tapOn:\n    selector:\n      text: Save (draft)\n")
         out = maestro.export_flow(flow, "t.yaml")
-        self.assertIn(r"Save\ \(draft\)", out.replace("\\ ", r"\ "))
+        # only real metacharacters are escaped; the space stays a space
+        self.assertIn(r"text: Save \(draft\)", out)
         self.assertIn("- tapOn:", out)
 
     def test_wait_until_becomes_extended_wait(self) -> None:

@@ -299,26 +299,77 @@ def install_app(adb: str, serial: str, path: Path) -> None:
     adb_mod.run_adb(adb, ["install", "-r", str(path)], serial=serial, timeout=180, check=True)
 
 
+def _component(app_id: str, activity: str) -> str:
+    return activity if "/" in activity else f"{app_id}/{activity}"
+
+
+def _raise_if_am_failed(output: str, component: str) -> None:
+    """`am start` reports most failures on stdout and still exits 0.
+
+    Measured: `am start -n pkg/.Bad` prints `Error type 3` and `Error:
+    Activity class {pkg/.Bad} does not exist.` with exit 0, so the launch used
+    to report ok while nothing started. A `Warning:` (the task was only
+    brought to the front) is not a failure.
+    """
+    for line in (output or "").splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("Error"):
+            continue
+        if "does not exist" in stripped:
+            raise errors.AutonomError(
+                errors.INVALID_VALUE,
+                f"cannot start {component}: {stripped[:200]}",
+                "Check the package is installed ('adb shell pm list packages') and the "
+                "activity name; without --activity the launcher activity is used.",
+            )
+        if stripped.startswith("Error:"):
+            raise errors.AutonomError(
+                errors.BACKEND_FAILED, f"am start {component} failed: {stripped[:200]}",
+                "Run 'adb shell cmd package resolve-activity --brief <package>' to see "
+                "what the package can start.",
+            )
+
+
+def _am_start(adb: str, serial: str, argv: list[str], component: str,
+              *, timeout: float) -> None:
+    from . import adb as adb_mod
+
+    completed = adb_mod.run_adb(
+        adb, ["shell", "am", "start", *argv], serial=serial, timeout=timeout, check=True,
+    )
+    _raise_if_am_failed(completed.stdout if isinstance(completed.stdout, str) else "",
+                        component)
+
+
 def launch_app(adb: str, serial: str, app_id: str, activity: str | None = None) -> None:
     from . import adb as adb_mod
 
     if activity:
-        component = activity if "/" in activity else f"{app_id}/{activity}"
-        adb_mod.run_adb(
-            adb,
-            ["shell", "am", "start", "-n", component],
-            serial=serial,
-            timeout=30,
-            check=True,
-        )
+        component = _component(app_id, activity)
+        _am_start(adb, serial, ["-n", component], component, timeout=30)
         return
-    adb_mod.run_adb(
+    # `--pct-syskeys 0`: monkey refuses to run at all on an AVD with
+    # hw.keyboard=no ("SYS_KEYS has no physical keys but with factor 2.0%",
+    # exit 251) because its default event mix includes system keys. One launch
+    # event needs none of them.
+    completed = adb_mod.run_adb(
         adb,
-        ["shell", "monkey", "-p", app_id, "-c", "android.intent.category.LAUNCHER", "1"],
+        ["shell", "monkey", "-p", app_id, "-c", "android.intent.category.LAUNCHER",
+         "--pct-syskeys", "0", "1"],
         serial=serial,
         timeout=30,
-        check=True,
+        check=False,
     )
+    output = completed.stdout if isinstance(completed.stdout, str) else ""
+    if "No activities found to run" in output:
+        raise errors.AutonomError(
+            errors.APP_NOT_INSTALLED,
+            f"{app_id} has no launcher activity on {serial} (is it installed?)",
+            "Check the package id with 'adb shell pm list packages', or launch a "
+            "specific activity with --activity.",
+        )
+    if completed.returncode != 0:
+        raise adb_mod.AdbError(output.strip() or f"monkey -p {app_id} failed ({completed.returncode})")
 
 
 FRESH_TASK_FLAGS = "0x10008000"  # FLAG_ACTIVITY_NEW_TASK | FLAG_ACTIVITY_CLEAR_TASK
@@ -343,17 +394,24 @@ def resolve_launcher_activity(adb: str, serial: str, app_id: str) -> str | None:
     return None
 
 
-def launch_app_fresh(adb: str, serial: str, app_id: str) -> dict:
-    """Start the launcher activity on a cleared task.
+def launch_app_fresh(adb: str, serial: str, app_id: str,
+                     activity: str | None = None) -> dict:
+    """Start the launcher activity (or `activity`) on a cleared task.
 
     `monkey` (what `launch_app` uses) resumes whatever the app's task holds,
     which on a real device meant a flow's first selector met a subscreen —
     or, with Android Settings, a search activity of *another* package that
     `force-stop` never touches. Clearing the task starts the app where a
     user launching it from the home screen would land, without wiping data.
-    """
-    from . import adb as adb_mod
 
+    With an explicit `activity` the same cleared-task start targets that
+    component, so `--fresh --activity` no longer falls back to a resume.
+    """
+    if activity:
+        component = _component(app_id, activity)
+        _am_start(adb, serial, ["-W", "-n", component, "-f", FRESH_TASK_FLAGS],
+                  component, timeout=60)
+        return {"mode": "fresh", "component": component}
     component = resolve_launcher_activity(adb, serial, app_id)
     if component is None:
         launch_app(adb, serial, app_id)
@@ -363,12 +421,12 @@ def launch_app_fresh(adb: str, serial: str, app_id: str) -> dict:
     # `am start` has no `--activity-new-task` option, and measured on an
     # API-37 emulator `--activity-clear-task` alone left Settings on its
     # SubSettings screen — CLEAR_TASK only clears when paired with NEW_TASK.
-    adb_mod.run_adb(
-        adb,
-        ["shell", "am", "start", "-W", "-n", component,
+    _am_start(
+        adb, serial,
+        ["-W", "-n", component,
          "-a", "android.intent.action.MAIN", "-c", "android.intent.category.LAUNCHER",
          "-f", FRESH_TASK_FLAGS],
-        serial=serial, timeout=60, check=True,
+        component, timeout=60,
     )
     return {"mode": "fresh", "component": component}
 

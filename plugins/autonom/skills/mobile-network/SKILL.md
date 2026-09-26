@@ -77,11 +77,15 @@ device is never left pointing at a dead proxy.
 **iOS limitation, state it in findings:** the per-process mechanism covers Dart /
 Flutter `HttpClient.findProxyFromEnvironment`, curl, and many SDKs. Native
 `URLSession` reads the *system* proxy configuration and is **not** captured this
-way. For that traffic, follow the manual Simulator proxy steps that
-`network attach` prints, then confirm with `network status`.
+way. The Simulator has no proxy pane of its own — it uses the host Mac's
+network stack — so the manual steps `network attach` prints set the **host's**
+system proxy (and switch it off again afterwards). Ask the operator before
+doing that, then confirm with `network status`. On iOS `network attach`
+answers `attached: false` with `attach_state: manual`: nothing has been
+observed yet.
 
-Autonom never changes macOS network-service settings: that is a system-wide change
-whose blast radius is the operator's whole machine.
+Autonom never changes macOS network-service settings itself: that is a
+system-wide change whose blast radius is the operator's whole machine.
 
 ## HTTPS and certificates
 
@@ -129,6 +133,12 @@ pinning disabled. Do not attempt to bypass pinning in a production build.
 - **Credentials are masked before anything is written to disk** — sensitive headers
   and credential-shaped body fields (`password`, `token`, `api_key`, …). Do not
   work around this to "see the real value".
+- **URLs are scrubbed too.** Values of sensitive query and fragment keys
+  (`token`, `access_token`, `api_key`, `key`, `secret`, `password`, `auth`,
+  `session`, `signature`, `code`, AWS signature keys, and similar — decoded
+  and case-insensitive) and the password in `user:password@host` become
+  `<redacted>` in the stored `url` and `Referer`, again in `requests
+  list/show`, and in HAR export; other query parameters (`page=2`) stay.
 - Bodies are **2 KiB previews** by default. `--capture-bodies` persists full bodies
   and is off deliberately: bodies are the densest source of secrets and personal
   data. `requests show --full` needs it and warns when used.
@@ -167,6 +177,9 @@ autonom network mock clear               # deletes everything
 - Rules reload without restarting the proxy, so they can be swapped mid-scenario;
   a corrupt registry keeps the last good set rather than dropping everything.
 - Mock CRUD needs **no session and no device** — rules can be prepared in advance.
+- Rules are validated when added or updated: a target (`--url` or `--match`)
+  is required (`selector_required`), a body that looks like JSON must parse,
+  `--status` must be 100..599, and each `--header` must be `Name: value`.
 - The registry lives outside any repository on purpose: a mock body is often a
   captured response, and a captured response often carries a token.
 
@@ -186,8 +199,9 @@ exactly which flows were faked.
 
 1. Report status codes and bodies as **measured facts**, on-screen text separately.
 2. `network status` reports `attached` as `true`, `false`, or **`unknown`** — it
-   only claims success when traffic has actually been observed. Do not upgrade
-   `unknown` to "working" in a summary.
+   only claims success when traffic has actually been observed — and
+   `attach_state` (`automated`, `manual`, `not_attached`) for how far the
+   attach got. Do not upgrade `unknown` to "working" in a summary.
 3. A HAR exported without `--capture-bodies` carries previews; its `log.comment`
    says so. Do not present a preview as a full payload.
 4. If nothing was captured, distinguish the causes: not attached, pinning, the app

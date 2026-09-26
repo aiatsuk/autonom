@@ -129,13 +129,26 @@ def resolve_source(record: dict[str, Any], source: str) -> Path:
             return confine(base, f"{dirname}/{name}")
     if source == "journal":
         return confine(base, "journal.ndjson")
-    known = ", ".join(sorted(e["id"] for e in catalog(record))) or "none"
+    # `device` (the live device log) is always followable; it is answered
+    # by the CLI before this lookup, but an agent reading the list must see it.
+    known = ", ".join(sorted({e["id"] for e in catalog(record)} | {"device"}))
     raise errors.AutonomError(
         errors.STREAM_NOT_FOUND,
         f"no session stream named {source!r} (known: {known})",
         "List followable streams with 'autonom session outputs', or pass "
         "--path relative to the artifacts dir.",
     )
+
+
+def default_source(record: dict[str, Any]) -> str | None:
+    """The stream `logs follow` follows when given neither --source nor --path.
+
+    When the session has exactly one device-log stream there is nothing to
+    choose between, so it is the answer; otherwise None and the caller asks.
+    """
+    device_streams = [entry["id"] for entry in catalog(record)
+                      if entry.get("kind") == "device_log"]
+    return device_streams[0] if len(device_streams) == 1 else None
 
 
 def _compile(grep: str | None) -> re.Pattern[str] | None:
@@ -145,10 +158,13 @@ def _compile(grep: str | None) -> re.Pattern[str] | None:
         # IGNORECASE matches the twins: `logs tail --grep` and `journal --grep`.
         return re.compile(grep, re.IGNORECASE)
     except re.error as exc:
+        # `logs follow` has always answered backend_failed here and callers
+        # pin it; the code stays (`logs tail --grep` uses invalid_value).
         raise errors.AutonomError(
-            errors.BACKEND_FAILED, f"invalid --grep regex: {exc}",
-            "The filter is a Python regular expression.",
-        )
+            errors.BACKEND_FAILED, f"invalid --grep regex {grep!r}: {exc}",
+            "The filter is a Python regular expression; escape literal "
+            "characters such as ( [ * with a backslash.",
+        ) from exc
 
 
 def _decode(raw_line: bytes) -> str:

@@ -15,22 +15,41 @@ requires:
       description: General
     timeoutMs: 15000
     label: The Settings home screen is up
+- assertVisible:
+    selector:
+      description: ^(Accessibility|Wi.?Fi|Bluetooth)$
+      match: regex
+    timeoutMs: 10000
+    label: The home lists its other top-level entries
 - tapOn:
     selector:
       description: General
+      id: com.apple.settings.general
     label: Open "General"
 - assertVisible:
     selector:
       description: About
     timeoutMs: 10000
     label: The "General" screen is up
+- assertNotVisible:
+    selector:
+      description: ^(Accessibility|Wi.?Fi|Bluetooth)$
+      match: regex
+    timeoutMs: 10000
+    label: The home entries are gone
+- assertNotVisible:
+    selector:
+      description: '^Model Name, '
+      match: regex
+    timeoutMs: 10000
+    label: The "About" facts are not shown yet
 - tapOn:
     selector:
       description: About
     label: Open "About"
 - assertVisible:
     selector:
-      description: ^Model Name, 
+      description: '^Model Name, '
       match: regex
     timeoutMs: 10000
     label: The "About" screen shows the device facts
@@ -39,8 +58,30 @@ requires:
       description: General
       role: button
     label: Back to "General"
+- assertVisible:
+    selector:
+      description: About
+    timeoutMs: 10000
+    label: The "General" screen is back
+- assertNotVisible:
+    selector:
+      description: '^Model Name, '
+      match: regex
+    timeoutMs: 10000
+    label: The "About" facts are gone
 - tapOn:
     selector:
       description: Settings
       role: button
     label: Back to the Settings home
+- assertVisible:
+    selector:
+      description: ^(Accessibility|Wi.?Fi|Bluetooth)$
+      match: regex
+    timeoutMs: 10000
+    label: The Settings home screen is back, with its top-level entries
+- assertNotVisible:
+    selector:
+      description: About
+    timeoutMs: 10000
+    label: The "General" list is gone

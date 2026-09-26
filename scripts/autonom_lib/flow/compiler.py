@@ -258,6 +258,17 @@ def compile_session(session: dict[str, Any], *, name: str | None = None,
             break
     if closing is not None:
         flow.steps.append(Step("assertVisible", {"selector": closing}))
+        # the closing assertion is a selector the flow depends on like any
+        # tap — it was proven by a 'ui find', so it counts as recorded
+        quality["selectors"]["recorded"] += 1
+        if "resource_id" in closing.fields:
+            quality["selectors"]["id"] += 1
+        elif "text" in closing.fields:
+            quality["selectors"]["text"] += 1
+        elif "desc" in closing.fields:
+            quality["selectors"]["description"] += 1
+        if closing.index is not None:
+            quality["selectors"]["index"] += 1
     else:
         warnings.append({
             "code": "no_final_assertion",
@@ -280,7 +291,10 @@ def compile_session(session: dict[str, Any], *, name: str | None = None,
     total_selectors = sum(quality["selectors"].values())
     stable_selectors = (quality["selectors"]["id"]
                         + quality["selectors"]["recorded"])
-    confidence = 1.0 if total_selectors == 0 else min(
+    # Nothing selected means nothing was proven: a flow with no selector at
+    # all (no tap, no closing assertion) is the least trustworthy output,
+    # never a perfect 1.0 that skips review.
+    confidence = 0.0 if total_selectors == 0 else min(
         1.0, stable_selectors / total_selectors)
     report = {"warnings": warnings, "quality": quality,
               "secrets_required": list(env_hint),
@@ -291,7 +305,8 @@ def compile_session(session: dict[str, Any], *, name: str | None = None,
                   "compiler": "autonom.teach/v1",
               },
               "confidence": round(confidence, 3),
-              "review_required": bool(warnings or confidence < 1.0)}
+              "review_required": bool(warnings or confidence < 1.0
+                                      or total_selectors == 0)}
     return flow, report
 
 

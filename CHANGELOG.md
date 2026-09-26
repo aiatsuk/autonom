@@ -12,6 +12,15 @@ Deterministic capture state and a repair hand-off, borrowed from
 generator that replays flows on the same simulators and emulators and had
 already solved the noise that makes two captures of one screen differ.
 
+Then a hardening pass: every feature exercised again on this Mac's
+emulators and simulators and against fakes, with a regression test for each
+defect found. It brings AXe as an iOS input backend for Xcode 27 (where an
+older idb companion can no longer inject touches), agent ergonomics seen in
+competing tools (`ui wait --settled`, an outline tree, ranked repair
+candidates, did-you-mean hints), honest `verified` read-backs on every
+simulator control, and a round of secret hygiene on device input, the
+journal, captured URLs, and approvals.
+
 ### Added
 - **`autonom tour`** — the guided first run: what the harness has (verb
   families), the usual workflow, an inventory of this Mac's emulators and
@@ -19,11 +28,21 @@ already solved the noise that makes two captures of one screen differ.
   screens into the Settings app (Android: Network & internet → Internet;
   iOS: General → About) with a screenshot, UI hierarchy and device log at
   every step, an HTML/JUnit report, an integrity bundle, and a written
-  account (`tour.md`). `--run` performs it (a TTY is asked first), `--human`
-  prints the Markdown instead of JSON, `--flow` walks your own flow,
-  `--shutdown` powers off what the tour booted. The walk is an ordinary
-  Flow v1 file under `scripts/autonom_lib/tours/`, run with evidence mode
-  `always`.
+  account (`tour.md`). `--run` performs it (a TTY is asked first, in
+  English), `--human` prints the Markdown instead of JSON, `--flow` walks
+  your own flow, `--shutdown` powers off what the tour booted. The walk is an
+  ordinary Flow v1 file under `scripts/autonom_lib/tours/`, run with evidence
+  mode `always`: before/after frames, hierarchy, and logs stay attached to
+  the action that produced them, so a click is one report step rather than a
+  click followed by a duplicate screenshot step, and every tap or back is
+  followed by an assertion that the screen it left is gone. `--run` refuses
+  while a session is active (`session_already_active`), refuses an unknown
+  `--avd`, a platform/target mismatch, and several candidates without a
+  target (listing them), and on iOS checks that the tree and input backends
+  are ready (idb, or AXe for input) before it boots anything. Whatever
+  fails after boot — a flow failure, an exception, Ctrl-C — the tour's
+  session is stopped and `--shutdown` is honoured. Reports are written
+  `0600` and the Next hints are commands that work once the tour is over.
 - **`simulator status-bar pin`** on both platforms: full battery and
   signal, no notification icons, and the real ticking clock, so a
   before/after screenshot diff shows only what the app changed. iOS uses
@@ -130,17 +149,331 @@ already solved the noise that makes two captures of one screen differ.
     list --mocked` is a bare flag; the xctrace "not supported on this
     platform" failure says to use a physical device.
 
+- **AXe as the iOS input backend.** Xcode 27 moved `SimulatorKit.framework`
+  to `Contents/SharedFrameworks`, and an idb companion built before that
+  still looks in `Library/PrivateFrameworks`, so every touch fails while the
+  accessibility tree keeps working. `ui tap`, `ui swipe`, `ui type`,
+  `ui key`, and the flow `longPressOn`/`doubleTapOn` commands can now go
+  through [AXe](https://github.com/cameroncooke/AXe)
+  (`brew install cameroncooke/axe/axe`): `--ios-hid axe` /
+  `AUTONOM_IOS_HID=axe` forces it, the default `auto` uses idb and switches
+  to AXe only when idb's HID is known broken and AXe is installed, and
+  `idb` pins idb with no fallback. `--axe PATH` / `AUTONOM_AXE` names the
+  binary. The tree stays on idb. Typed text reaches AXe through stdin, so a
+  leading dash is never read as a flag. Every `ui` input payload names its
+  `backend` (`adb`, `idb`, or `axe`).
+- **`doctor` understands Xcode 27:** it reports where SimulatorKit is, the
+  `idb_companion` build, and whether AXe is installed, and splits iOS
+  readiness into `capabilities.ios_tree` and `capabilities.ios_hid`. A
+  companion that cannot load SimulatorKit marks HID not ready with the fix
+  (`brew update && brew upgrade idb-companion`, or install AXe) in the
+  warning; an invalid `AUTONOM_IOS_HID` is warned. An idb failure that says
+  SimulatorKit is required for HID surfaces as the new
+  `ios_hid_framework_missing` with the same fix.
+- **`simulator animations pin|reset|show`** (Android): the window,
+  transition, and animator scales to 0 so a capture never lands mid-animation;
+  `pin` snapshots what it replaces and `reset` restores it (a scale that was
+  unset is deleted again). iOS has no host-level switch and refuses with
+  `unsupported_capability`.
+- **`ui wait --settled`** polls the tree until two consecutive snapshots
+  match for `--quiet-ms` (default 500), bounded by `--timeout-ms`; it
+  reports `settled`, `snapshots`, `changes`, and `elapsed_ms`, and exits 1
+  with a `screen_not_settled` warning when the screen never held still.
+- **`ui tree --format outline`** prints one indented line per node instead
+  of the nodes array, and `--interactable` keeps only nodes an agent can act
+  on (buttons, fields, switches, …).
+- On iOS a `ui find`/`ui tap` `--text` miss whose value matches a node's
+  `desc` says so (`label_is_in_desc` warning, a `--desc` hint): the visible
+  label lives in `desc`.
+- **Repair `candidates`:** when the failing step's hierarchy was captured,
+  the repair brief ranks up to five on-screen nodes by similarity to the
+  failed selector, each with a ready Flow `selector` (and the `index` that
+  picks it when a label is shared) and the `ui find` query that confirms it;
+  for `ambiguous_selector` it lists every match with its distinguishing
+  fields. The flow is never rewritten.
+- **Did-you-mean hints:** an unknown flow command, argument, selector
+  field, or match mode names its closest legal spelling (`Did you mean
+  'tapOn'?`) ahead of the full list.
+- `flow fmt --write --drop-comments` rewrites a file even though canonical
+  output loses its comments; the preview reports how many would go.
+- `teach approve --run` accepts `--env KEY=VALUE` and `--secret NAME` for the
+  replays it performs.
+- The iOS `session start --log-stream` file is filtered to the app (by a
+  distinctive process or subsystem name) and capped on disk:
+  `AUTONOM_IOS_LOG_MAX_MB` (default 50) with one rotation.
+- JUnit export and `report suite` emit `errors` and an `<error>` case for a
+  run that aborted on a definition or infrastructure error, and the suite
+  JSON carries the matching broken and JUnit counts.
+- `proof --base` selects a parent flow when only a `runFlow` child changed,
+  counts untracked files as changes, lists flows that fail to load under
+  `invalid_flows` instead of skipping them, marks a pass that leaves changed
+  files uncovered as `partial`, and prints repo-relative paths.
+- `atlas update --app-id X` ingests only screens whose foreground package
+  is X (no edge spans a foreign screen) and records `last_seen` from the
+  observation time; `atlas diff` refuses a file that is not an atlas.
+- Android `permissions grant|revoke` accept short names (`camera`,
+  `location` for the whole group) mapped to `android.permission.*`;
+  `permissions reset` reports `scope` and the `revoked` list.
+- Emulators started by `devices boot` are registered as harness-owned, so
+  `doctor` no longer lists a running one as an orphan, and `devices
+  shutdown` releases the entry.
+- A failed `session start --install/--launch` rolls the new session back and
+  names it in `session_rolled_back`.
+- Every `simulator` control reports `verification` (`read_back`,
+  `mismatch`, `unavailable`, `unsupported`) next to `verified`; an
+  Android live status-bar pin carries a `signal_unstable` warning because
+  the emulator's signal cannot be read back.
+- `network status` adds `attach_state` (`automated`, `manual`,
+  `not_attached`) alongside the unchanged `attached`.
+- Suite discovery reports skipped non-flow YAML files as a
+  `flow_files_skipped` warning with the reason, and `flow run` warnings reach
+  the run summary.
+- `AUTONOM_IDB_STATE_FILE` points at the idb client's companion registry.
+- `session launch --fresh --activity C` starts that activity on a cleared
+  task.
+
 ### Changed
-- `autonom tour` relies on `evidence=always` for its screenshots instead of
-  inserting separate `takeScreenshot` phases. Before/after frames, hierarchy,
-  and logs stay attached to the action that produced them, so a click is one
-  report step rather than a click followed by a duplicate screenshot step.
+- `session start` refuses with the new `session_already_active` (naming the
+  live session and hinting `session stop`) instead of silently replacing
+  the current session and orphaning its proxy and recorders.
+- `simulator` controls whitelist their actions: an unknown action (or a
+  text-size category that does not exist) is `invalid_simulator_action` with
+  `valid_actions`, refused before any device command. It used to surface as
+  `flow_command_invalid`.
+- `verified` is true only after a read-back that matches. Controls with
+  nothing to read back (iOS battery, Android network and biometric, iOS
+  status-bar pin, …) now answer `verified: false` with the reason in
+  `verification`; an Android API without `cmd clipboard` reports
+  `supported: false` and a `clipboard_unsupported` warning instead of a
+  verified set.
+- Android `permissions reset` revokes only the named package's granted
+  runtime permissions (`pm revoke`); it used to run `pm reset-permissions`,
+  which takes no package and reset every app on the device.
+- `flow fmt --write` refuses with the new `comments_would_be_lost` when the
+  canonical output would drop comments, leaving the file unchanged, unless
+  `--drop-comments` is passed. In a directory nothing is written when any
+  file would lose comments.
+- `flow check` is stricter: a negative `timeoutMs`/`delayMs`/`durationMs`/
+  `maxSwipes`/`chars`, a latitude or longitude out of range, an empty
+  selector string, and a regex that does not compile are positioned errors
+  (`timeoutMs: 0` stays legal). A UTF-8 byte-order mark is accepted.
+- `flow export --format maestro` writes `launchApp resume` as
+  `stopApp: false`, quotes every scalar YAML would misread, escapes an exact
+  selector so it stays exact through repeated import/export, keeps regex
+  selectors free of extra wrappers, refuses an `inputText` timeout and a
+  postcondition instead of dropping them, and collects every refusal with its
+  line rather than stopping at the first.
+- `flow import` (Maestro) accepts `launchApp` `stopApp` (`true` is a fresh
+  launch, `false` is `resume`) and maps text patterns back to the plainest
+  Flow mode: an escape-only pattern (`Sign\ in`) becomes exact text,
+  `(?i)literal` becomes `caseInsensitiveExact`, and `.*literal.*` becomes
+  `contains`, so import-export-import is stable.
+- `flow run --dry-run` answers top-level `status: "planned"` where it used
+  to answer `"passed"` — a script that checked `status == "passed"` on a dry
+  run must check `"planned"` now. The `planned` list numbers steps exactly as
+  the executor does at runtime (pre-order across `runFlow` children and
+  hooks), so an index read off it is a valid `--until-step`; an entry after a
+  `retry`, a `while:` repeat, or a `when:` runFlow carries `index_exact:
+  false` because its runtime index can shift. `--until-step` now trims the
+  plan too.
+- `teach approve` counts only replays whose recorded `flow_sha256` (and
+  every `subflow_sha256`) equals the current bytes; `--minimum-runs` must be
+  at least 1. A legacy manifest without a hash is counted by the Teach
+  ledger's hash, else only when the file has not been modified since that
+  run started; only those mtime-bound replays are listed as
+  `legacy_unhashed` in the receipt, with a `legacy_unhashed_replays`
+  warning.
+- The idb stale-companion retry happens at most once and only for
+  "Connection refused" — a failure that never delivered the action — and,
+  when the companion registry is readable, only if pruning actually removed
+  an entry. A reset connection is never retried, so a tap or typed string
+  is never sent twice.
+- `doctor --strict` that fails now answers `ok: false` with
+  `strict_failures`, not only exit 1; a probe that times out on a slow
+  device is a warning naming the target instead of an aborted doctor.
+- Boolean flags (`--clickable`, `--enabled`, …) accept only
+  true/false/1/0/yes/no; a selector plus coordinates on `ui tap`, or half a
+  coordinate pair, is a `usage_error`.
+- `network mock add` without `--url`/`--match` is `selector_required`; a
+  body that looks like JSON must parse, `--status` must be 100..599, and a
+  `--header` without `Name: value` is refused.
+- On iOS `network attach` adds `attach_state: manual` next to the unchanged
+  `attached: "unknown"`; the manual steps now describe the host Mac's system
+  proxy, since the Simulator has no Wi-Fi proxy pane.
+  `network status` keeps its `attached` value types.
+- A malformed regular expression anywhere (`logs tail --grep`,
+  `ui find --mode regex`) is `invalid_value` before the device is touched;
+  `logs follow --grep` keeps answering `backend_failed` for compatibility.
+- Flags that have no effect on the target platform (`--activity` on iOS,
+  iOS-only launch flags or `session clear --strategy` on Android,
+  `--log-stream` on Android) produce a `flag_ignored_on_platform` warning
+  instead of being dropped silently.
 - `simulator status-bar override` on Android now enters demo mode explicitly
   and accepts `battery`, `plugged`, `wifi`, `wifi_level`, `mobile`,
   `mobile_level`, `datatype`, and `notifications` alongside `hhmm`; an unknown
   key is refused before anything is broadcast.
 - The fake `simctl` now moves a device to `Shutdown` on `shutdown`, so a
   shutdown/write/boot sequence is proven by the device list.
+
+### Fixed
+- `simulator status-bar pin` validates every key and value before the
+  first device command (a bad `hhmm` no longer enters demo mode, a bad signal
+  level no longer sets the battery); a live pin after a demo pin leaves demo
+  mode first so the clock ticks again; the signal is pinned with an explicit
+  RSSI after the profile; battery is verified by the exact level line.
+- `status-bar clear` restores the battery and signal state recorded before
+  the first pin (a pre-existing battery override survives) instead of
+  resetting state the pin never owned; the snapshots live under
+  `$AUTONOM_HOME/simulator-state/<target>.json`.
+- A live Android `status-bar pin` no longer drifts between captures. On a
+  real API 36 emulator the cellular bars fell to none and the battery icon
+  vanished within 80 s of the pin (and with no pin at all), so no one-shot
+  command holds the bar; the pin now records its values and
+  `autonom screenshot`, flow `takeScreenshot`, and flow step/failure
+  evidence re-send them right before the frame, then wait 400 ms for
+  SystemUI to redraw. The screenshot payload and the flow event carry
+  additive `repinned` and `repinned_controls`; nothing is re-sent after
+  `clear`, over a demo-mode pin, or on iOS, whose simctl overrides persist.
+- On iOS `status-bar pin` refuses the Android-only keys `mode`, `hhmm`,
+  `wifi`, `mobile`, and `notifications` with a hint naming the iOS
+  equivalent, rather than forwarding them to simctl.
+- Repeated `simulator keyboard pin` calls merge only keys not yet recorded,
+  so `reset` restores the state before the first pin; a locale pin keeps the
+  region in `AppleLanguages`. `reboot=true` confirms the device reached
+  `Shutdown` before writing and refuses Booting or Shutting Down states.
+- `simulator biometric match|nonmatch` posts the Face ID notification on
+  Face ID devices and the Touch ID one otherwise (both when the device type
+  does not say, reported as `biometry`); `text-size` and `appearance` are read back on
+  both platforms; the iOS clipboard is read back.
+- Android launches work on an AVD without a hardware keyboard: the resume
+  launch passes `monkey --pct-syskeys 0`, and an `am start` that prints
+  `Error:` with exit status 0 is a failure, not a launch.
+- `session uninstall` reports a failed uninstall as `ok: false` on both
+  platforms.
+- `file pull` of a missing Android file no longer writes run-as's complaint
+  as the file, `file ls` of a missing directory is not a listing, an unknown
+  package is `app_not_installed` rather than `app_not_debuggable`, and an iOS
+  pull of a directory is a typed error instead of a traceback.
+- An unknown Android permission is `invalid_value` with a hint naming the
+  `android.permission.*` form, and an undeclared one points at the manifest,
+  instead of `backend_failed` with a Java trace.
+- A focused non-editable node (a button) no longer counts as a verified
+  `ui type` target on Android.
+- `ui tree --max-nodes` reports `truncated` exactly when nodes were cut, for
+  dumps and live trees.
+- `logs follow --source device` on Android starts at the device's now
+  (`logcat -T`) unless `--from-start`; the session's only device-log stream
+  is the default source.
+- `journal --session-id` works without `--follow`, `shots show` accepts the
+  relative path `shots list` prints, and `shots list --max` must be >= 0.
+- `--idb-host/--idb-port` and `AUTONOM_IDB_COMPANION` add `--companion
+  host:port` to every idb call.
+- The repair brief points at the step that ended the run — never a retry
+  attempt a later attempt recovered, never a failing cleanup hook — names
+  the file that contains it (`flow`, with `root_flow` for the replay),
+  computes `--until-step` as the last completed step that is not an
+  enclosing block, maps every selector field (`visibleText` as `--text` and
+  `--desc`), keeps `--mode regex`, and carries `--secret NAME` /
+  `--env NAME=<value>` placeholders; its advice matches the codes flows
+  actually produce.
+- Flow `inputText` with `timeoutMs: 0` checks focus once, and an incomplete
+  dump while the field's screen comes up is polled again instead of
+  aborting.
+- Directory suites skip App Skill overlays (`.autonom/apps/**`) and files
+  that declare another schema, so a workspace with a promoted skill no
+  longer fails with `flow_parse_error`; a `runFlow` cycle names the step
+  that closes it.
+- Teach compile counts a closing assertion's selector toward confidence and
+  gives zero confidence (needs review) when nothing was proven.
+- An output path that cannot be written (`screenshot --out`, `network
+  export`, `report export`, `file pull --out` onto a directory) is
+  `output_not_writable` before the device is touched; a missing `--dump`
+  file carries an error code; a usage error's hint is the usage of the verb
+  that rejected the flag; Python older than 3.11 is named in a
+  `tool_missing` envelope.
+- `record start --name` cannot escape the session directory; `note add`
+  refuses empty text; `metrics series` needs a positive count and interval;
+  canvas values are validated before anything starts.
+- `network start` keeps the library's warnings (`proxy_already_running`
+  when a live proxy has a different port or body setting) and no longer
+  claims full-body capture when the proxy it reused does not capture
+  bodies.
+- The tour's teardown is `try/finally` (session stopped, `--shutdown`
+  honoured on failure and interrupt), an explicit target that is not
+  running is an envelope rather than a traceback, and its tests never reach
+  the host's real simctl, adb, or idb.
+- The built-in tours pass on current targets. On Android 16 (API 36) a
+  Settings sub-screen's title is the collapsing toolbar's description, not a
+  text row, so the Android tour asserts the "Network & internet" and
+  "Internet" titles by `description`; the iOS 26.5 Simulator Settings home
+  has no Wi-Fi or Bluetooth rows, so the iOS tour recognises the home by
+  `Accessibility` (Wi-Fi and Bluetooth still count where they are shown)
+  and opens General by its `com.apple.settings.general` id.
+- `doctor` keeps only version fields of the companion's output.
+- `session stop` succeeds when the session's emulator or simulator no longer
+  exists: the session is cleared with a `stale_target` warning (and
+  `stale_target: true`), and the device-side proxy restore is skipped rather
+  than failed. The `session_already_active` refusal names the session's
+  target, says `autonom session stop` clears it even if that target is gone,
+  and carries `stale_target: true` when it is.
+- `devices shutdown` (and the tour's shutdown) restores a status-bar and
+  animations pin before `emu kill`. Emulators quickboot from the snapshot the
+  kill saves, so a pinned device came back with the battery override, hidden
+  notification icons, and zeroed animation scales, while the shutdown had
+  already dropped the record that could undo them. A record taken on the
+  same emulator (AVD name and boot id match) is now restored exactly as
+  `status-bar clear` and `animations reset` would, status bar first, and
+  reported in the additive `pins_restored` key; a record from another AVD or
+  boot sends nothing (`stale_pin_dropped` warning), and a failed restore
+  warns `pin_restore_failed` — either way the emulator is killed and the
+  record dropped.
+- Docs: on API 36 emulators SystemUI may not draw the battery glyph although
+  `dumpsys battery` reports the pinned level; on Xcode 27 with AXe carrying
+  input, `doctor` shows `ios_hid.ready: false` with `ios_hid.axe_ready` and
+  `ios_ui.ready` true, and agents are told to read those instead of giving up.
+
+### Security
+- A live status-bar pin (and the animation/status-bar snapshot `clear` and
+  `reset` restore) is bound to the emulator it was taken on: its AVD name
+  (`adb emu avd name`) and boot id (`/proc/sys/kernel/random/boot_id`). The
+  record lives under the adb serial, which names a console port, so an
+  emulator killed without a clear used to hand its pin to whatever emulator
+  took the port next — possibly the user's own AVD — before every capture.
+  Now a mismatched, legacy, or unverifiable record is dropped without a
+  single pin command (`stale_pin_dropped: true` plus a warning on
+  `screenshot`, flow capture events, `clear`, `reset`, and a new `pin`),
+  `devices shutdown` and `devices boot` drop the serial's record outright
+  (`pin_record_dropped` / `stale_pin_dropped`), and a pin on a device whose
+  boot identity cannot be read warns `pin_not_device_bound` and is never
+  replayed. iOS records need no guard: they are keyed by the simulator UDID.
+- Text sent through the Android device shell — `ui type`, flow
+  `inputText`, and `simulator clipboard set` — is single-quoted, so
+  `; & | $ \` ( ) < > " '` arrive as literal characters and can never form a
+  second shell command.
+- The journal resolves each argv token against the real parser (canonical
+  option, dest, and the spelling as typed) and writes, per token, the most
+  masked of that parser-resolved scrub, the argv-only scan, and the previous
+  release's exact rule, so it is never less masked than before. `ui type
+  --sensitive` text, every abbreviation of a secret-bearing flag in both
+  `--flag value` and `--flag=value` form, `--token`, and every
+  `KEY=VALUE` option value (`--env`, `--setenv`, …, journaled as
+  `KEY=<redacted>`) are masked wherever they appear; credentials inside
+  ordinary values (`?token=`, `password=`) are content-scrubbed.
+- Sensitive query and fragment values (`token`, `access_token`, `api_key`,
+  `key`, `secret`, `password`, `auth`, `session`, `signature`, `code`, AWS
+  signature keys, and similar; decoded, case-insensitive) and the password
+  in `user:password@host` are redacted in captured URLs and referers before
+  they are stored, and again in `network requests list/show` and HAR export.
+- `teach approve` binds an approval to the flow's content: the receipt
+  records `flow_sha256` and `subflow_sha256`, a changed `runFlow` child
+  refuses with the new `flow_source_changed`, and `app-skill promote`
+  refuses a flow whose bytes differ from its receipt. An edit that
+  preserves the file's mtime no longer passes as a replay.
+- A `flow run --env K=V` whose value reaches a `sensitive: true` slot
+  (directly or through a `runFlow` `env:`) is treated as a secret: redacted
+  from manifest, events, and reports, recorded under `secret_names`,
+  reproduced as `--secret K`, and named in a `flow_env_value_sensitive`
+  warning.
 
 ## [0.30.0] - 2026-08-28
 

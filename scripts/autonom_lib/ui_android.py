@@ -185,10 +185,27 @@ def swipe(adb: str, serial: str, x1: int, y1: int, x2: int, y2: int, duration: f
     )
 
 
+def device_shell_quote(value: str) -> str:
+    """One literal word for the device shell.
+
+    `adb shell a b c` does not exec argv on the device: adbd joins the words
+    with spaces and hands the string to the device's `sh -c`. Any `;`, `&`,
+    `|`, `$`, backtick, parentheses, redirections or quotes inside typed text
+    would therefore split or expand into device shell syntax. Single quotes
+    disable every expansion; a literal `'` is closed, escaped and reopened.
+    """
+    return "'" + value.replace("'", "'\\''") + "'"
+
+
 def type_text(adb: str, serial: str, text: str) -> None:
-    # adb shell input text: spaces as %s; keep ASCII-safe for Phase 1
-    escaped = text.replace(" ", "%s").replace("'", "\\'")
-    adb_mod.run_adb(adb, ["shell", "input", "text", escaped], serial=serial, timeout=10, check=True)
+    # `input text` turns `%s` into a space, so spaces travel as `%s`; the whole
+    # payload is then single-quoted so the device shell passes it through
+    # literally (see device_shell_quote). `input text` itself only injects
+    # characters the device's virtual keyboard map knows: ASCII is reliable,
+    # accents and other non-ASCII text depend on the image and may be dropped.
+    payload = text.replace(" ", "%s")
+    adb_mod.run_adb(adb, ["shell", "input", "text", device_shell_quote(payload)],
+                    serial=serial, timeout=10, check=True)
 
 
 def press_key(adb: str, serial: str, keycode: str) -> None:

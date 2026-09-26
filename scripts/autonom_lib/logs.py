@@ -2,14 +2,29 @@ from __future__ import annotations
 
 import json
 import re
-import subprocess
 import time
 from pathlib import Path
 from typing import Any
 
 from . import adb as adb_mod
-from . import ios_simctl
+from . import errors, ios_simctl
 from .platform import ANDROID, Target
+
+
+def compile_grep(grep: str | None) -> re.Pattern[str] | None:
+    """The `--grep` filter, or a typed refusal — never a raw `re.error`
+    traceback for a pattern like `(`. IGNORECASE matches `journal --grep`
+    and `logs follow --grep`."""
+    if not grep:
+        return None
+    try:
+        return re.compile(grep, re.IGNORECASE)
+    except re.error as exc:
+        raise errors.AutonomError(
+            errors.INVALID_VALUE, f"invalid --grep regex {grep!r}: {exc}",
+            "The filter is a Python regular expression; escape literal "
+            "characters such as ( [ * with a backslash.",
+        ) from exc
 
 
 def tail_logcat(
@@ -21,6 +36,7 @@ def tail_logcat(
     max_lines: int = 200,
     grep: str | None = None,
 ) -> list[dict[str, Any]]:
+    pattern = compile_grep(grep)  # refuse a bad pattern before touching the device
     args = ["logcat", "-d", "-v", "threadtime"]
     cutoff = None
     if since_seconds is not None and since_seconds > 0:
@@ -41,8 +57,7 @@ def tail_logcat(
         pid = pid_for_package(adb, serial, package)
         if pid:
             lines = [line for line in lines if f" {pid} " in f" {line} "]
-    if grep:
-        pattern = re.compile(grep, re.IGNORECASE)
+    if pattern:
         lines = [line for line in lines if pattern.search(line)]
     if max_lines > 0:
         lines = lines[-max_lines:]
@@ -126,33 +141,33 @@ def _filter_recent(lines: list[str], since_seconds: float) -> list[str]:
 # --- iOS ---------------------------------------------------------------------
 
 
-def start_log_stream(target: Target, destination: Path, *, bundle_id: str | None = None) -> int | None:
+def start_log_stream(target: Target, destination: Path, *, bundle_id: str | None = None,
+                     executable: str | None = None) -> int | None:
     """Start a session-long `log stream` writing ndjson to the artifacts dir.
 
-    Returns the pid so `session stop` can reap it (INV-10). Failure is not fatal:
-    logs are supplementary evidence and must never block the UI loop.
+    Returns the pid so `session stop` can reap it (INV-10). The stream runs
+    under `ios_simctl.start_log_stream`: filtered by `ios_simctl.log_predicate`
+    and capped on disk (AUTONOM_IOS_LOG_MAX_MB, one rotation), so a long
+    session cannot fill the disk. The pid is the bounded writer's; stopping it
+    stops the stream. Failure is not fatal: logs are supplementary evidence
+    and must never block the UI loop.
     """
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    args = [target.tool, "simctl", "spawn", target.target_id, "log", "stream",
-            "--style", "ndjson", "--level", "info"]
-    if bundle_id:
-        args += ["--predicate", _ios_predicate(bundle_id)]
-    try:
-        handle = open(destination, "ab")
-        process = subprocess.Popen(  # noqa: S603 - argv is constructed, never shell
-            args, stdout=handle, stderr=subprocess.DEVNULL, start_new_session=True
-        )
-        return process.pid
-    except OSError:
-        return None
+    return ios_simctl.start_log_stream(target.tool, target.target_id, destination,
+                                       bundle_id=bundle_id, executable=executable)
 
 
 def _ios_predicate(bundle_id: str) -> str:
-    leaf = bundle_id.rsplit(".", 1)[-1]
-    return (
-        f'subsystem == "{bundle_id}" OR processImagePath CONTAINS "{leaf}" '
-        f'OR senderImagePath CONTAINS "{leaf}"'
-    )
+    """Kept for callers of the old name; `ios_simctl.log_predicate` owns it."""
+    return ios_simctl.log_predicate(bundle_id)
+
+
+def _stream_line_matches(line: str, package: str) -> bool:
+    """Client-side filter over a stream file: the full bundle id, or the
+    distinctive last component — never a generic one like ``app``."""
+    if package in line:
+        return True
+    leaf = ios_simctl.log_leaf(package)
+    return bool(leaf) and leaf in line
 
 
 def _read_tail(path: Path, max_lines: int) -> list[str]:
@@ -174,6 +189,7 @@ def tail_ios(
     max_lines: int = 200,
     grep: str | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    pattern = compile_grep(grep)
     warnings: list[dict[str, Any]] = []
     lines: list[str] = []
 
@@ -195,9 +211,8 @@ def tail_ios(
             lines = (completed.stdout or "").splitlines()
 
     if package and stream_path:
-        lines = [line for line in lines if package.rsplit(".", 1)[-1] in line or package in line]
-    if grep:
-        pattern = re.compile(grep, re.IGNORECASE)
+        lines = [line for line in lines if _stream_line_matches(line, package)]
+    if pattern:
         lines = [line for line in lines if pattern.search(line)]
     if max_lines > 0:
         lines = lines[-max_lines:]

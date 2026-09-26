@@ -5,9 +5,9 @@ reads credentials by construction, and `.autonom/` is a working directory a user
 may later archive or attach to a bug report — so an artifact that has never
 contained a token is the only safe artifact.
 
-`mitm_addon.py` carries a by-value copy of `REDACTED_HEADERS`: mitmproxy runs the
-addon in its own interpreter and cannot import this package. A unit test asserts
-the two tables stay identical.
+`mitm_addon.py` carries by-value copies of `REDACTED_HEADERS` and
+`SENSITIVE_QUERY_KEYS`: mitmproxy runs the addon in its own interpreter and
+cannot import this package. Unit tests assert the tables stay identical.
 """
 from __future__ import annotations
 
@@ -72,6 +72,15 @@ def scrub_body(text: str) -> str:
             return json.dumps(_scrub_json(json.loads(text)), ensure_ascii=False)
         except (json.JSONDecodeError, ValueError, TypeError):
             pass
+    return scrub_patterns(text)
+
+
+def scrub_patterns(text: str) -> str:
+    """The regex half of `scrub_body`: JSON-ish fields and form fields.
+
+    Also useful on its own after structural JSON scrubbing, for a form value
+    embedded in a JSON string (`{"a": "password=x"}`).
+    """
     scrubbed = _FIELD_RE.sub(r'\1"' + PLACEHOLDER + '"', text)
     return _FORM_RE.sub(r"\1" + PLACEHOLDER, scrubbed)
 
@@ -108,11 +117,104 @@ def body_size(body: bytes | str | None) -> int:
     return len(body.encode("utf-8"))
 
 
+# Query-string (and fragment) keys whose value is a credential. Matched
+# case-insensitively on the decoded key. A signed or tokenised URL is the
+# commonest way a secret reaches a recorded flow without any header involved.
+SENSITIVE_QUERY_KEYS = frozenset({
+    "token", "access_token", "refresh_token", "id_token", "api_key", "apikey",
+    "key", "secret", "client_secret", "password", "passwd", "auth",
+    "authorization", "session", "sessionid", "session_id", "sid", "signature",
+    "sig", "code", "jwt", "bearer",
+    "x_amz_signature", "x_amz_credential", "x_amz_security_token",
+})
+
+
+def _query_key(name: str) -> str:
+    """Normalised query key: decoded, lower-case, `-` as `_`, no `[..]` suffix.
+
+    `Access-Token`, `access%5Ftoken`, `token[]` and `Token[0]` all compare as
+    their plain form. Decoding uses a regex rather than `urllib` so the addon's
+    by-value copy (which may import only a fixed stdlib set) stays identical.
+    """
+    decoded = re.sub(r"%([0-9A-Fa-f]{2})", lambda m: chr(int(m.group(1), 16)),
+                     name.replace("+", " "))
+    decoded = re.sub(r"(\[[^\]]*\])+$", "", decoded.strip())
+    return decoded.strip().lower().replace("-", "_")
+
+
+def is_sensitive_query_key(name: str) -> bool:
+    return _query_key(name) in SENSITIVE_QUERY_KEYS
+
+
+def _scrub_pairs(text: str) -> str:
+    """Mask sensitive values in an `a=1&b=2` string, byte-for-byte otherwise."""
+    parts = []
+    for part in text.split("&"):
+        name, equals, _value = part.partition("=")
+        if equals and is_sensitive_query_key(name):
+            part = f"{name}={PLACEHOLDER}"
+        parts.append(part)
+    return "&".join(parts)
+
+
+def _scrub_userinfo(url: str) -> str:
+    """`scheme://user:pw@host` keeps the user and loses the password."""
+    scheme, sep, rest = url.partition("://")
+    if not sep:
+        return url
+    end = len(rest)
+    for mark in "/?#":
+        position = rest.find(mark)
+        if position != -1:
+            end = min(end, position)
+    authority = rest[:end]
+    if "@" not in authority:
+        return url
+    userinfo, host = authority.rsplit("@", 1)
+    if ":" not in userinfo:
+        return url
+    user = userinfo.split(":", 1)[0]
+    return f"{scheme}://{user}:{PLACEHOLDER}@{host}{rest[end:]}"
+
+
+def scrub_url(url: str | None) -> str | None:
+    """Redact credentials in a URL; keep every other byte of it.
+
+    `https://h/p?token=abc&page=2` becomes `https://h/p?token=<redacted>&page=2`.
+    The fragment gets the same treatment, since OAuth implicit flows carry
+    `#access_token=...` there, and a `user:password@` userinfo loses the
+    password.
+    """
+    if not url or not isinstance(url, str):
+        return url
+    url = _scrub_userinfo(url)
+    if "?" not in url and "#" not in url:
+        return url
+    base, hash_mark, fragment = url.partition("#")
+    head, question, query = base.partition("?")
+    result = head + (question + _scrub_pairs(query) if question else "")
+    if hash_mark:
+        result += hash_mark + _scrub_pairs(fragment)
+    return result
+
+
 def scrub_flow(record: dict[str, Any]) -> dict[str, Any]:
-    """Defence in depth: re-apply redaction to a record read back from disk."""
+    """Defence in depth: re-apply redaction to a record read back from disk.
+
+    Flows recorded before URL redaction existed still carry raw query secrets,
+    so the URL, a redirect `location` and a request `referer` are scrubbed
+    here at read time too.
+    """
     scrubbed = dict(record)
     for key in ("request_headers_preview", "response_headers_preview"):
         headers = scrubbed.get(key)
         if isinstance(headers, dict):
             scrubbed[key] = redact_headers(headers)
+    if isinstance(scrubbed.get("url"), str):
+        scrubbed["url"] = scrub_url(scrubbed["url"])
+    for key, header in (("request_headers_preview", "referer"),
+                        ("response_headers_preview", "location")):
+        headers = scrubbed.get(key)
+        if isinstance(headers, dict) and isinstance(headers.get(header), str):
+            scrubbed[key] = {**headers, header: scrub_url(headers[header])}
     return scrubbed

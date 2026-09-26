@@ -58,13 +58,33 @@ and report only the differences the app itself made. Then clear the status
 bar and reset the keyboard.
 ```
 
+## Capture a screen that never lands mid-animation
+
+```text
+On the emulator, pin the status bar and turn system animations off with
+`autonom simulator animations pin`. Open the settings screen, run
+`autonom ui wait --settled --timeout-ms 5000`, and only take the screenshot
+once it reports settled: true. Afterwards reset animations and clear the
+status bar, and tell me which values were verified by read-back.
+```
+
 ## Repair a flow the app outgrew
 
 ```text
 Run flows/checkout.yaml. If it fails with a test failure, follow the
 `repair` block in order: replay the prefix with --until-step, dump the tree,
-run the widened ui find, and tell me the label or identifier the button has
-now. Propose the YAML edit; do not apply it without showing me the diff.
+run the widened ui find, and check the ranked `candidates` with their
+`ui find` commands. Tell me the label or identifier the button has now.
+Propose the YAML edit; do not apply it without showing me the diff.
+```
+
+## Approve a flow for an App Skill
+
+```text
+Run `autonom teach approve .autonom/flows/login.yaml --run --minimum-runs 3
+--secret TEST_PASSWORD`. If it refuses because the flow or a runFlow child
+changed since its replays, tell me which file; do not edit it to get past the
+check. Then promote it with `autonom app-skill promote <app-id> <flow>`.
 ```
 
 ## See what the app actually sent
@@ -117,6 +137,15 @@ Use Autonom: list iOS simulators, start a session on the booted iPhone, install 
 debug .app, launch it, dump the compact accessibility tree, tap the control labelled
 Continue, take before/after screenshots, and report the measured on-screen labels
 separately from hypotheses.
+```
+
+## Drive the Simulator on Xcode 27
+
+```text
+Run autonom doctor. If `ios_hid` is not ready because idb_companion cannot
+load SimulatorKit, tell me the fix it prints; if AXe is installed, confirm
+that `ui tap` reports backend axe and that the tree still comes from idb.
+Select iOS controls with --desc, not --text.
 ```
 
 ## Explain an iOS failure with evidence

@@ -99,13 +99,16 @@ class AndroidStatusBarTests(CaptureStateBase):
             "mode": "live", "battery": 100, "plugged": "false",
             "mobile_level": 4, "notifications": "hidden"})
         self.assertTrue(payload["verified"], "battery level is read back")
-        self.assertEqual(self.demo_broadcasts(), [])
+        # Leaving demo mode is the only broadcast; demo mode is never entered.
+        self.assertEqual(self.demo_broadcasts(), ["exit"])
         calls = self.shell_calls()
         self.assertIn("shell dumpsys battery set level 100", calls)
         self.assertIn("shell dumpsys battery unplug", calls)
         self.assertIn("emu gsm signal-profile 4", calls)
+        self.assertIn("emu gsm signal 31 0", calls)
         self.assertIn("shell cmd statusbar send-disable-flag notification-icons", calls)
-        self.assertNotIn("warnings", payload)
+        self.assertEqual([warning["code"] for warning in payload["warnings"]],
+                         [errors.SIGNAL_UNSTABLE])
 
     def test_live_pin_values(self) -> None:
         code, payload = self.android("simulator", "status-bar", "pin", "--value", "battery=80",
@@ -142,7 +145,8 @@ class AndroidStatusBarTests(CaptureStateBase):
             "network -e mobile hide",
             "notifications -e visible false",
         ])
-        allowed = [argv for argv in self.argv_log("adb") if "sysui_demo_allowed" in argv]
+        allowed = [argv for argv in self.argv_log("adb")
+                   if "sysui_demo_allowed" in argv and "put" in argv]
         self.assertEqual(len(allowed), 1, "demo mode must be allowed before it is entered")
         code, payload = self.android("simulator", "status-bar", "pin", "--value", "hhmm=12:30")
         self.assertEqual(payload["values"]["hhmm"], "1230")
@@ -206,7 +210,8 @@ class AndroidStatusBarTests(CaptureStateBase):
     def test_unknown_action_is_refused(self) -> None:
         code, payload = self.android("simulator", "status-bar", "freeze")
         self.assertEqual(code, 2)
-        self.assertEqual(payload["error_code"], errors.FLOW_COMMAND_INVALID)
+        self.assertEqual(payload["error_code"], errors.INVALID_SIMULATOR_ACTION)
+        self.assertEqual(payload["valid_actions"], ["override", "pin", "clear"])
 
     def test_hardware_is_refused(self) -> None:
         code, payload = self.run_cli("--adb", str(FAKE_ADB), "--serial", "R58M123ABC",
@@ -277,8 +282,9 @@ class KeyboardPinTests(CaptureStateBase):
         self.assertEqual(self.read_plist("com.apple.keyboard.preferences"), {
             "KeyboardAutocorrection": False, "KeyboardPrediction": False,
         })
+        # The region survives in AppleLanguages (it used to become ["en"]).
         self.assertEqual(self.read_plist(".GlobalPreferences"),
-                         {"AppleLocale": "en_US", "AppleLanguages": ["en"]})
+                         {"AppleLocale": "en_US", "AppleLanguages": ["en-US"]})
         # A shut-down simulator needs no lifecycle churn.
         self.assertEqual(self.lifecycle_calls(), [])
 
@@ -329,7 +335,7 @@ class KeyboardPinTests(CaptureStateBase):
         self.ios("simulator", "keyboard", "pin", "--value", "locale=de-DE")
         code, after = self.ios("simulator", "keyboard", "show", "--value", "locale=de-DE")
         self.assertTrue(after["pinned"])
-        self.assertEqual(after["observed"][".GlobalPreferences"]["AppleLanguages"], ["de"])
+        self.assertEqual(after["observed"][".GlobalPreferences"]["AppleLanguages"], ["de-DE"])
 
     def test_reset_removes_only_the_owned_keys(self) -> None:
         self.prefs_dir()
@@ -418,7 +424,7 @@ class KeyboardPinTests(CaptureStateBase):
         self.prefs_dir()
         code, payload = self.ios("simulator", "keyboard", "toggle")
         self.assertEqual(code, 2)
-        self.assertEqual(payload["error_code"], errors.FLOW_COMMAND_INVALID)
+        self.assertEqual(payload["error_code"], errors.INVALID_SIMULATOR_ACTION)
 
     def test_android_refuses_honestly(self) -> None:
         code, payload = self.android("simulator", "keyboard", "pin")

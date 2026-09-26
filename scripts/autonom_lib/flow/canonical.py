@@ -323,3 +323,73 @@ def fingerprint(flow: Flow):
         "on_flow_complete": tuple(_step_fp(s) for s in flow.on_flow_complete),
         "steps": tuple(_step_fp(s) for s in flow.steps),
     }
+
+
+# --- Comment preservation check (flow fmt --write) ---------------------------
+
+
+def find_comments(text: str) -> list[dict]:
+    """Every ``#`` comment in a Flow v1 / YAML-subset source, with position.
+
+    Mirrors the parser's rules: a comment starts at a ``#`` at the start of
+    a line or after whitespace, outside a quoted scalar. A quote opens only
+    where a value or entry starts (line start, after ``- ``, ``: ``, ``[``,
+    ``{`` or ``,``) — mid-scalar apostrophes (``it's``) are plain content,
+    and ``a#b`` is not a comment.
+    """
+    found: list[dict] = []
+    for lineno, raw in enumerate(text.split("\n"), start=1):
+        line = raw.rstrip("\r")
+        i = 0
+        token_start = True
+        while i < len(line):
+            ch = line[i]
+            if ch == "#" and (i == 0 or line[i - 1] in " \t"):
+                found.append({"line": lineno, "column": i + 1,
+                              "text": line[i:].strip()})
+                break
+            if token_start and ch in "'\"":
+                i += 1
+                while i < len(line):
+                    if ch == '"' and line[i] == "\\":
+                        i += 2
+                        continue
+                    if line[i] == ch:
+                        if ch == "'" and line[i + 1:i + 2] == "'":
+                            i += 2
+                            continue
+                        break
+                    i += 1
+                i += 1
+                token_start = False
+                continue
+            if ch in " \t":
+                i += 1
+                continue
+            if ch in "[{,":
+                token_start = True
+            elif ch in ":-" and line[i + 1:i + 2] in (" ", ""):
+                token_start = True
+            else:
+                token_start = False
+            i += 1
+    return found
+
+
+def lost_comments(original: str, canonical_text: str) -> list[dict]:
+    """Comments in ``original`` that ``canonical_text`` would drop.
+
+    The canonical emitter never writes comments, so today every source
+    comment is lost; the comparison by text keeps this honest if it ever
+    starts preserving some. ``flow fmt --write`` must refuse with
+    ``COMMENTS_WOULD_BE_LOST`` when this is non-empty, unless the caller
+    passed ``--drop-comments``.
+    """
+    kept = [item["text"] for item in find_comments(canonical_text)]
+    lost: list[dict] = []
+    for item in find_comments(original):
+        if item["text"] in kept:
+            kept.remove(item["text"])
+        else:
+            lost.append(item)
+    return lost

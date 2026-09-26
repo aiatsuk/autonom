@@ -26,10 +26,12 @@ IDB_REQUIRED = "idb_required"
 IDB_COMPANION_UNAVAILABLE = "idb_companion_unavailable"
 MITMDUMP_REQUIRED = "mitmdump_required"
 BACKEND_FAILED = "backend_failed"
+IOS_HID_FRAMEWORK_MISSING = "ios_hid_framework_missing"  # simulator HID input framework absent
 
 # --- Session -----------------------------------------------------------------
 NO_ACTIVE_SESSION = "no_active_session"
 SESSION_NOT_FOUND = "session_not_found"
+SESSION_ALREADY_ACTIVE = "session_already_active"  # a session already owns the target
 INSTALL_PATH_NOT_FOUND = "install_path_not_found"
 APP_NOT_INSTALLED = "app_not_installed"
 IOS_BOOT_FAILED = "ios_boot_failed"
@@ -47,6 +49,7 @@ SELECTOR_INDEX_OUT_OF_RANGE = "selector_index_out_of_range"
 COORDINATE_SPACE_MISMATCH = "coordinate_space_mismatch"
 UNSUPPORTED_KEY_FOR_PLATFORM = "unsupported_key_for_platform"
 UNSUPPORTED_ON_PLATFORM = "unsupported_on_platform"
+STALE_REF = "stale_ref"  # a node ref from an older tree snapshot
 
 # --- Device state ------------------------------------------------------------
 INVALID_URL = "invalid_url"
@@ -54,6 +57,8 @@ INVALID_COORDINATES = "invalid_coordinates"
 UNKNOWN_PRIVACY_SERVICE = "unknown_privacy_service"
 PATH_OUTSIDE_CONTAINER = "path_outside_container"
 RECORDING_ALREADY_ACTIVE = "recording_already_active"
+OUTPUT_NOT_WRITABLE = "output_not_writable"  # the requested output path cannot be written
+INVALID_SIMULATOR_ACTION = "invalid_simulator_action"  # an unknown simulator action name
 
 # --- Network -----------------------------------------------------------------
 PORT_UNAVAILABLE = "port_unavailable"
@@ -76,6 +81,7 @@ APP_NOT_RUNNING = "app_not_running"
 TOOL_MISSING = "tool_missing"  # generic, with a `tool` extra; per-tool codes above stay
 PRESET_UNAVAILABLE = "preset_unavailable"
 TRACE_FAILED = "trace_failed"
+SIGNAL_UNSTABLE = "signal_unstable"  # a measurement never settled within its window
 
 # --- Flow DSL ----------------------------------------------------------------
 # The DSL's code family is deliberately distinct from network capture's
@@ -103,6 +109,10 @@ FLOW_CHECK_FAILED = "flow_check_failed"
 FLOW_NO_FLOWS_FOUND = "flow_no_flows_found"
 FLOW_REPLAY_STEP_NOT_REACHED = "flow_replay_step_not_reached"
 UNSUPPORTED_FLOW_COMMAND = "unsupported_flow_command"  # Maestro import/export
+FLOW_SOURCE_CHANGED = "flow_source_changed"  # the flow file changed since the run
+RUN_NOT_FOUND = "run_not_found"  # no recorded flow run with that id
+STEP_NOT_FOUND = "step_not_found"  # no step with that id in the run
+COMMENTS_WOULD_BE_LOST = "comments_would_be_lost"  # a rewrite would drop YAML comments
 
 # --- Blueprint contracts ----------------------------------------------------
 UNSUPPORTED_CAPABILITY = "unsupported_capability"

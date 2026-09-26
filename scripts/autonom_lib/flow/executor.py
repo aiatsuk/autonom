@@ -157,6 +157,9 @@ class RunResult:
     blocks: list = field(default_factory=list)
     events_path: str | None = None
     replay_target: dict | None = None
+    # run-level warnings (additive): e.g. an --env value that feeds a
+    # sensitive slot and was therefore treated as a secret
+    warnings: list = field(default_factory=list)
 
 
 def _iter_var_names(text: str):
@@ -174,6 +177,18 @@ def _iter_var_names(text: str):
             index = match.end()
         else:
             index = position + 2
+
+
+def _repin_fields(repin: dict[str, Any] | None) -> dict[str, Any]:
+    """The additive event keys for a status-bar re-assert before a capture
+    (see simulator.reassert_pins); empty when nothing was pinned."""
+    if not repin:
+        return {}
+    fields = {"repinned": bool(repin.get("repinned")),
+              "repinned_controls": list(repin.get("controls") or [])}
+    if repin.get("stale_pin_dropped"):
+        fields["stale_pin_dropped"] = True
+    return fields
 
 
 class _Stop(Exception):
@@ -209,9 +224,15 @@ class Executor:
         self.runtime_values: dict[str, str] = {}
         self.sensitive_var_names: set[str] = set()
         self._children: dict[str, Flow] = {}
+        self._source_sha256: str | None = None
         self._counter = 0
         self._used_secret_anywhere = False
         self._retry_attempt: int | None = None
+        # the failed leaf that actually ended the run (not a recovered retry
+        # attempt, not a cleanup hook) — `failure` and the repair brief use it
+        self._terminal: StepOutcome | None = None
+        # --env names whose values reach a `sensitive: true` slot (SEC-004)
+        self.sensitive_env_names: set[str] = set()
         # indices of the composite steps (group/repeat/retry/runFlow) currently
         # open, so every leaf knows its parent and depth
         self._block_stack: list[int] = []
@@ -222,6 +243,7 @@ class Executor:
         self._writer_run_id: str | None = None
         self._last_nodes: list | None = None
         self._last_match: dict | None = None
+        self._last_repin: dict | None = None
         self._source_occurrences: dict[str, int] = {}
         self._setup_catalog: dict[str, list] = {
             "available": [], "selected": [], "applied": [],
@@ -236,6 +258,8 @@ class Executor:
         self.secret_values = set(self.config.secrets)
         self.runtime_values = {}
         self.sensitive_var_names = set()
+        self._terminal = None
+        self.sensitive_env_names = set()
         self._artifact_steps = []
         self._source_occurrences = {}
         self._setup_catalog = {
@@ -243,6 +267,9 @@ class Executor:
             "verified": [], "used": [],
         }
         self._children = {}
+        # The bytes this run executes, fixed now: an edit after this point
+        # must never be counted as a replay of the edited content (SEC-005).
+        self._source_sha256 = self._flow_digest(flow)
         self._collect_children(flow, flow.app_id)
         # Every name declared ANYWHERE in the graph (root env/--env/secrets,
         # child header envs, runFlow env: overlays). A runtime variable may
@@ -255,6 +282,7 @@ class Executor:
             self._collect_env_arg_names(
                 (*each.on_flow_start, *each.steps, *each.on_flow_complete))
         self._preflight_flow(flow, root_values, is_root=True)
+        run_warnings = self._classify_sensitive_env(flow)
 
         run_id = f"fr_{uuid.uuid4().hex[:10]}"
         writer = EventWriter(
@@ -267,17 +295,21 @@ class Executor:
         self._capability_snapshot = capability_snapshot.as_dict()
         self._writer_run_id = run_id
         result = RunResult(run_id=run_id, status="passed",
-                           events_path=str(writer.path))
+                           events_path=str(writer.path),
+                           warnings=list(run_warnings))
         evidence = self._effective_evidence(flow)
         unsupported = [k for k in evidence.collect if k == "crashes"]
+        started_warnings = list(run_warnings)
+        if unsupported:
+            started_warnings.insert(0, {"code": "flow_evidence_kind_unsupported",
+                                        "kinds": unsupported})
         writer.emit("flow.run.started", {
             "flow": flow.path, "name": flow.name, "app_id": flow.app_id,
             "tags": flow.tags, "steps": len(flow.steps),
             "dry_run": self.config.dry_run,
             **({"converted_from": flow.converted_from}
                if flow.converted_from else {}),
-            **({"warnings": [{"code": "flow_evidence_kind_unsupported",
-                              "kinds": unsupported}]} if unsupported else {}),
+            **({"warnings": started_warnings} if started_warnings else {}),
         })
         if self.config.dry_run:
             writer.emit("flow.run.finished",
@@ -328,13 +360,23 @@ class Executor:
             result.status = "failed"
             aborted = exc
         finally:
+            # captured before cleanup: an onFlowComplete step that fails
+            # must not become the run's failure
+            terminal = self._terminal
             if (flow.on_flow_complete and not self.config.dry_run
                     and not replay_reached):
                 self._run_complete_hooks(flow, root_values, writer, result,
                                          evidence)
 
         if result.status == "failed" and result.steps:
-            failed = next((s for s in result.steps if s.status == "failed"), None)
+            # The step that ENDED the run. The first failed step is wrong
+            # after a recovered retry (that attempt was superseded), and a
+            # leaf that aborted the run never reached `steps` at all.
+            failed = terminal
+            if failed is None and aborted is None:
+                failed = next((step for step in reversed(result.steps)
+                               if step.status == "failed"
+                               and step.hook != "onFlowComplete"), None)
             if failed is not None:
                 result.failure = {
                     "step_index": failed.index,
@@ -368,6 +410,18 @@ class Executor:
         if aborted is not None:
             raise aborted  # evidence is written; the envelope still reaches the CLI
         return result
+
+    @staticmethod
+    def _flow_digest(flow: Flow) -> str | None:
+        """sha256 of the bytes the loader parsed; for a flow built in memory,
+        of the file at ``flow.path`` as it is now; None without a file."""
+        digest = flow_validator.source_sha256(flow)
+        if digest:
+            return digest
+        try:
+            return hashlib.sha256(Path(flow.path).read_bytes()).hexdigest()
+        except (OSError, TypeError, ValueError):
+            return None
 
     @staticmethod
     def _wall_ms() -> int:
@@ -408,6 +462,12 @@ class Executor:
                 "flow_name": flow.name,
                 "flow_path": flow.path,
                 "flow_sources": flow_sources,
+                # the root file's bytes as read for this run, and every
+                # runFlow child's: Teach counts a replay by these hashes
+                "flow_sha256": self._source_sha256,
+                "subflow_sha256": {
+                    path: self._flow_digest(child)
+                    for path, child in sorted(self._children.items())},
                 "app_id": flow.app_id,
                 "platform": self.target.platform,
                 "target_id": self.target.target_id,
@@ -446,8 +506,19 @@ class Executor:
                 "side_effects": flow.side_effects,
                 "setup": self._setup_catalog,
                 "description": flow.description,
-                "env": {**flow.env, **self.config.env},
-                "secret_names": sorted(self.secret_values),
+                "env": {key: ("<redacted>" if key in self.sensitive_env_names
+                              else value)
+                        for key, value in {**flow.env, **self.config.env}.items()},
+                # an --env that fed a sensitive slot is recorded as the
+                # secret it is: replays then require it from the process
+                # environment instead of typing "<redacted>"
+                "secret_names": sorted(self.secret_values
+                                       | self.sensitive_env_names),
+                # --env names (values stay in `env`), so a repair brief can
+                # name them as placeholders without repeating the values
+                "env_override_names": sorted(set(self.config.env)
+                                             - self.sensitive_env_names),
+                "warnings": result.warnings,
                 "converted_from": flow.converted_from,
                 "workspace_root": str(workspace),
                 "environment": {
@@ -480,9 +551,13 @@ class Executor:
 
     def _reproduction_command(self, flow: Flow) -> str:
         parts = [f"autonom flow run {flow.path}"]
-        parts.extend(f"--secret {name}" for name in sorted(self.secret_values))
+        # an --env whose value reached a sensitive slot is reproduced the
+        # way it should have been passed: by name, value from the environment
+        parts.extend(f"--secret {name}" for name in
+                     sorted(self.secret_values | self.sensitive_env_names))
         for key, value in self.config.env.items():
-            parts.append(f"--env {key}={value}")
+            if key not in self.sensitive_env_names:
+                parts.append(f"--env {key}={value}")
         return " ".join(parts)
 
     def _execution_command(self, flow: Flow) -> str:
@@ -573,6 +648,58 @@ class Executor:
         return payload
 
     # -- pre-flight -----------------------------------------------------------
+
+    # Step args whose value lands in a sensitive slot when the step says
+    # `sensitive: true` (typed text, clipboard value).
+    _SENSITIVE_VALUE_ARGS = ("value",)
+
+    def _classify_sensitive_env(self, flow: Flow) -> list[dict]:
+        """--env names whose value reaches a `sensitive: true` slot (SEC-004).
+
+        Such a value is a secret passed the wrong way: it is redacted exactly
+        like a --secret (events, manifest, reproduction, report) and a
+        warning names the key. A runFlow ``env:`` mapping that forwards the
+        value under another name is followed to a fixed point.
+        """
+        referenced: set[str] = set()
+        forwards: list[tuple[str, str]] = []  # (child name, value text)
+
+        def walk(steps) -> None:
+            for step in steps:
+                if step.args.get("sensitive"):
+                    for name in self._SENSITIVE_VALUE_ARGS:
+                        value = step.args.get(name)
+                        if isinstance(value, str):
+                            referenced.update(_iter_var_names(value))
+                if step.command == "runFlow":
+                    for key, value in (step.args.get("env") or {}).items():
+                        forwards.append((key, value))
+                nested = step.args.get("commands")
+                if isinstance(nested, list):
+                    walk(nested)
+
+        for each in (flow, *self._children.values()):
+            walk((*each.on_flow_start, *each.steps, *each.on_flow_complete))
+        changed = True
+        while changed:
+            changed = False
+            for key, value in forwards:
+                if key in referenced:
+                    for name in _iter_var_names(value):
+                        if name not in referenced:
+                            referenced.add(name)
+                            changed = True
+        names = {name for name in referenced
+                 if name in self.config.env and name not in self.config.secrets}
+        self.sensitive_env_names = names
+        return [{
+            "code": "flow_env_value_sensitive",
+            "name": name,
+            "message": f"--env {name} feeds a sensitive: true slot; its value "
+                       "was treated as a secret and redacted",
+            "hint": f"Pass it as --secret {name} (value from the process "
+                    "environment) so it never appears on the command line.",
+        } for name in sorted(names)]
 
     @staticmethod
     def _declares_sensitive(flow: Flow) -> bool:
@@ -872,7 +999,8 @@ class Executor:
             snapshot, secret_names=names, secret_literals=literals)
 
     def _redact_secrets(self) -> tuple[set[str], set[str]]:
-        names = set(self.secret_values) | set(self.sensitive_var_names)
+        names = (set(self.secret_values) | set(self.sensitive_var_names)
+                 | set(self.sensitive_env_names))
         literals = {self.values[n] for n in names if n in self.values}
         literals |= {self.runtime_values[n] for n in names
                      if n in self.runtime_values}
@@ -886,7 +1014,7 @@ class Executor:
         def substitute(match: re.Match) -> str:
             nonlocal used_secret
             name = match.group(1)
-            if name in self.secret_values:
+            if name in self.secret_values or name in self.sensitive_env_names:
                 used_secret = True
                 return self.values[name]
             if name in self.runtime_values:
@@ -1079,6 +1207,8 @@ class Executor:
                 if self._is_replay_target(outcome):
                     raise _ReplayReached(outcome)
                 if outcome.status == "failed":
+                    if hook != "onFlowComplete":
+                        self._terminal = outcome
                     raise _Stop()
         finally:
             self.values = previous_values
@@ -1121,6 +1251,8 @@ class Executor:
                 outcome.error = exc.message
                 self._finish_runflow(outcome, payload, self.clock(),
                                      writer, result)
+                if hook != "onFlowComplete":
+                    self._terminal = outcome
                 raise
             if not met:
                 outcome.status = "skipped"
@@ -1375,6 +1507,9 @@ class Executor:
                 retryable = (failed is not None
                              and (not only_on or failed.error_code in only_on)
                              and attempt < max_attempts)
+                if retryable:
+                    # superseded by the next attempt: never the run's failure
+                    self._terminal = None
                 if not retryable:
                     self._emit_retry_finished(step, flow, writer, block_index,
                                               started, "failed", attempt)
@@ -1487,6 +1622,7 @@ class Executor:
         started = self.clock()
         self._last_nodes = None
         self._last_match = None
+        self._last_repin = None
         attempts = [0]
         try:
             secret_used = self._dispatch(step, flow, attempts)
@@ -1534,6 +1670,8 @@ class Executor:
             finished["screen"] = atlas_fingerprint.fingerprint(self._last_nodes)
         if outcome.target:
             finished["target"] = outcome.target
+        # a takeScreenshot re-asserted a live status-bar pin before its frame
+        finished.update(_repin_fields(self._last_repin))
         event = writer.emit("flow.step.finished", finished, sensitive=sensitive)
         writer.journal_step(event)
 
@@ -1564,8 +1702,10 @@ class Executor:
             return None
         captured: dict[str, str] = {}
         nodes: list[dict[str, Any]] | None = None
+        repin: dict[str, Any] | None = None
         if "screenshot" in evidence.collect:
             try:
+                repin = simulator_mod.repin_before_capture(self.target)
                 detail = screenshot_mod.capture_evidence(
                     self.target, self.session, label=f"step-{index}-{phase}",
                     task=writer.run_id)
@@ -1600,7 +1740,8 @@ class Executor:
             for kind, path in captured.items():
                 self._note_artifact(path, index, f"{kind}-{phase}")
             writer.emit("flow.evidence.captured",
-                        {"step_index": index, "phase": phase, **captured})
+                        {"step_index": index, "phase": phase, **captured,
+                         **_repin_fields(repin)})
         return atlas_fingerprint.fingerprint(nodes) if nodes else None
 
     def _note_artifact(self, path: str, index: int, kind: str) -> None:
@@ -1721,7 +1862,8 @@ class Executor:
                 # env may legitimately declare COPIED_TEXT (pre-flight
                 # accepts it) — same precedence as ${COPIED_TEXT}
                 value = self.values.get("COPIED_TEXT")
-                sensitive = "COPIED_TEXT" in self.secret_values
+                sensitive = ("COPIED_TEXT" in self.secret_values
+                             or "COPIED_TEXT" in self.sensitive_env_names)
             if value is None:
                 raise errors.AutonomError(
                     errors.FLOW_VAR_UNDEFINED,
@@ -1797,12 +1939,14 @@ class Executor:
             return secret
         if command == "takeScreenshot":
             label = step.args.get("label") or "flow"
+            repin = simulator_mod.repin_before_capture(target)
             detail = screenshot_mod.capture_evidence(
                 target, self.session, label=label, task=self._writer_run_id)
             # a deliberately labelled frame is evidence like any other: record
             # which step it belongs to, or the report cannot show it
             self._note_artifact(detail.get("path", ""),
                                 self._counter, "screenshot")
+            self._last_repin = repin
             return False
         if command == "checkpoint":
             # Evidence is captured by _auto_evidence after dispatch. The
@@ -1851,11 +1995,24 @@ class Executor:
             self.sleep(self.config.interval_ms / 1000)
 
     def _require_focused_field(self, step: Step, attempts: list) -> None:
-        timeout_ms = step.args.get("timeoutMs") or self.config.default_timeout_ms
+        # `is None`, not `or`: timeoutMs: 0 means "check once", not "default"
+        timeout_ms = step.args.get("timeoutMs")
+        if timeout_ms is None:
+            timeout_ms = self.config.default_timeout_ms
         deadline = self.clock() + timeout_ms / 1000
         while True:
             attempts[0] += 1
-            nodes = ui_mod.snapshot(self.target)
+            try:
+                nodes = ui_mod.snapshot(self.target)
+            except errors.AutonomError as exc:
+                # Right after the tap that opens a field the screen is often
+                # mid-transition and the dump comes back incomplete. That is
+                # the very moment this poll exists for: poll again, and only
+                # surface the backend error once the deadline has passed.
+                if exc.code != errors.BACKEND_FAILED or self.clock() >= deadline:
+                    raise
+                self.sleep(self.config.interval_ms / 1000)
+                continue
             self._last_nodes = nodes
             # Android trees say which node has focus; iOS trees do not, so
             # there the bar is "a text field is on screen" — still enough to
@@ -2077,7 +2234,9 @@ class Executor:
 
     def _capture_failure_evidence(self, index: int, writer: EventWriter) -> None:
         captured: dict[str, str] = {}
+        repin: dict[str, Any] | None = None
         try:
+            repin = simulator_mod.repin_before_capture(self.target)
             detail = screenshot_mod.capture_evidence(
                 self.target, self.session, label=f"failure-step-{index}",
                 task=writer.run_id)
@@ -2109,4 +2268,4 @@ class Executor:
             for kind, path in captured.items():
                 self._note_artifact(str(path), index, kind)
             writer.emit("flow.evidence.captured",
-                        {"step_index": index, **captured})
+                        {"step_index": index, **captured, **_repin_fields(repin)})

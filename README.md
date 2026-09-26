@@ -28,8 +28,10 @@ observed Runtime Map, local PR proof
 (`autonom proof --base`), live session watch (`session outputs`,
 `logs follow`, `network requests follow`), and an `autonom metrics` family
 (memory, CPU, frames, traces), and deterministic capture state — a pinned
-status bar on both platforms and a pinned keyboard/locale on iOS — with a
-`repair` hand-off on every failed flow step. Domain packs for Flutter, native
+status bar on both platforms, a pinned keyboard/locale on iOS, and system
+animations off on Android — with a `repair` hand-off (including ranked
+on-screen candidates) on every failed flow step. iOS input runs through idb
+or, where Xcode 27 broke an older idb companion, through AXe. Domain packs for Flutter, native
 Kotlin/Jetpack Compose, and iOS.  
 **Roadmap:** Flutter VM Service, React Native skills, optional MCP wrapper,
 hosted device providers.
@@ -64,7 +66,9 @@ autonom session start --platform ios --target <UDID> \
   --install build/ios/iphonesimulator/Runner.app --launch --app-id com.example.app
 
 # Same verbs on either platform
+autonom ui wait --settled --timeout-ms 5000  # until two consecutive trees match
 autonom ui tree
+autonom ui tree --format outline --interactable   # one line per actionable node
 autonom ui find --desc "Log In" --mode exact
 autonom ui tap --desc "Continue"
 autonom simulator status-bar pin            # full battery and signal: diff-stable screenshots
@@ -84,7 +88,14 @@ Sessions live under `~/.autonom/sessions/<id>/` (machine-global, found from any
 directory), and every verb plus your notes are appended to that session's
 `journal.ndjson`. Every command prints JSON; expected failures print
 `{"ok": false, "error_code": "...", "hint": "..."}` on stderr with exit code 2,
-so an agent branches on a stable code instead of parsing prose.
+so an agent branches on a stable code instead of parsing prose. A second
+`session start` while one is live is refused (`session_already_active`), and
+`verified: true` on a `simulator` control means the state was read back,
+never only that the command ran.
+
+On iOS the tree comes from idb; input goes through idb, or AXe
+(`brew install cameroncooke/axe/axe`) when `doctor` reports idb's HID broken —
+see [`docs/INSTALL.md`](docs/INSTALL.md) for the Xcode 27 fix.
 
 See `docs/CAPABILITIES.md` for the full shipped vs planned matrix.
 

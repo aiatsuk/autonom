@@ -188,6 +188,68 @@ def _store_body(
     return str(destination)
 
 
+def parse_header_args(values: Iterable[str] | None) -> dict[str, str] | None:
+    """`--header 'Name: value'` (repeatable) as a mapping; None when unused.
+
+    A value without a colon, or with an empty name, is refused rather than
+    dropped: a rule that silently lost the header its author asked for would
+    serve a response nobody intended.
+    """
+    if not values:
+        return None
+    headers: dict[str, str] = {}
+    for raw in values:
+        name, colon, value = str(raw).partition(":")
+        if not colon or not name.strip():
+            raise errors.AutonomError(
+                errors.INVALID_VALUE,
+                f"malformed --header {raw!r}: expected 'Name: value'",
+                "Pass each header as --header 'Name: value'.",
+            )
+        headers[name.strip()] = value.strip()
+    return headers
+
+
+def validate_response(*, status: int | None = None, body_text: str | None = None) -> None:
+    """Refuse a response the proxy could not serve as the author meant it.
+
+    `status` must be a real HTTP status (100..599). An inline body that looks
+    like JSON (starts with `{` or `[`) must parse: `--json '{bad'` would
+    otherwise be served verbatim under `Content-Type: application/json`.
+    Plain text bodies are still allowed.
+    """
+    if status is not None:
+        try:
+            code = int(status)
+        except (TypeError, ValueError):
+            code = -1
+        if not 100 <= code <= 599:
+            raise errors.AutonomError(
+                errors.INVALID_VALUE,
+                f"--status {status} is not an HTTP status (100..599)",
+                "Pass a status such as 200, 404 or 503.",
+            )
+    if body_text is not None and body_text.lstrip()[:1] in ("{", "["):
+        try:
+            json.loads(body_text)
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise errors.AutonomError(
+                errors.INVALID_VALUE,
+                f"--json is not valid JSON: {exc}",
+                "Fix the JSON, or pass the body with --body-file.",
+            ) from None
+
+
+def require_target(url_glob: str | None) -> None:
+    """A rule without a URL target would match nothing (or, as `*`, everything)."""
+    if not url_glob:
+        raise errors.AutonomError(
+            errors.SELECTOR_REQUIRED,
+            "no target given",
+            "Pass --url <full URL> or --match <glob>.",
+        )
+
+
 def url_to_match(url: str) -> dict[str, Any]:
     """`--url <exact URL>` sugar.
 
@@ -220,6 +282,8 @@ def add(
     note: str | None = None,
     registry: Path | None = None,
 ) -> dict[str, Any]:
+    require_target(url_glob)
+    validate_response(status=status, body_text=body_text)
     payload = _read_payload(registry)
     identifier = _next_id(payload)
     body_path = _store_body(
@@ -266,6 +330,7 @@ def update(
     registry: Path | None = None,
 ) -> dict[str, Any]:
     """Partial update. Only the fields actually supplied are touched."""
+    validate_response(status=status, body_text=body_text)
     payload = _read_payload(registry)
     rule = _find(payload["mocks"], identifier)
 

@@ -22,6 +22,10 @@ either way. What differs is **which field carries the visible label** — see be
 # Compact tree (meaningful nodes by default)
 python3 <autonom-root>/scripts/autonom.py ui tree
 python3 <autonom-root>/scripts/autonom.py --platform ios --target <UDID> ui tree
+python3 <autonom-root>/scripts/autonom.py ui tree --format outline --interactable   # one indented line per actionable node
+
+# Wait until the screen stops changing (animations, spinners, loading lists)
+python3 <autonom-root>/scripts/autonom.py ui wait --settled --timeout-ms 5000       # settled, snapshots, changes, elapsed_ms; exit 1 if never settled
 
 # Find
 python3 <autonom-root>/scripts/autonom.py ui find --text "Login" --mode contains     # Android
@@ -73,6 +77,24 @@ python3 <autonom-root>/scripts/autonom.py ui tree --dump tests/fixtures/idb_desc
 On iOS a control labelled "General" has `desc: "General"` and `text: null`, so
 `ui find --text "General"` returns **zero matches**. Read the tree first and select
 by `--desc`, or by `--resource-id` when the app sets accessibility identifiers.
+When a `--text` miss would have matched a `desc`, the response says so with a
+`label_is_in_desc` warning whose hint is the `--desc` retry. A `ui find` or
+`ui tap` with no selector at all is `selector_required`.
+
+## Which tool touched the screen (`backend`)
+
+Every input payload (`ui tap`, `ui swipe`, `ui type`, `ui key`) names its
+`backend`: `adb` on Android; `idb` or `axe` on iOS. The iOS tree always comes
+from idb. On Xcode 27 an idb companion built before the fix cannot load
+SimulatorKit, so the tree works while input fails with
+`ios_hid_framework_missing`; with AXe installed
+(`brew install cameroncooke/axe/axe`) the default `--ios-hid auto` sends
+input through AXe instead. `--ios-hid idb|axe` (or `AUTONOM_IOS_HID`) pins a
+route, and `--axe PATH` (or `AUTONOM_AXE`) names the binary; both go before
+the verb. `autonom doctor` reports `ios_tree` and `ios_hid` separately with
+the fix for each. On Xcode 27 with AXe carrying input, `ios_hid.ready` stays
+`false` (idb's own HID) while `ios_hid.axe_ready` and `ios_ui.ready` are
+`true`: read `ios_ui` and `axe_ready` — input works, do not give up on it.
 
 ## Gestures and keys by platform
 
@@ -125,6 +147,35 @@ On Android the default pin never enters SystemUI demo mode, because demo mode
 freezes the clock at the moment it is entered; `hhmm=`, `wifi=`, `mobile=`, or
 `mode=demo` opt into it when a fixed clock or shaped Wi-Fi bars matter more
 than a ticking one. `values.mode` in the response says which path ran.
+The emulator's signal cannot be read back, so a live Android pin carries a
+`signal_unstable` warning and does not claim the signal as verified. The
+emulator's bars and battery icon drift within a minute of any pin, so
+`autonom screenshot` and flow captures re-send the live pin right before the
+frame (`repinned: true` in the response) — take evidence through them, not a
+raw `adb screencap`. `status-bar clear` restores the battery and signal state recorded before the
+first pin.
+
+A pin is bound to the emulator it was set on (AVD name and boot id): an
+emulator that took the same serial later — another AVD, or a reboot — never
+receives it. The record is dropped instead (`stale_pin_dropped: true` and a
+warning), and `devices shutdown` / `devices boot` drop it outright; pin again
+on the new device. On API 36 emulators SystemUI may not draw the battery
+glyph at all even though `dumpsys battery` reports the pinned level, so a
+missing battery icon in a capture is the emulator's, not the pin's or the
+app's.
+
+On Android, turn system animations off before comparing captures, and wait
+for the screen to settle:
+
+```bash
+python3 <autonom-root>/scripts/autonom.py simulator animations pin        # window, transition, animator scales to 0
+python3 <autonom-root>/scripts/autonom.py ui wait --settled
+python3 <autonom-root>/scripts/autonom.py simulator animations reset      # restores what the first pin replaced
+```
+
+iOS has no host-level animation switch (`unsupported_capability`).
+Every `simulator` control answers `verified: true` only after reading the
+state back; otherwise `verified: false` with the reason in `verification`.
 
 `ui type` on iOS is at the mercy of autocorrect: a non-English keyboard
 rewrote "Sync conflicts when editing offline" into something else mid-flow.
@@ -154,7 +205,8 @@ computed in when you report a coordinate.
 
 1. `session start` so the target and artifacts are explicit.
 2. `ui tree` → read labels, roles, enabled state. Note which field holds the label.
-3. `ui find` / `ui tap` for the next action.
+3. `ui find` / `ui tap` for the next action; after a navigation, `ui wait
+   --settled` before the next read.
 4. `screenshot` after state changes that need visual proof — **compare before/after**;
    an exit code of 0 does not prove the screen changed. Pin the status bar first
    so the diff shows only what the app changed.

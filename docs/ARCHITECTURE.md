@@ -37,7 +37,7 @@ The core design is **routing first, evidence second**.
 ## Control plane
 
 ```text
-Host agent  →  skills  →  scripts/autonom.py  →  adb / xcrun simctl / idb / mitmdump
+Host agent  →  skills  →  scripts/autonom.py  →  adb / xcrun simctl / idb / axe / mitmdump
                               ↓
                      ~/.autonom/sessions/<id>/
 ```
@@ -50,7 +50,7 @@ overridable by `AUTONOM_HOME`:
 | Root | Default | Holds |
 | --- | --- | --- |
 | Session store | `~/.autonom/sessions/<id>/` | `session.json`, `journal.ndjson`, shots, trees, logs, network flows, recordings, crashes, pulled files |
-| Machine state | `$XDG_STATE_HOME/autonom`, else `~/.local/state/autonom` | mock registry, process registry, mitmproxy confdir (CA key, mode `0700`) |
+| Machine state | `$XDG_STATE_HOME/autonom`, else `~/.local/state/autonom` | mock registry, process registry, mitmproxy confdir (CA key, mode `0700`), `simulator-state/<target>.json` and `simulator-prefs/<udid>.json` pin snapshots |
 | Per-app knowledge | `~/.autonom/apps/<package>/` | `mobile-memory` overlays and flow runbooks |
 
 The consequence that matters: a session started in one directory is found from
@@ -70,14 +70,16 @@ scripts/autonom_lib/
   platform.py                 Target identity, resolution precedence, unified device listing
   errors.py                   AutonomError + the stable error_code vocabulary
   session.py                  schema v2 records, v1 in-memory upgrade, teardown registry
-  journal.py                  append-only journal.ndjson: every verb, scrubbed argv, notes
+  journal.py                  append-only journal.ndjson: every verb, parser-resolved scrubbed argv, notes
   consent.py                  the consent gate: per-invocation flag + typed phrase, never cached
   selector.py                 shared selector matching and duplicate policy
   ui.py                       platform dispatch + the compact node schema
   ui_android.py / adb.py      UI Automator parsing and adb actuation
-  ui_ios.py / ios_idb.py      accessibility tree parsing and idb actuation
+  ui_ios.py / ios_idb.py      accessibility tree parsing; idb actuation, or AXe for input
   ios_simctl.py               simulator lifecycle, screenshots, logs, device state
-  emulator.py                 AVD discovery, emulator boot and kill
+  emulator.py                 AVD discovery, emulator boot (registered harness-owned) and kill
+  simulator.py                `simulator` controls: action whitelist, read-back, pin snapshots
+  ios_prefs.py                the shut-down simulator's preference store (`keyboard pin`)
   device_state.py             deep links, permissions, location, media, crashes, files, recording
   screenshot.py / logs.py     per-platform dispatch; shots carry provenance metadata in the PNG
   follow.py                   bounded NDJSON follows: file tail, device-log stream, store poll
@@ -126,8 +128,10 @@ Two rules carry the design.
 1. **Actuation is single-sourced per backend.** Every idb command line lives in
    `ios_idb.py`, every adb command line in `adb.py`, every simctl command line
    in `ios_simctl.py`, so an Xcode upgrade that breaks idb has a one-file blast
-   radius. `doctor.py` is the deliberate exception: it probes `idb list-targets`
-   itself, because a diagnostic must keep working when the wrapper does not.
+   radius. The one AXe command line lives in `ui_ios.py` beside the routing
+   decision. `doctor.py` is the deliberate exception: it probes `idb
+   list-targets` and SimulatorKit's location itself, because a diagnostic must
+   keep working when the wrapper does not.
 2. **Platform knowledge stays below the CLI.** `autonom.py` still branches on
    `target.platform` where the *verb itself* differs between platforms — iOS has
    no `pm clear`, Android has no per-process launch environment, iOS attach is
@@ -141,11 +145,12 @@ Two rules carry the design.
 | --- | --- |
 | `version`, `devices`, `doctor` | identify the CLI, discover targets, diagnose the machine |
 | `session *` | start/show/stop, launch/clear/force-stop/uninstall, artifact dirs |
-| `ui tree\|find\|tap\|swipe\|pinch\|rotate\|shake\|type\|key` | understand and control the screen |
+| `ui tree\|find\|wait\|tap\|swipe\|type\|key` | understand and control the screen; `ui pinch\|rotate\|shake` exist but have no backend on either platform and are refused |
 | `screenshot`, `shots list\|show`, `record start\|stop` | visual evidence and its provenance |
 | `note add\|list`, `journal` | the run's own record: what was done, what was concluded |
 | `logs tail`, `crash list\|show` | textual evidence |
 | `open`, `permissions`, `location`, `media`, `file` | drive device state |
+| `simulator *` | battery, network, push, telephony, biometric, appearance, text size, clipboard, status-bar/keyboard/animation pins; `verified` only after a read-back |
 | `network *` | consent-gated HTTP(S) capture, mock, HAR |
 | `atlas update\|show\|coverage\|paths\|export\|diff` | the observed application graph, evidence-linked |
 | `proof --base` | run the covering flow suite for a diff; pass/fail/not_covered/blocked/inconclusive |
@@ -159,6 +164,64 @@ Two rules carry the design.
 Every verb except `note`, `journal`, and `version` passes through one journal
 choke point in `main()`, so the timeline records the failures too — including
 the ones the agent chose not to mention.
+
+### iOS input backends
+
+The accessibility tree always comes from idb (`describe-all`). Input — tap,
+swipe, type, key, long press, double tap — is routed per call by
+`ui_ios.hid_backend()`:
+
+| `--ios-hid` / `AUTONOM_IOS_HID` | Route |
+| --- | --- |
+| `idb` | idb only; a HID failure is reported, never retried elsewhere |
+| `axe` | AXe only (`--axe PATH` / `AUTONOM_AXE`, else `axe` on `PATH`); no binary is an error |
+| `auto` (default) | idb, unless idb's HID is known broken and AXe is installed |
+
+"Known broken" is either the doctor probe (a PATH-resolved idb whose
+companion cannot load SimulatorKit — Xcode 27 moved the framework to
+`Contents/SharedFrameworks`, companions built before the fix look in
+`Library/PrivateFrameworks`) or idb itself answering
+`ios_hid_framework_missing`. That failure happens before any event is
+delivered, so re-sending the same input through AXe repeats nothing. The
+probe runs once per process. Every input payload names the `backend` it
+used, so evidence says which tool touched the screen. The idb retry for a
+stale companion follows the same rule: at most one retry, and only for a
+refused connection, which never delivered the action.
+
+### Journal redaction
+
+The journal is written from `argv`, so it must know which tokens are
+secrets. Guessing from strings alone failed repeatedly (argparse accepts any
+unambiguous abbreviation, `--flag=value`, and flags on either side of the
+verb), so `main()` hands the journal the real parser and the parsed
+namespace. `journal.canonical_argv()` resolves every token the way argparse
+would — canonical option, its dest, how many values it takes — reading the
+parser's option tables without parsing anything. Three scrubs then run on
+the same argv, each strictly one output token per input token:
+
+1. **parser-resolved** — a value is secret when its canonical option, its
+   dest, or the spelling as typed is secret-bearing; every other value gets
+   content scrubbing (`password=`, `?token=`, JSON fields);
+2. **argv-only** — the conservative prefix scan, used alone when the parser
+   cannot resolve the argv;
+3. **the previous release's exact rule**, vendored verbatim.
+
+`scrub_for_journal()` writes, per token, the most masked of the three, so
+the journal is never less masked than any of them by construction. The
+price is over-masking (every `KEY=VALUE` option value is journaled as
+`KEY=<redacted>`); a differential test against the vendored rule guards the
+superset property.
+
+### Pin snapshots
+
+A pin changes device state a person may have set on purpose (a battery
+override for a low-battery test, a custom animation scale). The first
+`status-bar pin` or `animations pin` records what it is about to replace
+under `$AUTONOM_HOME/simulator-state/<target>.json` (mode `0600`); a second
+pin merges only keys not yet recorded, so the snapshot always describes the
+device before the **first** pin, and `clear`/`reset` restores exactly that
+and deletes the section. `keyboard pin` keeps its own per-UDID snapshot under
+`simulator-prefs/` with the same merge rule.
 
 ## Compact node schema
 
@@ -199,7 +262,7 @@ validator fails the build when a plugin manifest disagrees with it.
 - **Contract golden** — every Android response's key set was recorded from 0.4.0
   before the platform refactor; a renamed key fails the build even though
   hand-written assertions would still pass.
-- **Fake backends** — `tests/fakes/fake_{adb,simctl,idb}.py` record their argv, so
+- **Fake backends** — `tests/fakes/fake_{adb,simctl,idb,axe}.py` record their argv, so
   "what did we actually execute?" is an oracle rather than a claim. The fake idb
   additionally carries the real tool's command surface and refuses anything
   outside it: while it accepted any argv, three `ui` gestures were dispatched as

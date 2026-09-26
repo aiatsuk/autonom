@@ -40,9 +40,11 @@ BREW_TRUST_HINT = (
 # binary override points at nothing.
 BINARY_OVERRIDES = (
     "AUTONOM_ADB", "AUTONOM_SIMCTL", "AUTONOM_IDB", "AUTONOM_EMULATOR", "AUTONOM_MITMDUMP",
+    "AUTONOM_AXE",
 )
 OVERRIDE_VARS = BINARY_OVERRIDES + (
     "AUTONOM_IDB_COMPANION", "AUTONOM_HOME", "AUTONOM_CORESIMULATOR_DEVICES",
+    "AUTONOM_IOS_HID", "AUTONOM_IOS_LOG_MAX_MB", "AUTONOM_IDB_STATE_FILE",
 )
 
 
@@ -105,11 +107,9 @@ def _xcrun_version(path: str) -> str | None:
     )
     if completed.returncode != 0:
         return None
-    developer = subprocess.run(
-        ["xcode-select", "-p"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-        text=True, check=False, timeout=20,
-    )
-    return (developer.stdout or "").strip() or "simctl available"
+    # DEVELOPER_DIR first, then `xcode-select -p` — the same resolution the
+    # SimulatorKit check uses, so the two sections cannot disagree.
+    return ios_simctl.developer_dir() or "simctl available"
 
 
 def _mitmdump_version(path: str) -> str | None:
@@ -135,10 +135,18 @@ def _idb_entry(explicit: str | None = None) -> dict[str, Any]:
         return entry
     entry["path"] = path
 
-    completed = subprocess.run(
-        [path, "list-targets", "--json"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, check=False, timeout=40,
-    )
+    endpoint = ios_idb.companion_endpoint()
+    try:
+        completed = subprocess.run(
+            [path, *(["--companion", endpoint] if endpoint else []), "list-targets", "--json"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, check=False, timeout=40,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        entry["state"] = "error"
+        entry["error"] = f"idb list-targets did not answer: {exc}"
+        entry["install_hint"] = "Check 'idb list-targets' by hand; ensure idb_companion is installed."
+        return entry
     output = completed.stdout or ""
     if completed.returncode == 0:
         entry["state"] = "ok"
@@ -161,7 +169,142 @@ def _companion_entry() -> dict[str, Any]:
             "state": "missing", "path": None, "version": None,
             "install_hint": BREW_TRUST_HINT,
         }
-    return {"state": "ok", "path": path, "version": ios_idb.companion_version(path)}
+    # Only the parsed fields are kept: the companion can print its whole
+    # environment, tokens included, and none of that belongs in a report.
+    info = ios_idb.companion_info(path) or {}
+    summary = " ".join(part for part in (
+        info.get("version"),
+        f"built {info['build_date']}" if info.get("build_date") else None,
+    ) if part) or None
+    return {"state": "ok", "path": path, "version": summary,
+            "build_date": info.get("build_date"), "_info": info or None}
+
+
+def _axe_version(path: str) -> str | None:
+    try:
+        completed = subprocess.run(
+            [path, "--version"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL, text=True, check=False, timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    lines = (completed.stdout or "").strip().splitlines()
+    return lines[0].strip()[:64] if completed.returncode == 0 and lines else None
+
+
+def _ios_state(tools: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any],
+                                               list[dict[str, Any]], list[dict[str, Any]]]:
+    """The Xcode / SimulatorKit / companion / AXe picture, and what it means
+    for HID input. Returns (ios section, capabilities, checks, warnings).
+
+    Measured on Xcode 27: SimulatorKit lives only in Contents/SharedFrameworks,
+    and a companion built before the fix fails every tap with "SimulatorKit is
+    required for HID interactions" while describe-all still works — so tree and
+    HID readiness are reported separately.
+    """
+    from . import ui_ios
+
+    xcode = ios_simctl.xcode_info()
+    companion = tools["idb_companion"].pop("_info", None)
+    verdict = ios_idb.hid_assess(xcode, companion)
+    axe_path = ui_ios.find_axe()
+    axe_exists = bool(axe_path) and (Path(axe_path).expanduser().is_file()
+                                     or shutil.which(axe_path) is not None)
+    axe = {"state": "ok" if axe_exists else "missing", "path": axe_path if axe_exists else None,
+           "version": _axe_version(axe_path) if axe_exists else None,
+           "install_hint": None if axe_exists else "brew install cameroncooke/axe/axe"}
+    warnings: list[dict[str, Any]] = []
+    try:
+        mode = ui_ios.hid_mode()
+    except errors.AutonomError as exc:
+        mode = "auto"
+        warnings.append({"code": "invalid_ios_hid_mode", "variable": ui_ios.HID_ENV,
+                         "error": exc.message, "hint": exc.hint})
+
+    tree_ready = tools["idb"]["state"] == "ok" and tools["idb_companion"]["state"] == "ok"
+    idb_hid = tree_ready and verdict["ready"]
+    axe_ready = axe_exists and tools["simctl"]["state"] == "ok"
+    if mode == "idb":
+        backend = "idb" if idb_hid else None
+    elif mode == "axe":
+        backend = "axe" if axe_ready else None
+    else:
+        backend = "idb" if idb_hid else ("axe" if axe_ready else None)
+    ui_ready = tree_ready and backend is not None
+    degraded = None
+    if tree_ready and backend == "axe":
+        degraded = f"tree through idb; tap/swipe/type/key through AXe ({axe_path})"
+    elif tree_ready and backend is None:
+        degraded = ("tree works; tap/swipe/type/key fail: "
+                    + (verdict["reason"] or "no HID backend is available"))
+
+    capabilities = {
+        "ios_tree": {"ready": tree_ready, "needs": "idb + idb_companion"},
+        "ios_hid": {
+            "ready": idb_hid,
+            "needs": "idb_companion that loads SimulatorKit (>= 1.6.2 on Xcode 27), or AXe",
+            "backend": backend,
+            "axe_ready": axe_ready,
+            "degraded": None if idb_hid else (verdict["reason"] or None),
+        },
+        "ios_ui": {"ready": ui_ready, "needs": "idb + idb_companion", "degraded": degraded},
+    }
+
+    if not verdict["ready"]:
+        hint = f"{ios_idb.HID_UPGRADE_FIX}."
+        if axe_exists:
+            hint += f" Until then HID verbs route through AXe ({axe_path})."
+        else:
+            hint += " Or install AXe (brew install cameroncooke/axe/axe) to route HID through it."
+        built = (companion or {}).get("version") or (
+            f"built {(companion or {}).get('build_date')}")
+        warnings.append({
+            "code": "idb_companion_predates_xcode27",
+            "error": f"idb_companion ({built}) loads SimulatorKit from "
+                     f"{xcode.get('developer_dir')}/Library/PrivateFrameworks, which does "
+                     f"not exist on Xcode {xcode.get('xcode_version') or '27+'}"
+                     + (f"; SimulatorKit is at {xcode['simulatorkit_path']}"
+                        if xcode.get("simulatorkit_path") else ""),
+            "hint": hint,
+            "fix": ios_idb.HID_UPGRADE_FIX,
+        })
+
+    # Fixes are printed for the reader to run; doctor never runs them.
+    checks = [
+        {"name": "xcode_developer_dir", "ok": bool(xcode.get("developer_dir")), "required": True,
+         "detail": xcode.get("developer_dir"),
+         "fix": None if xcode.get("developer_dir")
+         else "sudo xcode-select -s /Applications/Xcode.app/Contents/Developer"},
+        {"name": "simulatorkit", "ok": bool(xcode.get("simulatorkit_path")), "required": True,
+         "detail": xcode.get("simulatorkit_path"),
+         "fix": None if xcode.get("simulatorkit_path")
+         else "Install Xcode (SimulatorKit ships with it) and select it with xcode-select"},
+        {"name": "idb_companion_hid", "ok": bool(idb_hid), "required": not axe_ready,
+         "detail": verdict["reason"],
+         "fix": None if idb_hid else (ios_idb.HID_UPGRADE_FIX if not verdict["ready"]
+                                      else BREW_TRUST_HINT)},
+        {"name": "axe", "ok": axe_exists, "required": False, "detail": axe_path,
+         "fix": None if axe_exists else "brew install cameroncooke/axe/axe"},
+    ]
+
+    ios = {
+        "developer_dir": xcode.get("developer_dir"),
+        "xcode_version": xcode.get("xcode_version"),
+        "xcode_build": xcode.get("xcode_build"),
+        "simulatorkit_path": xcode.get("simulatorkit_path"),
+        "simulatorkit_legacy_present": xcode.get("simulatorkit_legacy"),
+        "simulatorkit_shared_present": xcode.get("simulatorkit_shared"),
+        "idb_companion": {
+            "path": tools["idb_companion"].get("path"),
+            "version": (companion or {}).get("version"),
+            "build_date": (companion or {}).get("build_date"),
+            "predates_xcode27_fix": verdict["companion_predates_fix"],
+        },
+        "axe": axe,
+        "hid_mode": mode,
+        "hid_backend": backend,
+    }
+    return ios, capabilities, checks, warnings
 
 
 def collect(args: Any = None) -> dict[str, Any]:
@@ -188,15 +331,13 @@ def collect(args: Any = None) -> dict[str, Any]:
             "ready": tools["simctl"]["state"] == "ok",
             "needs": "xcrun (Xcode)",
         },
-        "ios_ui": {
-            "ready": tools["idb"]["state"] == "ok" and tools["idb_companion"]["state"] == "ok",
-            "needs": "idb + idb_companion",
-        },
         "network": {
             "ready": tools["mitmdump"]["state"] == "ok",
             "needs": "mitmdump (mitmproxy)",
         },
     }
+    ios_state, ios_caps, checks, ios_warnings = _ios_state(tools)
+    capabilities.update(ios_caps)
 
     # Optional profilers never gate `--strict` (is_healthy reads `tools` only):
     # a missing xctrace narrows what metrics can do, it does not break the host.
@@ -221,6 +362,7 @@ def collect(args: Any = None) -> dict[str, Any]:
         }
 
     network_state, orphans, warnings = _runtime_state(record)
+    warnings.extend(ios_warnings)
 
     overrides, override_warnings = _overrides()
     warnings.extend(override_warnings)
@@ -244,6 +386,8 @@ def collect(args: Any = None) -> dict[str, Any]:
         "ok": True,
         "tools": tools,
         "capabilities": capabilities,
+        "ios": ios_state,
+        "checks": checks,
         "metrics": metrics_caps,
         "session": session_summary,
         "network": network_state,
@@ -363,6 +507,8 @@ def _foreign_attachments(record: dict[str, Any] | None,
         devices = adb_mod.list_devices(adb_path)
     except errors.AutonomError:
         return []
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        return [_probe_timeout(None, "adb devices", exc)]
     ports_by_pid = {entry.get("pid"): entry for entry in live if entry.get("port")}
     current_port = ((record or {}).get("network") or {}).get("proxy_port")
     found: list[dict[str, Any]] = []
@@ -375,6 +521,11 @@ def _foreign_attachments(record: dict[str, Any] | None,
                 serial=device.serial, timeout=10, check=False,
             )
         except errors.AutonomError:
+            continue
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            # A hung emulator used to take the whole report down with a
+            # traceback; the proxy check for that one device is skipped instead.
+            found.append(_probe_timeout(device.serial, "settings get global http_proxy", exc))
             continue
         value = (completed.stdout if isinstance(completed.stdout, str) else "").strip()
         if not value or value in ("null", ":0"):
@@ -401,6 +552,20 @@ def _foreign_attachments(record: dict[str, Any] | None,
                     "'adb shell settings put global http_proxy :0' to clear it by hand.",
         })
     return found
+
+
+def _probe_timeout(target_id: str | None, probe: str, exc: BaseException) -> dict[str, Any]:
+    subject = target_id or "adb"
+    timed_out = isinstance(exc, subprocess.TimeoutExpired)
+    return {
+        "code": "probe_timed_out" if timed_out else "probe_failed",
+        "target_id": target_id,
+        "probe": probe,
+        "error": f"{subject} did not answer '{probe}'"
+                 + (f" within {exc.timeout:g}s" if timed_out and exc.timeout else f": {exc}"),
+        "hint": "The device may be busy or hung; its proxy attachment was not checked. "
+                "Retry 'autonom doctor', or inspect it with 'adb -s <serial> shell'.",
+    }
 
 
 def _latest_proxy_file(record: dict[str, Any] | None) -> Path | None:

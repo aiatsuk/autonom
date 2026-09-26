@@ -101,6 +101,140 @@ def set_orientation(target: Target, orientation: str) -> dict[str, Any]:
 # --- permissions -------------------------------------------------------------
 
 
+# Short names an agent reaches for first (they are the iOS service names too),
+# mapped to the Android runtime permissions they unambiguously mean. `location`
+# is a permission group: the system's own dialog grants fine and coarse
+# together, and API 31+ refuses fine without coarse.
+ANDROID_PERMISSION_ALIASES: dict[str, tuple[str, ...]] = {
+    "camera": ("android.permission.CAMERA",),
+    "microphone": ("android.permission.RECORD_AUDIO",),
+    "location": ("android.permission.ACCESS_FINE_LOCATION",
+                 "android.permission.ACCESS_COARSE_LOCATION"),
+    "contacts": ("android.permission.READ_CONTACTS",),
+    "photos": ("android.permission.READ_MEDIA_IMAGES",),
+    "notifications": ("android.permission.POST_NOTIFICATIONS",),
+}
+
+_PERMISSION_NAME_HINT = (
+    "Android takes full permission names, e.g. android.permission.CAMERA, "
+    "android.permission.RECORD_AUDIO, android.permission.ACCESS_FINE_LOCATION, "
+    "android.permission.POST_NOTIFICATIONS. Short names understood: "
+    + ", ".join(sorted(ANDROID_PERMISSION_ALIASES)) + "."
+)
+
+
+def android_permission_names(service: str) -> list[str]:
+    """The Android permission(s) a `permissions` service argument names."""
+    alias = ANDROID_PERMISSION_ALIASES.get((service or "").strip().lower())
+    return list(alias) if alias else [service]
+
+
+# `dumpsys package <pkg>` lists each runtime permission as
+# `android.permission.CAMERA: granted=true, flags=[ USER_SET ]` under a
+# `runtime permissions:` heading, once per user.
+_RUNTIME_PERMISSION = re.compile(r"^\s*([A-Za-z0-9_.]+):\s*granted=(true|false)")
+
+
+def granted_runtime_permissions(dumpsys_text: str) -> list[str]:
+    """Runtime permissions `dumpsys package` reports as granted, in order.
+
+    Only the `runtime permissions:` sections count: `install permissions`
+    (INTERNET and friends) are granted at install time and cannot be revoked.
+    """
+    granted: list[str] = []
+    in_runtime = False
+    for line in (dumpsys_text or "").splitlines():
+        stripped = line.strip()
+        if stripped.endswith(":") and "permissions" in stripped:
+            in_runtime = stripped == "runtime permissions:"
+            continue
+        if not in_runtime:
+            continue
+        match = _RUNTIME_PERMISSION.match(line)
+        if match is None:
+            in_runtime = False  # the section ended at the first non-permission line
+            continue
+        if match.group(2) == "true" and match.group(1) not in granted:
+            granted.append(match.group(1))
+    return granted
+
+
+def _raise_for_pm_output(output: str, app_id: str, permission: str) -> None:
+    """`pm grant|revoke` failures are Java exceptions on stdout; name them."""
+    text = (output or "").strip()
+    if not text:
+        return
+    lowered = text.lower()
+    if ("unknown package" in lowered or "package " + app_id.lower() + " not found" in lowered
+            or "no such package" in lowered):
+        raise errors.AutonomError(
+            errors.APP_NOT_INSTALLED, f"{app_id} is not installed on the device",
+            "Check the package id with 'adb shell pm list packages'.",
+        )
+    if "unknown permission" in lowered or "illegalargumentexception" in lowered:
+        raise errors.AutonomError(
+            errors.INVALID_VALUE, f"unknown Android permission: {permission}",
+            _PERMISSION_NAME_HINT,
+        )
+    if "has not requested permission" in lowered or "not a changeable permission" in lowered:
+        raise errors.AutonomError(
+            errors.INVALID_VALUE,
+            f"{permission} cannot be changed for {app_id}: {text.splitlines()[-1][:200]}",
+            "Only runtime permissions the app declares in its manifest can be granted "
+            "or revoked; install-time permissions are fixed.",
+        )
+    if "exception" in lowered or lowered.startswith(("error", "failure")):
+        raise adb_mod.AdbError(text.splitlines()[-1][:400])
+
+
+def _pm_permission(target: Target, action: str, app_id: str, permission: str) -> None:
+    completed = adb_mod.run_adb(
+        target.tool, ["shell", "pm", action, app_id, permission],
+        serial=target.target_id, timeout=30, check=False,
+    )
+    output = completed.stdout if isinstance(completed.stdout, str) else ""
+    _raise_for_pm_output(output, app_id, permission)
+    if completed.returncode != 0:
+        raise adb_mod.AdbError(output.strip() or f"pm {action} {app_id} {permission} failed")
+
+
+def _android_reset(target: Target, service: str, app_id: str) -> dict[str, Any]:
+    """Reset one package's runtime permissions — never another app's.
+
+    `pm reset-permissions` takes no package argument and resets EVERY app on
+    the device (measured: resetting Chrome cost YouTube its RECORD_AUDIO
+    grant). A reset here revokes the named permission, or with `all` each
+    runtime permission `dumpsys package` reports as granted, for this package
+    only, and clears the user-set/user-fixed flags so the app may ask again.
+    """
+    if (service or "").strip().lower() == "all":
+        completed = adb_mod.run_adb(
+            target.tool, ["shell", "dumpsys", "package", app_id],
+            serial=target.target_id, timeout=30, check=False,
+        )
+        text = completed.stdout if isinstance(completed.stdout, str) else ""
+        if "Unable to find package" in text or f"Package [{app_id}]" not in text:
+            raise errors.AutonomError(
+                errors.APP_NOT_INSTALLED, f"{app_id} is not installed on the device",
+                "Check the package id with 'adb shell pm list packages'.",
+            )
+        permissions_to_reset = granted_runtime_permissions(text)
+    else:
+        permissions_to_reset = android_permission_names(service)
+    revoked: list[str] = []
+    for permission in permissions_to_reset:
+        _pm_permission(target, "revoke", app_id, permission)
+        adb_mod.run_adb(
+            target.tool,
+            ["shell", "pm", "clear-permission-flags", app_id, permission,
+             "user-set", "user-fixed"],
+            serial=target.target_id, timeout=30, check=False,
+        )
+        revoked.append(permission)
+    return {"action": "reset", "service": service, "app_id": app_id,
+            "scope": "package", "revoked": revoked}
+
+
 def permissions(target: Target, action: str, service: str, app_id: str | None) -> dict[str, Any]:
     if target.platform == IOS:
         ios_simctl.privacy(target.tool, target.target_id, action, service, app_id)
@@ -112,21 +246,16 @@ def permissions(target: Target, action: str, service: str, app_id: str | None) -
             "Pass the package: 'autonom permissions grant android.permission.CAMERA com.example.app'.",
         )
     if action == "reset":
-        adb_mod.run_adb(
-            target.tool, ["shell", "pm", "reset-permissions", app_id],
-            serial=target.target_id, timeout=30, check=True,
-        )
-        return {"action": "reset", "service": "all", "app_id": app_id}
+        return _android_reset(target, service, app_id)
     if action not in {"grant", "revoke"}:
         raise errors.AutonomError(
             errors.UNKNOWN_PRIVACY_SERVICE, f"unknown action: {action}",
             "Valid actions: grant, revoke, reset.",
         )
-    adb_mod.run_adb(
-        target.tool, ["shell", "pm", action, app_id, service],
-        serial=target.target_id, timeout=30, check=True,
-    )
-    return {"action": action, "service": service, "app_id": app_id}
+    names = android_permission_names(service)
+    for permission in names:
+        _pm_permission(target, action, app_id, permission)
+    return {"action": action, "service": service, "app_id": app_id, "permissions": names}
 
 
 # --- location ----------------------------------------------------------------
@@ -137,7 +266,7 @@ def parse_coordinates(value: str) -> tuple[float, float]:
     if len(parts) != 2:
         raise errors.AutonomError(
             errors.INVALID_COORDINATES, f"expected 'lat,lon', got {value!r}",
-            "Example: --at 55.751244,37.618423",
+            "Pass latitude,longitude, e.g. 'autonom location set 55.751244,37.618423'.",
         )
     try:
         latitude, longitude = float(parts[0]), float(parts[1])
@@ -367,38 +496,99 @@ def crash_show(target: Target, name: str) -> str:
 # --- app-container files -----------------------------------------------------
 
 
-def safe_relative(remote: str) -> str:
-    """Reject anything that escapes the app container after normalization (INV-09)."""
+_PATH_EXAMPLES = {
+    IOS: "Documents/state.json",
+    ANDROID: "files/state.json or shared_prefs/<name>.xml",
+}
+
+
+def _path_hint(platform: str | None) -> str:
+    example = _PATH_EXAMPLES.get(platform or "") or (
+        f"{_PATH_EXAMPLES[IOS]} (iOS) or {_PATH_EXAMPLES[ANDROID]} (Android)")
+    return f"Pass a container-relative path such as {example}."
+
+
+def safe_relative(remote: str, platform: str | None = None) -> str:
+    """Reject anything that escapes the app container after normalization (INV-09).
+
+    Only a `..` path *component* escapes; a file name that merely contains two
+    dots (`a..b`) is an ordinary name and stays allowed."""
     candidate = (remote or "").strip()
+    hint = _path_hint(platform)
     if not candidate:
         raise errors.AutonomError(
-            errors.PATH_OUTSIDE_CONTAINER, "an empty path is not inside the container",
-            "Pass a container-relative path such as Documents/state.json.",
+            errors.PATH_OUTSIDE_CONTAINER, "an empty path is not inside the container", hint,
         )
     if candidate.startswith(("/", "~")):
         raise errors.AutonomError(
-            errors.PATH_OUTSIDE_CONTAINER, f"absolute paths are not allowed: {remote}",
-            "Pass a container-relative path such as Documents/state.json.",
+            errors.PATH_OUTSIDE_CONTAINER, f"absolute paths are not allowed: {remote}", hint,
         )
     normalized = os.path.normpath(candidate)
     if normalized == ".." or normalized.startswith("../") or normalized.startswith("/"):
         raise errors.AutonomError(
-            errors.PATH_OUTSIDE_CONTAINER, f"path escapes the app container: {remote}",
-            "Pass a container-relative path such as Documents/state.json.",
+            errors.PATH_OUTSIDE_CONTAINER, f"path escapes the app container: {remote}", hint,
         )
     return normalized
 
 
+def _path_not_found(app_id: str, relative: str, platform: str) -> errors.AutonomError:
+    """A container path that does not exist.
+
+    Emitted as `body_file_not_found` — the code `file ls` has always used here,
+    kept because codes are never repurposed or removed — with `detail:
+    path_not_found` so a caller can tell it from a missing network-mock body.
+    """
+    return errors.AutonomError(
+        errors.BODY_FILE_NOT_FOUND,
+        f"no such path in the {app_id} container: {relative}",
+        f"List the container first: 'autonom file ls --app-id {app_id}'. "
+        + _path_hint(platform),
+        detail="path_not_found",
+    )
+
+
+def _is_a_directory(app_id: str, relative: str) -> errors.AutonomError:
+    return errors.AutonomError(
+        errors.INVALID_VALUE,
+        f"{relative} in the {app_id} container is a directory, not a file",
+        f"'file pull' copies one file; list the directory with "
+        f"'autonom file ls {relative} --app-id {app_id}' and pull a file from it.",
+        detail="is_a_directory",
+    )
+
+
+def _shell_complaint(tool: str, relative: str, output: str) -> str | None:
+    """What `cat`/`ls` said about `relative`, when that is all the output is.
+
+    `exec-out` merges stderr into stdout and exits 0, so a missing file comes
+    back as the one line `cat: files/x: No such file or directory` — which
+    `file pull` used to write to disk as if it were the file.
+    """
+    first = (output or "").lstrip().split("\n", 1)[0].strip()
+    if not first.startswith(f"{tool}: ") or relative not in first:
+        return None
+    lowered = first.lower()
+    if "no such file or directory" in lowered:
+        return "missing"
+    if "is a directory" in lowered:
+        return "directory"
+    return None
+
+
 def file_pull(target: Target, app_id: str, remote: str, destination: Path) -> dict[str, Any]:
-    relative = safe_relative(remote)
+    relative = safe_relative(remote, target.platform)
     destination = destination.expanduser()
     destination.parent.mkdir(parents=True, exist_ok=True)
 
     if target.platform == IOS:
         container = ios_simctl.app_container(target.tool, target.target_id, app_id, "data")
-        if container and (container / relative).exists():
-            data = (container / relative).read_bytes()
-            destination.write_bytes(data)
+        if container and container.is_dir():
+            source = container / relative
+            if source.is_dir():
+                raise _is_a_directory(app_id, relative)
+            if not source.exists():
+                raise _path_not_found(app_id, relative, IOS)
+            destination.write_bytes(source.read_bytes())
         else:
             ios_idb.file_pull(target, app_id, relative, destination)
     else:
@@ -409,7 +599,14 @@ def file_pull(target: Target, app_id: str, remote: str, destination: Path) -> di
         )
         assert isinstance(completed.stdout, bytes)
         stderr = (completed.stderr or b"").decode("utf-8", "replace")
-        _raise_if_run_as_refused(app_id, stderr or completed.stdout.decode("utf-8", "replace"))
+        # Only the head can be a complaint; never decode a whole binary file.
+        head = completed.stdout[:512].decode("utf-8", "replace")
+        _raise_if_run_as_refused(app_id, stderr or head)
+        complaint = _shell_complaint("cat", relative, stderr or head)
+        if complaint == "missing":
+            raise _path_not_found(app_id, relative, ANDROID)
+        if complaint == "directory":
+            raise _is_a_directory(app_id, relative)
         if completed.returncode != 0:
             raise adb_mod.AdbError(stderr.strip() or f"run-as {app_id} cat {relative} failed")
         destination.write_bytes(completed.stdout)
@@ -419,13 +616,14 @@ def file_pull(target: Target, app_id: str, remote: str, destination: Path) -> di
 
 
 def file_ls(target: Target, app_id: str, remote: str = ".") -> list[str]:
-    relative = safe_relative(remote) if remote not in (".", "") else "."
+    relative = safe_relative(remote, target.platform) if remote not in (".", "") else "."
     if target.platform == IOS:
         container = ios_simctl.app_container(target.tool, target.target_id, app_id, "data")
         if not container:
             raise errors.AutonomError(
                 errors.APP_NOT_INSTALLED, f"no data container for {app_id}",
-                "System apps (com.apple.*) expose no data container; for your own app "
+                "Either the app is not installed or it has no data container. System "
+                "apps vary (com.apple.Maps has one, com.apple.Preferences does not); "
                 "check the bundle id with 'xcrun simctl listapps <udid>'.",
             )
         if not container.is_dir():
@@ -436,11 +634,11 @@ def file_ls(target: Target, app_id: str, remote: str = ".") -> list[str]:
             )
         base = container if relative == "." else container / relative
         if not base.exists():
-            raise errors.AutonomError(
-                errors.PATH_OUTSIDE_CONTAINER if ".." in relative else errors.BODY_FILE_NOT_FOUND,
-                f"no such path in the {app_id} container: {relative}",
-                "List the container root first: 'autonom file ls --app-id <id>'.",
-            )
+            # safe_relative already refused every escaping path, so a name
+            # like `a..b` is simply missing, not outside the container.
+            raise _path_not_found(app_id, relative, IOS)
+        if not base.is_dir():
+            return [base.name]
         return sorted(entry.name + ("/" if entry.is_dir() else "") for entry in base.iterdir())
     completed = adb_mod.run_adb(
         target.tool, ["exec-out", "run-as", app_id, "ls", "-1", relative],
@@ -451,6 +649,8 @@ def file_ls(target: Target, app_id: str, remote: str = ".") -> list[str]:
     # used to come back as one "file" named `run-as: package not an
     # application` with ok: true. Refuse by name instead.
     _raise_if_run_as_refused(app_id, text)
+    if _shell_complaint("ls", relative, text) == "missing":
+        raise _path_not_found(app_id, relative, ANDROID)
     if completed.returncode != 0:
         raise adb_mod.AdbError(text.strip() or f"run-as {app_id} ls {relative} failed")
     return [line.strip() for line in text.splitlines() if line.strip()]
@@ -466,10 +666,18 @@ def _raise_if_run_as_refused(app_id: str, output: str) -> None:
     lowered = (output or "").lower()
     if not lowered.startswith("run-as:") and "run-as:" not in lowered[:200]:
         return
+    first_line = output.strip().splitlines()[0][:160] if output.strip() else ""
+    if "unknown package" in lowered:
+        # Not a debuggability question: the package is not on the device.
+        raise errors.AutonomError(
+            errors.APP_NOT_INSTALLED,
+            f"{app_id} is not installed on the device: {first_line}",
+            "Check the package id with 'adb shell pm list packages', or install the app.",
+        )
     if any(marker.lower() in lowered for marker in _RUN_AS_REFUSALS):
         raise errors.AutonomError(
             errors.APP_NOT_DEBUGGABLE,
-            f"run-as refused {app_id}: {output.strip().splitlines()[0][:160]}",
+            f"run-as refused {app_id}: {first_line}",
             "Container files are readable only for debuggable builds (release and "
             "system apps refuse run-as). Install a debug build, or pull app data "
             "through the app's own export.",

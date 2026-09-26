@@ -587,9 +587,17 @@ class _Parser:
             i = match.end()
 
 
+def strip_bom(text: str) -> str:
+    """Drop one leading UTF-8 byte-order mark, if present."""
+    return text[1:] if text.startswith("\ufeff") else text
+
+
 def parse_document(text: str, path: str,
                    allow_flow_mappings: bool = False) -> FlowDocument:
     """Parse one flow file: header mapping, one ``---``, command sequence."""
+    # Editors on Windows save UTF-8 with a byte-order mark; it is encoding
+    # metadata, not content, and must not turn `schema` into a bad key.
+    text = strip_bom(text)
     raw_lines = text.split("\n")
     separators = [i for i, line in enumerate(raw_lines) if line.strip() == "---"]
     scratch = _Parser([], 1, path)  # error helper for document-level problems

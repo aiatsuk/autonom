@@ -46,21 +46,31 @@ def proxy_environment(port: int, host: str = "127.0.0.1") -> dict[str, str]:
 
 
 def manual_steps(port: int, certificate: Path | None) -> list[str]:
+    # The Simulator has no Wi-Fi settings pane: it uses the host Mac's network
+    # stack, so native URLSession traffic only follows the macOS system proxy.
+    # That is a host-wide change, which is why it is the operator's manual step
+    # and never something Autonom does itself.
     steps = [
-        f"1. Keep the proxy running on 127.0.0.1:{port}.",
-        "2. In the Simulator, open Settings → Wi-Fi → (i) → Configure Proxy → Manual, "
-        f"   then set Server 127.0.0.1 and Port {port}.",
+        f"Keep the proxy running on 127.0.0.1:{port}.",
+        "On the host Mac (this changes the proxy for the whole machine), open "
+        "System Settings > Network > <active service> > Details > Proxies, enable "
+        f"Web Proxy (HTTP) and Secure Web Proxy (HTTPS), and set both to "
+        f"127.0.0.1 port {port}.",
     ]
     if certificate:
         steps.append(
-            f"3. Trust the CA: xcrun simctl keychain <udid> add-root-cert {certificate} "
+            f"Trust the CA: xcrun simctl keychain <udid> add-root-cert {certificate} "
             "(or re-run attach with --install-ca)."
         )
     steps.append(
-        "4. Exercise the app, then run 'autonom network status' — it reports attached "
+        "Exercise the app, then run 'autonom network status' — it reports attached "
         "only once traffic has actually been observed."
     )
-    return steps
+    steps.append(
+        "When finished, switch both proxies off again in the same pane, so the "
+        "host stops routing through a proxy that is no longer running."
+    )
+    return [f"{index}. {step}" for index, step in enumerate(steps, start=1)]
 
 
 def install_ca_certificate(target: Target, record: dict[str, Any], *, acknowledged: bool) -> Path:
@@ -134,7 +144,10 @@ def attach(
         "device_proxy": f"127.0.0.1:{port}",
         "ca_installed": bool(certificate),
         "ca_certificate": str(certificate) if certificate else None,
+        # Kept as the string "unknown" for compatibility: nothing has been
+        # observed yet. How far the attach got is the additive `attach_state`.
         "attached": "unknown",
+        "attach_state": "manual",
         "warnings": [{
             "code": "urlsession_not_covered",
             "error": URLSESSION_CAVEAT,

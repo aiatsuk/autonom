@@ -19,9 +19,25 @@ Physical devices are out of scope: they need Developer Mode, signing, and tunnel
 python3 <autonom-root>/scripts/autonom.py doctor
 ```
 
-Everything except `ui *` works with Xcode alone. The accessibility tree and
-gestures additionally need `idb` plus `idb_companion`; `doctor` reports both and
-prints the exact install command when either is missing.
+Everything except `ui *` works with Xcode alone. The accessibility tree
+additionally needs `idb` plus `idb_companion`; input (tap, swipe, type, key)
+needs a companion that can load SimulatorKit, or AXe. `doctor` reports
+`capabilities.ios_tree` and `capabilities.ios_hid` separately and prints the
+exact fix for each gap.
+
+**Xcode 27 trap:** SimulatorKit moved to `Contents/SharedFrameworks`, and an
+`idb_companion` built before that looks in `Library/PrivateFrameworks`. The
+tree still works, but every input fails with `ios_hid_framework_missing`.
+Fix it with `brew update && brew upgrade idb-companion`, or install AXe
+(`brew install cameroncooke/axe/axe`): the default `--ios-hid auto` then
+routes input through AXe while the tree stays on idb, and each `ui` input
+payload reports `backend: axe`. Pin a route with `--ios-hid idb|axe` (or
+`AUTONOM_IOS_HID`) before the verb. Do not report a failed tap as an app
+defect until `doctor` shows input ready. On Xcode 27 with AXe carrying input,
+`capabilities.ios_hid.ready` stays `false` (it describes idb's own HID) while
+`ios_hid.axe_ready` is `true`, `ios_hid.backend` is `axe`, and
+`capabilities.ios_ui.ready` is `true`: read `ios_ui` and `axe_ready`, and keep
+going — input works.
 
 ## 1. Build
 
@@ -54,8 +70,11 @@ python3 <autonom-root>/scripts/autonom.py session start \
   --install <path>.app --launch --app-id <bundle-id> --log-stream
 ```
 
-`--log-stream` starts a background `log stream` for the session, which makes
-`logs tail` cheap afterwards. Without it, tailing falls back to `log show`.
+`--log-stream` starts a background `log stream` for the session, filtered to
+the app and capped on disk (`AUTONOM_IOS_LOG_MAX_MB`, default 50, one
+rotation), which makes `logs tail` cheap afterwards. Without it, tailing
+falls back to `log show`. A second `session start` while one is live is
+refused with `session_already_active`; stop the old one first.
 
 ## 3. Reproduce and capture
 
@@ -97,6 +116,14 @@ python3 <autonom-root>/scripts/autonom.py file pull Documents/state.json --app-i
 python3 <autonom-root>/scripts/autonom.py session launch <bundle-id> --setenv FLAVOR=staging
 python3 <autonom-root>/scripts/autonom.py simulator biometric enroll     # then match | nonmatch | unenroll
 ```
+
+`simulator biometric match|nonmatch` posts the Face ID notification on a
+Face ID device and the Touch ID one otherwise (both when the device type
+does not say; `biometry` reports which), through the Simulator's Darwin
+notifications. Nothing reports whether a prompt consumed it, so it answers
+`verified: false` with the reason in `verification`; prove the effect from
+the app's screen. Unknown
+actions are `invalid_simulator_action` with the valid list.
 
 File access is confined to the app container; a path that escapes it is refused.
 Pulled files are written into session artifacts and their contents are not echoed,

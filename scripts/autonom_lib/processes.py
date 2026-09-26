@@ -35,6 +35,9 @@ from . import session as session_mod
 # on "mitmdump" alone would sweep up a colleague's unrelated proxy.
 ADDON_MARKER = "mitm_addon.py"
 PROXY_MARKER = "autonom_dir="
+# `owner` of a process the harness itself keeps (an emulator from `devices
+# boot`) rather than a session. Owned for as long as it runs.
+HARNESS_OWNER = "harness"
 
 
 def registry_dir() -> Path:
@@ -97,6 +100,22 @@ def register(kind: str, pid: int, **detail: Any) -> dict[str, Any]:
     return entry
 
 
+def update(pid: int, **detail: Any) -> dict[str, Any] | None:
+    """Add fields to an existing entry (an emulator learns its serial late)."""
+    entries = _read()
+    for entry in entries:
+        if entry.get("pid") == pid:
+            entry.update(detail)
+            _write(entries)
+            return entry
+    return None
+
+
+def entries() -> list[dict[str, Any]]:
+    """The registry rows as recorded. Read-only."""
+    return [dict(item) for item in _read()]
+
+
 def deregister(pid: int) -> None:
     entries = _read()
     remaining = [item for item in entries if item.get("pid") != pid]
@@ -144,13 +163,26 @@ def discover_proxies() -> list[dict[str, Any]]:
     return found
 
 
+def harness_owned(entry: dict[str, Any]) -> bool:
+    """Kept by the harness itself rather than a session. Only `devices boot`
+    registers emulators, so an entry written before `owner` existed is the
+    same kind of process."""
+    return entry.get("owner") == HARNESS_OWNER or entry.get("kind") == "emulator"
+
+
 def _still_owned(entry: dict[str, Any]) -> bool:
     """Does an intact session still claim this process?
 
     A proxy whose artifacts directory or `proxy.json` has gone is answerable to
     nobody: `network stop` can no longer reach it, because the file it reads to
     find the pid is exactly what disappeared.
+
+    A harness-owned process (an emulator booted by `devices boot`) has no
+    session directory by design; it is owned while it runs, and released by
+    `devices shutdown`.
     """
+    if harness_owned(entry):
+        return True
     directory = entry.get("artifacts_dir")
     if not directory:
         return False
@@ -175,16 +207,21 @@ def scan() -> dict[str, Any]:
             # was lost, so nothing but this scan can ever find it again.
             entries[pid] = candidate
 
-    live, orphans, stale = [], [], []
+    live, orphans, stale, harness = [], [], [], []
     for pid, entry in sorted(entries.items()):
         if not session_mod.pid_alive(pid):
             stale.append(entry)
+        elif harness_owned(entry):
+            # Neither a session's live process nor an orphan: `live` is read
+            # as "serving some session" (doctor names foreign proxies from
+            # it), and an orphan is what `cleanup` kills.
+            harness.append(entry)
         elif _still_owned(entry):
             live.append(entry)
         else:
             entry.setdefault("reason", "no session owns this process any more")
             orphans.append(entry)
-    return {"live": live, "orphans": orphans, "stale_entries": stale}
+    return {"live": live, "orphans": orphans, "stale_entries": stale, "harness": harness}
 
 
 # --- reaping ------------------------------------------------------------------
@@ -205,7 +242,9 @@ def cleanup(*, dry_run: bool = False, include_live: bool = False) -> dict[str, A
 
     `include_live` exists for "stop everything Autonom started" — the honest
     escape hatch when a run is being abandoned. It is never the default: a live
-    proxy may be serving a session in another terminal.
+    proxy may be serving a session in another terminal. Harness-owned
+    processes (a booted emulator) are never terminated here; `devices
+    shutdown` is the verb that stops an emulator cleanly.
     """
     state = scan()
     targets = list(state["orphans"])
@@ -235,5 +274,6 @@ def cleanup(*, dry_run: bool = False, include_live: bool = False) -> dict[str, A
         "failed": sum(1 for item in actions if item["result"] == "termination_failed"),
         "stale_entries_reaped": reaped,
         "still_live": 0 if include_live else len(state["live"]),
+        "harness_owned": len(state["harness"]),
         "registry": str(registry_file()),
     }

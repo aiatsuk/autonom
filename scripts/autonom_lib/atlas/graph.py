@@ -23,6 +23,36 @@ def _now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
+def _time_key(stamp: str | None) -> str:
+    """Comparable form of both stamp shapes (``...:05Z``, ``...:05.123Z``)."""
+    if not stamp:
+        return ""
+    body = stamp.rstrip("Z")
+    if "." not in body:
+        body += ".000"
+    return body
+
+
+def _later(current: str | None, observed: str) -> str:
+    return observed if _time_key(observed) >= _time_key(current) else current
+
+
+def _earlier(current: str | None, observed: str) -> str:
+    if not current:
+        return observed
+    return observed if _time_key(observed) < _time_key(current) else current
+
+
+def _in_app(screen: dict[str, Any], app_id: str | None) -> bool:
+    """A screen belongs to the app unless its foreground package says not.
+
+    Screens fingerprinted before the package was recorded (and platforms
+    that do not report one) carry no package and cannot be proven foreign.
+    """
+    package = screen.get("package")
+    return not (app_id and package and package != app_id)
+
+
 def apps_home() -> Path:
     home = os.environ.get("AUTONOM_HOME")
     base = Path(home) if home else Path.home() / ".autonom"
@@ -67,21 +97,29 @@ def save(app_id: str, graph: dict[str, Any]) -> Path:
 
 
 def _touch_screen(graph: dict[str, Any], screen: dict[str, Any],
-                  evidence: dict[str, Any]) -> str:
+                  evidence: dict[str, Any], observed_at: str | None = None) -> str:
+    # first/last seen are *observation* times (the event's wall time), not
+    # the time of this ingest — re-ingesting an old run never makes a screen
+    # look freshly seen.
+    observed = observed_at or _now()
     screen_id = screen["structure"]
     entry = graph["screens"].setdefault(screen_id, {
         "screen_id": screen_id, "labels": screen.get("labels", []),
-        "first_seen": _now(), "last_seen": None,
+        "first_seen": observed, "last_seen": None,
         "variants": {}, "sessions": [],
     })
-    entry["last_seen"] = _now()
+    entry["first_seen"] = _earlier(entry.get("first_seen"), observed)
+    entry["last_seen"] = _later(entry.get("last_seen"), observed)
+    if screen.get("package") and not entry.get("package"):
+        entry["package"] = screen["package"]
     for label in screen.get("labels", []):
         if label not in entry["labels"]:
             entry["labels"].append(label)
     entry["labels"] = entry["labels"][:5]
     variant = entry["variants"].setdefault(screen["state"], {
-        "first_seen": _now(), "last_seen": None, "count": 0})
-    variant["last_seen"] = _now()
+        "first_seen": observed, "last_seen": None, "count": 0})
+    variant["first_seen"] = _earlier(variant.get("first_seen"), observed)
+    variant["last_seen"] = _later(variant.get("last_seen"), observed)
     variant["count"] += 1
     session_id = evidence.get("session_id")
     if session_id and session_id not in entry["sessions"]:
@@ -91,16 +129,19 @@ def _touch_screen(graph: dict[str, Any], screen: dict[str, Any],
 
 def _touch_transition(graph: dict[str, Any], source: str, target: str,
                       command: str, detail: str | None,
-                      ok: bool, evidence: dict[str, Any]) -> None:
+                      ok: bool, evidence: dict[str, Any],
+                      observed_at: str | None = None) -> None:
     if source == target:
         return  # an action that did not change the screen is not an edge
+    observed = observed_at or _now()
     key = f"{source}->{target}::{command}"
     entry = graph["transitions"].setdefault(key, {
         "from": source, "to": target, "command": command, "detail": detail,
         "success": 0, "failure": 0,
-        "first_seen": _now(), "last_seen": None, "evidence": [],
+        "first_seen": observed, "last_seen": None, "evidence": [],
     })
-    entry["last_seen"] = _now()
+    entry["first_seen"] = _earlier(entry.get("first_seen"), observed)
+    entry["last_seen"] = _later(entry.get("last_seen"), observed)
     entry["success" if ok else "failure"] += 1
     reference = {k: v for k, v in evidence.items() if v is not None}
     if reference and reference not in entry["evidence"]:
@@ -108,8 +149,15 @@ def _touch_transition(graph: dict[str, Any], source: str, target: str,
 
 
 def ingest_flow_events(graph: dict[str, Any], events: list[dict[str, Any]],
-                       session_id: str | None) -> int:
-    """Consecutive step fingerprints become screens and edges."""
+                       session_id: str | None,
+                       app_id: str | None = None) -> int:
+    """Consecutive step fingerprints become screens and edges.
+
+    Only screens of ``app_id`` (default: the graph's own app) are ingested;
+    a step that left the app (a link opened in a browser) ends the chain, so
+    no edge ever spans the excursion.
+    """
+    app_id = app_id or graph.get("app_id")
     added = 0
     previous_screen: str | None = None
     pending: dict[str, Any] | None = None  # the step leaving previous_screen
@@ -118,18 +166,23 @@ def ingest_flow_events(graph: dict[str, Any], events: list[dict[str, Any]],
             continue
         payload = event.get("payload") or {}
         screen = payload.get("screen")
+        observed = event.get("wall_time") or event.get("timestamp")
+        if screen and not _in_app(screen, app_id):
+            previous_screen = None
+            pending = None
+            continue
         evidence = {"session_id": session_id,
                     "run_id": event.get("run_id"),
                     "step_index": payload.get("step_index")}
         if pending is not None and screen:
-            target = _touch_screen(graph, screen, evidence)
+            target = _touch_screen(graph, screen, evidence, observed)
             _touch_transition(
                 graph, pending["from"], target, pending["command"],
-                pending.get("detail"), pending["ok"], evidence)
+                pending.get("detail"), pending["ok"], evidence, observed)
             added += 1
             pending = None
         if screen:
-            previous_screen = _touch_screen(graph, screen, evidence)
+            previous_screen = _touch_screen(graph, screen, evidence, observed)
         if previous_screen and payload.get("command") in (
                 "tapOn", "longPressOn", "doubleTapOn", "swipe", "back",
                 "openLink", "pressKey", "scrollUntilVisible", "launchApp"):
@@ -146,20 +199,31 @@ def ingest_flow_events(graph: dict[str, Any], events: list[dict[str, Any]],
 
 def ingest_action_details(graph: dict[str, Any],
                           details: list[dict[str, Any]],
-                          session_id: str | None) -> int:
-    """Manual sessions: each tap detail carries the tree seen *before* it."""
+                          session_id: str | None,
+                          app_id: str | None = None) -> int:
+    """Manual sessions: each tap detail carries the tree seen *before* it.
+
+    Same app scope as flow events. Detail records carry no timestamp, so
+    their observation time is the detail's ``at``/``recorded_at`` when
+    present, else the ingest time.
+    """
+    app_id = app_id or graph.get("app_id")
     added = 0
     pending: dict[str, Any] | None = None
     for detail in details:
         if detail.get("kind") != "tap" or not detail.get("nodes"):
             continue
         screen = fingerprint_mod.fingerprint(detail["nodes"])
+        if not _in_app(screen, app_id):
+            pending = None
+            continue
+        observed = detail.get("at") or detail.get("recorded_at")
         evidence = {"session_id": session_id}
-        screen_id = _touch_screen(graph, screen, evidence)
+        screen_id = _touch_screen(graph, screen, evidence, observed)
         if pending is not None:
             _touch_transition(graph, pending["from"], screen_id,
                               pending["command"], pending.get("detail"),
-                              True, evidence)
+                              True, evidence, observed)
             added += 1
         pending = {
             "from": screen_id,
@@ -258,7 +322,54 @@ def paths(graph: dict[str, Any], source_query: str,
     }
 
 
+def validate_snapshot(value: Any, source: str = "snapshot") -> dict[str, Any]:
+    """Refuse anything that is not an Atlas graph (``atlas export`` output).
+
+    Without this, diffing against an arbitrary JSON file reports every
+    screen as added — a confident answer about nothing.
+    """
+    problems = []
+    if not isinstance(value, dict):
+        problems.append("not a JSON object")
+    else:
+        if not isinstance(value.get("schema_version"), int) \
+                or isinstance(value.get("schema_version"), bool):
+            problems.append("no integer schema_version")
+        elif value["schema_version"] > ATLAS_SCHEMA_VERSION:
+            problems.append(f"schema_version {value['schema_version']} is "
+                            f"newer than {ATLAS_SCHEMA_VERSION}")
+        for key in ("screens", "transitions"):
+            if not isinstance(value.get(key), dict):
+                problems.append(f"no {key} map")
+    if problems:
+        raise errors.AutonomError(
+            errors.INVALID_VALUE,
+            f"{source} is not an Atlas graph snapshot: {'; '.join(problems)}",
+            hint="Create one with 'autonom atlas export --out <file>'.",
+            file=source, problems=problems,
+        )
+    return value
+
+
+def load_snapshot(path: Path) -> dict[str, Any]:
+    """Read and validate an exported Atlas snapshot file."""
+    path = Path(path)
+    if not path.is_file():
+        raise errors.AutonomError(
+            errors.FLOW_FILE_NOT_FOUND, f"no atlas snapshot at {path}",
+            hint="Create one with 'autonom atlas export --out <file>'.",
+            file=str(path),
+        )
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        value = None
+    return validate_snapshot(value, str(path))
+
+
 def diff(base: dict[str, Any], head: dict[str, Any]) -> dict[str, Any]:
+    validate_snapshot(base, "base")
+    validate_snapshot(head, "head")
     base_screens = set(base.get("screens", {}))
     head_screens = set(head.get("screens", {}))
     base_edges = set(base.get("transitions", {}))
