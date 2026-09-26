@@ -80,6 +80,101 @@ def source_sha256(flow: schema_mod.Flow) -> str | None:
     return getattr(flow, "source_sha256", None)
 
 
+def _all_steps(steps):
+    """Every step, composite bodies included (inline runFlow, group, retry,
+    repeat) — the same file only, never a runFlow ``file:`` child."""
+    for step in steps:
+        yield step
+        nested = step.args.get("commands")
+        if isinstance(nested, list):
+            yield from _all_steps(nested)
+
+
+def _check_links(flow: schema_mod.Flow) -> None:
+    """An ``openLink`` URL must be absolute (carry a scheme).
+
+    A recorded ``open <url> --serial S`` once compiled to ``openLink:
+    emulator-5556``; the OS cannot open that, and the run only failed on the
+    device. A URL that starts with ``${VAR}`` is judged at run time.
+    """
+    for step in _all_steps((*flow.on_flow_start, *flow.steps,
+                            *flow.on_flow_complete)):
+        if step.command != "openLink":
+            continue
+        url = step.args.get("url", "")
+        if schema_mod.url_has_scheme(url) is False:
+            raise errors.AutonomError(
+                errors.FLOW_COMMAND_INVALID,
+                f"{flow.path}:{step.line}:{step.col}: openLink url {url!r} has "
+                "no scheme",
+                hint="openLink takes an absolute URL: myapp://path or "
+                     "https://host/path.",
+                file=flow.path, line=step.line, column=step.col,
+                command="openLink",
+            )
+
+
+def _ios_blockers(flow: schema_mod.Flow, path: Path, cache: dict) -> list:
+    """``(owner flow, step, (code, message, hint))`` for every step that would
+    run on iOS but cannot.
+
+    Walks hooks, composite bodies, and runFlow ``file:`` children already in
+    ``cache`` (a child's own hooks never run, as in the executor). A runFlow
+    whose ``when.platform`` names another platform never runs on iOS, so its
+    body does not count.
+    """
+    found: list = []
+    visited: set = set()
+
+    def walk(steps, owner: schema_mod.Flow, owner_path: Path) -> None:
+        for step in steps:
+            if step.command == "runFlow":
+                when = step.args.get("when")
+                if when is not None and when.platform and when.platform != "ios":
+                    continue
+                if "commands" in step.args:
+                    walk(step.args["commands"], owner, owner_path)
+                elif "file" in step.args:
+                    target = (owner_path.parent / step.args["file"]).resolve()
+                    child = cache.get(target)
+                    if child is not None and target not in visited:
+                        visited.add(target)
+                        walk(child.steps, child, target)
+                continue
+            nested = step.args.get("commands")
+            if isinstance(nested, list):
+                walk(nested, owner, owner_path)
+                continue
+            reason = schema_mod.android_only(step)
+            if reason is not None:
+                found.append((owner, step, reason))
+
+    walk((*flow.on_flow_start, *flow.steps, *flow.on_flow_complete), flow, path)
+    return found
+
+
+def _platforms(flow: schema_mod.Flow, blockers: list) -> list[str]:
+    declared = list(flow.requires_platforms or schema_mod.PLATFORMS)
+    if blockers:
+        declared = [platform for platform in declared if platform != "ios"]
+    return declared
+
+
+def flow_platforms(flow: schema_mod.Flow) -> list[str]:
+    """The platforms ``flow`` can actually run on.
+
+    ``requires.platform`` when declared, else both — minus iOS when a step
+    that runs there is Android-only (``back``, ``clearState``,
+    ``setOrientation``, ``launchApp.clearState``, a ``KEYCODE_*`` key). A flow
+    from ``validate_tree`` counts its runFlow children; one from ``load_flow``
+    only its own steps.
+    """
+    inferred = getattr(flow, "inferred_platforms", None)
+    if inferred is not None:
+        return list(inferred)
+    return _platforms(flow, _ios_blockers(flow, Path(flow.path), {}))
+
+
 def _subflow_steps(flow: schema_mod.Flow):
     def walk(steps):
         for step in steps:
@@ -116,6 +211,7 @@ def validate_tree(path: Path, root: Path | None = None,
         return cache[resolved]
 
     flow = load_flow(resolved)
+    _check_links(flow)
     stack.append(resolved)
     try:
         for step in _subflow_steps(flow):
@@ -154,6 +250,18 @@ def validate_tree(path: Path, root: Path | None = None,
             validate_tree(target, root=root, _stack=stack, _cache=cache)
     finally:
         stack.pop()
+    blockers = _ios_blockers(flow, resolved, cache)
+    if blockers and "ios" in flow.requires_platforms:
+        owner, step, (code, message, hint) = blockers[0]
+        raise errors.AutonomError(
+            code,
+            f"{owner.path}:{step.line}:{step.col}: {message}, but "
+            f"{flow.path} declares requires.platform ios",
+            hint=f"{hint} Or drop ios from requires.platform.",
+            file=owner.path, line=step.line, column=step.col,
+            command=step.command, platforms=flow.requires_platforms,
+        )
+    flow.inferred_platforms = _platforms(flow, blockers)
     cache[resolved] = flow
     return flow
 

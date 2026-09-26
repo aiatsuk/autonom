@@ -4,6 +4,7 @@ Three follow shapes share one NDJSON line protocol on stdout:
 
 - ``follow_file``    — tail a file under the session artifacts dir;
 - ``follow_process`` — stream a device-log subprocess (adb logcat, log stream);
+  ``follow_processes`` merges several (a uid logcat plus a lifecycle one);
 - ``follow_poll``    — poll a store and emit only items not seen before.
 
 Every follow is bounded by ``--max-seconds`` / ``--max-lines`` and always ends
@@ -21,7 +22,10 @@ from __future__ import annotations
 import os
 import re
 import selectors
+import shlex
+import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -32,8 +36,22 @@ from . import errors
 # writer forgot to register). Kind mirrors the registered vocabulary.
 _SCAN_DIRS = (("output", "output"), ("logs", "device_log"), ("network", "network"))
 _SCAN_SUFFIXES = {".log", ".ndjson", ".jsonl", ".txt"}
+# Evidence a session writes but nobody tails: metric snapshots, heap dumps,
+# trace bundles (an Instruments `.trace` is a directory) and screen
+# recordings. `session outputs` used to omit them, so a run's heaviest
+# evidence was invisible to the verb that lists a session's outputs. Every
+# entry is listed; only text files are marked followable.
+_ARTIFACT_DIRS = (("metrics", "metrics"), ("recordings", "recording"))
 
 _READ_CHUNK = 1 << 20  # drain in bounded slices, never the whole file at once
+
+
+def _opener() -> str | None:
+    """The desktop "open this file" command for this host, if any: `open`
+    on macOS, `xdg-open` where it is installed, nothing otherwise."""
+    if sys.platform == "darwin":
+        return "open"
+    return "xdg-open" if shutil.which("xdg-open") else None
 
 
 def _now() -> str:
@@ -59,24 +77,35 @@ def confine(artifacts_dir: Path, raw: str) -> Path:
 
 
 def _entry(base: Path, *, stream_id: str, kind: str, rel: str,
-           label: str | None = None, pid: int | None = None) -> dict[str, Any]:
+           label: str | None = None, pid: int | None = None,
+           followable: bool = True) -> dict[str, Any]:
     path = base / rel
     entry: dict[str, Any] = {
         "id": stream_id,
         "kind": kind,
         "path": rel,
         "abs_path": str(path),
-        "exists": path.is_file(),
+        "exists": path.is_file() or (not followable and path.exists()),
     }
-    if entry["exists"]:
+    if path.is_file():
         stat = path.stat()
         entry["bytes"] = stat.st_size
         entry["mtime"] = time.strftime(
             "%Y-%m-%dT%H:%M:%SZ", time.gmtime(stat.st_mtime))
+    elif entry["exists"]:  # a bundle directory such as an Instruments .trace
+        entry["directory"] = True
+        entry["mtime"] = time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ", time.gmtime(path.stat().st_mtime))
     if label:
         entry["label"] = label
     if pid:
         entry["pid"] = pid
+    entry["followable"] = followable
+    if not followable:
+        opener = _opener()
+        if opener:  # no hint where no opener is known; abs_path is the answer
+            entry["shell_hint"] = f"{opener} {shlex.quote(str(path))}"
+        return entry
     if kind == "journal":
         entry["follow_hint"] = "autonom journal --follow"
     else:
@@ -114,6 +143,18 @@ def catalog(record: dict[str, Any]) -> list[dict[str, Any]]:
     if "journal.ndjson" not in seen and (base / "journal.ndjson").is_file():
         entries.append(_entry(base, stream_id="journal", kind="journal",
                               rel="journal.ndjson"))
+    for dirname, kind in _ARTIFACT_DIRS:
+        directory = base / dirname
+        if not directory.is_dir():
+            continue
+        for item in sorted(directory.iterdir()):
+            rel = f"{dirname}/{item.name}"
+            if rel in seen or item.name.startswith("."):
+                continue
+            seen.add(rel)
+            text = item.is_file() and item.suffix in _SCAN_SUFFIXES
+            entries.append(_entry(base, stream_id=rel.replace("/", ":", 1),
+                                  kind=kind, rel=rel, followable=text))
     return entries
 
 
@@ -125,7 +166,7 @@ def resolve_source(record: dict[str, Any], source: str) -> Path:
             return confine(base, stream["path"])
     if ":" in source:
         dirname, name = source.split(":", 1)
-        if dirname in {d for d, _ in _SCAN_DIRS}:
+        if dirname in {d for d, _ in _SCAN_DIRS + _ARTIFACT_DIRS}:
             return confine(base, f"{dirname}/{name}")
     if source == "journal":
         return confine(base, "journal.ndjson")
@@ -252,9 +293,11 @@ def follow_file(
 
 
 def _eof_line(emit: Callable[[Any], None], reason: str, emitted: int,
-              source: str) -> dict[str, Any]:
+              source: str, detail: dict[str, Any] | None = None) -> dict[str, Any]:
     payload = {"kind": "eof", "reason": reason, "lines": emitted,
                "source": source}
+    for key, value in (detail or {}).items():
+        payload.setdefault(key, value)
     emit(payload)
     return payload
 
@@ -269,69 +312,137 @@ def follow_process(
     grep: str | None = None,
     line_filter: Callable[[str], bool] | None = None,
     clock: Callable[[], float] = time.monotonic,
+    warnings: list[dict[str, Any]] | None = None,
+    detail: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Stream a log subprocess's stdout line by line until a bound is hit or
     the process ends. The child is always reaped; when it closes its stream,
     a final unterminated line is still emitted — the writer is done, so the
     fragment is complete evidence."""
+    return follow_processes([(argv, line_filter)], source=source, emit=emit,
+                            max_seconds=max_seconds, max_lines=max_lines, grep=grep,
+                            clock=clock, warnings=warnings, detail=detail)
+
+
+_DEDUP_WINDOW = 512  # recent lines remembered per stream for cross-stream dedup
+
+
+def follow_processes(
+    streams: list[tuple[Any, ...]],
+    *,
+    source: str,
+    emit: Callable[[Any], None],
+    max_seconds: float = 0.0,
+    max_lines: int = 0,
+    grep: str | None = None,
+    clock: Callable[[], float] = time.monotonic,
+    warnings: list[dict[str, Any]] | None = None,
+    detail: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Follow several log subprocesses as one stream (`logs follow --package`
+    on API 31+ runs the app's uid logcat and a lifecycle-tag logcat side by
+    side, because one logcat cannot OR the two filters).
+
+    Each ``(argv, line_filter[, ended_warning])`` entry is one child. A line
+    both children print — the app's own AndroidRuntime lines are in each — is
+    emitted once. ``warnings`` are emitted first as ``{"kind": "warning",
+    ...}`` lines, so a degraded filter is announced before its output; a
+    child that ends while others still run emits its ``ended_warning`` the
+    same way, so a follow never silently loses half its filter. ``detail`` is
+    merged into the final eof line. The stream ends when every child has
+    ended, or at the first bound.
+    """
     pattern = _compile(grep)
     deadline = clock() + max_seconds if max_seconds > 0 else None
+    for warning in warnings or []:
+        emit({"kind": "warning", "source": source, **warning})
     emitted = 0
-    try:
-        process = subprocess.Popen(  # noqa: S603 - argv built by the caller
-            argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-    except OSError as exc:
-        raise errors.AutonomError(
-            errors.BACKEND_FAILED, f"could not start {argv[0]}: {exc}")
-    assert process.stdout is not None
+    processes: list[subprocess.Popen] = []
     selector = selectors.DefaultSelector()
-    selector.register(process.stdout, selectors.EVENT_READ)
-    buffer = b""
     reason = None
+    buffers: dict[int, bytes] = {}
+    filters: dict[int, Callable[[str], bool] | None] = {}
+    ended_warnings: dict[int, dict[str, Any] | None] = {}
+    recent: dict[int, list[str]] = {}
 
-    def push(line: str) -> bool:
+    def push(index: int, line: str) -> bool:
         """Emit one line; True when the max_lines bound has been reached."""
         nonlocal emitted
         if pattern and not pattern.search(line):
             return False
+        line_filter = filters.get(index)
         if line_filter and not line_filter(line):
             return False
+        if len(processes) > 1:
+            for other, lines in recent.items():
+                if other != index and line in lines:
+                    lines.remove(line)  # seen from the other child: once is enough
+                    return False
+            mine = recent.setdefault(index, [])
+            mine.append(line)
+            del mine[:-_DEDUP_WINDOW]
         emit({"kind": "line", "source": source, "ts": _now(), "text": line})
         emitted += 1
         return bool(max_lines and emitted >= max_lines)
 
     try:
-        while reason is None:
+        for index, spec in enumerate(streams):
+            argv, line_filter = spec[0], spec[1]
+            ended_warnings[index] = spec[2] if len(spec) > 2 else None
+            try:
+                process = subprocess.Popen(  # noqa: S603 - argv built by the caller
+                    argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            except OSError as exc:
+                raise errors.AutonomError(
+                    errors.BACKEND_FAILED, f"could not start {argv[0]}: {exc}")
+            assert process.stdout is not None
+            processes.append(process)
+            filters[index] = line_filter
+            buffers[index] = b""
+            selector.register(process.stdout, selectors.EVENT_READ, index)
+        open_streams = len(processes)
+        while reason is None and open_streams:
             timeout = 0.25
             if deadline is not None:
                 timeout = min(timeout, max(0.0, deadline - clock()))
-            if selector.select(timeout):
-                chunk = os.read(process.stdout.fileno(), 65536)
-                if not chunk:  # the process closed stdout: flush the tail
-                    if buffer and reason is None:
-                        push(_decode(buffer))
-                        buffer = b""
-                    reason = reason or "stream_ended"
-                    break
-                buffer += chunk
-                *complete, buffer = buffer.split(b"\n")
+            for key, _events in selector.select(timeout):
+                index = key.data
+                chunk = os.read(key.fileobj.fileno(), 65536)  # type: ignore[union-attr]
+                if not chunk:  # this child closed stdout: flush its tail
+                    selector.unregister(key.fileobj)
+                    open_streams -= 1
+                    if buffers[index] and reason is None:
+                        if push(index, _decode(buffers[index])):
+                            reason = "max_lines"
+                        buffers[index] = b""
+                    if reason is None and open_streams and ended_warnings.get(index):
+                        emit({"kind": "warning", "source": source,
+                              **ended_warnings[index]})  # type: ignore[arg-type]
+                    continue
+                buffers[index] += chunk
+                *complete, buffers[index] = buffers[index].split(b"\n")
                 for raw_line in complete:
-                    if push(_decode(raw_line)):
+                    if push(index, _decode(raw_line)):
                         reason = "max_lines"
                         break
+                if reason is not None:
+                    break
             if reason is None and deadline is not None and clock() >= deadline:
                 reason = "max_seconds"
     finally:
         selector.close()
-        if process.poll() is None:
-            process.terminate()
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait()
-        process.stdout.close()
-    return _eof_line(emit, reason or "stream_ended", emitted, source)
+        for process in processes:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+            if process.stdout is not None:
+                process.stdout.close()
+    payload = _eof_line(emit, reason or "stream_ended", emitted, source, detail)
+    return payload
 
 
 def follow_poll(

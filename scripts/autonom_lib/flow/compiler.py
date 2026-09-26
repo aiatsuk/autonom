@@ -27,7 +27,7 @@ from .. import errors
 from .. import journal as journal_mod
 from .canonical import emit_flow
 from .parser import parse_document
-from .schema import Flow, FlowSelector, Step, build_flow
+from .schema import Flow, FlowSelector, Step, build_flow, url_has_scheme
 from ..contracts import stable_id
 
 _CREDENTIAL_HINT = re.compile(
@@ -39,6 +39,87 @@ _NOISE_VERBS = {
     "network requests", "network status", "record start", "record stop",
     "flow", "crash", "file", "logs",
 }
+
+
+# The value-taking options of the verbs compiled below, as build_parser() in
+# scripts/autonom.py declares them: the target flags every leaf verb repeats
+# (plus the global-only --axe/--ios-hid), then each verb's own. A journal
+# argv is read with these, so `open URL --serial S` yields URL — never S.
+_TARGET_VALUE_FLAGS = (
+    "--platform", "--target", "--serial", "--udid", "--adb", "--simctl",
+    "--idb", "--idb-host", "--idb-port", "--axe", "--ios-hid",
+)
+_VERB_OPTIONS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
+    # verb: (value-taking options, switches)
+    "open": ((), ()),
+    "session launch": (("--activity", "--arg", "--setenv"), ("--fresh",)),
+    "session force-stop": ((), ()),
+    "session clear": (("--strategy",), ()),
+    "session uninstall": ((), ()),
+    "ui key": ((), ()),
+    "location set": ((), ()),
+    "permissions": ((), ()),
+}
+_NEGATIVE_NUMBER_RE = re.compile(r"^-\.?\d")
+# `session launch` options Flow v1 launchApp cannot express (schema.py:
+# launchApp takes clearState, resume, label, postcondition only)
+_LAUNCH_ONLY_OPTIONS = ("--activity", "--arg", "--setenv")
+
+
+def _resolve_option(token: str, known: tuple[str, ...],
+                    value_flags: tuple[str, ...]) -> str | None:
+    """The option a `--name` token means, with argparse's prefix rule."""
+    if token in known:
+        return token
+    candidates = [flag for flag in known if flag.startswith(token)]
+    if len(candidates) == 1:
+        return candidates[0]
+    if candidates and all(flag in value_flags for flag in candidates):
+        return candidates[0]  # ambiguous, but it takes a value either way
+    return None
+
+
+def _parse_argv(verb: str, argv: list[Any]) -> tuple[list[str], set[str]] | None:
+    """(positionals after the verb words, options present) for a journal argv.
+
+    Option values are never positionals: `--serial S` and `--label=x` are
+    skipped with their value wherever they sit (before the verb, between
+    positionals, at the end). A `--` before the verb path is complete is
+    dropped as argparse drops it; a later one makes the rest positional.
+    None when the argv does not spell `verb`.
+    """
+    values, switches = _VERB_OPTIONS.get(verb, ((), ()))
+    value_flags = _TARGET_VALUE_FLAGS + values
+    known = value_flags + switches
+    verb_words = verb.split()
+    tokens = [str(token) for token in argv]
+    words: list[str] = []
+    present: set[str] = set()
+    only_positionals = False
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        index += 1
+        if only_positionals:
+            words.append(token)
+        elif token == "--":
+            if len(words) >= len(verb_words):
+                only_positionals = True
+        elif token.startswith("--") and len(token) > 2:
+            name, equals, _value = token.partition("=")
+            option = _resolve_option(name, known, value_flags)
+            if option is not None:
+                present.add(option)
+                if option in value_flags and not equals:
+                    index += 1  # its value
+        elif token.startswith("-") and len(token) > 1 \
+                and not _NEGATIVE_NUMBER_RE.match(token):
+            continue  # a short switch (-h); none of these verbs takes a value
+        else:
+            words.append(token)
+    if words[:len(verb_words)] != verb_words:
+        return None
+    return words[len(verb_words):], present
 
 
 def _selector_from_detail(detail: dict[str, Any]) -> FlowSelector | None:
@@ -145,16 +226,56 @@ def compile_session(session: dict[str, Any], *, name: str | None = None,
         result = entry.get("result") or {}
         detail = details.get(result.get("detail", ""))
 
+        parsed = _parse_argv(verb, argv) if verb in _VERB_OPTIONS else None
+        positionals, options = parsed if parsed is not None else ([], set())
+        # The platform the action ran on: the journal entry's own result
+        # (every target verb records `platform` there), else the session's.
+        platform = result.get("platform") or session.get("platform")
+
         if verb == "session launch":
-            flow.steps.append(Step("launchApp", {}))
-            flow.app_id = flow.app_id or (argv[2] if len(argv) > 2 else None)
+            # `session launch` resumes the app where it was unless --fresh;
+            # a bare flow `launchApp` is the fresh launch
+            flow.steps.append(Step("launchApp", {} if "--fresh" in options
+                                   else {"resume": True}))
+            flow.app_id = flow.app_id or (positionals[0] if positionals else None)
+            dropped = sorted(options & set(_LAUNCH_ONLY_OPTIONS))
+            if dropped:
+                # launchApp carries no activity, arguments or environment;
+                # the launch compiles, these options do not (values stay out)
+                warn("launch_args_not_compilable",
+                     f"launchApp has no equivalent for {', '.join(dropped)}; "
+                     "the launch was compiled without them",
+                     seq=entry.get("seq"), options=dropped)
         elif verb == "session clear":
-            flow.steps.append(Step("clearState", {}))
+            if platform == "ios":
+                # clearState is Android-only (pm clear): emitting it would
+                # make the recorded flow unrunnable on the platform it came from
+                warn("clear_state_not_compilable_on_ios",
+                     "clearState is Android-only; on iOS declare "
+                     "'setup: {reset: true}' in the flow header (reinstalls "
+                     "from the recorded install path) or reset outside the flow",
+                     seq=entry.get("seq"), platform=platform)
+            else:
+                flow.steps.append(Step("clearState", {}))
         elif verb == "session force-stop":
             flow.steps.append(Step("stopApp", {}))
+        elif verb == "session uninstall":
+            warn("uninstall_not_compilable",
+                 "a flow cannot uninstall the app — replay needs it installed; "
+                 "reinstall outside the flow (session start --install) or use "
+                 "setup.reset (or clearState on Android) for a clean state",
+                 seq=entry.get("seq"))
         elif verb == "open":
-            url = argv[-1] if argv else None
-            if url:
+            url = positionals[0] if positionals else None
+            if not url:
+                warn("open_url_not_recoverable",
+                     "the journal argv of this 'open' carries no URL",
+                     seq=entry.get("seq"))
+            elif url_has_scheme(url) is False:
+                warn("open_url_not_compilable",
+                     f"{url!r} has no scheme; openLink needs an absolute URL",
+                     seq=entry.get("seq"))
+            else:
                 flow.steps.append(Step("openLink", {"url": url}))
         elif verb == "ui tap":
             if not detail or detail.get("coordinate"):
@@ -212,7 +333,7 @@ def compile_session(session: dict[str, Any], *, name: str | None = None,
             else:
                 flow.steps.append(Step("inputText", {"value": detail["text"]}))
         elif verb == "ui key":
-            key = argv[-1] if argv else None
+            key = positionals[0] if positionals else None
             if key == "KEYCODE_BACK":
                 flow.steps.append(Step("back", {}))
             elif key:
@@ -226,7 +347,7 @@ def compile_session(session: dict[str, Any], *, name: str | None = None,
             flow.steps.append(Step("takeScreenshot",
                                    {"label": label} if label else {}))
         elif verb == "location set":
-            coordinates = argv[-1] if argv else ""
+            coordinates = positionals[0] if positionals else ""
             if "," in coordinates:
                 latitude, longitude = coordinates.split(",", 1)
                 try:
@@ -236,10 +357,10 @@ def compile_session(session: dict[str, Any], *, name: str | None = None,
                 except ValueError:
                     pass
         elif verb == "permissions":
-            if len(argv) >= 3:
-                args = {"action": argv[1], "service": argv[2]}
-                if len(argv) >= 4 and not argv[3].startswith("-"):
-                    args["appId"] = argv[3]
+            if len(positionals) >= 2:
+                args = {"action": positionals[0], "service": positionals[1]}
+                if len(positionals) >= 3:
+                    args["appId"] = positionals[2]
                 flow.steps.append(Step("setPermissions", args))
         elif verb == "ui swipe":
             warn("swipe_not_compilable",

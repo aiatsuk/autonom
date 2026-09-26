@@ -800,7 +800,7 @@ class ControlActionTests(HardeningBase):
         cases = [
             (self.android, "battery", "bogus"), (self.android, "network", "offlien"),
             (self.android, "call", "bogus"), (self.android, "sms", "bogus"),
-            (self.android, "clipboard", "get"), (self.android, "appearance", "dim"),
+            (self.android, "clipboard", "paste"), (self.android, "appearance", "dim"),
             (self.ios, "push", "bogus"), (self.ios, "appearance", "dim"),
             (self.ios, "battery", "bogus"), (self.ios, "biometric", "wink"),
         ]
@@ -858,10 +858,11 @@ class ControlActionTests(HardeningBase):
         self.assertEqual(payload["observed"], "yes")
 
     def test_controls_without_a_read_back_are_not_verified(self) -> None:
-        for run, argv in ((self.ios, ["battery", "set", "--value", "level=50"]),
-                          (self.android, ["network", "offline"]),
+        # iOS battery and status-bar overrides are read back with
+        # `simctl status_bar list` now (tests/test_fix_ios_dev.py).
+        for run, argv in ((self.android, ["network", "offline"]),
                           (self.android, ["biometric", "match"]),
-                          (self.ios, ["status-bar", "pin"])):
+                          (self.ios, ["biometric", "match"])):
             with self.subTest(argv=argv):
                 code, payload = run("simulator", *argv)
                 self.assertEqual(code, 0, payload)
@@ -871,11 +872,9 @@ class ControlActionTests(HardeningBase):
     def test_android_clipboard_without_the_shell_command_is_unsupported(self) -> None:
         self.set_state(clipboard_unsupported=True)
         code, payload = self.android("simulator", "clipboard", "set", "--value", "text=hi")
-        self.assertEqual(code, 0, payload)
-        self.assertFalse(payload["verified"])
+        self.refused(code, payload, errors.UNSUPPORTED_CAPABILITY)
+        self.assertEqual(payload["capability"], "simulator.clipboard")
         self.assertFalse(payload["supported"])
-        self.assertEqual(payload["verification"], "unsupported")
-        self.assertEqual(payload["warnings"][0]["code"], "clipboard_unsupported")
 
     def test_android_clipboard_text_survives_the_device_shell(self) -> None:
         text = "it's $HOME; echo gone && `id` \"quoted\""

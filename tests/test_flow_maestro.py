@@ -416,12 +416,12 @@ class ExportTests(unittest.TestCase):
         out = maestro.export_flow(flow, "t.yaml")
         self.assertIn("- extendedWaitUntil:", out)
         self.assertIn("timeout: 30000", out)
-        # a timed tap has no equivalent — refuse instead of changing the wait
+        # a timed tap waits for its target: extendedWaitUntil, then the tap
         flow = self._flow("- tapOn:\n    selector:\n      text: Done\n"
                           "    timeoutMs: 30000\n")
-        with self.assertRaises(errors.AutonomError) as caught:
-            maestro.export_flow(flow, "t.yaml")
-        self.assertIn("extendedWaitUntil", caught.exception.hint)
+        out = maestro.export_flow(flow, "t.yaml")
+        self.assertIn("- extendedWaitUntil:\n    visible:\n", out)
+        self.assertIn("    timeout: 30000\n- tapOn:\n", out)
 
     def test_relational_selectors_refuse(self) -> None:
         flow = self._flow("- tapOn:\n    selector:\n      text: a\n"

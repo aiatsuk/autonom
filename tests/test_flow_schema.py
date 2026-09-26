@@ -37,7 +37,7 @@ class RegistryIntegrityTests(unittest.TestCase):
                 self.assertIsInstance(spec.mutating, bool)
                 self.assertIn(spec.since,
                               ("0.20.0", "0.20.1", "0.20.2", "0.21.0",
-                               "0.28.1"))
+                               "0.28.1", "0.31.0"))
 
     def test_assertions_are_never_mutating(self) -> None:
         for spec in schema.REGISTRY.values():

@@ -229,7 +229,10 @@ class IosStatusBarTests(CaptureStateBase):
         code, payload = self.ios("simulator", "status-bar", "pin")
         self.assertEqual(code, 0, payload)
         calls = self._status_bar_calls()
-        self.assertEqual(len(calls), 1)
+        # One override, then the `list` that reads it back.
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1], ["simctl", "status_bar", UDID, "list"])
+        self.assertTrue(payload["verified"], payload)
         argv = calls[0]
         self.assertEqual(argv[:4], ["simctl", "status_bar", UDID, "override"])
         flags = dict(zip(argv[4::2], argv[5::2]))
@@ -251,7 +254,8 @@ class IosStatusBarTests(CaptureStateBase):
     def test_clear_restores_the_live_bar(self) -> None:
         code, _ = self.ios("simulator", "status-bar", "clear")
         self.assertEqual(code, 0)
-        self.assertEqual(self._status_bar_calls(), [["simctl", "status_bar", UDID, "clear"]])
+        self.assertEqual(self._status_bar_calls(), [["simctl", "status_bar", UDID, "clear"],
+                                                    ["simctl", "status_bar", UDID, "list"]])
 
 
 class KeyboardPinTests(CaptureStateBase):

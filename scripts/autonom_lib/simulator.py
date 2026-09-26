@@ -151,7 +151,7 @@ CONTROL_ACTIONS: dict[str, tuple[str, ...]] = {
     "sms": ("send",),
     "call": ("incoming", "cancel"),
     "biometric": ("enroll", "unenroll", "match", "nonmatch"),
-    "clipboard": ("set",),
+    "clipboard": ("set", "get"),
     "appearance": ("light", "dark"),
     "status-bar": ("override", "pin", "clear"),
     "keyboard": ("pin", "reset", "show"),
@@ -192,7 +192,9 @@ def _simctl(target: Target, args: list[str]) -> str:
 
 
 def apply(target: Target, control: str, action: str,
-          values: dict[str, Any]) -> dict[str, Any]:
+          values: dict[str, Any], *, session: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Run one control. ``session`` is the record defaults come from (the
+    app `push send` addresses); None reads the current session."""
     if control not in CONTROLS:
         raise errors.AutonomError(errors.UNSUPPORTED_CAPABILITY,
                                   f"unknown simulator control {control!r}")
@@ -222,7 +224,7 @@ def apply(target: Target, control: str, action: str,
     if control == "network":
         return _network(target, action, values)
     if control == "push":
-        return _push(target, values)
+        return _push(target, values, session)
     if control in ("sms", "call"):
         return _telephony(target, control, action, values)
     if control == "biometric":
@@ -283,9 +285,14 @@ def _choice(values: dict[str, Any], key: str, default: str,
     return value
 
 
-def _unverified(result: dict[str, Any], reason: str = "unavailable") -> dict[str, Any]:
+def _unverified(result: dict[str, Any], reason: str = "unavailable",
+                detail: str | None = None) -> dict[str, Any]:
     result["verified"] = False
     result["verification"] = reason
+    if detail:
+        # Why a read-back that exists could not be made this time (a simctl
+        # that timed out, a listing it did not print).
+        result["verification_detail"] = detail
     return result
 
 
@@ -552,26 +559,94 @@ def _read_battery(target: Target) -> tuple[dict[str, Any], str]:
     return parse_battery(observed), observed
 
 
+def tail_lines(text: str, limit: int = 500) -> str:
+    """The last whole lines of ``text`` that fit in ``limit`` characters.
+    A plain ``text[-500:]`` cut `dumpsys battery` mid-word ("wered: false");
+    a single line longer than the limit is kept whole rather than cut."""
+    kept: list[str] = []
+    size = 0
+    for line in reversed((text or "").splitlines()):
+        if kept and size + len(line) + 1 > limit:
+            break
+        kept.append(line)
+        size += len(line) + 1
+    return "\n".join(reversed(kept))
+
+
+def _update_live_pin_battery(target: Target, level: int) -> bool:
+    """Make a live status-bar pin hold ``level`` from now on.
+
+    `reassert_pins` re-sends the pinned battery before every capture, so a
+    `battery set level=42` under a live pin read back 42 and the next
+    screenshot showed 100 again. The pin's battery is the level the caller
+    asked for last; True when a live pin was updated."""
+    snapshot = read_snapshot(target)
+    section = snapshot.get("status_bar")
+    pinned = section.get("pinned") if isinstance(section, dict) else None
+    if not isinstance(pinned, dict) or pinned.get("mode") != "live":
+        return False
+    pinned["battery"] = level
+    _write_snapshot(target, snapshot)
+    return True
+
+
+def _ios_read_back(target: Target, result: dict[str, Any],
+                   expected: dict[str, Any] | None = None,
+                   cleared: tuple[str, ...] | None = None) -> dict[str, Any]:
+    """Verify simctl status-bar overrides by listing them.
+
+    ``expected`` maps override keys to the values just sent: each must read
+    back equal (`verified_keys`, `mismatched_keys`). ``cleared`` names keys
+    that must no longer be overridden (an empty tuple: none at all). A
+    listing that cannot be read leaves `verification: unavailable`."""
+    if expected is not None and not expected:
+        return _unverified(result)
+    overrides, why = ios_simctl.read_status_bar(target.tool, target.target_id)
+    if overrides is None:
+        return _unverified(result, detail=why)
+    # Not `observed`: that key is a string elsewhere (Android `dumpsys`).
+    result["observed_overrides"] = overrides
+    if expected is not None:
+        mismatched = [key for key, value in expected.items()
+                      if not ios_simctl.status_bar_value_matches(key, value, overrides.get(key))]
+        result["verified_keys"] = [key for key in expected if key not in mismatched]
+        if mismatched:
+            result["mismatched_keys"] = mismatched
+        return _checked(result, not mismatched)
+    remaining = [key for key in overrides if not cleared or key in cleared]
+    if remaining:
+        result["mismatched_keys"] = remaining
+    return _checked(result, not remaining)
+
+
 def _battery(target: Target, action: str, values: dict[str, Any]) -> dict[str, Any]:
     if target.platform == IOS:
         if action == "reset":
             _simctl(target, ["status_bar", target.target_id, "clear"])
-            return _unverified({"control": "battery", "action": action})
+            return _ios_read_back(target, {"control": "battery", "action": action},
+                                  cleared=("batteryState", "batteryLevel", "notCharging"))
         level = _int(values, "level", 100, 0, 100)
         state = _choice(values, "state", "charged", IOS_BATTERY_STATES)
         _simctl(target, ["status_bar", target.target_id, "override",
                          "--batteryLevel", str(level), "--batteryState", state])
-        # simctl has no read-back for an override; the glyph is the evidence.
-        return _unverified({"control": "battery", "level": level, "state": state})
+        return _ios_read_back(target, {"control": "battery", "level": level, "state": state},
+                              {"batteryLevel": level, "batteryState": state})
     if action == "reset":
         _adb(target, ["shell", "dumpsys", "battery", "reset"])
         parsed, _ = _read_battery(target)
         return _checked({"control": "battery", "action": action}, not parsed["overridden"])
     level = _int(values, "level", 100, 0, 100)
+    # A record from another device (or boot) must not be updated in place.
+    stale = drop_stale_record(target)
     _adb(target, ["shell", "dumpsys", "battery", "set", "level", str(level)])
     parsed, observed = _read_battery(target)
-    return _checked({"control": "battery", "level": level, "observed": observed[-500:],
-                     "observed_level": parsed["level"]}, parsed["level"] == level)
+    result = _checked({"control": "battery", "level": level, "observed": tail_lines(observed),
+                       "observed_level": parsed["level"]}, parsed["level"] == level)
+    result["pin_updated"] = _update_live_pin_battery(target, level)
+    if stale:
+        result["stale_pin_dropped"] = True
+        result.setdefault("warnings", []).append(_stale_warning())
+    return result
 
 
 _NETWORK_SPEEDS = ("gsm", "hscsd", "gprs", "edge", "umts", "hsdpa", "lte", "evdo", "full")
@@ -607,25 +682,59 @@ def _network(target: Target, action: str, values: dict[str, Any]) -> dict[str, A
                         "delay": delay})
 
 
-def _push(target: Target, values: dict[str, Any]) -> dict[str, Any]:
-    app_id = str(values.get("app_id") or "")
+PUSH_JSON_HINT = (
+    "Pass the notification as JSON: autonom simulator push send --json "
+    "'{\"app_id\": \"com.example.app\", \"payload\": {\"aps\": {\"alert\": \"Hello\"}}}'. "
+    "app_id may be left out while a session for this simulator has one.")
+
+
+def _current_session() -> dict[str, Any] | None:
+    from . import session as session_mod  # lazy: the controls work without one
+
+    try:
+        return session_mod.load_current()
+    except Exception:  # noqa: BLE001 - an unreadable record only loses a default
+        return None
+
+
+def _push(target: Target, values: dict[str, Any],
+          session: dict[str, Any] | None = None) -> dict[str, Any]:
+    if target.platform != IOS:
+        # Refused before the values are judged: no payload makes it possible.
+        raise errors.AutonomError(
+            errors.UNSUPPORTED_CAPABILITY,
+            "Android has no provider-neutral local push injection command",
+            hint="Use a declared fixture or network mock for Android push flows.",
+            capability="simulator.push")
+    app_id = str(values.get("app_id") or "").strip()
+    source = "value"
+    if not app_id:
+        record = session if session is not None else _current_session()
+        if (isinstance(record, dict) and record.get("app_id")
+                and record.get("target_id") in (None, target.target_id)):
+            app_id = str(record["app_id"])
+            source = "session"
     payload = values.get("payload")
-    if not app_id or not isinstance(payload, dict):
-        raise errors.AutonomError(errors.FLOW_COMMAND_INVALID,
-                                  "push requires app_id and a JSON object payload")
-    if target.platform == IOS:
-        rendered = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".apns", encoding="utf-8") as handle:
-            handle.write(rendered)
-            handle.flush()
-            _simctl(target, ["push", target.target_id, app_id, handle.name])
-        # simctl accepted the payload; whether the app showed it is not known.
-        return _unverified({"control": "push", "app_id": app_id})
-    raise errors.AutonomError(
-        errors.UNSUPPORTED_CAPABILITY,
-        "Android has no provider-neutral local push injection command",
-        hint="Use a declared fixture or network mock for Android push flows.",
-        capability="simulator.push")
+    if isinstance(payload, str):
+        # `--value payload={...}` arrives as text.
+        try:
+            payload = json.loads(payload)
+        except ValueError:
+            pass
+    missing = ([] if app_id else ["app_id"]) + (
+        [] if isinstance(payload, dict) else ["payload (a JSON object)"])
+    if missing:
+        raise errors.AutonomError(
+            errors.INVALID_VALUE,
+            "push send needs " + " and ".join(missing),
+            PUSH_JSON_HINT, missing=[item.split(" ", 1)[0] for item in missing])
+    rendered = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".apns", encoding="utf-8") as handle:
+        handle.write(rendered)
+        handle.flush()
+        _simctl(target, ["push", target.target_id, app_id, handle.name])
+    # simctl accepted the payload; whether the app showed it is not known.
+    return _unverified({"control": "push", "app_id": app_id, "app_id_source": source})
 
 
 def _telephony(target: Target, control: str, action: str,
@@ -731,8 +840,18 @@ def _biometric(target: Target, action: str) -> dict[str, Any]:
                                   "notifications": [name for name, _ in posts]}
         if action in ("match", "nonmatch"):
             result["biometry"] = kind or "unknown"
-        # notifyutil posts and returns; nothing reports whether a prompt took it.
-        return _unverified(result)
+            # notifyutil posts and returns; nothing reports whether a prompt took it.
+            return _unverified(result)
+        # Enrollment is the state value of the notification itself, which
+        # `notifyutil -g` reads back (the Simulator's Enrolled menu item
+        # follows the same value).
+        expected = 1 if action == "enroll" else 0
+        observed, why = ios_simctl.read_notify_state(target.tool, target.target_id,
+                                                     IOS_BIOMETRIC_ENROLLMENT)
+        result["observed_state"] = observed
+        if observed is None:
+            return _unverified(result, detail=why)
+        return _checked(result, observed == expected)
     if action != "match":
         raise errors.AutonomError(
             errors.UNSUPPORTED_CAPABILITY,
@@ -748,7 +867,27 @@ def shell_quote(text: str) -> str:
     return "'" + text.replace("'", "'\\''") + "'"
 
 
+def _clipboard_get(target: Target) -> dict[str, Any]:
+    if target.platform != IOS:
+        raise errors.AutonomError(
+            errors.UNSUPPORTED_ON_PLATFORM,
+            "Android has no host-level clipboard read: 'cmd clipboard' has no get, "
+            "and the clipboard service answers only the focused app",
+            "Paste into a field with 'autonom ui key KEYCODE_PASTE' and read the "
+            "field with 'autonom ui find', or read it from the app under test.",
+            control="clipboard", action="get", valid_actions=["set"])
+    text, why = ios_simctl.read_pasteboard(target.tool, target.target_id)
+    if text is None:
+        raise errors.AutonomError(
+            errors.BACKEND_FAILED, f"simctl pbpaste could not read the pasteboard: {why}",
+            "Check the simulator is booted with 'autonom devices'.")
+    return _checked({"control": "clipboard", "action": "get", "text": text,
+                     "length": len(text)}, True)
+
+
 def _clipboard(target: Target, action: str, values: dict[str, Any]) -> dict[str, Any]:
+    if action == "get":
+        return _clipboard_get(target)
     text = str(values.get("text") or "")
     result: dict[str, Any] = {"control": "clipboard", "action": "set", "length": len(text)}
     if target.platform == IOS:
@@ -759,27 +898,28 @@ def _clipboard(target: Target, action: str, values: dict[str, Any]) -> dict[str,
         if completed.returncode:
             raise errors.AutonomError(errors.BACKEND_FAILED,
                                       completed.stderr.strip() or "simctl pbcopy failed")
-        pasted = ios_simctl.run_simctl(target.tool, ["pbpaste", target.target_id],
-                                       timeout=30, check=False)
-        if pasted.returncode:
-            return _unverified(result)
-        return _checked(result, (pasted.stdout or "") == text)
+        pasted, why = ios_simctl.read_pasteboard(target.tool, target.target_id)
+        if pasted is None:
+            return _unverified(result, detail=why)
+        return _checked(result, pasted == text)
     completed = adb_mod.run_adb(
         target.tool, ["shell", "cmd", "clipboard", "set", "text", shell_quote(text)],
         serial=target.target_id, timeout=30, check=False)
     output = (completed.stdout or "") if isinstance(completed.stdout, str) else ""
-    # API 36 answers "No shell command implementation." and exits 0.
+    # API 36 answers "No shell command implementation." and exits 0. That
+    # used to come back as `ok: true` with `supported: false`, the one
+    # control that reported "could not" as a success; it is refused like
+    # every other unsupported control now.
     if (completed.returncode or "No shell command implementation" in output
             or "nknown command" in output):
-        result["supported"] = False
-        result["warnings"] = [{
-            "code": "clipboard_unsupported",
-            "error": "this Android build has no 'cmd clipboard' shell command; "
-                     "the clipboard was not changed",
-            "hint": "Type the text with 'autonom ui type' instead, or seed it from "
-                    "the app under test.",
-        }]
-        return _unverified(result, "unsupported")
+        raise errors.AutonomError(
+            errors.UNSUPPORTED_CAPABILITY,
+            "this Android build has no 'cmd clipboard' shell command; "
+            "the clipboard was not changed",
+            "Type the text with 'autonom ui type' instead, or seed it from "
+            "the app under test.",
+            capability="simulator.clipboard", supported=False,
+            reason="clipboard_unsupported")
     result["supported"] = True
     # `cmd clipboard` has no portable read-back.
     return _unverified(result)
@@ -878,7 +1018,8 @@ def _status_bar(target: Target, action: str,
 def _ios_status_bar(target: Target, action: str, values: dict[str, Any]) -> dict[str, Any]:
     if action == "clear":
         _simctl(target, ["status_bar", target.target_id, "clear"])
-        return _unverified({"control": "status-bar", "action": action, "values": {}})
+        return _ios_read_back(target, {"control": "status-bar", "action": action, "values": {}},
+                              cleared=())
     android_keys = [key for key in values if key in IOS_EQUIVALENT_OF_ANDROID_KEY]
     if android_keys:
         raise errors.AutonomError(
@@ -905,7 +1046,12 @@ def _ios_status_bar(target: Target, action: str, values: dict[str, Any]) -> dict
     for key, value in applied.items():
         args.extend([f"--{key}", str(value).strip()])
     _simctl(target, args)
-    return _unverified({"control": "status-bar", "action": action, "values": applied})
+    # Read back with `status_bar list`: every key sent must be listed with
+    # the value sent (an override simctl accepted but the device dropped is
+    # a mismatch, not a success).
+    return _ios_read_back(target, {"control": "status-bar", "action": action,
+                                   "values": applied},
+                          {key: str(value).strip() for key, value in applied.items()})
 
 
 def _android_signal(target: Target, level: int) -> None:

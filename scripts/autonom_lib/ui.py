@@ -55,12 +55,12 @@ def parse_compact_tree(
     max_nodes: int | None = 200,
 ) -> list[dict[str, Any]]:
     """Android UI Automator XML -> compact nodes. Kept for 0.4.0 callers."""
-    return ui_android.parse_tree(
+    return selector.mark_visibility(ui_android.parse_tree(
         xml_text,
         meaningful_only=meaningful_only,
         max_depth=max_depth,
         max_nodes=max_nodes,
-    )
+    ))
 
 
 def find_nodes(
@@ -90,7 +90,7 @@ def find_nodes(
     }
     require_selector(fields)
     return selector.select(
-        ui_android.parse_all(xml_text),
+        selector.mark_visibility(ui_android.parse_all(xml_text)),
         fields,
         mode=mode,
         case_sensitive=case_sensitive,
@@ -121,10 +121,12 @@ def no_match_hint(platform: str, nodes: list[dict[str, Any]], fields: Mapping[st
 
     On iOS the visible label lives in `desc` (AXLabel), not `text`, so a
     `--text` miss whose value does match a `desc` is almost always that
-    confusion (AGENTS rule 8) — say so instead of "run ui tree".
+    confusion (AGENTS rule 8) — say so instead of "run ui tree". Android has
+    the same trap: Flutter exposes its labels as the content-description,
+    and so do image buttons, so the hint applies on every platform.
     """
     value = fields.get("text")
-    if platform != IOS or value is None or fields.get("desc") is not None:
+    if value is None or fields.get("desc") is not None:
         return None
     swapped = {**fields, "text": None, "desc": value}
     try:
@@ -133,14 +135,20 @@ def no_match_hint(platform: str, nodes: list[dict[str, Any]], fields: Mapping[st
         return None
     if not hits:
         return None
-    return (f"On iOS the visible label is in desc (AXLabel), not text: {len(hits)} node(s) "
-            f"have desc matching {value!r}. Retry with --desc instead of --text.")
+    found = f"{len(hits)} node(s) have desc matching {value!r}"
+    retry = "Retry with --desc instead of --text."
+    if platform == IOS:
+        return f"On iOS the visible label is in desc (AXLabel), not text: {found}. {retry}"
+    if platform == ANDROID:
+        return ("On Android, Flutter apps (and image buttons) carry the label in desc "
+                f"(content-description), not text: {found}. {retry}")
+    return f"The label is in desc, not text: {found}. {retry}"
 
 
 def no_match_error(platform: str, nodes: list[dict[str, Any]], fields: Mapping[str, Any],
                    *, mode: str = "contains", case_sensitive: bool = False,
                    message: str = "no matching node") -> errors.AutonomError:
-    """The `no_matching_node` envelope, carrying the iOS --desc hint when it applies."""
+    """The `no_matching_node` envelope, carrying the --desc hint when it applies."""
     hint = no_match_hint(platform, nodes, fields, mode=mode, case_sensitive=case_sensitive)
     return errors.AutonomError(
         errors.NO_MATCHING_NODE, message,
@@ -160,7 +168,21 @@ def clip(nodes: list[dict[str, Any]], max_nodes: int | None) -> tuple[list[dict[
     return nodes[:max_nodes], True
 
 
-def center_of(node: dict[str, Any]) -> tuple[int, int]:
+def center_of(node: dict[str, Any], *,
+              viewport: tuple[int, int, int, int] | None = None) -> tuple[int, int]:
+    """Where a tap on this node lands — refused when it has no place on screen.
+
+    iOS lists Flutter's off-screen nodes with a 0x0 frame at the origin; their
+    "centre" is (0, 0), and tapping it reported success while nothing was
+    touched. A node without area raises ``element_offscreen``, and so does
+    one entirely outside an explicit ``viewport``.
+
+    A node *with* area outside the screen is deliberately left to the tap
+    guard (INV-06): when a whole tree is off by the display scale, every
+    node sits outside the screen and ``coordinate_space_mismatch`` is the
+    diagnosis that helps. ``snapshot`` still marks such a node
+    ``visible: false``, and flows never select it.
+    """
     bounds = node.get("bounds")
     if not bounds or len(bounds) != 4:
         raise errors.AutonomError(
@@ -168,8 +190,125 @@ def center_of(node: dict[str, Any]) -> tuple[int, int]:
             f"node {node.get('ref')} has no bounds",
             "Pick a node with bounds, or tap by --x/--y.",
         )
+    # geometry only: the `visible` mark also covers the scale mix-up above
+    if not selector.is_visible({"bounds": bounds}, viewport):
+        raise offscreen_error(node)
     left, top, right, bottom = bounds
     return ((left + right) // 2, (top + bottom) // 2)
+
+
+def offscreen_error(node: Mapping[str, Any], *, match_count: int = 1) -> errors.AutonomError:
+    """`element_offscreen`: the selector matched, but not anything on screen."""
+    where = (f"node {node.get('ref')} ({selector.visible_label(node)}) is not on screen "
+             f"(bounds {list(node.get('bounds') or [])})")
+    if match_count > 1:
+        where = f"{match_count} nodes matched and none is on screen; {where}"
+    return errors.AutonomError(
+        errors.ELEMENT_OFFSCREEN,
+        f"{where}; a tap there would land nowhere",
+        "Scroll it into view first — 'autonom ui swipe --from X,Y --to X,Y', or "
+        "scrollUntilVisible in a flow — then select it again. 'ui find --all' marks "
+        "off-screen matches with visible: false.",
+        ref=node.get("ref"),
+        bounds=list(node.get("bounds") or []),
+        match_count=match_count,
+    )
+
+
+def _has_area(node: Mapping[str, Any]) -> bool:
+    """Laid out with a size at all, wherever that is (bounds-less counts)."""
+    return selector.is_visible({"bounds": node.get("bounds")})
+
+
+def resolve_match(
+    nodes: list[dict[str, Any]],
+    fields: Mapping[str, Any],
+    *,
+    mode: str = "contains",
+    case_sensitive: bool = False,
+    index: int | None = None,
+) -> tuple[dict[str, Any] | None, int]:
+    """The one node a selector picks, and how many nodes it matched.
+
+    The single resolution core behind ``ui tap`` (``select_for_action``) and
+    ``ui find`` (``select_for_find``), so the two cannot drift: the same
+    duplicates, the same ``--index`` counting, the same ambiguity listing.
+
+    Matches that can be on screen are resolved first — duplicates and
+    ``index`` counted among them, exactly as a flow counts. iOS also lists
+    Flutter's off-screen scroll cache at 0x0; counting it made a selector
+    unique on Android ambiguous on iOS, and made ``--index`` mean another
+    node. Only when no match is on screen is every match resolved over
+    instead. Ambiguity and a bad index raise; no match is ``(None, 0)``.
+    """
+    def pick(**kwargs: Any) -> list[dict[str, Any]]:
+        return selector.select(nodes, fields, mode=mode, case_sensitive=case_sensitive,
+                               **kwargs)
+
+    everything = pick(all_matches=True)
+    if not everything:
+        return None, 0
+    on_screen = pick(index=index, visible_only=True)
+    if on_screen:
+        return on_screen[0], len(everything)
+    return pick(index=index)[0], len(everything)
+
+
+def select_for_action(
+    nodes: list[dict[str, Any]],
+    fields: Mapping[str, Any],
+    *,
+    mode: str = "contains",
+    case_sensitive: bool = False,
+    index: int | None = None,
+) -> dict[str, Any] | None:
+    """The one node an action verb (tap, long press) acts on; None if none matches.
+
+    Resolved by ``resolve_match``, exactly as ``ui find`` resolves it. Then,
+    when no match was on screen:
+
+    - the node has no area (never laid out on screen): ``element_offscreen``
+      with the scroll hint;
+    - the node has real area outside the screen: returned, and its centre
+      meets the tap guard, which answers ``coordinate_space_mismatch`` — the
+      right diagnosis when a whole tree is off by the display scale (INV-06).
+    """
+    node, matched = resolve_match(nodes, fields, mode=mode, case_sensitive=case_sensitive,
+                                  index=index)
+    if node is not None and not _has_area(node):
+        raise offscreen_error(node, match_count=matched)
+    return node
+
+
+def select_for_find(
+    nodes: list[dict[str, Any]],
+    fields: Mapping[str, Any],
+    *,
+    mode: str = "contains",
+    case_sensitive: bool = False,
+    index: int | None = None,
+    all_matches: bool = False,
+) -> list[dict[str, Any]]:
+    """What ``ui find`` reports: the node ``ui tap`` would act on, or every match.
+
+    Without ``all_matches`` it is ``resolve_match`` — the node tap resolves,
+    raising the same ambiguity and index errors — but it never refuses an
+    off-screen node: find inspects, so it shows it. With ``all_matches`` every
+    match is listed. Either way a node that cannot be on screen is marked
+    ``visible: false``, even when the tree came unmarked (a ``--dump``).
+    """
+    if all_matches:
+        found = selector.select(nodes, fields, mode=mode, case_sensitive=case_sensitive,
+                                all_matches=True)
+    else:
+        node, _matched = resolve_match(nodes, fields, mode=mode,
+                                       case_sensitive=case_sensitive, index=index)
+        found = [] if node is None else [node]
+    view = selector.viewport(nodes)
+    for match in found:  # copies: the caller's tree is never touched
+        if not selector.is_visible(match, view):
+            match["visible"] = False
+    return found
 
 
 # --- live dispatch -----------------------------------------------------------
@@ -182,12 +321,17 @@ def _ios():
 
 
 def snapshot(target: Target) -> list[dict[str, Any]]:
-    """Every node on screen, unfiltered — the search corpus for find/tap."""
+    """Every node the tree lists, unfiltered — the search corpus for find/tap.
+
+    Nodes that cannot be on screen stay in the list and carry
+    ``visible: false`` (see ``selector.mark_visibility``).
+    """
     if target.platform == ANDROID:
-        return annotate_parents(
-            ui_android.parse_all(ui_android.dump_hierarchy(target.tool, target.target_id)))
+        return selector.mark_visibility(annotate_parents(
+            ui_android.parse_all(ui_android.dump_hierarchy(target.tool, target.target_id))))
     if target.platform == IOS:
-        return annotate_parents(_ios().parse_all(_ios().describe_all(target)))
+        return selector.mark_visibility(
+            annotate_parents(_ios().parse_all(_ios().describe_all(target))))
     raise errors.AutonomError(errors.UNKNOWN_PLATFORM, f"unknown platform: {target.platform}")
 
 
@@ -198,7 +342,10 @@ def tree(
     max_depth: int | None = None,
     max_nodes: int | None = 200,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Compact tree plus any warnings (e.g. a sparse accessibility tree)."""
+    """Compact tree plus any warnings (e.g. a sparse accessibility tree).
+
+    Off-screen nodes are kept — and counted — with ``visible: false``.
+    """
     if target.platform == ANDROID:
         nodes = ui_android.parse_tree(
             ui_android.dump_hierarchy(target.tool, target.target_id),
@@ -206,14 +353,19 @@ def tree(
             max_depth=max_depth,
             max_nodes=max_nodes,
         )
-        return nodes, []
+        return selector.mark_visibility(nodes), []
     ios = _ios()
-    return ios.parse_tree(
-        ios.describe_all(target),
+    payload = ios.describe_all(target)
+    nodes, warnings = ios.parse_tree(
+        payload,
         meaningful_only=meaningful_only,
         max_depth=max_depth,
         max_nodes=max_nodes,
     )
+    # the meaningful filter drops an unlabelled application root; the screen
+    # rectangle then comes from the same payload (a re-parse, no device call)
+    view = selector.viewport(nodes) or selector.viewport(ios.parse_all(payload))
+    return selector.mark_visibility(nodes, view), warnings
 
 
 def tree_clipped(
@@ -262,30 +414,58 @@ def settle(
     box). An animation, a spinner or a list still loading keeps changing the
     signature; a timeout returns `settled: false` rather than raising, so the
     caller decides whether an unsettled screen is fatal.
+
+    A dump is not instant (an Android UI Automator dump takes a second or
+    more), so the loop never starts a snapshot its forecast says cannot
+    finish before the deadline. The forecast is the slower of the last two
+    dumps after the first. The first dump pays one-time costs (idb reaching
+    its companion, UI Automator starting up), so on its own it forecasts
+    half its time — a cold first dump must not end the wait early. A dump
+    therefore overruns only when it is slower than forecast: with dumps of
+    even cost the second by at most half a dump, a later one not at all.
+    `elapsed_ms` is always the real clock, never clamped, so an overrun is
+    reported, not hidden.
     """
     take = snapshot_fn or (lambda: snapshot(target))  # type: ignore[arg-type]
     started = clock()
     deadline = started + max(timeout_ms, 0) / 1000
+    interval = max(interval_ms, 10) / 1000
     previous: tuple | None = None
     stable_since = started
     snapshots = 0
     changes = 0
+    first = 0.0                # how long the first (cold) dump took
+    recent: list[float] = []   # the last two dumps after it
+
+    def report(settled: bool, now: float) -> dict[str, Any]:
+        return {"settled": settled, "snapshots": snapshots, "changes": changes,
+                "elapsed_ms": int((now - started) * 1000)}
+
     while True:
+        began = clock()
         signature = tree_signature(take())
         snapshots += 1
         now = clock()
+        if snapshots == 1:
+            first = now - began
+        else:
+            recent = (recent + [now - began])[-2:]
         if previous is not None and signature == previous:
             if now - stable_since >= max(quiet_ms, 0) / 1000:
-                return {"settled": True, "snapshots": snapshots, "changes": changes,
-                        "elapsed_ms": int((now - started) * 1000)}
+                return report(True, now)
         else:
             if previous is not None:
                 changes += 1
             previous, stable_since = signature, now
-        if now >= deadline:
-            return {"settled": False, "snapshots": snapshots, "changes": changes,
-                    "elapsed_ms": int((now - started) * 1000)}
-        sleep(max(0.0, min(max(interval_ms, 10) / 1000, deadline - now)))
+        remaining = deadline - now
+        if remaining <= 0:
+            return report(False, now)
+        pause = min(interval, remaining)
+        forecast = max(recent) if recent else first / 2
+        if pause + forecast > remaining:
+            # the next dump would still be running at the deadline
+            return report(False, now)
+        sleep(pause)
 
 
 _INTERACTABLE_ROLES = ("button", "textfield", "searchfield", "securetextfield", "switch",
@@ -293,10 +473,19 @@ _INTERACTABLE_ROLES = ("button", "textfield", "searchfield", "securetextfield", 
 
 
 def is_interactable(node: Mapping[str, Any]) -> bool:
-    """Could an agent act on this node? Disabled nodes never count."""
+    """Could an agent act on this node? Disabled nodes never count.
+
+    Acting means clicking, long-clicking, checking, scrolling or typing.
+    Being focusable is not enough: Flutter on Android marks every static
+    label focusable (for the screen reader), and those are not controls.
+    Android nodes carry ``long_clickable`` and ``checkable`` (UI Automator's
+    ``long-clickable``/``checkable``), so a long-press-only or checkable-only
+    Flutter control still counts.
+    """
     if node.get("enabled") is False:
         return False
-    if node.get("clickable") or node.get("scrollable") or node.get("focusable"):
+    if (node.get("clickable") or node.get("long_clickable") or node.get("checkable")
+            or node.get("scrollable") or is_editable(node)):
         return True
     role = str(node.get("role") or "").lower()
     return any(marker in role for marker in _INTERACTABLE_ROLES)
@@ -328,6 +517,8 @@ def outline_line(node: Mapping[str, Any], indent: int = 0) -> str:
     flags = [flag for flag in _OUTLINE_FLAGS if node.get(flag)]
     if node.get("enabled") is False:
         flags.append("disabled")
+    if node.get("visible") is False:
+        flags.append("offscreen")  # listed by the tree, but not on screen
     if flags:
         parts.append("[" + " ".join(flags) + "]")
     return "  " * max(indent, 0) + " ".join(parts)
@@ -524,8 +715,14 @@ def focused_node(nodes: list[dict[str, Any]]) -> dict[str, Any] | None:
     characters land nowhere. Both trees carry `focused` (UIAutomator's
     attribute, AXFocused on iOS), so the absence of a focused node is the
     only signal there is that a type would be swallowed.
+
+    Android reports window focus too: the window's FrameLayout says
+    ``focused`` ahead of the EditText that holds the input focus. So an
+    editable focused node wins; otherwise the deepest focused node (the
+    first of equals), which is where input focus sits in the hierarchy.
     """
-    for node in nodes:
-        if node.get("focused"):
-            return node
-    return None
+    focused = [node for node in nodes if node.get("focused")]
+    if not focused:
+        return None
+    editable = [node for node in focused if is_editable(node)]
+    return max(editable or focused, key=lambda node: int(node.get("depth") or 0))

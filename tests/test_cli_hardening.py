@@ -285,7 +285,7 @@ class SessionStartTests(CliCase):
         self.assertFalse(sessions.exists() and any(p.is_dir() for p in sessions.iterdir()))
 
     def test_failed_launch_rolls_the_session_back(self) -> None:
-        self.write_state(fail={f"-s {SERIAL} shell monkey": [251, "** monkey aborted"]})
+        self.write_state(fail={f"-s {SERIAL} shell am start": [1, "Error: Activity not started"]})
         code, payload = self.android("session", "start", "--app-id", "com.example.app",
                                      "--launch")
         self.assertEqual(code, 2, payload)

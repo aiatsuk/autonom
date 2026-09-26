@@ -50,6 +50,7 @@ COORDINATE_SPACE_MISMATCH = "coordinate_space_mismatch"
 UNSUPPORTED_KEY_FOR_PLATFORM = "unsupported_key_for_platform"
 UNSUPPORTED_ON_PLATFORM = "unsupported_on_platform"
 STALE_REF = "stale_ref"  # a node ref from an older tree snapshot
+ELEMENT_OFFSCREEN = "element_offscreen"  # the matched node is not on screen (0x0 / outside it)
 
 # --- Device state ------------------------------------------------------------
 INVALID_URL = "invalid_url"

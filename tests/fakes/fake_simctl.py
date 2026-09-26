@@ -11,12 +11,28 @@ State keys used by the simulator controls (all optional):
 ``ui``               ``{"appearance": ..., "content_size": ...}`` that ``simctl ui``
                      reports and updates
 ``pasteboard``       what ``pbcopy`` stored and ``pbpaste`` prints
+``status_bar``       the live overrides (flag name -> value) ``status_bar override``
+                     stores, ``list`` prints and ``clear`` drops
+``status_bar_ignored`` ``override``/``clear`` exit 0 and change nothing
+``status_bar_names`` ``list`` prints enumeration names instead of raw values
+``notify``           Darwin notification states ``notifyutil -s`` stores and
+                     ``notifyutil -g`` prints
+``notify_ignored``   ``notifyutil -s`` exits 0 and stores nothing
+``app_info``         ``{bundle: {"CFBundleExecutable": ..., ...}}`` that ``appinfo``
+                     prints; any other bundle is an error, as for an app that is
+                     not installed
+``app_bundle``       the path ``get_app_container <udid> <bundle> app`` prints
+                     (default ``(null)``: no bundle a test did not create)
+``privacy_help``     the text ``help privacy`` prints (default: Xcode 27.0's)
+``simctl_hang``      ``{argv prefix: seconds}``: sleep that long first (a wedged
+                     simctl, for timeout paths)
 """
 from __future__ import annotations
 
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 PNG = bytes.fromhex(
@@ -38,6 +54,90 @@ DEFAULT_DEVICES = {
         ]
     }
 }
+
+
+# `xcrun simctl help privacy`, Xcode 27.0 (it prints to stderr and exits 0).
+PRIVACY_HELP = """Grant, revoke, or reset privacy and permissions
+Usage: simctl privacy <device> <action> <service> [<bundle identifier>]
+
+\taction
+\t     The action to take:
+\t         grant - Grant access without prompting. Requires bundle identifier.
+\t         revoke - Revoke access, denying all use of the service. Requires bundle identifier.
+\t         reset - Reset access, prompting on next use. Bundle identifier optional.
+\t     Some permission changes will terminate the application if running.
+\tservice
+\t     The service:
+\t         all - Apply the action to all services.
+\t         calendar - Allow access to calendar.
+\t         contacts-limited - Allow access to basic contact info.
+\t         contacts - Allow access to full contact details.
+\t         location - Allow access to location services when app is in use.
+\t         location-always - Allow access to location services at all times.
+\t         photos-add - Allow adding photos to the photo library.
+\t         photos - Allow full access to the photo library.
+\t         media-library - Allow access to the media library.
+\t         microphone - Allow access to audio input.
+\t         motion - Allow access to motion and fitness data.
+\t         reminders - Allow access to reminders.
+\t         siri - Allow use of the app with Siri.
+\tbundle identifier
+\t     The bundle identifier of the target application.
+
+Examples:
+\treset all permissions: privacy <device> reset all
+\tgrant test host photo permissions: privacy <device> grant photos com.example.app.test-host
+"""
+
+# The raw values Xcode 27.0's `status_bar override` parser assigns, which is
+# what `status_bar list` prints back.
+STATUS_BAR_ENUMS = {
+    "dataNetwork": {"hide": 0, "wifi": 1, "3g": 6, "4g": 7, "lte": 8, "lte-a": 9,
+                    "lte+": 10, "5g": 11, "5g+": 12, "5g-uwb": 13, "5g-uc": 14},
+    "wifiMode": {"searching": 1, "failed": 2, "active": 3},
+    "cellularMode": {"notSupported": 0, "searching": 1, "failed": 2, "active": 3},
+    "batteryState": {"discharging": 0, "charging": 1, "charged": 2},
+}
+
+
+def status_bar_listing(overrides: dict, names: bool) -> str:
+    """`status_bar list` as simctl prints it: a header, then one line per
+    group that has an override (a group's other fields take simctl's
+    defaults)."""
+    def shown(key: str, default: str) -> str:
+        value = overrides.get(key, default)
+        if key in STATUS_BAR_ENUMS and not names:
+            return str(STATUS_BAR_ENUMS[key].get(value, value))
+        return str(value)
+
+    lines = ["Current Status Bar Overrides:", "============================="]
+    if "time" in overrides:
+        lines.append(f"Time: {overrides['time']}")
+    if "dataNetwork" in overrides:
+        lines.append(f"DataNetworkType: {shown('dataNetwork', 'hide')}")
+    if "wifiMode" in overrides or "wifiBars" in overrides:
+        lines.append(f"WiFi Mode: {shown('wifiMode', 'active')}, "
+                     f"WiFi Bars: {shown('wifiBars', '3')}")
+    if {"cellularMode", "cellularBars", "operatorName"} & set(overrides):
+        lines.append(f"Cell Mode: {shown('cellularMode', 'active')}, "
+                     f"Cell Bars: {shown('cellularBars', '4')}")
+        if "operatorName" in overrides:
+            lines.append(f"Operator Name: {overrides['operatorName']}")
+    if "batteryState" in overrides or "batteryLevel" in overrides:
+        lines.append(f"Battery State: {shown('batteryState', 'charged')}, "
+                     f"Battery Level: {shown('batteryLevel', '100')}, Not Charging: 0")
+    return "\n".join(lines) + "\n"
+
+
+def openstep(fields: dict) -> str:
+    """`simctl appinfo`'s OpenStep-style dictionary."""
+    body = []
+    for key, value in sorted(fields.items()):
+        text = str(value)
+        if not text.replace("_", "").isalnum():
+            text = '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
+        body.append(f"    {key} = {text};")
+    return "{\n" + "\n".join(body) + "\n}\n"
 
 
 def load_state() -> dict:
@@ -64,6 +164,10 @@ def record(argv: list[str]) -> None:
 def main(argv: list[str]) -> int:
     record(argv)
     state = load_state()
+
+    for prefix, seconds in (state.get("simctl_hang") or {}).items():
+        if " ".join(argv).startswith(prefix):
+            time.sleep(float(seconds))
 
     for prefix, outcome in (state.get("simctl_fail") or {}).items():
         if " ".join(argv).startswith(prefix):
@@ -134,6 +238,63 @@ def main(argv: list[str]) -> int:
         sys.stdout.write(str(ui.get(args[2], defaults.get(args[2], ""))) + "\n")
         return 0
 
+    if args[:2] == ["help", "privacy"]:
+        sys.stderr.write(state.get("privacy_help", PRIVACY_HELP))
+        return 0
+
+    if args[:1] == ["appinfo"] and len(args) >= 3:
+        info = (state.get("app_info") or {}).get(args[2])
+        if not info:
+            sys.stderr.write("An error was encountered processing the command "
+                             "(domain=IXErrorDomain, code=2):\nNo such app\n")
+            return 1
+        sys.stdout.write(openstep({"CFBundleIdentifier": args[2], **info}))
+        return 0
+
+    if args[:1] == ["status_bar"] and len(args) >= 3:
+        overrides = state.setdefault("status_bar", {})
+        if args[2] == "list":
+            sys.stdout.write(status_bar_listing(overrides, bool(state.get("status_bar_names"))))
+            return 0
+        if args[2] == "clear":
+            if not state.get("status_bar_ignored"):
+                overrides.clear()
+                write_state(state)
+            return 0
+        if args[2] == "override":
+            flags = args[3:]
+            if not flags:
+                sys.stderr.write("No arguments were specified, nothing to do.\n")
+                return 1
+            if not state.get("status_bar_ignored"):
+                for flag, value in zip(flags[::2], flags[1::2]):
+                    overrides[flag.lstrip("-")] = value
+                write_state(state)
+            return 0
+        sys.stderr.write(f"Unknown argument '{args[2]}'\n")
+        return 1
+
+    if args[:1] == ["spawn"] and args[2:3] == ["notifyutil"]:
+        # `notifyutil -s <name> <state> -p <name> -g <name>`, in order.
+        notify = state.setdefault("notify", {})
+        rest = args[3:]
+        index = 0
+        while index < len(rest):
+            option = rest[index]
+            if option == "-s" and index + 2 < len(rest):
+                if not state.get("notify_ignored"):
+                    notify[rest[index + 1]] = int(rest[index + 2])
+                    write_state(state)
+                index += 3
+            elif option == "-g" and index + 1 < len(rest):
+                sys.stdout.write(f"{rest[index + 1]} {notify.get(rest[index + 1], 0)}\n")
+                index += 2
+            elif option == "-p" and index + 1 < len(rest):
+                index += 2
+            else:
+                index += 1
+        return 0
+
     if args[:1] == ["pbcopy"]:
         state["pasteboard"] = sys.stdin.read()
         write_state(state)
@@ -175,6 +336,11 @@ def main(argv: list[str]) -> int:
         return 0
 
     if args[:1] == ["get_app_container"]:
+        if args[3:4] == ["app"]:
+            # No bundle on disk unless a test provides one: never a path on
+            # the host that a test did not create.
+            sys.stdout.write(state.get("app_bundle", "(null)") + "\n")
+            return 0
         sys.stdout.write(state.get("container", "/tmp/fake-container") + "\n")
         return 0
 

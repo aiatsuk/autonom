@@ -40,6 +40,33 @@ def capture(target: Target, app_id: str) -> tuple[str, dict[str, Any]]:
     return raw, parse_gfxinfo(raw)
 
 
+# Where an iOS caller asks for frame stats. The Simulator has no gfxinfo
+# twin, and Instruments refuses Animation Hitches there ("not supported on
+# this platform"), so the hint must not send a Simulator run to `hitches`.
+IOS_FRAMES_HINT = (
+    "The iOS Simulator has no frame-stats source: Instruments refuses "
+    "Animation Hitches there, so record hitches in Instruments on a physical "
+    "device. On the Simulator, summarize Flutter frame timings with "
+    "'metrics frames flutter-summary <timings.json>', or look for main-thread "
+    "stalls with 'metrics trace --preset time-profiler'.")
+
+_PERCENTILE_KEYS = tuple(name for name, _ in _GFX_PATTERNS
+                         if name.startswith("percentile_"))
+
+NO_FRAMES_WARNING: dict[str, str] = {
+    "code": "no_frames",
+    "error": ("gfxinfo counted 0 HWUI frames for this window, so it has no "
+              "frame times; the percentile lines it prints then are only "
+              "its histogram's top bucket and are omitted. Flutter (and other "
+              "SurfaceView or game-engine renderers) draw outside HWUI, so "
+              "gfxinfo never sees their frames."),
+    "hint": ("For a Flutter app, record frame timings (an integration test's "
+             "timeline summary or FrameTiming callbacks) and run 'autonom "
+             "metrics frames flutter-summary <timings.json>'. For native views, "
+             "drive the UI between 'metrics frames reset' and 'capture'."),
+}
+
+
 def parse_gfxinfo(text: str) -> dict[str, Any]:
     summary: dict[str, Any] = {}
     for name, pattern in _GFX_PATTERNS:
@@ -53,6 +80,12 @@ def parse_gfxinfo(text: str) -> dict[str, Any]:
     if not summary["parsed"]:
         summary["note"] = ("gfxinfo shape not recognized on this API level; "
                            "the raw artifact holds the truth")
+    elif summary.get("total_frames") == 0:
+        # zero frames have no distribution: gfxinfo still prints 4950 ms
+        # percentiles and a 0.00% jank share, and both would read as data
+        for key in (*_PERCENTILE_KEYS, "janky_percent"):
+            summary.pop(key, None)
+        summary["warnings"] = [dict(NO_FRAMES_WARNING)]
     return summary
 
 

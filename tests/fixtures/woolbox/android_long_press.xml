@@ -1,0 +1,10 @@
+<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>
+<hierarchy rotation="0">
+  <node index="0" text="" resource-id="" class="android.widget.FrameLayout" package="com.example.yarnshop" content-desc="" checkable="false" checked="false" clickable="false" enabled="true" focusable="false" focused="false" scrollable="false" long-clickable="false" password="false" selected="false" bounds="[0,0][1080,2424]">
+    <node index="0" text="" resource-id="" class="android.view.View" package="com.example.yarnshop" content-desc="Hold to delete" checkable="false" checked="false" clickable="false" enabled="true" focusable="true" focused="false" scrollable="false" long-clickable="true" password="false" selected="false" bounds="[0,100][1080,300]" />
+    <node index="1" text="" resource-id="" class="android.view.View" package="com.example.yarnshop" content-desc="Accept terms" checkable="true" checked="false" clickable="false" enabled="true" focusable="true" focused="false" scrollable="false" long-clickable="false" password="false" selected="false" bounds="[0,300][1080,400]" />
+    <node index="2" text="" resource-id="" class="android.view.View" package="com.example.yarnshop" content-desc="Static label" checkable="false" checked="false" clickable="false" enabled="true" focusable="true" focused="false" scrollable="false" long-clickable="false" password="false" selected="false" bounds="[0,400][1080,500]" />
+    <node index="3" text="" resource-id="" class="android.widget.EditText" package="com.example.yarnshop" content-desc="Note" checkable="false" checked="false" clickable="false" enabled="true" focusable="true" focused="false" scrollable="false" long-clickable="false" password="false" selected="false" bounds="[0,500][1080,640]" />
+    <node index="4" text="" resource-id="" class="android.view.View" package="com.example.yarnshop" content-desc="Archived action" checkable="false" checked="false" clickable="true" enabled="false" focusable="true" focused="false" scrollable="false" long-clickable="true" password="false" selected="false" bounds="[0,640][1080,760]" />
+  </node>
+</hierarchy>

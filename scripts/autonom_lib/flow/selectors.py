@@ -5,6 +5,15 @@ The shim never reimplements matching: field names were already translated to
 ``description``→``desc``), so this module only maps the flow match mode onto
 ``(mode, case_sensitive)`` and calls the shared engine — ambiguity refusal,
 index handling, and regex errors surface identically on both platforms.
+
+A flow only ever sees nodes that can be on screen (``visible_only``). iOS
+also lists Flutter's off-screen nodes at ``[0, 0, 0, 0]``; counting them made
+``assertVisible`` pass on nothing the user could see, ``scrollUntilVisible``
+stop before scrolling, and ``tapOn`` hit (0, 0). Android's UI Automator
+already leaves such nodes out, so dropping them also keeps a selector that is
+unique on Android unique on iOS. ``tapOn`` on an off-screen node therefore
+keeps polling and fails as ``flow_assertion_timeout`` — a test failure, not
+the CLI's ``element_offscreen``, which the flow failure classes do not map.
 """
 from __future__ import annotations
 
@@ -38,6 +47,7 @@ def select(nodes: list, flow_selector: FlowSelector) -> list:
     return selector_engine.select(
         nodes, _engine_keys(flow_selector), mode=mode,
         case_sensitive=case_sensitive, index=flow_selector.index,
+        visible_only=True,
     )
 
 
@@ -45,6 +55,8 @@ def select_all(nodes: list, flow_selector: FlowSelector) -> list:
     """Assertion-style matching: all matches, relations included.
 
     ``index`` narrows to that occurrence (missing = simply "not there").
+    Only on-screen nodes count, so an element Flutter keeps below the fold
+    is "not visible" to assertVisible/assertNotVisible/scrollUntilVisible.
     A geometric relation whose anchor is off-screen matches nothing here —
     in an assertion context an absent anchor means the constrained element
     is not present, not an error (an ambiguous anchor still refuses).
@@ -53,7 +65,7 @@ def select_all(nodes: list, flow_selector: FlowSelector) -> list:
     try:
         matches = selector_engine.select(
             nodes, _engine_keys(flow_selector), mode=mode,
-            case_sensitive=case_sensitive, all_matches=True,
+            case_sensitive=case_sensitive, all_matches=True, visible_only=True,
         )
     except errors.AutonomError as exc:
         # A geometric anchor that is simply off-screen means "not present" in

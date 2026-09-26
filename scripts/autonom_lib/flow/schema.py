@@ -208,6 +208,13 @@ REGISTRY: dict[str, CommandSpec] = {spec.name: spec for spec in [
                 args=(ArgSpec("visible", "selector"),
                       ArgSpec("notVisible", "selector"),
                       ArgSpec("timeoutMs", "int", required=True), _LABEL)),
+    # Waits until the UI tree stops changing (ui.settle, the engine behind
+    # `ui wait --settled`) so a tap does not fire into a sheet that is still
+    # animating. Never fails the flow: a screen still moving at timeoutMs is
+    # reported (`settled: false`, a `screen_not_settled` run warning).
+    CommandSpec("waitForSettled", False, bare=True, since="0.31.0",
+                args=(ArgSpec("timeoutMs", "int"), ArgSpec("quietMs", "int"),
+                      _LABEL)),
     # device state
     CommandSpec("setLocation", True, since="0.20.2",
                 args=(ArgSpec("latitude", "float", required=True),
@@ -255,7 +262,8 @@ REGISTRY: dict[str, CommandSpec] = {spec.name: spec for spec in [
 # Known names we deliberately do not run, each with a pointed hint. An unknown
 # command is never ignored (research doc §17, Phase 1 exit criterion).
 DEFERRED_COMMANDS = {
-    "waitForIdle": "no idle signal exists on either backend; use waitUntil with an explicit timeoutMs",
+    "waitForIdle": "no idle signal exists on either backend; use waitForSettled "
+                   "(the UI tree stops changing) or waitUntil with an explicit timeoutMs",
     "extendedWaitUntil": "use waitUntil with an explicit timeoutMs",
     "runScript": "Flow v1 has no script engine, by design; run scripts outside the flow",
     "evalScript": "Flow v1 has no script engine, by design",
@@ -396,9 +404,82 @@ def did_you_mean(name: str, known) -> str:
 
 # Integer arguments that are durations or counts: a negative value is never
 # meaningful, and at run time it silently became "expire at once".
-_NON_NEGATIVE_ARGS = ("timeoutMs", "delayMs", "durationMs", "maxSwipes", "chars")
+_NON_NEGATIVE_ARGS = ("timeoutMs", "delayMs", "durationMs", "maxSwipes", "chars",
+                      "quietMs")
 _COORDINATE_RANGES = {"latitude": (-90.0, 90.0), "longitude": (-180.0, 180.0)}
 _VAR_REF_RE = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*\}")
+
+# waitForSettled defaults — the same bounds as `autonom ui wait --settled`
+SETTLE_DEFAULT_TIMEOUT_MS = 5000
+SETTLE_DEFAULT_QUIET_MS = 500
+
+
+def settle_window(args: dict) -> tuple[int, int]:
+    """``(timeoutMs, quietMs)`` a waitForSettled step runs with.
+
+    An absent quietMs is the default capped at timeoutMs, so a short wait
+    (``timeoutMs: 300``, Maestro's ``waitForAnimationToEnd: {timeout: 300}``)
+    stays legal; ``timeoutMs: 0`` is one snapshot, which cannot prove the
+    screen still, so it reports ``settled: false``.
+    """
+    timeout = args.get("timeoutMs", SETTLE_DEFAULT_TIMEOUT_MS)
+    quiet = args.get("quietMs", min(SETTLE_DEFAULT_QUIET_MS, timeout))
+    return timeout, quiet
+
+# An absolute URL starts with a scheme (RFC 3986 §3.1): `myapp://path`,
+# `https://host/path`, `mailto:x`. `openLink` hands the value to the OS as a
+# VIEW intent / `simctl openurl`; without a scheme it opens nothing useful.
+_URL_SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.\-]*:")
+
+
+def url_has_scheme(url: str) -> bool | None:
+    """True/False for a literal URL; None when a leading ``${VAR}`` decides
+    the scheme at run time (``${BASE_URL}/path`` cannot be judged here)."""
+    if url.startswith("${"):
+        return None
+    return bool(_URL_SCHEME_RE.match(url))
+
+
+# --- Platform reach ----------------------------------------------------------
+# What only Android can run, in one table: the executor refuses these on iOS
+# before any mutation, and `flow check` infers a flow's platforms from the
+# same answer (validator.flow_platforms) — so the two can never disagree.
+_ANDROID_ONLY_COMMANDS = {
+    "back": "iOS has no system Back button; tapOn the navigation bar's back "
+            "control instead, or guard the step with runFlow "
+            "when: {platform: android}.",
+    "clearState": "iOS has no 'pm clear' equivalent; setup.reset reinstalls "
+                  "the app from the recorded install path instead.",
+    "setOrientation": "simctl/idb expose no orientation control on iOS.",
+}
+
+
+def android_only(step: "Step") -> tuple[str, str, str] | None:
+    """``(error_code, message, hint)`` when ``step`` itself cannot run on iOS.
+
+    Composite steps (runFlow/repeat/retry/group) are not judged here — their
+    children are, by the callers that walk the tree. A ``pressKey`` whose key
+    is a ``${VAR}`` is only known at run time and is left to the device.
+    """
+    if step.command in _ANDROID_ONLY_COMMANDS:
+        return (errors.UNSUPPORTED_ON_PLATFORM,
+                f"{step.command} is not supported on iOS",
+                _ANDROID_ONLY_COMMANDS[step.command])
+    if step.command == "launchApp" and step.args.get("clearState"):
+        return (errors.UNSUPPORTED_ON_PLATFORM,
+                "launchApp.clearState is not supported on iOS (no 'pm clear' "
+                "equivalent)",
+                "Use setup.reset, which reinstalls the app on iOS.")
+    if step.command == "pressKey":
+        key = step.args.get("key")
+        if isinstance(key, str) and key.upper().startswith("KEYCODE_"):
+            return (errors.UNSUPPORTED_KEY_FOR_PLATFORM,
+                    f"pressKey {key} is an Android key code; iOS has no "
+                    "KEYCODE_* keys",
+                    "iOS takes named buttons such as HOME or LOCK, or a numeric "
+                    "HID keycode; guard Android keys with runFlow "
+                    "when: {platform: android}.")
+    return None
 
 
 def _check_coordinate(name: str, value, code: str, path: str,
@@ -785,6 +866,17 @@ def _finish_step(spec: CommandSpec, args: dict, key: Scalar, path: str) -> Step:
                   hint="Reference a subflow file, or inline the commands.")
         if "commands" in args and not args["commands"]:
             _fail(code, "runFlow.commands is empty", path, key.line, key.col)
+    if spec.name == "waitForSettled" and "quietMs" in args:
+        # only an explicit quietMs can be impossible: the default quiet
+        # window shrinks to fit a short timeoutMs (settle_window)
+        timeout, quiet = settle_window(args)
+        if quiet > timeout:
+            _fail(code, f"waitForSettled.quietMs ({quiet}) exceeds timeoutMs "
+                        f"({timeout}); the screen could never count as settled",
+                  path, key.line, key.col,
+                  hint=f"Keep quietMs at or below timeoutMs (defaults: timeoutMs "
+                       f"{SETTLE_DEFAULT_TIMEOUT_MS}, quietMs "
+                       f"{SETTLE_DEFAULT_QUIET_MS} capped at timeoutMs).")
     if spec.name == "tapOn":
         taps = args.get("repeat")
         if taps is not None and not 2 <= taps <= 10:

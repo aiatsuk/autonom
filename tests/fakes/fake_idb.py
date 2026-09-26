@@ -177,6 +177,11 @@ def main(argv: list[str]) -> int:
         return 0
 
     if argv[:2] == ["crash", "list"]:
+        # `idb_crash_list_stderr`: a complaint printed with exit 0 and no
+        # listing (a companion lost mid-call); `idb_fail` covers a non-zero
+        # exit.
+        if state.get("idb_crash_list_stderr"):
+            sys.stderr.write(state["idb_crash_list_stderr"] + "\n")
         sys.stdout.write(state.get("idb_crash_list", ""))
         return 0
 

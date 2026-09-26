@@ -211,6 +211,20 @@ def flow_id(counter: int) -> str:
     return "f_%04d" % counter
 
 
+def client_ip(flow):
+    """The address the flow's client connected from, or None.
+
+    mitmproxy 7+ exposes it as `client_conn.peername`; older releases as
+    `client_conn.address`. Either is a (host, port) pair.
+    """
+    connection = getattr(flow, "client_conn", None)
+    for name in ("peername", "address"):
+        peer = getattr(connection, name, None)
+        if isinstance(peer, (tuple, list)) and peer and peer[0]:
+            return str(peer[0])
+    return None
+
+
 # --- addon --------------------------------------------------------------------
 
 
@@ -311,6 +325,9 @@ class AutonomRecorder:
             "response_body_preview": preview(flow.response.content),
             "mocked": bool(flow.metadata.get("autonom_mock_id")),
             "mock_id": flow.metadata.get("autonom_mock_id"),
+            # Who sent it: `network status` counts a flow as the target's only
+            # when its client is the target (a host curl is a flow too).
+            "client_ip": client_ip(flow),
             "sizes": {
                 "request_bytes": len(flow.request.content or b""),
                 "response_bytes": len(flow.response.content or b""),

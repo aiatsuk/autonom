@@ -55,11 +55,15 @@ def compact_node(node: Any, ref: str) -> dict[str, Any]:
         "package": node.package or None,
         "bounds": bounds,
         "clickable": node.bool_attr("clickable"),
+        # Additive: a Flutter control can be long-press-only or checkable
+        # without being clickable; `--interactable` has to see both.
+        "long_clickable": node.bool_attr("long-clickable"),
         "enabled": node.bool_attr("enabled"),
         "focusable": node.bool_attr("focusable"),
         "focused": node.bool_attr("focused"),
         "scrollable": node.bool_attr("scrollable"),
         "selected": node.bool_attr("selected"),
+        "checkable": node.bool_attr("checkable"),
         "checked": node.bool_attr("checked"),
         "depth": node.depth,
     }

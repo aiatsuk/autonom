@@ -37,8 +37,24 @@ ROLE_BY_TYPE = {
     "TabBar": "tabbar", "Toolbar": "toolbar", "Alert": "alert", "Sheet": "sheet",
     "ProgressIndicator": "progress", "Group": "group", "Other": "node",
     "Application": "app", "Window": "window",
+    # Spelled out (the lowercased fallback gives the same roles) because the
+    # toggle state below keys on them.
+    "CheckBox": "checkbox", "RadioButton": "radiobutton", "ToggleButton": "togglebutton",
 }
-CLICKABLE_ROLES = {"button", "link", "cell", "switch", "tabbar", "slider"}
+# Two-state controls. idb reports their state in AXValue, not in a boolean:
+# a Flutter `Checkbox` (and a UIKit/SwiftUI switch) comes back as
+# `{"type": "CheckBox", "AXValue": "1"}` / `"0"`, some builds say "on"/"off".
+# `checked` used to read only `checked`/`AXChecked`, which idb never sends,
+# so it was false for every control and `assertChecked` could not pass on iOS.
+TOGGLE_ROLES = {"checkbox", "switch", "togglebutton", "radiobutton"}
+TOGGLE_AX_ROLES = {"AXCheckBox", "AXSwitch", "AXToggle", "AXRadioButton"}
+TOGGLE_VALUES = {
+    "1": True, "true": True, "on": True, "yes": True, "checked": True, "selected": True,
+    "0": False, "false": False, "off": False, "no": False, "unchecked": False,
+    "not selected": False,
+}
+CLICKABLE_ROLES = {"button", "link", "cell", "switch", "tabbar", "slider",
+                   "checkbox", "radiobutton", "togglebutton"}
 
 
 def _first(source: dict[str, Any], *names: str) -> Any:
@@ -104,6 +120,35 @@ def _truthy(element: dict[str, Any], *names: str, default: bool = False) -> bool
     return str(value).strip().lower() in {"true", "1", "yes"}
 
 
+def is_toggle(element: dict[str, Any], role: str | None = None) -> bool:
+    """A checkbox, switch, toggle button, or radio button — by compact role,
+    or by the AX role/subrole idb reports next to the type."""
+    if (role or _role(element)) in TOGGLE_ROLES:
+        return True
+    return any(str(element.get(key) or "") in TOGGLE_AX_ROLES for key in ("role", "subrole"))
+
+
+def toggle_state(element: dict[str, Any]) -> bool | None:
+    """The on/off state a toggle's AXValue carries; None when it says neither
+    (absent, or a mixed checkbox's "2")."""
+    value = _first(element, "AXValue", "value")
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return {1: True, 0: False}.get(int(value)) if value in (0, 1) else None
+    if value is None:
+        return None
+    return TOGGLE_VALUES.get(str(value).strip().lower())
+
+
+def _checked(element: dict[str, Any], role: str) -> bool:
+    if _first(element, "checked", "AXChecked") is not None:
+        return _truthy(element, "checked", "AXChecked")
+    if is_toggle(element, role):
+        return bool(toggle_state(element))
+    return False
+
+
 def compact_node(element: dict[str, Any], ref: str) -> dict[str, Any]:
     role = _role(element)
     traits = element.get("traits") or element.get("AXTraits") or []
@@ -129,7 +174,7 @@ def compact_node(element: dict[str, Any], ref: str) -> dict[str, Any]:
         "focused": _truthy(element, "focused", "AXFocused", "has_focus"),
         "scrollable": role in {"scroll", "list"},
         "selected": _truthy(element, "selected", "AXSelected"),
-        "checked": _truthy(element, "checked", "AXChecked"),
+        "checked": _checked(element, role),
         "depth": int(element.get("_depth") or 0),
     }
 
@@ -141,7 +186,7 @@ def is_meaningful(node: dict[str, Any]) -> bool:
         or node.get("resource_id")
         or node.get("clickable")
         or node.get("scrollable")
-        or node.get("role") in {"textfield", "switch", "slider", "button"}
+        or node.get("role") in {"textfield", "slider", "button", *TOGGLE_ROLES}
     )
 
 

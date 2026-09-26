@@ -562,6 +562,50 @@ document.addEventListener('keydown',event=>{{if(event.target===filter){{if(event
 """
 
 
+def suite_flow_key(manifest: dict[str, Any]) -> str:
+    """Which flow a run belongs to: its ``id``, else its file, else its name.
+
+    The header ``id`` is the flow's stable identity (the same file reached
+    through ``/tmp`` and ``/private/tmp`` is one flow); a flow without one
+    falls back to its path, then its name, then the run itself.
+    """
+    for key in ("flow_id", "flow_path", "flow_name"):
+        value = manifest.get(key)
+        if value:
+            return f"{key}:{value}"
+    return f"run_id:{manifest.get('run_id')}"
+
+
+def latest_runs_per_flow(manifests: list[dict[str, Any]],
+                         last: int | None) -> list[dict[str, Any]]:
+    """``report suite --last N``: the latest run of each of the N flows that
+    ran most recently, in run order (oldest first, like the input).
+
+    ``manifests`` must be in run order. Counting runs instead let one re-run
+    push another flow out of a window sized to the suite; here a re-run
+    replaces its flow's earlier run. ``last`` of None or 0 keeps every run.
+    """
+    if not last:
+        return list(manifests)
+    if last < 0:
+        from .. import errors
+        raise errors.AutonomError(
+            errors.INVALID_VALUE, f"--last must be a positive count, got {last}",
+            hint="Pass how many flows to report, e.g. --last 46.")
+    chosen: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for manifest in reversed(manifests):
+        key = suite_flow_key(manifest)
+        if key in seen:
+            continue
+        seen.add(key)
+        chosen.append(manifest)
+        if len(chosen) == last:
+            break
+    chosen.reverse()
+    return chosen
+
+
 def _shorten(text: str, base: Path | None) -> str:
     """Drop a leading base directory so a shared report carries no local paths."""
     if not base:

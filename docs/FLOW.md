@@ -33,6 +33,17 @@ autonom flow run login.yaml            # execute against the active session
 autonom flow run login.yaml --until-step 7 --evidence always
 ```
 
+`platforms` in `flow check` and `flow list` is what the flow can really run
+on: `requires.platform` when declared, otherwise both — minus iOS when a step
+that runs there is Android-only (`back`, `clearState`, `setOrientation`,
+`launchApp.clearState`, a `pressKey` with a `KEYCODE_*` key). A step inside a
+`runFlow` guarded by `when: {platform: android}` does not count, and
+`flow check` counts `runFlow` children too. A flow that declares `ios` in
+`requires.platform` and still uses such a step is refused with
+`unsupported_on_platform` (`unsupported_key_for_platform` for a key) at the
+step's `file:line:column`; on an iOS target `flow run` refuses the same steps
+at pre-flight, before any mutation, with the step's file and line.
+
 `flow run` needs an active session (`autonom session start`), pre-flights the
 whole flow against the resolved target before any mutation (`requires.platform`
 and `requires.capabilities` included), and exits `0` on
@@ -83,11 +94,13 @@ screenshot|hierarchy|logs|crashes|network` flags override its evidence kinds.
   (`waitForIdle`, `extendedWaitUntil`, `runScript`, `evalScript`) are
   rejected with a pointed hint.
 - **Values that can only fail on the device**: a negative `timeoutMs`,
-  `delayMs`, `durationMs`, `maxSwipes`, or `chars`; a `setLocation` (or
-  `setup.location`) latitude outside -90..90 or longitude outside
-  -180..180; an empty selector string; and a `match: regex` pattern that
-  does not compile are positioned `flow check` errors (a pattern that
-  interpolates `${VAR}` is checked when it runs). `timeoutMs: 0` is legal:
+  `delayMs`, `durationMs`, `maxSwipes`, `chars`, or `quietMs`; a
+  `waitForSettled` whose explicit `quietMs` exceeds its `timeoutMs`; a `setLocation`
+  (or `setup.location`) latitude outside -90..90 or longitude outside
+  -180..180; an empty selector string; a `match: regex` pattern that
+  does not compile; and an `openLink` URL without a scheme (`myapp://path`,
+  `https://host/path`) are positioned `flow check` errors (a pattern or URL
+  that starts with `${VAR}` is checked when it runs). `timeoutMs: 0` is legal:
   one check, no waiting. A UTF-8 byte-order mark at the start of a file is
   accepted and ignored.
 - **Type guessing**: `true` is a boolean only where a boolean belongs;
@@ -211,6 +224,7 @@ command assertNotVisible: selector timeoutMs label
 command assertEnabled: selector timeoutMs label
 command assertChecked: selector timeoutMs label
 command waitUntil: visible notVisible timeoutMs label
+command waitForSettled: timeoutMs quietMs label
 command setLocation: latitude longitude label postcondition
 command setPermissions: action service appId label postcondition
 command addMedia: path label postcondition
@@ -223,7 +237,7 @@ command takeScreenshot: label
 command checkpoint: name
 command note: text
 deferred: waitForIdle extendedWaitUntil runScript evalScript
-requires-capabilities: ui.accessibility ui.input screenshots screen.stream logs network.capture checkpoint.create checkpoint.restore simulator.location simulator.permissions simulator.clipboard simulator.appearance simulator.text_size simulator.status_bar simulator.battery simulator.network simulator.push simulator.sms simulator.call simulator.biometric
+requires-capabilities: ui.accessibility ui.input screenshots screen.stream logs network.capture checkpoint.create checkpoint.restore simulator.location simulator.permissions simulator.clipboard simulator.appearance simulator.text_size simulator.status_bar simulator.battery simulator.network simulator.push simulator.sms simulator.call simulator.biometric simulator.keyboard
 ```
 
 `sideEffects` declares the mutation classes a reviewer should expect:
@@ -262,6 +276,17 @@ applied, verified, and used setup entries separately.
   with Android Settings, in a search activity of another package that
   `stopApp` never touches. `resume: true` restores the old behaviour for a
   flow that continues a journey.
+- `waitForSettled` polls the UI tree until it holds still — the same engine
+  as `autonom ui wait --settled`: settled means consecutive snapshots with an
+  identical tree for at least `quietMs` (default 500, capped at `timeoutMs`),
+  bounded by `timeoutMs` (default 5000); `timeoutMs: 0` takes one snapshot,
+  which cannot prove the screen still, so it reports `settled: false`. Put it
+  before a tap on a sheet or page that is still
+  animating in: measured on a device, a `tapOn` fired mid-animation missed.
+  It never fails the flow — a tree still changing at `timeoutMs` (a spinner,
+  a looping animation) is reported as `settled: false` on the step and a
+  `screen_not_settled` run warning, and the flow goes on; assert the state
+  you need with `waitUntil`.
 - `repeat` is bounded, declared iteration: `times` (1–25) is the hard
   limit, `while:` (`visible`/`notVisible` only) stops the loop early the
   moment it no longer holds; a failing iteration fails the flow, and
@@ -289,7 +314,20 @@ the session, converts `ui type --sensitive` (and values typed into
 credential-shaped fields) to `${SECRET_n}` placeholders that are never
 stored, turns the final verifying `ui find` into the closing assertion,
 and refuses to approximate what it cannot prove — coordinate taps and
-point-to-point swipes are reported as warnings, not guessed. The response
+point-to-point swipes are reported as warnings, not guessed. Journal argv is
+read the way the CLI parser reads it: option values (`--serial S`,
+`--label x`) are never taken for a positional, so `open <url> --serial S`
+becomes `openLink: <url>`. `session launch` (which resumes the app) becomes
+`launchApp: {resume: true}`; `session launch --fresh` becomes the bare, fresh
+`launchApp`. What has no flow equivalent is skipped with a named warning
+and counted in `quality.skipped`, never dropped: a `session uninstall`
+(`uninstall_not_compilable`), an `open` URL without a scheme, which would not
+pass `flow check` (`open_url_not_compilable`), the `--activity`, `--arg` and
+`--setenv` of a `session launch` (`launch_args_not_compilable`; the launch
+itself compiles, option values stay out of the report), and a `session clear`
+recorded on iOS (`clear_state_not_compilable_on_ios` — `clearState` is
+Android-only; declare `setup: {reset: true}` instead). The platform is the
+journal entry's own `result.platform`, else the session's `platform`. The response
 carries a quality report and the exact `flow run … --secret …` replay
 command. End recordings with a `ui find` on the success state.
 
@@ -307,7 +345,11 @@ html|junit --out` writes it anywhere. For a whole suite, `autonom
 report suite` folds every run of the session into one `suite.html`
 (totals, failures first, every flow expandable to its steps; failed
 flows open by default) plus a `suite.xml` `<testsuites>` document —
-the shape CI dashboards expect. It exits 1 when any flow failed. A run that
+the shape CI dashboards expect. It exits 1 when any flow failed. `--last N`
+narrows it to the latest run of each of the N flows that ran most recently
+(a flow is its header `id`, else its file): re-running one flow replaces that
+flow's earlier run instead of pushing another flow out of the window, so
+`--last 46` after a 46-flow suite plus one re-run still reports 46 flows. A run that
 aborted on a definition or infrastructure error (exit 2 — an unreachable
 `--until-step`, a dead backend) is a JUnit **error**, never a green suite: its
 `<testsuite>` carries `errors="1"` and an `<error>` case built from the
@@ -365,7 +407,9 @@ documented Core Profile — header `appId`/`name`/`tags`/`env`/`properties`/
 `clearState`, `tapOn`, `longPressOn`, `doubleTapOn`, `inputText`,
 `eraseText` (`charactersToErase`), `pressKey`, `swipe` (direction),
 `back`, `openLink` (link), `assertVisible`/`assertNotVisible`,
-`extendedWaitUntil`→`waitUntil`, `takeScreenshot`, `scrollUntilVisible`
+`extendedWaitUntil`→`waitUntil`, `waitForAnimationToEnd` (`timeout`)→
+`waitForSettled` (both wait for a still screen and never fail),
+`takeScreenshot`, `scrollUntilVisible`
 (`element`/`direction`/`centerElement`), `retry` (`maxRetries`+1→
 `maxAttempts`, capped at 3 attempts; mutating children get an explicit
 `allowMutations: true` because that is what Maestro's retry does),
@@ -391,11 +435,21 @@ and the file position; an ambiguous conversion never produces a file that
 silently means something else. `flow export --format maestro` goes the
 other way, over a **narrower** surface than import: exact text is
 regex-escaped, `label`/`optional`/`eraseText.chars` carry over,
-`checkpoint`/`note` become comments, and anything Maestro cannot express
-identically — a per-command `timeoutMs`, relational selectors, `group`,
-`setOrientation`, `assertEnabled`/`assertChecked`, and the commands added in
-0.28.1 (`scroll`, `repeat`, `swipe.from`, the clipboard variables) — refuses
-rather than exporting something that means something else. Note the one
+`checkpoint`/`note` become comments, an assertion's `timeoutMs` becomes an
+`extendedWaitUntil`, and a tap's `timeoutMs` (`tapOn`, `longPressOn`,
+`doubleTapOn`) becomes `extendedWaitUntil: {visible: <selector>, timeout: N}`
+followed by the tap — that wait is exactly what the timeout bounds. An
+optional tap makes the wait `optional: true` as well; on import, an optional
+`extendedWaitUntil` carrying only `visible`, `timeout` and `optional` right
+before an optional tap on the same element folds back into that tap's
+`timeoutMs`, and any other optional wait refuses (Autonom waits cannot be
+optional, and a fold must not drop a `notVisible` arm or a label). `waitForSettled` exports as
+`waitForAnimationToEnd` (`quietMs` has no Maestro form and refuses). Anything
+Maestro cannot express identically — `inputText.timeoutMs`, relational
+selectors, `group`, `setOrientation`, `assertEnabled`/`assertChecked`, and the
+commands added in 0.28.1 (`scroll`, `repeat`, `swipe.from`, the clipboard
+variables) — refuses rather than exporting something that means something
+else. Note the one
 asymmetry the format forces: our strict `text` exports as Maestro `text`,
 which upstream matches the label union, so an exported flow can match
 slightly more than the original; export `visibleText` when that matters.

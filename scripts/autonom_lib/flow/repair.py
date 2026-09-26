@@ -67,9 +67,10 @@ _SELECTOR_MISS = (
     "The element the step targets was not on screen within timeoutMs. "
     "Reconstruct the state with --until-step, dump the tree, find the label "
     "or identifier it carries now (candidates ranks what was on screen), and "
-    "update the selector — prefer id, then description on iOS / text on "
-    "Android. Raise timeoutMs only when the tree proves the element arrives "
-    "late."
+    "update the selector — prefer id, then visibleText, which matches the "
+    "visible label wherever the platform stores it (text on native Android "
+    "views, the accessibility label on Flutter and iOS). Raise timeoutMs only "
+    "when the tree proves the element arrives late."
 )
 _ADVICE = {
     # Flows reach this only through a relational anchor that is off-screen
@@ -77,8 +78,8 @@ _ADVICE = {
     errors.NO_MATCHING_NODE: (
         "The element the step targets (or its relational anchor) was not on "
         "screen when the step ran. Dump the tree, find the label or identifier "
-        "it carries now, and update the selector — prefer id, then description "
-        "on iOS / text on Android."
+        "it carries now, and update the selector — prefer id, then visibleText, "
+        "which matches the visible label wherever the platform stores it."
     ),
     errors.FLOW_ASSERTION_TIMEOUT: (
         "The asserted state never held within timeoutMs. Reconstruct the state "
@@ -357,6 +358,12 @@ def rank_candidates(selector: dict[str, Any] | None,
     """
     if not nodes or not isinstance(selector, dict):
         return []
+    # Flows resolve over on-screen nodes only (flow/selectors.py). Rank and
+    # count that same set, or an off-screen 0x0 copy (iOS lists Flutter's
+    # scroll cache) is suggested, or shifts the suggested `index` past the
+    # flow's matches.
+    view = selector_engine.viewport(nodes)
+    nodes = [node for node in nodes if selector_engine.is_visible(node, view)]
     if error_code == errors.AMBIGUOUS_SELECTOR:
         return _ambiguous_candidates(selector, nodes)
     wanted = _string_fields(selector)
