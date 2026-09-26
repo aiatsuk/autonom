@@ -365,8 +365,12 @@ class LogStreamTests(_Sandbox):
         # preferred when known: tests/test_fix_ios_dev.py).
         self.assertIn('processImagePath ENDSWITH "/Runner"',
                       ios_simctl.log_predicate("com.example.app", executable="Runner"))
-        self.assertEqual(logs._ios_predicate("com.example.app"),  # noqa: SLF001
-                         ios_simctl.log_predicate("com.example.app"))
+        # With nothing resolvable about the installed app, the resolved
+        # predicate every log verb uses is exactly that subsystem form.
+        with mock.patch.object(ios_simctl, "app_image", return_value=(None, None)):
+            self.assertEqual(
+                logs.ios_predicate(Target(IOS, UDID, str(FAKE_SIMCTL)), "com.example.app"),
+                ios_simctl.log_predicate("com.example.app"))
 
     def test_stream_file_filter_ignores_a_generic_leaf(self) -> None:
         stream = self.root / "stream.ndjson"

@@ -9,6 +9,7 @@ import json
 import os
 import shutil
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -425,6 +426,10 @@ def cmd_session_start(args: argparse.Namespace) -> int:
             "--activity", target.platform,
             "Activities are Android components; iOS launches by bundle id."))
 
+    # What --install / --launch actually did, reported beside the session: the
+    # record alone did not say whether a launch happened, or how.
+    installed = False
+    launched: dict[str, Any] | None = None
     try:
         if install_path is not None:
             if target.platform == IOS:
@@ -432,25 +437,24 @@ def cmd_session_start(args: argparse.Namespace) -> int:
             else:
                 session_mod.install_app(target.tool, target.target_id, install_path)
             record["install_path"] = str(install_path.resolve())
+            installed = True
 
         if launch_id:
             if target.platform == IOS:
-                ios_simctl.launch(target.tool, target.target_id, launch_id)
+                pid = ios_simctl.launch(target.tool, target.target_id, launch_id)
+                launched = {"app_id": launch_id, "pid": pid}
             else:
-                session_mod.launch_app(target.tool, target.target_id, launch_id,
-                                       activity=args.activity)
+                # `am start -W`: mode, component and the launch report
+                detail = session_mod.launch_app(target.tool, target.target_id, launch_id,
+                                                activity=args.activity)
+                launched = {"app_id": launch_id, **detail}
             record["app_id"] = launch_id
 
         if target.platform == IOS and getattr(args, "log_stream", False):
-            stream = session_mod.artifact_path(record, "logs", "stream.ndjson")
-            # bounded on disk (AUTONOM_IOS_LOG_MAX_MB) and filtered to the app
-            pid = ios_simctl.start_log_stream(
-                target.tool, target.target_id, stream, bundle_id=record.get("app_id"))
-            record["background"]["log_stream_pid"] = pid
-            if pid:
-                session_mod.register_stream(
-                    record, stream_id="log_stream", kind="device_log",
-                    path="logs/stream.ndjson", label="ios log stream", pid=pid)
+            # bounded on disk (AUTONOM_IOS_LOG_MAX_MB), filtered to the
+            # installed app's bundle, and entered in the process registry
+            # under this session (background pid, streams[] and registry row)
+            logs_mod.start_session_log_stream(target, record)
     except BaseException as exc:
         # A failed install or launch must not leave a half-built session as
         # "current": the next verb would silently drive it.
@@ -462,7 +466,8 @@ def cmd_session_start(args: argparse.Namespace) -> int:
         raise
 
     session_mod.save(record)
-    payload: dict[str, Any] = {"ok": True, "session": record}
+    payload: dict[str, Any] = {"ok": True, "session": record,
+                               "installed": installed, "launched": launched}
     if target.platform == IOS:
         payload["booted"] = booted
     if warnings:
@@ -499,28 +504,95 @@ def cmd_session_stop(args: argparse.Namespace) -> int:
 
         return device_proxy_ios.detach(target, record)
 
+    # The pids in the record may be days old and belong to anything by now:
+    # each is signalled only once its registry row or its command line shows
+    # it is still this session's writer or recorder. The detail stays the
+    # bool it always was (True: a process was stopped); how each pid was
+    # judged is kept for the warnings below.
+    verification: dict[str, dict[str, Any]] = {}
+
+    def _log_stream() -> bool:
+        outcome = logs_mod.stop_log_writer(record, background.get("log_stream_pid"))
+        verification["log_stream"] = outcome
+        return outcome["result"] == "terminated"
+
+    def _recorder() -> bool:
+        outcome = _stop_recorder(record)
+        verification["recorder"] = outcome
+        return outcome["result"] == "terminated"
+
     # Order matters: restore the device's network before killing the proxy, or the
     # device is briefly pointed at a dead listener (INV-07, INV-10).
     actions: list[tuple[str, Any]] = [
-        ("log_stream", lambda: session_mod.terminate_pid(background.get("log_stream_pid"))),
-        ("recorder", lambda: session_mod.terminate_pid(background.get("recorder_pid"))),
+        ("log_stream", _log_stream),
+        ("recorder", _recorder),
         ("network_detach", _detach),
         ("network_stop", lambda: proxy_mod.stop(record)),
+        # last: every registry row this session owns (the log-stream writer,
+        # a canvas pair, an idb_companion its idb calls started), each one
+        # signature-checked before it is signalled
+        ("session_processes", lambda: session_mod.reap_owned_processes(record)),
     ]
     teardown = session_mod.run_teardown(actions)
+    reaped: dict[str, Any] = next(
+        (item.get("detail") or {} for item in teardown
+         if item["action"] == "session_processes" and item.get("ok")), {})
+    if (reaped.get("terminated") or reaped.get("companion_left_running")
+            or reaped.get("group_remnants")):
+        # kept on the stopped record, as the library's own reap keeps it
+        current = session_mod.load_current()
+        if current:
+            current["process_teardown"] = reaped
+            session_mod.save(current)
 
-    stopped = session_mod.stop_session()
+    # the list above already reaped the session's processes
+    stopped = session_mod.stop_session(reap=False)
     payload: dict[str, Any] = {"ok": True, "session": stopped, "teardown": teardown}
+    warnings: list[dict[str, Any]] = []
     if gone:
         target_id = record.get("target_id") or record.get("serial")
         payload["stale_target"] = True
-        payload["warnings"] = [{
+        warnings.append({
             "code": "stale_target",
             "error": f"the session's target {target_id} is no longer present; "
                      "the session was cleared without device-side teardown",
             "hint": "Pick a running target with 'autonom devices', then "
                     "'autonom session start'.",
-        }]
+        })
+    for name, outcome in verification.items():
+        if outcome.get("result") == "unverified_skipped":
+            what = "log-stream writer" if name == "log_stream" else "screen recorder"
+            warnings.append({
+                "code": "unverified_skipped",
+                "error": f"the session's {what} (pid {outcome['pid']}) was not "
+                         "signalled: ps could not confirm it is still that process",
+                "hint": f"Inspect it with 'ps -p {outcome['pid']}' and stop it yourself "
+                        "only if it is yours.",
+            })
+    if any(outcome.get("result") in ("pid_reused", "unverified_skipped")
+           for outcome in verification.values()):
+        payload["teardown_verification"] = verification
+    companions = reaped.get("companion_left_running") or []
+    if companions:
+        udid = record.get("target_id")
+        warnings.append({
+            "code": "companion_left_running",
+            "error": f"{len(companions)} idb_companion process(es) for {udid} were not "
+                     "started by this session and were left running",
+            "hint": "Stop them with kill <pid> if nothing else uses the simulator.",
+            "companions": companions,
+        })
+    remnants = reaped.get("group_remnants") or []
+    if remnants:
+        warnings.append({
+            "code": "group_remnant_left_running",
+            "error": f"{len(remnants)} process group(s) recorded for this session lost "
+                     "their leader and were left running; they may not be Autonom's",
+            "hint": remnants[0].get("hint"),
+            "group_remnants": remnants,
+        })
+    if warnings:
+        payload["warnings"] = warnings
     return emit(payload, as_json=True)
 
 
@@ -575,10 +647,11 @@ def cmd_session_launch(args: argparse.Namespace) -> int:
                                               activity=args.activity)
         payload = {"ok": True, "launched": args.app_id, **detail, **target.identity()}
     else:
-        session_mod.launch_app(target.tool, target.target_id, args.app_id,
-                               activity=args.activity)
-        payload = {"ok": True, "launched": args.app_id, "mode": "resume",
-                   **target.identity()}
+        # `am start -W` on the launcher activity (monkey only as the
+        # fallback): mode, component, and the launch report
+        detail = session_mod.launch_app(target.tool, target.target_id, args.app_id,
+                                        activity=args.activity)
+        payload = {"ok": True, "launched": args.app_id, **detail, **target.identity()}
     if warnings:
         payload["warnings"] = warnings
     return emit(payload, as_json=True)
@@ -628,10 +701,17 @@ def cmd_session_clear(args: argparse.Namespace) -> int:
             )
         ios_simctl.uninstall(target.tool, target.target_id, args.app_id, check=True)
         ios_simctl.install(target.tool, target.target_id, Path(install_path))
-        return emit(
-            {"ok": True, "cleared": args.app_id, "strategy": "reinstall", **target.identity()},
-            as_json=True,
-        )
+        payload = {"ok": True, "cleared": args.app_id, "strategy": "reinstall",
+                   **target.identity()}
+        # the reinstalled app lives in a new container, which a running
+        # stream's bundle-path predicate cannot follow: stop the old writer
+        # (only once it is shown to be this session's) and start a new one
+        restart = simulator_mod.restart_session_log_stream(target, cause="reinstall",
+                                                           stop_previous=True)
+        if restart.get("warnings"):
+            payload["warnings"] = restart.pop("warnings")
+        payload.update(restart)
+        return emit(payload, as_json=True)
     if strategy == "privacy":
         ios_simctl.privacy(target.tool, target.target_id, "reset", "all", args.app_id)
         return emit(
@@ -705,13 +785,15 @@ def _snapshot(args: argparse.Namespace) -> tuple[list[dict[str, Any]], str, str,
     dump = getattr(args, "dump", None)
     if dump:
         text = _read_dump(dump)
+        # marked like a live snapshot: a node that cannot be on screen
+        # carries visible: false, whatever file it came from
         if _dump_platform(text) == IOS:
             from autonom_lib import ui_ios
 
-            return ui_ios.parse_all(text), "file", dump, None
+            return selector_mod.mark_visibility(ui_ios.parse_all(text)), "file", dump, None
         from autonom_lib import ui_android
 
-        return ui_android.parse_all(text), "file", dump, None
+        return selector_mod.mark_visibility(ui_android.parse_all(text)), "file", dump, None
     target = _target(args)
     return ui_mod.snapshot(target), "device", target.target_id, target
 
@@ -735,6 +817,12 @@ def cmd_ui_tree(args: argparse.Namespace) -> int:
                 text, meaningful_only=not args.all, max_depth=args.max_depth,
                 max_nodes=fetch,
             )
+            # as a live tree is marked: the meaningful filter may drop an
+            # unlabelled application root, so the screen rectangle can come
+            # from the whole dump instead
+            view = (selector_mod.viewport(nodes)
+                    or selector_mod.viewport(ui_ios.parse_all(text)))
+            nodes = selector_mod.mark_visibility(nodes, view)
             identity = {"platform": IOS}
         else:
             nodes = ui_mod.parse_compact_tree(
@@ -829,13 +917,10 @@ def cmd_ui_wait(args: argparse.Namespace) -> int:
                                "timeout_ms": args.timeout_ms, "quiet_ms": args.quiet_ms,
                                **target.identity()}
     if not result["settled"]:
-        payload["warnings"] = [{
-            "code": "screen_not_settled",
-            "error": f"the tree was still changing after {args.timeout_ms} ms "
-                     f"({result['changes']} change(s) over {result['snapshots']} snapshots)",
-            "hint": "An animation, spinner or loading list keeps it moving; raise "
-                    "--timeout-ms, or wait for a specific node with 'ui find'.",
-        }]
+        # "still changing" only when a change was seen; one slow dump in the
+        # budget (or identical dumps short of --quiet-ms) cannot confirm either
+        error, hint = ui_mod.unsettled_message(result, args.timeout_ms, args.quiet_ms)
+        payload["warnings"] = [{"code": "screen_not_settled", "error": error, "hint": hint}]
     emit(payload, as_json=True)
     return 0 if result["settled"] else 1
 
@@ -893,36 +978,20 @@ def cmd_session_outputs(args: argparse.Namespace) -> int:
                  "count": len(streams), "streams": streams}, as_json=True)
 
 
-def _logcat_start(adb: str, serial: str) -> list[str]:
-    """`-T <device epoch>`: start at the device's *now*, not the whole buffer.
-
-    Without it `logs follow --source device` replayed thousands of stale
-    lines before the first new one (CLI-009). The device clock is used, not
-    the host's — an emulator that outlived a host sleep lags by seconds.
-    `-T 1` (only the newest buffered line) is the fallback when the device
-    clock cannot be read.
-    """
-    completed = adb_mod.run_adb(adb, ["shell", "date", "+%s"], serial=serial,
-                                timeout=10, check=False)
-    epoch = (completed.stdout or "").strip()
-    return ["-T", f"{epoch}.000" if epoch.isdigit() else "1"]
-
-
 def _follow_device(args: argparse.Namespace) -> dict[str, Any]:
     target = _target(args)
     if target.platform == ANDROID:
-        argv = [target.tool, "-s", target.target_id, "logcat", "-v", "time"]
-        if not args.from_start:
-            argv += _logcat_start(target.tool, target.target_id)
-        if args.package:
-            pid = logs_mod.pid_for_package(
-                target.tool, target.target_id, args.package)
-            if pid:
-                argv.append(f"--pid={pid}")
-        return follow_mod.follow_process(
-            argv, source="device", emit=_stream_print,
-            max_seconds=args.max_seconds, max_lines=args.max_lines,
-            grep=args.grep)
+        # starts at the device's now (`logcat -T`) unless --from-start; with
+        # --package, the app's uid on API 31+ (plus the lifecycle lines
+        # naming it), else its running pid, else lines naming it — and says
+        # which, up front. An unknown package is app_not_installed.
+        plan = logs_mod.android_follow_plan(target.tool, target.target_id, args.package,
+                                            from_start=args.from_start)
+        return follow_mod.follow_processes(
+            plan["streams"], source="device", emit=_stream_print,
+            max_seconds=args.max_seconds, max_lines=args.max_lines, grep=args.grep,
+            warnings=plan["warnings"],
+            detail={"filter": plan["filter"]} if plan["filter"] else None)
 
     # iOS: a named past session can only replay its recorded stream file; the
     # current session's file is preferred only while its writer is alive —
@@ -931,8 +1000,11 @@ def _follow_device(args: argparse.Namespace) -> dict[str, Any]:
               else session_mod.load_current())
     stream = (Path(record["artifacts_dir"]) / "logs" / "stream.ndjson"
               if record else None)
-    package_filter = ((lambda line: args.package in line)
-                      if args.package else None)
+    # the session's install path helps resolve the app's image, when the
+    # package followed is the session's own app
+    app_path = (record.get("install_path")
+                if record and args.package and record.get("app_id") == args.package
+                else None)
     if args.session_id:
         if stream is None or not stream.exists():
             raise errors.AutonomError(
@@ -943,22 +1015,33 @@ def _follow_device(args: argparse.Namespace) -> dict[str, Any]:
             )
         writer_alive = True  # replaying a past recording, liveness irrelevant
         args.from_start = True  # a recording is read, not awaited
+        # the app may have moved container since: match the executable the
+        # stream recorded, not a bundle path resolved today
+        executable = ((record.get("background") or {}).get("log_stream_executable"))
+        package = args.package
+        line_filter = ((lambda line: ios_simctl.log_line_matches(
+            line, package, executable=executable)) if package
+            else (lambda line: not ios_simctl.is_log_noise(line)))
     else:
         pid = (record or {}).get("background", {}).get("log_stream_pid")
         writer_alive = session_mod.pid_alive(pid)
+        line_filter = None
     if stream is not None and stream.exists() and writer_alive:
+        if line_filter is None:
+            line_filter = logs_mod.ios_line_filter(target, args.package, app_path=app_path)
         return follow_mod.follow_file(
             stream, source="device", emit=_stream_print,
             from_start=args.from_start, max_seconds=args.max_seconds,
             max_lines=args.max_lines, grep=args.grep,
-            poll_ms=args.poll_ms, line_filter=package_filter)
-    argv = [target.tool, "simctl", "spawn", target.target_id,
-            "log", "stream", "--style", "ndjson", "--level", "info"]
-    if args.package:
-        argv += ["--predicate", logs_mod._ios_predicate(args.package)]  # noqa: SLF001
+            poll_ms=args.poll_ms, line_filter=line_filter)
+    # a live `log stream`: the predicate names the installed app exactly
+    # (its bundle path when it resolves); the line filter only drops the
+    # `log` tool's own banner and trailer
+    argv = logs_mod.ios_follow_argv(target, args.package, app_path=app_path)
     return follow_mod.follow_process(
         argv, source="device", emit=_stream_print,
-        max_seconds=args.max_seconds, max_lines=args.max_lines, grep=args.grep)
+        max_seconds=args.max_seconds, max_lines=args.max_lines, grep=args.grep,
+        line_filter=logs_mod.ios_line_filter(target))
 
 
 def cmd_logs_follow(args: argparse.Namespace) -> int:
@@ -1017,7 +1100,11 @@ def cmd_ui_find(args: argparse.Namespace) -> int:
     ui_mod.require_selector(_selectors(args))
     _check_selector_regex(args)
     nodes, source, label, target = _snapshot(args)
-    matches = selector_mod.select(
+    # without --all: the node `ui tap` would act on (one resolution core,
+    # on-screen matches first); --all lists every match in the order --index
+    # counts them, each with the `index` that selects it. Off-screen matches
+    # are marked visible: false either way, dumps included.
+    matches = ui_mod.select_for_find(
         nodes,
         _selectors(args),
         mode=args.mode,
@@ -1109,19 +1196,21 @@ def cmd_ui_tap(args: argparse.Namespace) -> int:
                 "pass --x and --y for a point.",
             )
         nodes = ui_mod.snapshot(target)
-        matches = selector_mod.select(
+        # resolved exactly as `ui find` resolves it: on-screen matches first,
+        # counted the way a flow counts; a node never laid out on screen is
+        # refused with element_offscreen
+        node = ui_mod.select_for_action(
             nodes,
             _selectors(args),
             mode=args.mode,
             case_sensitive=args.case_sensitive,
             index=args.index,
         )
-        if not matches:
-            # carries the iOS "the label is in desc" hint when it applies
+        if node is None:
+            # carries the "the label is in desc" hint when it applies
             raise ui_mod.no_match_error(
                 target.platform, nodes, _selectors(args), mode=args.mode,
                 case_sensitive=args.case_sensitive, message="no matching node to tap")
-        node = matches[0]
         x, y = ui_mod.center_of(node)
         ref = node.get("ref")
     duration = getattr(args, "duration", None)
@@ -1331,20 +1420,32 @@ def cmd_logs_tail(args: argparse.Namespace) -> int:
     if current and target.platform == IOS:
         candidate = Path(current["artifacts_dir"]) / "logs" / "stream.ndjson"
         stream_path = candidate if candidate.exists() else None
-    entries, warnings = logs_mod.tail(
+    # Android --package narrows by the app's uid (API 31+), else its pid, else
+    # lines naming it, and says which in `filter`; an unknown package is
+    # app_not_installed. iOS matches the installed app exactly and names the
+    # `executable` the predicate used.
+    detail = logs_mod.tail_detailed(
         target,
         stream_path=stream_path,
         package=args.package,
         since_seconds=args.since,
         max_lines=args.max_lines,
         grep=args.grep,
+        app_path=(current.get("install_path")
+                  if current and args.package and current.get("app_id") == args.package
+                  else None),
     )
+    entries, warnings = detail["entries"], detail["warnings"]
     payload: dict[str, Any] = {
         "ok": True,
         "count": len(entries),
         "lines": entries,
         **target.identity(),
     }
+    if detail.get("filter") is not None:
+        payload["filter"] = detail["filter"]
+    if detail.get("executable"):
+        payload["executable"] = detail["executable"]
     if warnings:
         payload["warnings"] = warnings
     if current:
@@ -1539,8 +1640,10 @@ def cmd_metrics_memory_warn(args: argparse.Namespace) -> int:
                  **target.identity()}, as_json=True)
 
 
+# The hint must not send a Simulator run to `trace --preset hitches`:
+# Instruments refuses Animation Hitches on the Simulator.
 _FRAMES_ANDROID_ONLY = ("gfxinfo frame stats are Android-only",
-                        "On iOS use 'metrics trace --preset hitches'.")
+                        metrics_frames.IOS_FRAMES_HINT)
 
 
 def cmd_metrics_frames_reset(args: argparse.Namespace) -> int:
@@ -1558,6 +1661,10 @@ def cmd_metrics_frames_capture(args: argparse.Namespace) -> int:
     raw, summary = metrics_frames.capture(target, app_id)
     payload: dict[str, Any] = {"ok": True, "summary": summary,
                                **target.identity()}
+    if summary.get("warnings"):
+        # `no_frames` (a Flutter app draws outside HWUI) belongs where every
+        # other verb's warnings are, not only inside the summary
+        payload["warnings"] = list(summary["warnings"])
     if args.out or session_mod.load_current():
         out_dir = _metrics_out_dir(args)
         stem = metrics_artifacts.unique_stem(
@@ -1629,10 +1736,61 @@ def _app_id(args: argparse.Namespace, *, required: bool = True) -> str | None:
     return app_id
 
 
+_VIEW_ACTION = "android.intent.action.VIEW"
+# What Android shows when several apps (or none by default) take a URL: the
+# system resolver/chooser, not the app a deep link was meant for.
+_CHOOSER_MARKERS = ("ResolverActivity", "ChooserActivity", "intentresolver")
+
+
+def _open_android(target: Target, url: str) -> dict[str, Any]:
+    """The VIEW intent through `am start -W`, which names the activity that
+    took the URL: a deep link that lands in Chrome or the chooser instead of
+    the app used to be reported exactly like one that reached the app."""
+    if not device_state._URL.match(url or ""):  # noqa: SLF001 - open_url's own check
+        device_state.open_url(target, url)  # raises its invalid_url envelope
+    completed = adb_mod.run_adb(
+        target.tool,
+        ["shell", "am", "start", "-W", "-a", _VIEW_ACTION, "-d", shlex.quote(url)],
+        serial=target.target_id, timeout=60, check=True,
+    )
+    output = completed.stdout if isinstance(completed.stdout, str) else ""
+    report = session_mod.parse_am_wait(output)
+    handled_by = (report or {}).get("activity")
+    detail: dict[str, Any] = {"handled_by": handled_by}
+    if report is not None:
+        detail["launch"] = report
+    warnings: list[dict[str, Any]] = []
+    unresolved = next((line.strip() for line in output.splitlines()
+                       if line.strip().startswith("Error")), None)
+    if unresolved:
+        warnings.append({
+            "code": "url_not_handled",
+            "error": f"no activity took the URL: {unresolved[:200]}",
+            "hint": "Check the app declares an intent filter for this scheme and "
+                    "host ('adb shell dumpsys package d'), and that it is installed.",
+        })
+    elif handled_by and any(marker in handled_by for marker in _CHOOSER_MARKERS):
+        warnings.append({
+            "code": "url_opened_chooser",
+            "error": f"the URL opened the system chooser ({handled_by}), not an app",
+            "hint": "More than one app takes this URL and none is verified as its "
+                    "default; verify the App Link or pick the app in the chooser.",
+        })
+    if warnings:
+        detail["warnings"] = warnings
+    return detail
+
+
 def cmd_open(args: argparse.Namespace) -> int:
     target = _target(args)
-    device_state.open_url(target, args.url)
-    return emit({"ok": True, "opened": args.url, **target.identity()}, as_json=True)
+    if target.platform == ANDROID:
+        detail = _open_android(target, args.url)
+    else:
+        device_state.open_url(target, args.url)
+        # `simctl openurl` does not say which app took the URL
+        detail = {"handled_by": "unknown"}
+    return emit({"ok": True, "opened": args.url, **detail, **target.identity()},
+                as_json=True)
 
 
 def cmd_permissions(args: argparse.Namespace) -> int:
@@ -1712,6 +1870,87 @@ def cmd_file_pull(args: argparse.Namespace) -> int:
 _RECORDING_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 
 
+# What `device_state.record_start` runs: `simctl io <udid> recordVideo … <path>`
+# on iOS, `adb -s <serial> shell screenrecord /sdcard/autonom-recording.mp4`
+# on Android. Its command line is what shows a recorded pid is still it.
+_ANDROID_RECORDING = "/sdcard/autonom-recording.mp4"
+
+
+def _command_tokens(command: str) -> list[str] | None:
+    """`command` split like argv, or None when it cannot be (`ps` does not
+    quote, so an argument with a quote character can defeat shlex)."""
+    try:
+        return shlex.split(command)
+    except ValueError:
+        return None
+
+
+def _has_token(command: str, value: str, tokens: list[str] | None) -> bool:
+    """`value` is one whole argument of `command`: `R58M123` is not found in
+    `R58M123ABCD`, nor a path in `<path>.bak`."""
+    if tokens is not None and not any(char.isspace() for char in value):
+        return value in tokens
+    return re.search(r"(?:^|\s)" + re.escape(value) + r"(?:\s|$)", command) is not None
+
+
+def _has_pair(command: str, flag: str, value: str, tokens: list[str] | None) -> bool:
+    """`flag value` as two adjacent whole arguments (`-s <serial>`)."""
+    if tokens is not None and not any(char.isspace() for char in value):
+        return any(first == flag and second == value
+                   for first, second in zip(tokens, tokens[1:]))
+    return re.search(r"(?:^|\s)" + re.escape(flag) + r"\s+" + re.escape(value)
+                     + r"(?:\s|$)", command) is not None
+
+
+def _recorder_state(record: dict[str, Any], pid: int | None) -> str:
+    """``none`` | ``gone`` | ``ours`` | ``pid_reused`` | ``unverified``."""
+    if not pid:
+        return "none"
+    if not session_mod.pid_alive(pid):
+        return "gone"
+    command = processes_mod.command_of(pid)
+    if command is None:
+        return "unverified" if session_mod.pid_alive(pid) else "gone"
+    tokens = _command_tokens(command)
+    path = (record.get("background") or {}).get("recorder_path")
+    target_id = str(record.get("target_id") or record.get("serial") or "")
+    if not target_id:
+        return "pid_reused"
+    if (path and _has_token(command, "recordVideo", tokens)
+            and _has_token(command, target_id, tokens)
+            and _has_token(command, str(path), tokens)):
+        return "ours"
+    if (_has_token(command, "screenrecord", tokens)
+            and _has_token(command, _ANDROID_RECORDING, tokens)
+            and _has_pair(command, "-s", target_id, tokens)):
+        return "ours"
+    return "pid_reused"
+
+
+def _stop_recorder(record: dict[str, Any]) -> dict[str, Any]:
+    """Stop the session's screen recorder — only once its command line shows
+    it is it (`_recorder_state`); through its registry row when there is one,
+    which re-checks its own signature. ``{"pid", "result"}`` in
+    `processes.terminate_entry`'s vocabulary."""
+    pid = (record.get("background") or {}).get("recorder_pid")
+    if not pid:
+        return {"pid": None, "result": "none"}
+    row = next((entry for entry in processes_mod.entries()
+                if entry.get("pid") == pid and entry.get("kind") == "recorder"), None)
+    state = _recorder_state(record, pid)
+    if state == "ours":
+        if row is not None:
+            result = processes_mod.terminate_entry(row)
+        else:
+            result = "terminated" if session_mod.terminate_pid(pid) else "already_exited"
+    else:
+        result = {"gone": "already_exited", "pid_reused": "pid_reused",
+                  "unverified": "unverified_skipped"}[state]
+    if row is not None and result in ("terminated", "already_exited", "pid_reused"):
+        processes_mod.deregister(int(pid))
+    return {"pid": pid, "result": result}
+
+
 def cmd_record_start(args: argparse.Namespace) -> int:
     # the name becomes <artifacts>/recordings/<name>.mp4: never a path
     if not _RECORDING_NAME.fullmatch(args.name or "") or ".." in args.name:
@@ -1723,7 +1962,9 @@ def cmd_record_start(args: argparse.Namespace) -> int:
         )
     target = _target(args)
     record = session_mod.require_current()
-    if session_mod.pid_alive((record.get("background") or {}).get("recorder_pid")):
+    # a recorded pid that now runs something else is no recording in progress
+    if _recorder_state(record, (record.get("background") or {}).get("recorder_pid")) in (
+            "ours", "unverified"):
         raise errors.AutonomError(
             errors.RECORDING_ALREADY_ACTIVE,
             "a recording is already in progress for this session",
@@ -1751,11 +1992,30 @@ def cmd_record_stop(args: argparse.Namespace) -> int:
                      **target.identity()}, as_json=True)
     destination = Path(background.get("recorder_path") or
                        session_mod.artifact_path(record, "recordings", "latest.mp4"))
-    detail = device_state.record_stop(target, background.get("recorder_pid"), destination)
+    # SIGINT only a pid shown to still be this recorder: the recorded one
+    # may have died long ago and been reused
+    pid = background.get("recorder_pid")
+    state = _recorder_state(record, pid)
+    detail = device_state.record_stop(target, pid if state == "ours" else None, destination)
+    warnings: list[dict[str, Any]] = []
+    if state in ("pid_reused", "unverified"):
+        detail["recorder"] = {"pid": pid, "result": ("pid_reused" if state == "pid_reused"
+                                                     else "unverified_skipped")}
+        if state == "unverified":
+            warnings.append({
+                "code": "unverified_skipped",
+                "error": f"the recorder (pid {pid}) was not signalled: ps could not "
+                         "confirm it is still the screen recorder",
+                "hint": f"Inspect it with 'ps -p {pid}' and stop it yourself only if "
+                        "it is yours.",
+            })
     background["recorder_pid"] = None
     background["recorder_path"] = None
     session_mod.save(record)
-    return emit({"ok": True, **detail, **target.identity()}, as_json=True)
+    payload: dict[str, Any] = {"ok": True, **detail, **target.identity()}
+    if warnings:
+        payload["warnings"] = warnings
+    return emit(payload, as_json=True)
 
 
 # --- network -----------------------------------------------------------------
@@ -1809,14 +2069,9 @@ def cmd_network_start(args: argparse.Namespace) -> int:
     # again the moment the proxy starts. Say so before it can mislead anyone.
     mocks_state = mocks_mod.summary()
     payload["mocks"] = mocks_state
-    if mocks_state["active"]:
-        warnings.append({
-            "code": "persistent_mocks_active",
-            "error": f"{mocks_state['active']} mock rule(s) loaded from the persistent "
-                     f"registry — matching responses WILL be faked",
-            "hint": "Review with 'autonom network mock list', switch off with "
-                    "'autonom network mock disable --all'.",
-        })
+    persistent = mocks_mod.persistent_mocks_warning(mocks_state)
+    if persistent:
+        warnings.append(persistent)
     if warnings:
         payload["warnings"] = warnings
     return emit(payload, as_json=True)
@@ -1826,13 +2081,33 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
     """Reap Autonom's leftover processes, from anywhere on the machine."""
     detail = processes_mod.cleanup(dry_run=args.dry_run, include_live=args.all)
     payload: dict[str, Any] = {"ok": True, **detail}
+    warnings: list[dict[str, Any]] = []
     if detail["failed"]:
-        payload["warnings"] = [{
+        warnings.append({
             "code": "termination_failed",
             "error": f"{detail['failed']} process(es) would not terminate",
             "hint": "They may belong to another user; inspect them with "
                     "'ps -p <pid>' before escalating.",
-        }]
+        })
+    if detail.get("skipped_group_remnants"):
+        warnings.append({
+            "code": "group_remnant_left_running",
+            "error": f"{detail['skipped_group_remnants']} process group(s) lost their "
+                     "recorded leader; they were not signalled because the group id "
+                     "may have been reused",
+            "hint": "Inspect each with 'ps -Ao pid,pgid,command', and kill -- -<pgid> "
+                    "only if it is yours.",
+        })
+    if detail.get("skipped_unverified"):
+        warnings.append({
+            "code": "unverified_skipped",
+            "error": f"{detail['skipped_unverified']} process(es) were not signalled: "
+                     "ps could not confirm they are still the process Autonom started",
+            "hint": "Re-run 'autonom cleanup'; if it persists, inspect them with "
+                    "'ps -p <pid>'.",
+        })
+    if warnings:
+        payload["warnings"] = warnings
     return emit(payload, as_json=True)
 
 
@@ -1850,56 +2125,46 @@ def cmd_network_stop(_: argparse.Namespace) -> int:
 
 
 def cmd_network_status(args: argparse.Namespace) -> int:
+    from autonom_lib.network import attachment as attachment_mod
+
     record = session_mod.require_current()
     state = proxy_mod.status(record)
     network = record.get("network") or {}
     payload: dict[str, Any] = {"ok": True, "proxy": state}
 
-    attached: Any = False
-    evidence = "not_attached"
-    if network.get("attached"):
-        flows, _warnings = store_mod.read_all(record)
-        recent = store_mod.filter_flows(flows, since_seconds=60)
-        if recent:
-            attached, evidence = True, "recent_flows"
-        elif network.get("platform_manual"):
-            attached, evidence = "unknown", "manual_attach_unverified"
-        else:
-            try:
-                target = _target(args)
-                observed = (device_proxy_android.observed_setting(target)
-                            if target.platform == ANDROID else None)
-            except errors.AutonomError:
-                observed = None
-            if observed and observed == network.get("device_proxy"):
-                attached, evidence = True, "device_setting"
-            elif observed is None and target_platform_is_android(record):
-                attached, evidence = False, "device_proxy_cleared_externally"
-            else:
-                attached, evidence = "unknown", "no_traffic_and_no_readable_setting"
-
-    payload["attached"] = attached  # value types unchanged: bool or "unknown"
-    payload["evidence"] = evidence
+    # Only a flow whose client is the target is evidence: a host `curl`
+    # through the proxy used to answer attached: true. The Android setting
+    # is read back when no flow decides, and an unreadable device is
+    # `setting_unreadable`, never "cleared externally".
+    platform = record.get("platform") or ANDROID
+    observe = ((lambda: device_proxy_android.read_setting(_target(args)))
+               if platform == ANDROID else None)
+    evidence = attachment_mod.attachment_evidence(record, platform=platform,
+                                                  observe_setting=observe)
+    payload["attached"] = evidence["attached"]  # value types unchanged: bool or "unknown"
+    payload["evidence"] = evidence["evidence"]
     # how far the attach got, independent of whether traffic was observed
     payload["attach_state"] = (
         network.get("attach_state")
         or ("manual" if network.get("platform_manual")
             else "automated" if network.get("attached") else "not_attached"))
-    payload["recent_flow_count"] = len(
-        store_mod.filter_flows(store_mod.read_all(record)[0], since_seconds=60)
-    )
+    payload["recent_flow_count"] = evidence["recent_flow_count"]
+    for key in ("reason", "target_flow_count", "unattributed_flow_count",
+                "recent_user_agents"):
+        if key in evidence:
+            payload[key] = evidence[key]
     mocks_state = mocks_mod.summary()
     idle = _annotate_hits(mocks_mod.active())
     payload["mocks"] = mocks_state
     if idle:
         payload.setdefault("warnings", []).extend(idle)
-    if attached == "unknown":
+    # the verb re-run while judging evidence says so too, as start and doctor do
+    persistent = mocks_mod.persistent_mocks_warning(mocks_state)
+    if persistent:
+        payload.setdefault("warnings", []).append(persistent)
+    if payload["attached"] == "unknown":
         payload["next_action"] = "exercise the app, then re-run 'autonom network status'"
     return emit(payload, as_json=True)
-
-
-def target_platform_is_android(record: dict[str, Any]) -> bool:
-    return (record.get("platform") or ANDROID) == ANDROID
 
 
 def cmd_network_attach(args: argparse.Namespace) -> int:
@@ -2237,7 +2502,9 @@ def _flow_summary(flow) -> dict[str, Any]:
         "id": flow.flow_id,
         "name": flow.name,
         "tags": flow.tags,
-        "platforms": flow.requires_platforms or ["android", "ios"],
+        # what it can really run on: requires.platform, else both minus iOS
+        # when a step that runs there is Android-only
+        "platforms": flow_validator.flow_platforms(flow),
     }
 
 
@@ -2599,6 +2866,38 @@ def cmd_flow_run(args: argparse.Namespace) -> int:
         )
     target = _target(args)
 
+    skipped: list[str] = []
+    if path.is_dir():
+        # A suite is run on one target: a flow that cannot run there (declared
+        # for the other platform, or Android-only steps on iOS) is skipped
+        # with a warning, instead of its pre-flight refusal aborting the rest.
+        runnable = []
+        for flow in flows:
+            platforms = flow_validator.flow_platforms(flow)
+            if target.platform in platforms:
+                runnable.append(flow)
+                continue
+            skipped.append(flow.path)
+            discovery_warnings.append({
+                "code": "flow_skipped_for_platform",
+                "error": f"{flow.path} runs on {'/'.join(platforms) or 'no platform'}, "
+                         f"not {target.platform}; skipped",
+                "hint": "'autonom flow check <file>' shows why; a single-file run "
+                        "names the step that is refused.",
+                "file": flow.path,
+                "platforms": platforms,
+            })
+        if not runnable:
+            raise errors.AutonomError(
+                errors.FLOW_NO_FLOWS_FOUND,
+                f"no flow under {path} can run on {target.platform}",
+                hint="Run the suite against a target of the platform the flows "
+                     "declare, or check them with 'autonom flow list'.",
+                skipped=skipped,
+                **({"warnings": discovery_warnings} if discovery_warnings else {}),
+            )
+        flows = runnable
+
     env_overrides = _flow_env_overrides(args)
     secrets = _flow_secrets(args)
 
@@ -2659,7 +2958,10 @@ def cmd_flow_run(args: argparse.Namespace) -> int:
 
     clean = ("passed", "replayed", "planned")
     if len(flows) == 1:
-        summary = {"ok": True, **run_one(flows[0]), **target.identity()}
+        run = run_one(flows[0])
+        # `runs` gives a single file the list a directory run has, so one
+        # reader handles both; the run's own keys stay at the top level
+        summary = {"ok": True, **run, "runs": [run], **target.identity()}
         exit_code = 0 if summary["status"] in clean else 1
     else:
         runs = []
@@ -2673,6 +2975,8 @@ def cmd_flow_run(args: argparse.Namespace) -> int:
                    "failed": sum(1 for r in runs if r["status"] not in clean),
                    "runs": runs, **target.identity()}
         exit_code = 0 if overall in ("passed", "planned") else 1
+    if skipped:
+        summary["skipped_flows"] = skipped
     if discovery_warnings:
         summary.setdefault("warnings", [])
         summary["warnings"] = discovery_warnings + summary["warnings"]
@@ -3034,7 +3338,10 @@ def cmd_report_watch(args: argparse.Namespace) -> int:
 def cmd_report_suite(args: argparse.Namespace) -> int:
     """One page for the whole session — the suite view CI and humans read."""
     record = _session_by_id(args.session)
-    manifests = _suite_manifests(record, args.last)
+    # --last N: the latest run of each of the N flows that ran most recently;
+    # a re-run replaces its flow's earlier run instead of pushing another
+    # flow out of the window (report history still counts runs)
+    manifests = flow_report.latest_runs_per_flow(_suite_manifests(record, None), args.last)
     out_dir = _output_dir(args.out if args.out else Path(record["artifacts_dir"]) / "flows",
                           "--out")
     base = Path(args.relative_to).resolve() if args.relative_to else None
@@ -3538,7 +3845,9 @@ def cmd_simulator(args: argparse.Namespace) -> int:
         key, value = pair.split("=", 1)
         values[key] = value
     target = _target(args)
-    result = simulator_mod.apply(target, args.control, args.action, values)
+    # the session record defaults come from (the app `push send` addresses)
+    result = simulator_mod.apply(target, args.control, args.action, values,
+                                 session=session_mod.load_current())
     return emit({"ok": True, **result, **target.identity()}, as_json=True)
 
 
@@ -3700,7 +4009,18 @@ def cmd_canvas_serve(args: argparse.Namespace) -> int:
         command.append("--no-auth")
     if args.token:
         command += ["--token", args.token]
-    return subprocess.run(command, check=False).returncode
+    # Supervised in its own process group and registered (supervisor and
+    # node child) for its whole life, so `processes` lists the pair, `cleanup
+    # --all` and `session stop` can stop it, and killing this CLI takes node
+    # and its children down too. Owned by the session on the same target.
+    # The command (it may carry --token) is never passed as registry detail.
+    current = session_mod.load_current()
+    owner = (current.get("session_id")
+             if current and current.get("target_id") == target.target_id else None)
+    return processes_mod.run_supervised(
+        command, kind="canvas", owner=owner,
+        artifacts_dir=current.get("artifacts_dir") if owner and current else None,
+        target_id=target.target_id, port=args.port)
 
 
 # --- parser ------------------------------------------------------------------
@@ -4298,7 +4618,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--session", default="current",
                    help="session id (default: current)")
     p.add_argument("--last", type=int,
-                   help="only the N most recent runs (default: all)")
+                   help="only the latest run of each of the N most recently run "
+                        "flows (default: every run)")
     p.add_argument("--out", help="destination directory")
     p.add_argument("--relative-to", metavar="DIR",
                    help="strip this directory from paths (share a report "

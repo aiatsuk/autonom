@@ -34,6 +34,10 @@ _FAILURE_CLASS_BY_CODE = {
     errors.SELECTOR_INDEX_OUT_OF_RANGE: TEST_FAILURE,
     errors.COORDINATE_SPACE_MISMATCH: TEST_FAILURE,
     errors.FLOW_NO_FOCUSED_FIELD: TEST_FAILURE,
+    # A safety net: flows select on-screen nodes only and should never meet
+    # it, but a node that is not on screen is the app's state, not a broken
+    # backend — it must not read as infrastructure.
+    errors.ELEMENT_OFFSCREEN: TEST_FAILURE,
     # The flow file itself is wrong for this target or malformed.
     errors.FLOW_PARSE_ERROR: FLOW_DEFINITION,
     errors.FLOW_SCHEMA_UNSUPPORTED: FLOW_DEFINITION,

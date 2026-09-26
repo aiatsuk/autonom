@@ -293,21 +293,49 @@ def select_for_find(
 
     Without ``all_matches`` it is ``resolve_match`` — the node tap resolves,
     raising the same ambiguity and index errors — but it never refuses an
-    off-screen node: find inspects, so it shows it. With ``all_matches`` every
-    match is listed. Either way a node that cannot be on screen is marked
-    ``visible: false``, even when the tree came unmarked (a ``--dump``).
+    off-screen node: find inspects, so it shows it. Either way a node that
+    cannot be on screen is marked ``visible: false``, even when the tree came
+    unmarked (a ``--dump``).
+
+    With ``all_matches`` every match is listed in the order ``--index``
+    counts them, so position ``i`` of the list is what ``--index i`` selects:
+    on-screen matches first (tree order), then the off-screen ones (tree
+    order) — or plain tree order when none is on screen, which is how
+    ``resolve_match`` falls back. Every reported match — with or without
+    ``all_matches`` — carries ``index``: the non-negative ``--index`` that
+    selects it, or None for an off-screen match that no index reaches while
+    another match is on screen.
     """
+    view = selector.viewport(nodes)
+    ordered = _ordered_matches(nodes, fields, mode=mode, case_sensitive=case_sensitive,
+                               view=view)
     if all_matches:
-        found = selector.select(nodes, fields, mode=mode, case_sensitive=case_sensitive,
-                                all_matches=True)
+        found = ordered
     else:
         node, _matched = resolve_match(nodes, fields, mode=mode,
                                        case_sensitive=case_sensitive, index=index)
         found = [] if node is None else [node]
-    view = selector.viewport(nodes)
+        if node is not None:
+            node["index"] = next((match["index"] for match in ordered
+                                  if match.get("ref") == node.get("ref")), None)
     for match in found:  # copies: the caller's tree is never touched
         if not selector.is_visible(match, view):
             match["visible"] = False
+    return found
+
+
+def _ordered_matches(nodes: list[dict[str, Any]], fields: Mapping[str, Any], *,
+                     mode: str, case_sensitive: bool,
+                     view: Any) -> list[dict[str, Any]]:
+    """Every match in the order ``--index`` counts them, each with its ``index``."""
+    found = selector.select(nodes, fields, mode=mode, case_sensitive=case_sensitive,
+                            all_matches=True)
+    on_screen = [match for match in found if selector.is_visible(match, view)]
+    if on_screen:
+        found = on_screen + [match for match in found
+                             if not selector.is_visible(match, view)]
+    for position, match in enumerate(found):
+        match["index"] = position if not on_screen or position < len(on_screen) else None
     return found
 
 
@@ -438,8 +466,14 @@ def settle(
     recent: list[float] = []   # the last two dumps after it
 
     def report(settled: bool, now: float) -> dict[str, Any]:
+        # `dump_ms`: the slowest dump seen, so an unsettled answer can say
+        # whether the budget ever had room for two
+        slowest = max([first, *recent]) if snapshots else 0.0
+        # `stable_ms`: how long the last tree had held still when it ended
         return {"settled": settled, "snapshots": snapshots, "changes": changes,
-                "elapsed_ms": int((now - started) * 1000)}
+                "elapsed_ms": int((now - started) * 1000),
+                "dump_ms": int(slowest * 1000),
+                "stable_ms": int((now - stable_since) * 1000) if snapshots else 0}
 
     while True:
         began = clock()
@@ -466,6 +500,54 @@ def settle(
             # the next dump would still be running at the deadline
             return report(False, now)
         sleep(pause)
+
+
+def unsettled_message(result: Mapping[str, Any], timeout_ms: int, quiet_ms: int, *,
+                      timeout_name: str = "--timeout-ms",
+                      node_wait: str = "wait for a specific node with 'ui find'",
+                      ) -> tuple[str, str]:
+    """The ``screen_not_settled`` warning for an unsettled `settle` result:
+    ``(error, hint)``, one precise statement and one piece of advice.
+
+    "Still changing" is a claim only a change at the end supports. The other
+    cases say what was seen: the tree changed and then held still, but for
+    less than `quiet_ms`; identical snapshots that never spanned `quiet_ms`;
+    or a single snapshot (an Android UI Automator dump can take two
+    seconds, so a 3 s budget fits one) — settling could not be confirmed.
+    `timeout_name` spells the budget the caller has (`--timeout-ms` on the
+    CLI, `timeoutMs` in a flow); `node_wait` is how that caller waits for a
+    node instead.
+    """
+    snapshots = int(result.get("snapshots") or 0)
+    changes = int(result.get("changes") or 0)
+    dump_ms = int(result.get("dump_ms") or 0)
+    stable_ms = int(result.get("stable_ms") or 0)
+    dump = f" (a dump takes ~{dump_ms} ms)" if dump_ms else ""
+    if changes and (stable_ms <= 0 or snapshots < 2):
+        return (f"the tree was still changing after {timeout_ms} ms ({changes} "
+                f"change(s) over {snapshots} snapshots)",
+                f"An animation, spinner or loading list keeps it moving: raise "
+                f"{timeout_name}, or {node_wait}.")
+    if changes:
+        short = max(quiet_ms - stable_ms, 0) + dump_ms
+        return (f"the tree changed {changes} time(s), then held still for {stable_ms} "
+                f"ms, less than the {quiet_ms} ms quiet window, when {timeout_ms} ms "
+                f"ran out{dump}",
+                f"It may have just settled: raise {timeout_name} by at least ~{short} ms "
+                f"so the quiet window fits.")
+    if snapshots < 2:
+        shown = "no snapshot" if snapshots == 0 else "only 1 snapshot"
+        error = (f"could not confirm the screen settled: {shown} fit in "
+                 f"{timeout_ms} ms{dump}; raise {timeout_name}")
+    else:
+        error = (f"could not confirm the screen settled: {snapshots} identical "
+                 f"snapshots held still for {stable_ms} ms, less than the {quiet_ms} ms "
+                 f"quiet window, within {timeout_ms} ms{dump}; raise {timeout_name}")
+    needed = f" to at least ~{2 * dump_ms + quiet_ms} ms" if dump_ms else ""
+    return (error,
+            f"Nothing was seen changing, but the budget was too short to prove the "
+            f"screen still: raise {timeout_name}{needed} (two dumps plus the quiet "
+            f"window).")
 
 
 _INTERACTABLE_ROLES = ("button", "textfield", "searchfield", "securetextfield", "switch",

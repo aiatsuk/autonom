@@ -878,6 +878,12 @@ def _clipboard_get(target: Target) -> dict[str, Any]:
             control="clipboard", action="get", valid_actions=["set"])
     text, why = ios_simctl.read_pasteboard(target.tool, target.target_id)
     if text is None:
+        missing = errors.tool_missing("simctl")
+        if why == missing.message:
+            # the probe never raises, so a missing xcrun comes back as its
+            # message; it is the same simctl_not_found every other control
+            # answers, not a pasteboard the simulator failed to read
+            raise missing
         raise errors.AutonomError(
             errors.BACKEND_FAILED, f"simctl pbpaste could not read the pasteboard: {why}",
             "Check the simulator is booted with 'autonom devices'.")
@@ -1503,4 +1509,98 @@ def _keyboard(target: Target, action: str, values: dict[str, Any]) -> dict[str, 
         ios_simctl.boot(target.tool, udid)
     result["observed"] = observed
     result["rebooted"] = booted
+    if booted:
+        # the shutdown ended the session's `log stream`; bring it back
+        _merge(result, restart_session_log_stream(target, cause="reboot"))
+    return result
+
+
+def _merge(result: dict[str, Any], extra: dict[str, Any]) -> None:
+    warnings = extra.pop("warnings", None)
+    result.update(extra)
+    if warnings:
+        result.setdefault("warnings", []).extend(warnings)
+
+
+def restart_session_log_stream(target: Target, *, cause: str = "reboot",
+                               stop_previous: bool = False) -> dict[str, Any]:
+    """Give the current session its iOS log stream back after the stream
+    was cut off from the app.
+
+    A reboot (`keyboard pin` with ``reboot=true``) ends the `log stream`
+    child, and with it the bounded writer, so the session kept listing a
+    stream that recorded nothing; nothing needs stopping then. A reinstall
+    (`session clear --strategy reinstall`) moves the app to a new container,
+    which a running stream's bundle-path predicate can no longer match, so
+    the old writer is stopped first (``stop_previous``) — through
+    `logs.stop_log_writer`, which signals it only once its registry row or
+    its command line shows it is this session's writer: the pid in the
+    session file may be days old and belong to anything. Then
+    `logs.ensure_log_stream` starts a new one, and the record is saved.
+
+    Returns additive payload keys: none when the current session is not on
+    this simulator or never had a stream; ``log_stream_restarted`` (with
+    ``log_stream_pid``) otherwise, ``previous_log_stream`` when an old writer
+    was dealt with, a ``log_stream_stopped`` warning when no new stream could
+    be started, and ``unverified_skipped`` when a live pid could not be
+    vouched for. Never raises: logs are supplementary evidence and must not
+    fail the verb that moved the device.
+    """
+    from . import logs as logs_mod
+    from . import processes as processes_mod
+    from . import session as session_mod
+
+    record = _current_session()
+    if (target.platform != IOS or not isinstance(record, dict)
+            or record.get("target_id") != target.target_id):
+        return {}
+    previous = (record.get("background") or {}).get("log_stream_pid")
+    stopped: dict[str, Any] | None = None
+    try:
+        if previous and stop_previous:
+            stopped = logs_mod.stop_log_writer(record, previous)
+        elif previous and not session_mod.pid_alive(previous):
+            processes_mod.deregister(int(previous))  # a dead writer's row is obsolete
+        outcome = logs_mod.ensure_log_stream(target, record)
+    except Exception as exc:  # noqa: BLE001 - see the docstring
+        outcome = {"restarted": False, "error": str(exc)}
+    if outcome.get("reason") == "no_log_stream":
+        return {}
+    result: dict[str, Any] = {}
+    warnings: list[dict[str, Any]] = []
+    if stopped is not None:
+        result["previous_log_stream"] = stopped
+    unverified = (stopped or {}).get("result") == "unverified_skipped" or \
+        outcome.get("reason") == "unverified"
+    if unverified:
+        warnings.append({
+            "code": "unverified_skipped",
+            "error": f"the session's previous log-stream writer (pid {previous}) was "
+                     "not signalled: ps could not confirm it is still that writer",
+            "hint": f"Inspect it with 'ps -p {previous}'; 'autonom cleanup' retries "
+                    "once it can be verified.",
+        })
+    if outcome.get("reason") in ("alive", "unverified"):
+        result.update({"log_stream_restarted": False, "log_stream_pid": outcome.get("pid")})
+    else:
+        try:
+            session_mod.save(record)
+        except OSError:
+            pass
+        if outcome.get("restarted"):
+            result.update({"log_stream_restarted": True,
+                           "log_stream_pid": outcome.get("pid")})
+        else:
+            result["log_stream_restarted"] = False
+            warnings.append({
+                "code": "log_stream_stopped",
+                "error": f"the session's log stream ended with the {cause} and could not "
+                         "be started again" + (f": {outcome['error']}"
+                                              if outcome.get("error") else ""),
+                "hint": "Device logs are still readable with 'autonom logs tail' or "
+                        "'autonom logs follow --source device'; restart the session "
+                        "with --log-stream for a continuous file.",
+            })
+    if warnings:
+        result["warnings"] = warnings
     return result

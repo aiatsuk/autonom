@@ -153,7 +153,19 @@ _SECRET_ENDS = ("key", "auth")
 _SECRET_WORDS = frozenset({"pass", "pwd", "pw"})
 # `scheme://user:pass@host` anywhere in an argument, including inside
 # `--mode upstream:http://u:p@h`: the userinfo goes, scheme and host stay.
-_URL_USERINFO = re.compile(r"([A-Za-z][A-Za-z0-9+.-]*://)[^/\s]*@")  # to the last `@`
+# The lookbehind lets a match start only where a run of scheme characters
+# starts: unanchored, every position of a long letter run was a fresh start
+# that scanned to the run's end looking for `://`, and a 400 KB argv took
+# minutes (quadratic). Anchored, the scan is linear. The run may open with
+# characters a scheme cannot start with (`curl -xhttp://u:p@proxy`); they are
+# kept as found, and the scheme starts at the run's first letter, which is
+# where the unanchored pattern found it too.
+_URL_USERINFO = re.compile(
+    r"(?<![A-Za-z0-9+.-])([0-9+.-]*[A-Za-z][A-Za-z0-9+.-]*://)[^/\s]*@")  # to the last `@`
+# `ps` lines are unbounded (an argv can be megabytes); discovery redacts only
+# a bounded head of each, and keeps a bounded head of the result.
+_DISCOVERY_SCAN_CHARS = 8192
+_DISCOVERY_KEEP_CHARS = 400
 
 
 def _secret_name(name: str) -> bool:
@@ -188,7 +200,8 @@ def redact_command(command: str) -> str:
             if not piece.startswith("-"):
                 out.append(REDACTED)
                 continue
-        token = _URL_USERINFO.sub(lambda match: match.group(1) + REDACTED + "@", piece)
+        token = (_URL_USERINFO.sub(lambda match: match.group(1) + REDACTED + "@", piece)
+                 if "://" in piece else piece)
         name, sep, _value = token.partition("=")
         if sep and _secret_name(name):
             out.append(f"{name}={REDACTED}")
@@ -283,7 +296,7 @@ def discover_proxies() -> list[dict[str, Any]]:
             if token.startswith(PROXY_MARKER):
                 directory = token[len(PROXY_MARKER):]
         found.append({"kind": "proxy", "pid": pid, "artifacts_dir": directory,
-                      "command": redact_command(command)[:400], "source": "signature"})
+                      "command": _discovered_command(command), "source": "signature"})
     return found
 
 
@@ -295,8 +308,13 @@ def discover_companions(udid: str | None) -> list[dict[str, Any]]:
     for pid, command in _running_processes():
         if COMPANION_MARKER in command and udid in command:
             found.append({"kind": "idb_companion", "pid": pid, "udid": udid,
-                          "command": redact_command(command)[:400]})
+                          "command": _discovered_command(command)})
     return found
+
+
+def _discovered_command(command: str) -> str:
+    """A discovered process's command line as shown: redacted, bounded."""
+    return redact_command(command[:_DISCOVERY_SCAN_CHARS])[:_DISCOVERY_KEEP_CHARS]
 
 
 def command_of(pid: int) -> str | None:
@@ -571,26 +589,55 @@ def terminate_entry(entry: dict[str, Any]) -> str:
     Returns ``terminated``, ``termination_failed``, ``already_exited``,
     ``pid_reused`` (the pid now runs something without the entry's recorded
     `signature`), ``unverified_skipped`` (a signature was recorded but `ps`
-    could not be asked) or ``group_remnant`` (the leader is gone and a group
+    could not be asked, or the recorded signature is empty — an empty mark
+    proves nothing) or ``group_remnant`` (the leader is gone and a group
     with its id lives on, see `_group_remnant`). The last three never signal
     anything: a process that cannot be shown to be ours is left alone.
+
+    Only a row with no `signature` key at all is signalled unchecked: a
+    proxy found by its command line in this very scan (`discover_proxies`),
+    and rows written before signatures existed. Harness rows (emulators)
+    carry none either, but `cleanup` and `reap_session` never target them.
     """
     pid = int(entry["pid"])
     group = entry.get("process_group")
     leads = bool(group) and int(group) == pid
     if not session_mod.pid_alive(pid):
         return "group_remnant" if leads and _group_remnant(entry) else "already_exited"
-    signature = entry.get("signature")
-    if signature:
+    if "signature" in entry:
+        signature = entry.get("signature")
+        if not usable_signature(signature):
+            return "unverified_skipped"
         command = command_of(pid)
         if command is None:
             # ps could not answer: gone in the meantime, or unverifiable.
             return "already_exited" if not session_mod.pid_alive(pid) else "unverified_skipped"
-        if str(signature) not in command:
+        if not signature_matches(signature, command):
             return "pid_reused"
     if leads and _leads_group(pid, pid):
         return "terminated" if terminate_group(pid) else "termination_failed"
     return "terminated" if session_mod.terminate_pid(pid) else "termination_failed"
+
+
+def signature_matches(signature: Any, command: str) -> bool:
+    """Does `command` still carry a row's recorded `signature`?
+
+    A string must appear in the command line; a list is several marks that
+    must all appear — an `idb_companion` row records the binary *and* the
+    simulator it serves, so another simulator's companion (or any process
+    that merely names the UDID) is never taken for it."""
+    if not usable_signature(signature):
+        return False
+    marks = signature if isinstance(signature, (list, tuple)) else [signature]
+    return all(str(mark) in command for mark in marks)
+
+
+def usable_signature(signature: Any) -> bool:
+    """A signature that can prove something: a non-empty string, or a
+    non-empty list of non-empty strings. `""`, `[]`, `[""]` and `None` match
+    every command line, so they verify nothing."""
+    marks = signature if isinstance(signature, (list, tuple)) else [signature]
+    return bool(marks) and all(isinstance(mark, str) and mark for mark in marks)
 
 
 # Outcomes that leave the registry row in place for a later attempt.
@@ -736,10 +783,13 @@ def track_idb_companions(udid: str | None, *,
             try:
                 for companion in discover_companions(udid):
                     session_id = session.get("session_id")
+                    # both marks: the binary alone matches any simulator's
+                    # companion (`signature_matches`)
                     register("idb_companion", companion["pid"], owner=session_id,
                              session_id=session_id,
                              artifacts_dir=session.get("artifacts_dir"),
-                             udid=udid, signature=COMPANION_MARKER, spawned_by="idb")
+                             udid=udid, signature=[COMPANION_MARKER, udid],
+                             spawned_by="idb")
             except Exception:  # noqa: BLE001
                 pass
 
@@ -793,7 +843,7 @@ def run_supervised(command: Sequence[str], *, kind: str, owner: str | None = Non
             pass
     child: subprocess.Popen | None = None
     registered: list[int] = []
-    code = 0
+    code: int | None = None
     try:
         try:
             child = subprocess.Popen(argv, start_new_session=True)  # noqa: S603
@@ -814,7 +864,8 @@ def run_supervised(command: Sequence[str], *, kind: str, owner: str | None = Non
             registered.append(child.pid)
         except OSError:
             pass  # the registry is a safety net; the child still runs supervised
-        code = child.wait()
+        # Waited for, not reaped: see `_stop_supervised_group`.
+        _child_exited(child, None)
     except _Stopped as stopped:
         code = 128 + stopped.signum
     except KeyboardInterrupt:
@@ -826,15 +877,125 @@ def run_supervised(command: Sequence[str], *, kind: str, owner: str | None = Non
             except (ValueError, OSError):
                 pass
         if child is not None:
-            if child.poll() is None or _group_alive(child.pid):
-                terminate_group(child.pid)
-            try:
-                child.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                pass
+            _stop_supervised_group(child)
         for pid in registered:
             try:
                 deregister(pid)
             except OSError:
                 pass
+    if code is None:
+        code = child.returncode if child is not None and child.returncode is not None else 0
     return code
+
+
+def _child_exited(child: subprocess.Popen, timeout: float | None) -> bool:
+    """Has our child exited? Waits up to `timeout` seconds (None: until it
+    has), and never reaps it — a reaped leader frees its pid, and with it its
+    process-group id, which a stranger's new group may then take.
+
+    `os.waitid(WNOWAIT)` where Python has it; macOS builds before 3.13 do
+    not, and a kqueue exit notification is the same promise there. Without
+    either the child is reaped (`wait`), the behaviour before this existed.
+    """
+    if child.returncode is not None:
+        return True
+    pid = child.pid
+    if hasattr(os, "waitid"):
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            flags = os.WEXITED | os.WNOWAIT | (0 if deadline is None else os.WNOHANG)
+            try:
+                if os.waitid(os.P_PID, pid, flags) is not None:
+                    return True
+            except ChildProcessError:
+                return True  # reaped elsewhere: gone either way
+            if deadline is None:
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.05)
+    try:
+        import select
+
+        queue = select.kqueue()
+    except (ImportError, AttributeError, OSError):
+        if timeout is None:
+            child.wait()
+            return True
+        try:
+            child.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return False
+        return True
+    try:
+        event = select.kevent(pid, filter=select.KQ_FILTER_PROC,
+                              flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
+                              fflags=select.KQ_NOTE_EXIT)
+        # an already-exited (zombie) child answers at once, with ESRCH
+        return bool(queue.control([event], 1, timeout))
+    finally:
+        queue.close()
+
+
+def _live_group_members(pgid: int, *, besides: int) -> list[int] | None:
+    """Live (non-zombie) pids of group `pgid` other than `besides`, from
+    ps; None when ps cannot say."""
+    try:
+        completed = subprocess.run(
+            ["ps", "-Ao", "pid=,pgid=,stat="],
+            capture_output=True, text=True, timeout=15, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0:
+        return None
+    members = []
+    for line in (completed.stdout or "").splitlines():
+        fields = line.split()
+        if (len(fields) >= 3 and fields[0].isdigit() and fields[1] == str(pgid)
+                and not fields[2].startswith("Z") and int(fields[0]) != besides):
+            members.append(int(fields[0]))
+    return members
+
+
+def _stop_supervised_group(child: subprocess.Popen, *, timeout: float = 5.0) -> None:
+    """Take the child's whole group down, then reap the child.
+
+    The child leads its group (`start_new_session`), so its pid is the
+    group id — and until the child is reaped that id cannot be reused, even
+    once every member has exited. So: wait without reaping, signal the
+    group while the (possibly zombie) leader pins the id, reap last.
+    Reaping first (`poll()`, then `killpg`) left a window in which the id
+    could name a stranger's group by the time the signal was sent.
+    """
+    pgid = child.pid
+    if child.returncode is not None:
+        # already reaped (no non-reaping wait on this platform): the id is
+        # no longer pinned; the unpinned best effort is all that is left
+        if _group_alive(pgid):
+            terminate_group(pgid)
+        return
+
+    def remaining() -> bool:
+        if not _child_exited(child, 0):
+            return True
+        others = _live_group_members(pgid, besides=pgid)
+        return others is None or bool(others)
+
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        pass
+    deadline = time.monotonic() + timeout
+    while remaining() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    if remaining():
+        try:
+            os.killpg(pgid, signal.SIGKILL)  # still pinned: cannot hit a stranger
+        except OSError:
+            pass
+        _child_exited(child, 2.0)
+    try:
+        child.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass

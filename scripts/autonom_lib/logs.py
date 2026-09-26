@@ -494,7 +494,7 @@ def start_log_stream(target: Target, destination: Path, *, bundle_id: str | None
                 "log_stream", pid, owner=session_id, session_id=session_id,
                 artifacts_dir=record.get("artifacts_dir"), target_id=target.target_id,
                 bundle_id=bundle_id, executable=executable,
-                signature=str(destination),
+                signature=writer_signature(destination),
             )
         except OSError:
             pass  # the registry is a safety net; the stream itself is running
@@ -527,37 +527,127 @@ def start_session_log_stream(target: Target, record: dict[str, Any], *,
     return pid
 
 
+def stream_destination(record: dict[str, Any]) -> Path:
+    """The session's `--log-stream` file — also the writer's registry
+    signature, since the bounded writer carries it in its argv."""
+    return Path(record["artifacts_dir"]) / "logs" / "stream.ndjson"
+
+
+def _writer_mark() -> str:
+    """A line of the bounded writer's own script (`ios_simctl.spawn_bounded`
+    runs it as `python -c <script> <dest> <cap> <argv...>`). The script
+    reaches `ps` verbatim except for its newlines (macOS prints them as
+    `\\012`), and this line has none, so it identifies the writer on any
+    host — a `tail -f` of the same file does not carry it."""
+    return next(line.strip() for line in
+                ios_simctl._BOUNDED_WRITER.splitlines()  # noqa: SLF001 - same writer
+                if "sys.argv[1]" in line)
+
+
+def writer_signature(destination: Path | str) -> list[str]:
+    """The registry signature of the writer for `destination`: its script
+    mark, and the file as a whole argument followed by the next one (the
+    cap), so `<file>.bak` never matches (`processes.signature_matches`)."""
+    return [_writer_mark(), f" {destination} "]
+
+
+def is_writer_command(command: str, destination: Path | str) -> bool:
+    """Is `command` (a `ps` command line) the bounded writer of `destination`?
+
+    It must carry the writer's script mark and `destination` as a whole
+    argument followed by the numeric cap — the argv shape
+    `ios_simctl.spawn_bounded` produces. `tail -f <file>`, a writer of
+    `<file>.bak` or `<file>.1`, or any process merely naming the file is
+    not it."""
+    if _writer_mark() not in command:
+        return False
+    token = re.compile(r"(?:^|\s)" + re.escape(str(destination)) + r"\s+\d+(?:\s|$)")
+    return token.search(command) is not None
+
+
+def log_writer_state(record: dict[str, Any], pid: int | None) -> str:
+    """Is `pid` still this session's log-stream writer?
+
+    ``gone`` (not running), ``ours`` (its command line is this session's
+    bounded writer, `is_writer_command`), ``pid_reused`` (alive, but running
+    something else) or ``unverified`` (alive, and `ps` could not say). A pid
+    recorded in a session file can be days old and belong to anything by
+    now, so a live pid alone proves nothing."""
+    from . import processes
+    from . import session as session_mod
+
+    if not pid or not session_mod.pid_alive(pid):
+        return "gone"
+    command = processes.command_of(pid)
+    if command is None:
+        return "unverified" if session_mod.pid_alive(pid) else "gone"
+    return "ours" if is_writer_command(command, stream_destination(record)) else "pid_reused"
+
+
+def stop_log_writer(record: dict[str, Any], pid: int | None) -> dict[str, Any]:
+    """Stop the session's log-stream writer `pid` — only once it is shown to be it.
+
+    `log_writer_state` decides first, whatever the registry says; the stop
+    then goes through the registry row when there is one
+    (`processes.terminate_entry` checks the row's own signature too). Returns
+    ``{"pid", "result"}`` with `terminate_entry`'s vocabulary:
+    ``terminated``, ``already_exited``, ``pid_reused``,
+    ``unverified_skipped`` (nothing is signalled for the last two), or
+    ``none`` when there was no pid."""
+    from . import processes
+    from . import session as session_mod
+
+    if not pid:
+        return {"pid": None, "result": "none"}
+    row = next((entry for entry in processes.entries()
+                if entry.get("pid") == pid and entry.get("kind") == "log_stream"), None)
+    state = log_writer_state(record, pid)
+    if state == "ours":
+        # through the row when there is one: it re-checks its own signature
+        if row is not None:
+            result = processes.terminate_entry(row)
+        else:
+            result = "terminated" if session_mod.terminate_pid(pid) else "already_exited"
+    else:
+        result = {"gone": "already_exited", "pid_reused": "pid_reused",
+                  "unverified": "unverified_skipped"}[state]
+    if row is not None and result in ("terminated", "already_exited", "pid_reused"):
+        processes.deregister(int(pid))  # the row no longer names a live writer
+    return {"pid": pid, "result": result}
+
+
 def ensure_log_stream(target: Target, record: dict[str, Any]) -> dict[str, Any]:
-    """Restart the session's log stream when its writer has died.
+    """Restart the session's log stream when its writer is gone.
 
     A simulator reboot (`simulator keyboard pin` with a reboot) ends the
     `log stream` child, and with it the bounded writer, so the session kept
     reporting a stream that recorded nothing. A reinstall moves the app to a
     new container, which a running stream's bundle-path predicate cannot
-    follow; stop the old writer first and this starts one on the new path.
-    Only a session that had a stream gets one back. The caller saves the
-    record.
+    follow; stop the old writer first (`stop_log_writer`) and this starts one
+    on the new path. "Gone" is decided by `log_writer_state`, never by a live
+    pid alone: a recorded pid that now runs something else is not the
+    writer, and a new stream is started (``reason: pid_reused``). One that
+    `ps` cannot vouch for is left alone and no second writer is started
+    (``reason: unverified``). Only a session that had a stream gets one
+    back. The caller saves the record.
     """
-    from . import session as session_mod
-
     background = record.get("background") or {}
     previous = background.get("log_stream_pid")
     had_stream = bool(previous) or any(
         stream.get("id") == "log_stream" for stream in record.get("streams") or [])
     if target.platform == ANDROID or not had_stream:
         return {"restarted": False, "reason": "no_log_stream"}
-    if session_mod.pid_alive(previous):
+    state = log_writer_state(record, previous)
+    if state == "ours":
         return {"restarted": False, "pid": previous, "reason": "alive"}
+    if state == "unverified":
+        return {"restarted": False, "pid": previous, "reason": "unverified"}
     pid = start_session_log_stream(target, record,
                                    executable=background.get("log_stream_executable"))
-    return {"restarted": bool(pid), "pid": pid, "previous_pid": previous}
-
-
-def _ios_predicate(bundle_id: str) -> str:
-    """Kept for callers of the old name that have no target to resolve the
-    app with (the CLI's live follow until it passes one): the subsystem /
-    leaf form. `ios_predicate` is the resolved one."""
-    return ios_simctl.log_predicate(bundle_id)
+    outcome: dict[str, Any] = {"restarted": bool(pid), "pid": pid, "previous_pid": previous}
+    if state == "pid_reused":
+        outcome["previous_state"] = "pid_reused"
+    return outcome
 
 
 def ios_predicate(target: Target, bundle_id: str, *,

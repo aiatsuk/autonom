@@ -480,6 +480,20 @@ def _runtime_state(record: dict[str, Any] | None) -> tuple[dict[str, Any], list,
             "hint": "Run 'autonom cleanup' to reap them.",
         })
 
+    # A group whose recorded leader is gone is never an orphan (cleanup does
+    # not signal it: the group id may have been reused), so it would appear
+    # nowhere in this report. Name each one with its own inspection hint.
+    for remnant in machine.get("group_remnants") or []:
+        warnings.append({
+            "code": "group_remnant_left_running",
+            "error": f"process group {remnant.get('pid')} recorded for "
+                     f"{remnant.get('kind') or 'a process'} lost its leader and still "
+                     f"has members {remnant.get('members') or []}; it was left running "
+                     "and may not be Autonom's",
+            "hint": remnant.get("hint") or "Inspect it with 'ps -Ao pid,pgid,command'.",
+            "group_remnant": remnant,
+        })
+
     dangling = _dangling_attachment(record, network)
     if dangling:
         warnings.append(dangling)

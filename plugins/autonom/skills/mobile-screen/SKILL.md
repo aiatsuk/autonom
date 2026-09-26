@@ -61,6 +61,8 @@ python3 <autonom-root>/scripts/autonom.py ui tree --dump tests/fixtures/idb_desc
   "resource_id": "com.apple.settings.general",
   "bounds": [16, 380, 386, 432],
   "clickable": true,
+  "long_clickable": false,
+  "checkable": false,
   "enabled": true
 }
 ```
@@ -77,9 +79,37 @@ python3 <autonom-root>/scripts/autonom.py ui tree --dump tests/fixtures/idb_desc
 On iOS a control labelled "General" has `desc: "General"` and `text: null`, so
 `ui find --text "General"` returns **zero matches**. Read the tree first and select
 by `--desc`, or by `--resource-id` when the app sets accessibility identifiers.
-When a `--text` miss would have matched a `desc`, the response says so with a
-`label_is_in_desc` warning whose hint is the `--desc` retry. A `ui find` or
-`ui tap` with no selector at all is `selector_required`.
+Flutter on Android puts its labels in `desc` (content-description) too. On both
+platforms, when a `--text` miss would have matched a `desc`, the response says so
+with a `label_is_in_desc` warning whose hint is the `--desc` retry. A `ui find` or
+`ui tap` with no selector at all is `selector_required`. Whitespace is normalised
+(iOS joins a merged Flutter label with a newline, Android with a space), except
+in `--mode regex`.
+
+## What is on screen, and which match is picked
+
+iOS lists Flutter's scroll cache — nodes laid out but not on screen — at a 0x0
+frame. Such a node stays in `ui tree` (it is counted) marked `visible: false`,
+and so does any node entirely outside the app's frame, live or from `--dump`.
+
+- `ui tap` and `ui find` resolve **on-screen matches first**: duplicates and
+  `--index` are counted among them, exactly as a flow counts, so a selector
+  that is unique on Android is not ambiguous on iOS because of an off-screen
+  copy. Only when no match is on screen is every match counted.
+- `ui tap` on a node that was never laid out on screen refuses with
+  `element_offscreen` (with `ref`, `bounds`, `match_count`) and taps nothing —
+  it used to tap the screen's origin and report success. Swipe it into view,
+  then select it again.
+- `ui find --all` lists on-screen matches first, then off-screen ones. Every
+  match `ui find` reports, with or without `--all`, carries `index` — the
+  `--index` that selects it (`null` for an off-screen match no index reaches
+  while another match is on screen). Position *i* of the `--all` list is what
+  `--index i` taps.
+- `ui wait --settled` says the tree was "still changing" only when its last
+  snapshot was a change. If it changed and then held still for less than
+  `--quiet-ms`, it says that (`stable_ms`); if only one dump fit in
+  `--timeout-ms` (an Android dump can take ~2 s), it says settling could not
+  be confirmed and how far to raise it.
 
 ## Which tool touched the screen (`backend`)
 

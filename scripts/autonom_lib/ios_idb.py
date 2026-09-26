@@ -12,6 +12,7 @@ adapter rather than a rewrite.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -22,6 +23,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from . import errors
+from . import processes as processes_mod
 from .platform import Target
 
 BUTTONS = ("APPLE_PAY", "HOME", "LOCK", "SIDE_BUTTON", "SIRI")
@@ -117,15 +119,22 @@ def run_idb(
     command = [idb, *(["--companion", endpoint] if endpoint else []), *args]
     if udid:
         command += ["--udid", udid]
+    # A local idb call may spawn an idb_companion for the simulator; the
+    # tracker registers one that appears during this call under the session
+    # that owns the simulator, so `session stop` can stop it. A remote
+    # companion is on another Mac and never ours to track.
+    tracker = (processes_mod.track_idb_companions(udid) if udid and not endpoint
+               else contextlib.nullcontext())
     try:
-        completed = subprocess.run(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-            timeout=timeout,
-            text=not binary,
-        )
+        with tracker:
+            completed = subprocess.run(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=timeout,
+                text=not binary,
+            )
     except FileNotFoundError as exc:
         raise errors.tool_missing("idb") from exc
     if check and completed.returncode != 0:

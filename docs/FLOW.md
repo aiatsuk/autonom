@@ -67,7 +67,16 @@ Flow schema of any version, or a Maestro document, is always a member;
 `runFlow` children execute inline with the root `appId` inherited and their
 own env frame; a false `when:` skips the step with the failed condition as
 the reason; `onFlowComplete` cleanup is isolated per command and reported as
-`hook_failures` without ever masking the primary outcome.
+`hook_failures` without ever masking the primary outcome. A suite runs on one
+target: a flow whose `platforms` exclude it (declared for the other platform,
+or an Android-only step on iOS) is skipped with a `flow_skipped_for_platform`
+warning and listed under `skipped_flows` instead of aborting the rest, and a
+suite of which no flow can run is refused with `flow_no_flows_found`. Only a
+platform mismatch is skipped: a flow the target refuses for anything else — a
+capability from `requires.capabilities` or `setup` it lacks
+(`flow_requirements_unmet`) — still stops the suite. The
+summary lists every run under `runs`; a single-file run carries the same
+`runs` list (of one) next to its run's own keys.
 
 `--until-step N` is prefix replay for debugging: it executes one flow through
 runtime leaf step `N`, returns status `replayed`, skips `onFlowComplete`, and
@@ -157,6 +166,24 @@ and iOS. Prefer it for flows that must run on both platforms; `text` and
 matters. It is also the exact equivalent of Maestro's `text`, which matches
 the same union — so an imported Maestro flow means on Autonom what it means
 on Maestro.
+
+**A selector only matches what is on screen.** A node that cannot be on
+screen — iOS lists Flutter's scroll cache, laid out but not visible, at a 0x0
+frame, and a node can lie entirely outside the app's frame — is never
+selected by a flow: `assertVisible` does not pass on it, `tapOn` never taps
+it, `scrollUntilVisible` keeps scrolling until the node is really on screen,
+and `assertNotVisible` passes. Duplicates and `index` are counted among the
+on-screen matches only, which is also how `autonom ui find` and `ui tap`
+count first, so a selector unique on Android stays unique on iOS and a
+`ui find --index N` names the node a flow's `index: N` does. `ui find --all`
+still lists off-screen matches, last and marked `visible: false`.
+
+**Whitespace is normalised** for `exact`, `caseInsensitiveExact`, and
+`contains`: on both sides every run of spaces, newlines, or tabs compares as
+one space and the ends are trimmed, so a merged Flutter label that iOS joins
+with a newline (`M\nMarta`) and Android with a space (`M Marta`) is matched
+by one selector. `regex` sees the raw value (a pattern can still target a
+newline on purpose), and a selector made only of whitespace is compared raw.
 
 Relational constraints narrow a match by another element (the *anchor*):
 
@@ -286,7 +313,12 @@ applied, verified, and used setup entries separately.
   It never fails the flow — a tree still changing at `timeoutMs` (a spinner,
   a looping animation) is reported as `settled: false` on the step and a
   `screen_not_settled` run warning, and the flow goes on; assert the state
-  you need with `waitUntil`.
+  you need with `waitUntil`. The warning says the tree was still changing
+  only when the last snapshot was a change; when it changed and then held
+  still for less than `quietMs` it says so, with how long it held; when
+  fewer than two snapshots fit in `timeoutMs` (an Android dump can take
+  ~2 s) it says settling could not be confirmed and how far to raise
+  `timeoutMs`.
 - `repeat` is bounded, declared iteration: `times` (1–25) is the hard
   limit, `while:` (`visible`/`notVisible` only) stops the loop early the
   moment it no longer holds; a failing iteration fails the flow, and

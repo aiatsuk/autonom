@@ -1708,16 +1708,18 @@ class Executor:
             finished["settled"] = outcome.settled
             finished["settle"] = settle
             if not outcome.settled:
+                # the same honest text as `ui wait --settled`: "still changing"
+                # only when a change was seen between two snapshots
+                error, hint = ui_mod.unsettled_message(
+                    settle, settle["timeout_ms"], settle["quiet_ms"],
+                    timeout_name="timeoutMs",
+                    node_wait="wait for the node the next step needs with waitUntil")
                 self._step_warnings.append({
                     "code": "screen_not_settled",
                     "step_index": index, "file": flow.path, "line": step.line,
-                    "message": (f"waitForSettled (line {step.line}): the UI tree "
-                                f"was still changing after {settle['timeout_ms']} "
-                                f"ms ({settle['changes']} change(s) over "
-                                f"{settle['snapshots']} snapshots); the flow went on"),
-                    "hint": "An animation, spinner or loading list keeps it "
-                            "moving; raise timeoutMs, or wait for the node the "
-                            "next step needs with waitUntil.",
+                    "message": f"waitForSettled (line {step.line}): {error}; the flow "
+                               "went on",
+                    "hint": hint,
                 })
         event = writer.emit("flow.step.finished", finished, sensitive=sensitive)
         writer.journal_step(event)
@@ -2122,6 +2124,8 @@ class Executor:
                              "snapshots": result.get("snapshots"),
                              "changes": result.get("changes"),
                              "elapsed_ms": result.get("elapsed_ms"),
+                             "dump_ms": result.get("dump_ms"),
+                             "stable_ms": result.get("stable_ms"),
                              "timeout_ms": timeout_ms, "quiet_ms": quiet_ms}
 
     def _scroll_until_visible(self, step: Step, attempts: list) -> bool:

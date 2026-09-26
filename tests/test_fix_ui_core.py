@@ -225,13 +225,14 @@ class ActionSelectionTests(unittest.TestCase):
             ui.select_for_action(nodes, {"desc": "Irina Weaver"}, mode="exact", index=1)
         self.assertEqual(caught.exception.code, errors.SELECTOR_INDEX_OUT_OF_RANGE)
         self.assertIn("on-screen", caught.exception.message)
-        # `ui find` resolves exactly as tap does; only --all lists every match
+        # `ui find` resolves exactly as tap does; only --all lists every match,
+        # in the order --index counts them: on-screen first
         self.assertEqual(ui.select_for_find(nodes, {"desc": "Irina Weaver"}, mode="exact",
                                             index=0)[0]["ref"], on["ref"])
         listed = ui.select_for_find(nodes, {"desc": "Irina Weaver"}, mode="exact",
                                     all_matches=True)
-        self.assertEqual([(m["ref"], m.get("visible", True)) for m in listed],
-                         [(off["ref"], False), (on["ref"], True)])
+        self.assertEqual([(m["ref"], m.get("visible", True), m["index"]) for m in listed],
+                         [(on["ref"], True, 0), (off["ref"], False, None)])
 
     def test_only_offscreen_matches_refuse_with_element_offscreen(self) -> None:
         nodes = ios_nodes()

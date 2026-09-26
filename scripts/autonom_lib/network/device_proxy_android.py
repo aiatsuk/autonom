@@ -126,14 +126,10 @@ def install_ca_certificate(
 
 
 def _get_setting(target: Target) -> str | None:
-    completed = adb_mod.run_adb(
-        target.tool, ["shell", "settings", "get", "global", SETTING],
-        serial=target.target_id, timeout=15, check=False,
-    )
-    value = (completed.stdout or "").strip() if isinstance(completed.stdout, str) else ""
-    if not value or value == "null":
-        return None
-    return value
+    """`read_setting`: a failed adb read raises instead of being taken as the
+    value. It used to return adb's error text, which `attach` then saved as
+    the previous proxy and `detach` wrote back to the device."""
+    return read_setting(target)
 
 
 def _put_setting(target: Target, value: str) -> None:

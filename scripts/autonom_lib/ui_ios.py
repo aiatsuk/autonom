@@ -167,6 +167,11 @@ def compact_node(element: dict[str, Any], ref: str) -> dict[str, Any]:
         "bounds": _bounds(element),
         "clickable": role in CLICKABLE_ROLES or "Button" in trait_text
         or _truthy(element, "hittable", "AXHittable"),
+        # The Android schema's long-clickable/checkable (C-03 key parity).
+        # iOS accessibility has no long-press trait; what can be checked is a
+        # toggle — the same test that derives `checked` from AXValue below.
+        "long_clickable": False,
+        "checkable": is_toggle(element, role),
         "enabled": _truthy(element, "enabled", "AXEnabled", default=True),
         # iOS accessibility has no "focusable" concept; AXFocused is the
         # FOCUSED state and used to be misfiled under focusable — fixed.

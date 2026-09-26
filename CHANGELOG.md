@@ -21,6 +21,12 @@ candidates, did-you-mean hints), honest `verified` read-backs on every
 simulator control, and a round of secret hygiene on device input, the
 journal, captured URLs, and approvals.
 
+Then a fix round from driving a real Flutter app (WoolBox) on a dedicated
+Android emulator and iOS simulator: off-screen nodes, iOS logs of a Flutter
+`Runner`, process ownership, attachment evidence, flows, and metrics, each
+with a regression test against the fakes. The non-additive changes are
+listed in `docs/COMPATIBILITY.md`.
+
 ### Added
 - **`autonom tour`** — the guided first run: what the harness has (verb
   families), the usual workflow, an inventory of this Mac's emulators and
@@ -182,9 +188,10 @@ journal, captured URLs, and approvals.
 - **`ui tree --format outline`** prints one indented line per node instead
   of the nodes array, and `--interactable` keeps only nodes an agent can act
   on (buttons, fields, switches, …).
-- On iOS a `ui find`/`ui tap` `--text` miss whose value matches a node's
-  `desc` says so (`label_is_in_desc` warning, a `--desc` hint): the visible
-  label lives in `desc`.
+- A `ui find`/`ui tap` `--text` miss whose value matches a node's `desc`
+  says so (`label_is_in_desc` warning, a `--desc` hint): the visible label
+  lives in `desc` on iOS, and in the content-description of Flutter (and
+  image button) labels on Android.
 - **Repair `candidates`:** when the failing step's hierarchy was captured,
   the repair brief ranks up to five on-screen nodes by similarity to the
   failed selector, each with a ready Flow `selector` (and the `index` that
@@ -198,9 +205,9 @@ journal, captured URLs, and approvals.
   output loses its comments; the preview reports how many would go.
 - `teach approve --run` accepts `--env KEY=VALUE` and `--secret NAME` for the
   replays it performs.
-- The iOS `session start --log-stream` file is filtered to the app (by a
-  distinctive process or subsystem name) and capped on disk:
-  `AUTONOM_IOS_LOG_MAX_MB` (default 50) with one rotation.
+- The iOS `session start --log-stream` file is filtered to the app (by its
+  installed bundle path, else its executable, else its subsystem) and capped
+  on disk: `AUTONOM_IOS_LOG_MAX_MB` (default 50) with one rotation.
 - JUnit export and `report suite` emit `errors` and an `<error>` case for a
   run that aborted on a definition or infrastructure error, and the suite
   JSON carries the matching broken and JUnit counts.
@@ -231,6 +238,61 @@ journal, captured URLs, and approvals.
 - `AUTONOM_IDB_STATE_FILE` points at the idb client's companion registry.
 - `session launch --fresh --activity C` starts that activity on a cleared
   task.
+- **Flow `waitForSettled`** (declared `since` 0.31.0): polls the UI tree
+  until it holds still — the engine of `ui wait --settled` — with
+  `timeoutMs` (default 5000) and `quietMs` (default 500, capped at
+  `timeoutMs`); it never fails the flow, and a tree still moving at the
+  deadline is `settled: false` plus a `screen_not_settled` run warning.
+  Maestro's `waitForAnimationToEnd` imports as it and it exports as that.
+- `open <url>` on Android sends the VIEW intent with `am start -W` and
+  reports `handled_by` — the activity that took the URL — plus the launch
+  report; a URL that opened the system chooser warns `url_opened_chooser`,
+  one nothing took `url_not_handled`. iOS answers `handled_by: "unknown"`
+  (`simctl openurl` cannot say).
+- `session start` reports what `--install` and `--launch` did: `installed`
+  and `launched` (the app id with the iOS `pid`, or the Android `mode`,
+  `component` and `am start -W` report).
+- A single-file `flow run` result carries `runs: [<its run>]`, the list a
+  directory run has, next to its existing keys.
+- Every match `ui find` reports carries the `index` that selects it — with
+  `--all` and without (null for an off-screen match no index reaches).
+- `ui wait --settled` (and a flow's settle result) reports `dump_ms`, the
+  slowest dump, and `stable_ms`, how long the last tree held still.
+- iOS nodes carry `long_clickable` (always false: accessibility has no
+  long-press trait) and `checkable` (true for toggles), so a node's key set
+  is identical on both platforms again; Android nodes carry UI Automator's
+  `long-clickable` and `checkable`.
+- `simulator clipboard get` reads the iOS pasteboard (`simctl pbpaste`) and
+  verifies it; `simulator push send` takes `app_id` from the session when it
+  is left out (`app_id_source`); `capabilities` lists `simulator.keyboard`.
+- Android `logs tail` and `logs follow --source device` report the
+  `filter` a `--package` used (`uid`, `pid`, `none`), with
+  `log_filter_degraded` when it is not the uid and
+  `process_name_not_filtered` for a `com.x:remote` process name; iOS
+  `logs tail` names the `executable` its predicate matched.
+- `network status` reports `target_flow_count`, `unattributed_flow_count`,
+  `recent_user_agents` and a `reason`, and raises `persistent_mocks_active`
+  as `network start` and `doctor` do.
+- `processes` lists session-owned background processes (`background`: the
+  iOS log-stream writer, `canvas serve` pairs, idb companions Autonom's own
+  idb calls started) and `group_remnants`; `cleanup` reports
+  `skipped_unverified`, `group_remnants`, `skipped_group_remnants` with
+  `unverified_skipped` / `group_remnant_left_running` warnings; `doctor`
+  names every group remnant with its inspection hint.
+- `session stop` reaps every registry row the session owns
+  (`session_processes` in `teardown`, `process_teardown` on the record) and
+  names an idb companion it did not start (`companion_left_running`) or a
+  group remnant (`group_remnant_left_running`) instead of killing it.
+- `session outputs` lists `metrics/` and `recordings/` artifacts
+  (`followable`, `directory` for an Instruments `.trace`) with an `open` /
+  `xdg-open` hint where the host has one.
+- `flow create` names what it cannot compile instead of dropping it:
+  `launch_args_not_compilable` (a `session launch`'s `--activity`/`--arg`/
+  `--setenv`), `clear_state_not_compilable_on_ios`, `uninstall_not_compilable`,
+  `open_url_not_compilable` (no scheme) and `open_url_not_recoverable`.
+- `metrics snapshot` on Android adds `cpu_sampling` (how the CPU figure was
+  obtained) and a `cpu_stale` warning; `metrics frames capture` warns
+  `no_frames` at the top level for a window of zero HWUI frames.
 
 ### Changed
 - `session start` refuses with the new `session_already_active` (naming the
@@ -243,9 +305,9 @@ journal, captured URLs, and approvals.
 - `verified` is true only after a read-back that matches. Controls with
   nothing to read back (iOS battery, Android network and biometric, iOS
   status-bar pin, …) now answer `verified: false` with the reason in
-  `verification`; an Android API without `cmd clipboard` reports
-  `supported: false` and a `clipboard_unsupported` warning instead of a
-  verified set.
+  `verification`; an Android API without `cmd clipboard` refuses
+  `clipboard set` with `unsupported_capability` (`reason:
+  clipboard_unsupported`, `supported: false`) instead of a verified set.
 - Android `permissions reset` revokes only the named package's granted
   runtime permissions (`pm revoke`); it used to run `pm reset-permissions`,
   which takes no package and reset every app on the device.
@@ -314,6 +376,83 @@ journal, captured URLs, and approvals.
   key is refused before anything is broadcast.
 - The fake `simctl` now moves a device to `Shutdown` on `shutdown`, so a
   shutdown/write/boot sequence is proven by the device list.
+- **`ui tap` and `ui find` resolve on-screen matches first.** Duplicates and
+  `--index` are counted among the matches that can be on screen — exactly
+  as a flow counts — and every match only when none is; `ui find` without
+  `--all` answers the node `ui tap` would act on. On iOS an off-screen copy
+  (Flutter's scroll cache) had made a selector unique on Android
+  `ambiguous_selector`, and `--index` picked another node than the flow did.
+- `ui find --all` lists on-screen matches first (tree order), then the
+  off-screen ones, so position *i* is what `--index i` selects.
+- **Android resume launch uses `am start -W`** on the launcher activity with
+  the launcher's own intent flags (`0x10200000`) instead of `monkey`, whose
+  freeze/thaw reset a pinned orientation; `monkey` remains only for a
+  package without a resolvable launcher activity. `session launch` reports
+  `component` and the `launch` report; an explicit `--activity` resume waits
+  too (`-W`).
+- **`network status` counts only the target's traffic.** A flow is evidence
+  only when its client is the target: an Android emulator guest flow proves
+  attachment (`target_flows`); loopback flows are unattributed and the
+  device's proxy setting, read back, decides (`device_setting`,
+  `device_proxy_cleared_externally`, `setting_unreadable` when adb cannot
+  read it). On iOS host and Simulator traffic are indistinguishable, so it
+  stays `"unknown"` (`host_traffic_indistinguishable`). `recent_flows` is no
+  longer answered: a host `curl` through the proxy used to read as attached.
+- iOS `network attach` answers `mode: "manual"`, matching `attach_state`
+  (it said `"automated"` next to `attach_state: manual`); `mechanism` names
+  what was automated. It also warns `flutter_proxy_hook_required`: `dart:io`
+  ignores the proxy environment unless the app sets `HttpClient.findProxy`.
+- `report suite --last N` covers the latest run of each of the N most
+  recently run flows: a re-run replaces its flow's earlier run instead of
+  pushing another flow out of the window. `report history --last` still
+  counts runs.
+- `flow export --format maestro` exports a tap's `timeoutMs` (`tapOn`,
+  `longPressOn`, `doubleTapOn`) as `extendedWaitUntil: {visible: <selector>,
+  timeout: N}` followed by the tap (`optional` carried over) instead of
+  refusing it; on import an optional pair of that shape folds back into the
+  tap's `timeoutMs`, and any other optional wait refuses.
+- `flow check` / `flow list` report the `platforms` a flow can really run
+  on: `requires.platform`, else both minus iOS when a step that runs there
+  is Android-only (`back`, `clearState`, `setOrientation`,
+  `launchApp.clearState`, a `KEYCODE_*` key); iOS `flow run` refuses the same
+  steps at pre-flight from the same table.
+- `flow run <dir>` skips a flow whose platforms exclude the target (declared
+  for the other platform, or an Android-only step on iOS) with a
+  `flow_skipped_for_platform` warning (`skipped_flows`) instead of aborting
+  the suite at that flow's pre-flight refusal; a suite of which nothing can
+  run is `flow_no_flows_found`. A flow refused for anything else, such as a
+  missing capability, still stops the suite.
+- Android `logs tail --package` / `logs follow --source device --package`
+  narrow by the app's uid on API 31+ (its lifecycle lines included, earlier
+  processes of the app too), by the running pid on older APIs, else to lines
+  naming it; an unknown package is `app_not_installed` instead of a
+  screenful of other apps' lines.
+- `cleanup` kills a registered process only after `ps` confirms it still
+  runs the recorded command (`pid_reused`, `unverified_skipped` otherwise),
+  and by default only when it is orphaned (its session stopped, its
+  supervisor died, or it has no owner and no intact artifacts directory);
+  `cleanup --all` also stops the `background` category. A process group
+  whose recorded leader is gone is never signalled (`group_remnant`): its id
+  may belong to someone else by now.
+- `metrics snapshot` on Android measures CPU now — two `/proc` reads 0.5 s
+  apart, on the one-core scale (a process busy on two cores reads 200) —
+  and uses `dumpsys cpuinfo`, whose window may have closed minutes earlier,
+  only as the fallback.
+- `metrics frames capture` drops gfxinfo's `percentile_*_ms` and
+  `janky_percent` for a window of zero frames (they were the histogram's top
+  bucket and a meaningless 0%).
+- `metrics trace --preset simpleperf` records `--app <id>` with
+  `cpu-cycles` when `simpleperf list hw` lists it and `cpu-clock` otherwise
+  (an emulator has no PMU); `metrics list-presets` marks `hitches`
+  `unsupported_on_simulator`, and the iOS frames refusal points at a physical
+  device, `flutter-summary` and `time-profiler` instead of `hitches`.
+- `simulator push send` without `app_id` (and no session app) or a payload
+  is `invalid_value` (was `flow_command_invalid`); Android `simulator
+  clipboard get` is `unsupported_on_platform` (was `invalid_simulator_action`).
+- `logs follow` ends with eof reason `max_lines` when a final unterminated
+  fragment reaches `--max-lines` (was `stream_ended`).
+- Registry rows drop detail keys whose value is null and store a `command`
+  redacted.
 
 ### Fixed
 - `simulator status-bar pin` validates every key and value before the
@@ -345,9 +484,9 @@ journal, captured URLs, and approvals.
   Face ID devices and the Touch ID one otherwise (both when the device type
   does not say, reported as `biometry`); `text-size` and `appearance` are read back on
   both platforms; the iOS clipboard is read back.
-- Android launches work on an AVD without a hardware keyboard: the resume
-  launch passes `monkey --pct-syskeys 0`, and an `am start` that prints
-  `Error:` with exit status 0 is a failure, not a launch.
+- Android launches work on an AVD without a hardware keyboard: the `monkey`
+  fallback passes `--pct-syskeys 0`, and an `am start` that prints `Error:`
+  with exit status 0 is a failure, not a launch.
 - `session uninstall` reports a failed uninstall as `ok: false` on both
   platforms.
 - `file pull` of a missing Android file no longer writes run-as's complaint
@@ -431,6 +570,99 @@ journal, captured URLs, and approvals.
   `dumpsys battery` reports the pinned level; on Xcode 27 with AXe carrying
   input, `doctor` shows `ios_hid.ready: false` with `ios_hid.axe_ready` and
   `ios_ui.ready` true, and agents are told to read those instead of giving up.
+- **Off-screen iOS nodes.** iOS lists Flutter's scroll cache at a 0x0 frame:
+  `ui tap` tapped the screen's origin and reported success, `assertVisible`
+  passed on such a node, and `scrollUntilVisible` "found" one without
+  scrolling. They are now marked `visible: false` (live trees and `--dump`
+  alike), `ui tap` refuses them with the new `element_offscreen` (nothing is
+  dispatched), and flows select on-screen nodes only; a flow that still meets
+  `element_offscreen` classifies it as a test failure. The repair brief ranks
+  and indexes on-screen candidates, so its confirming `ui find` resolves to
+  the suggested node.
+- Selectors normalise whitespace (`exact`, `contains`, both case modes): iOS
+  joins a merged Flutter label with a newline, Android with a space, and one
+  selector matched on one platform only. `regex` sees the raw value.
+- `ui type` names the focused editable field (Android reported window focus
+  on a FrameLayout ahead of the focused EditText), and `--interactable` no
+  longer keeps Flutter's focusable-only static labels while keeping
+  long-press-only and checkable controls.
+- `ui wait --settled` never starts a snapshot it cannot finish before
+  `--timeout-ms`, and one slow first dump no longer ends the wait early.
+- iOS toggles report `checked` from `AXValue` (`1`/`0`, `on`/`off`), so
+  `assertChecked` can pass on iOS, and count as clickable.
+- **iOS logs of a Flutter app.** The predicate looked for the bundle id's
+  last component while every Flutter app's process is `Runner`, so
+  `logs tail --package` returned only `log show`'s trailer. `logs tail`,
+  `logs follow` (live and from the session's file) and `--log-stream` now
+  match the installed bundle path, so another Flutter app on the same
+  simulator never leaks in; the `log` tool's banner and trailer are never
+  returned as log lines.
+- The session's iOS log stream survives the device moving under it:
+  `simulator keyboard pin` with `reboot=true` and `session clear --strategy
+  reinstall` restart it (`log_stream_restarted`, `log_stream_pid`), or warn
+  `log_stream_stopped` when it cannot be restarted.
+- The bounded log writer can no longer lose the previous rotation when
+  `session stop` lands mid-rotation.
+- No pid read back from a session file is signalled unverified any more. The
+  log-stream restart after a reboot never signals the old writer (the
+  shutdown already ended it) and after a reinstall stops it only once its
+  command line is the bounded writer of the session's stream file — the
+  writer's own script line plus the file as a whole argument followed by
+  its cap, so `tail -f <file>` or a writer of `<file>.bak` never qualifies;
+  a recorded pid that now runs something else gets a new stream started
+  instead of being taken for the writer. `session stop` checks the
+  log-stream writer and the screen recorder the same way (`recordVideo`,
+  the UDID and the path; `screenrecord`, the device file and `-s <serial>`
+  as adjacent whole arguments, so `R58M123` never claims `R58M123ABCD`'s
+  recorder), and so do `record stop` and `record start`; a pid `ps` cannot
+  vouch for is skipped with an `unverified_skipped` warning. An unrelated
+  process whose pid had been reused used to receive SIGTERM, then SIGKILL.
+  A registry row whose signature is empty (`""`, `[]`) is never signalled
+  either: it used to be killed unchecked, as if it had none.
+- An `idb_companion` registry row records the simulator's UDID next to the
+  binary, so a pid reused by another simulator's companion is never taken
+  for it.
+- Android `network attach` refuses with `backend_failed` when adb cannot
+  read the current global proxy; adb's error text used to be saved as the
+  previous proxy and written back to the device by `detach`.
+- `ui wait --settled` and flow `waitForSettled` no longer claim "the tree was
+  still changing" when it was not: with one ~2 s Android dump in a 3 s
+  budget the warning says settling could not be confirmed, how long a dump
+  took, and how far to raise the timeout; a tree that changed and then held
+  still for less than the quiet window is said to have done exactly that.
+  Each case has one hint. Same code (`screen_not_settled`) and exit status.
+- iOS `crash list` reports a listing idb could not produce (its companion
+  was lost) as an error instead of `count: 0`; `permissions` checks the
+  service against this Xcode's `simctl help privacy`; the iOS status bar,
+  battery and biometric enrollment are read back for `verified`; simctl
+  probes never raise.
+- iOS `simulator clipboard get` with no usable `xcrun` is `simctl_not_found`
+  like every other control (was `backend_failed`).
+- Android `battery set` under a live status-bar pin updates the pin, so the
+  next capture no longer undoes it.
+- The iOS log-stream writer, `canvas serve` (now supervised in its own
+  process group, node child and all) and the idb companions Autonom's idb
+  calls start are in the process registry, so `processes`, `cleanup --all`
+  and `session stop` can find them. Ending the CLI running `canvas serve`
+  with SIGTERM, SIGHUP or Ctrl-C takes node and its children down; after a
+  SIGKILL, which cannot be caught, the node child is listed as an orphan and
+  `cleanup` reaps its process group.
+- `canvas serve`'s supervisor signals the child's process group before
+  reaping the child: a reaped leader frees its pid, and with it the group
+  id, which a new process group could take before the signal was sent.
+- Command-line redaction in the registry is linear: an unanchored URL
+  pattern made a 400 KB argv take minutes, on every idb call once companion
+  discovery ran there; discovery also redacts only a bounded head of each
+  `ps` line.
+- `flow create` reads journal argv as the parser does: `open <url> --serial
+  S` compiles to `openLink: <url>`, `session launch` to `launchApp: {resume:
+  true}`, `session launch --fresh` to the fresh `launchApp`; `flow check`
+  refuses an `openLink` URL without a scheme.
+- `simpleperf` failed on emulators with the default `cpu-cycles` event (no
+  PMU).
+- The fake emulator and fake adb write their state atomically and read it
+  patiently, and the endless iOS log-stream test waits on progress instead
+  of a timer — the two CI flakes of the hardening pass.
 
 ### Security
 - A live status-bar pin (and the animation/status-bar snapshot `clear` and
@@ -474,6 +706,12 @@ journal, captured URLs, and approvals.
   from manifest, events, and reports, recorded under `secret_names`,
   reproduced as `--secret K`, and named in a `flow_env_value_sensitive`
   warning.
+- Command lines stored in the process registry, and those `processes` and
+  `doctor` discover, are redacted: values of secret-named options
+  (`--token`, `--api-key`, `--password=`, `PASS=`), `name=value` pairs whose
+  name looks secret, and URL userinfo (`scheme://<redacted>@host`). A
+  `canvas serve --token` never appears in `processes` or `doctor`; the
+  supervised canvas rows carry no command line at all.
 
 ## [0.30.0] - 2026-08-28
 

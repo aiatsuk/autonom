@@ -73,6 +73,18 @@ def _gone(pid: int) -> bool:
     return False
 
 
+def _stop_writer(writer: subprocess.Popen) -> None:
+    """SIGTERM first: the bounded writer stops its child on it (SIGKILL would
+    leave the child waiting out its sleep)."""
+    if writer.poll() is None:
+        writer.terminate()
+    try:
+        writer.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        writer.kill()
+        writer.wait(timeout=10)
+
+
 def _kill_quietly(pid: int | None) -> None:
     if not pid:
         return
@@ -438,10 +450,13 @@ class LogStreamRegistryTests(_RegistryCase):
 
     def _start(self, target: Target, record: dict) -> int:
         def fake_start(_xcrun, _udid, destination, **_kwargs):
-            # The real bounded writer carries its destination in its argv,
-            # which is what the registry checks before it kills a pid.
-            return self.sleeper(sys.executable, "-c", "import time; time.sleep(120)",
-                                str(destination)).pid
+            # The real bounded writer (its argv carries the writer script and
+            # its destination, which is what the registry checks before it
+            # kills a pid), over a child that just waits.
+            writer = ios_simctl.spawn_bounded(
+                [sys.executable, "-c", "import time; time.sleep(120)"], destination)
+            self.addCleanup(_stop_writer, writer)
+            return writer.pid
 
         with mock.patch.object(ios_simctl, "start_log_stream", fake_start), \
                 mock.patch.object(ios_simctl, "app_image", return_value=("Runner", None)):
@@ -515,13 +530,6 @@ LEADER_EXITS = textwrap.dedent("""\
     pathlib.Path(sys.argv[1]).write_text(str(worker.pid))
     worker.returncode = 0  # leave it running: no "still running" warning at exit
 """)
-
-
-def _kill_group_quietly(pgid: int) -> None:
-    try:
-        os.killpg(pgid, signal.SIGKILL)
-    except OSError:
-        pass
 
 
 CHILD = textwrap.dedent("""\
@@ -990,14 +998,16 @@ class VerifyBeforeKillTests(_RegistryCase):
         """The reviewer's shape: a leader in its own session spawns a worker
         and exits (a double-forking daemon — the adb fork-server, ssh/gpg
         agents), leaving a live group whose leader is dead. Returns
-        (pgid, worker pid); the test always kills the group itself."""
+        (pgid, worker pid); the test always kills the worker itself."""
         pidfile = Path(tempfile.mkdtemp(dir=self.home)) / "worker.pid"
         leader = subprocess.Popen([sys.executable, "-c", LEADER_EXITS, str(pidfile)],
                                   start_new_session=True)
         self.assertEqual(leader.wait(timeout=30), 0)  # reaped: the leader is gone
         self.assertTrue(_wait_until(lambda: pidfile.exists() and pidfile.read_text()))
         worker = int(pidfile.read_text())
-        self.addCleanup(_kill_group_quietly, leader.pid)
+        # the worker itself, never `killpg(leader.pid)`: the leader is reaped,
+        # so by cleanup time that group id may belong to someone else
+        self.addCleanup(_kill_quietly, worker)
         self.assertFalse(_gone(worker))
         return leader.pid, worker
 
