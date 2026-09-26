@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -381,8 +382,17 @@ class Token:
         return self.raw
 
 
-# argparse's own `_negative_number_matcher` (3.14): a prefix match.
-_NEGATIVE_NUMBER = re.compile(r"-\.?\d")
+# Fallback for argparse's `_negative_number_matcher` when a parser does not
+# carry one: 3.14 uses a prefix match, older releases a full match
+# (`-5,10` is a negative number to 3.14 but an unknown option to 3.11).
+_NEGATIVE_NUMBER = re.compile(r"-\.?\d") if sys.version_info >= (3, 14) \
+    else re.compile(r"^-\d+$|^-\d*\.\d+$")
+
+
+def _negative_number_matcher(parser: Any) -> Any:
+    """The running parser's own negative-number rule (read-only)."""
+    matcher = getattr(parser, "_negative_number_matcher", None)
+    return matcher if hasattr(matcher, "match") else _NEGATIVE_NUMBER
 
 
 def _canonical_option(action: Any) -> str:
@@ -403,7 +413,7 @@ def _resolve_option(parser: Any, name: str) -> Any:
 
 
 def _classify(parser: Any, raw: str) -> tuple[str, Any, str | None, str | None]:
-    """Mirror `ArgumentParser._parse_optional` (3.14) for one token.
+    """Mirror `ArgumentParser._parse_optional` of the running Python for one token.
 
     Returns (kind, action, option spelling, inline value) where kind is
     `positional`, `option` or `unknown`. Same order as argparse: exact
@@ -424,7 +434,8 @@ def _classify(parser: Any, raw: str) -> tuple[str, Any, str | None, str | None]:
     action = _resolve_option(parser, lookup)
     if action is not None:
         return "option", action, lookup, inline if sep else None
-    if _NEGATIVE_NUMBER.match(raw) and not parser._has_negative_number_optionals:  # noqa: SLF001
+    if _negative_number_matcher(parser).match(raw) \
+            and not parser._has_negative_number_optionals:  # noqa: SLF001
         return "positional", None, None, None
     if " " in raw:
         return "positional", None, None, None
@@ -482,7 +493,13 @@ def canonical_argv(parser: Any, argv: list[str]) -> list[Token]:
                 continue
             while index < len(argv):
                 following = argv[index]
-                if mode != "one" and _classify(current, following)[0] != "positional":
+                kind_following = _classify(current, following)[0]
+                if mode != "one" and kind_following != "positional":
+                    break
+                if kind_following == "unknown":
+                    # argparse takes only an argument-like token as a value
+                    # (`--from -5,10` on 3.11): leave it unknown so the whole
+                    # argv defers to the conservative scan, as argparse rejects it.
                     break
                 tokens.append(Token(following, "value", option=option,
                                     dest=action.dest, path=path, spelling=name))

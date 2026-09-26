@@ -471,8 +471,16 @@ class CanonicalArgvTests(unittest.TestCase):
                      ["ui", "type", "-5.5"], ["ui", "type", "-.5"],
                      ["ui", "type", "-5,10"], ["ui", "type", "-1e3x"]):
             tokens = journal_mod.canonical_argv(self.parser, argv)
-            self.assertFalse([t.raw for t in tokens if t.role in ("unknown", "stray")], argv)
-            self.parser.parse_args(argv)  # argparse accepts it the same way
+            rejected = [t.raw for t in tokens if t.role in ("unknown", "stray")]
+            # Canonicalization follows the running argparse's own negative-number
+            # rule: 3.14 accepts `-5,10` as a value, 3.11 rejects it as an option.
+            if self._parse(argv) is None:
+                self.assertTrue(rejected, argv)
+            else:
+                self.assertFalse(rejected, argv)
+            for scrubbed in (journal_mod.scrub_canonical(self.parser, argv),
+                             journal_mod.scrub_argv(argv)):
+                self.assertEqual(len(scrubbed), len(argv), argv)
         scrubbed = journal_mod.scrub_canonical(self.parser, ["ui", "type", "-5.5"])
         self.assertEqual(scrubbed, ["ui", "type", "<4 chars>"])
 
@@ -756,10 +764,21 @@ class HeadDifferentialTests(unittest.TestCase):
                             f"{name}: token {index} of {argv}: {output[index]!r} "
                             f"vs HEAD {head[index]!r}")
 
+    def _accepts_leading_separator(self) -> bool:
+        return self._parse(["--", "ui", "type", "PROBE"]) is not None
+
     def test_v3_review_repros_are_masked_in_every_mode(self) -> None:
         for argv in self.V3_REPROS:
             args = self._parse(argv)
-            self.assertIsNotNone(args, argv)
+            # Acceptance is version-dependent (3.11 argparse rejects a `--` before
+            # the subcommand, and `-9X` as an unknown option); masking in every
+            # mode is not. Any rejection must be one canonicalization foresees.
+            before_verb = argv[:argv.index("ui")] if "ui" in argv else argv
+            tokens = journal_mod.canonical_argv(self.parser, argv)
+            foreseen = any(t.role in ("unknown", "stray") for t in tokens) or (
+                "--" in before_verb and not self._accepts_leading_separator())
+            if not foreseen:
+                self.assertIsNotNone(args, argv)
             for name, output in self._modes(argv, args):
                 self.assertFalse(self.V3_MARKER.findall(json.dumps(output)), f"{name}: {output}")
             for name, output in self._modes(argv, None):
