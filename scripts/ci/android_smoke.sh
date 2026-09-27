@@ -20,19 +20,21 @@ cd "$ROOT"
 
 export AUTONOM_HOME="${AUTONOM_HOME:-$(mktemp -d)}"
 
-# The emulator-runner action's own teardown (emu kill, then wait for the
-# emulator process) intermittently hangs until the job times out, well after
-# the smoke has passed. Stop the emulator here on any exit, forcibly if it
-# does not go within 30 s, so that teardown has nothing left to wait for.
+# The emulator-runner action's teardown intermittently hangs until the job
+# times out, well after the smoke has passed: emulator helpers (netsimd,
+# crashpad_handler) outlive the emulator and keep the action's output pipes
+# open. Stop the emulator and those helpers here on any exit, forcibly if the
+# emulator does not go within 30 s, so teardown has nothing left to wait for.
 # CI-only script on a throwaway runner: the only emulator is the one it booted.
 stop_emulator() {
   adb emu kill >/dev/null 2>&1 || true
   for _ in $(seq 1 30); do
-    pgrep -f qemu-system >/dev/null 2>&1 || return 0
+    pgrep -f qemu-system >/dev/null 2>&1 || break
     sleep 1
   done
-  echo "emulator did not exit after emu kill; killing it" >&2
   pkill -9 -f qemu-system >/dev/null 2>&1 || true
+  pkill -9 -f netsimd >/dev/null 2>&1 || true
+  pkill -9 -f crashpad_handler >/dev/null 2>&1 || true
 }
 trap stop_emulator EXIT
 OUT="$(mktemp -d)"
