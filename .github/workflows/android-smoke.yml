@@ -50,6 +50,8 @@ jobs:
           script: echo "Generated AVD snapshot for caching."
 
       - name: Run the smoke script on a real emulator
+        # The smoke itself takes about two minutes; a hang fails fast.
+        timeout-minutes: 15
         uses: reactivecircus/android-emulator-runner@v2
         with:
           api-level: ${{ env.API_LEVEL }}

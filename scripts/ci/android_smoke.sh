@@ -19,6 +19,22 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 
 export AUTONOM_HOME="${AUTONOM_HOME:-$(mktemp -d)}"
+
+# The emulator-runner action's own teardown (emu kill, then wait for the
+# emulator process) intermittently hangs until the job times out, well after
+# the smoke has passed. Stop the emulator here on any exit, forcibly if it
+# does not go within 30 s, so that teardown has nothing left to wait for.
+# CI-only script on a throwaway runner: the only emulator is the one it booted.
+stop_emulator() {
+  adb emu kill >/dev/null 2>&1 || true
+  for _ in $(seq 1 30); do
+    pgrep -f qemu-system >/dev/null 2>&1 || return 0
+    sleep 1
+  done
+  echo "emulator did not exit after emu kill; killing it" >&2
+  pkill -9 -f qemu-system >/dev/null 2>&1 || true
+}
+trap stop_emulator EXIT
 OUT="$(mktemp -d)"
 CLI=(python3 scripts/autonom.py --platform android)
 
