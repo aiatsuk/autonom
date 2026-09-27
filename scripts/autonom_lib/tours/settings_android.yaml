@@ -16,6 +16,12 @@ requires:
       match: regex
     timeoutMs: 15000
     label: The Settings home screen is up
+- assertVisible:
+    selector:
+      text: ^(Apps|Apps & notifications|Connected devices)$
+      match: regex
+    timeoutMs: 10000
+    label: The home lists the other top-level entries
 - tapOn:
     selector:
       text: ^Network (&|and) [Ii]nternet$
@@ -27,18 +33,60 @@ requires:
       match: regex
     timeoutMs: 10000
     label: The "Network & internet" screen is up
+- assertNotVisible:
+    selector:
+      text: ^(Apps|Apps & notifications|Connected devices)$
+      match: regex
+    timeoutMs: 10000
+    label: The home entries are gone
+- assertVisible:
+    selector:
+      description: ^Network (&|and) [Ii]nternet$
+      match: regex
+    timeoutMs: 10000
+    label: The toolbar titles the screen "Network & internet"
 - tapOn:
     selector:
       text: ^(Internet|Wi.?Fi)$
       match: regex
     label: Open "Internet"
-- assertNotVisible:
+- assertVisible:
     selector:
-      text: ^Network (&|and) [Ii]nternet$
+      description: ^(Internet|Wi.?Fi)$
       match: regex
     timeoutMs: 10000
-    label: The "Internet" screen replaced the list
+    label: The toolbar titles the screen "Internet"
+- assertNotVisible:
+    selector:
+      description: ^Network (&|and) [Ii]nternet$
+      match: regex
+    timeoutMs: 10000
+    label: The "Network & internet" title is gone
 - back:
     label: Back to "Network & internet"
+- assertVisible:
+    selector:
+      description: ^Network (&|and) [Ii]nternet$
+      match: regex
+    timeoutMs: 10000
+    label: The "Network & internet" title is back, which the "Internet" screen lacks
+- assertVisible:
+    selector:
+      text: ^(Internet|Wi.?Fi)$
+      match: regex
+    timeoutMs: 10000
+    label: The "Internet" entry is listed again
 - back:
     label: Back to the Settings home
+- assertVisible:
+    selector:
+      text: ^(Apps|Apps & notifications|Connected devices)$
+      match: regex
+    timeoutMs: 10000
+    label: The Settings home screen is back, with its top-level entries
+- assertNotVisible:
+    selector:
+      text: ^(Internet|Wi.?Fi)$
+      match: regex
+    timeoutMs: 10000
+    label: The "Network & internet" list is gone

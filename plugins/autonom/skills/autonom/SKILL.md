@@ -90,10 +90,10 @@ reads it back — the record you use to re-check or hand off a flow.
 | --- | --- |
 | Discover | `doctor`, `devices`, `devices boot/shutdown` |
 | Session | `session start/show/stop/launch/force-stop/clear/uninstall` |
-| Screen | `ui tree/find/tap/swipe/pinch/rotate/shake/type/key` |
-| First run | `tour` — overview, the workflow, this machine's targets, and `--run` to walk three screens into Settings with evidence at every step and a written account |
+| Screen | `ui tree/find/wait/tap/swipe/type/key` (`ui wait --settled`, `ui tree --format outline`); `pinch/rotate/shake` are refused on both platforms; iOS input via idb or AXe, named in `backend` |
+| First run | `tour` — overview, the workflow, this machine's targets, and `--run` to walk three screens into Settings: before/after screenshots, hierarchy, and device log attached to each tap or back, an assertion that the screen changed after each, an HTML/JUnit report, and a written account |
 | Evidence | `screenshot` (with `width`/`height`), `shots list/show`, `record start/stop`, `note add/list`, `journal` |
-| Deterministic state | `simulator status-bar pin\|clear` (both platforms), `simulator keyboard pin\|reset\|show` (iOS) — remove clock, battery, and autocorrect noise from before/after comparisons |
+| Deterministic state | `simulator status-bar pin\|clear` (both platforms), `simulator keyboard pin\|reset\|show` (iOS), `simulator animations pin\|reset\|show` (Android) — remove clock, battery, animation, and autocorrect noise from before/after comparisons; `verified` only after a read-back |
 | Device state | `open` (deep link), `permissions`, `location` (iOS + Android emulator), `media add`, `file ls/pull` |
 | Diagnostics | `logs tail`, `crash list/show` |
 | Live observation | `session outputs`, `logs follow`, `network requests follow`, `journal --follow` — bounded NDJSON streams |

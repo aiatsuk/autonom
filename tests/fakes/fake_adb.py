@@ -16,14 +16,27 @@ State keys (all optional):
 ``clock_skew``      seconds the fake device clock lags the host (default 0)
 ``fail``            mapping of "joined argv prefix" -> [exit_code, message]
 ``avd_names``       mapping of serial -> AVD name for ``emu avd name``
+``boot_ids``        mapping of serial -> kernel boot_id (``null`` = unreadable);
+                    a fixed default id otherwise
 ``run_as_refused``  text run-as prints instead of a listing (system / release app)
 ``ui_dump_incomplete`` number of truncated dumps to return before a complete one
 ``battery_level``   level ``dumpsys battery`` reports (``set level`` updates it)
+``battery_overridden`` true while ``dumpsys battery set``/``unplug`` overrides are live
+``battery_ac``      "true"/"false" for ``AC powered`` (``set ac`` updates it)
+``battery_real_level`` the level ``dumpsys battery reset`` returns to (default 100)
+``signal_profile``  last ``emu gsm signal-profile`` value; ``signal_rssi`` /
+                    ``signal_ber`` the last ``emu gsm signal`` pair
+``settings_system`` / ``settings_secure`` the other two settings namespaces
+``night_mode``      what ``cmd uimode night`` reports (``yes``/``no``)
+``clipboard``       the text ``cmd clipboard set text`` stored, after the device
+                    shell has parsed the line
+``clipboard_unsupported`` answer "No shell command implementation." (API 36)
 """
 from __future__ import annotations
 
 import json
 import os
+import shlex
 import sys
 import time
 from pathlib import Path
@@ -119,17 +132,82 @@ def main(argv: list[str]) -> int:
         return 0
 
     if args[:3] == ["shell", "dumpsys", "battery"]:
-        # The battery service remembers `set level`, so a pin can be read back.
-        if args[3:5] == ["set", "level"] and len(args) > 5:
-            state["battery_level"] = args[5]
+        # The battery service remembers every `set`, prints the "UPDATES
+        # STOPPED" banner while an override is live, and `reset` returns it to
+        # the real readings — so a pin, and what a clear restores, can be read
+        # back the way a real emulator reports them.
+        if args[3:4] == ["set"] and len(args) > 5:
+            state["battery_overridden"] = True
+            if args[4] == "level":
+                state["battery_level"] = args[5]
+            elif args[4] in ("ac", "usb"):
+                state[f"battery_{args[4]}"] = "true" if args[5] == "1" else "false"
             write_state(state)
             return 0
-        if args[3:4] in (["set"], ["unplug"], ["reset"]):
+        if args[3:4] == ["unplug"]:
+            state.update(battery_overridden=True, battery_ac="false", battery_usb="false")
+            write_state(state)
             return 0
+        if args[3:4] == ["reset"]:
+            state.update(battery_overridden=False,
+                         battery_level=state.get("battery_real_level", "100"),
+                         battery_ac="false", battery_usb="false")
+            write_state(state)
+            return 0
+        banner = ("Current Battery Service state:\n  (UPDATES STOPPED -- use 'reset' "
+                  "to restart)\n" if state.get("battery_overridden")
+                  else "Current Battery Service state:\n")
         sys.stdout.write(
-            "Current Battery Service state:\n  AC powered: false\n  USB powered: false\n"
-            f"  status: 4\n  level: {state.get('battery_level', '100')}\n")
+            f"{banner}  AC powered: {state.get('battery_ac', 'false')}\n"
+            f"  USB powered: {state.get('battery_usb', 'false')}\n"
+            f"  status: 4\n  level: {state.get('battery_level', '100')}\n  scale: 100\n")
         return 0
+
+    if args[:3] == ["emu", "gsm", "signal-profile"]:
+        # The console accepts 0..4 and says OK; anything else is a KO.
+        if len(args) < 4 or args[3] not in ("0", "1", "2", "3", "4"):
+            sys.stdout.write("KO: bad signal profile\n")
+            return 1
+        state["signal_profile"] = args[3]
+        write_state(state)
+        sys.stdout.write("OK\n")
+        return 0
+
+    if args[:3] == ["emu", "gsm", "signal"]:
+        # `gsm signal <rssi> [<ber>]`: rssi 0..31 or 99, ber 0..7 or 99.
+        rssi = args[3] if len(args) > 3 else ""
+        ber = args[4] if len(args) > 4 else "99"
+        valid_rssi = rssi.isdigit() and (int(rssi) <= 31 or int(rssi) == 99)
+        valid_ber = ber.isdigit() and (int(ber) <= 7 or int(ber) == 99)
+        if not (valid_rssi and valid_ber):
+            sys.stdout.write("KO: bad rssi or ber\n")
+            return 1
+        state.update(signal_rssi=rssi, signal_ber=ber)
+        write_state(state)
+        sys.stdout.write("OK\n")
+        return 0
+
+    if args[:1] == ["shell"] and len(args) > 1:
+        # The device shell parses the joined line exactly as `sh` would, so a
+        # badly quoted argument shows up here as the wrong words.
+        try:
+            words = shlex.split(" ".join(args[1:]))
+        except ValueError:  # unbalanced quotes: sh would refuse the line too
+            words = []
+        if words[:3] == ["cmd", "clipboard", "set"]:
+            if state.get("clipboard_unsupported"):
+                sys.stdout.write("No shell command implementation.\n")
+                return 0
+            state["clipboard"] = " ".join(words[4:]) if words[3:4] == ["text"] else ""
+            state["clipboard_words"] = len(words) - 4
+            write_state(state)
+            return 0
+        if words[:3] == ["cmd", "uimode", "night"]:
+            if len(words) > 3:
+                state["night_mode"] = words[3]
+                write_state(state)
+            sys.stdout.write(f"Night mode: {state.get('night_mode', 'no')}\n")
+            return 0
 
     if args[:3] == ["shell", "dumpsys", "location"]:
         default = (
@@ -250,6 +328,17 @@ def main(argv: list[str]) -> int:
         sys.stdout.write(state.get("dumpsys_gfxinfo", ""))
         return 0
 
+    if args[:3] == ["shell", "cat", "/proc/sys/kernel/random/boot_id"]:
+        # A fresh random id per boot; tests model "another emulator on the
+        # same serial" by changing it (and ``avd_names``) under the serial.
+        serial = argv[1] if argv[:1] == ["-s"] and len(argv) >= 2 else ""
+        boot_ids = state.get("boot_ids") or {}
+        if serial in boot_ids and boot_ids[serial] is None:
+            sys.stdout.write("cat: /proc/sys/kernel/random/boot_id: Permission denied\n")
+            return 1
+        sys.stdout.write(boot_ids.get(serial, "5f3c2a10-0000-4000-8000-000000000001") + "\n")
+        return 0
+
     if args[:2] == ["shell", "cat"] and len(args) > 2 and args[2].startswith("/proc/"):
         default = "Threads:\t42\nVmRSS:\t8500 kB\nVmSize:\t120000 kB\n"
         sys.stdout.write(state.get("proc_status", default))
@@ -260,16 +349,23 @@ def main(argv: list[str]) -> int:
         sys.stdout.write((state.get("pidof", {}).get(package, "")) + "\n")
         return 0
 
-    if args[:4] == ["shell", "settings", "get", "global"]:
-        value = state.get("settings", {}).get(args[4], "null")
-        sys.stdout.write(f"{value}\n")
-        return 0
-
-    if args[:4] == ["shell", "settings", "put", "global"]:
-        settings = state.setdefault("settings", {})
-        settings[args[4]] = args[5]
-        write_state(state)
-        return 0
+    if args[:2] == ["shell", "settings"] and len(args) > 4 and args[3] in (
+            "global", "system", "secure"):
+        # `settings` keeps its original global table under `settings`.
+        table = "settings" if args[3] == "global" else f"settings_{args[3]}"
+        if args[2] == "get":
+            value = state.get(table, {}).get(args[4], "null")
+            sys.stdout.write(f"{value}\n")
+            return 0
+        if args[2] == "put" and len(args) > 5:
+            state.setdefault(table, {})[args[4]] = args[5]
+            write_state(state)
+            return 0
+        if args[2] == "delete":
+            state.setdefault(table, {}).pop(args[4], None)
+            write_state(state)
+            sys.stdout.write("Deleted 1 rows\n")
+            return 0
 
     # install / shell input / shell am / shell pm all succeed silently.
     return 0

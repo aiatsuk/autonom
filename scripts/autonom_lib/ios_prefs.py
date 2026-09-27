@@ -96,9 +96,19 @@ def keyboard_pins(locale: str | None) -> dict[str, dict[str, Any]]:
         normalized = normalize_locale(locale)
         pins[GLOBAL_DOMAIN] = {
             "AppleLocale": normalized,
-            "AppleLanguages": [normalized.split("_", 1)[0]],
+            "AppleLanguages": [language_tag(normalized)],
         }
     return pins
+
+
+def language_tag(normalized: str) -> str:
+    """The AppleLanguages entry for a locale: the BCP 47 form, region kept.
+
+    `en-US` used to become `["en"]`, which dropped the region a device had
+    (`["en-US"]` on the first real simulator) and changed number and date
+    formatting along with it. `de` stays `de`; `en_US` becomes `en-US`.
+    """
+    return normalized.replace("_", "-")
 
 
 def owned_keys(pins: dict[str, dict[str, Any]]) -> dict[str, tuple[str, ...]]:
@@ -141,16 +151,27 @@ def read_backup(udid: str) -> dict[str, dict[str, Any]] | None:
 
 
 def record_backup(udid: str, pins: dict[str, dict[str, Any]]) -> Path | None:
-    """Snapshot the owned keys before the first pin; a second pin on top of
-    the first must not overwrite the snapshot with pinned values."""
-    if read_backup(udid) is not None:
-        return None
-    snapshot: dict[str, dict[str, Any]] = {}
+    """Snapshot the owned keys before they are first pinned.
+
+    A second pin on top of the first must not overwrite the snapshot with
+    pinned values, but it must still record any domain or key the first pin
+    did not touch: `pin` then `pin locale=de-DE` used to keep the first
+    snapshot as is, so `reset` knew nothing of AppleLocale and deleted it.
+    Returns the backup path when anything was recorded, else None.
+    """
+    snapshot = read_backup(udid) or {}
+    changed = False
     for domain, values in pins.items():
+        recorded = snapshot.setdefault(domain, {})
+        missing = [key for key in values if key not in recorded]
+        if not missing:
+            continue
         current = read_domain(udid, domain)
-        snapshot[domain] = {
-            key: (current[key] if key in current else _ABSENT) for key in values
-        }
+        for key in missing:
+            recorded[key] = current[key] if key in current else _ABSENT
+        changed = True
+    if not changed:
+        return None
     path = backup_path(udid)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2) + "\n",
@@ -201,10 +222,13 @@ def apply_pins(udid: str, pins: dict[str, dict[str, Any]]) -> dict[str, dict[str
 def remove_pins(udid: str, pins: dict[str, dict[str, Any]]) -> dict[str, Any]:
     """Undo a pin: put back what the pin replaced, delete what it added.
 
-    With a backup from `record_backup`, every owned key returns to its
-    recorded value (or is deleted when it was absent). Without one — a pin
-    made by hand, or a backup lost with the state root — the owned keys are
-    deleted so the system defaults apply, which is the best honest guess.
+    With a backup from `record_backup`, every recorded key returns to its
+    recorded value (or is deleted when it was absent), and a key the backup
+    never recorded is one no pin wrote, so it is left alone (`pin` without a
+    locale, then `reset`, must not delete the device's own AppleLocale).
+    Without a backup — a pin made by hand, or a backup lost with the state
+    root — the owned keys are deleted so the system defaults apply, which is
+    the best honest guess.
     Returns `{"restored": {domain: {key: value}}, "removed": {domain: [key]},
     "backup": bool}`.
     """
@@ -217,6 +241,8 @@ def remove_pins(udid: str, pins: dict[str, dict[str, Any]]) -> dict[str, Any]:
         previous = (backup or {}).get(domain, {})
         changed = False
         for key in keys:
+            if backup is not None and key not in previous:
+                continue
             if key in previous and previous[key] != _ABSENT:
                 if current.get(key) != previous[key]:
                     current[key] = previous[key]

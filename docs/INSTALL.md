@@ -90,6 +90,31 @@ idb list-targets
 `idb_companion` prints an objc class-collision warning on stderr (it loads Apple
 private frameworks). It is cosmetic.
 
+#### Xcode 27: tree works, taps fail
+
+Xcode 27 moved `SimulatorKit.framework` from `Library/PrivateFrameworks` to
+`Contents/SharedFrameworks`. An `idb_companion` built before that still looks
+in the old place, so `ui tree` works while every tap, swipe, and typed string
+fails with `ios_hid_framework_missing`. `autonom doctor` says so: it reports
+where SimulatorKit is, the companion build, and `capabilities.ios_hid.ready:
+false` next to a working `capabilities.ios_tree`. Either fix works:
+
+```bash
+# upgrade the companion (and the client with it)
+brew update && brew upgrade idb-companion
+pipx upgrade fb-idb
+
+# or install AXe, which drives the simulator HID on its own
+brew install cameroncooke/axe/axe
+```
+
+With AXe installed, the default `--ios-hid auto` keeps using idb for the tree
+and sends input through AXe whenever idb's HID is known broken. Force a route
+with `--ios-hid idb|axe` (or `AUTONOM_IOS_HID`) and point at a binary outside
+`PATH` with `--axe PATH` (or `AUTONOM_AXE`). Run `autonom doctor` again
+afterwards: `ios.hid_backend` names the backend input will use, and `checks`
+lists each prerequisite with its fix.
+
 #### Remote iOS targets
 
 The idb client can drive a companion on another Mac, so a Linux orchestrator can
@@ -98,6 +123,9 @@ use a Mac simulator farm:
 ```bash
 export AUTONOM_IDB_COMPANION=mac-farm-01:10882
 ```
+
+Every idb call then carries `--companion mac-farm-01:10882`; `--idb-host` and
+`--idb-port` set the same endpoint per invocation.
 
 ### Verify what you have
 
@@ -113,14 +141,14 @@ Nothing lands in the project directory.
 | --- | --- |
 | `~/.autonom/sessions/<id>/` | one run: `session.json`, `journal.ndjson`, shots, trees, logs, network flows, recordings, crashes, pulled files |
 | `~/.autonom/apps/<package>/` | per-app knowledge and flow runbooks (`mobile-memory`) |
-| `~/.local/state/autonom/` | mock registry, process registry, and the mitmproxy CA (mode `0700`) — `$XDG_STATE_HOME/autonom` when that is set |
+| `~/.local/state/autonom/` | mock registry, process registry, the mitmproxy CA (mode `0700`), and the snapshots `simulator … pin` takes so `clear`/`reset` can restore the device (`simulator-state/`, `simulator-prefs/`) — `$XDG_STATE_HOME/autonom` when that is set |
 
 Set `AUTONOM_HOME` to move all of it under one root. Session artifacts can hold
 screenshots, logs, and captured traffic: treat the directory as sensitive and
 delete it when an investigation ends.
 
 Binary paths can be pinned without flags: `AUTONOM_ADB`, `AUTONOM_SIMCTL`,
-`AUTONOM_IDB`, `AUTONOM_EMULATOR`, `AUTONOM_MITMDUMP`.
+`AUTONOM_IDB`, `AUTONOM_AXE`, `AUTONOM_EMULATOR`, `AUTONOM_MITMDUMP`.
 
 ## Put `autonom` on PATH
 

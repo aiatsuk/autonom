@@ -11,6 +11,7 @@ filesystem access (that is ``validator.py``) and no device knowledge.
 """
 from __future__ import annotations
 
+import difflib
 import re
 from dataclasses import dataclass, field
 
@@ -377,6 +378,40 @@ def _fail(code: str, message: str, path: str, line: int, col: int,
     )
 
 
+def did_you_mean(name: str, known) -> str:
+    """``"Did you mean 'tapOn'? "`` for a near miss, else ``""``.
+
+    A hint prefix only — the full list of legal names still follows it, so a
+    wrong guess never hides the alternatives.
+    """
+    known = list(known)
+    close = difflib.get_close_matches(name, known, n=1, cutoff=0.6)
+    if not close:
+        # case slips (`appid`, `tapon`) score low on raw ratio
+        folded = {item.casefold(): item for item in known}
+        close = [folded[hit] for hit in difflib.get_close_matches(
+            name.casefold(), list(folded), n=1, cutoff=0.6)]
+    return f"Did you mean {close[0]!r}? " if close else ""
+
+
+# Integer arguments that are durations or counts: a negative value is never
+# meaningful, and at run time it silently became "expire at once".
+_NON_NEGATIVE_ARGS = ("timeoutMs", "delayMs", "durationMs", "maxSwipes", "chars")
+_COORDINATE_RANGES = {"latitude": (-90.0, 90.0), "longitude": (-180.0, 180.0)}
+_VAR_REF_RE = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*\}")
+
+
+def _check_coordinate(name: str, value, code: str, path: str,
+                      line: int, col: int, what: str) -> None:
+    low, high = _COORDINATE_RANGES[name]
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        _fail(code, f"{what} must be a number, got {value!r}", path, line, col)
+    if not low <= value <= high:
+        _fail(code, f"{what} {value:g} is outside {low:g}..{high:g}",
+              path, line, col,
+              hint="Latitude spans -90..90 and longitude -180..180 degrees.")
+
+
 def _coerce(scalar, kind: str, code: str, path: str, what: str):
     if not isinstance(scalar, Scalar):
         _fail(code, f"{what} must be a single value",
@@ -464,8 +499,18 @@ def _build_setup(node, path: str) -> dict:
         if key.text not in SETUP_FIELDS:
             _fail(code, f"unknown setup field {key.text!r}",
                   path, key.line, key.col,
-                  hint="Setup fields: " + ", ".join(SETUP_FIELDS) + ".")
+                  hint=did_you_mean(key.text, SETUP_FIELDS)
+                  + "Setup fields: " + ", ".join(SETUP_FIELDS) + ".")
         result[key.text] = _literal(value, code, path, f"setup.{key.text}")
+        if key.text == "location":
+            location = result["location"]
+            if (not isinstance(location, dict) or "latitude" not in location
+                    or "longitude" not in location):
+                _fail(code, "setup.location needs latitude and longitude",
+                      path, key.line, key.col)
+            for name in ("latitude", "longitude"):
+                _check_coordinate(name, location[name], code, path,
+                                  key.line, key.col, f"setup.location.{name}")
     return result
 
 
@@ -487,6 +532,10 @@ def build_selector(node, path: str, *, _anchor: bool = False) -> FlowSelector:
         name = key.text
         if name in SELECTOR_STRING_FIELDS:
             text = _coerce(value, "str", code, path, f"selector.{name}")
+            if not text:
+                _fail(code, f"selector.{name} is empty", path, value.line, value.col,
+                      hint="An empty string matches every node in contains "
+                           "mode and none in exact mode; name the element.")
             selector.fields[SELECTOR_STRING_FIELDS[name]] = text
             selector.source_fields[name] = text
         elif name in SELECTOR_BOOL_FIELDS:
@@ -497,7 +546,8 @@ def build_selector(node, path: str, *, _anchor: bool = False) -> FlowSelector:
             mode = _coerce(value, "str", code, path, "selector.match")
             if mode not in MATCH_MODES:
                 _fail(code, f"unknown match mode {mode!r}", path, value.line, value.col,
-                      hint="Match modes: " + ", ".join(sorted(MATCH_MODES)) + ".")
+                      hint=did_you_mean(mode, MATCH_MODES)
+                      + "Match modes: " + ", ".join(sorted(MATCH_MODES)) + ".")
             selector.match = mode
         elif name == "index":
             if _anchor:
@@ -521,11 +571,11 @@ def build_selector(node, path: str, *, _anchor: bool = False) -> FlowSelector:
             _fail(code, f"selector field {name!r} is not supported in Flow v1",
                   path, key.line, key.col, hint=SELECTOR_DEFERRED_FIELDS[name])
         else:
+            known = (list(SELECTOR_STRING_FIELDS) + list(SELECTOR_BOOL_FIELDS)
+                     + list(SELECTOR_RELATIONAL_FIELDS) + ["match", "index"])
             _fail(code, f"unknown selector field {name!r}", path, key.line, key.col,
-                  hint="Fields: " + ", ".join(list(SELECTOR_STRING_FIELDS)
-                                              + list(SELECTOR_BOOL_FIELDS)
-                                              + list(SELECTOR_RELATIONAL_FIELDS)
-                                              + ["match", "index"]) + ".")
+                  hint=did_you_mean(name, known)
+                  + "Fields: " + ", ".join(known) + ".")
     has_strings = bool(set(selector.fields) & set(SELECTOR_STRING_FIELDS.values()))
     if not has_strings and not selector.relations:
         what = "anchor" if _anchor else "selector"
@@ -536,7 +586,27 @@ def build_selector(node, path: str, *, _anchor: bool = False) -> FlowSelector:
     if _anchor and not has_strings:
         _fail(code, "anchor needs at least one of id, text, description, role",
               path, node.line, node.col)
+    if selector.match == "regex":
+        _check_patterns(selector, path)
     return selector
+
+
+def _check_patterns(selector: FlowSelector, path: str) -> None:
+    """Compile regex selector values now, not on the device.
+
+    A value that interpolates ``${VAR}`` is only known at run time and is
+    left to the engine; every literal pattern must compile here.
+    """
+    for name, text in selector.source_fields.items():
+        if not isinstance(text, str) or _VAR_REF_RE.search(text) or "$${" in text:
+            continue
+        try:
+            re.compile(text)
+        except re.error as exc:
+            _fail(errors.FLOW_SELECTOR_INVALID,
+                  f"selector.{name} is not a valid regular expression: {exc}",
+                  path, selector.line, selector.col,
+                  hint="Fix the pattern, or use match: contains for literal text.")
 
 
 # --- When clause -------------------------------------------------------------
@@ -564,8 +634,10 @@ def build_when(node, path: str) -> WhenClause:
             when.env_equals = _string_map(value, code, path, "when.envEquals")
         else:
             _fail(code, f"unknown when condition {name!r}", path, key.line, key.col,
-                  hint="Conditions: platform, visible, notVisible, envEquals "
-                       "(AND semantics).")
+                  hint=did_you_mean(name, ("platform", "visible", "notVisible",
+                                           "envEquals"))
+                  + "Conditions: platform, visible, notVisible, envEquals "
+                    "(AND semantics).")
     return when
 
 
@@ -578,7 +650,8 @@ def _unknown_command(name: str, path: str, line: int, col: int) -> None:
               f"command {name!r} is not part of Flow v1", path, line, col,
               hint=DEFERRED_COMMANDS[name])
     _fail(errors.FLOW_UNKNOWN_COMMAND, f"unknown command {name!r}", path, line, col,
-          hint="Commands: " + ", ".join(sorted(REGISTRY)) + ".")
+          hint=did_you_mean(name, REGISTRY)
+          + "Commands: " + ", ".join(sorted(REGISTRY)) + ".")
 
 
 def _apply_shorthand(spec: CommandSpec, scalar: Scalar, path: str) -> dict:
@@ -587,6 +660,12 @@ def _apply_shorthand(spec: CommandSpec, scalar: Scalar, path: str) -> dict:
               f"{spec.name} takes a mapping of arguments, not a single value",
               path, scalar.line, scalar.col)
     if spec.shorthand == "selector.text":
+        if not scalar.text:
+            _fail(errors.FLOW_SELECTOR_INVALID,
+                  f"{spec.name} shorthand text is empty", path,
+                  scalar.line, scalar.col,
+                  hint="An empty string matches every node in contains mode "
+                       "and none in exact mode; name the element.")
         return {"selector": FlowSelector(fields={"text": scalar.text},
                                          line=scalar.line, col=scalar.col,
                                          source_fields={"text": scalar.text})}
@@ -632,7 +711,8 @@ def build_step(item, path: str) -> Step:
         if arg is None:
             _fail(code, f"unknown argument {arg_name!r} for {name}",
                   path, arg_key.line, arg_key.col,
-                  hint="Arguments: " + ", ".join(a.name for a in spec.args) + ".")
+                  hint=did_you_mean(arg_name, by_name)
+                  + "Arguments: " + ", ".join(a.name for a in spec.args) + ".")
         if arg.kind == "selector":
             args[arg_name] = build_selector(arg_value, path)
         elif arg.kind == "env":
@@ -649,6 +729,12 @@ def build_step(item, path: str) -> Step:
                                           f"{name}.{arg_name}")
         else:
             coerced = _coerce(arg_value, arg.kind, code, path, f"{name}.{arg_name}")
+            if arg_name in _NON_NEGATIVE_ARGS and arg.kind == "int" and coerced < 0:
+                _fail(code, f"{name}.{arg_name} cannot be negative, got {coerced}",
+                      path, arg_value.line, arg_value.col)
+            if name == "setLocation" and arg_name in _COORDINATE_RANGES:
+                _check_coordinate(arg_name, coerced, code, path, arg_value.line,
+                                  arg_value.col, f"{name}.{arg_name}")
             if arg.choices and coerced not in arg.choices:
                 _fail(code, f"{name}.{arg_name} must be one of "
                             f"{', '.join(arg.choices)}",
@@ -682,9 +768,12 @@ def _finish_step(spec: CommandSpec, args: dict, key: Scalar, path: str) -> Step:
                   path, key.line, key.col)
         if not args.get("reason"):
             _fail(errors.FLOW_OPTIONAL_ASSERTION_FORBIDDEN,
-                  "optional steps must state a reason", path, key.line, key.col,
-                  hint="reason: documents why skipping this step cannot hide "
-                       "a real failure.")
+                  f"{spec.name} has optional: true but no reason: — an optional "
+                  "step must say why skipping it cannot hide a real failure",
+                  path, key.line, key.col,
+                  hint=f"Add `reason: <why this may be absent>` under {spec.name}, "
+                       "next to optional: true (e.g. reason: the cookie banner "
+                       "only shows on first launch).")
     if "when" in args and spec.name != "runFlow":
         _fail(code, "when is only supported on runFlow in v1",
               path, key.line, key.col)
@@ -809,7 +898,11 @@ def _build_evidence(node, path: str) -> Evidence:
                       path, value.line, value.col)
             evidence.bodies = bodies
         else:
-            _fail(code, f"unknown evidence field {name!r}", path, key.line, key.col)
+            _fail(code, f"unknown evidence field {name!r}", path, key.line, key.col,
+                  hint=did_you_mean(name, ("mode", "beforeMutation",
+                                           "afterAssertion", "collect", "bodies"))
+                  + "Evidence fields: mode, beforeMutation, afterAssertion, "
+                    "collect, bodies.")
     return evidence
 
 
@@ -839,7 +932,9 @@ def _build_requires(node, path: str, flow: Flow) -> None:
             flow.requires_capabilities = names
         else:
             _fail(code, f"unknown requires field {key.text!r}",
-                  path, key.line, key.col)
+                  path, key.line, key.col,
+                  hint=did_you_mean(key.text, ("platform", "capabilities"))
+                  + "Requires fields: platform, capabilities.")
 
 
 def _build_hook(node, path: str) -> list:
@@ -874,7 +969,8 @@ def build_flow(document: FlowDocument) -> Flow:
             continue
         if name not in HEADER_FIELDS:
             _fail(code, f"unknown header field {name!r}", path, key.line, key.col,
-                  hint="Header fields: " + ", ".join(HEADER_FIELDS) + ".")
+                  hint=did_you_mean(name, HEADER_FIELDS)
+                  + "Header fields: " + ", ".join(HEADER_FIELDS) + ".")
         if name == "appId":
             flow.app_id = _coerce(value, "str", code, path, "appId")
         elif name == "name":

@@ -69,8 +69,29 @@ def _rows(nodes: Iterable[dict[str, Any]]):
         yield structure, state
 
 
+def foreground_package(nodes: Iterable[dict[str, Any]]) -> str | None:
+    """The package most of the meaningful (non-system) nodes belong to.
+
+    A hierarchy dump is the foreground window, so this is the app actually
+    on screen — the Atlas uses it to keep another app's screens (a browser
+    opened from a link) out of this app's graph. None when nodes carry no
+    package at all.
+    """
+    counts: dict[str, int] = {}
+    for node in nodes:
+        package = node.get("package") or ""
+        if not package or any(package.startswith(system)
+                              for system in _SYSTEM_PACKAGES):
+            continue
+        counts[package] = counts.get(package, 0) + 1
+    if not counts:
+        return None
+    return max(counts, key=lambda name: counts[name])  # first seen wins ties
+
+
 def fingerprint(nodes: list[dict[str, Any]]) -> dict[str, Any]:
-    """-> {structure, state, labels} — hashes plus a human-readable handle.
+    """-> {structure, state, labels, package} — hashes plus a human-readable
+    handle and the foreground package (None when unknown).
 
     The structure hash collapses *consecutive same-shaped* rows (a list of 3
     and a list of 30 are the same screen); the state hash collapses only
@@ -100,4 +121,5 @@ def fingerprint(nodes: list[dict[str, Any]]) -> dict[str, Any]:
         "\n".join(states).encode("utf-8")).hexdigest()[:12]
     return {"structure": f"scr_{structure_hash}",
             "state": f"var_{state_hash}",
-            "labels": labels[:3]}
+            "labels": labels[:3],
+            "package": foreground_package(nodes)}

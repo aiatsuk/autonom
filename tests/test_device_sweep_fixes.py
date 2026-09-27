@@ -278,22 +278,50 @@ class LifecycleAnswerTests(SweepBase):
 
 
 class BiometricTests(SweepBase):
+    def _device(self, name: str, device_type: str) -> None:
+        self.set_state(simctl_devices={"devices": {
+            "com.apple.CoreSimulator.SimRuntime.iOS-26-0": [
+                {"udid": UDID, "name": name, "deviceTypeIdentifier": device_type,
+                 "state": "Booted", "isAvailable": True}]}})
+
     def test_ios_biometric_posts_darwin_notifications(self) -> None:
+        """The default fake device is an iPhone 17 Pro: a Face ID device, whose
+        Simulator menu listens on the `pearl` names, not `fingerTouch`."""
         for action, expected in (
             ("enroll", ["-s", "com.apple.BiometricKit.enrollmentChanged", "1",
                         "-p", "com.apple.BiometricKit.enrollmentChanged"]),
-            ("match", ["-p", "com.apple.BiometricKit_Sim.fingerTouch.match"]),
-            ("nonmatch", ["-p", "com.apple.BiometricKit_Sim.fingerTouch.nomatch"]),
+            ("match", ["-p", "com.apple.BiometricKit_Sim.pearl.match"]),
+            ("nonmatch", ["-p", "com.apple.BiometricKit_Sim.pearl.nomatch"]),
         ):
             with self.subTest(action=action):
                 code, payload = self.ios("simulator", "biometric", action)
                 self.assertEqual(code, 0, payload)
+                self.assertFalse(payload["verified"], "notifyutil cannot confirm a match")
                 argv = self.argv_log("simctl")[-1]
                 self.assertEqual(argv[:4], ["simctl", "spawn", UDID, "notifyutil"])
                 self.assertEqual(argv[4:], expected)
         code, payload = self.ios("simulator", "biometric", "wink")
         self.assertEqual(code, 2)
-        self.assertEqual(payload["error_code"], errors.FLOW_COMMAND_INVALID)
+        self.assertEqual(payload["error_code"], errors.INVALID_SIMULATOR_ACTION)
+        self.assertIn("match", payload["valid_actions"])
+
+    def test_touch_id_devices_get_the_finger_touch_names(self) -> None:
+        self._device("iPhone SE (3rd generation)",
+                     "com.apple.CoreSimulator.SimDeviceType.iPhone-SE-3rd-generation")
+        code, payload = self.ios("simulator", "biometric", "match")
+        self.assertEqual(code, 0, payload)
+        self.assertEqual(payload["biometry"], "touch")
+        self.assertEqual(self.argv_log("simctl")[-1][4:],
+                         ["-p", "com.apple.BiometricKit_Sim.fingerTouch.match"])
+
+    def test_an_unknown_device_type_gets_both_families(self) -> None:
+        self._device("Custom Sim", "com.example.SimDeviceType.Unknown")
+        code, payload = self.ios("simulator", "biometric", "nonmatch")
+        self.assertEqual(code, 0, payload)
+        self.assertEqual(payload["biometry"], "unknown")
+        posted = [argv[-1] for argv in self.argv_log("simctl") if "notifyutil" in argv]
+        self.assertEqual(posted, ["com.apple.BiometricKit_Sim.pearl.nomatch",
+                                  "com.apple.BiometricKit_Sim.fingerTouch.nomatch"])
 
 
 class IdbCompanionRetryTests(SweepBase):

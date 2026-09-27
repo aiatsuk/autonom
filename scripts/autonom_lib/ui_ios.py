@@ -13,8 +13,11 @@ TASK-2.0.1 probe rather than assumed.
 from __future__ import annotations
 
 import json
+import os
+import shutil
+import subprocess
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 from . import errors, ios_idb, ios_simctl
 from .platform import Target
@@ -247,19 +250,185 @@ def screen_size_from(payload: str | dict | list) -> tuple[int, int] | None:
     return (widest, tallest) if widest and tallest else None
 
 
-def tap(target: Target, x: int, y: int) -> None:
-    ios_idb.tap(target, x, y)
+# --- HID backend: idb or AXe ---------------------------------------------------
+#
+# idb_companion before 1.6.2 cannot load SimulatorKit on Xcode 27, so every
+# HID verb fails while the accessibility tree still works. AXe drives the same
+# simulator HID through its own FBSimulatorControl build and works there. The
+# tree stays on idb either way: only input is routed.
+#
+# AUTONOM_IOS_HID (or a ``ios_hid`` alias on the Target) selects the route:
+#   idb  - always idb;
+#   axe  - always AXe (missing AXe is an error);
+#   auto - idb, unless idb HID is known broken and AXe is available. "Known"
+#          is the doctor probe (only for a PATH-resolved idb; a pinned client
+#          may not pair with the companion on PATH) or, failing that, idb itself
+#          answering ios_hid_framework_missing — that failure happens before
+#          any event is delivered, so re-sending through AXe repeats nothing.
+
+HID_ENV = "AUTONOM_IOS_HID"
+AXE_ENV = "AUTONOM_AXE"
+HID_MODES = ("auto", "idb", "axe")
+AXE_INSTALL_HINT = "Install AXe: brew install cameroncooke/axe/axe (or set AUTONOM_AXE=/path/to/axe)."
+
+_hid_probe: dict[str, Any] | None = None
+_last_backend: str | None = None
 
 
-def swipe(target: Target, x1: int, y1: int, x2: int, y2: int, duration: float) -> None:
-    ios_idb.swipe(target, x1, y1, x2, y2, duration)
+def reset_hid_probe() -> None:
+    """Forget the per-process HID probe (tests, or after an upgrade)."""
+    global _hid_probe, _last_backend
+    _hid_probe = None
+    _last_backend = None
 
 
-def type_text(target: Target, text: str) -> None:
-    ios_idb.text(target, text)
+def last_backend() -> str | None:
+    """The backend the most recent HID verb in this process went through."""
+    return _last_backend
 
 
-def press_key(target: Target, key: str) -> None:
+def hid_mode(target: Target | None = None) -> str:
+    aliases = getattr(target, "aliases", None) or {}
+    mode = (aliases.get("ios_hid") or os.environ.get(HID_ENV) or "auto").strip().lower()
+    if mode not in HID_MODES:
+        raise errors.AutonomError(
+            errors.INVALID_VALUE,
+            f"{HID_ENV}={mode!r} is not a HID backend",
+            "Use one of: " + ", ".join(HID_MODES) + ".",
+        )
+    return mode
+
+
+def find_axe(target: Target | None = None) -> str | None:
+    """AXe client: a Target alias, else AUTONOM_AXE, else PATH. None if absent."""
+    aliases = getattr(target, "aliases", None) or {}
+    explicit = aliases.get("axe") or os.environ.get(AXE_ENV)
+    if explicit:
+        return explicit
+    return shutil.which("axe")
+
+
+def _idb_hid_ready() -> bool:
+    """Cached per process; only consulted for a PATH-resolved idb."""
+    global _hid_probe
+    if ios_idb.idb_is_overridden() or ios_idb.companion_endpoint():
+        return True
+    if _hid_probe is None:
+        try:
+            _hid_probe = ios_idb.hid_status()
+        except Exception:  # noqa: BLE001 - a probe must never block input
+            _hid_probe = {"ready": True}
+    return bool(_hid_probe.get("ready", True))
+
+
+def _mark_idb_hid_broken() -> None:
+    global _hid_probe
+    _hid_probe = {"ready": False, "reason": "idb answered ios_hid_framework_missing"}
+
+
+def hid_backend(target: Target) -> str:
+    """Which backend the next HID verb will use: ``idb`` or ``axe``."""
+    mode = hid_mode(target)
+    if mode == "idb":
+        return "idb"
+    axe = find_axe(target)
+    if mode == "axe":
+        if not axe:
+            raise errors.AutonomError(
+                errors.INVALID_VALUE,
+                f"{HID_ENV}=axe but no axe binary was found",
+                AXE_INSTALL_HINT,
+            )
+        return "axe"
+    if axe and not _idb_hid_ready():
+        return "axe"
+    return "idb"
+
+
+def run_axe(axe: str, args: list[str], *, udid: str, input_text: str | None = None,
+            timeout: float = 30) -> subprocess.CompletedProcess:
+    command = [axe, *args, "--udid", udid]
+    try:
+        completed = subprocess.run(
+            command, input=input_text, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            stdin=None if input_text is not None else subprocess.DEVNULL,
+            text=True, check=False, timeout=timeout,
+        )
+    except FileNotFoundError as exc:
+        raise errors.AutonomError(
+            errors.BACKEND_FAILED, f"axe not found at {axe}", AXE_INSTALL_HINT,
+            backend="axe",
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise errors.AutonomError(
+            errors.BACKEND_FAILED, f"axe {args[0]} timed out after {timeout:.0f}s",
+            "Check the simulator is booted with 'autonom devices'.",
+        ) from exc
+    if completed.returncode != 0:
+        raise errors.AutonomError(
+            errors.BACKEND_FAILED,
+            (completed.stderr or completed.stdout or "").strip()[-400:]
+            or f"axe {args[0]} failed ({completed.returncode})",
+            "Check 'axe list-simulators'; run 'autonom doctor' for the whole environment.",
+            backend="axe",
+        )
+    return completed
+
+
+def _dispatch(target: Target, via_idb: Callable[[], None], axe_args: list[str],
+              *, input_text: str | None = None) -> str:
+    global _last_backend
+    backend = hid_backend(target)
+    if backend == "idb":
+        try:
+            via_idb()
+        except errors.AutonomError as exc:
+            axe = find_axe(target)
+            if (exc.code != errors.IOS_HID_FRAMEWORK_MISSING or hid_mode(target) != "auto"
+                    or not axe):
+                raise
+            _mark_idb_hid_broken()
+            backend = "axe"
+        else:
+            _last_backend = "idb"
+            return "idb"
+    run_axe(find_axe(target) or "axe", axe_args, udid=target.target_id,
+            input_text=input_text)
+    _last_backend = backend
+    return backend
+
+
+def _seconds(value: float) -> str:
+    return f"{float(value):g}"
+
+
+def tap(target: Target, x: int, y: int, *, duration: float | None = None) -> str:
+    """Tap (or, with ``duration`` seconds, long-press). Returns the backend."""
+    if duration is not None:
+        axe_args = ["touch", "-x", str(x), "-y", str(y), "--down", "--up",
+                    "--delay", _seconds(duration)]
+    else:
+        axe_args = ["tap", "-x", str(x), "-y", str(y)]
+    return _dispatch(target, lambda: ios_idb.tap(target, x, y, duration=duration), axe_args)
+
+
+def swipe(target: Target, x1: int, y1: int, x2: int, y2: int, duration: float) -> str:
+    return _dispatch(
+        target,
+        lambda: ios_idb.swipe(target, x1, y1, x2, y2, duration),
+        ["swipe", "--start-x", str(x1), "--start-y", str(y1),
+         "--end-x", str(x2), "--end-y", str(y2), "--duration", _seconds(duration)],
+    )
+
+
+def type_text(target: Target, text: str) -> str:
+    # Through stdin, so text that starts with '-' is not read as a flag and
+    # the typed value never shows up in a process listing.
+    return _dispatch(target, lambda: ios_idb.text(target, text), ["type", "--stdin"],
+                     input_text=text)
+
+
+def press_key(target: Target, key: str) -> str:
     """Named hardware buttons, or a numeric HID keycode.
 
     Android `KEYCODE_*` names are rejected with the valid list rather than
@@ -268,11 +437,10 @@ def press_key(target: Target, key: str) -> None:
     """
     upper = key.upper()
     if upper in ios_idb.BUTTONS:
-        ios_idb.button(target, upper)
-        return
+        return _dispatch(target, lambda: ios_idb.button(target, upper),
+                         ["button", upper.lower().replace("_", "-")])
     if key.isdigit():
-        ios_idb.key(target, key)
-        return
+        return _dispatch(target, lambda: ios_idb.key(target, key), ["key", key])
     hint = "Valid iOS buttons: " + ", ".join(ios_idb.BUTTONS) + "; or a numeric HID keycode."
     if upper.startswith("KEYCODE_"):
         hint += (" iOS has no global Back button — tap the navigation bar's back control "

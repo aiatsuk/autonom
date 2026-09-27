@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import errno
 import json
 import os
 import shutil
@@ -13,6 +14,33 @@ import sys
 import time
 from pathlib import Path
 from typing import Any
+
+# docs/INSTALL.md states 3.11 (CI runs 3.11 and 3.14); the library uses 3.10+
+# constructs such as dataclass(slots=True), so an older interpreter died in an
+# import traceback before any envelope could be printed. Checked before the
+# library is imported, with the same stderr shape as every other failure.
+MIN_PYTHON = (3, 11)
+
+
+def _python_too_old(version: tuple[int, ...]) -> dict[str, Any] | None:
+    if tuple(version[:2]) >= MIN_PYTHON:
+        return None
+    found = ".".join(str(part) for part in version[:3])
+    wanted = ".".join(str(part) for part in MIN_PYTHON)
+    return {
+        "ok": False,
+        "error_code": "tool_missing",  # errors.TOOL_MISSING; not importable yet
+        "tool": "python3",
+        "error": f"Autonom needs Python >= {wanted}; this is Python {found}",
+        "hint": f"Run it with a newer interpreter, e.g. 'python3.{MIN_PYTHON[1]} "
+                "scripts/autonom.py ...' (see docs/INSTALL.md).",
+    }
+
+
+_TOO_OLD = _python_too_old(tuple(sys.version_info))
+if _TOO_OLD is not None:
+    print(json.dumps(_TOO_OLD), file=sys.stderr)
+    raise SystemExit(2)
 
 ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
@@ -72,6 +100,9 @@ from autonom_lib.atlas import graph as atlas_graph  # noqa: E402
 
 
 _LAST_EMIT: dict[str, Any] | None = None
+# The root parser of the running invocation: the journal resolves argv through
+# it (abbreviations, --flag=value, value positions) before scrubbing (SEC-002).
+_ROOT_PARSER: argparse.ArgumentParser | None = None
 
 
 def emit(data: Any, *, as_json: bool) -> int:
@@ -108,6 +139,99 @@ def _selectors(args: argparse.Namespace) -> dict[str, Any]:
         "role": getattr(args, "role", None),
         "clickable": getattr(args, "clickable", None),
         "enabled": getattr(args, "enabled", None),
+    }
+
+
+def _check_selector_regex(args: argparse.Namespace) -> None:
+    """`--mode regex` with a malformed pattern is the caller's mistake.
+
+    The selector engine reports it as `no_matching_node` (flows pin that), and
+    only once some node is compared at all; on the CLI a bad pattern is an
+    invalid value, refused before the device is asked for anything.
+    """
+    if getattr(args, "mode", None) != "regex":
+        return
+    for name, value in _selectors(args).items():
+        if not isinstance(value, str):
+            continue
+        try:
+            re.compile(value)
+        except re.error as exc:
+            raise errors.AutonomError(
+                errors.INVALID_VALUE,
+                f"invalid regular expression for --{name.replace('_', '-')}: {exc}",
+                "Fix the pattern (escape ( [ * with a backslash), or use "
+                "--mode contains.",
+            ) from exc
+
+
+def _not_writable(path: Path, flag: str, reason: str) -> errors.AutonomError:
+    return errors.AutonomError(
+        errors.OUTPUT_NOT_WRITABLE,
+        f"{flag} {path}: {reason}",
+        f"Pass a {flag} path in a directory you can write to.",
+        path=str(path),
+    )
+
+
+def _output_path(raw: str | Path, flag: str) -> Path:
+    """An output file the verb is about to write, checked before any effect.
+
+    A path whose directory is read-only (or is itself a directory) used to
+    surface as a PermissionError traceback after the device work was done.
+    An existing writable file — `/dev/null` included — is fine as it is.
+    """
+    path = Path(raw).expanduser()
+    if path.is_dir():
+        raise _not_writable(path, flag, "is a directory")
+    if path.exists():
+        if not os.access(path, os.W_OK):
+            raise _not_writable(path, flag, "permission denied")
+        return path
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise _not_writable(path, flag, exc.strerror or str(exc)) from exc
+    if not os.access(path.parent, os.W_OK):
+        raise _not_writable(path, flag, "directory is not writable")
+    return path
+
+
+def _output_dir(raw: str | Path, flag: str) -> Path:
+    """An output directory: created when missing, refused when unwritable."""
+    path = Path(raw).expanduser()
+    if path.exists() and not path.is_dir():
+        raise _not_writable(path, flag, "exists and is not a directory")
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise _not_writable(path, flag, exc.strerror or str(exc)) from exc
+    if not os.access(path, os.W_OK):
+        raise _not_writable(path, flag, "directory is not writable")
+    return path
+
+
+def _point(raw: str, flag: str) -> tuple[int, int]:
+    """`X,Y` as two integers; anything else is one clean invalid_value."""
+    parts = [part.strip() for part in str(raw).split(",")]
+    try:
+        if len(parts) != 2:
+            raise ValueError
+        return int(parts[0]), int(parts[1])
+    except ValueError:
+        raise errors.AutonomError(
+            errors.INVALID_VALUE,
+            f"{flag} takes X,Y (two integers), got {raw!r}",
+            f"Example: {flag} 200,400",
+        ) from None
+
+
+def _ignored_flag_warning(flag: str, platform: str, why: str) -> dict[str, str]:
+    """A flag that has no effect on this platform: said, never silently dropped."""
+    return {
+        "code": "flag_ignored_on_platform",
+        "error": f"{flag} has no effect on {platform} and was ignored",
+        "hint": why,
     }
 
 
@@ -210,8 +334,57 @@ def cmd_devices_shutdown(args: argparse.Namespace) -> int:
 # --- session -----------------------------------------------------------------
 
 
+def _session_target_gone(args: argparse.Namespace) -> bool:
+    """True only when the current session's target is confirmed absent: no
+    such adb device, no such simulator. Anything that cannot be checked (a
+    missing tool, no session) is not "gone"."""
+    tools = argparse.Namespace(adb=getattr(args, "adb", None),
+                               simctl=getattr(args, "simctl", None))
+    try:
+        target = _target(tools)
+        if target.platform == IOS:
+            return ios_simctl.find_simulator(target.tool, target.target_id) is None
+        return all(device.serial != target.target_id
+                   for device in adb_mod.list_devices(target.tool))
+    except errors.AutonomError:
+        return False
+
+
 def cmd_session_start(args: argparse.Namespace) -> int:
+    # One session per machine store: starting a second one silently replaced
+    # the current pointer and orphaned the first one's proxy and log stream.
+    current = session_mod.load_current()
+    if current:
+        target_id = current.get("target_id") or current.get("serial")
+        gone = _session_target_gone(args)
+        extra: dict[str, Any] = {"stale_target": True} if gone else {}
+        raise errors.AutonomError(
+            errors.SESSION_ALREADY_ACTIVE,
+            f"session {current.get('session_id')} is still active on "
+            f"{target_id}" + (" (no longer present)" if gone else ""),
+            f"Stop it first with 'autonom session stop' (it clears the session on "
+            f"{target_id} even if that target is gone), then start the new one.",
+            session_id=current.get("session_id"),
+            target_id=target_id,
+            **extra,
+        )
     target = platform_mod.resolve(args)
+    # Everything that can be refused is refused before the session exists.
+    install_path = Path(args.install).expanduser() if args.install else None
+    if install_path is not None and not install_path.exists():
+        raise errors.AutonomError(
+            errors.INSTALL_PATH_NOT_FOUND, f"package not found: {install_path}",
+            "Pass the path of an .apk (Android) or a built .app bundle (iOS).",
+        )
+    launch_id = None
+    if args.launch is not None:
+        launch_id = args.app_id or args.launch or None
+        if not launch_id:
+            raise errors.AutonomError(
+                errors.NO_TARGET,
+                "--launch requires --app-id or an explicit package id",
+                "Pass --app-id com.example.app, or --launch com.example.app.",
+            )
     tooling: dict[str, Any] = {}
     booted = False
 
@@ -242,42 +415,51 @@ def cmd_session_start(args: argparse.Namespace) -> int:
             "hint": "simctl-backed verbs (screenshot, logs, open, permissions) still work.",
         })
 
-    if args.install:
-        install_path = Path(args.install)
-        if target.platform == IOS:
-            ios_simctl.install(target.tool, target.target_id, install_path)
-        else:
-            if not install_path.exists():
-                raise errors.AutonomError(
-                    errors.INSTALL_PATH_NOT_FOUND, f"package not found: {install_path}"
-                )
-            session_mod.install_app(target.tool, target.target_id, install_path)
-        record["install_path"] = str(install_path.expanduser().resolve())
+    if getattr(args, "log_stream", False) and target.platform != IOS:
+        warnings.append(_ignored_flag_warning(
+            "--log-stream", target.platform,
+            "The background stream is iOS-only; on Android read logcat with "
+            "'autonom logs tail' or 'autonom logs follow --source device'."))
+    if args.activity and target.platform == IOS:
+        warnings.append(_ignored_flag_warning(
+            "--activity", target.platform,
+            "Activities are Android components; iOS launches by bundle id."))
 
-    if args.launch is not None:
-        app_id = args.app_id or args.launch or None
-        if not app_id:
-            raise errors.AutonomError(
-                errors.NO_TARGET,
-                "--launch requires --app-id or an explicit package id",
-                "Pass --app-id com.example.app, or --launch com.example.app.",
-            )
-        if target.platform == IOS:
-            ios_simctl.launch(target.tool, target.target_id, app_id)
-        else:
-            session_mod.launch_app(target.tool, target.target_id, app_id, activity=args.activity)
-        record["app_id"] = app_id
+    try:
+        if install_path is not None:
+            if target.platform == IOS:
+                ios_simctl.install(target.tool, target.target_id, install_path)
+            else:
+                session_mod.install_app(target.tool, target.target_id, install_path)
+            record["install_path"] = str(install_path.resolve())
 
-    if target.platform == IOS and getattr(args, "log_stream", False):
-        stream = session_mod.artifact_path(record, "logs", "stream.ndjson")
-        pid = logs_mod.start_log_stream(
-            target, stream, bundle_id=record.get("app_id")
-        )
-        record["background"]["log_stream_pid"] = pid
-        if pid:
-            session_mod.register_stream(
-                record, stream_id="log_stream", kind="device_log",
-                path="logs/stream.ndjson", label="ios log stream", pid=pid)
+        if launch_id:
+            if target.platform == IOS:
+                ios_simctl.launch(target.tool, target.target_id, launch_id)
+            else:
+                session_mod.launch_app(target.tool, target.target_id, launch_id,
+                                       activity=args.activity)
+            record["app_id"] = launch_id
+
+        if target.platform == IOS and getattr(args, "log_stream", False):
+            stream = session_mod.artifact_path(record, "logs", "stream.ndjson")
+            # bounded on disk (AUTONOM_IOS_LOG_MAX_MB) and filtered to the app
+            pid = ios_simctl.start_log_stream(
+                target.tool, target.target_id, stream, bundle_id=record.get("app_id"))
+            record["background"]["log_stream_pid"] = pid
+            if pid:
+                session_mod.register_stream(
+                    record, stream_id="log_stream", kind="device_log",
+                    path="logs/stream.ndjson", label="ios log stream", pid=pid)
+    except BaseException as exc:
+        # A failed install or launch must not leave a half-built session as
+        # "current": the next verb would silently drive it.
+        session_mod.terminate_pid((record.get("background") or {}).get("log_stream_pid"))
+        session_mod.save(record)
+        session_mod.stop_session()
+        if isinstance(exc, errors.AutonomError):
+            exc.extra.setdefault("session_rolled_back", record.get("session_id"))
+        raise
 
     session_mod.save(record)
     payload: dict[str, Any] = {"ok": True, "session": record}
@@ -288,7 +470,7 @@ def cmd_session_start(args: argparse.Namespace) -> int:
     return emit(payload, as_json=True)
 
 
-def cmd_session_stop(_: argparse.Namespace) -> int:
+def cmd_session_stop(args: argparse.Namespace) -> int:
     record = session_mod.load_current()
     if not record:
         raise errors.AutonomError(
@@ -298,11 +480,19 @@ def cmd_session_stop(_: argparse.Namespace) -> int:
         )
 
     background = record.get("background") or {}
+    # A session whose emulator was killed or simulator deleted must still be
+    # clearable, or every later `session start` is refused for good.
+    gone = _session_target_gone(args)
 
     def _detach() -> Any:
         if not (record.get("network") or {}).get("attached"):
             return {"was_attached": False}
         target = _target(argparse.Namespace())
+        if gone and target.platform == ANDROID:
+            # The proxy setting lived on the device, which is gone with it.
+            record.setdefault("network", {}).update(
+                {"attached": False, "device_proxy": None, "previous_http_proxy": None})
+            return {"was_attached": True, "skipped": "stale_target"}
         if target.platform == ANDROID:
             return device_proxy_android.detach(target, record)
         from autonom_lib.network import device_proxy_ios
@@ -320,7 +510,17 @@ def cmd_session_stop(_: argparse.Namespace) -> int:
     teardown = session_mod.run_teardown(actions)
 
     stopped = session_mod.stop_session()
-    payload = {"ok": True, "session": stopped, "teardown": teardown}
+    payload: dict[str, Any] = {"ok": True, "session": stopped, "teardown": teardown}
+    if gone:
+        target_id = record.get("target_id") or record.get("serial")
+        payload["stale_target"] = True
+        payload["warnings"] = [{
+            "code": "stale_target",
+            "error": f"the session's target {target_id} is no longer present; "
+                     "the session was cleared without device-side teardown",
+            "hint": "Pick a running target with 'autonom devices', then "
+                    "'autonom session start'.",
+        }]
     return emit(payload, as_json=True)
 
 
@@ -337,7 +537,12 @@ def cmd_session_show(_: argparse.Namespace) -> int:
 
 def cmd_session_launch(args: argparse.Namespace) -> int:
     target = _target(args)
+    warnings: list[dict[str, str]] = []
     if target.platform == IOS:
+        if args.activity:
+            warnings.append(_ignored_flag_warning(
+                "--activity", IOS, "Activities are Android components; iOS "
+                "launches by bundle id."))
         env = dict(pair.split("=", 1) for pair in (args.setenv or []) if "=" in pair)
         # When the session is attached to a proxy, launching without the proxy
         # environment would silently produce an uncaptured run.
@@ -352,16 +557,31 @@ def cmd_session_launch(args: argparse.Namespace) -> int:
         pid = ios_simctl.launch(
             target.tool, target.target_id, args.app_id, args=args.arg or [], env=env
         )
-        return emit({"ok": True, "launched": args.app_id, "pid": pid,
-                     "mode": "fresh" if getattr(args, "fresh", False) else "resume",
-                     **target.identity()}, as_json=True)
-    if getattr(args, "fresh", False) and not args.activity:
-        detail = session_mod.launch_app_fresh(target.tool, target.target_id, args.app_id)
-        return emit({"ok": True, "launched": args.app_id, **detail, **target.identity()},
-                    as_json=True)
-    session_mod.launch_app(target.tool, target.target_id, args.app_id, activity=args.activity)
-    return emit({"ok": True, "launched": args.app_id, "mode": "resume",
-                 **target.identity()}, as_json=True)
+        payload: dict[str, Any] = {
+            "ok": True, "launched": args.app_id, "pid": pid,
+            "mode": "fresh" if getattr(args, "fresh", False) else "resume",
+            **target.identity()}
+        if warnings:
+            payload["warnings"] = warnings
+        return emit(payload, as_json=True)
+    for flag, value in (("--arg", args.arg), ("--setenv", args.setenv)):
+        if value:
+            warnings.append(_ignored_flag_warning(
+                flag, ANDROID, "Launch arguments and environment are iOS "
+                "(simctl launch) only; Android starts the activity as declared."))
+    if getattr(args, "fresh", False):
+        # `--fresh --activity` used to fall back to a resume of that activity.
+        detail = session_mod.launch_app_fresh(target.tool, target.target_id, args.app_id,
+                                              activity=args.activity)
+        payload = {"ok": True, "launched": args.app_id, **detail, **target.identity()}
+    else:
+        session_mod.launch_app(target.tool, target.target_id, args.app_id,
+                               activity=args.activity)
+        payload = {"ok": True, "launched": args.app_id, "mode": "resume",
+                   **target.identity()}
+    if warnings:
+        payload["warnings"] = warnings
+    return emit(payload, as_json=True)
 
 
 def cmd_session_stop_app(args: argparse.Namespace) -> int:
@@ -379,8 +599,19 @@ def cmd_session_stop_app(args: argparse.Namespace) -> int:
 def cmd_session_clear(args: argparse.Namespace) -> int:
     target = _target(args)
     if target.platform == ANDROID:
-        session_mod.clear_data(target.tool, target.target_id, args.app_id)
-        return emit({"ok": True, "cleared": args.app_id, **target.identity()}, as_json=True)
+        try:
+            session_mod.clear_data(target.tool, target.target_id, args.app_id)
+        except errors.AutonomError as exc:
+            if not exc.hint:
+                exc.hint = (f"Check that {args.app_id} is installed ('adb shell pm list "
+                            "packages') and that the device is online ('autonom devices').")
+            raise
+        payload: dict[str, Any] = {"ok": True, "cleared": args.app_id, **target.identity()}
+        if args.strategy != "auto":
+            payload["warnings"] = [_ignored_flag_warning(
+                "--strategy", ANDROID, "Android clears app data with 'pm clear'; "
+                "the reinstall/privacy strategies are iOS-only.")]
+        return emit(payload, as_json=True)
 
     record = session_mod.load_current() or {}
     strategy = args.strategy
@@ -395,7 +626,7 @@ def cmd_session_clear(args: argparse.Namespace) -> int:
                 "Re-run 'session start --install <path>.app', or use "
                 "'session clear <bundle> --strategy privacy' to reset permissions only.",
             )
-        ios_simctl.uninstall(target.tool, target.target_id, args.app_id)
+        ios_simctl.uninstall(target.tool, target.target_id, args.app_id, check=True)
         ios_simctl.install(target.tool, target.target_id, Path(install_path))
         return emit(
             {"ok": True, "cleared": args.app_id, "strategy": "reinstall", **target.identity()},
@@ -424,21 +655,57 @@ def cmd_session_clear(args: argparse.Namespace) -> int:
 def cmd_session_uninstall(args: argparse.Namespace) -> int:
     target = _target(args)
     if target.platform == IOS:
-        ios_simctl.uninstall(target.tool, target.target_id, args.app_id)
+        # the simctl return code used to be dropped: every uninstall was ok
+        ios_simctl.uninstall(target.tool, target.target_id, args.app_id, check=True)
     else:
-        adb_mod.run_adb(target.tool, ["uninstall", args.app_id], serial=target.target_id, check=False)
+        completed = adb_mod.run_adb(target.tool, ["uninstall", args.app_id],
+                                    serial=target.target_id, check=False)
+        output = f"{completed.stdout or ''}\n{completed.stderr or ''}"
+        failure = next((line.strip() for line in output.splitlines()
+                        if line.strip().startswith("Failure")), None)
+        if completed.returncode != 0 or failure:
+            raise errors.AutonomError(
+                errors.BACKEND_FAILED,
+                failure or f"adb uninstall {args.app_id} failed ({completed.returncode})",
+                "DELETE_FAILED_INTERNAL_ERROR usually means the package is not "
+                "installed; check with 'adb shell pm list packages'.",
+                app_id=args.app_id,
+            )
     return emit({"ok": True, "uninstalled": args.app_id, **target.identity()}, as_json=True)
 
 
 # --- ui ----------------------------------------------------------------------
 
 
+def _read_dump(dump: str) -> str:
+    """An offline UI dump; a missing or unreadable file is one clean envelope."""
+    path = Path(dump).expanduser()
+    if not path.is_file():
+        raise errors.AutonomError(
+            errors.INVALID_VALUE, f"--dump {dump}: no such file",
+            "Pass a uiautomator XML or an idb describe-all JSON file.",
+            path=str(path),
+        )
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise errors.AutonomError(
+            errors.INVALID_VALUE, f"--dump {dump}: {exc}",
+            "Pass a readable UTF-8 uiautomator XML or idb describe-all JSON file.",
+            path=str(path),
+        ) from exc
+
+
+def _dump_platform(text: str) -> str:
+    return IOS if text.lstrip()[:1] in "{[" else ANDROID
+
+
 def _snapshot(args: argparse.Namespace) -> tuple[list[dict[str, Any]], str, str, Target | None]:
     """All on-screen nodes plus provenance: (nodes, source, target label, target)."""
     dump = getattr(args, "dump", None)
     if dump:
-        text = Path(dump).read_text(encoding="utf-8")
-        if text.lstrip()[:1] in "{[":
+        text = _read_dump(dump)
+        if _dump_platform(text) == IOS:
             from autonom_lib import ui_ios
 
             return ui_ios.parse_all(text), "file", dump, None
@@ -452,30 +719,41 @@ def _snapshot(args: argparse.Namespace) -> tuple[list[dict[str, Any]], str, str,
 def cmd_ui_tree(args: argparse.Namespace) -> int:
     dump = getattr(args, "dump", None)
     warnings: list[dict[str, Any]] = []
+    if args.max_nodes is not None and args.max_nodes < 1:
+        raise errors.AutonomError(
+            errors.INVALID_VALUE, f"--max-nodes must be >= 1, got {args.max_nodes}",
+            "Omit it for the default of 200.")
+    # one node past the limit is fetched, so `truncated` is exact: a screen of
+    # exactly --max-nodes nodes is complete, not cut
+    fetch = None if args.max_nodes is None else args.max_nodes + 1
     if dump:
-        text = Path(dump).read_text(encoding="utf-8")
-        if text.lstrip()[:1] in "{[":
+        text = _read_dump(dump)
+        if _dump_platform(text) == IOS:
             from autonom_lib import ui_ios
 
             nodes, warnings = ui_ios.parse_tree(
                 text, meaningful_only=not args.all, max_depth=args.max_depth,
-                max_nodes=args.max_nodes,
+                max_nodes=fetch,
             )
             identity = {"platform": IOS}
         else:
             nodes = ui_mod.parse_compact_tree(
                 text, meaningful_only=not args.all, max_depth=args.max_depth,
-                max_nodes=args.max_nodes,
+                max_nodes=fetch,
             )
             identity = {"platform": ANDROID}
+        nodes, truncated = ui_mod.clip(nodes, args.max_nodes)
         source, label, target = "file", dump, None
     else:
         target = _target(args)
-        nodes, warnings = ui_mod.tree(
-            target, meaningful_only=not args.all, max_depth=args.max_depth, max_nodes=args.max_nodes
+        nodes, warnings, truncated = ui_mod.tree_clipped(
+            target, meaningful_only=not args.all, max_depth=args.max_depth,
+            max_nodes=args.max_nodes,
         )
         source, label = "device", target.target_id
         identity = target.identity()
+    if getattr(args, "interactable", False):
+        nodes = ui_mod.interactable(nodes)
 
     payload: dict[str, Any] = {
         "ok": True,
@@ -487,7 +765,7 @@ def cmd_ui_tree(args: argparse.Namespace) -> int:
     }
     # `--max-nodes` used to cut the list silently; an agent reading 5 nodes
     # could not tell a 5-node screen from a 200-node one. Cheap and honest.
-    if args.max_nodes is not None and len(nodes) >= args.max_nodes:
+    if truncated:
         payload["truncated"] = True
     if not dump:
         # The coordinate space the bounds live in (pixels on Android, points
@@ -520,10 +798,53 @@ def cmd_ui_tree(args: argparse.Namespace) -> int:
             blob, encoding="utf-8"
         )
         payload["saved"] = str(history)
+    if getattr(args, "format", "json") == "outline":
+        # One line per node for a token-cheap read; the saved history above
+        # keeps the full nodes, the printed envelope carries the outline.
+        payload["format"] = "outline"
+        payload["outline"] = ui_mod.outline(nodes)
+        payload.pop("nodes", None)
     return emit(payload, as_json=True)
 
 
+def cmd_ui_wait(args: argparse.Namespace) -> int:
+    """`ui wait --settled`: poll until the tree stops changing, bounded.
+
+    Mirrors the other bounded checks (`flow fmt --check`, `doctor --strict`):
+    the report is on stdout either way, and a screen that never settled
+    within --timeout-ms exits 1 with `settled: false`.
+    """
+    if not args.settled:
+        raise errors.AutonomError(
+            errors.USAGE_ERROR, "ui wait needs a condition",
+            "Pass --settled (wait until two consecutive trees match).")
+    for flag, value in (("--timeout-ms", args.timeout_ms), ("--quiet-ms", args.quiet_ms)):
+        if value < 0:
+            raise errors.AutonomError(
+                errors.INVALID_VALUE, f"{flag} must be >= 0, got {value}",
+                "Pass a duration in milliseconds.")
+    target = _target(args)
+    result = ui_mod.settle(target, timeout_ms=args.timeout_ms, quiet_ms=args.quiet_ms)
+    payload: dict[str, Any] = {"ok": bool(result["settled"]), **result,
+                               "timeout_ms": args.timeout_ms, "quiet_ms": args.quiet_ms,
+                               **target.identity()}
+    if not result["settled"]:
+        payload["warnings"] = [{
+            "code": "screen_not_settled",
+            "error": f"the tree was still changing after {args.timeout_ms} ms "
+                     f"({result['changes']} change(s) over {result['snapshots']} snapshots)",
+            "hint": "An animation, spinner or loading list keeps it moving; raise "
+                    "--timeout-ms, or wait for a specific node with 'ui find'.",
+        }]
+    emit(payload, as_json=True)
+    return 0 if result["settled"] else 1
+
+
 def cmd_note_add(args: argparse.Namespace) -> int:
+    if not (args.text or "").strip():
+        raise errors.AutonomError(
+            errors.INVALID_VALUE, "an empty note records nothing",
+            "Write what you observed or concluded: autonom note add \"...\".")
     session = session_mod.require_current()
     entry = journal_mod.note(
         session, args.text, task=getattr(args, "task", None),
@@ -572,10 +893,27 @@ def cmd_session_outputs(args: argparse.Namespace) -> int:
                  "count": len(streams), "streams": streams}, as_json=True)
 
 
+def _logcat_start(adb: str, serial: str) -> list[str]:
+    """`-T <device epoch>`: start at the device's *now*, not the whole buffer.
+
+    Without it `logs follow --source device` replayed thousands of stale
+    lines before the first new one (CLI-009). The device clock is used, not
+    the host's — an emulator that outlived a host sleep lags by seconds.
+    `-T 1` (only the newest buffered line) is the fallback when the device
+    clock cannot be read.
+    """
+    completed = adb_mod.run_adb(adb, ["shell", "date", "+%s"], serial=serial,
+                                timeout=10, check=False)
+    epoch = (completed.stdout or "").strip()
+    return ["-T", f"{epoch}.000" if epoch.isdigit() else "1"]
+
+
 def _follow_device(args: argparse.Namespace) -> dict[str, Any]:
     target = _target(args)
     if target.platform == ANDROID:
         argv = [target.tool, "-s", target.target_id, "logcat", "-v", "time"]
+        if not args.from_start:
+            argv += _logcat_start(target.tool, target.target_id)
         if args.package:
             pid = logs_mod.pid_for_package(
                 target.tool, target.target_id, args.package)
@@ -634,6 +972,10 @@ def cmd_logs_follow(args: argparse.Namespace) -> int:
     elif args.source:
         path = follow_mod.resolve_source(record, args.source)
         source = args.source
+    elif follow_mod.default_source(record):
+        # the session's only device-log stream: nothing to choose between
+        source = follow_mod.default_source(record)
+        path = follow_mod.resolve_source(record, source)
     else:
         raise errors.AutonomError(
             errors.STREAM_NOT_FOUND,
@@ -648,7 +990,9 @@ def cmd_logs_follow(args: argparse.Namespace) -> int:
 
 
 def cmd_journal(args: argparse.Namespace) -> int:
-    session = session_mod.load_current()
+    # --session-id reads a finished session's journal, with or without --follow
+    session = (_session_by_id(args.session_id) if getattr(args, "session_id", None)
+               else session_mod.load_current())
     if getattr(args, "follow", False):
         record = _observed_session(args)
         return _finish_stream(follow_mod.follow_file(
@@ -670,6 +1014,8 @@ def cmd_journal(args: argparse.Namespace) -> int:
 
 
 def cmd_ui_find(args: argparse.Namespace) -> int:
+    ui_mod.require_selector(_selectors(args))
+    _check_selector_regex(args)
     nodes, source, label, target = _snapshot(args)
     matches = selector_mod.select(
         nodes,
@@ -705,18 +1051,55 @@ def cmd_ui_find(args: argparse.Namespace) -> int:
             "error": "no element on this screen exposes an identifier",
             "hint": "Select by --text or --desc instead.",
         }]
+    if not matches:
+        platform = (target.platform if target else
+                    _dump_platform(_read_dump(args.dump)) if getattr(args, "dump", None)
+                    else None)
+        hint = ui_mod.no_match_hint(platform or "", nodes, _selectors(args),
+                                    mode=args.mode, case_sensitive=args.case_sensitive)
+        if hint:
+            payload.setdefault("warnings", []).append({
+                "code": "label_is_in_desc",
+                "error": "--text matched nothing, but the same value matches desc",
+                "hint": hint,
+            })
     return emit(payload, as_json=True)
 
 
+def _backend(returned: Any) -> str | None:
+    """Which backend delivered the input: the ui_mod return value, else what
+    ui_ios recorded for the last HID verb (None when nothing reported one)."""
+    if isinstance(returned, str) and returned:
+        return returned
+    from autonom_lib import ui_ios
+
+    return ui_ios.last_backend()
+
+
 def cmd_ui_tap(args: argparse.Namespace) -> int:
+    has_selector = any(value is not None for value in _selectors(args).values())
+    has_x, has_y = args.x is not None, args.y is not None
+    if has_selector and (has_x or has_y):
+        raise errors.AutonomError(
+            errors.USAGE_ERROR,
+            "ui tap takes a selector or --x/--y, not both",
+            "Tap a node by --desc/--text/--resource-id, or a point by --x and --y.",
+        )
+    if has_x != has_y:
+        raise errors.AutonomError(
+            errors.USAGE_ERROR,
+            "--x and --y go together",
+            "Pass both --x and --y for a point, or a selector for a node.",
+        )
+    _check_selector_regex(args)
     target = _target(args)
     ref = None
     node = None
     nodes: list[dict[str, Any]] = []
-    if args.x is not None and args.y is not None:
+    if has_x and has_y:
         x, y = args.x, args.y
     else:
-        if not any(value is not None for value in _selectors(args).values()):
+        if not has_selector:
             # An empty selector matches every node, which used to surface as
             # "ambiguous_selector: matched 78 nodes" — true, but not the point.
             raise errors.AutonomError(
@@ -734,19 +1117,18 @@ def cmd_ui_tap(args: argparse.Namespace) -> int:
             index=args.index,
         )
         if not matches:
-            raise errors.AutonomError(
-                errors.NO_MATCHING_NODE,
-                "no matching node to tap",
-                "Run 'autonom ui tree' to see what is on screen.",
-            )
+            # carries the iOS "the label is in desc" hint when it applies
+            raise ui_mod.no_match_error(
+                target.platform, nodes, _selectors(args), mode=args.mode,
+                case_sensitive=args.case_sensitive, message="no matching node to tap")
         node = matches[0]
         x, y = ui_mod.center_of(node)
         ref = node.get("ref")
     duration = getattr(args, "duration", None)
     if duration:
-        ui_mod.long_press(target, x, y, duration)
+        backend = _backend(ui_mod.long_press(target, x, y, duration))
     else:
-        ui_mod.tap(target, x, y)
+        backend = _backend(ui_mod.tap(target, x, y))
     detail = actions_mod.record_detail(session_mod.load_current(), "tap", {
         "kind": "tap",
         "coordinate": node is None,
@@ -761,6 +1143,8 @@ def cmd_ui_tap(args: argparse.Namespace) -> int:
         "nodes": nodes,
     })
     payload: dict[str, Any] = {"ok": True, "x": x, "y": y, "ref": ref}
+    if backend:
+        payload["backend"] = backend
     if duration:
         payload["duration_ms"] = duration
     if detail:
@@ -769,14 +1153,15 @@ def cmd_ui_tap(args: argparse.Namespace) -> int:
 
 
 def cmd_ui_swipe(args: argparse.Namespace) -> int:
+    x1, y1 = _point(args.start, "--from")
+    x2, y2 = _point(args.end, "--to")
     target = _target(args)
-    x1, y1 = (int(part) for part in args.start.split(","))
-    x2, y2 = (int(part) for part in args.end.split(","))
-    ui_mod.swipe(target, x1, y1, x2, y2, args.duration)
-    return emit(
-        {"ok": True, "from": [x1, y1], "to": [x2, y2], "duration": args.duration, **target.identity()},
-        as_json=True,
-    )
+    backend = _backend(ui_mod.swipe(target, x1, y1, x2, y2, args.duration))
+    payload: dict[str, Any] = {"ok": True, "from": [x1, y1], "to": [x2, y2],
+                               "duration": args.duration}
+    if backend:
+        payload["backend"] = backend
+    return emit({**payload, **target.identity()}, as_json=True)
 
 
 def cmd_ui_gesture(args: argparse.Namespace) -> int:
@@ -787,7 +1172,7 @@ def cmd_ui_gesture(args: argparse.Namespace) -> int:
             raise errors.AutonomError(
                 errors.INVALID_COORDINATES, "pinch requires --at X,Y", "Example: --at 200,400"
             )
-        x, y = (int(part) for part in args.at.split(","))
+        x, y = _point(args.at, "--at")
         kwargs = {"x": x, "y": y, "scale": args.scale}
     ui_mod.gesture(target, args.gesture, **kwargs)
     return emit({"ok": True, "gesture": args.gesture, **target.identity()}, as_json=True)
@@ -813,7 +1198,7 @@ def cmd_ui_type(args: argparse.Namespace) -> int:
                 "hint": "Tap the field first (ui tap), wait for it to appear, then "
                         "type; confirm with ui find on the typed text.",
             }
-    ui_mod.type_text(target, args.text)
+    backend = _backend(ui_mod.type_text(target, args.text))
     sensitive = bool(getattr(args, "sensitive", False))
     detail = actions_mod.record_detail(session_mod.load_current(), "type", {
         "kind": "type",
@@ -828,6 +1213,8 @@ def cmd_ui_type(args: argparse.Namespace) -> int:
     if sensitive:
         payload["typed"] = f"<{len(args.text)} chars>"
         payload["sensitive"] = True
+    if backend:
+        payload["backend"] = backend
     if detail:
         payload["detail"] = detail
     if focused is not None:
@@ -843,26 +1230,56 @@ def cmd_ui_type(args: argparse.Namespace) -> int:
 
 def cmd_ui_key(args: argparse.Namespace) -> int:
     target = _target(args)
-    ui_mod.press_key(target, args.keycode)
-    return emit({"ok": True, "keycode": args.keycode, **target.identity()}, as_json=True)
+    backend = _backend(ui_mod.press_key(target, args.keycode))
+    payload: dict[str, Any] = {"ok": True, "keycode": args.keycode}
+    if backend:
+        payload["backend"] = backend
+    return emit({**payload, **target.identity()}, as_json=True)
 
 
 # --- evidence ----------------------------------------------------------------
 
 
 def cmd_screenshot(args: argparse.Namespace) -> int:
+    out = _output_path(args.out, "--out") if args.out else None
     target = _target(args)
+    # A live Android status-bar pin drifts within a minute; re-send it so
+    # before/after frames show the same bar.
+    repin = simulator_mod.repin_before_capture(target)
     detail = shot_mod.capture_evidence(
         target,
         session_mod.load_current(),
         label=getattr(args, "label", None),
         task=getattr(args, "task", None),
-        out=Path(args.out) if args.out else None,
+        out=out,
     )
-    return emit({"ok": True, **detail, **target.identity()}, as_json=True)
+    payload: dict[str, Any] = {"ok": True, **detail}
+    if repin is not None:
+        payload["repinned"] = repin["repinned"]
+        payload["repinned_controls"] = repin["controls"]
+        if repin.get("repin_error"):
+            payload.setdefault("warnings", []).append({
+                "code": errors.SIGNAL_UNSTABLE, "error": repin["repin_error"],
+                "hint": "The status-bar pin could not be re-sent before this "
+                        "capture; re-run 'simulator status-bar pin'."})
+        if repin.get("stale_pin_dropped"):
+            payload["stale_pin_dropped"] = True
+            payload.setdefault("warnings", []).append({
+                "code": "stale_pin_dropped",
+                "error": "a status-bar pin recorded for another device (or an earlier "
+                         "boot) on this serial was dropped, not replayed",
+                "hint": "Run 'simulator status-bar pin' on this device if the capture "
+                        "needs a deterministic bar."})
+    return emit({**payload, **target.identity()}, as_json=True)
 
 
 def cmd_shots_list(args: argparse.Namespace) -> int:
+    limit = getattr(args, "max", 50)
+    if limit is None or limit < 0:
+        raise errors.AutonomError(
+            errors.INVALID_VALUE, f"--max must be >= 0, got {limit}",
+            "Pass the number of most recent shots to list (0 lists none, "
+            "total_matched still counts them).")
     record = session_mod.require_current()
     entries = shot_mod.load_index(record)
     if getattr(args, "task", None):
@@ -875,15 +1292,26 @@ def cmd_shots_list(args: argparse.Namespace) -> int:
     if getattr(args, "mocked_only", False):
         entries = [e for e in entries if e.get("mocks_active")]
     total = len(entries)
-    limit = getattr(args, "max", 50) or 50
-    return emit({"ok": True, "count": min(total, limit), "total_matched": total,
-                 "truncated": total > limit, "shots": entries[-limit:],
+    shown = entries[-limit:] if limit else []
+    return emit({"ok": True, "count": len(shown), "total_matched": total,
+                 "truncated": total > len(shown), "shots": shown,
                  "index": str(shot_mod.index_path(record))}, as_json=True)
 
 
 def cmd_shots_show(args: argparse.Namespace) -> int:
     """Read the metadata back out of the PNG itself."""
     path = Path(args.path).expanduser()
+    if not path.is_absolute():
+        # `shots list` names each shot by its path inside the session
+        # artifacts dir; that is what an agent pastes back here.
+        record = session_mod.load_current()
+        if record and record.get("artifacts_dir"):
+            try:
+                inside = follow_mod.confine(Path(record["artifacts_dir"]), str(path))
+            except errors.AutonomError:
+                inside = None  # escapes the session: read it as cwd-relative
+            if inside is not None and inside.exists():
+                path = inside
     if not path.exists():
         raise errors.AutonomError(
             errors.BODY_FILE_NOT_FOUND, f"no such file: {path}",
@@ -930,6 +1358,11 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     """Always exits 0 unless --strict: a diagnostic that fails is useless in a pipe."""
     report = doctor_mod.collect(args)
     healthy = doctor_mod.is_healthy(report)
+    if args.strict and not healthy:
+        # a strict failure must read as one in the JSON too, not only the exit
+        report["ok"] = False
+        report["strict_failures"] = sorted(
+            name for name, entry in report["tools"].items() if entry.get("state") != "ok")
     emit(report, as_json=True)
     return 0 if (healthy or not args.strict) else 1
 
@@ -1000,6 +1433,15 @@ def cmd_metrics_snapshot(args: argparse.Namespace) -> int:
 
 
 def cmd_metrics_series(args: argparse.Namespace) -> int:
+    if args.count < 1:
+        raise errors.AutonomError(
+            errors.INVALID_VALUE, f"--count must be >= 1, got {args.count}",
+            "A series needs at least one snapshot.")
+    if args.interval < 0:
+        # 0 is allowed and pinned by callers: back-to-back snapshots
+        raise errors.AutonomError(
+            errors.INVALID_VALUE, f"--interval must be >= 0 seconds, got {args.interval}",
+            "Pass the pause between snapshots, e.g. --interval 2.")
     label = _safe_label(args.label or "series")
     if args.from_dir:
         samples = metrics_series.from_dir(Path(args.from_dir), args.glob)
@@ -1254,9 +1696,10 @@ def cmd_file_ls(args: argparse.Namespace) -> int:
 
 
 def cmd_file_pull(args: argparse.Namespace) -> int:
+    out = _output_path(args.out, "--out") if args.out else None
     target = _target(args)
-    if args.out:
-        destination = Path(args.out)
+    if out is not None:
+        destination = out
     else:
         current = session_mod.require_current()
         destination = session_mod.artifact_path(
@@ -1266,7 +1709,18 @@ def cmd_file_pull(args: argparse.Namespace) -> int:
     return emit({"ok": True, **detail, **target.identity()}, as_json=True)
 
 
+_RECORDING_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+
+
 def cmd_record_start(args: argparse.Namespace) -> int:
+    # the name becomes <artifacts>/recordings/<name>.mp4: never a path
+    if not _RECORDING_NAME.fullmatch(args.name or "") or ".." in args.name:
+        raise errors.AutonomError(
+            errors.INVALID_VALUE,
+            f"--name {args.name!r} is not a plain file name",
+            "Use letters, digits, '.', '_' or '-' (no '/' and no '..'), "
+            "e.g. --name login-flow.",
+        )
     target = _target(args)
     record = session_mod.require_current()
     if session_mod.pid_alive((record.get("background") or {}).get("recorder_pid")):
@@ -1339,8 +1793,12 @@ def cmd_network_start(args: argparse.Namespace) -> int:
     if ca:
         payload["ca_certificate"] = str(ca)
 
-    warnings: list[dict[str, str]] = []
-    if args.capture_bodies:
+    # The library's own warnings (proxy_already_running with different
+    # settings) used to be overwritten by the list below.
+    warnings: list[dict[str, str]] = list(state.get("warnings") or [])
+    # What is actually being captured decides the warning, not what was asked:
+    # an already-running proxy keeps its own --capture-bodies setting.
+    if state.get("capture_bodies", args.capture_bodies):
         warnings.append({
             "code": "full_body_capture_enabled",
             "error": "full request and response bodies are being written to disk",
@@ -1420,8 +1878,13 @@ def cmd_network_status(args: argparse.Namespace) -> int:
             else:
                 attached, evidence = "unknown", "no_traffic_and_no_readable_setting"
 
-    payload["attached"] = attached
+    payload["attached"] = attached  # value types unchanged: bool or "unknown"
     payload["evidence"] = evidence
+    # how far the attach got, independent of whether traffic was observed
+    payload["attach_state"] = (
+        network.get("attach_state")
+        or ("manual" if network.get("platform_manual")
+            else "automated" if network.get("attached") else "not_attached"))
     payload["recent_flow_count"] = len(
         store_mod.filter_flows(store_mod.read_all(record)[0], since_seconds=60)
     )
@@ -1583,13 +2046,13 @@ def cmd_network_requests_show(args: argparse.Namespace) -> int:
 
 def cmd_network_export(args: argparse.Namespace) -> int:
     record = session_mod.require_current()
+    destination = Path(args.har).expanduser()
+    if not destination.is_absolute():
+        destination = Path(record["artifacts_dir"]) / destination
+    destination = _output_path(destination, "--har")
     flows, warnings = store_mod.read_all(record)
     state = proxy_mod.status(record)
     document = har_mod.build(flows, bodies_captured=bool(state.get("capture_bodies")))
-    destination = Path(args.har)
-    if not destination.is_absolute():
-        destination = Path(record["artifacts_dir"]) / destination
-    destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(json.dumps(document, indent=2, ensure_ascii=False) + "\n",
                            encoding="utf-8")
     payload: dict[str, Any] = {"ok": True, "path": str(destination),
@@ -1600,13 +2063,9 @@ def cmd_network_export(args: argparse.Namespace) -> int:
 
 
 def _mock_headers(args: argparse.Namespace) -> dict[str, str] | None:
-    """`--header 'Name: value'`, repeatable. None when the flag was not used."""
-    if not getattr(args, "header", None):
-        return None
-    return dict(
-        (part.split(":", 1)[0].strip(), part.split(":", 1)[1].strip())
-        for part in args.header if ":" in part
-    )
+    """`--header 'Name: value'`, repeatable. None when the flag was not used;
+    a malformed header is refused rather than silently dropped."""
+    return mocks_mod.parse_header_args(getattr(args, "header", None))
 
 
 def _mock_body(args: argparse.Namespace) -> tuple[Path | None, str | None]:
@@ -1687,12 +2146,7 @@ def _annotate_hits(rules: list[dict[str, Any]]) -> list[dict[str, str]]:
 
 def cmd_network_mock_add(args: argparse.Namespace) -> int:
     selector = _mock_selector(args)
-    if not selector.get("url_glob"):
-        raise errors.AutonomError(
-            errors.MOCK_NOT_FOUND,
-            "no target given",
-            "Pass --url <full URL> or --match <glob>.",
-        )
+    mocks_mod.require_target(selector.get("url_glob"))
     body_file, body_text = _mock_body(args)
     default_headers = {}
     if body_text is not None and body_text.lstrip()[:1] in "{[":
@@ -1787,9 +2241,14 @@ def _flow_summary(flow) -> dict[str, Any]:
     }
 
 
-def _flow_files(path: Path) -> list[Path]:
+def _flow_files(path: Path, warnings: list[dict[str, Any]] | None = None) -> list[Path]:
+    """Flow files under `path`; `warnings` (when given) receives one entry for
+    the files discovery skipped because their header names another schema."""
     if path.is_dir():
-        files = flow_validator.discover(path)
+        files, skipped = flow_validator.discover_with_skipped(path)
+        skipped_note = flow_validator.skipped_warning(skipped)
+        if skipped_note is not None and warnings is not None:
+            warnings.append(skipped_note)
         if not files:
             raise errors.AutonomError(
                 errors.FLOW_NO_FLOWS_FOUND,
@@ -1802,7 +2261,8 @@ def _flow_files(path: Path) -> list[Path]:
 
 def cmd_flow_check(args: argparse.Namespace) -> int:
     path = Path(args.path)
-    files = _flow_files(path)
+    warnings: list[dict[str, Any]] = []
+    files = _flow_files(path, warnings)
     flows: list[dict[str, Any]] = []
     problems: list[dict[str, Any]] = []
     for file in files:
@@ -1818,21 +2278,48 @@ def cmd_flow_check(args: argparse.Namespace) -> int:
             f"{len(problems)} of {len(files)} flow files failed validation",
             hint="Each entry in 'errors' carries file, line, and column.",
             errors=problems, checked=len(files),
+            **({"warnings": warnings} if warnings else {}),
         )
-    return emit({"ok": True, "checked": len(files), "flows": flows}, as_json=True)
+    payload: dict[str, Any] = {"ok": True, "checked": len(files), "flows": flows}
+    if warnings:
+        payload["warnings"] = warnings
+    return emit(payload, as_json=True)
 
 
 def cmd_flow_fmt(args: argparse.Namespace) -> int:
     path = Path(args.path)
     files = _flow_files(path)
-    results: list[dict[str, Any]] = []
-    changed_any = False
+    drop_comments = bool(getattr(args, "drop_comments", False))
+    prepared = []
+    refused: list[dict[str, Any]] = []
     for file in files:
         flow = flow_validator.load_flow(file)
         canonical_text = flow_canonical.emit_flow(flow)
         original = file.read_text(encoding="utf-8")
+        lost = flow_canonical.lost_comments(original, canonical_text)
+        prepared.append((file, flow, canonical_text, original, lost))
+        if (args.write and lost and not drop_comments
+                and canonical_text != original and not flow.converted_from):
+            refused.append({"file": str(file), "comments": len(lost),
+                            "first_line": lost[0].get("line")})
+    if refused:
+        # Checked for every file before any is written: a directory run never
+        # leaves half the suite rewritten and half refused.
+        raise errors.AutonomError(
+            errors.COMMENTS_WOULD_BE_LOST,
+            f"{sum(item['comments'] for item in refused)} comment(s) in "
+            f"{len(refused)} file(s) would be dropped by the canonical format",
+            "Canonical output carries no comments. Move them into 'description:' "
+            "or step labels, or pass --drop-comments to rewrite anyway.",
+            files=refused,
+        )
+    results: list[dict[str, Any]] = []
+    changed_any = False
+    for file, flow, canonical_text, original, lost in prepared:
         changed = canonical_text != original
         entry: dict[str, Any] = {"file": str(file), "changed": changed}
+        if lost:
+            entry["comments_lost"] = len(lost)
         if flow.converted_from:
             entry["converted_from"] = flow.converted_from
         if changed and args.diff:
@@ -1868,7 +2355,8 @@ def cmd_flow_list(args: argparse.Namespace) -> int:
             errors.FLOW_NO_FLOWS_FOUND, f"no flow directory at {base}",
             hint="Pass a directory or file path, or create .autonom/flows.",
         )
-    files = _flow_files(base)
+    warnings: list[dict[str, Any]] = []
+    files = _flow_files(base, warnings)
     flows: list[dict[str, Any]] = []
     invalid: list[dict[str, Any]] = []
     for file in files:
@@ -1880,6 +2368,8 @@ def cmd_flow_list(args: argparse.Namespace) -> int:
     payload: dict[str, Any] = {"ok": True, "count": len(flows), "flows": flows}
     if invalid:
         payload["invalid"] = invalid
+    if warnings:
+        payload["warnings"] = warnings
     return emit(payload, as_json=True)
 
 
@@ -1919,8 +2409,7 @@ def cmd_flow_create(args: argparse.Namespace) -> int:
         **report,
     }
     if args.out:
-        out = Path(args.out)
-        out.parent.mkdir(parents=True, exist_ok=True)
+        out = _output_path(args.out, "--out")
         out.write_text(text, encoding="utf-8")
         payload["out"] = args.out
         secrets = " ".join(f"--secret {name}"
@@ -1943,7 +2432,7 @@ def cmd_flow_import(args: argparse.Namespace) -> int:
         path.read_text(encoding="utf-8"), str(path))
     payload: dict[str, Any] = {"ok": True, "imported": str(path)}
     if args.out:
-        Path(args.out).write_text(canonical_text, encoding="utf-8")
+        _output_path(args.out, "--out").write_text(canonical_text, encoding="utf-8")
         payload["out"] = args.out
     else:
         payload["canonical"] = canonical_text
@@ -1957,7 +2446,7 @@ def cmd_flow_export(args: argparse.Namespace) -> int:
     payload: dict[str, Any] = {"ok": True, "exported": str(path),
                                "format": args.format}
     if args.out:
-        Path(args.out).write_text(exported, encoding="utf-8")
+        _output_path(args.out, "--out").write_text(exported, encoding="utf-8")
         payload["out"] = args.out
     else:
         payload["maestro"] = exported
@@ -1992,12 +2481,85 @@ def _flow_secrets(args: argparse.Namespace) -> dict[str, str]:
     return secrets
 
 
+_COMPOSITE = ("runFlow", "group", "retry", "repeat")
+
+
+def _plan_steps(flow) -> list[dict[str, Any]]:
+    """What a run would execute, numbered the way the executor numbers it.
+
+    The executor counts every step pre-order across the whole tree: a
+    composite (runFlow, group, retry, repeat) takes the next index, then its
+    children do — onFlowStart first, then the steps, then onFlowComplete. So
+    `runFlow` then `assertVisible` puts assertVisible after every child of
+    the runFlow, not at 2. Each retry is planned as passing on its first
+    attempt and each repeat as running all `times`; an index after a retry,
+    a `while:` repeat or a `when:` runFlow can shift at runtime, and says so
+    (`index_exact: false`).
+    """
+    planned: list[dict[str, Any]] = []
+    counter = 0
+    exact = True
+    children: dict[str, Any] = {}
+
+    def child_of(parent, step):
+        target = (Path(parent.path).resolve().parent / step.args["file"]).resolve()
+        key = str(target)
+        if key not in children:
+            children[key] = flow_validator.load_flow(target)
+        return children[key]
+
+    def walk(steps, owner, depth: int, parent_index: int | None,
+             hook: str | None) -> None:
+        nonlocal counter, exact
+        for step in steps:
+            counter += 1
+            index = counter
+            entry: dict[str, Any] = {"index": index, "command": step.command,
+                                     "line": step.line}
+            if getattr(step, "label", None):
+                entry["label"] = step.label
+            if owner is not flow:
+                entry["flow"] = owner.path
+            if depth:
+                entry["depth"] = depth
+                entry["parent_index"] = parent_index
+            if hook:
+                entry["hook"] = hook
+            if not exact:
+                entry["index_exact"] = False
+            planned.append(entry)
+            if step.command not in _COMPOSITE:
+                continue
+            if step.command == "runFlow":
+                inline = "file" not in step.args
+                body_owner = owner if inline else child_of(owner, step)
+                body = step.args["commands"] if inline else body_owner.steps
+                walk(body, body_owner, depth + 1, index, hook)
+                if step.args.get("when") is not None:
+                    exact = False  # the condition may skip every child
+            elif step.command == "repeat":
+                for _ in range(int(step.args.get("times") or 1)):
+                    walk(step.args["commands"], owner, depth + 1, index, hook)
+                if step.args.get("while") is not None:
+                    exact = False  # may stop before `times`
+            else:
+                walk(step.args["commands"], owner, depth + 1, index, hook)
+                if step.command == "retry":
+                    exact = False  # a failed first attempt re-runs the block
+
+    walk(flow.on_flow_start, flow, 0, None, "onFlowStart")
+    walk(flow.steps, flow, 0, None, None)
+    walk(flow.on_flow_complete, flow, 0, None, "onFlowComplete")
+    return planned
+
+
 def cmd_flow_run(args: argparse.Namespace) -> int:
     path = Path(args.path)
     include = args.include_tag or []
     exclude = args.exclude_tag or []
+    discovery_warnings: list[dict[str, Any]] = []
     if path.is_dir():
-        candidates = _flow_files(path)
+        candidates = _flow_files(path, discovery_warnings)
         selected = []
         for file in candidates:
             flow = flow_validator.load_flow(file)
@@ -2066,15 +2628,20 @@ def cmd_flow_run(args: argparse.Namespace) -> int:
             "events": result.events_path,
             "sensitive": result.sensitive,
         }
+        if getattr(result, "warnings", None):
+            summary["warnings"] = list(result.warnings)
         if args.dry_run:
             # A dry run executes nothing, so `steps` is empty by definition;
-            # list what *would* run so the answer is more than "passed".
+            # list what *would* run — numbered exactly as the executor numbers
+            # runtime steps, so `--until-step N` can be read off this list.
             summary["dry_run"] = True
-            summary["planned"] = [
-                {"index": index, "command": step.command, "line": step.line,
-                 **({"label": step.label} if getattr(step, "label", None) else {})}
-                for index, step in enumerate(flow.steps, start=1)
-            ]
+            planned = _plan_steps(flow)
+            if args.until_step is not None:
+                planned = [entry for entry in planned if entry["index"] <= args.until_step]
+                summary["until_step"] = args.until_step
+            summary["planned"] = planned
+            if summary["status"] == "passed":
+                summary["status"] = "planned"
         if flow.converted_from:
             summary["converted_from"] = flow.converted_from
         if result.failure:
@@ -2090,19 +2657,25 @@ def cmd_flow_run(args: argparse.Namespace) -> int:
             summary["replay_target"] = result.replay_target
         return summary
 
+    clean = ("passed", "replayed", "planned")
     if len(flows) == 1:
         summary = {"ok": True, **run_one(flows[0]), **target.identity()}
-        exit_code = 0 if summary["status"] in ("passed", "replayed") else 1
+        exit_code = 0 if summary["status"] in clean else 1
     else:
         runs = []
         for flow in flows:  # a test failure moves on; an AutonomError aborts
             runs.append(run_one(flow))
-        overall = "passed" if all(r["status"] == "passed" for r in runs) else "failed"
+        overall = ("planned" if args.dry_run and all(r["status"] == "planned" for r in runs)
+                   else "passed" if all(r["status"] in clean for r in runs)
+                   else "failed")
         summary = {"ok": True, "status": overall,
                    "flows": len(runs),
-                   "failed": sum(1 for r in runs if r["status"] != "passed"),
+                   "failed": sum(1 for r in runs if r["status"] not in clean),
                    "runs": runs, **target.identity()}
-        exit_code = 0 if overall == "passed" else 1
+        exit_code = 0 if overall in ("passed", "planned") else 1
+    if discovery_warnings:
+        summary.setdefault("warnings", [])
+        summary["warnings"] = discovery_warnings + summary["warnings"]
     if not args.events:
         emit(summary, as_json=True)
     else:
@@ -2121,10 +2694,14 @@ def cmd_proof(args: argparse.Namespace) -> int:
     env_overrides = _flow_env_overrides(args)
     changed = proof_mod.changed_files(repo, args.base, args.head)
     flows_dir = Path(args.flows) if args.flows else repo / ".autonom/flows"
+    out_dir = _output_dir(args.out, "--out") if args.out else None
     selected: list[dict[str, Any]] = []
     covered: list[str] = []
+    invalid: list[dict[str, Any]] = []
     if flows_dir.is_dir():
-        selected, covered = proof_mod.select_flows(flows_dir, repo, changed)
+        # a flow that does not load is a coverage gap to report, not to forget
+        suite = proof_mod.select_suite(flows_dir, repo, changed)
+        selected, covered, invalid = suite["selected"], suite["covered"], suite["invalid"]
     uncovered = [name for name in changed if name not in covered]
 
     runs: list[dict[str, Any]] = []
@@ -2176,15 +2753,17 @@ def cmd_proof(args: argparse.Namespace) -> int:
     }
     if blocked_reason:
         result_payload["blocked_reason"] = blocked_reason
+    if invalid:
+        result_payload["invalid_flows"] = invalid
+    # `partial` on a pass with unverified changed files, plus warnings
+    result_payload.update(proof_mod.coverage_flags(status, uncovered, invalid))
 
-    if args.out:
-        out_dir = Path(args.out)
-        out_dir.mkdir(parents=True, exist_ok=True)
+    if out_dir is not None:
         (out_dir / "proof.json").write_text(
             json.dumps(result_payload, ensure_ascii=False, indent=2),
             encoding="utf-8")
         (out_dir / "proof.md").write_text(
-            proof_mod.render_markdown(result_payload), encoding="utf-8")
+            proof_mod.render_markdown(result_payload, repo), encoding="utf-8")
         result_payload["out"] = str(out_dir)
 
     emit(result_payload, as_json=True)
@@ -2259,8 +2838,7 @@ def cmd_atlas_paths(args: argparse.Namespace) -> int:
 def cmd_atlas_export(args: argparse.Namespace) -> int:
     app_id = _atlas_app_id(args, session_mod.load_current())
     graph = atlas_graph.load(app_id)
-    out = Path(args.out)
-    out.parent.mkdir(parents=True, exist_ok=True)
+    out = _output_path(args.out, "--out")
     out.write_text(json.dumps(graph, ensure_ascii=False, indent=2),
                    encoding="utf-8")
     return emit({"ok": True, "app_id": app_id, "out": str(out),
@@ -2269,19 +2847,11 @@ def cmd_atlas_export(args: argparse.Namespace) -> int:
 
 
 def cmd_atlas_diff(args: argparse.Namespace) -> int:
-    def load_snapshot(path_text: str) -> dict[str, Any]:
-        path = Path(path_text)
-        if not path.is_file():
-            raise errors.AutonomError(
-                errors.FLOW_FILE_NOT_FOUND, f"no atlas snapshot at {path}",
-                hint="Create one with 'autonom atlas export --out <file>'.",
-                file=str(path),
-            )
-        return json.loads(path.read_text(encoding="utf-8"))
-
-    base = load_snapshot(args.base)
+    # load_snapshot validates the shape: a truncated or foreign JSON file is a
+    # clean envelope, never a traceback or a diff of garbage
+    base = atlas_graph.load_snapshot(Path(args.base))
     if args.head:
-        head = load_snapshot(args.head)
+        head = atlas_graph.load_snapshot(Path(args.head))
     else:
         head = atlas_graph.load(_atlas_app_id(args, session_mod.load_current()))
     return emit({"ok": True, **atlas_graph.diff(base, head)}, as_json=True)
@@ -2348,8 +2918,7 @@ def _report_model(record: dict[str, Any], run_id: str | None) -> tuple[Path, dic
 def cmd_report_model(args: argparse.Namespace) -> int:
     record = _session_by_id(args.session)
     run_dir, _manifest, model = _report_model(record, args.run)
-    out = Path(args.out) if args.out else run_dir / "report-model-v2.json"
-    out.parent.mkdir(parents=True, exist_ok=True)
+    out = _output_path(args.out if args.out else run_dir / "report-model-v2.json", "--out")
     out.write_text(json.dumps(model, ensure_ascii=False, indent=2) + "\n",
                    encoding="utf-8")
     os.chmod(out, 0o600)
@@ -2379,13 +2948,12 @@ def cmd_report_annotate(args: argparse.Namespace) -> int:
 
 
 def cmd_report_gate(args: argparse.Namespace) -> int:
+    out = _output_path(args.out, "--out") if args.out else None
     record = _session_by_id(args.session)
     _run_dir, _manifest, model = _report_model(record, args.run)
     result = gates_mod.evaluate(
         model, gates_mod.load_rules(Path(args.rules) if args.rules else None))
-    if args.out:
-        out = Path(args.out)
-        out.parent.mkdir(parents=True, exist_ok=True)
+    if out is not None:
         out.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n",
                        encoding="utf-8")
         result["out"] = str(out)
@@ -2399,8 +2967,7 @@ def cmd_report_history(args: argparse.Namespace) -> int:
     result = gates_mod.history([
         report_model_mod.compile_manifest(manifest) for manifest in manifests])
     if args.out:
-        out = Path(args.out)
-        out.parent.mkdir(parents=True, exist_ok=True)
+        out = _output_path(args.out, "--out")
         out.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n",
                        encoding="utf-8")
         result["out"] = str(out)
@@ -2468,8 +3035,8 @@ def cmd_report_suite(args: argparse.Namespace) -> int:
     """One page for the whole session — the suite view CI and humans read."""
     record = _session_by_id(args.session)
     manifests = _suite_manifests(record, args.last)
-    out_dir = Path(args.out) if args.out else Path(record["artifacts_dir"]) / "flows"
-    out_dir.mkdir(parents=True, exist_ok=True)
+    out_dir = _output_dir(args.out if args.out else Path(record["artifacts_dir"]) / "flows",
+                          "--out")
     base = Path(args.relative_to).resolve() if args.relative_to else None
     artifacts_dir = Path(record["artifacts_dir"])
     sensitive_run = any(m.get("sensitive") for m in manifests)
@@ -2511,12 +3078,21 @@ def cmd_report_suite(args: argparse.Namespace) -> int:
     os.chmod(junit_path, mode)  # CI must be able to read the JUnit it consumes
     failed = [m for m in manifests if m.get("status") == "failed"]
     replayed = [m for m in manifests if m.get("status") == "replayed"]
+    # the same counts suite.xml carries, so the JSON and the JUnit agree; a
+    # broken run (aborted, often with no failed step) is counted on its own
+    junit_counts = {"tests": 0, "failures": 0, "errors": 0, "skipped": 0}
+    for manifest in manifests:
+        counts = flow_report.junit_counts(manifest)
+        for key in junit_counts:
+            junit_counts[key] += int(counts.get(key) or 0)
     payload = {
         "ok": True,
         "flows": len(manifests),
         "passed": sum(1 for m in manifests if m.get("status") == "passed"),
         "failed": len(failed),
+        "broken": sum(1 for m in manifests if flow_report._is_broken(m)),  # noqa: SLF001
         "replayed": len(replayed),
+        "junit_counts": junit_counts,
         "html": str(html_path),
         "junit": str(junit_path),
         "sensitive": any(m.get("sensitive") for m in manifests),
@@ -2606,8 +3182,7 @@ def cmd_report_export(args: argparse.Namespace) -> int:
         rendered = flow_report.render_html(manifest,
                                            Path(record["artifacts_dir"]))
         default_name = "report.html"
-    out = Path(args.out) if args.out else run_dir / default_name
-    out.parent.mkdir(parents=True, exist_ok=True)
+    out = _output_path(args.out if args.out else run_dir / default_name, "--out")
     out.write_text(rendered, encoding="utf-8")
     os.chmod(out, 0o600)
     return emit({"ok": True, "format": args.format, "out": str(out),
@@ -2839,27 +3414,21 @@ def cmd_teach_compile(args: argparse.Namespace) -> int:
 
 
 def cmd_teach_approve(args: argparse.Namespace) -> int:
+    # refused before anything replays: an approval with zero runs proves nothing
+    teach_mod._require_minimum_runs(args.minimum_runs)  # noqa: SLF001
+    env_overrides = _flow_env_overrides(args)
+    secrets = _flow_secrets(args)
     record = session_mod.require_current()
     replays: list[dict[str, Any]] = []
     if getattr(args, "run", False):
         # `approve` only counts replays that already happened; with --run it
         # performs them here, against the session's target, and stops at the
         # first failure — an approval is a claim about consecutive passes.
+        # teach.replay binds each replay to the flow's bytes (flow_sha256).
         target = _target(args)
-        flow = flow_validator.validate_tree(Path(args.flow))
-        for _ in range(args.minimum_runs):
-            runner = flow_executor.Executor(target, record, flow_executor.RunConfig())
-            result = runner.run(flow)
-            replays.append({"run_id": result.run_id, "status": result.status})
-            if result.status not in ("passed", "replayed"):
-                raise errors.AutonomError(
-                    errors.TEACH_APPROVAL_BLOCKED,
-                    f"replay {len(replays)} of {args.minimum_runs} failed; approval "
-                    "needs consecutive clean passes",
-                    hint="Read the failure in the run's events, fix the flow, and "
-                         "re-run 'teach approve --run'.",
-                    flow_id=flow.flow_id, replays=replays, failure=result.failure,
-                )
+        replays = teach_mod.replay(record, target, Path(args.flow),
+                                   runs=args.minimum_runs, env=env_overrides,
+                                   secrets=secrets)
     result = teach_mod.approve(record, Path(args.flow), minimum_runs=args.minimum_runs)
     payload = {"ok": True, **result}
     if replays:
@@ -3100,6 +3669,15 @@ def cmd_agent_inspect(args: argparse.Namespace) -> int:
 
 
 def cmd_canvas_serve(args: argparse.Namespace) -> int:
+    # validated here: the node bridge answered a bad value with a stack trace
+    if not 1 <= args.port <= 65535:
+        raise errors.AutonomError(
+            errors.INVALID_VALUE, f"--port must be 1..65535, got {args.port}",
+            "The default is 3277.")
+    if not 1 <= args.fps <= 60:
+        raise errors.AutonomError(
+            errors.INVALID_VALUE, f"--fps must be 1..60, got {args.fps}",
+            "The default is 15.")
     target = _target(args)
     node = shutil.which("node")
     if not node:
@@ -3149,8 +3727,19 @@ def target_flags_parent() -> argparse.ArgumentParser:
     return parent
 
 
+_TRUE_WORDS = frozenset({"1", "true", "yes"})
+_FALSE_WORDS = frozenset({"0", "false", "no"})
+
+
 def _bool_flag(value: str) -> bool:
-    return value.lower() in {"1", "true", "yes"}
+    """true/false/1/0/yes/no only: `--enabled flase` used to read as False."""
+    word = str(value).strip().lower()
+    if word in _TRUE_WORDS:
+        return True
+    if word in _FALSE_WORDS:
+        return False
+    raise argparse.ArgumentTypeError(
+        f"expected true/false (or 1/0, yes/no), got {value!r}")
 
 
 def _add_selector_flags(parser: argparse.ArgumentParser) -> None:
@@ -3207,6 +3796,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--idb", help="path to idb binary")
     parser.add_argument("--idb-host", help="remote idb companion host")
     parser.add_argument("--idb-port", type=int, help="remote idb companion port")
+    # Global only (before the verb): published as AUTONOM_AXE / AUTONOM_IOS_HID
+    # for the process, exactly like the environment variables they mirror.
+    parser.add_argument("--axe", metavar="PATH",
+                        help="path to the AXe binary (iOS HID fallback; AUTONOM_AXE)")
+    parser.add_argument("--ios-hid", choices=("auto", "idb", "axe"),
+                        help="iOS input backend: auto (idb, AXe when idb HID is "
+                             "broken), idb, or axe (AUTONOM_IOS_HID)")
     sub = parser.add_subparsers(dest="command", required=True)
     target_flags = target_flags_parent()
 
@@ -3292,6 +3888,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--all", action="store_true", help="include non-meaningful nodes")
     p.add_argument("--max-depth", type=int, default=None)
     p.add_argument("--max-nodes", type=int, default=200)
+    p.add_argument("--format", choices=("json", "outline"), default="json",
+                   help="outline: one indented line per node instead of the nodes array")
+    p.add_argument("--interactable", action="store_true",
+                   help="only nodes an agent can act on (buttons, fields, switches, ...)")
     p.set_defaults(func=cmd_ui_tree)
 
     p = ui_sub.add_parser("find", help="find nodes by selector", parents=[target_flags])
@@ -3299,6 +3899,16 @@ def build_parser() -> argparse.ArgumentParser:
     _add_selector_flags(p)
     p.add_argument("--all", action="store_true")
     p.set_defaults(func=cmd_ui_find)
+
+    p = ui_sub.add_parser("wait", help="wait until the screen stops changing",
+                          parents=[target_flags])
+    p.add_argument("--settled", action="store_true",
+                   help="poll until two consecutive trees match for --quiet-ms")
+    p.add_argument("--timeout-ms", type=int, default=5000,
+                   help="give up after N ms (exit 1, settled: false)")
+    p.add_argument("--quiet-ms", type=int, default=500,
+                   help="how long the tree must hold still (default 500)")
+    p.set_defaults(func=cmd_ui_wait)
 
     p = ui_sub.add_parser("tap", help="tap by selector or coordinates", parents=[target_flags])
     _add_selector_flags(p)
@@ -3318,7 +3928,7 @@ def build_parser() -> argparse.ArgumentParser:
     # neither, and offering the flags there advertised an argument that was
     # parsed, ignored, and never reached the device.
     for name in ("pinch", "rotate", "shake"):
-        p = ui_sub.add_parser(name, help=f"{name} gesture (iOS)", parents=[target_flags])
+        p = ui_sub.add_parser(name, help=f"{name} gesture (no backend: refused on Android and iOS)", parents=[target_flags])
         if name == "pinch":
             p.add_argument("--at", metavar="X,Y", help="anchor point")
             p.add_argument("--scale", type=float, default=2.0)
@@ -3369,7 +3979,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="with --follow: stop after N seconds")
     p.add_argument("--max-lines", type=int, default=0,
                    help="with --follow: stop after N emitted lines")
-    p.add_argument("--session-id", help="with --follow: a past session's journal")
+    p.add_argument("--session-id", help="a past session's journal (with or without --follow)")
     p.set_defaults(func=cmd_journal)
 
     shots = sub.add_parser("shots", help="browse captured screenshots")
@@ -3441,12 +4051,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     simulator = sub.add_parser(
         "simulator", help="battery, network, push, telephony, biometric, UI state, "
-                          "status-bar pin, and keyboard/locale pin")
+                          "status-bar pin, keyboard/locale pin, and animations")
     simulator_sub = simulator.add_subparsers(dest="simulator_command", required=True)
     for control in ("battery", "network", "push", "sms", "call", "biometric",
-                    "clipboard", "appearance", "text-size", "status-bar", "keyboard"):
-        p = simulator_sub.add_parser(control, parents=[target_flags])
-        p.add_argument("action")
+                    "clipboard", "appearance", "text-size", "status-bar", "keyboard",
+                    "animations"):
+        valid = simulator_mod.CONTROL_ACTIONS.get(control)
+        actions = ("one of: " + ", ".join(valid) if valid
+                   else "the iOS content size, e.g. large or accessibility-extra-large")
+        p = simulator_sub.add_parser(control, parents=[target_flags],
+                                     help=f"{control} ({actions})")
+        p.add_argument("action", help=actions)
         p.add_argument("--value", action="append", metavar="KEY=VALUE")
         p.add_argument("--json", help="JSON object of control values")
         p.set_defaults(func=cmd_simulator, control=control)
@@ -3510,6 +4125,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="exit 1 when reformatting is needed")
     p.add_argument("--diff", action="store_true",
                    help="include a unified diff per changed file")
+    p.add_argument("--drop-comments", action="store_true",
+                   help="with --write: rewrite even though comments would be lost")
     p.set_defaults(func=cmd_flow_fmt)
     p = flow_sub.add_parser("list", help="list flows: file, id, name, tags, platforms")
     p.add_argument("path", nargs="?", help="directory to scan (default .autonom/flows)")
@@ -3547,6 +4164,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--minimum-runs", type=int, default=3)
     p.add_argument("--run", action="store_true",
                    help="perform the replays now instead of counting past ones")
+    p.add_argument("--env", action="append", metavar="KEY=VALUE",
+                   help="with --run: non-secret variable override (repeatable)")
+    p.add_argument("--secret", action="append", metavar="NAME",
+                   help="with --run: read NAME from the process environment as a "
+                        "secret (repeatable)")
     p.set_defaults(func=cmd_teach_approve)
 
     app_skill = sub.add_parser("app-skill", help="validate and promote portable app knowledge")
@@ -3843,8 +4465,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--status", type=int)
     p.add_argument("--path", help="glob over path or url")
     p.add_argument("--since", type=float, help="seconds")
-    p.add_argument("--mocked", nargs="?", const=True, default=None,
-                   type=lambda v: v.lower() in {"1", "true", "yes"})
+    p.add_argument("--mocked", nargs="?", const=True, default=None, type=_bool_flag)
     p.add_argument("--max", type=int, default=store_mod.DEFAULT_MAX)
     p.add_argument("--since-id", help="only flows recorded after this id")
     p.set_defaults(func=cmd_network_requests_list)
@@ -3854,8 +4475,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--method")
     p.add_argument("--status", type=int)
     p.add_argument("--path", help="glob over path or url")
-    p.add_argument("--mocked", nargs="?", const=True, default=None,
-                   type=lambda v: v.lower() in {"1", "true", "yes"})
+    p.add_argument("--mocked", nargs="?", const=True, default=None, type=_bool_flag)
     p.add_argument("--interval", type=float, default=1.0, help="poll seconds")
     p.add_argument("--max", type=int, default=0, help="stop after N new flows")
     p.add_argument("--max-seconds", type=float, default=0,
@@ -4057,21 +4677,129 @@ def _journal_command(args: argparse.Namespace, argv: list[str], ok: bool,
         session = None
     if not session:
         return
+    argv, args = _redact_pair_values(args, argv)
     journal_mod.record_action(
         session, verb=_verb_string(args), argv=argv,
         payload=_LAST_EMIT, ok=ok, error_code=error_code,
+        args=args, parser=_ROOT_PARSER,
+    )
+
+
+_PAIR_FLAGS = ("--env", "--setenv")
+
+
+def _pair_dests(args: argparse.Namespace) -> list[str]:
+    """Dests of this verb's KEY=VALUE options (--env, --setenv, --value ...),
+    found by walking the parser the verb was parsed with."""
+    if _ROOT_PARSER is None:
+        return ["env", "setenv"]
+    leaf = _leaf_parser(_ROOT_PARSER, args)
+    return sorted({action.dest for action in leaf._actions  # noqa: SLF001
+                   if any(flag in _PAIR_FLAGS for flag in action.option_strings)
+                   or action.metavar == "KEY=VALUE"})
+
+
+def _redact_pair_values(args: argparse.Namespace,
+                        argv: list[str]) -> tuple[list[str], argparse.Namespace]:
+    """`--env K=V` (any spelling: `--env=K=V`, `--en K=V`) as `K=<redacted>`.
+
+    Whether a value is secret is not knowable from its key: `--env CODE=...`
+    feeding a `sensitive: true` slot looked harmless. So every KEY=VALUE
+    option value is masked in the journal, the key kept, argv kept 1:1; the
+    values are located through the parsed args, not by guessing spellings.
+    """
+    values: set[str] = set()
+    redacted = argparse.Namespace(**vars(args))
+    for dest in _pair_dests(args):
+        items = getattr(args, dest, None)
+        if not isinstance(items, list):
+            continue
+        values.update(str(item) for item in items)
+        setattr(redacted, dest, [_masked_pair(str(item)) for item in items])
+    if not values:
+        return argv, args
+    out: list[str] = []
+    for token in argv:
+        if token in values:
+            out.append(_masked_pair(token))
+        elif token.startswith("--") and "=" in token and token.split("=", 1)[1] in values:
+            flag, value = token.split("=", 1)
+            out.append(f"{flag}={_masked_pair(value)}")
+        else:
+            out.append(token)
+    return out, redacted
+
+
+def _masked_pair(value: str) -> str:
+    key, sep, _ = value.partition("=")
+    return f"{key}=<redacted>" if sep else "<redacted>"
+
+
+def _leaf_parser(parser: argparse.ArgumentParser,
+                 args: argparse.Namespace) -> argparse.ArgumentParser:
+    """The deepest sub-parser the parsed verb path reaches."""
+    node = parser
+    while True:
+        action = next((item for item in node._actions  # noqa: SLF001
+                       if isinstance(item, argparse._SubParsersAction)), None)  # noqa: SLF001
+        if action is None:
+            return node
+        chosen = action.choices.get(getattr(args, action.dest, None) or "")
+        if chosen is None:
+            return node
+        node = chosen
+
+
+def _parse(parser: argparse.ArgumentParser, argv: list[str] | None) -> argparse.Namespace:
+    """`parse_args`, except that an unknown flag is reported by the verb it
+    was given to: the hint is `ui tap`'s usage, not the root's 60-verb list."""
+    args, extras = parser.parse_known_args(argv)
+    if extras:
+        _leaf_parser(parser, args).error(
+            "unrecognized arguments: " + " ".join(extras))
+    return args
+
+
+def _apply_ios_overrides(args: argparse.Namespace) -> None:
+    """`--axe` / `--ios-hid` become the environment variables ui_ios reads."""
+    axe = getattr(args, "axe", None)
+    if axe:
+        os.environ["AUTONOM_AXE"] = str(axe)
+    hid = getattr(args, "ios_hid", None)
+    if hid:
+        os.environ["AUTONOM_IOS_HID"] = hid
+
+
+def _os_error(exc: OSError) -> errors.AutonomError:
+    """An OSError that escaped a verb: an unwritable output, or a backend."""
+    where = exc.filename or ""
+    if isinstance(exc, (PermissionError, IsADirectoryError, NotADirectoryError)) or \
+            exc.errno in (errno.EACCES, errno.EROFS, errno.ENOSPC, errno.EISDIR):
+        return errors.AutonomError(
+            errors.OUTPUT_NOT_WRITABLE,
+            f"cannot write {where}: {exc.strerror or exc}" if where
+            else f"cannot write: {exc.strerror or exc}",
+            "Pass an output path in a directory you can write to.",
+            **({"path": str(where)} if where else {}),
+        )
+    return errors.AutonomError(
+        errors.BACKEND_FAILED, f"{exc.strerror or exc}" + (f": {where}" if where else ""),
+        "Check the path and the tool it names; 'autonom doctor' lists the toolchain.",
     )
 
 
 def main(argv: list[str] | None = None) -> int:
+    global _ROOT_PARSER
     parser = build_parser()
+    _ROOT_PARSER = parser
     argv_used = list(argv) if argv is not None else sys.argv[1:]
-    args = parser.parse_args(argv)
+    args = _parse(parser, argv)
     ok, error_code = True, None
     try:
         code = None
         try:
             platform_mod.apply_tool_overrides(args)
+            _apply_ios_overrides(args)
             code = args.func(args)
             return code
         finally:
@@ -4100,8 +4828,28 @@ def main(argv: list[str] | None = None) -> int:
             "and retry.",
         ))
     except FileNotFoundError as exc:
-        ok = False
-        return fail(str(exc))
+        # used to be the one envelope without an error_code
+        ok, error_code = False, errors.INVALID_VALUE
+        where = exc.filename or ""
+        return fail_error(errors.AutonomError(
+            errors.INVALID_VALUE,
+            f"no such file or directory: {where}" if where else str(exc),
+            "Check the path argument; relative paths resolve against the "
+            "current directory.",
+            **({"path": str(where)} if where else {}),
+        ))
+    except OSError as exc:
+        wrapped = _os_error(exc)
+        ok, error_code = False, wrapped.code
+        return fail_error(wrapped)
+    except re.error as exc:
+        # re.error is not a ValueError: a bad --grep used to be a traceback
+        ok, error_code = False, errors.INVALID_VALUE
+        return fail_error(errors.AutonomError(
+            errors.INVALID_VALUE, f"invalid regular expression: {exc}",
+            "The filter is a Python regular expression; escape literal "
+            "characters such as ( [ * with a backslash.",
+        ))
     except (IndexError, ValueError) as exc:
         # A bare ValueError used to leave the envelope without an error_code.
         ok, error_code = False, errors.INVALID_VALUE

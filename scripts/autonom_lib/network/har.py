@@ -11,6 +11,7 @@ from __future__ import annotations
 from typing import Any
 
 from .. import __version__
+from . import redact
 
 HAR_VERSION = "1.2"
 PREVIEW_NOTE = (
@@ -29,8 +30,10 @@ def _query(url: str) -> list[dict[str, str]]:
         return []
     from urllib.parse import parse_qsl
 
-    return [{"name": name, "value": value}
-            for name, value in parse_qsl(url.split("?", 1)[1], keep_blank_values=True)]
+    query = url.split("?", 1)[1].split("#", 1)[0]
+    return [{"name": name,
+             "value": redact.PLACEHOLDER if redact.is_sensitive_query_key(name) else value}
+            for name, value in parse_qsl(query, keep_blank_values=True)]
 
 
 def _mime(headers: dict[str, str] | None) -> str:
@@ -38,6 +41,9 @@ def _mime(headers: dict[str, str] | None) -> str:
 
 
 def entry_for(flow: dict[str, Any]) -> dict[str, Any]:
+    # Callers normally pass flows already scrubbed by the store; scrubbing again
+    # is idempotent and keeps a HAR built from any other source safe.
+    flow = redact.scrub_flow(flow)
     request_headers = flow.get("request_headers_preview") or {}
     response_headers = flow.get("response_headers_preview") or {}
     sizes = flow.get("sizes") or {}

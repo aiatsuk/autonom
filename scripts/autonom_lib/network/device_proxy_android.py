@@ -235,7 +235,9 @@ def attach(
         "previous_http_proxy": previous,
     })
     consent.record(record, entry)
-    result = {"attached": True, "device_proxy": device_proxy,
+    # `attach_state` mirrors the iOS attach: "automated" here means the device
+    # setting was written by Autonom itself.
+    result = {"attached": True, "attach_state": "automated", "device_proxy": device_proxy,
               "previous_http_proxy": previous, "setting_applied": applied}
     if not applied.get("applied"):
         result["warnings"] = [{

@@ -41,9 +41,18 @@ pass, `1` on a *test failure* (summary on stdout with
 (stderr envelope). Events stream to
 `~/.autonom/sessions/<id>/flows/<run_id>/events.ndjson` (or stdout with
 `--events`); secrets pass via `--secret NAME` and never enter artifacts
-(including `when.envEquals` skip reasons).
+(including `when.envEquals` skip reasons). An `--env NAME=VALUE` whose value
+reaches a `sensitive: true` slot (directly or forwarded through a runFlow
+`env:`) is treated as the secret it is: redacted from events, manifest and
+reports, recorded under `secret_names`, reproduced as `--secret NAME`, and
+named in a `flow_env_value_sensitive` run warning.
 Directory runs execute a tag-filtered suite
-(`flow run .autonom/flows --include-tag smoke --exclude-tag flaky`);
+(`flow run .autonom/flows --include-tag smoke --exclude-tag flaky`). Suite
+discovery takes every `*.yaml` below the directory except App Skill overlays
+(`.autonom/apps/**` — `selectors.yaml`, `fixtures.yaml`,
+`compatibility.yaml` and promoted copies) and files whose header declares
+another schema (`schema: autonom.selectors/v1` and friends); a file with a
+Flow schema of any version, or a Maestro document, is always a member;
 `runFlow` children execute inline with the root `appId` inherited and their
 own env frame; a false `when:` skips the step with the failed condition as
 the reason; `onFlowComplete` cleanup is isolated per command and reported as
@@ -69,9 +78,18 @@ screenshot|hierarchy|logs|crashes|network` flags override its evidence kinds.
   opt-in per selector. A selector that matches more than one node refuses to
   act (`ambiguous_selector`) unless `index` disambiguates.
 - **Unknown anything**: an unknown command, header field, selector field, or
-  argument is an error, never ignored. Deferred features (`waitForIdle`,
-  `extendedWaitUntil`, `runScript`, `evalScript`) are rejected with a
-  pointed hint.
+  argument is an error, never ignored; a near miss gets a `Did you mean
+  'tapOn'?` hint ahead of the full list of legal names. Deferred features
+  (`waitForIdle`, `extendedWaitUntil`, `runScript`, `evalScript`) are
+  rejected with a pointed hint.
+- **Values that can only fail on the device**: a negative `timeoutMs`,
+  `delayMs`, `durationMs`, `maxSwipes`, or `chars`; a `setLocation` (or
+  `setup.location`) latitude outside -90..90 or longitude outside
+  -180..180; an empty selector string; and a `match: regex` pattern that
+  does not compile are positioned `flow check` errors (a pattern that
+  interpolates `${VAR}` is checked when it runs). `timeoutMs: 0` is legal:
+  one check, no waiting. A UTF-8 byte-order mark at the start of a file is
+  accepted and ignored.
 - **Type guessing**: `true` is a boolean only where a boolean belongs;
   a quoted `"true"` in a boolean slot is a positioned type error (so
   `text: No` never becomes `false`).
@@ -156,7 +174,8 @@ directory — `flow check|fmt|list|run` take any path.
 `runFlow` paths resolve relative to the referencing file, symlinks are
 resolved, and the result must stay inside the workspace root (the nearest
 ancestor of the root flow containing `.autonom`, else the root flow's own
-directory). Recursion and cycles are refused with the full chain named.
+directory). Recursion and cycles are refused with the full chain named and
+the `file`/`line`/`column` of the `runFlow` step that closes the loop.
 
 ## Language surface
 
@@ -231,11 +250,13 @@ applied, verified, and used setup entries separately.
   reports keyboard focus and fails with `flow_no_focused_field` (a test
   failure) when none appears: on real devices a `tapOn` that opens the
   field's activity followed by an immediate `inputText` typed into nothing
-  and passed. iOS accessibility dumps carry no focus attribute (verified on
+  and passed. An incomplete dump while the field's screen is still coming
+  up is polled again, not an abort. iOS accessibility dumps carry no focus attribute (verified on
   a Simulator), so there the bar is "a text field is on screen".
   `requireFocus: false` opts out for a UI whose field never reports focus.
 - `launchApp` starts the app **fresh**: the launcher activity on a cleared
-  task on Android (`am start --activity-clear-task`), terminate-then-launch
+  task on Android (`am start -W -f 0x10008000`, i.e. `NEW_TASK |
+  CLEAR_TASK`), terminate-then-launch
   on iOS. Data is untouched (`clearState: true` wipes it). Measured on real
   devices, a resumed task put a flow's first selector on a subscreen — or,
   with Android Settings, in a search activity of another package that
@@ -286,7 +307,12 @@ html|junit --out` writes it anywhere. For a whole suite, `autonom
 report suite` folds every run of the session into one `suite.html`
 (totals, failures first, every flow expandable to its steps; failed
 flows open by default) plus a `suite.xml` `<testsuites>` document —
-the shape CI dashboards expect. It exits 1 when any flow failed.
+the shape CI dashboards expect. It exits 1 when any flow failed. A run that
+aborted on a definition or infrastructure error (exit 2 — an unreachable
+`--until-step`, a dead backend) is a JUnit **error**, never a green suite: its
+`<testsuite>` carries `errors="1"` and an `<error>` case built from the
+primary error, a failed step of that class is an `<error>` rather than a
+`<failure>`, and `suite.xml` rolls `errors` up next to `failures`.
 `--detailed` turns that into a small site — `index.html` plus
 `runs/<run_id>.html` per flow. Its addressable step timeline exposes the step
 record, before/after frames with matched-target highlighting, UI hierarchy
@@ -393,31 +419,63 @@ failure in `flow run` therefore carries a `repair` block next to `failure`:
 
 ```json
 "repair": {
-  "step_index": 3, "command": "tapOn", "line": 12, "flow": "flows/login.yaml",
-  "selector": {"description": "Log In", "match": "exact"},
+  "step_index": 4, "command": "tapOn", "line": 12,
+  "flow": "flows/login.yaml", "root_flow": "flows/smoke.yaml",
+  "selector": {"text": "Sign In", "match": "exact"},
+  "until_step": 2,
   "commands": [
-    "autonom flow run flows/login.yaml --until-step 2",
+    "autonom flow run flows/smoke.yaml --until-step 2 --secret PASSWORD --env USER=<value>",
     "autonom ui tree",
-    "autonom ui find --desc 'Log In' --mode contains --all",
+    "autonom ui find --text 'Sign In' --mode contains --all",
     "autonom screenshot --label 'repair tapOn line 12'",
-    "autonom flow check flows/login.yaml",
-    "autonom flow run flows/login.yaml"
+    "autonom flow check flows/smoke.yaml",
+    "autonom flow run flows/smoke.yaml --secret PASSWORD --env USER=<value>"
   ],
-  "advice": "The element the step targets was not on screen when the step ran. …",
+  "candidates": [
+    {"selector": {"text": "Sign in", "role": "button"},
+     "command": "autonom ui find --text 'Sign in' --role button --mode exact --case-sensitive",
+     "score": 1.0, "matched_field": "text", "node": {"ref": "n7", "role": "button", "text": "Sign in"}}
+  ],
+  "advice": "The element the step targets was not on screen within timeoutMs. …",
   "evidence": "~/.autonom/sessions/<id>/flows/<run_id>/events.ndjson",
   "note": "The corrected flow is a reviewed edit, never an automatic rewrite."
 }
 ```
 
+The step is the one that **ended** the run — never a retry attempt that a
+later attempt recovered, never a failing `onFlowComplete` cleanup. `flow`
+is the file that contains it (a `runFlow` child when the failure happened
+there; `line` is in that file), `root_flow` is what `flow run` replays.
+
 The commands are the repair loop in order: replay the prefix so the device
 sits in the state the failed step assumed, dump what is on screen now, query
 the old selector *widened* (`contains`, `--all`) to see what it nearly
-matched, keep a screenshot, then re-validate and re-run. `advice` is keyed by
-the error code (`no_matching_node`, `flow_assertion_timeout`,
-`ambiguous_selector`, `selector_index_out_of_range`,
-`coordinate_space_mismatch`). Definition and infrastructure failures abort
-with their own envelope and get no brief. Nothing rewrites the flow: the
-edit is yours to review and commit.
+matched, keep a screenshot, then re-validate and re-run. `--until-step` is
+the last step completed before the failure that is not one of its enclosing
+blocks — for the first step inside a `runFlow`, that is the step before the
+`runFlow`, not the block itself. When nothing ran before the failure the
+replay command is omitted and `until_step_reason` says why. Every Flow
+selector field maps to its `ui find` flag (`visibleText` becomes one query
+per label source, `--text` and `--desc`); a `match: regex` selector keeps
+`--mode regex`. Declared secrets and `--env` overrides appear as
+`--secret NAME` / `--env NAME=<value>` placeholders — never their values.
+
+When the failing step's hierarchy was captured, `candidates` ranks up to
+five nodes that were on screen by similarity to the failed selector's text,
+visibleText, description, and id (case-folded `difflib` ratio, threshold
+0.5, a bonus when the role agrees). Each carries a ready-to-paste Flow
+`selector` (with the `index` that picks it when its label is shared) and
+the exact `ui find` query that confirms it. For `ambiguous_selector` the
+list is every match instead, each with its `distinguishing` fields.
+
+`advice` follows what flows actually produce: a selector that never matched
+surfaces as `flow_assertion_timeout` (with the step's selector), plus
+`ambiguous_selector`, `selector_index_out_of_range` (taps),
+`coordinate_space_mismatch`, `flow_no_focused_field`, `flow_copy_empty`,
+and `no_matching_node` (an off-screen relational anchor). Definition and
+infrastructure failures abort with their own envelope and get no brief.
+Nothing rewrites the flow: the candidates are suggestions, and the edit is
+yours to review and commit.
 
 ## Errors
 

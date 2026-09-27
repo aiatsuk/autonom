@@ -75,6 +75,45 @@ def reject(group: str, value: str, choices: frozenset[str]) -> int:
     return 2
 
 
+# Top-level options real idb accepts before the verb (`idb --companion h:p ui
+# tap ...`). They are stripped before dispatch so the verb is found the way
+# idb's own argparse finds it; the log keeps the full argv.
+GLOBAL_WITH_VALUE = frozenset({"--companion", "--companion-path", "--log", "--compression"})
+GLOBAL_FLAGS = frozenset({"--companion-tls", "--no-prune-dead-companion"})
+
+
+def strip_globals(argv: list[str]) -> list[str]:
+    index = 0
+    while index < len(argv):
+        if argv[index] in GLOBAL_WITH_VALUE:
+            index += 2
+        elif argv[index] in GLOBAL_FLAGS:
+            index += 1
+        else:
+            break
+    return argv[index:]
+
+
+def _pid_alive(pid) -> bool:
+    try:
+        os.kill(int(pid), 0)
+    except (OSError, TypeError, ValueError):
+        return False
+    return True
+
+
+def prune_state_file() -> None:
+    """What real `list-targets` does to /tmp/idb/state: drop companions whose
+    process is gone. Only the file AUTONOM_IDB_STATE_FILE names is touched."""
+    path = os.environ.get("AUTONOM_IDB_STATE_FILE")
+    if not path or not Path(path).exists():
+        return
+    entries = json.loads(Path(path).read_text(encoding="utf-8"))
+    kept = [entry for entry in entries
+            if not entry.get("stale") and _pid_alive(entry.get("pid"))]
+    Path(path).write_text(json.dumps(kept), encoding="utf-8")
+
+
 def check_surface(argv: list[str]) -> int | None:
     positional = [arg for arg in argv if not arg.startswith("-")]
     if not positional:
@@ -92,6 +131,7 @@ def check_surface(argv: list[str]) -> int | None:
 
 def main(argv: list[str]) -> int:
     record(argv)
+    argv = strip_globals(argv)
     state = load_state()
 
     if argv[:1] != ["--version"]:
@@ -108,6 +148,8 @@ def main(argv: list[str]) -> int:
     # A failure that clears itself once `list-targets` has run — the stale
     # companion registration seen on a real Mac, which `list-targets` prunes.
     once = state.get("idb_fail_until_pruned") or {}
+    if argv[:1] == ["list-targets"]:
+        prune_state_file()
     if argv[:1] == ["list-targets"] and once:
         state.pop("idb_fail_until_pruned", None)
         write_state(state)

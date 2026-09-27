@@ -27,6 +27,7 @@ python3 <autonom-root>/scripts/autonom.py flow check login.yaml
 # Canonical form — expands shorthand, materializes `match: exact`
 python3 <autonom-root>/scripts/autonom.py flow fmt login.yaml --write
 python3 <autonom-root>/scripts/autonom.py flow fmt .autonom/flows --check   # exit 1 = needs formatting
+python3 <autonom-root>/scripts/autonom.py flow fmt login.yaml --write --drop-comments   # only when losing comments is intended
 
 # Enumerate: file, id, name, tags, platforms
 python3 <autonom-root>/scripts/autonom.py flow list
@@ -36,8 +37,20 @@ python3 <autonom-root>/scripts/autonom.py flow run login.yaml
 python3 <autonom-root>/scripts/autonom.py flow run .autonom/flows --include-tag smoke --exclude-tag flaky
 python3 <autonom-root>/scripts/autonom.py flow run login.yaml --secret TEST_PASSWORD --env LOCALE=en_US
 python3 <autonom-root>/scripts/autonom.py flow run login.yaml --events     # NDJSON stream on stdout
-python3 <autonom-root>/scripts/autonom.py flow run login.yaml --dry-run    # pre-flight only
+python3 <autonom-root>/scripts/autonom.py flow run login.yaml --dry-run    # pre-flight only; top-level status "planned", `planned` list with runtime indexes
+
+# Approve for promotion: N consecutive clean replays of the current bytes
+python3 <autonom-root>/scripts/autonom.py teach approve login.yaml --run --minimum-runs 3 --secret TEST_PASSWORD --env LOCALE=en_US
 ```
+
+`flow check` catches what used to fail only on the device: negative
+`timeoutMs`/`delayMs`/`durationMs`/`maxSwipes`/`chars`, a latitude or
+longitude out of range, an empty selector string, and a `match: regex`
+pattern that does not compile (`timeoutMs: 0` is legal: one check). An
+unknown command, argument, selector field, or match mode names its closest
+legal spelling (`Did you mean 'tapOn'?`). `flow fmt --write` refuses with
+`comments_would_be_lost` rather than silently dropping YAML comments; in a
+directory nothing is written until every file is safe.
 
 ## A minimal flow
 
@@ -79,13 +92,25 @@ tags: [smoke, auth]
 - A test failure also carries `repair`: the `--until-step` command that
   reconstructs the state the failed step assumed, `ui tree`, the old selector
   as a widened `ui find … --mode contains --all`, and the re-verification
-  commands, with advice keyed by the error code. Run them in order, edit the
-  YAML, and re-run — the brief never rewrites the flow for you.
+  commands, with advice keyed by the error code. It names the step that
+  ended the run (never a recovered retry or a cleanup hook), the file that
+  holds it (`flow`; `root_flow` is what gets replayed), and `--secret NAME` /
+  `--env NAME=<value>` placeholders — never values. When the failing step's
+  hierarchy was captured, `candidates` ranks up to five on-screen nodes by
+  similarity to the failed selector, each with a ready Flow `selector` and
+  the `ui find` command that confirms it. Run them in order, confirm a
+  candidate, edit the YAML, and re-run — the brief never rewrites the flow
+  for you.
+- A run that aborted on a definition or infrastructure error is a JUnit
+  `<error>` (`errors="1"`), never a green suite.
 
 ## Rules
 
 1. Never put credentials in a flow file. Pass `--secret NAME`; reference it
    as `${NAME}`. Values never enter the file, events, journal, or summary.
+   An `--env` value that reaches a `sensitive: true` slot is treated as a
+   secret too (redacted, reproduced as `--secret NAME`, and flagged with a
+   `flow_env_value_sensitive` warning) — switch it to `--secret`.
 2. Prefer `id`, then unique visible text (`description` on iOS). Use
    `index` only for a justified duplicate, never to paper over a bad
    selector.
@@ -98,7 +123,12 @@ tags: [smoke, auth]
    need hand-written waits.
 4. Keep subflows atomic (login, dismiss-permissions) and let `runFlow`
    compose them; recursion and paths escaping the workspace are refused.
-5. Flow files are source — commit them. If the repository blanket-ignores
+5. Approvals are bound to content. `teach approve` counts only replays whose
+   recorded `flow_sha256` (and every `runFlow` child's `subflow_sha256`)
+   matches the current bytes; the receipt stores both, and `app-skill
+   promote` refuses a flow edited since. Edit, then replay again — an
+   mtime-preserving copy does not count.
+6. Flow files are source — commit them. If the repository blanket-ignores
    `.autonom/`, un-ignore the flows subtree (`!.autonom/flows/**`).
 
 ## Failure codes
@@ -113,6 +143,8 @@ tags: [smoke, auth]
 | `flow_no_focused_field` | test failure: `inputText` found nothing with keyboard focus to type into (`requireFocus: false` opts out) |
 | `flow_var_undefined` / `flow_secret_undefined` | `${VAR}` unresolved / `--secret` not in the environment |
 | `flow_no_flows_found` | no flow files (or none match the tag filters) |
+| `flow_source_changed` | `teach approve` / `app-skill promote`: the flow or a `runFlow` child changed since its replays or receipt |
+| `comments_would_be_lost` | `flow fmt --write` would drop comments; pass `--drop-comments` to accept that |
 | `no_active_session` | run `session start` first (see mobile-session) |
 
 ## Related

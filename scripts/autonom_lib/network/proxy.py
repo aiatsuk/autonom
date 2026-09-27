@@ -206,6 +206,37 @@ def status(record: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _already_running(current: dict[str, Any], *, port: int | None,
+                     capture_bodies: bool) -> dict[str, Any]:
+    """The running proxy, plus a warning when the request asked for another one.
+
+    Starting is idempotent, but silently returning a proxy on a different port,
+    or one that is (not) writing full bodies, would let the caller believe its
+    flags took effect. The running proxy is kept — restarting it would drop
+    in-flight traffic — and the mismatch is reported as requested vs actual.
+    """
+    result = {**current, "already_running": True}
+    requested: dict[str, Any] = {}
+    actual: dict[str, Any] = {}
+    if port and port != current.get("port"):
+        requested["port"], actual["port"] = port, current.get("port")
+    if bool(capture_bodies) != bool(current.get("capture_bodies")):
+        requested["capture_bodies"] = bool(capture_bodies)
+        actual["capture_bodies"] = bool(current.get("capture_bodies"))
+    if requested:
+        result["requested"] = requested
+        result["warnings"] = [{
+            "code": "proxy_already_running",
+            "error": "the proxy is already running with different settings; "
+                     "the running proxy was kept: "
+                     + ", ".join(f"{key} requested {requested[key]!r}, actual {actual[key]!r}"
+                                 for key in requested),
+            "hint": "Run 'autonom network stop' and start again to apply the new "
+                    "--port / --capture-bodies.",
+        }]
+    return result
+
+
 def start(
     record: dict[str, Any],
     *,
@@ -218,7 +249,7 @@ def start(
     assert_safe_permissions(record)
     current = status(record)
     if current["running"]:
-        return current
+        return _already_running(current, port=port, capture_bodies=capture_bodies)
 
     binary = find_mitmdump(mitmdump)
     directory = network_dir(record)

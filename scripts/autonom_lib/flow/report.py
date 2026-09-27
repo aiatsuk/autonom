@@ -731,22 +731,70 @@ def recovered_retry_indexes(manifest: dict[str, Any]) -> set[int]:
 
 def _is_junit_failure(step: dict[str, Any], recovered: set[int]) -> bool:
     return (step.get("status") == "failed"
-            and step.get("index") not in recovered)
+            and step.get("index") not in recovered
+            and step.get("failure_class") in (None, "test_failure"))
+
+
+def _is_junit_error(step: dict[str, Any], recovered: set[int]) -> bool:
+    """A failed step that is the flow's or the target's fault, not the app's."""
+    return (step.get("status") == "failed"
+            and step.get("index") not in recovered
+            and step.get("failure_class") not in (None, "test_failure"))
+
+
+def _is_broken(manifest: dict[str, Any]) -> bool:
+    """The run aborted on a definition/infrastructure error (exit 2).
+
+    Such a run often has no failed step at all — the aborting step never
+    completed — so counting failed steps alone exported ``tests=0
+    failures=0`` and a broken run read as green in CI.
+    """
+    if manifest.get("status") == "replayed":
+        return False
+    if manifest.get("execution_status") == "broken":
+        return True
+    primary = manifest.get("primary_error") or {}
+    return (manifest.get("status") == "failed" and bool(primary)
+            and primary.get("failure_class") not in (None, "test_failure"))
+
+
+def junit_counts(manifest: dict[str, Any]) -> dict[str, int]:
+    """tests/failures/errors/skipped for one run, exactly as rendered."""
+    steps = manifest.get("steps", [])
+    prefix_replay = manifest.get("status") == "replayed"
+    recovered = recovered_retry_indexes(manifest)
+    failures = (0 if prefix_replay else
+                sum(1 for s in steps if _is_junit_failure(s, recovered)))
+    step_errors = (0 if prefix_replay else
+                   sum(1 for s in steps if _is_junit_error(s, recovered)))
+    # the abort itself is one error case unless a step already carries it
+    abort_case = 1 if (_is_broken(manifest) and not step_errors) else 0
+    skipped = (len(steps) if prefix_replay else
+               sum(1 for s in steps
+                   if s.get("status") == "skipped"
+                   or (s.get("status") == "failed"
+                       and s.get("index") in recovered)))
+    return {"tests": len(steps) + abort_case, "failures": failures,
+            "errors": step_errors + abort_case, "skipped": skipped,
+            "abort_case": abort_case}
 
 
 def render_suite_junit(manifests: list[dict[str, Any]]) -> str:
-    """One JUnit document with a <testsuite> per flow — what CI expects."""
+    """One JUnit document with a <testsuite> per flow — what CI expects.
+
+    The roll-up uses the same per-run counts as each <testsuite>, so a run
+    that aborted (errors) is never missing from the totals.
+    """
     suites = [render_junit(m).split("\n", 1)[1].strip() for m in manifests]
-    tests = sum(len(m.get("steps", [])) for m in manifests)
-    failures = sum(
-        1 for m in manifests
-        for s in m.get("steps", [])
-        if (m.get("status") != "replayed"
-            and _is_junit_failure(s, recovered_retry_indexes(m))))
+    counts = [junit_counts(m) for m in manifests]
+    tests = sum(c["tests"] for c in counts)
+    failures = sum(c["failures"] for c in counts)
+    errors_total = sum(c["errors"] for c in counts)
     total = sum(s.get("duration_ms", 0)
                 for m in manifests for s in m.get("steps", [])) / 1000
     return ('<?xml version="1.0" encoding="UTF-8"?>\n'
             f'<testsuites tests="{tests}" failures="{failures}" '
+            f'errors="{errors_total}" '
             f'time="{total:.3f}">' + "".join(suites) + "</testsuites>\n")
 
 
@@ -755,13 +803,7 @@ def render_junit(manifest: dict[str, Any]) -> str:
     steps = manifest.get("steps", [])
     prefix_replay = manifest.get("status") == "replayed"
     recovered = recovered_retry_indexes(manifest)
-    failures = (0 if prefix_replay else
-                sum(1 for s in steps if _is_junit_failure(s, recovered)))
-    skipped = (len(steps) if prefix_replay else
-               sum(1 for s in steps
-                   if s.get("status") == "skipped"
-                   or (s.get("status") == "failed"
-                       and s.get("index") in recovered)))
+    counts = junit_counts(manifest)
     total_time = sum(s.get("duration_ms", 0) for s in steps) / 1000
     cases = []
     for step in steps:
@@ -777,18 +819,34 @@ def render_junit(manifest: dict[str, Any]) -> str:
         elif step.get("status") == "failed":
             message = quoteattr(str(step.get("error", "")))
             code = xml_escape(str(step.get("error_code", "")))
-            body = (f'<failure message={message} type="{code}">'
-                    f'{xml_escape(str(step.get("failure_class", "")))}</failure>')
+            tag = "error" if _is_junit_error(step, recovered) else "failure"
+            body = (f'<{tag} message={message} type="{code}">'
+                    f'{xml_escape(str(step.get("failure_class", "")))}</{tag}>')
         elif step.get("status") == "skipped":
             body = (f'<skipped message='
                     f'{quoteattr(str(step.get("skip_reason", "")))}/>')
         cases.append(
             f'<testcase classname={quoteattr(str(suite_name))} '
             f'name={quoteattr(name)} time="{time_s:.3f}">{body}</testcase>')
+    if counts["abort_case"]:
+        primary = manifest.get("primary_error") or {}
+        where = primary.get("command") or "run"
+        if primary.get("line"):
+            where += f" line {primary['line']}"
+        name = f"{primary.get('step_index') or 0:03d} {where} — aborted"
+        message = quoteattr(str(primary.get("error", "")))
+        code = xml_escape(str(primary.get("error_code", "")))
+        cases.append(
+            f'<testcase classname={quoteattr(str(suite_name))} '
+            f'name={quoteattr(name)} time="0.000">'
+            f'<error message={message} type="{code}">'
+            f'{xml_escape(str(primary.get("failure_class", "")))}</error>'
+            '</testcase>')
     return (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
-        f'<testsuite name={quoteattr(str(suite_name))} tests="{len(steps)}" '
-        f'failures="{failures}" skipped="{skipped}" errors="0" '
+        f'<testsuite name={quoteattr(str(suite_name))} tests="{counts["tests"]}" '
+        f'failures="{counts["failures"]}" skipped="{counts["skipped"]}" '
+        f'errors="{counts["errors"]}" '
         f'time="{total_time:.3f}">'
         + "".join(cases) + "</testsuite>\n"
     )

@@ -48,12 +48,17 @@ simulator on its own, so `devices boot` is only needed to start an Android
 emulator up front or to pre-warm a target. `shutdown` refuses any serial that
 is not `emulator-<port>` — it never powers off physical hardware.
 
+An emulator started by `devices boot` is registered as **harness-owned**:
+`doctor` does not list it as an orphan while it runs, and `devices shutdown`
+releases its registry entry, so no stale process warning follows.
+
 ### Android
 
 ```bash
 python3 <autonom-root>/scripts/autonom.py session start --serial emulator-5554 --app-id com.example.app
 python3 <autonom-root>/scripts/autonom.py session launch com.example.app            # resume where it was
 python3 <autonom-root>/scripts/autonom.py session launch com.example.app --fresh    # launcher activity on a cleared task
+python3 <autonom-root>/scripts/autonom.py session launch com.example.app --fresh --activity .MainActivity
 python3 <autonom-root>/scripts/autonom.py session force-stop com.example.app
 python3 <autonom-root>/scripts/autonom.py session clear com.example.app
 python3 <autonom-root>/scripts/autonom.py session stop
@@ -74,6 +79,15 @@ python3 <autonom-root>/scripts/autonom.py session stop
 
 Target flags work before or after the subcommand. A shutdown simulator is booted
 automatically and the response reports `"booted": true` when this call did it.
+
+`session start` refuses with `session_already_active` (naming the live
+session's id and target) while a session is current — run `session stop`
+first; it never replaces a session silently. If `--install` or `--launch`
+fails, the new session is rolled back (`session_rolled_back` names it) so no
+half-built session is left current. A flag that does nothing on the
+platform (`--log-stream` or `--setenv` on Android, `--activity` on iOS) is
+reported in a `flag_ignored_on_platform` warning, and `session uninstall`
+reports a failed uninstall as `ok: false`.
 
 Intent extras that start with `--` must be attached to the flag, or argparse
 reads them as options: `session launch com.example.app --arg=--es --arg=key=value`.
@@ -101,9 +115,11 @@ python3 <autonom-root>/scripts/autonom.py journal --kind note         # only not
 python3 <autonom-root>/scripts/autonom.py journal --verb 'ui tap'     # only taps
 python3 <autonom-root>/scripts/autonom.py note add "login screen renders; password field visible" --task login
 python3 <autonom-root>/scripts/autonom.py note list --task login
+python3 <autonom-root>/scripts/autonom.py journal --session-id <id>   # a finished session's timeline
 ```
 
-The journal is secret-safe (typed text and body/header values are masked) and
+The journal is secret-safe (typed text, secret-bearing flag values in any
+spelling or abbreviation, and every `KEY=VALUE` option value are masked) and
 best-effort (a journal error never fails your command). `ui tree` keeps a
 sequenced file per capture under `trees/`, so the whole run's screens are kept,
 not just the last.
@@ -149,6 +165,7 @@ export AUTONOM_IDB_COMPANION=mac-farm-01:10882
 | Code | Meaning |
 | --- | --- |
 | `ambiguous_target` | more than one ready target; pass `--target` |
+| `session_already_active` | a session is current; `session stop` it before starting another |
 | `idb_required` | iOS `ui` verbs need idb; `screenshot`/`logs`/`open` still work |
 | `ios_boot_failed` | simulator never reached `Booted`; try `xcrun simctl erase <udid>` |
 | `no_active_session` | start one with `session start` |

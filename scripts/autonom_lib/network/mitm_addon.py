@@ -10,8 +10,8 @@ running the rest of Autonom. It therefore:
 - keeps its pure helpers importable **without** mitmproxy, so the repository's
   own test suite can exercise them directly.
 
-The redaction table below is a by-value copy of `redact.REDACTED_HEADERS`; a unit
-test asserts the two never diverge.
+The redaction tables below are by-value copies of `redact.REDACTED_HEADERS` and
+`redact.SENSITIVE_QUERY_KEYS`; unit tests assert they never diverge.
 """
 from __future__ import annotations
 
@@ -37,6 +37,14 @@ SENSITIVE_FIELDS = (
     "id_token", "api_key", "apikey", "client_secret", "authorization",
     "session_key", "private_key", "credential", "otp", "pin",
 )
+
+SENSITIVE_QUERY_KEYS = frozenset({
+    "token", "access_token", "refresh_token", "id_token", "api_key", "apikey",
+    "key", "secret", "client_secret", "password", "passwd", "auth",
+    "authorization", "session", "sessionid", "session_id", "sid", "signature",
+    "sig", "code", "jwt", "bearer",
+    "x_amz_signature", "x_amz_credential", "x_amz_security_token",
+})
 
 
 # --- pure helpers (importable without mitmproxy) ------------------------------
@@ -77,6 +85,77 @@ def scrub_body(text):
     text = re.sub(r'(?i)("(?:' + names + r')"\s*:\s*)"(?:[^"\\]|\\.)*"',
                   r'\1"' + PLACEHOLDER + '"', text)
     return re.sub(r'(?i)\b((?:' + names + r')=)[^&\s]+', r'\1' + PLACEHOLDER, text)
+
+
+def _query_key(name):
+    """Normalised query key: decoded, lower-case, `-` as `_`, no `[..]` suffix.
+
+    `Access-Token`, `access%5Ftoken`, `token[]` and `Token[0]` all compare as
+    their plain form. Decoding uses a regex rather than `urllib` so the addon's
+    by-value copy (which may import only a fixed stdlib set) stays identical.
+    """
+    import re
+
+    decoded = re.sub(r"%([0-9A-Fa-f]{2})", lambda m: chr(int(m.group(1), 16)),
+                     name.replace("+", " "))
+    decoded = re.sub(r"(\[[^\]]*\])+$", "", decoded.strip())
+    return decoded.strip().lower().replace("-", "_")
+
+
+def is_sensitive_query_key(name):
+    return _query_key(name) in SENSITIVE_QUERY_KEYS
+
+
+def _scrub_pairs(text):
+    """Mask sensitive values in an `a=1&b=2` string, byte-for-byte otherwise."""
+    parts = []
+    for part in text.split("&"):
+        name, equals, _value = part.partition("=")
+        if equals and is_sensitive_query_key(name):
+            part = "%s=%s" % (name, PLACEHOLDER)
+        parts.append(part)
+    return "&".join(parts)
+
+
+def _scrub_userinfo(url):
+    """`scheme://user:pw@host` keeps the user and loses the password."""
+    scheme, sep, rest = url.partition("://")
+    if not sep:
+        return url
+    end = len(rest)
+    for mark in "/?#":
+        position = rest.find(mark)
+        if position != -1:
+            end = min(end, position)
+    authority = rest[:end]
+    if "@" not in authority:
+        return url
+    userinfo, host = authority.rsplit("@", 1)
+    if ":" not in userinfo:
+        return url
+    user = userinfo.split(":", 1)[0]
+    return "%s://%s:%s@%s%s" % (scheme, user, PLACEHOLDER, host, rest[end:])
+
+
+def scrub_url(url):
+    """Redact credentials in a URL; keep every other byte of it.
+
+    `https://h/p?token=abc&page=2` becomes `https://h/p?token=<redacted>&page=2`.
+    The fragment gets the same treatment, since OAuth implicit flows carry
+    `#access_token=...` there, and a `user:password@` userinfo loses the
+    password.
+    """
+    if not url or not isinstance(url, str):
+        return url
+    url = _scrub_userinfo(url)
+    if "?" not in url and "#" not in url:
+        return url
+    base, hash_mark, fragment = url.partition("#")
+    head, question, query = base.partition("?")
+    result = head + (question + _scrub_pairs(query) if question else "")
+    if hash_mark:
+        result += hash_mark + _scrub_pairs(fragment)
+    return result
 
 
 def preview(body, limit: int = PREVIEW_LIMIT):
@@ -220,7 +299,8 @@ class AutonomRecorder:
             "started_at_ms": int(started * 1000),
             "finished_at_ms": int(ended * 1000),
             "method": flow.request.method,
-            "url": flow.request.pretty_url,
+            # Mock matching above sees the raw URL; only the record is scrubbed.
+            "url": scrub_url(flow.request.pretty_url),
             "host": flow.request.host,
             "path": flow.request.path.split("?", 1)[0],
             "status": flow.response.status_code,
@@ -236,6 +316,11 @@ class AutonomRecorder:
                 "response_bytes": len(flow.response.content or b""),
             },
         }
+
+        for key, header in (("request_headers_preview", "referer"),
+                            ("response_headers_preview", "location")):
+            if record[key].get(header):
+                record[key][header] = scrub_url(record[key][header])
 
         if self.capture_bodies:
             bodies = os.path.join(self.directory, "bodies")

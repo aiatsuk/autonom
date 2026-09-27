@@ -47,12 +47,24 @@ class LocalDeviceSession:
             except errors.AutonomError:
                 idb_state = "missing"
         ui_ready = is_android or idb_state == "ready"
+        # The tree and input are separate on iOS: an idb_companion that cannot
+        # load SimulatorKit (Xcode 27) still describes the screen but fails
+        # every tap. AXe, when present, carries input instead.
+        input_state, input_reason = (
+            ("available", None) if ui_ready else ("unavailable", "UI backend is not ready"))
+        hid = (tooling.get("idb") or {}).get("hid") or {}
+        if not is_android and ui_ready and hid.get("ready") is False:
+            from . import ui_ios
+            if ui_ios.find_axe(self.target):
+                input_state, input_reason = "degraded", "HID input routes through AXe"
+            else:
+                input_state = "unavailable"
+                input_reason = hid.get("reason") or "idb HID is not ready"
         simulated = self._device_class() == "simulator"
         values: dict[str, tuple[str, str | None]] = {
             "ui.accessibility": ("available" if ui_ready else "unavailable",
                                  None if ui_ready else "idb is not ready"),
-            "ui.input": ("available" if ui_ready else "unavailable",
-                         None if ui_ready else "UI backend is not ready"),
+            "ui.input": (input_state, input_reason),
             "screenshots": ("available", None),
             "screen.stream": ("available", None),
             "logs": ("available", None),
