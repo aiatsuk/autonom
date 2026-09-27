@@ -4,8 +4,10 @@
 The serial `unittest discover` took seven minutes, and `tty_guard.py` ran the
 whole suite a second time. This runner does both jobs in one pass:
 
-- every test module runs in its own interpreter, `os.cpu_count()` at a time
-  (`AUTONOM_TEST_JOBS` overrides), slowest modules first;
+- every test module runs in its own interpreter, and the slowest modules are
+  split further into one interpreter per TestCase class; units start slowest
+  first, twice `os.cpu_count()` at a time (`AUTONOM_TEST_JOBS` overrides) —
+  most tests wait on fake devices and timeouts rather than burn CPU;
 - each worker gets its own scratch `AUTONOM_HOME`, so modules never share a
   machine store;
 - each worker loads `test_aa_env_snapshot` first and `test_zz_env_hygiene`
@@ -42,8 +44,25 @@ sys.stdin = TtyThatRefusesToBeRead()
 unittest.main(module=None, argv=["worker", *sys.argv[1:]])
 """
 
-# Modules measured slowest; started first so the long tail runs alongside
-# the short ones instead of after them.
+# Lists the TestCase classes of the named modules, one `module.Class` a line.
+LISTER = """
+import sys, unittest
+sys.path.insert(0, {tests!r})
+def walk(suite):
+    for item in suite:
+        if isinstance(item, unittest.TestSuite):
+            yield from walk(item)
+        else:
+            yield type(item).__module__ + "." + type(item).__qualname__
+seen = []
+for name in walk(unittest.defaultTestLoader.loadTestsFromNames(sys.argv[1:])):
+    if name not in seen:
+        seen.append(name)
+print("\\n".join(seen))
+"""
+
+# Modules measured slowest: split per class and started first, so the long
+# tail runs alongside the short ones instead of after them.
 SLOW_FIRST = (
     "test_fix_ios_logs_uuid", "test_cli_hardening", "test_capture_hardening",
     "test_flow_executor", "test_network", "test_device_sweep_fixes",
@@ -66,6 +85,25 @@ def order(modules: list[str]) -> list[str]:
     return sorted(modules, key=lambda name: (rank.get(name, len(rank)), name))
 
 
+def units(modules: list[str]) -> list[str]:
+    """Modules in SLOW_FIRST become one unit per TestCase class."""
+    slow = [name for name in modules if name in SLOW_FIRST]
+    if not slow:
+        return modules
+    listed = subprocess.run(
+        [sys.executable, "-c", LISTER.format(tests=str(TESTS)), *slow],
+        cwd=TESTS, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+        check=True,
+    ).stdout.split()
+    classes: dict[str, list[str]] = {}
+    for name in listed:
+        classes.setdefault(name.partition(".")[0], []).append(name)
+    result: list[str] = []
+    for module in modules:
+        result.extend(classes.get(module) or [module])
+    return result
+
+
 def run_module(module: str) -> tuple[str, int, str, float]:
     home = tempfile.mkdtemp(prefix="autonom-test-")
     env = {**os.environ, "AUTONOM_HOME": home}
@@ -84,12 +122,13 @@ def run_module(module: str) -> tuple[str, int, str, float]:
 
 def main(argv: list[str]) -> int:
     modules = order(argv or discover())
-    jobs = int(os.environ.get("AUTONOM_TEST_JOBS") or os.cpu_count() or 2)
+    work = units(modules)
+    jobs = int(os.environ.get("AUTONOM_TEST_JOBS") or 2 * (os.cpu_count() or 1))
     started = time.monotonic()
     failed: list[str] = []
     total = skipped = 0
     with ThreadPoolExecutor(max_workers=max(1, jobs)) as pool:
-        for module, code, output, seconds in pool.map(run_module, modules):
+        for module, code, output, seconds in pool.map(run_module, work):
             ran = RAN.search(output)
             total += int(ran.group(1)) if ran else 0
             skip = SKIPPED.search(output.rsplit("\n", 3)[-2] if output else "")
@@ -100,8 +139,8 @@ def main(argv: list[str]) -> int:
                 failed.append(module)
                 print(output, flush=True)
     elapsed = time.monotonic() - started
-    print(f"\nRan {total} tests (incl. env guards) in {len(modules)} modules, "
-          f"{jobs} jobs, {elapsed:.1f}s; skipped={skipped}.")
+    print(f"\nRan {total} tests (incl. env guards) in {len(modules)} modules "
+          f"({len(work)} units), {jobs} jobs, {elapsed:.1f}s; skipped={skipped}.")
     if failed:
         print("FAILED modules: " + ", ".join(failed), file=sys.stderr)
         return 1

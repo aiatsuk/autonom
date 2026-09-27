@@ -22,7 +22,7 @@ done < <(find plugins tests -type f -name '*.mjs' -print0)
 # One module per process, in parallel, each with its own AUTONOM_HOME and a
 # stdin that claims to be a TTY and raises on read (the tty_guard contract),
 # so a test that would block a developer's terminal fails here. Set
-# AUTONOM_TEST_JOBS to change the worker count (default: CPU count).
+# AUTONOM_TEST_JOBS to change the worker count (default: twice the CPU count).
 python3 tests/run_parallel.py
 
 node --test tests/*.test.mjs

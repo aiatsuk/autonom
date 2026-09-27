@@ -338,7 +338,8 @@ listed in `docs/COMPATIBILITY.md`.
 
 ### Changed
 - `run_checks.sh` runs the unit suite through `tests/run_parallel.py`: one
-  module per process, CPU-count workers (`AUTONOM_TEST_JOBS`), a scratch
+  module per process (the slowest split per TestCase class), twice-CPU-count
+  workers (`AUTONOM_TEST_JOBS`), a scratch
   `AUTONOM_HOME` each, the environment guards around every module, and the
   `tty_guard` refusing stdin in every worker. One pass replaces the serial
   suite plus its second `tty_guard` pass: about 70 s instead of 14 minutes
