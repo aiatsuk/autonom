@@ -244,6 +244,11 @@ the release that will carry it; the version is not bumped until then.
   (`.github/workflows/release.yml`).
 - Releases are built by `scripts/build_release.sh` (tarball + `SHA256SUMS`)
   and published from tags; `CHANGELOG.md` carries the notes.
+- Supported interpreter: Python >= 3.14 (`MIN_PYTHON` in `scripts/autonom.py`,
+  the only version CI tests). Raising it is a breaking change recorded here and
+  in `CHANGELOG.md`; it was raised from 3.11 to 3.14 in the release after
+  0.30.0. An older interpreter gets a `tool_missing` envelope (exit 2), never a
+  traceback.
 
 ## Forward commitments
 

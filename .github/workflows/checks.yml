@@ -19,25 +19,16 @@ jobs:
       - name: Lint workflow files
         run: docker run --rm -v "$PWD:/repo" --workdir /repo rhysd/actionlint:latest -color
 
+  # Python 3.14 is the minimum supported version (scripts/autonom.py
+  # MIN_PYTHON), so one Linux leg covers it; it also runs the tty_guard pass.
   checks:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            python: "3.11"
-            skip_tty_guard: "1"
-          # The one leg that also re-runs the suite under tty_guard.
-          - os: ubuntu-latest
-            python: "3.14"
-            skip_tty_guard: "0"
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
     timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.python }}
+          python-version: "3.14"
       - uses: actions/setup-node@v4
         with:
           # import.meta.dirname in tests/browser-bridge.test.mjs needs >= 20.11.
@@ -53,7 +44,7 @@ jobs:
       - name: Run the full check suite
         env:
           AUTONOM_REQUIRE_SHELLCHECK: "1"
-          AUTONOM_SKIP_TTY_GUARD: ${{ matrix.skip_tty_guard }}
+          AUTONOM_SKIP_TTY_GUARD: "0"
         run: ./scripts/run_checks.sh
 
   # macOS is the slowest and most expensive leg: run it on main only. Pull
