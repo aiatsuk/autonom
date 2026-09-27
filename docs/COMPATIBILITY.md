@@ -114,6 +114,63 @@ strengthened, never silently weakened.
   to `"manual"`, so the two no longer contradict each other (`mechanism`
   names what was automated). `network status` keeps `attached` as a bool or
   `"unknown"` exactly as before.
+- **Transparent Android capture is additive.** `network attach --system-ca`
+  answers `mode: "transparent"` with `capture_mode: "transparent"`,
+  `http_proxy_routed`, and `system_ca` (`{installed, hash, api, method,
+  reversible, verified, checked_via}`); the app-proxy path now also carries
+  `capture_mode: "app_proxy"` in the session network record. `network status`
+  gains `capture_mode` (and, on the transparent path, `system_ca` and
+  `http_proxy_routed`). `devices boot --http-proxy HOST:PORT` adds `http_proxy`
+  to the boot payload. No existing key changed type or meaning. The refusals
+  reuse the existing `unsupported_capability` code (never a new code) with a
+  `capability` extra: `network.system_ca` on a non-rootable / Play image
+  (`reason: adb_root_refused|adb_root_unavailable|physical_device`), and
+  `network.transparent_capture` when the emulator was not booted proxy-routed
+  (`reason: emulator_not_proxy_routed`, with `expected`/`observed`) or while an
+  app-proxy attach is active (`reason: app_proxy_attached`, with
+  `device_proxy`; `network detach` restores the device's saved global proxy
+  first — switching modes on top of it would lose that value).
+- **`network status` in transparent mode** answers `attached: true` with a new
+  additive `evidence` value `"transparent_proxy"`, `target_flow_count ==
+  recent_flow_count`, and `unattributed_flow_count: 0`, while the process
+  registry still shows the session's emulator booted routed through the
+  recorded proxy (a registry read, never a device call). Every flow on the
+  proxy is then *counted* as the device's regardless of its `client_ip` (all
+  `127.0.0.1` by design); a host process using the port would be counted too,
+  which is the accepted default on a dedicated test host. The loopback
+  attribution heuristic (`scripts/autonom_lib/network/attachment.py`) is
+  skipped only in that case. Once the route is gone (`devices shutdown`, or a
+  reboot without `--http-proxy`) status answers `attached: false` with the
+  added `evidence` value `"transparent_route_gone"` and a `reason` (unless a
+  guest-network `10.0.2.x` flow still proves attachment, as on the app-proxy
+  path); loopback
+  flows are unattributed again, and the device proxy setting is not read
+  (transparent mode never wrote one). `network requests` never filtered by
+  client attribution, so it lists these flows either way; `attachment.py` value
+  types are unchanged (`transparent_proxy` and `transparent_route_gone` are
+  added `evidence` strings).
+- **`system_ca_unverified`** is an added `warnings[].code` (never an
+  `error_code`, so not in `errors.py`): `network attach --system-ca` installed
+  the CA but could not confirm it from a zygote mount namespace. The attach
+  still stands (`attached: true`) with `system_ca.verified: false` — HTTP is
+  captured and the change is reversible.
+- **Verification scope.** The transparent path is verified live only on
+  **API >= 34** (APEX conscrypt, `method: apex_conscrypt`). The API < 34 path
+  (`method: system_cacerts`, the `/system/etc/security/cacerts` remount) is
+  implemented but **not yet verified on a device**; it is documented as such and
+  not claimed to work.
+- **A recorded flow's `host` is the requested name.** The addon
+  (`scripts/autonom_lib/network/mitm_addon.py`) used to record
+  `flow.request.host`, which is the CONNECT target; under the emulator's
+  `-http-proxy` every CONNECT names an IP, so `host` read `130.193.59.68` while
+  the app asked for `backend.woolbox.app`, and `network requests list --host` and
+  `network mock add --host` both missed every flow. `host` (and host-based mock
+  matching) now use mitmproxy's `pretty_host` — the Host header / `:authority`,
+  falling back to `request.host`. When the CONNECT target is a literal IP that
+  differs from the name, it is kept in an additive `server_ip` field. The key
+  set and type are unchanged; the value differs only where the Host header and
+  the CONNECT target disagree (in practice, the transparent path). Flows recorded
+  earlier keep their stored `host`.
 
 ### Behaviour and value changes in the live-testing fix round
 

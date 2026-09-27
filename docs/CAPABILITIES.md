@@ -8,7 +8,7 @@ Legend: ✅ shipped · ⚠️ partial · 🔜 planned · ❌ not planned for nea
 | --- | --- | --- | --- |
 | Agent-portable skills (Codex / Claude / Grok) | ✅ | ✅ | install via marketplace or `install_skills.sh` |
 | Unified device listing | ✅ | ✅ | `autonom devices`; each entry has a `running` flag |
-| Boot / shut down a target | ✅ | ✅ | `devices boot --avd`/`--udid`, `devices shutdown`; refuses hardware |
+| Boot / shut down a target | ✅ | ✅ | `devices boot --avd`/`--udid`, `devices shutdown`; refuses hardware. `devices boot --avd X --http-proxy HOST:PORT` (Android) routes ALL of the emulator's traffic through a proxy at launch — the launch-time flag transparent capture needs |
 | Bootable AVD discovery | ✅ | — | `devices` reports an `avds` array on Android, plus `avd_profiles` (hardware profile, screen, density, API) and the `avd` a running emulator booted from |
 | Explicit multi-target selection | ✅ | ✅ | `--platform` / `--target`; `--serial` and `--udid` are aliases |
 | Guided first run | ✅ | ✅ | `autonom tour` — what the harness has, the workflow, this Mac's targets, and an offer to boot one and walk three screens into Settings with per-step screenshots, hierarchies and logs, an HTML report and a written account (`--run`, `--human`) |
@@ -41,7 +41,8 @@ Legend: ✅ shipped · ⚠️ partial · 🔜 planned · ❌ not planned for nea
 | App-container file access | ✅ | ✅ | `autonom file ls\|pull`, confined to the container; a release/system app refuses with `app_not_debuggable` |
 | Remote target host | — | ✅ | idb client can drive a companion on another Mac: `--idb-host/--idb-port` or `AUTONOM_IDB_COMPANION` add `--companion host:port` to every idb call |
 | Emulator browser mirror | ✅ | ⚠️ | `canvas serve` (`android-emulator-browser` skill). iOS: frames are polled `simctl io screenshot` PNGs (no H.264 stream; the `screenrecord` transport is Android-only), and taps, drags and ASCII text go through the same action bridge as `ui` (idb, or AXe); the Android key buttons have no iOS equivalent and are refused. The node bridge runs supervised, registered to the target's session |
-| Network capture (HTTP/HTTPS) | ✅ | ⚠️ | mitmproxy, loopback-only, consent-gated; `network status` counts a flow as the target's only when its client is the target (`target_flows`) — the iOS Simulator shares the host's network stack, so its traffic and a host `curl` are indistinguishable (`host_traffic_indistinguishable`), and an Android device that cannot be read is `setting_unreadable`; `persistent_mocks_active` is raised by `network start`, `network status` and `doctor` |
+| Network capture (HTTP/HTTPS) | ✅ | ⚠️ | mitmproxy, loopback-only, consent-gated; `network status` counts a flow as the target's only when its client is the target (`target_flows`) — the iOS Simulator shares the host's network stack, so its traffic and a host `curl` are indistinguishable (`host_traffic_indistinguishable`), and an Android device that cannot be read is `setting_unreadable`; `persistent_mocks_active` is raised by `network start`, `network status` and `doctor`. `network status` reports `capture_mode` (`transparent`/`app_proxy`) and, on the transparent path, the installed `system_ca` |
+| Transparent Android capture (no app change) | ✅ | — | `network attach --system-ca` on a rooted `google_apis` emulator booted with `devices boot --http-proxy` to the session proxy: installs the MITM CA into the SYSTEM trust store (reversible tmpfs + zygote mount-namespace bind) and verifies it from a zygote namespace (`system_ca.verified`), so even Flutter `dart:io` and pinned-store traffic are captured with zero app modification. **Verified live on API ≥ 34** (APEX conscrypt); the API < 34 `/system/etc/security/cacerts` remount is implemented but not yet device-verified. In this mode every flow on the proxy is counted as the device's (they arrive from `127.0.0.1` by design; a host process using the port would be counted too, which is acceptable on a dedicated test host), so `network status` answers `attached: true`, `evidence: transparent_proxy`, `unattributed_flow_count: 0` — but only while the process registry still shows the emulator booted routed through the proxy; after a shutdown or an unrouted reboot it answers `attached: false`, `evidence: transparent_route_gone`. `network requests` lists all flows. `--system-ca` is refused (`reason: app_proxy_attached`) while an app-proxy attach is active; `network detach` first. A flow's `host` is the requested name (Host header), not the CONNECT IP (kept as `server_ip`), so `--host` filters and `--host` mocks match. Refuses (`unsupported_capability`, `network.system_ca`) on a non-rootable / Play image, and (`network.transparent_capture`) when the emulator was not booted proxy-routed. The device-proxy + user-CA path stays as a fallback with the honest warning that Flutter/pinned traffic is not captured that way |
 | Response mocking | ✅ | ⚠️ | exact URL or glob + method/host; first enabled rule wins |
 | Persistent mock registry | ✅ | ✅ | machine-level, survives restarts; full CRUD; reported by `doctor` |
 | Process reaping | ✅ | ✅ | `processes` / `cleanup`, machine-wide; finds orphan proxies by signature when the registry is lost; the iOS log-stream writer, `canvas serve` pairs, and idb companions Autonom's own idb calls started are registered (`background`); every kill — `cleanup`, `session stop`, `record stop`, the log-stream restart — first checks the pid still runs the recorded command (`pid_reused`, `unverified_skipped`: whole arguments, never substrings; a companion row names its simulator's UDID; an empty signature verifies nothing), and a group whose recorded leader is gone is only reported (`group_remnants`, `group_remnant_left_running`), never signalled; registered command lines are redacted |
@@ -106,6 +107,7 @@ after the verb. Two iOS input overrides are global and go before the verb:
 autonom version
 autonom devices [list] [--platform android|ios]
 autonom devices boot [--avd NAME | --target ID] [--no-wait] [--timeout S] [--emulator PATH]
+                     [--http-proxy HOST:PORT]
 autonom devices shutdown [--target ID]
 autonom doctor [--strict] [--mitmdump PATH]
 autonom tour [--run] [--avd NAME] [--flow PATH] [--human] [--shutdown]
@@ -234,7 +236,7 @@ autonom file ls [remote] [--app-id ID] | file pull <remote> [--app-id ID] [--out
 
 autonom network start --i-understand-mitm [--port N] [--capture-bodies] [--mitmdump PATH]
                       [--ignore-hosts REGEX] [--intercept-connectivity-checks]
-autonom network attach --i-understand-mitm [--install-ca] [--no-network-cycle]
+autonom network attach --i-understand-mitm [--install-ca] [--no-network-cycle] [--system-ca]
 autonom network detach|stop|status
 autonom network requests list [--host --method --status --path --since --mocked --max --since-id]
 autonom network requests follow [--host --method --status --path --mocked] [--interval S]

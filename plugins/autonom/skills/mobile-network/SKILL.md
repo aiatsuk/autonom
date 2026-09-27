@@ -66,11 +66,94 @@ throws away rules you may want tomorrow. Use `clear` only to actually delete the
 `session stop` performs detach and stop best-effort anyway, in that order, so the
 device is never left pointing at a dead proxy.
 
+## Transparent capture on Android (no app change)
+
+The workflow above sets the device's **global HTTP proxy** and trusts the CA in
+the **user** store. That is enough for a native app with a debug
+`network_security_config`, but it captures **nothing** from a Flutter app:
+`dart:io` ignores the Android global proxy, and apps targeting API 24+ do not
+trust user CAs. The fix routes the whole emulator through the proxy at launch and
+puts the CA in the **system** store — with **zero changes to the app**:
+
+`-http-proxy` is a **launch-time** flag, so pick the proxy port up front and pass
+the *same* port to the boot and to `network start`. The emulator tolerates the
+proxy being down at boot and connects once `network start` brings it up on that
+fixed port. This is the exact order verified live on a rooted API 37 emulator:
+
+```bash
+# 1. Boot a dedicated, rootable AVD ROUTED through a chosen port (here 18091).
+#    `-http-proxy` cannot be injected into an already-running emulator.
+python3 <autonom-root>/scripts/autonom.py devices boot --avd Autonom_Mitm_API37 --http-proxy 127.0.0.1:18091
+# -> note the serial it reports (e.g. emulator-5554); use it as <serial> below
+
+# 2. Own a session on that emulator
+python3 <autonom-root>/scripts/autonom.py session start --serial <serial> --app-id com.example.app
+
+# 3. Start the proxy on the SAME port the emulator was routed to
+python3 <autonom-root>/scripts/autonom.py network start --port 18091 --i-understand-mitm
+
+# 4. Install the MITM CA into the SYSTEM trust store (reversible; needs root)
+python3 <autonom-root>/scripts/autonom.py network attach --system-ca --i-understand-mitm --serial <serial>
+
+# 5. Launch/drive the app, then look — Flutter/Dio requests now decrypt
+python3 <autonom-root>/scripts/autonom.py session launch com.example.app
+python3 <autonom-root>/scripts/autonom.py network requests list
+```
+
+`network start` is session-bound, which is why the session is owned first (step
+2) and the port is fixed by hand rather than auto-chosen. `network attach
+--system-ca` verifies the install from a zygote mount namespace and reports
+`system_ca.verified`; a failed verify is a `system_ca_unverified` warning, not a
+hard failure (HTTP is still captured, and the change is reversible).
+
+**Hard constraint — the image must be rootable.** Use a `google_apis` system
+image (userdebug: `adb root` succeeds or adbd already runs as uid 0), **not** a
+`google_apis_playstore` image and not a production build — those block root, and
+`network attach --system-ca` then refuses with `unsupported_capability`
+(`capability: network.system_ca`). Use a **dedicated test AVD**; the change is a
+tmpfs plus a bind into the zygote mount namespaces, and a **reboot clears all of
+it** — never the host, never a real device. **Verified live on API >= 34** (the
+APEX conscrypt store, `apex_conscrypt`); the API < 34 path uses the
+`/system/etc/security/cacerts` remount instead and is **not yet verified on a
+device**.
+
+If the emulator was not booted routed to this session's proxy, `network attach
+--system-ca` refuses with `unsupported_capability`
+(`capability: network.transparent_capture`) and tells you to reboot with
+`devices boot --avd X --http-proxy <session proxy>` — you cannot inject
+`-http-proxy` into a running emulator. It also refuses (`reason:
+app_proxy_attached`) while an app-proxy `network attach` is active: run `network
+detach` first, so the device's previous global proxy is restored.
+
+In transparent mode every flow on the proxy is **counted as the device's**, so
+`network status` answers `attached: true` with `evidence: "transparent_proxy"`,
+`target_flow_count == recent_flow_count`, and `unattributed_flow_count: 0`. The
+flows all arrive from `127.0.0.1` by design, and any host process can reach the
+proxy on loopback too — a `curl` through its port would be counted as well. That
+is a reasonable default on a **dedicated test host**, where nothing else uses
+the port; keep it that way while you gather evidence. The count holds only while
+the process registry still shows this emulator booted routed through the proxy:
+after `devices shutdown`, or a reboot without `--http-proxy`, `network status`
+answers `attached: false` with `evidence: "transparent_route_gone"` and a
+`reason` (unless a guest-network `10.0.2.x` flow still proves attachment),
+and loopback flows are unattributed again. `network requests` lists
+**all** captured flows. `network status` also reports `capture_mode` and the
+installed `system_ca` (`verified`, `checked_via`). A fresh `adb shell ls
+/apex/com.android.conscrypt/cacerts` will **not** show the cert (a different
+mount namespace); Autonom verifies from a zygote namespace with `nsenter`.
+
+The emulator's `-http-proxy` opens every tunnel as `CONNECT <ip>:443`, so the
+connection target is an IP. Each flow's `host` is still the **name** the app
+asked for (the Host header), and the IP is kept in `server_ip`. So `network
+requests list --host backend.example.com` and `network mock add --host
+backend.example.com` work as usual in transparent mode.
+
 ## Attaching, per platform
 
 | Platform | How | Coverage |
 | --- | --- | --- |
-| Android emulator | sets the device's global HTTP proxy to `10.0.2.2:<port>` | full |
+| Android emulator (transparent) | `--system-ca` on an emulator booted with `devices boot --http-proxy`: routes at launch + system-store CA | full, incl. Flutter/`dart:io` (see the section above); needs a rootable `google_apis` image |
+| Android emulator (app-proxy) | sets the device's global HTTP proxy to `10.0.2.2:<port>` + user-store CA (`--install-ca`) | native apps with a debug `network_security_config`; **not** Flutter/`dart:io`, **not** pinned traffic |
 | Android physical | **refused** — the proxy is loopback-only and a physical device cannot reach it; widening the bind would expose an open proxy | none |
 | iOS Simulator | injects proxy environment variables into apps launched by `session launch` | clients honouring proxy env vars |
 
@@ -102,7 +185,11 @@ system-wide change whose blast radius is the operator's whole machine.
 
 Decrypting TLS needs the app to trust the MITM CA.
 
-- **Preferred, no CA install:** point a **debug build** at a
+- **Android, no app change at all:** transparent capture (see "Transparent
+  capture on Android" above) — `network attach --system-ca` on a rooted emulator
+  booted with `devices boot --http-proxy`. This is the only path that captures a
+  release-config Flutter app without rebuilding it.
+- **Preferred when you can rebuild:** point a **debug build** at a
   `network_security_config` (Android) that trusts user CAs, or use a debug trust
   configuration on iOS.
 - **iOS Simulator:** `--install-ca` runs `simctl keychain add-root-cert`, scoped to

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from typing import Any
 
@@ -225,6 +226,37 @@ def client_ip(flow):
     return None
 
 
+# An IPv4 dotted quad, or anything IPv6-shaped (hex groups with a colon,
+# optionally bracketed). A hostname never contains a colon.
+_IP_LITERAL = re.compile(r"^(?:\d{1,3}(?:\.\d{1,3}){3}|\[?[0-9A-Fa-f]*:[0-9A-Fa-f:.]*\]?)$")
+
+
+def flow_host(flow) -> str:
+    """The host the client asked for: the Host header, not the CONNECT target.
+
+    `request.host` is whatever the CONNECT named. Under the emulator's
+    `-http-proxy` every CONNECT names an IP, so it read `130.193.59.68` while the
+    app asked for `backend.woolbox.app` — and `requests list --host` and a
+    `--host` mock both missed every flow. mitmproxy's `pretty_host` prefers the
+    Host header (`:authority` on HTTP/2), which is the name. Falls back to
+    `request.host` when a flow has no `pretty_host`.
+    """
+    request = flow.request
+    return getattr(request, "pretty_host", None) or request.host
+
+
+def server_ip(flow):
+    """The CONNECT target when it is a literal IP other than the recorded host.
+
+    Kept (additively) so the address the connection actually went to is not
+    lost once `host` is the requested name; None when the two agree.
+    """
+    raw = getattr(flow.request, "host", None)
+    if isinstance(raw, str) and raw and raw != flow_host(flow) and _IP_LITERAL.match(raw):
+        return raw
+    return None
+
+
 # --- addon --------------------------------------------------------------------
 
 
@@ -270,8 +302,9 @@ class AutonomRecorder:
             self.capture_bodies = bool(ctx.options.autonom_capture_bodies)
 
     def request(self, flow) -> None:
+        # Host-based rules match the requested name, never the CONNECT IP.
         rule = select_rule(
-            self._load_rules(), flow.request.method, flow.request.pretty_url, flow.request.host
+            self._load_rules(), flow.request.method, flow.request.pretty_url, flow_host(flow)
         )
         if not rule:
             return
@@ -315,7 +348,9 @@ class AutonomRecorder:
             "method": flow.request.method,
             # Mock matching above sees the raw URL; only the record is scrubbed.
             "url": scrub_url(flow.request.pretty_url),
-            "host": flow.request.host,
+            # The requested name (Host header), so `--host` filters work
+            # when the CONNECT target is an IP (the emulator's -http-proxy).
+            "host": flow_host(flow),
             "path": flow.request.path.split("?", 1)[0],
             "status": flow.response.status_code,
             "duration_ms": max(0, int((ended - started) * 1000)),
@@ -333,6 +368,10 @@ class AutonomRecorder:
                 "response_bytes": len(flow.response.content or b""),
             },
         }
+
+        connected_ip = server_ip(flow)
+        if connected_ip:
+            record["server_ip"] = connected_ip
 
         for key, header in (("request_headers_preview", "referer"),
                             ("response_headers_preview", "location")):

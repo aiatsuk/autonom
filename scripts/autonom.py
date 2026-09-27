@@ -288,6 +288,7 @@ def cmd_devices_boot(args: argparse.Namespace) -> int:
         detail = emulator_mod.boot_avd(
             emulator_bin, adb_path, avd,
             wait=not args.no_wait, timeout=args.timeout,
+            http_proxy=getattr(args, "http_proxy", None),
         )
         return emit({"ok": True, "platform": ANDROID, **detail}, as_json=True)
     if not explicit:
@@ -2203,6 +2204,14 @@ def cmd_network_status(args: argparse.Namespace) -> int:
                 "recent_user_agents"):
         if key in evidence:
             payload[key] = evidence[key]
+    # How this attach captures, and whether the system CA is in place — a
+    # transparent (rooted, `-http-proxy`-routed) attach captures Flutter/pinned
+    # traffic; the app-proxy fallback does not. Additive keys.
+    payload["capture_mode"] = network.get("capture_mode")
+    if network.get("system_ca"):
+        payload["system_ca"] = network.get("system_ca")
+    if network.get("capture_mode") == "transparent" and network.get("http_proxy_routed"):
+        payload["http_proxy_routed"] = network.get("http_proxy_routed")
     mocks_state = mocks_mod.summary()
     idle = _annotate_hits(mocks_mod.active())
     payload["mocks"] = mocks_state
@@ -2228,6 +2237,16 @@ def cmd_network_attach(args: argparse.Namespace) -> int:
         )
     target = _target(args)
     if target.platform == ANDROID:
+        if getattr(args, "system_ca", False):
+            # Transparent capture: the emulator is already routed through the
+            # proxy at launch (`devices boot --http-proxy`); this only installs
+            # the system CA so the proxy can decrypt. Refuses when not routed.
+            detail = device_proxy_android.attach_transparent(
+                target, record, port=state["port"], acknowledged=args.i_understand_mitm
+            )
+            session_mod.save(record)
+            return emit({"ok": True, "mode": "transparent", **detail, **target.identity()},
+                        as_json=True)
         ca_detail = None
         if args.install_ca:
             ca_detail = device_proxy_android.install_ca_certificate(
@@ -4194,6 +4213,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--avd", help="Android AVD name to start ('autonom devices' lists them)")
     p.add_argument("--emulator", help="path to the Android emulator binary")
+    p.add_argument("--http-proxy", metavar="HOST:PORT",
+                   help="route ALL of the emulator's traffic through this proxy at launch "
+                        "(a launch-time flag; needed for transparent 'network attach "
+                        "--system-ca' capture). Android emulator only")
     p.add_argument("--timeout", type=float, default=180.0,
                    help="seconds to wait for the boot to complete")
     p.add_argument("--no-wait", action="store_true",
@@ -4822,6 +4845,11 @@ def build_parser() -> argparse.ArgumentParser:
                         "without it the setting is stored but never applied")
     p.add_argument("--install-ca", action="store_true",
                    help="also seed the CA certificate into the target's trust store")
+    p.add_argument("--system-ca", action="store_true",
+                   help="transparent capture (Android emulator): install the MITM CA into "
+                        "the SYSTEM trust store on a rooted emulator that was booted with "
+                        "'devices boot --http-proxy'. Captures Flutter/pinned-store traffic "
+                        "with no app change; refuses when the emulator is not proxy-routed")
     p.set_defaults(func=cmd_network_attach)
 
     p = network_sub.add_parser("detach", help="restore the target's previous proxy",
