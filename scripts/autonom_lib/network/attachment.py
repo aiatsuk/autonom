@@ -8,6 +8,17 @@ attached.
 
 Only a flow whose *client* is the target counts now:
 
+- **Android emulator, transparent capture.** When the session was attached with
+  ``--system-ca`` (``capture_mode: transparent``) *and* the process registry
+  still shows the session's emulator booted routed through the recorded proxy
+  (``emulator.proxy_routing``), every flow on the proxy is *counted* as the
+  target's, whatever its client address (``evidence: transparent_proxy``).
+  Those flows arrive from loopback by design, and any host process could use
+  the port as well — a ``curl`` through it would be counted too — but on a
+  dedicated test host nothing else is expected to, which makes this the useful
+  default. Once the route is gone (the emulator was shut down, or rebooted
+  without ``--http-proxy``) the flows are judged by the rules below and the
+  answer says why (``evidence: transparent_route_gone``).
 - **Android emulator.** A flow from the guest network (``10.0.2.x``) is the
   emulator's. The emulator's user-mode NAT usually presents guest connections
   to the host as loopback, though, which is indistinguishable from a host
@@ -44,6 +55,31 @@ ANDROID_LOOPBACK = (
     "connections as loopback) or from any host process; they are not "
     "counted as the device's."
 )
+TRANSPARENT_ROUTE_GONE = (
+    "The session was attached transparently, but its emulator is no longer "
+    "registered as booted routed through this proxy (shut down, or rebooted "
+    "without --http-proxy), so loopback flows are no longer counted as the "
+    "device's."
+)
+
+
+def transparent_route_live(record: dict[str, Any]) -> bool:
+    """Is the session's emulator still registered as routed through its proxy?
+
+    A registry read (``emulator.proxy_routing``), never a device call. The
+    record's ``http_proxy_routed`` was true at attach time; after a
+    ``devices shutdown``, or a reboot without ``--http-proxy``, the registry no
+    longer says so, and trusting the old record would count a host ``curl``
+    through the port as the device's.
+    """
+    network = record.get("network") or {}
+    routed = network.get("http_proxy_routed")
+    serial = record.get("target_id") or record.get("serial")
+    if not routed or not serial:
+        return False
+    from .. import emulator  # lazy: keeps this module import-light
+
+    return emulator.proxy_routing(str(serial)) == routed
 
 
 def _normalise(ip: str) -> str:
@@ -117,13 +153,40 @@ def attachment_evidence(
     if flows is None:
         flows, _warnings = store.read_all(record)
     recent = store.filter_flows(flows, since_seconds=since_seconds)
-    mine = attributed_flows(recent, platform)
+    # Transparent capture: while the session's emulator is still registered as
+    # LAUNCHED with `-http-proxy` pointing at this proxy, every flow on the
+    # proxy is counted as the device's, whatever its client address — they all
+    # arrive from 127.0.0.1 by design. A host process could use the port too;
+    # on a dedicated test host that is not expected, so it is the useful
+    # default. The loopback heuristic below is for every other case.
+    transparent = network.get("capture_mode") == "transparent"
+    route_live = transparent and transparent_route_live(record)
+    mine = recent if route_live else attributed_flows(recent, platform)
     result.update(recent_flow_count=len(recent), target_flow_count=len(mine),
                   unattributed_flow_count=len(recent) - len(mine))
     if recent and len(mine) < len(recent):
         result["recent_user_agents"] = _user_agents(
             [flow for flow in recent if flow not in mine])
     if not network.get("attached"):
+        return result
+
+    if route_live:
+        # Attachment is proven by the launch-time route, not by traffic: the
+        # answer is `true` even before the app has made a request.
+        result.update(attached=True, evidence="transparent_proxy")
+        return result
+
+    if transparent:
+        # The route is gone (shut down, or rebooted without --http-proxy), so
+        # the stored record proves nothing any more. A guest-network flow would
+        # still be evidence; otherwise the answer is "not attached". The device
+        # proxy setting is not read: transparent mode never wrote one, so its
+        # absence would be misreported as "cleared externally".
+        if mine:
+            result.update(attached=True, evidence="target_flows")
+        else:
+            result.update(attached=False, evidence="transparent_route_gone")
+        result["reason"] = TRANSPARENT_ROUTE_GONE
         return result
 
     if mine:

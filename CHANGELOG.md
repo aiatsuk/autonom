@@ -28,6 +28,47 @@ with a regression test against the fakes. The non-additive changes are
 listed in `docs/COMPATIBILITY.md`.
 
 ### Added
+- **Transparent Android network capture, no app change** — the fix for
+  live WoolBox (a Flutter/Dio app) capturing zero requests: `dart:io` ignores
+  Android's global `http_proxy` and apps targeting API 24+ do not trust
+  user-store CAs, so the device-proxy + user-CA path saw nothing. Now
+  `devices boot --avd X --http-proxy HOST:PORT` launches the emulator routed
+  through the proxy at the network level (a launch-time flag; it cannot be
+  applied to a running emulator), and `network attach --system-ca` installs
+  the MITM CA into the SYSTEM trust store of a rooted `google_apis` emulator —
+  reversibly (a tmpfs over the store plus a bind into each zygote mount
+  namespace, cleared by a reboot) and API-aware (the APEX conscrypt store with
+  the `nsenter` bind on API≥34, `/system/etc/security/cacerts` below). The
+  install is verified from the zygote mount namespace, not a plain `adb shell`,
+  and the real result rides on `system_ca.verified` / `checked_via`; a failed
+  verify is a non-fatal `system_ca_unverified` warning, not a false success.
+  Because the emulator is routed through the proxy at launch, every flow on the
+  proxy is counted as the device's (all arrive from `127.0.0.1` by design; a
+  host process using the port would be counted too, acceptable on a dedicated
+  test host): `network status` answers `attached: true`, `evidence:
+  transparent_proxy`, `unattributed_flow_count: 0`, and `network requests` lists
+  all flows. That holds only while the process registry still shows the
+  emulator booted routed through the proxy; after `devices shutdown` or an
+  unrouted reboot, status answers `attached: false`, `evidence:
+  transparent_route_gone` (unless a guest-network `10.0.2.x` flow still proves
+  attachment), and loopback flows are unattributed again.
+  `--system-ca` is refused (`reason: app_proxy_attached`) while an app-proxy
+  attach is active, so the device's saved proxy is never lost; `network detach`
+  first. The session records
+  `capture_mode: "transparent"`; `network status` also reports the installed
+  `system_ca`. It refuses cleanly — `unsupported_capability` with a `capability`
+  extra — on a non-rootable / Play image (`network.system_ca`) or when the
+  emulator was not booted proxy-routed (`network.transparent_capture`, with a
+  hint to reboot). Verified live on API ≥ 34 (APEX conscrypt); the API < 34
+  `/system/etc/security/cacerts` remount is implemented but not yet
+  device-verified. The device-proxy + user-CA path stays as the fallback for
+  non-rootable devices, now marked `capture_mode: "app_proxy"`, with the honest
+  warning that Flutter and pinned traffic are not captured that way. A recorded
+  flow's `host` is now the requested name (mitmproxy's `pretty_host`: Host
+  header / `:authority`) instead of the CONNECT target, which is an IP under
+  `-http-proxy`; host-based mocks match on the same name, so `network requests
+  list --host` and `network mock add --host` work in transparent mode. The IP
+  stays available as an additive `server_ip`.
 - **`autonom tour`** — the guided first run: what the harness has (verb
   families), the usual workflow, an inventory of this Mac's emulators and
   simulators, and an offer to boot one, own a session, and walk three

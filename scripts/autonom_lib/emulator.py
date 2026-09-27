@@ -168,6 +168,42 @@ def running_avd_name(adb_path: str, serial: str) -> str | None:
     return None
 
 
+def _proxy_hostport(value: str) -> str:
+    """`HOST:PORT` from either a bare `HOST:PORT` or a full `http(s)://` URL.
+
+    The emulator's launch flag wants a URL, while the registry and the
+    transparent-capture check compare against the loopback `HOST:PORT` the
+    proxy binds to, so both forms have to reduce to the same string.
+    """
+    text = value.strip()
+    for scheme in ("http://", "https://"):
+        if text.lower().startswith(scheme):
+            text = text[len(scheme):]
+            break
+    return text.rstrip("/")
+
+
+def _emulator_proxy_url(value: str) -> str:
+    return f"http://{_proxy_hostport(value)}"
+
+
+def proxy_routing(serial: str) -> str | None:
+    """The `HOST:PORT` an emulator on `serial` was booted routed through.
+
+    `-http-proxy` is a launch-time flag — it cannot be applied to a running
+    emulator — so `devices boot --http-proxy` records it on the harness-owned
+    process entry, and this reads it back by serial. None when the emulator was
+    not booted routed (or was not booted by Autonom), which is exactly when a
+    transparent `network attach --system-ca` must refuse.
+    """
+    for entry in processes.entries():
+        if entry.get("kind") == "emulator" and entry.get("serial") == serial:
+            routed = entry.get("http_proxy")
+            if routed:
+                return str(routed)
+    return None
+
+
 def boot_avd(
     emulator_bin: str,
     adb_path: str,
@@ -175,6 +211,7 @@ def boot_avd(
     *,
     wait: bool = True,
     timeout: float = 180.0,
+    http_proxy: str | None = None,
 ) -> dict[str, Any]:
     known = list_avds(emulator_bin)
     if name not in known:
@@ -184,8 +221,16 @@ def boot_avd(
             f"Available: {', '.join(known) if known else 'none — create one in Android Studio'}.",
         )
     before = {device.serial for device in adb_mod.list_devices(adb_path)}
+    argv = [emulator_bin, "-avd", name]
+    routed_hostport = None
+    if http_proxy:
+        # A launch-time flag that routes ALL of the emulator's TCP through the
+        # host proxy at the network level — no device proxy setting, no app
+        # change. It cannot be injected into a running emulator.
+        routed_hostport = _proxy_hostport(http_proxy)
+        argv += ["-http-proxy", _emulator_proxy_url(http_proxy)]
     child = subprocess.Popen(
-        [emulator_bin, "-avd", name],
+        argv,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -194,9 +239,14 @@ def boot_avd(
     # Owned by the harness, not by a session: `devices boot` has no session
     # directory to point at, and an entry without one used to be classified
     # an orphan — so `cleanup` would have killed an emulator a session was
-    # using. `devices shutdown` removes the entry.
-    processes.register("emulator", child.pid, avd=name, owner=processes.HARNESS_OWNER)
+    # using. `devices shutdown` removes the entry. The proxy the emulator was
+    # routed through is recorded here so `network attach --system-ca` can prove
+    # the transparent path is available before touching the device.
+    processes.register("emulator", child.pid, avd=name, owner=processes.HARNESS_OWNER,
+                       http_proxy=routed_hostport)
     detail: dict[str, Any] = {"avd": name, "pid": child.pid}
+    if routed_hostport:
+        detail["http_proxy"] = routed_hostport
     if not wait:
         return {**detail, "booted": False, "waited": False}
 
