@@ -456,6 +456,14 @@ listed in `docs/COMPATIBILITY.md`.
   redacted.
 
 ### Fixed
+- A process that has exited but whose parent has not reaped it yet (a
+  zombie) no longer counts as alive: stopping one returns at once instead of
+  waiting out the 5 s termination timeout and SIGKILLing a corpse; `logs
+  follow` no longer tails the file of such a dead writer, and `doctor` reports
+  it as a stale background pid.
+- The iOS bounded log writer installs its stop handler before it starts
+  `log stream`: a stop that landed in between used to end the writer and
+  leave `log stream` running with nobody to stop it.
 - `simulator status-bar pin` validates every key and value before the
   first device command (a bad `hhmm` no longer enters demo mode, a bad signal
   level no longer sets the battery); a live pin after a demo pin leaves demo

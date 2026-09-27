@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import time
 import uuid
 from pathlib import Path
@@ -293,6 +294,31 @@ def _collect_if_child(pid: int) -> None:
         pass
 
 
+def _is_zombie(pid: int) -> bool:
+    """True when `pid` has exited but its parent has not reaped it yet.
+
+    A zombie still answers `kill(pid, 0)`, so an exited process whose parent
+    is slow to reap it (or is a long-lived process that never does) looked
+    alive until the termination timeout ran out. Never raises; unknown is
+    "not a zombie"."""
+    try:
+        completed = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)],
+                                   capture_output=True, text=True, timeout=5,
+                                   check=False)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return completed.stdout.strip().startswith("Z")
+
+
+def _exited(pid: int, *, ask_ps: bool = True) -> bool:
+    _collect_if_child(pid)
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return True
+    return ask_ps and _is_zombie(pid)
+
+
 def terminate_pid(pid: int | None, *, timeout: float = 5.0) -> bool:
     """Stop a session-owned background process; returns True when it was alive."""
     if not pid:
@@ -302,22 +328,20 @@ def terminate_pid(pid: int | None, *, timeout: float = 5.0) -> bool:
     except (ProcessLookupError, PermissionError):
         return False
     deadline = time.time() + timeout
+    polls = 0
     while time.time() < deadline:
-        _collect_if_child(pid)
-        try:
-            os.kill(pid, 0)
-        except OSError:
+        # `ps` (the zombie check) every fifth poll: a live process shutting
+        # down is polled every 50 ms, and kill(pid, 0) alone is free.
+        if _exited(pid, ask_ps=polls % 5 == 0):
             return True
+        polls += 1
         time.sleep(0.05)
     try:
         os.kill(pid, 9)
     except OSError:
         pass
-    for _ in range(40):  # SIGKILL is not instant under load: see it land
-        _collect_if_child(pid)
-        try:
-            os.kill(pid, 0)
-        except OSError:
+    for polls in range(40):  # SIGKILL is not instant under load: see it land
+        if _exited(pid, ask_ps=polls % 5 == 0):
             break
         time.sleep(0.05)
     return True
@@ -330,7 +354,7 @@ def pid_alive(pid: int | None) -> bool:
         os.kill(pid, 0)
     except OSError:
         return False
-    return True
+    return not _is_zombie(pid)
 
 
 # --- Android app control (unchanged behavior) --------------------------------

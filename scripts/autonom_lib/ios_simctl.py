@@ -948,9 +948,16 @@ DEFAULT_LOG_MAX_MB = 50
 _BOUNDED_WRITER = r"""
 import os, signal, subprocess, sys
 dest, cap, argv = sys.argv[1], max(1, int(sys.argv[2])), sys.argv[3:]
-child = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                         stderr=subprocess.DEVNULL)
+# The handlers go in before the child is started: a stop that landed between
+# the fork and the handler used to kill only the writer and leave the child
+# (`log stream`) running with nobody to stop it. A stop that arrives while
+# the child is being started is carried out right after.
+child = None
+stopping = []
 def stop(*_):
+    stopping.append(True)
+    if child is None:
+        return
     try:
         child.terminate()
     except OSError:
@@ -965,6 +972,10 @@ def stop(*_):
     os._exit(0)
 for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
     signal.signal(sig, stop)
+child = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                         stderr=subprocess.DEVNULL)
+if stopping:
+    stop()
 out = open(dest, "ab")
 size = out.tell()
 for line in iter(child.stdout.readline, b""):
