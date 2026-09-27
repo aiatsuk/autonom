@@ -500,6 +500,13 @@ listed in `docs/COMPATIBILITY.md`.
 - Registry rows drop detail keys whose value is null and store a `command`
   redacted.
 
+### Removed
+- The `android-smoke` workflow and `scripts/ci/android_smoke.sh`. It booted
+  an API-30 emulator on every push to main only to tap a row in the
+  preinstalled Settings app, touched no app under test and no network path,
+  and never checked that the tap changed the screen. CI now runs no device;
+  device runs stay manual and are judged by before/after artifacts.
+
 ### Fixed
 - A process that has exited but whose parent has not reaped it yet (a
   zombie) no longer counts as alive: stopping one returns at once instead of
