@@ -298,16 +298,20 @@ class ReportEndToEndTests(unittest.TestCase):
         try:
             url = f"http://127.0.0.1:{port}/"
             page = None
-            for _ in range(50):
+            # A deadline, not a try count: a loaded CI runner can take several
+            # seconds to boot the server, and a refused connect returns at once.
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline:
                 try:
                     with urllib.request.urlopen(url, timeout=1) as response:
                         page = response.read().decode("utf-8")
                     break
-                except urllib.error.URLError:
+                except (urllib.error.URLError, ConnectionError, TimeoutError):
                     if process.poll() is not None:
                         break
                     time.sleep(0.05)
-            self.assertIsNotNone(page, process.stderr.read() if process.poll() else "")
+            self.assertIsNotNone(
+                page, process.stderr.read() if process.poll() is not None else "")
             self.assertIn("Replay to this step", page)
             token_match = re.search(r"name='token' value='([^']+)'", page)
             self.assertIsNotNone(token_match)
