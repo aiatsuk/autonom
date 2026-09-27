@@ -12,7 +12,9 @@ read. Any prompt therefore surfaces instantly, naming the test that reached for
 the terminal, instead of hanging a shell. It cannot live inside the suite
 itself: it has to own stdin before any test starts.
 
-Run by `scripts/run_checks.sh`. Exit 0 = no test touches the terminal.
+`tests/run_parallel.py` (what `scripts/run_checks.sh` runs) installs the same
+stdin in every worker; this script remains the serial, standalone form.
+Exit 0 = no test touches the terminal.
 """
 from __future__ import annotations
 

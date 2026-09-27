@@ -279,7 +279,7 @@ of the verb that rejected the flag.
 | `AUTONOM_CORESIMULATOR_DEVICES` | The CoreSimulator `Devices` directory `simulator keyboard` edits (default `~/Library/Developer/CoreSimulator/Devices`); point it at a mounted tree to pin a remote Mac's simulator |
 | `AUTONOM_PREFIX`, `AUTONOM_BIN_DIR` | Installer only: bundle home and the directory `autonom` is linked into |
 | `AUTONOM_REQUIRE_SHELLCHECK` | Dev tooling only: `run_checks.sh` fails instead of skipping the shell lint when shellcheck is missing (set by CI) |
-| `AUTONOM_SKIP_TTY_GUARD` | Dev tooling only: `run_checks.sh` skips its second `tty_guard` pass when set to `1` (CI sets it on all but one matrix leg) |
+| `AUTONOM_TEST_JOBS` | Dev tooling only: worker count of `tests/run_parallel.py`, the parallel unit-suite runner `run_checks.sh` uses (default: CPU count) |
 
 ## Evidence ladder (unchanged)
 

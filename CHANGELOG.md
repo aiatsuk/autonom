@@ -337,6 +337,13 @@ listed in `docs/COMPATIBILITY.md`.
   `no_frames` at the top level for a window of zero HWUI frames.
 
 ### Changed
+- `run_checks.sh` runs the unit suite through `tests/run_parallel.py`: one
+  module per process, CPU-count workers (`AUTONOM_TEST_JOBS`), a scratch
+  `AUTONOM_HOME` each, the environment guards around every module, and the
+  `tty_guard` refusing stdin in every worker. One pass replaces the serial
+  suite plus its second `tty_guard` pass: about 70 s instead of 14 minutes
+  on a 10-core Mac. `AUTONOM_SKIP_TTY_GUARD` is gone; CI job timeouts drop
+  from 35 to 15 minutes.
 - CI: pull requests run one Linux job on the minimum supported Python 3.11
   (including the `tty_guard` pass); the macOS job runs Python 3.14 on pushes to
   `main` only and skips `tty_guard` (`AUTONOM_SKIP_TTY_GUARD=1`). Local

@@ -20,11 +20,10 @@ jobs:
         run: docker run --rm -v "$PWD:/repo" --workdir /repo rhysd/actionlint:latest -color
 
   # One Linux job on the minimum supported Python (MIN_PYTHON in
-  # scripts/autonom.py); it also runs the tty_guard pass. The newest Python is
-  # covered by the macOS job on main.
+  # scripts/autonom.py). The newest Python is covered by the macOS job on main.
   checks:
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -45,7 +44,6 @@ jobs:
       - name: Run the full check suite
         env:
           AUTONOM_REQUIRE_SHELLCHECK: "1"
-          AUTONOM_SKIP_TTY_GUARD: "0"
         run: ./scripts/run_checks.sh
 
   # macOS is the slowest and most expensive leg: run it on main only. Pull
@@ -53,7 +51,7 @@ jobs:
   checks-macos:
     if: github.event_name == 'push'
     runs-on: macos-latest
-    timeout-minutes: 35
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -73,5 +71,4 @@ jobs:
       - name: Run the full check suite
         env:
           AUTONOM_REQUIRE_SHELLCHECK: "1"
-          AUTONOM_SKIP_TTY_GUARD: "1"
         run: ./scripts/run_checks.sh
