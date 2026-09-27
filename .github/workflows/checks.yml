@@ -26,12 +26,12 @@ jobs:
         include:
           - os: ubuntu-latest
             python: "3.11"
+            skip_tty_guard: "1"
+          # The one leg that also re-runs the suite under tty_guard.
           - os: ubuntu-latest
             python: "3.14"
-          - os: macos-latest
-            python: "3.14"
+            skip_tty_guard: "0"
     runs-on: ${{ matrix.os }}
-    # run_checks.sh runs the whole suite twice (plain and under tty_guard)
     timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
@@ -42,9 +42,6 @@ jobs:
         with:
           # import.meta.dirname in tests/browser-bridge.test.mjs needs >= 20.11.
           node-version: "22"
-      - name: Install shellcheck (macOS)
-        if: runner.os == 'macOS'
-        run: command -v shellcheck >/dev/null 2>&1 || brew install shellcheck
       - name: Tool gates
         # The suite shells out to openssl with no skip guard, and the lint is
         # only real when shellcheck exists — fail here, not silently later.
@@ -56,4 +53,33 @@ jobs:
       - name: Run the full check suite
         env:
           AUTONOM_REQUIRE_SHELLCHECK: "1"
+          AUTONOM_SKIP_TTY_GUARD: ${{ matrix.skip_tty_guard }}
+        run: ./scripts/run_checks.sh
+
+  # macOS is the slowest and most expensive leg: run it on main only. Pull
+  # requests are covered by the two Linux legs above.
+  checks-macos:
+    if: github.event_name == 'push'
+    runs-on: macos-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install shellcheck
+        run: command -v shellcheck >/dev/null 2>&1 || brew install shellcheck
+      - name: Tool gates
+        run: |
+          shellcheck --version
+          openssl version
+          node --version
+          python3 --version
+      - name: Run the full check suite
+        env:
+          AUTONOM_REQUIRE_SHELLCHECK: "1"
+          AUTONOM_SKIP_TTY_GUARD: "1"
         run: ./scripts/run_checks.sh
