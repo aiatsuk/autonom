@@ -703,9 +703,9 @@ def cmd_session_clear(args: argparse.Namespace) -> int:
         ios_simctl.install(target.tool, target.target_id, Path(install_path))
         payload = {"ok": True, "cleared": args.app_id, "strategy": "reinstall",
                    **target.identity()}
-        # the reinstalled app lives in a new container, which a running
-        # stream's bundle-path predicate cannot follow: stop the old writer
-        # (only once it is shown to be this session's) and start a new one
+        # the reinstall may bring another build, whose binary UUIDs the
+        # session has not recorded: stop the old writer (only once it is
+        # shown to be this session's) and start a new one, which records them
         restart = simulator_mod.restart_session_log_stream(target, cause="reinstall",
                                                            stop_previous=True)
         if restart.get("warnings"):
@@ -1015,33 +1015,59 @@ def _follow_device(args: argparse.Namespace) -> dict[str, Any]:
             )
         writer_alive = True  # replaying a past recording, liveness irrelevant
         args.from_start = True  # a recording is read, not awaited
-        # the app may have moved container since: match the executable the
-        # stream recorded, not a bundle path resolved today
-        executable = ((record.get("background") or {}).get("log_stream_executable"))
-        package = args.package
-        line_filter = ((lambda line: ios_simctl.log_line_matches(
-            line, package, executable=executable)) if package
-            else (lambda line: not ios_simctl.is_log_noise(line)))
+        # the file holds every same-named app's records: the session's own
+        # app is matched by the identity the stream recorded (executable,
+        # binary UUIDs) — it may have moved, been replaced or be gone since;
+        # any other package is resolved from its installed binary; with no
+        # package, the session's own app
+        line_filter = (logs_mod.recorded_line_filter(record, args.package, target=target)
+                       if args.package else
+                       logs_mod.session_stream_filter(record, stream)
+                       or logs_mod.recorded_line_filter(record, None))
     else:
         pid = (record or {}).get("background", {}).get("log_stream_pid")
         writer_alive = session_mod.pid_alive(pid)
         line_filter = None
     if stream is not None and stream.exists() and writer_alive:
         if line_filter is None:
-            line_filter = logs_mod.ios_line_filter(target, args.package, app_path=app_path)
+            # the installed binary's UUIDs plus those the session recorded;
+            # with no package, the session's own app
+            line_filter = (logs_mod.ios_line_filter(target, args.package, app_path=app_path,
+                                                    record=record)
+                           if args.package else
+                           logs_mod.session_stream_filter(record, stream, target=target)
+                           or logs_mod.ios_line_filter(target))
         return follow_mod.follow_file(
-            stream, source="device", emit=_stream_print,
+            stream, source="device", emit=_eof_detail(line_filter),
             from_start=args.from_start, max_seconds=args.max_seconds,
             max_lines=args.max_lines, grep=args.grep,
             poll_ms=args.poll_ms, line_filter=line_filter)
-    # a live `log stream`: the predicate names the installed app exactly
-    # (its bundle path when it resolves); the line filter only drops the
+    # a live `log stream`: the predicate names the app's executable, which
+    # every same-named app (every Flutter `Runner`) shares, so the line
+    # filter keeps the records of the app's binary UUIDs — and drops the
     # `log` tool's own banner and trailer
     argv = logs_mod.ios_follow_argv(target, args.package, app_path=app_path)
+    line_filter = logs_mod.ios_line_filter(target, args.package, app_path=app_path,
+                                           record=record)
     return follow_mod.follow_process(
-        argv, source="device", emit=_stream_print,
+        argv, source="device", emit=_eof_detail(line_filter),
         max_seconds=args.max_seconds, max_lines=args.max_lines, grep=args.grep,
-        line_filter=logs_mod.ios_line_filter(target))
+        line_filter=line_filter)
+
+
+def _eof_detail(line_filter: Any) -> Any:
+    """`_stream_print`, with the binary UUIDs an iOS line filter matched on
+    added to the eof line (``image_uuids``, sorted) when there were any."""
+    uuids = logs_mod.filter_image_uuids(line_filter)
+    if not uuids:
+        return _stream_print
+
+    def emit_line(payload: Any) -> None:
+        if isinstance(payload, dict) and payload.get("kind") == "eof":
+            payload.setdefault("image_uuids", uuids)
+        _stream_print(payload)
+
+    return emit_line
 
 
 def cmd_logs_follow(args: argparse.Namespace) -> int:
@@ -1066,10 +1092,31 @@ def cmd_logs_follow(args: argparse.Namespace) -> int:
             "List followable streams with 'autonom session outputs', or "
             "use --source device for the device log.",
         )
+    # An iOS session's own `--log-stream` file (or its `.1` rotation) holds
+    # every same-named app's raw records (every Flutter `Runner`): read it as
+    # the session's app. Any other file is followed as it is.
+    line_filter = logs_mod.session_stream_filter(
+        record, path, target=_session_target_or_none(args, record))
     return _finish_stream(follow_mod.follow_file(
-        path, source=source, emit=_stream_print,
+        path, source=source, emit=_eof_detail(line_filter),
         from_start=args.from_start, max_seconds=args.max_seconds,
-        max_lines=args.max_lines, grep=args.grep, poll_ms=args.poll_ms))
+        max_lines=args.max_lines, grep=args.grep, poll_ms=args.poll_ms,
+        line_filter=line_filter))
+
+
+def _session_target_or_none(args: argparse.Namespace, record: dict[str, Any]) -> Any:
+    """The current session's own iOS simulator, to resolve its app from the
+    installed binary; None for a past session (`--session-id`), a session
+    that is not iOS or has no app, or a target that cannot be resolved (the
+    stream's recorded identity is used then)."""
+    if (getattr(args, "session_id", None) or record.get("platform") != IOS
+            or not record.get("app_id")):
+        return None
+    try:
+        target = _target(args)
+    except errors.AutonomError:
+        return None
+    return target if target.target_id == record.get("target_id") else None
 
 
 def cmd_journal(args: argparse.Namespace) -> int:
@@ -1446,6 +1493,9 @@ def cmd_logs_tail(args: argparse.Namespace) -> int:
         payload["filter"] = detail["filter"]
     if detail.get("executable"):
         payload["executable"] = detail["executable"]
+    if detail.get("image_uuids"):
+        # the binary UUIDs the app's records were matched by
+        payload["image_uuids"] = detail["image_uuids"]
     if warnings:
         payload["warnings"] = warnings
     if current:

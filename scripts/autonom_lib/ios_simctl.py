@@ -13,8 +13,11 @@ import os
 import plistlib
 import re
 import shutil
+import stat
+import struct
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
@@ -282,29 +285,43 @@ def app_container(xcrun: str, udid: str, bundle_id: str, kind: str = "data") -> 
     return Path(value)
 
 
-# --- the app's executable and installed bundle ------------------------------------
+# --- the app's executable, installed bundle and binary UUIDs -----------------------
 #
-# The log predicate matches the app's process by image path. The bundle id's
-# last component is only a guess at that name, and for a Flutter app it is
-# always wrong: every Flutter iOS app's executable is `Runner`, so a live
-# Flutter session (`com.example.knit`) filtered on "knit" and returned no
-# line at all. The executable name alone is not enough either — every other
-# Flutter app on the simulator is a `Runner` too — so where the app's
-# installed bundle is known the predicate matches that path exactly.
+# The log predicate matches the app's process by image. The bundle id's last
+# component is only a guess at its name, and for a Flutter app it is always
+# wrong: every Flutter iOS app's executable is `Runner`, so a live Flutter
+# session (`com.example.knit`) filtered on "knit" and returned no line at
+# all. The executable name alone is not enough either — every other Flutter
+# app on the simulator is a `Runner` too.
+#
+# The installed bundle's path cannot tell them apart in the log either. The
+# unified log keeps the path at which it first saw a binary's UUID: after
+# the same build is uninstalled and installed again, every record still
+# names the first, deleted container (measured on iOS 26.5 / Xcode 27: the
+# app ran from `…/441D5220-…/Runner-26.09.23.app/Runner` while all of its
+# 817 records said `…/FE85D28A-…/Runner-26.09.23.app/Runner`). What does
+# identify the app is the binary's own Mach-O UUID (LC_UUID), which every
+# record carries as `processImageUUID` / `senderImageUUID`. `log` predicates
+# cannot compare it, so the server-side predicate names the executable
+# (`ENDSWITH "/Runner"`) and the client-side filter keeps the records whose
+# image UUID is the installed binary's (``binary_uuids``).
 #
 # The executable is CFBundleExecutable in the app's Info.plist: read from the
 # recorded install .app when one is given (a local file, never cached), else
 # from `simctl appinfo`, else from the installed bundle. The installed bundle
 # path is appinfo's `Path`, else `get_app_container <udid> <bundle> app`. The
 # recorded install path is the build output, NOT where the process runs
-# from, so it never feeds the path match.
+# from, so it never feeds the path match or the UUIDs.
 #
 # Every lookup here is best-effort and never raises: a timeout, a missing
-# tool, or a malformed plist degrades the filter, it must never fail (or roll
-# back) the verb that asked.
+# tool, a malformed plist or binary degrades the filter, it must never fail
+# (or roll back) the verb that asked.
 
 _EXECUTABLE_CACHE: dict[tuple[str, str, str], str] = {}
 _BUNDLE_PATH_CACHE: dict[tuple[str, str, str], str] = {}
+# binary path -> ((dev, inode, size, mtime_ns), UUIDs): read again when the
+# file changes, dropped when it disappears
+_UUID_CACHE: dict[str, tuple[tuple[int, int, int, int], frozenset[str]]] = {}
 PROBE_TIMEOUT = 30
 
 
@@ -399,19 +416,27 @@ def _installed_bundle(value: str | None) -> str | None:
         return None
 
 
-def _lookup_installed(xcrun: str, udid: str, bundle_id: str) -> tuple[str | None, str | None]:
-    """(executable, installed bundle path) from the device, best-effort."""
+def _lookup_installed(xcrun: str, udid: str, bundle_id: str, *,
+                      timeout: float | None = None) -> tuple[str | None, str | None]:
+    """(executable, installed bundle path) from the device, best-effort.
+    ``timeout`` bounds both probes together (``PROBE_TIMEOUT`` each when
+    None)."""
     executable = path = None
-    completed, reason = _probe(xcrun, ["appinfo", udid, bundle_id])
+    deadline = None if timeout is None else time.monotonic() + timeout
+    completed, reason = _probe(xcrun, ["appinfo", udid, bundle_id], timeout=timeout)
     if reason is None and completed is not None:
         text = completed.stdout or ""
         ident = _appinfo_value(text, _APPINFO_IDENTIFIER)
         if ident is None or ident == bundle_id:
             executable = parse_appinfo_executable(text, bundle_id)
             path = _installed_bundle(_appinfo_value(text, _APPINFO_PATH))
-    # A simulator that timed out once is not asked twice in a row.
-    if not path and "timed out" not in (reason or ""):
-        completed, reason = _probe(xcrun, ["get_app_container", udid, bundle_id, "app"])
+    remaining = None if deadline is None else deadline - time.monotonic()
+    # A simulator that timed out once is not asked twice in a row, nor once
+    # the budget is spent.
+    if (not path and "timed out" not in (reason or "")
+            and (remaining is None or remaining > 0.05)):
+        completed, reason = _probe(xcrun, ["get_app_container", udid, bundle_id, "app"],
+                                   timeout=remaining)
         if reason is None and completed is not None:
             path = _installed_bundle(completed.stdout)
     if path and not executable:
@@ -420,9 +445,11 @@ def _lookup_installed(xcrun: str, udid: str, bundle_id: str) -> tuple[str | None
 
 
 def app_image(xcrun: str, udid: str, bundle_id: str, *,
-              app_path: Path | str | None = None) -> tuple[str | None, str | None]:
+              app_path: Path | str | None = None,
+              timeout: float | None = None) -> tuple[str | None, str | None]:
     """``(executable, installed bundle path)`` for ``bundle_id``, either
-    possibly None. Never raises.
+    possibly None. Never raises. ``timeout`` bounds the device lookup
+    (``PROBE_TIMEOUT`` per probe when None).
 
     Device answers are cached per (xcrun, udid, bundle id) once found; a
     miss is not cached (an app installed later is still found), and a cached
@@ -439,7 +466,7 @@ def app_image(xcrun: str, udid: str, bundle_id: str, *,
         path = None
     if executable and path:
         return executable, path
-    found_executable, found_path = _lookup_installed(xcrun, udid, bundle_id)
+    found_executable, found_path = _lookup_installed(xcrun, udid, bundle_id, timeout=timeout)
     if found_executable:
         _EXECUTABLE_CACHE[key] = found_executable
     if found_path:
@@ -469,11 +496,192 @@ def app_bundle_path(xcrun: str, udid: str, bundle_id: str) -> str | None:
     return app_image(xcrun, udid, bundle_id)[1]
 
 
+# Mach-O: the first four bytes as stored in the file. A thin image is
+# (byte order, header size); a fat (universal) wrapper is (byte order,
+# 64-bit slice table). Fat headers are big-endian in practice; the swapped
+# forms are read too.
+_MACHO_THIN = {
+    b"\xfe\xed\xfa\xce": (">", 28),  # MH_MAGIC
+    b"\xce\xfa\xed\xfe": ("<", 28),  # MH_CIGAM
+    b"\xfe\xed\xfa\xcf": (">", 32),  # MH_MAGIC_64
+    b"\xcf\xfa\xed\xfe": ("<", 32),  # MH_CIGAM_64
+}
+_MACHO_FAT = {
+    b"\xca\xfe\xba\xbe": (">", False),  # FAT_MAGIC
+    b"\xbe\xba\xfe\xca": ("<", False),  # FAT_CIGAM
+    b"\xca\xfe\xba\xbf": (">", True),   # FAT_MAGIC_64
+    b"\xbf\xba\xfe\xca": ("<", True),   # FAT_CIGAM_64
+}
+LC_UUID = 0x1B
+# Bounds on what is read: a universal binary has a handful of slices (and a
+# Java class file, which shares 0xcafebabe, reads as dozens), and the load
+# commands sit in the first few KB of each slice.
+MACHO_MAX_SLICES = 16
+MACHO_MAX_COMMANDS = 4096
+MACHO_MAX_COMMAND_BYTES = 1 << 20
+
+
+class _NotMachO(Exception):
+    """A structural problem: the file is not a readable Mach-O image."""
+
+
+def _uuid_text(raw: bytes) -> str:
+    text = raw.hex().upper()
+    return f"{text[:8]}-{text[8:12]}-{text[12:16]}-{text[16:20]}-{text[20:32]}"
+
+
+def _slice_uuid(handle: Any, offset: int) -> str | None:
+    """The LC_UUID of the thin image at ``offset``, or None when it has
+    none. Raises ``_NotMachO`` for anything that is not a thin image."""
+    handle.seek(offset)
+    header = handle.read(32)
+    kind = _MACHO_THIN.get(header[:4])
+    if kind is None:
+        raise _NotMachO("no thin Mach-O magic")
+    order, size = kind
+    if len(header) < size:
+        raise _NotMachO("truncated header")
+    ncmds, sizeofcmds = struct.unpack(order + "II", header[16:24])
+    if ncmds > MACHO_MAX_COMMANDS:
+        raise _NotMachO("implausible load command count")
+    handle.seek(offset + size)
+    commands = handle.read(min(sizeofcmds, MACHO_MAX_COMMAND_BYTES))
+    position = 0
+    for _ in range(ncmds):
+        if position + 8 > len(commands):
+            raise _NotMachO("truncated load commands")
+        command, command_size = struct.unpack_from(order + "II", commands, position)
+        if command_size < 8:
+            raise _NotMachO("malformed load command")
+        if command == LC_UUID:
+            if command_size < 24 or position + 24 > len(commands):
+                raise _NotMachO("truncated LC_UUID")
+            raw = commands[position + 8:position + 24]
+            return _uuid_text(raw) if raw != bytes(16) else None
+        position += command_size
+    return None
+
+
+def binary_uuids(path: Path | str) -> set[str]:
+    """The LC_UUIDs of a Mach-O binary, canonical upper-case
+    ``8-4-4-4-12``: the one of a thin 32/64-bit image (either byte order),
+    or one per slice of a fat/fat64 universal binary.
+
+    Reads only headers and load commands (bounded: ``MACHO_MAX_SLICES``,
+    ``MACHO_MAX_COMMANDS``, ``MACHO_MAX_COMMAND_BYTES``), never the whole
+    file, and only from a regular file. Never raises: a missing, truncated
+    or non-Mach-O file — or any slice of one that is not a thin image — is
+    the empty set. A slice without an LC_UUID contributes nothing."""
+    try:
+        if not stat.S_ISREG(os.stat(path).st_mode):
+            return set()
+        with open(path, "rb") as handle:
+            head = handle.read(8)
+            fat = _MACHO_FAT.get(head[:4])
+            if fat is None:
+                found = _slice_uuid(handle, 0)
+                return {found} if found else set()
+            order, wide = fat
+            if len(head) < 8:
+                return set()
+            (count,) = struct.unpack(order + "I", head[4:8])
+            if not 0 < count <= MACHO_MAX_SLICES:
+                return set()
+            entry = 32 if wide else 20
+            table = handle.read(entry * count)
+            if len(table) < entry * count:
+                return set()
+            uuids: set[str] = set()
+            for index in range(count):
+                offset = struct.unpack_from(order + ("Q" if wide else "I"), table,
+                                            index * entry + 8)[0]
+                if offset < 8 + entry * count:
+                    return set()  # a slice inside the fat header: not a binary
+                found = _slice_uuid(handle, offset)
+                if found:
+                    uuids.add(found)
+            return uuids
+    except Exception:  # noqa: BLE001 - never raises, see the section note
+        return set()
+
+
+def image_uuids(path: Path | str) -> frozenset[str]:
+    """``binary_uuids`` of ``path``, cached while the file is unchanged
+    (same device, inode, size and mtime). A path that is gone drops its
+    entry and answers the empty set. Never raises."""
+    key = str(path)
+    try:
+        info = os.stat(key)
+    except (OSError, ValueError):
+        _UUID_CACHE.pop(key, None)
+        return frozenset()
+    stamp = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+    cached = _UUID_CACHE.get(key)
+    if cached is not None and cached[0] == stamp:
+        return cached[1]
+    found = frozenset(binary_uuids(key))
+    if found:
+        _UUID_CACHE[key] = (stamp, found)
+    else:
+        _UUID_CACHE.pop(key, None)
+    return found
+
+
+def bundle_identifier(app_path: Path | str | None) -> str | None:
+    """CFBundleIdentifier from ``<app>/Info.plist``, or None when the plist
+    is missing, unreadable or names none. Never raises."""
+    if not app_path:
+        return None
+    try:
+        with (Path(app_path).expanduser() / "Info.plist").open("rb") as handle:
+            data = plistlib.load(handle)
+    except Exception:  # noqa: BLE001 - never raises, see the section note
+        return None
+    ident = data.get("CFBundleIdentifier") if isinstance(data, dict) else None
+    return ident if isinstance(ident, str) and ident else None
+
+
+def installed_image_uuids(bundle_path: str | None, executable: str | None = None,
+                          bundle_id: str | None = None) -> frozenset[str]:
+    """The UUIDs of the installed app's binary,
+    ``<bundle>/<CFBundleExecutable>`` — the executable named by the
+    installed bundle's own Info.plist, else ``executable``. Empty when
+    either is unknown or the binary cannot be read — and, with
+    ``bundle_id``, when the bundle's Info.plist names another identifier:
+    that is another app's install (a reused path), whose binary vouches for
+    nothing. Only a plist that is missing, unreadable or names no identifier
+    falls back to ``executable``. Never raises."""
+    if not bundle_path:
+        return frozenset()
+    ident = bundle_identifier(bundle_path)
+    if bundle_id and ident is not None and ident != bundle_id:
+        return frozenset()
+    name = bundle_executable(bundle_path, bundle_id) or _sane_executable(executable)
+    if not name:
+        return frozenset()
+    return image_uuids(os.path.join(str(bundle_path), name))
+
+
+def app_identity(xcrun: str, udid: str, bundle_id: str, *,
+                 app_path: Path | str | None = None,
+                 timeout: float | None = None,
+                 ) -> tuple[str | None, str | None, frozenset[str]]:
+    """``(executable, installed bundle path, binary UUIDs)``: ``app_image``
+    plus ``installed_image_uuids`` of what it found. The UUIDs are what
+    tells this app's log records from another app's with the same
+    executable name, whatever container path the log reports. ``timeout``
+    bounds the device lookup. Never raises."""
+    bounded = {"timeout": timeout} if timeout is not None else {}
+    executable, bundle_path = app_image(xcrun, udid, bundle_id, app_path=app_path, **bounded)
+    return executable, bundle_path, installed_image_uuids(bundle_path, executable, bundle_id)
+
+
 def reset_caches() -> None:
     """Forget the per-process app and privacy-service probes (tests, or
     after an Xcode switch)."""
     _EXECUTABLE_CACHE.clear()
     _BUNDLE_PATH_CACHE.clear()
+    _UUID_CACHE.clear()
     _PRIVACY_CACHE.clear()
 
 
@@ -847,22 +1055,25 @@ def bundle_prefixes(bundle_path: str) -> list[str]:
 
 def log_predicate(bundle_id: str, *, executable: str | None = None,
                   bundle_path: str | None = None) -> str:
-    """The app's own subsystem, or a process/sender image that is the app.
+    """The app's own subsystem, or a process/sender image that is the app —
+    the server-side half of the match (`log stream`, `log show`).
 
-    The image clauses are as exact as what is known: the installed bundle
-    (``BEGINSWITH "<bundle>/"``: the app's own process and the frameworks it
-    ships, and no other app, even another Flutter `Runner`), else the
-    executable (``ENDSWITH "/Runner"``: any app with that executable name),
-    else the bundle id's last component — only when it is distinctive
-    (``log_leaf``). For ``com.example.app`` with nothing known the predicate
-    is the subsystem alone: exact, possibly narrower, never "every process
-    whose path contains app"."""
+    The image clauses name the executable (``ENDSWITH "/Runner"``), else the
+    bundle id's last component — only when it is distinctive (``log_leaf``).
+    For ``com.example.app`` with nothing known the predicate is the
+    subsystem alone: exact, possibly narrower, never "every process whose
+    path contains app".
+
+    ``bundle_path`` no longer narrows it: the unified log reports the
+    container path it first saw the binary at, so after a reinstall of the
+    same build ``BEGINSWITH "<installed bundle>/"`` matched none of the
+    app's records. ``ENDSWITH "/<executable>"`` survives a container move
+    and also admits other apps with the same executable name (every Flutter
+    `Runner`); the client-side ``log_line_matches`` narrows by binary UUID.
+    The parameter is still accepted so callers need not change."""
+    del bundle_path  # see the docstring: a container path is not identity
     clauses = [f'subsystem == "{_quoted(bundle_id)}"']
-    if bundle_path:
-        for prefix in bundle_prefixes(bundle_path):
-            clauses += [f'processImagePath BEGINSWITH "{_quoted(prefix)}"',
-                        f'senderImagePath BEGINSWITH "{_quoted(prefix)}"']
-    elif executable:
+    if executable:
         clauses += [f'processImagePath ENDSWITH "/{_quoted(executable)}"',
                     f'senderImagePath ENDSWITH "/{_quoted(executable)}"']
     else:
@@ -902,16 +1113,47 @@ def is_log_noise(line: str) -> bool:
     return isinstance(record, dict) and set(record) <= {"count", "finished"}
 
 
+IMAGE_UUID_KEYS = ("processImageUUID", "senderImageUUID")
+
+
+def normalized_uuids(values: Any) -> frozenset[str]:
+    """Upper-case UUID strings from any iterable of values (a recorded
+    list, a set, one string); anything that is not a non-empty string is
+    skipped. Never raises."""
+    if isinstance(values, str):
+        values = [values]
+    try:
+        items = list(values or ())
+    except TypeError:
+        return frozenset()
+    return frozenset(value.strip().upper() for value in items
+                     if isinstance(value, str) and value.strip())
+
+
+def record_image_uuids(record: dict[str, Any]) -> list[str]:
+    """The image UUIDs a unified-log record names (process, sender),
+    upper-cased; empty when it names none."""
+    return [value.strip().upper() for value in (record.get(key) for key in IMAGE_UUID_KEYS)
+            if isinstance(value, str) and value.strip()]
+
+
 def log_line_matches(line: str, bundle_id: str, *, executable: str | None = None,
-                     bundle_path: str | None = None) -> bool:
-    """Client-side filter mirroring ``log_predicate``: the app's subsystem or
-    full bundle id, then its image — under the installed bundle when that is
-    known (another app's `/Runner.app/Runner` is rejected), else named
-    ``executable``, else containing the distinctive last component."""
+                     bundle_path: str | None = None,
+                     uuids: Any = None) -> bool:
+    """Client-side filter behind ``log_predicate``.
+
+    A JSON record matches on the app's subsystem; then, with ``uuids`` (the
+    installed binary's LC_UUIDs, ``app_identity``), on its image UUID alone:
+    a ``processImageUUID`` or ``senderImageUUID`` in the set passes — even
+    under a stale container path — and a record whose image UUIDs are all
+    outside it is rejected, even when its path looks right (another Flutter
+    app is a `Runner` too). Without UUIDs, or for a record that names none,
+    the path rules apply: the full bundle id anywhere in the line, then an
+    image under the installed bundle when that is known, else named
+    ``executable``, else containing the distinctive last component.
+    A line that is not JSON can only be judged by those substrings."""
     if is_log_noise(line):
         return False
-    if bundle_id in line:
-        return True
     try:
         record = json.loads(line)
     except ValueError:
@@ -919,6 +1161,13 @@ def log_line_matches(line: str, bundle_id: str, *, executable: str | None = None
     if isinstance(record, dict):
         if record.get("subsystem") == bundle_id:
             return True
+        wanted = normalized_uuids(uuids)
+        seen = record_image_uuids(record) if wanted else []
+        if seen:
+            return any(value in wanted for value in seen)
+    if bundle_id in line:
+        return True
+    if isinstance(record, dict):
         images = [str(record.get(key) or "") for key in ("processImagePath", "senderImagePath")]
         if bundle_path:
             prefixes = bundle_prefixes(bundle_path)
@@ -937,15 +1186,21 @@ def log_line_matches(line: str, bundle_id: str, *, executable: str | None = None
 
 
 def app_log_filter(xcrun: str, udid: str, bundle_id: str, *,
-                   app_path: Path | str | None = None) -> Any:
+                   app_path: Path | str | None = None,
+                   extra_uuids: Any = None) -> Any:
     """A ``line -> bool`` filter for the installed app, resolved once now
-    (``app_image``). Never raises."""
-    executable, bundle_path = app_image(xcrun, udid, bundle_id, app_path=app_path)
+    (``app_identity``): its binary's UUIDs, plus ``extra_uuids`` (those a
+    session recorded for earlier installs of the app). The UUIDs it matches
+    on are on the filter as ``image_uuids`` (sorted; empty when none were
+    known), for a payload to report. Never raises."""
+    executable, bundle_path, uuids = app_identity(xcrun, udid, bundle_id, app_path=app_path)
+    uuids = uuids | normalized_uuids(extra_uuids)
 
     def matches(line: str) -> bool:
         return log_line_matches(line, bundle_id, executable=executable,
-                                bundle_path=bundle_path)
+                                bundle_path=bundle_path, uuids=uuids)
 
+    matches.image_uuids = sorted(uuids)  # type: ignore[attr-defined]
     return matches
 
 
@@ -982,20 +1237,33 @@ def start_log_stream(xcrun: str, udid: str, destination: Path, *,
                      executable: str | None = None,
                      app_path: Path | str | None = None,
                      bundle_path: str | None = None,
-                     max_bytes: int | None = None) -> int | None:
+                     max_bytes: int | None = None,
+                     identity: dict[str, Any] | None = None) -> int | None:
     """Session-long ndjson `log stream`, filtered to the app when known and
     capped on disk. Returns the writer pid (stopping it stops the stream), or
     None when it could not start — logs are supplementary evidence and must
     never block the UI loop, so nothing here raises.
 
-    What is not passed is resolved (``app_image``; ``app_path`` only helps
-    find the executable name): with the installed bundle known, the stream
-    is exactly this app. The predicate is fixed when the stream starts, so a
-    reinstall (which moves the app to a new container) needs a new stream
-    to keep the path clauses; the subsystem clause keeps matching."""
-    if bundle_id and not bundle_path:
-        found_executable, bundle_path = app_image(xcrun, udid, bundle_id, app_path=app_path)
-        executable = executable or found_executable
+    An executable that is not passed is resolved (``app_identity``;
+    ``app_path`` only helps find it). The predicate (``log_predicate``)
+    names the executable, not the container, so it keeps matching the app
+    across a reinstall — and admits other apps with the same executable
+    name: the file is narrowed when it is read (``log_line_matches`` with
+    the app's binary UUIDs), never when it is written.
+
+    With ``identity`` (a dict), what the writer was started with is put
+    there: ``executable`` (the one its predicate names, or None),
+    ``bundle_path`` and ``image_uuids`` (sorted; what this call resolved —
+    empty when the executable was passed in). A lookup here can succeed
+    where the caller's missed a moment earlier (misses are not cached), so
+    this, not the caller's lookup, is what a session must record."""
+    uuids: frozenset[str] = frozenset()
+    if bundle_id and not executable:
+        executable, found_path, uuids = app_identity(xcrun, udid, bundle_id, app_path=app_path)
+        bundle_path = bundle_path or found_path
+    if identity is not None:
+        identity.update({"executable": executable, "bundle_path": bundle_path,
+                         "image_uuids": sorted(uuids)})
     try:
         process = spawn_bounded(log_stream_argv(xcrun, udid, bundle_id=bundle_id,
                                                 executable=executable,

@@ -188,12 +188,13 @@ class IosFlutterLogTests(unittest.TestCase):
         def fake_simctl(_xcrun, args, **_kwargs):
             predicate = args[args.index("--predicate") + 1] if "--predicate" in args else ""
             seen.append(predicate)
-            # Like the real unified log: only records the predicate selects.
+            # Like the real unified log: only records the predicate selects —
+            # by executable name, so the other `Runner` comes back too and
+            # the client-side filter must drop it.
             body = [line for line in (self.mine("flutter: [Network] GET /home"),
                                       self.theirs("flutter: other app"))
-                    if any(f'BEGINSWITH "{prefix}"' in predicate
-                           for prefix in ios_simctl.bundle_prefixes(
-                               json.loads(line)["processImagePath"].rsplit("/", 1)[0]))]
+                    if 'ENDSWITH "/{}"'.format(
+                        json.loads(line)["processImagePath"].rsplit("/", 1)[1]) in predicate]
             body.append('{"count":1,"finished":1}')
             return types.SimpleNamespace(returncode=0, stdout="\n".join(body) + "\n",
                                          stderr="")

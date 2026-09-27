@@ -263,17 +263,44 @@ def deregister(pid: int) -> None:
 # --- discovery ----------------------------------------------------------------
 
 
-def _running_processes() -> list[tuple[int, str]]:
-    """(pid, command) for every process on the machine, or [] if ps is unusable."""
+def utf8_locale() -> str:
+    """A UTF-8 locale this host has: `en_US.UTF-8` ships with every macOS,
+    `C.UTF-8` with current glibc and musl."""
+    return "en_US.UTF-8" if sys.platform == "darwin" else "C.UTF-8"
+
+
+def _ps_output(argv: Sequence[str], *, timeout: float) -> str | None:
+    """`ps`'s stdout as text, or None when it could not run.
+
+    `ps` renders a command line through the caller's locale: under
+    `LC_ALL=C` macOS prints every non-ASCII byte as a meta escape (`café`
+    reads `cafM-CM-)`), so a writer whose stream file sits under a
+    non-ASCII `AUTONOM_HOME` no longer carried its own path and was taken
+    for a stranger. `ps` therefore always runs under a UTF-8 locale, and
+    its bytes are decoded as UTF-8 with `surrogateescape` — the way Python
+    decodes the file names it compares them with."""
+    env = dict(os.environ)
+    env["LC_ALL"] = utf8_locale()
     try:
         completed = subprocess.run(
-            ["ps", "-Ao", "pid=,command="],
-            capture_output=True, text=True, timeout=15, check=False,
+            list(argv), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            timeout=timeout, check=False, env=env,
         )
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    output = completed.stdout
+    if isinstance(output, bytes):
+        return output.decode("utf-8", "surrogateescape")
+    return output or ""
+
+
+def _running_processes() -> list[tuple[int, str]]:
+    """(pid, command) for every process on the machine, or [] if ps is unusable."""
+    output = _ps_output(["ps", "-Ao", "pid=,command="], timeout=15)
+    if output is None:
         return []
     found = []
-    for line in (completed.stdout or "").splitlines():
+    for line in output.splitlines():
         stripped = line.strip()
         if not stripped:
             continue
@@ -318,15 +345,14 @@ def _discovered_command(command: str) -> str:
 
 
 def command_of(pid: int) -> str | None:
-    """The command line of one pid, or None when ps cannot answer."""
+    """The command line of one pid, or None when ps cannot answer. Rendered
+    under a UTF-8 locale whatever the caller's (`_ps_output`), so a
+    non-ASCII argument reads as itself."""
     try:
-        completed = subprocess.run(
-            ["ps", "-ww", "-o", "command=", "-p", str(int(pid))],
-            capture_output=True, text=True, timeout=10, check=False,
-        )
-    except (OSError, subprocess.SubprocessError, ValueError):
+        argv = ["ps", "-ww", "-o", "command=", "-p", str(int(pid))]
+    except (TypeError, ValueError):
         return None
-    text = (completed.stdout or "").strip()
+    text = (_ps_output(argv, timeout=10) or "").strip()
     return text or None
 
 
@@ -598,6 +624,8 @@ def terminate_entry(entry: dict[str, Any]) -> str:
     proxy found by its command line in this very scan (`discover_proxies`),
     and rows written before signatures existed. Harness rows (emulators)
     carry none either, but `cleanup` and `reap_session` never target them.
+    A signature is checked with `entry_matches`, which holds a log-stream
+    row with a plain-string signature to the bounded writer's own shape.
     """
     pid = int(entry["pid"])
     group = entry.get("process_group")
@@ -612,7 +640,7 @@ def terminate_entry(entry: dict[str, Any]) -> str:
         if command is None:
             # ps could not answer: gone in the meantime, or unverifiable.
             return "already_exited" if not session_mod.pid_alive(pid) else "unverified_skipped"
-        if not signature_matches(signature, command):
+        if not entry_matches(entry, command):
             return "pid_reused"
     if leads and _leads_group(pid, pid):
         return "terminated" if terminate_group(pid) else "termination_failed"
@@ -630,6 +658,26 @@ def signature_matches(signature: Any, command: str) -> bool:
         return False
     marks = signature if isinstance(signature, (list, tuple)) else [signature]
     return all(str(mark) in command for mark in marks)
+
+
+def entry_matches(entry: dict[str, Any], command: str) -> bool:
+    """Does `command` still carry registry row `entry`'s signature?
+
+    `signature_matches`, plus one stricter case: a log-stream row whose
+    signature is a plain string. Rows written before the writer's strict
+    signature (`logs.writer_signature`) recorded just the stream file's
+    path, which `tail -f <stream>` or a writer of `<stream>.bak` carries
+    too; such a row matches only the bounded writer of exactly that file
+    (`logs.is_writer_command`: the writer's script line, and the path as a
+    whole argument followed by its cap)."""
+    signature = entry.get("signature")
+    if not signature_matches(signature, command):
+        return False
+    if entry.get("kind") == "log_stream" and isinstance(signature, str):
+        from . import logs  # late: logs imports this module lazily too
+
+        return logs.is_writer_command(command, signature)
+    return True
 
 
 def usable_signature(signature: Any) -> bool:

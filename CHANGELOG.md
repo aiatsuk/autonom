@@ -205,9 +205,10 @@ listed in `docs/COMPATIBILITY.md`.
   output loses its comments; the preview reports how many would go.
 - `teach approve --run` accepts `--env KEY=VALUE` and `--secret NAME` for the
   replays it performs.
-- The iOS `session start --log-stream` file is filtered to the app (by its
-  installed bundle path, else its executable, else its subsystem) and capped
-  on disk: `AUTONOM_IOS_LOG_MAX_MB` (default 50) with one rotation.
+- The iOS `session start --log-stream` file is filtered to the app's
+  subsystem or executable (narrowed to the app by binary UUID when it is
+  read) and capped on disk: `AUTONOM_IOS_LOG_MAX_MB` (default 50) with one
+  rotation.
 - JUnit export and `report suite` emit `errors` and an `<error>` case for a
   run that aborted on a definition or infrastructure error, and the suite
   JSON carries the matching broken and JUnit counts.
@@ -594,9 +595,44 @@ listed in `docs/COMPATIBILITY.md`.
   last component while every Flutter app's process is `Runner`, so
   `logs tail --package` returned only `log show`'s trailer. `logs tail`,
   `logs follow` (live and from the session's file) and `--log-stream` now
-  match the installed bundle path, so another Flutter app on the same
-  simulator never leaks in; the `log` tool's banner and trailer are never
-  returned as log lines.
+  match the installed app (its executable, narrowed by binary UUID: see
+  the next entry), so another Flutter app on the same simulator never
+  leaks in; the `log` tool's banner and trailer are never returned as log
+  lines.
+- **iOS logs after a reinstall.** The unified log keeps reporting the
+  container path at which it first saw a binary's UUID, so once the same
+  build had been uninstalled and installed again (`session clear --strategy
+  reinstall`, or by hand) every record named a deleted directory and the
+  installed-bundle-path predicate matched none of them: on WoolBox
+  `--log-stream` wrote 0 bytes and `logs tail --package` returned 0 lines
+  while the app ran. The `log` predicate now names the app's executable,
+  and its records are kept on the client by the image UUID each one
+  carries (`processImageUUID` / `senderImageUUID`) against the installed
+  binary's Mach-O LC_UUIDs — read by a bounded stdlib parser, thin or
+  universal — so another Flutter `Runner` is still kept out. `logs tail`
+  narrows `log show` output the same way, and the session records the
+  UUIDs (`log_stream_image_uuids`) so its stream file stays readable once
+  the app is gone or replaced. `logs follow` narrows the same way live,
+  from the current session's file (with the UUIDs it recorded) and in a
+  `--session-id` replay — which matches the session's own app by the
+  identity its stream recorded, and any other `--package` by its installed
+  binary. `logs tail` and the follow's `eof` line report the `image_uuids`
+  they matched on. The stream file itself keeps every same-named app's raw
+  records (a build installed while it runs must not be lost), so a read of
+  it without `--package` — `logs follow` by default, `--source log_stream`,
+  `--path logs/stream.ndjson` (or a hard link to it), `logs tail` — is
+  narrowed to the session's app, by the identity its stream recorded; the
+  simulator is asked only when that install is gone, belongs to another
+  app, or was never recorded, for at most 5 s. Any other `--path` is read
+  raw.
+- A session's log-stream writer under a non-ASCII `AUTONOM_HOME` is
+  recognised again: `ps` ran under the caller's locale, and with
+  `LC_ALL=C` macOS prints `café` as `cafM-CM-)`, so the writer read as a
+  stranger, was left running, and lost its registry row. `ps` now always
+  runs under a UTF-8 locale. `session stop` keeps a log-stream row whose
+  own signature still matches the live process (or that `ps` could not
+  render), and a row that records only the bare stream path no longer
+  lets `cleanup` or `session stop` signal a `tail -f` of that file.
 - The session's iOS log stream survives the device moving under it:
   `simulator keyboard pin` with `reboot=true` and `session clear --strategy
   reinstall` restart it (`log_stream_restarted`, `log_stream_pid`), or warn

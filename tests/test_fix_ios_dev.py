@@ -356,7 +356,7 @@ class AppExecutableTests(Base):
         self.assertTrue(streams, "the writer never started `log stream`")
         return streams[0][streams[0].index("--predicate") + 1]
 
-    def test_the_session_stream_filters_on_the_installed_bundle(self) -> None:
+    def test_the_session_stream_filters_on_the_installed_executable(self) -> None:
         app = self.installed("A1")
         self.set_state(app_info={BUNDLE: {"CFBundleExecutable": "Runner", "Path": str(app)}})
         destination = self.root / "logs" / "stream.ndjson"
@@ -366,11 +366,14 @@ class AppExecutableTests(Base):
         os.waitpid(pid, 0)
         predicate = self.stream_predicate()
         # Before: `processImagePath CONTAINS "knit"`, which no Runner line has;
-        # then `CONTAINS "Runner"`, which every Flutter app's line has.
-        self.assertIn(f'processImagePath BEGINSWITH "{app}/"', predicate)
-        self.assertIn(f'senderImagePath BEGINSWITH "{app}/"', predicate)
+        # then `CONTAINS "Runner"`, which every Flutter app's line has. The
+        # container path is not used: the log reports the first one a
+        # binary was seen at (tests/test_fix_ios_logs_uuid.py).
+        self.assertIn('processImagePath ENDSWITH "/Runner"', predicate)
+        self.assertIn('senderImagePath ENDSWITH "/Runner"', predicate)
         self.assertIn(f'subsystem == "{BUNDLE}"', predicate)
-        self.assertNotIn("Runner\"", predicate.replace(f"{app}/", ""))
+        self.assertNotIn(str(app), predicate)
+        self.assertNotIn("BEGINSWITH", predicate)
 
     def test_with_only_the_executable_the_stream_matches_its_name_exactly(self) -> None:
         self.set_state(app_info={BUNDLE: {"CFBundleExecutable": "Runner"}})
@@ -382,18 +385,22 @@ class AppExecutableTests(Base):
         self.assertIn('processImagePath ENDSWITH "/Runner"', predicate)
         self.assertNotIn("CONTAINS", predicate)
 
-    def test_session_start_log_stream_uses_the_installed_bundle(self) -> None:
+    def test_session_start_log_stream_uses_the_installed_executable(self) -> None:
         app = self.installed("A1")
         self.set_state(app_info={BUNDLE: {"CFBundleExecutable": "Runner", "Path": str(app)}},
                        installed=[BUNDLE])
         code, payload = self.ios("session", "start", "--app-id", BUNDLE, "--log-stream")
         self.assertEqual(code, 0, payload)
         self.addCleanup(self.ios, "session", "stop")
-        self.assertIn(f'processImagePath BEGINSWITH "{app}/"', self.stream_predicate())
+        predicate = self.stream_predicate()
+        self.assertIn('processImagePath ENDSWITH "/Runner"', predicate)
+        self.assertNotIn(str(app), predicate)
 
-    def test_a_path_with_quotes_is_escaped_in_the_predicate(self) -> None:
-        predicate = ios_simctl.log_predicate(BUNDLE, bundle_path='/x/"a\\b"/Runner.app')
-        self.assertIn('processImagePath BEGINSWITH "/x/\\"a\\\\b\\"/Runner.app/"', predicate)
+    def test_a_name_with_quotes_is_escaped_in_the_predicate(self) -> None:
+        predicate = ios_simctl.log_predicate(BUNDLE, executable='My "App"\\x',
+                                             bundle_path='/x/"a\\b"/Runner.app')
+        self.assertIn('processImagePath ENDSWITH "/My \\"App\\"\\\\x"', predicate)
+        self.assertNotIn("Runner.app", predicate)
 
     def test_log_noise_is_recognised(self) -> None:
         self.assertTrue(ios_simctl.is_log_noise('{"count":0,"finished":1}'))
@@ -436,13 +443,15 @@ class AppExecutableTests(Base):
         keep = ios_simctl.app_log_filter(str(FAKE_SIMCTL), UDID, BUNDLE)
         kept = sorted(name for name, record in records.items() if keep(json.dumps(record)))
         self.assertEqual(kept, ["mine", "my engine", "my subsystem"])
+        # The predicate names the executable, never a container (the log
+        # keeps a reinstalled binary's first path): the client side narrows.
         predicate = ios_simctl.app_log_predicate(str(FAKE_SIMCTL), UDID, BUNDLE)
-        self.assertIn(str(mine), predicate)
+        self.assertIn('processImagePath ENDSWITH "/Runner"', predicate)
+        self.assertNotIn(str(mine), predicate)
         self.assertNotIn(str(theirs), predicate)
         # macOS temp dirs sit behind the /var -> /private/var link; both forms match.
         real = os.path.realpath(mine)
         if real != str(mine):
-            self.assertIn(f'processImagePath BEGINSWITH "{real}/"', predicate)
             self.assertTrue(keep(json.dumps({"processImagePath": f"{real}/Runner"})))
 
     def test_the_bounded_writer_drops_the_banner_and_the_trailer(self) -> None:

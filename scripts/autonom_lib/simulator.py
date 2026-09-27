@@ -1530,13 +1530,14 @@ def restart_session_log_stream(target: Target, *, cause: str = "reboot",
     A reboot (`keyboard pin` with ``reboot=true``) ends the `log stream`
     child, and with it the bounded writer, so the session kept listing a
     stream that recorded nothing; nothing needs stopping then. A reinstall
-    (`session clear --strategy reinstall`) moves the app to a new container,
-    which a running stream's bundle-path predicate can no longer match, so
-    the old writer is stopped first (``stop_previous``) — through
-    `logs.stop_log_writer`, which signals it only once its registry row or
-    its command line shows it is this session's writer: the pid in the
+    (`session clear --strategy reinstall`) may bring another build, whose
+    binary UUIDs the session has not recorded (its records are matched by
+    them on read), so the old writer is stopped first (``stop_previous``) —
+    through `logs.stop_log_writer`, which signals it only once its registry
+    row or its command line shows it is this session's writer: the pid in the
     session file may be days old and belong to anything. Then
-    `logs.ensure_log_stream` starts a new one, and the record is saved.
+    `logs.ensure_log_stream` starts a new one, which adds the installed
+    binary's UUIDs to the record, and the record is saved.
 
     Returns additive payload keys: none when the current session is not on
     this simulator or never had a stream; ``log_stream_restarted`` (with

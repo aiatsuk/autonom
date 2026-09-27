@@ -488,7 +488,7 @@ class LogStreamRestartTests(_Cli):
         self.assertEqual([s["pid"] for s in streams], [payload["log_stream_pid"]])
         spawned = [call for call in self.calls("simctl") if "stream" in call]
         self.assertEqual(len(spawned), 2, "one stream at start, one after the reboot")
-        self.assertIn(f'processImagePath BEGINSWITH "{self.app_bundle}/"', spawned[-1][-1])
+        self.assertIn('processImagePath ENDSWITH "/Runner"', spawned[-1][-1])
 
     def test_a_reboot_without_a_stream_reports_nothing_about_one(self) -> None:
         self.prefs_dir()
@@ -819,7 +819,7 @@ class IosNodeParityTests(unittest.TestCase):
 
 
 class IosLogWiringTests(_Cli):
-    def test_follow_spawns_a_stream_filtered_to_the_installed_bundle(self) -> None:
+    def test_follow_spawns_a_stream_filtered_to_the_installed_executable(self) -> None:
         """Before: `--predicate` came from the unresolved subsystem/leaf form,
         which for `com.example.app` never named the Flutter `Runner`."""
         self.write_state(**self.ios_app_state(),
@@ -831,7 +831,7 @@ class IosLogWiringTests(_Cli):
                           for line in lines if line.get("kind") == "line"], ["mine"])
         stream = next(call for call in self.calls("simctl") if "stream" in call)
         predicate = stream[stream.index("--predicate") + 1]
-        self.assertIn(f'processImagePath BEGINSWITH "{self.app_bundle}/"', predicate)
+        self.assertIn('processImagePath ENDSWITH "/Runner"', predicate)
         self.assertFalse(hasattr(logs, "_ios_predicate"), "one resolved path only")
 
     def test_follow_of_the_live_session_file_keeps_only_the_app(self) -> None:
@@ -866,13 +866,13 @@ class IosLogWiringTests(_Cli):
         self.assertEqual([json.loads(line["text"])["eventMessage"]
                           for line in lines if line.get("kind") == "line"], ["mine"])
 
-    def test_tail_names_the_executable_and_the_bundle_predicate(self) -> None:
+    def test_tail_names_the_executable_and_the_executable_predicate(self) -> None:
         self.write_state(**self.ios_app_state(), ios_log=[self.mine])
         code, payload = self.ios("logs", "tail", "--package", BUNDLE)
         self.assertEqual(code, 0, payload)
         self.assertEqual(payload["executable"], "Runner")
         show = next(call for call in self.calls("simctl") if "show" in call)
-        self.assertIn(f'processImagePath BEGINSWITH "{self.app_bundle}/"',
+        self.assertIn('processImagePath ENDSWITH "/Runner"',
                       show[show.index("--predicate") + 1])
 
 
@@ -939,8 +939,9 @@ class SessionTeardownTests(_Cli):
     def test_stop_reaps_owned_processes_and_names_foreign_companions(self) -> None:
         udid = f"FAKE-{uuid.uuid4().hex[:8].upper()}-0000-0000-0000-000000000000"
         record = self.ios_session(udid)
-        writer = self.sleeper(sys.executable, "-c", "import time; time.sleep(120)",
-                              str(Path(record["artifacts_dir"]) / "logs/stream.ndjson"))
+        # the real writer's shape: a round-1 plain-path signature matches
+        # only the bounded writer of that file, never any process naming it
+        writer = _bounded_writer(self, Path(record["artifacts_dir"]) / "logs/stream.ndjson")
         processes.register("log_stream", writer.pid, owner=record["session_id"],
                            session_id=record["session_id"],
                            artifacts_dir=record["artifacts_dir"], target_id=udid,
