@@ -152,7 +152,11 @@ as four separate categories.
   the Simulator process + data-container size — never comparable to Android
   PSS), `metrics series` for direction, `metrics memory warn` as a best-effort
   pressure stimulus, and `metrics trace --preset allocations|time-profiler|
-  leaks|hitches` for real Instruments `.trace` bundles. Do not present a
+  leaks|hitches` for real Instruments `.trace` bundles. `hitches` is
+  physical-device only: Instruments refuses Animation Hitches on the
+  Simulator (`list-presets` says `unsupported_on_simulator`), so on the
+  Simulator use `time-profiler` for main-thread stalls or
+  `metrics frames flutter-summary` on Flutter frame timings. Do not present a
   screenshot or a log line as a performance measurement.
 - Simulator behavior differs from a physical device for camera, sensors, push,
   background execution, and memory pressure. Say so when it matters to the finding.

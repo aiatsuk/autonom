@@ -31,7 +31,8 @@ jobs:
           - os: macos-latest
             python: "3.14"
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    # run_checks.sh runs the whole suite twice (plain and under tty_guard)
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

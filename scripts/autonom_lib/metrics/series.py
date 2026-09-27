@@ -73,16 +73,32 @@ def summarize(samples: list[dict[str, Any]], min_growth_kb: int) -> dict[str, An
         }
 
     leads = [name for name, info in metrics.items() if info["directional_growth"]]
-    return {
+    report: dict[str, Any] = {
         "sample_count": len(samples),
         "metrics": metrics,
         "directional_growth_leads": leads,
         "interpretation": INTERPRETATION,
     }
+    stale = sum(1 for sample in samples if sample.get("cpu_stale") is True)
+    if stale:
+        report["warnings"] = [{
+            "code": "cpu_stale",
+            "error": (f"{stale} of {len(samples)} samples carry a stale dumpsys "
+                      "cpuinfo CPU figure (its averaging window closed long "
+                      "before the sample, or was not printed); process_percent "
+                      "there is history, not the load at that moment"),
+            "hint": ("Read process_percent only from samples with "
+                     "cpu_stale false; the snapshots' cpu_sampling blocks "
+                     "name each figure's source and window."),
+        }]
+    return report
 
 
 def flatten_snapshot(payload: dict[str, Any]) -> dict[str, float]:
-    """Numeric metrics from one snapshot payload, flat for series math."""
+    """Numeric metrics from one snapshot payload, flat for series math.
+
+    `cpu_sampling` (source, window, age) is deliberately not a section here:
+    a window age grows with every stale sample and would read as a lead."""
     flat: dict[str, float] = {}
     for section in ("memory", "cpu", "proc", "disk"):
         block = payload.get(section)
@@ -92,6 +108,20 @@ def flatten_snapshot(payload: dict[str, Any]) -> dict[str, float]:
             if isinstance(value, (int, float)) and not isinstance(value, bool):
                 flat[key] = float(value)
     return flat
+
+
+def cpu_flags(payload: dict[str, Any]) -> dict[str, Any]:
+    """Per-sample CPU provenance: {cpu_source, cpu_stale} when the snapshot
+    says how its CPU figure was obtained (Android), else nothing."""
+    sampling = payload.get("cpu_sampling")
+    if not isinstance(sampling, Mapping):
+        return {}
+    flags: dict[str, Any] = {}
+    if isinstance(sampling.get("source"), str):
+        flags["cpu_source"] = sampling["source"]
+    if isinstance(sampling.get("stale"), bool):
+        flags["cpu_stale"] = sampling["stale"]
+    return flags
 
 
 def capture(snapshot_fn: Callable[[], dict[str, Any]], *, count: int,
@@ -106,6 +136,7 @@ def capture(snapshot_fn: Callable[[], dict[str, Any]], *, count: int,
             "captured_at": payload.get("captured_at"),
             "artifact": (payload.get("artifacts") or [None])[0],
             "metrics": flatten_snapshot(payload),
+            **cpu_flags(payload),
         })
         if index + 1 < count:
             sleep(max(interval, 0.0))
@@ -133,5 +164,6 @@ def from_dir(directory: Path, glob: str) -> list[dict[str, Any]]:
             "path": str(file),
             "captured_at": payload.get("captured_at"),
             "metrics": flatten_snapshot(payload),
+            **cpu_flags(payload),
         })
     return samples

@@ -107,6 +107,9 @@ SWEEP: list[tuple[str, list[str], bool]] = [
     ("simulator_keyboard_pin", ["simulator", "keyboard", "pin", "--udid", UDID], False),
     ("simulator_keyboard_show", ["simulator", "keyboard", "show", "--udid", UDID], False),
     ("simulator_animations_pin", ["simulator", "animations", "pin"], False),
+    ("simulator_clipboard_get", ["simulator", "clipboard", "get", "--udid", UDID], False),
+    ("simulator_clipboard_get_bad_xcrun", ["--simctl", "/nonexistent/xcrun", "--udid", UDID,
+                                           "simulator", "clipboard", "get"], False),
     ("ios_hid_global_flags", ["--ios-hid", "axe", "--axe", "/nonexistent/axe",
                               "ui", "key", "HOME"], False),
     ("file_ls", ["file", "ls"], False),
@@ -204,6 +207,10 @@ class BareHostTests(unittest.TestCase):
         cases = {
             ("devices", "--platform", "android"): "adb_not_found",
             ("devices", "--platform", "ios"): "simctl_not_found",
+            # the pasteboard probe never raises; a missing xcrun used to come
+            # back from it as backend_failed "could not read the pasteboard"
+            ("--simctl", "/nonexistent/xcrun", "--udid", UDID,
+             "simulator", "clipboard", "get"): "simctl_not_found",
         }
         for argv, expected in cases.items():
             with self.subTest(argv=argv):

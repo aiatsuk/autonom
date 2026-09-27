@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import time
 import uuid
 from pathlib import Path
@@ -196,12 +197,27 @@ def save(record: dict[str, Any], cwd: Path | None = None) -> dict[str, Any]:
     return record
 
 
-def stop_session(cwd: Path | None = None) -> dict[str, Any] | None:
+def stop_session(cwd: Path | None = None, *, reap: bool = True) -> dict[str, Any] | None:
+    """Mark the current session stopped and clear the pointer.
+
+    With `reap` (the default), every process the machine registry records as
+    this session's — the iOS log-stream writer, a `canvas serve` pair, an
+    `idb_companion` its own idb calls started — is terminated first, and the
+    outcome is kept on the record as `process_teardown` (with any companion
+    it could not attribute under `companion_left_running`). This is the
+    safety net under the CLI's own teardown list: a process the list forgot
+    must not outlive the session it served.
+    """
     current = artifacts_root(cwd) / "current.json"
     if not current.exists():
         return None
     record = upgrade(json.loads(current.read_text(encoding="utf-8")))
     record["stopped_at"] = _now()
+    if reap:
+        teardown = reap_owned_processes(record)
+        if (teardown.get("terminated") or teardown.get("companion_left_running")
+                or teardown.get("group_remnants")):
+            record["process_teardown"] = teardown
     session_path = Path(record["artifacts_dir"]) / "session.json"
     session_path.parent.mkdir(parents=True, exist_ok=True)
     session_path.write_text(json.dumps(record, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
@@ -258,6 +274,51 @@ def run_teardown(actions: list[tuple[str, Callable[[], Any]]]) -> list[dict[str,
     return results
 
 
+def reap_owned_processes(record: dict[str, Any]) -> dict[str, Any]:
+    """`processes.reap_session`, never raising: teardown must not fail."""
+    try:
+        from . import processes
+
+        return processes.reap_session(record)
+    except Exception as exc:  # noqa: BLE001 - teardown must not raise (INV-10)
+        return {"terminated": [], "companion_left_running": [], "error": str(exc)}
+
+
+def _collect_if_child(pid: int) -> None:
+    """Reap `pid` when it is this process's own exited child: a zombie
+    answers `kill(pid, 0)`, which kept every self-started process "alive"
+    for the whole termination timeout."""
+    try:
+        os.waitpid(pid, os.WNOHANG)
+    except (ChildProcessError, OSError):
+        pass
+
+
+def _is_zombie(pid: int) -> bool:
+    """True when `pid` has exited but its parent has not reaped it yet.
+
+    A zombie still answers `kill(pid, 0)`, so an exited process whose parent
+    is slow to reap it (or is a long-lived process that never does) looked
+    alive until the termination timeout ran out. Never raises; unknown is
+    "not a zombie"."""
+    try:
+        completed = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)],
+                                   capture_output=True, text=True, timeout=5,
+                                   check=False)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return completed.stdout.strip().startswith("Z")
+
+
+def _exited(pid: int, *, ask_ps: bool = True) -> bool:
+    _collect_if_child(pid)
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return True
+    return ask_ps and _is_zombie(pid)
+
+
 def terminate_pid(pid: int | None, *, timeout: float = 5.0) -> bool:
     """Stop a session-owned background process; returns True when it was alive."""
     if not pid:
@@ -267,16 +328,22 @@ def terminate_pid(pid: int | None, *, timeout: float = 5.0) -> bool:
     except (ProcessLookupError, PermissionError):
         return False
     deadline = time.time() + timeout
+    polls = 0
     while time.time() < deadline:
-        try:
-            os.kill(pid, 0)
-        except OSError:
+        # `ps` (the zombie check) every fifth poll: a live process shutting
+        # down is polled every 50 ms, and kill(pid, 0) alone is free.
+        if _exited(pid, ask_ps=polls % 5 == 0):
             return True
+        polls += 1
         time.sleep(0.05)
     try:
         os.kill(pid, 9)
     except OSError:
         pass
+    for polls in range(40):  # SIGKILL is not instant under load: see it land
+        if _exited(pid, ask_ps=polls % 5 == 0):
+            break
+        time.sleep(0.05)
     return True
 
 
@@ -287,7 +354,7 @@ def pid_alive(pid: int | None) -> bool:
         os.kill(pid, 0)
     except OSError:
         return False
-    return True
+    return not _is_zombie(pid)
 
 
 # --- Android app control (unchanged behavior) --------------------------------
@@ -331,23 +398,61 @@ def _raise_if_am_failed(output: str, component: str) -> None:
 
 
 def _am_start(adb: str, serial: str, argv: list[str], component: str,
-              *, timeout: float) -> None:
+              *, timeout: float) -> str:
     from . import adb as adb_mod
 
     completed = adb_mod.run_adb(
         adb, ["shell", "am", "start", *argv], serial=serial, timeout=timeout, check=True,
     )
-    _raise_if_am_failed(completed.stdout if isinstance(completed.stdout, str) else "",
-                        component)
+    output = completed.stdout if isinstance(completed.stdout, str) else ""
+    _raise_if_am_failed(output, component)
+    return output
 
 
-def launch_app(adb: str, serial: str, app_id: str, activity: str | None = None) -> None:
+_WAIT_KEYS = {"Status": "status", "LaunchState": "launch_state", "Activity": "activity",
+              "TotalTime": "total_time_ms", "WaitTime": "wait_time_ms"}
+
+
+def parse_am_wait(output: str) -> dict[str, Any] | None:
+    """The launch report `am start -W` prints, or None when there is none.
+
+    ``{"launch_state", "activity", "total_time_ms", "wait_time_ms", "status",
+    "brought_to_front"}``: `launch_state` is lower-cased (``cold``, ``warm``,
+    ``hot``, ``unknown`` — the last when an existing task was only brought to
+    the front, which is what a resume normally is).
+    """
+    fields: dict[str, Any] = {}
+    brought = False
+    for line in (output or "").splitlines():
+        stripped = line.strip()
+        if "brought to the front" in stripped:
+            brought = True
+        key, sep, value = stripped.partition(":")
+        if not sep or key not in _WAIT_KEYS:
+            continue
+        value = value.strip()
+        name = _WAIT_KEYS[key]
+        if name.endswith("_ms"):
+            fields[name] = int(value) if value.isdigit() else None
+        elif name == "launch_state":
+            fields[name] = value.split()[0].lower() if value else None
+        else:
+            fields[name] = value or None
+    if not fields:
+        return None
+    report = {"launch_state": None, "activity": None, "total_time_ms": None,
+              "wait_time_ms": None, "status": None}
+    report.update(fields)
+    report["brought_to_front"] = brought
+    return report
+
+
+def _monkey_launch(adb: str, serial: str, app_id: str) -> None:
+    """The last-resort launch, for a package with no resolvable launcher
+    activity. `monkey` freezes rotation to 0 and thaws it again when it ends,
+    which silently undoes a pinned orientation — never the first choice."""
     from . import adb as adb_mod
 
-    if activity:
-        component = _component(app_id, activity)
-        _am_start(adb, serial, ["-n", component], component, timeout=30)
-        return
     # `--pct-syskeys 0`: monkey refuses to run at all on an AVD with
     # hw.keyboard=no ("SYS_KEYS has no physical keys but with factor 2.0%",
     # exit 251) because its default event mix includes system keys. One launch
@@ -372,6 +477,44 @@ def launch_app(adb: str, serial: str, app_id: str, activity: str | None = None) 
         raise adb_mod.AdbError(output.strip() or f"monkey -p {app_id} failed ({completed.returncode})")
 
 
+MAIN_ACTION = "android.intent.action.MAIN"
+LAUNCHER_CATEGORY = "android.intent.category.LAUNCHER"
+# FLAG_ACTIVITY_NEW_TASK | FLAG_ACTIVITY_RESET_TASK_IF_NEEDED: exactly what the
+# home screen (and monkey) send, so an existing task is brought to the front
+# as it stands — no CLEAR_TASK, nothing the user was doing is thrown away.
+RESUME_TASK_FLAGS = "0x10200000"
+
+
+def launch_app(adb: str, serial: str, app_id: str,
+               activity: str | None = None) -> dict[str, Any]:
+    """Start (or bring to the front) the app the way its launcher icon does.
+
+    `am start -W` on the resolved launcher activity, never `monkey` first:
+    monkey freezes the rotation to 0 and thaws it when it finishes, so every
+    resume reset the orientation a test had pinned. monkey remains the
+    fallback for a package whose launcher activity cannot be resolved.
+
+    Returns ``{"mode": "resume", "component", "launch"}`` where `launch` is
+    the `-W` report (`parse_am_wait`), or None when monkey had to be used.
+    """
+    if activity:
+        component = _component(app_id, activity)
+        output = _am_start(adb, serial, ["-W", "-n", component], component, timeout=60)
+        return {"mode": "resume", "component": component, "launch": parse_am_wait(output)}
+    component = resolve_launcher_activity(adb, serial, app_id)
+    if component is None:
+        _monkey_launch(adb, serial, app_id)
+        return {"mode": "resume", "component": None, "launch": None,
+                "note": "no launcher activity resolved; launched via monkey"}
+    output = _am_start(
+        adb, serial,
+        ["-W", "-n", component, "-a", MAIN_ACTION, "-c", LAUNCHER_CATEGORY,
+         "-f", RESUME_TASK_FLAGS],
+        component, timeout=60,
+    )
+    return {"mode": "resume", "component": component, "launch": parse_am_wait(output)}
+
+
 FRESH_TASK_FLAGS = "0x10008000"  # FLAG_ACTIVITY_NEW_TASK | FLAG_ACTIVITY_CLEAR_TASK
 
 
@@ -383,7 +526,7 @@ def resolve_launcher_activity(adb: str, serial: str, app_id: str) -> str | None:
     completed = adb_mod.run_adb(
         adb,
         ["shell", "cmd", "package", "resolve-activity", "--brief",
-         "-c", "android.intent.category.LAUNCHER", app_id],
+         "-a", MAIN_ACTION, "-c", LAUNCHER_CATEGORY, app_id],
         serial=serial, timeout=30, check=False,
     )
     text = completed.stdout if isinstance(completed.stdout, str) else ""
@@ -398,37 +541,45 @@ def launch_app_fresh(adb: str, serial: str, app_id: str,
                      activity: str | None = None) -> dict:
     """Start the launcher activity (or `activity`) on a cleared task.
 
-    `monkey` (what `launch_app` uses) resumes whatever the app's task holds,
-    which on a real device meant a flow's first selector met a subscreen —
-    or, with Android Settings, a search activity of *another* package that
+    A resume (`launch_app`) brings back whatever the app's task holds, which
+    on a real device meant a flow's first selector met a subscreen — or,
+    with Android Settings, a search activity of *another* package that
     `force-stop` never touches. Clearing the task starts the app where a
     user launching it from the home screen would land, without wiping data.
 
     With an explicit `activity` the same cleared-task start targets that
     component, so `--fresh --activity` no longer falls back to a resume.
+    The `-W` launch report is returned under `launch` when there is one.
     """
     if activity:
         component = _component(app_id, activity)
-        _am_start(adb, serial, ["-W", "-n", component, "-f", FRESH_TASK_FLAGS],
-                  component, timeout=60)
-        return {"mode": "fresh", "component": component}
+        output = _am_start(adb, serial, ["-W", "-n", component, "-f", FRESH_TASK_FLAGS],
+                           component, timeout=60)
+        return _with_launch({"mode": "fresh", "component": component}, output)
     component = resolve_launcher_activity(adb, serial, app_id)
     if component is None:
-        launch_app(adb, serial, app_id)
+        _monkey_launch(adb, serial, app_id)
         return {"mode": "resume", "component": None,
                 "note": "no launcher activity resolved; resumed via monkey"}
     # FLAG_ACTIVITY_NEW_TASK | FLAG_ACTIVITY_CLEAR_TASK as a raw flag value:
     # `am start` has no `--activity-new-task` option, and measured on an
     # API-37 emulator `--activity-clear-task` alone left Settings on its
     # SubSettings screen — CLEAR_TASK only clears when paired with NEW_TASK.
-    _am_start(
+    output = _am_start(
         adb, serial,
         ["-W", "-n", component,
-         "-a", "android.intent.action.MAIN", "-c", "android.intent.category.LAUNCHER",
+         "-a", MAIN_ACTION, "-c", LAUNCHER_CATEGORY,
          "-f", FRESH_TASK_FLAGS],
         component, timeout=60,
     )
-    return {"mode": "fresh", "component": component}
+    return _with_launch({"mode": "fresh", "component": component}, output)
+
+
+def _with_launch(detail: dict[str, Any], output: str) -> dict[str, Any]:
+    report = parse_am_wait(output)
+    if report is not None:
+        detail["launch"] = report
+    return detail
 
 
 def force_stop(adb: str, serial: str, app_id: str) -> None:

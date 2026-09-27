@@ -152,10 +152,9 @@ class MaestroFidelityTests(unittest.TestCase):
             maestro.export_flow(flow, "t.yaml")
         refusals = caught.exception.extra["refusals"]
         self.assertEqual([item["command"] for item in refusals],
-                         ["setOrientation", "tapOn", "scrollUntilVisible",
-                          "retry"])
-        self.assertEqual([item["line"] for item in refusals], [5, 6, 11, 14])
-        self.assertIn("3 more", caught.exception.message)
+                         ["setOrientation", "scrollUntilVisible", "retry"])
+        self.assertEqual([item["line"] for item in refusals], [5, 11, 14])
+        self.assertIn("2 more", caught.exception.message)
         self.assertEqual(caught.exception.extra["line"], 5)
 
     def test_postcondition_refuses_instead_of_dropping(self) -> None:

@@ -13,8 +13,11 @@ import os
 import plistlib
 import re
 import shutil
+import stat
+import struct
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
@@ -282,13 +285,477 @@ def app_container(xcrun: str, udid: str, bundle_id: str, kind: str = "data") -> 
     return Path(value)
 
 
+# --- the app's executable, installed bundle and binary UUIDs -----------------------
+#
+# The log predicate matches the app's process by image. The bundle id's last
+# component is only a guess at its name, and for a Flutter app it is always
+# wrong: every Flutter iOS app's executable is `Runner`, so a live Flutter
+# session (`com.example.knit`) filtered on "knit" and returned no line at
+# all. The executable name alone is not enough either — every other Flutter
+# app on the simulator is a `Runner` too.
+#
+# The installed bundle's path cannot tell them apart in the log either. The
+# unified log keeps the path at which it first saw a binary's UUID: after
+# the same build is uninstalled and installed again, every record still
+# names the first, deleted container (measured on iOS 26.5 / Xcode 27: the
+# app ran from `…/441D5220-…/Runner-26.09.23.app/Runner` while all of its
+# 817 records said `…/FE85D28A-…/Runner-26.09.23.app/Runner`). What does
+# identify the app is the binary's own Mach-O UUID (LC_UUID), which every
+# record carries as `processImageUUID` / `senderImageUUID`. `log` predicates
+# cannot compare it, so the server-side predicate names the executable
+# (`ENDSWITH "/Runner"`) and the client-side filter keeps the records whose
+# image UUID is the installed binary's (``binary_uuids``).
+#
+# The executable is CFBundleExecutable in the app's Info.plist: read from the
+# recorded install .app when one is given (a local file, never cached), else
+# from `simctl appinfo`, else from the installed bundle. The installed bundle
+# path is appinfo's `Path`, else `get_app_container <udid> <bundle> app`. The
+# recorded install path is the build output, NOT where the process runs
+# from, so it never feeds the path match or the UUIDs.
+#
+# Every lookup here is best-effort and never raises: a timeout, a missing
+# tool, a malformed plist or binary degrades the filter, it must never fail
+# (or roll back) the verb that asked.
+
+_EXECUTABLE_CACHE: dict[tuple[str, str, str], str] = {}
+_BUNDLE_PATH_CACHE: dict[tuple[str, str, str], str] = {}
+# binary path -> ((dev, inode, size, mtime_ns), UUIDs): read again when the
+# file changes, dropped when it disappears
+_UUID_CACHE: dict[str, tuple[tuple[int, int, int, int], frozenset[str]]] = {}
+PROBE_TIMEOUT = 30
+
+
+def _appinfo_pattern(key: str) -> re.Pattern[str]:
+    return re.compile(
+        r'^\s*"?' + re.escape(key) + r'"?\s*=\s*(?:"((?:[^"\\]|\\.)*)"|([^;\s]+))\s*;', re.M)
+
+
+_APPINFO_EXECUTABLE = _appinfo_pattern("CFBundleExecutable")
+_APPINFO_IDENTIFIER = _appinfo_pattern("CFBundleIdentifier")
+_APPINFO_PATH = _appinfo_pattern("Path")
+
+
+def _probe(xcrun: str, args: Sequence[str], *,
+           timeout: float | None = None) -> tuple[subprocess.CompletedProcess | None, str | None]:
+    """Run a read-only simctl query without letting it raise.
+
+    Returns ``(completed, None)`` on success, else ``(completed or None,
+    reason)``: a timeout (``PROBE_TIMEOUT`` seconds unless given), a missing
+    tool, or a non-zero exit, in words a payload can carry."""
+    timeout = PROBE_TIMEOUT if timeout is None else timeout
+    try:
+        completed = run_simctl(xcrun, list(args), timeout=timeout, check=False)
+    except subprocess.TimeoutExpired:
+        return None, f"simctl {args[0]} timed out after {timeout:g}s"
+    except errors.AutonomError as exc:
+        return None, exc.message
+    except OSError as exc:
+        return None, f"simctl {args[0]} could not run: {exc}"
+    if completed.returncode != 0:
+        detail = (completed.stderr or "").strip()[-200:]
+        return completed, detail or f"simctl {args[0]} failed ({completed.returncode})"
+    return completed, None
+
+
+def _sane_executable(value: Any) -> str | None:
+    """A CFBundleExecutable fit for a predicate: a plain file name."""
+    if not isinstance(value, str):
+        return None
+    name = value.strip()
+    if not name or len(name) > 255 or "/" in name or any(ch in name for ch in "\r\n\0"):
+        return None
+    return name
+
+
+def bundle_executable(app_path: Path | str, bundle_id: str | None = None) -> str | None:
+    """CFBundleExecutable from ``<app>/Info.plist`` (XML or binary, via
+    plistlib), or None. With ``bundle_id``, the plist must name exactly that
+    identifier: another app's bundle, or one that names none, lends nothing.
+    Any read or parse failure is None — a malformed XML plist raises
+    ExpatError, which is none of plistlib's own exception types."""
+    try:
+        with (Path(app_path).expanduser() / "Info.plist").open("rb") as handle:
+            data = plistlib.load(handle)
+    except Exception:  # noqa: BLE001 - never raises, see the section note
+        return None
+    if not isinstance(data, dict):
+        return None
+    if bundle_id and data.get("CFBundleIdentifier") != bundle_id:
+        return None
+    return _sane_executable(data.get("CFBundleExecutable"))
+
+
+def _appinfo_value(text: str, pattern: re.Pattern[str]) -> str | None:
+    match = pattern.search(text or "")
+    if not match:
+        return None
+    return match.group(1) if match.group(1) is not None else match.group(2)
+
+
+def parse_appinfo_executable(text: str, bundle_id: str | None = None) -> str | None:
+    """CFBundleExecutable from `simctl appinfo`'s OpenStep-style listing."""
+    if bundle_id:
+        ident = _appinfo_value(text, _APPINFO_IDENTIFIER)
+        if ident is not None and ident != bundle_id:
+            return None
+    return _sane_executable(_appinfo_value(text, _APPINFO_EXECUTABLE))
+
+
+def _installed_bundle(value: str | None) -> str | None:
+    """An installed .app path worth matching: absolute, and a directory on
+    this host (simulator containers live on the host's disk)."""
+    if not value:
+        return None
+    value = value.strip()
+    if not value or value == "(null)" or not value.startswith("/"):
+        return None
+    path = value.rstrip("/")
+    try:
+        return path if os.path.isdir(path) else None
+    except (OSError, ValueError):
+        return None
+
+
+def _lookup_installed(xcrun: str, udid: str, bundle_id: str, *,
+                      timeout: float | None = None) -> tuple[str | None, str | None]:
+    """(executable, installed bundle path) from the device, best-effort.
+    ``timeout`` bounds both probes together (``PROBE_TIMEOUT`` each when
+    None)."""
+    executable = path = None
+    deadline = None if timeout is None else time.monotonic() + timeout
+    completed, reason = _probe(xcrun, ["appinfo", udid, bundle_id], timeout=timeout)
+    if reason is None and completed is not None:
+        text = completed.stdout or ""
+        ident = _appinfo_value(text, _APPINFO_IDENTIFIER)
+        if ident is None or ident == bundle_id:
+            executable = parse_appinfo_executable(text, bundle_id)
+            path = _installed_bundle(_appinfo_value(text, _APPINFO_PATH))
+    remaining = None if deadline is None else deadline - time.monotonic()
+    # A simulator that timed out once is not asked twice in a row, nor once
+    # the budget is spent.
+    if (not path and "timed out" not in (reason or "")
+            and (remaining is None or remaining > 0.05)):
+        completed, reason = _probe(xcrun, ["get_app_container", udid, bundle_id, "app"],
+                                   timeout=remaining)
+        if reason is None and completed is not None:
+            path = _installed_bundle(completed.stdout)
+    if path and not executable:
+        executable = bundle_executable(path, bundle_id)
+    return executable, path
+
+
+def app_image(xcrun: str, udid: str, bundle_id: str, *,
+              app_path: Path | str | None = None,
+              timeout: float | None = None) -> tuple[str | None, str | None]:
+    """``(executable, installed bundle path)`` for ``bundle_id``, either
+    possibly None. Never raises. ``timeout`` bounds the device lookup
+    (``PROBE_TIMEOUT`` per probe when None).
+
+    Device answers are cached per (xcrun, udid, bundle id) once found; a
+    miss is not cached (an app installed later is still found), and a cached
+    bundle path that no longer exists — a reinstall moves the app to a new
+    container — is looked up again. ``app_path`` is read every time."""
+    if not bundle_id:
+        return None, None
+    key = (str(xcrun), udid, bundle_id)
+    executable = bundle_executable(app_path, bundle_id) if app_path else None
+    executable = executable or _EXECUTABLE_CACHE.get(key)
+    path = _BUNDLE_PATH_CACHE.get(key)
+    if path and _installed_bundle(path) is None:
+        _BUNDLE_PATH_CACHE.pop(key, None)
+        path = None
+    if executable and path:
+        return executable, path
+    found_executable, found_path = _lookup_installed(xcrun, udid, bundle_id, timeout=timeout)
+    if found_executable:
+        _EXECUTABLE_CACHE[key] = found_executable
+    if found_path:
+        _BUNDLE_PATH_CACHE[key] = found_path
+    return executable or found_executable, path or found_path
+
+
+def app_executable(xcrun: str, udid: str, bundle_id: str, *,
+                   app_path: Path | str | None = None) -> str | None:
+    """The app's executable name (``Runner`` for any Flutter app), or None.
+    Never raises; see ``app_image`` for the sources and the cache."""
+    if not bundle_id:
+        return None
+    if app_path:
+        name = bundle_executable(app_path, bundle_id)
+        if name:
+            return name
+    cached = _EXECUTABLE_CACHE.get((str(xcrun), udid, bundle_id))
+    if cached:
+        return cached
+    return app_image(xcrun, udid, bundle_id)[0]
+
+
+def app_bundle_path(xcrun: str, udid: str, bundle_id: str) -> str | None:
+    """Where the installed app lives on this host (``…/Containers/Bundle/
+    Application/<uuid>/Runner.app``), or None. Never raises."""
+    return app_image(xcrun, udid, bundle_id)[1]
+
+
+# Mach-O: the first four bytes as stored in the file. A thin image is
+# (byte order, header size); a fat (universal) wrapper is (byte order,
+# 64-bit slice table). Fat headers are big-endian in practice; the swapped
+# forms are read too.
+_MACHO_THIN = {
+    b"\xfe\xed\xfa\xce": (">", 28),  # MH_MAGIC
+    b"\xce\xfa\xed\xfe": ("<", 28),  # MH_CIGAM
+    b"\xfe\xed\xfa\xcf": (">", 32),  # MH_MAGIC_64
+    b"\xcf\xfa\xed\xfe": ("<", 32),  # MH_CIGAM_64
+}
+_MACHO_FAT = {
+    b"\xca\xfe\xba\xbe": (">", False),  # FAT_MAGIC
+    b"\xbe\xba\xfe\xca": ("<", False),  # FAT_CIGAM
+    b"\xca\xfe\xba\xbf": (">", True),   # FAT_MAGIC_64
+    b"\xbf\xba\xfe\xca": ("<", True),   # FAT_CIGAM_64
+}
+LC_UUID = 0x1B
+# Bounds on what is read: a universal binary has a handful of slices (and a
+# Java class file, which shares 0xcafebabe, reads as dozens), and the load
+# commands sit in the first few KB of each slice.
+MACHO_MAX_SLICES = 16
+MACHO_MAX_COMMANDS = 4096
+MACHO_MAX_COMMAND_BYTES = 1 << 20
+
+
+class _NotMachO(Exception):
+    """A structural problem: the file is not a readable Mach-O image."""
+
+
+def _uuid_text(raw: bytes) -> str:
+    text = raw.hex().upper()
+    return f"{text[:8]}-{text[8:12]}-{text[12:16]}-{text[16:20]}-{text[20:32]}"
+
+
+def _slice_uuid(handle: Any, offset: int) -> str | None:
+    """The LC_UUID of the thin image at ``offset``, or None when it has
+    none. Raises ``_NotMachO`` for anything that is not a thin image."""
+    handle.seek(offset)
+    header = handle.read(32)
+    kind = _MACHO_THIN.get(header[:4])
+    if kind is None:
+        raise _NotMachO("no thin Mach-O magic")
+    order, size = kind
+    if len(header) < size:
+        raise _NotMachO("truncated header")
+    ncmds, sizeofcmds = struct.unpack(order + "II", header[16:24])
+    if ncmds > MACHO_MAX_COMMANDS:
+        raise _NotMachO("implausible load command count")
+    handle.seek(offset + size)
+    commands = handle.read(min(sizeofcmds, MACHO_MAX_COMMAND_BYTES))
+    position = 0
+    for _ in range(ncmds):
+        if position + 8 > len(commands):
+            raise _NotMachO("truncated load commands")
+        command, command_size = struct.unpack_from(order + "II", commands, position)
+        if command_size < 8:
+            raise _NotMachO("malformed load command")
+        if command == LC_UUID:
+            if command_size < 24 or position + 24 > len(commands):
+                raise _NotMachO("truncated LC_UUID")
+            raw = commands[position + 8:position + 24]
+            return _uuid_text(raw) if raw != bytes(16) else None
+        position += command_size
+    return None
+
+
+def binary_uuids(path: Path | str) -> set[str]:
+    """The LC_UUIDs of a Mach-O binary, canonical upper-case
+    ``8-4-4-4-12``: the one of a thin 32/64-bit image (either byte order),
+    or one per slice of a fat/fat64 universal binary.
+
+    Reads only headers and load commands (bounded: ``MACHO_MAX_SLICES``,
+    ``MACHO_MAX_COMMANDS``, ``MACHO_MAX_COMMAND_BYTES``), never the whole
+    file, and only from a regular file. Never raises: a missing, truncated
+    or non-Mach-O file — or any slice of one that is not a thin image — is
+    the empty set. A slice without an LC_UUID contributes nothing."""
+    try:
+        if not stat.S_ISREG(os.stat(path).st_mode):
+            return set()
+        with open(path, "rb") as handle:
+            head = handle.read(8)
+            fat = _MACHO_FAT.get(head[:4])
+            if fat is None:
+                found = _slice_uuid(handle, 0)
+                return {found} if found else set()
+            order, wide = fat
+            if len(head) < 8:
+                return set()
+            (count,) = struct.unpack(order + "I", head[4:8])
+            if not 0 < count <= MACHO_MAX_SLICES:
+                return set()
+            entry = 32 if wide else 20
+            table = handle.read(entry * count)
+            if len(table) < entry * count:
+                return set()
+            uuids: set[str] = set()
+            for index in range(count):
+                offset = struct.unpack_from(order + ("Q" if wide else "I"), table,
+                                            index * entry + 8)[0]
+                if offset < 8 + entry * count:
+                    return set()  # a slice inside the fat header: not a binary
+                found = _slice_uuid(handle, offset)
+                if found:
+                    uuids.add(found)
+            return uuids
+    except Exception:  # noqa: BLE001 - never raises, see the section note
+        return set()
+
+
+def image_uuids(path: Path | str) -> frozenset[str]:
+    """``binary_uuids`` of ``path``, cached while the file is unchanged
+    (same device, inode, size and mtime). A path that is gone drops its
+    entry and answers the empty set. Never raises."""
+    key = str(path)
+    try:
+        info = os.stat(key)
+    except (OSError, ValueError):
+        _UUID_CACHE.pop(key, None)
+        return frozenset()
+    stamp = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+    cached = _UUID_CACHE.get(key)
+    if cached is not None and cached[0] == stamp:
+        return cached[1]
+    found = frozenset(binary_uuids(key))
+    if found:
+        _UUID_CACHE[key] = (stamp, found)
+    else:
+        _UUID_CACHE.pop(key, None)
+    return found
+
+
+def bundle_identifier(app_path: Path | str | None) -> str | None:
+    """CFBundleIdentifier from ``<app>/Info.plist``, or None when the plist
+    is missing, unreadable or names none. Never raises."""
+    if not app_path:
+        return None
+    try:
+        with (Path(app_path).expanduser() / "Info.plist").open("rb") as handle:
+            data = plistlib.load(handle)
+    except Exception:  # noqa: BLE001 - never raises, see the section note
+        return None
+    ident = data.get("CFBundleIdentifier") if isinstance(data, dict) else None
+    return ident if isinstance(ident, str) and ident else None
+
+
+def installed_image_uuids(bundle_path: str | None, executable: str | None = None,
+                          bundle_id: str | None = None) -> frozenset[str]:
+    """The UUIDs of the installed app's binary,
+    ``<bundle>/<CFBundleExecutable>`` — the executable named by the
+    installed bundle's own Info.plist, else ``executable``. Empty when
+    either is unknown or the binary cannot be read — and, with
+    ``bundle_id``, when the bundle's Info.plist names another identifier:
+    that is another app's install (a reused path), whose binary vouches for
+    nothing. Only a plist that is missing, unreadable or names no identifier
+    falls back to ``executable``. Never raises."""
+    if not bundle_path:
+        return frozenset()
+    ident = bundle_identifier(bundle_path)
+    if bundle_id and ident is not None and ident != bundle_id:
+        return frozenset()
+    name = bundle_executable(bundle_path, bundle_id) or _sane_executable(executable)
+    if not name:
+        return frozenset()
+    return image_uuids(os.path.join(str(bundle_path), name))
+
+
+def app_identity(xcrun: str, udid: str, bundle_id: str, *,
+                 app_path: Path | str | None = None,
+                 timeout: float | None = None,
+                 ) -> tuple[str | None, str | None, frozenset[str]]:
+    """``(executable, installed bundle path, binary UUIDs)``: ``app_image``
+    plus ``installed_image_uuids`` of what it found. The UUIDs are what
+    tells this app's log records from another app's with the same
+    executable name, whatever container path the log reports. ``timeout``
+    bounds the device lookup. Never raises."""
+    bounded = {"timeout": timeout} if timeout is not None else {}
+    executable, bundle_path = app_image(xcrun, udid, bundle_id, app_path=app_path, **bounded)
+    return executable, bundle_path, installed_image_uuids(bundle_path, executable, bundle_id)
+
+
+def reset_caches() -> None:
+    """Forget the per-process app and privacy-service probes (tests, or
+    after an Xcode switch)."""
+    _EXECUTABLE_CACHE.clear()
+    _BUNDLE_PATH_CACHE.clear()
+    _UUID_CACHE.clear()
+    _PRIVACY_CACHE.clear()
+
+
 # --- device state ------------------------------------------------------------
 
+# The fallback when the running simctl's own list cannot be read. The live
+# list wins: Xcode 27 has no `camera` or `userTracking` service, and sending
+# one answered backend_failed with simctl's usage text.
 PRIVACY_SERVICES = (
     "all", "calendar", "contacts-limited", "contacts", "location", "location-always",
     "photos-add", "photos", "media-library", "microphone", "motion", "reminders",
     "siri", "camera", "userTracking",
 )
+_PRIVACY_CACHE: dict[str, tuple[str, ...] | None] = {}
+_PRIVACY_ITEM = re.compile(r"^\s+([A-Za-z][A-Za-z0-9._+-]*)\s+-\s+\S")
+_PRIVACY_SECTIONS = {"action", "service", "bundle identifier"}
+
+
+def parse_privacy_services(help_text: str) -> tuple[str, ...]:
+    """The service names under `simctl help privacy`'s ``service`` heading
+    (the ``action`` heading's grant/revoke/reset have the same shape, so the
+    section is tracked, never pattern-matched alone)."""
+    services: list[str] = []
+    section = None
+    for line in (help_text or "").splitlines():
+        stripped = line.strip()
+        if stripped in _PRIVACY_SECTIONS:
+            section = stripped
+            continue
+        if not line[:1].isspace() and stripped:
+            section = None  # "Examples:", "Warning:", the usage line
+            continue
+        if section == "service":
+            match = _PRIVACY_ITEM.match(line)
+            if match and match.group(1) not in services:
+                services.append(match.group(1))
+    return tuple(services)
+
+
+def privacy_services(xcrun: str) -> tuple[tuple[str, ...], str]:
+    """``(services, source)``: this simctl's own list (``simctl``), parsed
+    once per process, or the static fallback (``static``). `simctl help`
+    prints to stderr and touches no device."""
+    key = str(xcrun)
+    if key not in _PRIVACY_CACHE:
+        parsed: tuple[str, ...] | None = None
+        # A timeout or a missing tool falls back to the static list (and is
+        # remembered, so a wedged simctl is not waited on twice).
+        completed, reason = _probe(xcrun, ["help", "privacy"])
+        if reason is None and completed is not None:
+            parsed = parse_privacy_services((completed.stdout or "") + "\n"
+                                            + (completed.stderr or "")) or None
+        _PRIVACY_CACHE[key] = parsed
+    live = _PRIVACY_CACHE[key]
+    return (live, "simctl") if live else (PRIVACY_SERVICES, "static")
+
+
+def check_privacy_service(xcrun: str, service: str) -> str:
+    """Refuse a service before the device is touched: one this simctl does
+    not have (but the static list knows) is ``invalid_value``; a name nobody
+    knows keeps ``unknown_privacy_service``. Both list what is supported."""
+    supported, source = privacy_services(xcrun)
+    if service in supported:
+        return source
+    hint = "Supported services: " + ", ".join(supported) + "."
+    if service in PRIVACY_SERVICES:
+        raise errors.AutonomError(
+            errors.INVALID_VALUE,
+            f"privacy service {service!r} is not supported by this Xcode's simctl",
+            hint, service=service, supported_services=list(supported))
+    raise errors.AutonomError(
+        errors.UNKNOWN_PRIVACY_SERVICE,
+        f"unknown privacy service: {service}",
+        hint, service=service, supported_services=list(supported))
 
 
 def openurl(xcrun: str, udid: str, url: str) -> None:
@@ -296,16 +763,150 @@ def openurl(xcrun: str, udid: str, url: str) -> None:
 
 
 def privacy(xcrun: str, udid: str, action: str, service: str, bundle_id: str | None = None) -> None:
-    if service not in PRIVACY_SERVICES:
-        raise errors.AutonomError(
-            errors.UNKNOWN_PRIVACY_SERVICE,
-            f"unknown privacy service: {service}",
-            "Valid services: " + ", ".join(PRIVACY_SERVICES),
-        )
+    check_privacy_service(xcrun, service)
     args = ["privacy", udid, action, service]
     if bundle_id:
         args.append(bundle_id)
     run_simctl(xcrun, args, timeout=30)
+
+
+# --- read-backs for the simulator controls -----------------------------------------
+#
+# `simctl status_bar <udid> list` prints only the overrides that are set:
+#
+#     Current Status Bar Overrides:
+#     =============================
+#     Time: 9:41
+#     DataNetworkType: 11
+#     WiFi Mode: 3, WiFi Bars: 3
+#     Cell Mode: 3, Cell Bars: 4
+#     Operator Name: Carrier
+#     Battery State: 2, Battery Level: 100, Not Charging: 0
+#
+# (format strings and the "print only when set" branches read from Xcode
+# 27.0's simctl). The enumerations come back as the raw values simctl's own
+# `override` parser assigns to each name, so they are mapped back here; a
+# build that prints the name instead is accepted too.
+
+IOS_STATUS_BAR_ENUMS: dict[str, dict[str, int]] = {
+    "dataNetwork": {"hide": 0, "wifi": 1, "3g": 6, "4g": 7, "lte": 8, "lte-a": 9,
+                    "lte+": 10, "5g": 11, "5g+": 12, "5g-uwb": 13, "5g-uc": 14},
+    "wifiMode": {"searching": 1, "failed": 2, "active": 3},
+    "cellularMode": {"notSupported": 0, "searching": 1, "failed": 2, "active": 3},
+    "batteryState": {"discharging": 0, "charging": 1, "charged": 2},
+}
+_STATUS_BAR_HEADER = "Current Status Bar Overrides"
+_STATUS_BAR_FIELDS = {
+    "time": "time", "datanetworktype": "dataNetwork", "wifi mode": "wifiMode",
+    "wifi bars": "wifiBars", "cell mode": "cellularMode", "cell bars": "cellularBars",
+    "cellular mode": "cellularMode", "cellular bars": "cellularBars",
+    "operator name": "operatorName", "battery state": "batteryState",
+    "battery level": "batteryLevel", "not charging": "notCharging",
+}
+_UNSET = {"", "(null)", "null", "<null>"}
+
+
+def parse_status_bar_list(text: str) -> dict[str, str] | None:
+    """The overrides `status_bar list` reports, keyed by the override flag
+    name (``batteryLevel``, ``wifiMode``, ...), values as printed. None when
+    the output is not a status-bar listing at all."""
+    lines = (text or "").splitlines()
+    if not any(_STATUS_BAR_HEADER in line for line in lines):
+        return None
+    overrides: dict[str, str] = {}
+    for line in lines:
+        if _STATUS_BAR_HEADER in line or set(line.strip()) <= {"="}:
+            continue
+        # "Time:" takes the whole rest of the line (a clock contains ':');
+        # the other lines are comma-separated "Label: value" pairs.
+        head, sep, rest = line.partition(":")
+        if not sep:
+            continue
+        if head.strip().lower() in ("time", "operator name"):
+            pairs = [(head, rest)]
+        else:
+            pairs = [part.partition(":")[::2] for part in line.split(",")]
+        for label, value in pairs:
+            key = _STATUS_BAR_FIELDS.get(label.strip().lower())
+            if key is None:
+                continue
+            value = value.strip()
+            # An explicit empty carrier name ('') is an override; "(null)"
+            # is not, whatever the key.
+            if value.lower() in _UNSET and not (key == "operatorName" and value == ""):
+                continue
+            overrides[key] = value
+    return overrides
+
+
+def status_bar_value_matches(key: str, expected: Any, observed: str | None) -> bool:
+    """One override read back: ints compare as ints, the enumerations by
+    name or by simctl's raw value, the free-text keys exactly."""
+    if observed is None:
+        return False
+    wanted = str(expected).strip()
+    if key in IOS_STATUS_BAR_ENUMS:
+        table = IOS_STATUS_BAR_ENUMS[key]
+        if observed.strip().lstrip("-").isdigit():
+            return table.get(wanted) == int(observed)
+        return observed.strip().lower() == wanted.lower()
+    if key in ("batteryLevel", "wifiBars", "cellularBars"):
+        try:
+            return int(observed) == int(wanted)
+        except ValueError:
+            return False
+    return observed == wanted
+
+
+def read_status_bar(xcrun: str, udid: str) -> tuple[dict[str, str] | None, str | None]:
+    """``(overrides, None)``, or ``(None, reason)`` when they cannot be
+    listed (a timeout, a failure, output that is not a listing). Never
+    raises."""
+    completed, reason = _probe(xcrun, ["status_bar", udid, "list"])
+    if reason is not None or completed is None:
+        return None, reason or "simctl status_bar list did not run"
+    overrides = parse_status_bar_list(completed.stdout or "")
+    if overrides is None:
+        return None, "simctl status_bar list printed no override listing"
+    return overrides, None
+
+
+def status_bar_overrides(xcrun: str, udid: str) -> dict[str, str] | None:
+    """The live overrides, or None when they cannot be listed."""
+    return read_status_bar(xcrun, udid)[0]
+
+
+def read_notify_state(xcrun: str, udid: str, name: str) -> tuple[int | None, str | None]:
+    """``(state, None)`` for a Darwin notification inside the simulator
+    (`notifyutil -g <name>` prints ``<name> <value>``), or ``(None,
+    reason)``. Never raises."""
+    completed, reason = _probe(xcrun, ["spawn", udid, "notifyutil", "-g", name])
+    if reason is not None or completed is None:
+        return None, reason or "notifyutil -g did not run"
+    for line in (completed.stdout or "").splitlines():
+        fields = line.split()
+        if len(fields) >= 2 and fields[0] == name and fields[-1].lstrip("-").isdigit():
+            return int(fields[-1]), None
+    return None, f"notifyutil -g printed no state for {name}"
+
+
+def notify_state(xcrun: str, udid: str, name: str) -> int | None:
+    """The notification's state value, or None."""
+    return read_notify_state(xcrun, udid, name)[0]
+
+
+def read_pasteboard(xcrun: str, udid: str) -> tuple[str | None, str | None]:
+    """``(text, None)`` from `simctl pbpaste`, or ``(None, reason)``. Never
+    raises."""
+    completed, reason = _probe(xcrun, ["pbpaste", udid])
+    if reason is not None or completed is None:
+        return None, reason or "simctl pbpaste did not run"
+    return completed.stdout or "", None
+
+
+def pasteboard(xcrun: str, udid: str) -> str | None:
+    """The simulator pasteboard's text, or None when it cannot be read."""
+    return read_pasteboard(xcrun, udid)[0]
 
 
 def set_location(xcrun: str, udid: str, latitude: float, longitude: float) -> None:
@@ -347,28 +948,58 @@ DEFAULT_LOG_MAX_MB = 50
 _BOUNDED_WRITER = r"""
 import os, signal, subprocess, sys
 dest, cap, argv = sys.argv[1], max(1, int(sys.argv[2])), sys.argv[3:]
-child = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                         stderr=subprocess.DEVNULL)
+# The handlers go in before the child is started: a stop that landed between
+# the fork and the handler used to kill only the writer and leave the child
+# (`log stream`) running with nobody to stop it. A stop that arrives while
+# the child is being started is carried out right after.
+child = None
+stopping = []
 def stop(*_):
+    stopping.append(True)
+    if child is None:
+        return
     try:
         child.terminate()
+    except OSError:
+        pass
+    # A stop between linking the rotation's temp name and renaming it over
+    # `.1` leaves a second name for `dest`'s own bytes; drop it. Nothing is
+    # lost: `dest` and the previous `.1` are both intact at that point.
+    try:
+        os.remove(dest + ".1.tmp")
     except OSError:
         pass
     os._exit(0)
 for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
     signal.signal(sig, stop)
+child = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                         stderr=subprocess.DEVNULL)
+if stopping:
+    stop()
 out = open(dest, "ab")
 size = out.tell()
 for line in iter(child.stdout.readline, b""):
+    # `log stream` opens with a plain-text banner that quotes the predicate
+    # (and so the bundle id): not a record, and a package filter over the
+    # file would pass it as one. `log show` ends with a count trailer.
+    head = line.lstrip()[:64]
+    if head.startswith(b"Filtering the log data") or (
+            head.startswith(b'{"count"') and b'"finished"' in line and len(line) < 80):
+        continue
     line = line[:cap]
     if size + len(line) > cap:
         out.close()
-        # Link, then atomically swap in an empty file: `dest` never vanishes,
-        # so a reader polling it never sees a missing file.
+        # Link `dest` to a temp name and rename that over `.1`, then swap in
+        # an empty `dest`. Each step is atomic, so neither `dest` nor an
+        # existing `.1` ever vanishes: a reader polling `dest` never sees a
+        # missing file, and a SIGTERM (`session stop`) at any step keeps the
+        # previous rotation. Removing `.1` before linking it used to lose a
+        # full cap of evidence when the stop landed between the two calls.
         try:
-            if os.path.lexists(dest + ".1"):
-                os.remove(dest + ".1")
-            os.link(dest, dest + ".1")
+            if os.path.lexists(dest + ".1.tmp"):
+                os.remove(dest + ".1.tmp")
+            os.link(dest, dest + ".1.tmp")
+            os.replace(dest + ".1.tmp", dest + ".1")
             open(dest + ".new", "wb").close()
             os.replace(dest + ".new", dest)
         except OSError:
@@ -418,29 +1049,180 @@ def _quoted(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"')
 
 
-def log_predicate(bundle_id: str, *, executable: str | None = None) -> str:
-    """The app's own subsystem, or a process/sender image named after it.
+def bundle_prefixes(bundle_path: str) -> list[str]:
+    """``<bundle>/`` as given and, when it differs, with symlinks resolved
+    (`/tmp` is `/private/tmp` on macOS): the forms a record's image path may
+    take. The trailing slash keeps `Runner.app` from matching `Runner.app2`."""
+    base = str(bundle_path).rstrip("/")
+    forms = [base]
+    try:
+        real = os.path.realpath(base)
+    except (OSError, ValueError):
+        real = base
+    if real != base:
+        forms.append(real)
+    return [form + "/" for form in forms]
 
-    The image-path clauses use the app's executable name when it is known,
-    else the bundle id's last component — but only when that component is
-    distinctive (``log_leaf``). For ``com.example.app`` with no known
-    executable the predicate is the subsystem alone: exact, possibly
-    narrower, never "every process whose path contains app".
-    """
+
+def log_predicate(bundle_id: str, *, executable: str | None = None,
+                  bundle_path: str | None = None) -> str:
+    """The app's own subsystem, or a process/sender image that is the app —
+    the server-side half of the match (`log stream`, `log show`).
+
+    The image clauses name the executable (``ENDSWITH "/Runner"``), else the
+    bundle id's last component — only when it is distinctive (``log_leaf``).
+    For ``com.example.app`` with nothing known the predicate is the
+    subsystem alone: exact, possibly narrower, never "every process whose
+    path contains app".
+
+    ``bundle_path`` no longer narrows it: the unified log reports the
+    container path it first saw the binary at, so after a reinstall of the
+    same build ``BEGINSWITH "<installed bundle>/"`` matched none of the
+    app's records. ``ENDSWITH "/<executable>"`` survives a container move
+    and also admits other apps with the same executable name (every Flutter
+    `Runner`); the client-side ``log_line_matches`` narrows by binary UUID.
+    The parameter is still accepted so callers need not change."""
+    del bundle_path  # see the docstring: a container path is not identity
     clauses = [f'subsystem == "{_quoted(bundle_id)}"']
-    name = executable or log_leaf(bundle_id)
-    if name:
-        clauses += [f'processImagePath CONTAINS "{_quoted(name)}"',
-                    f'senderImagePath CONTAINS "{_quoted(name)}"']
+    if executable:
+        clauses += [f'processImagePath ENDSWITH "/{_quoted(executable)}"',
+                    f'senderImagePath ENDSWITH "/{_quoted(executable)}"']
+    else:
+        leaf = log_leaf(bundle_id)
+        if leaf:
+            clauses += [f'processImagePath CONTAINS "{_quoted(leaf)}"',
+                        f'senderImagePath CONTAINS "{_quoted(leaf)}"']
     return " OR ".join(clauses)
 
 
+def app_log_predicate(xcrun: str, udid: str, bundle_id: str, *,
+                      app_path: Path | str | None = None) -> str:
+    """``log_predicate`` for the installed app, resolved now (``app_image``).
+    Never raises; with nothing resolvable it is the subsystem/leaf form."""
+    executable, bundle_path = app_image(xcrun, udid, bundle_id, app_path=app_path)
+    return log_predicate(bundle_id, executable=executable, bundle_path=bundle_path)
+
+
+_LOG_BANNER = "Filtering the log data"
+
+
+def is_log_noise(line: str) -> bool:
+    """True for the two lines `log` prints that are not log records: the
+    `log stream` banner (``Filtering the log data using "<predicate>"``)
+    and the `log show --style ndjson` trailer (``{"count":0,"finished":1}``).
+    Returning either as a log line answered "one line" for an app that had
+    logged nothing."""
+    text = (line or "").strip()
+    if text.startswith(_LOG_BANNER):
+        return True
+    if not (text.startswith("{") and '"finished"' in text):
+        return False
+    try:
+        record = json.loads(text)
+    except ValueError:
+        return False
+    return isinstance(record, dict) and set(record) <= {"count", "finished"}
+
+
+IMAGE_UUID_KEYS = ("processImageUUID", "senderImageUUID")
+
+
+def normalized_uuids(values: Any) -> frozenset[str]:
+    """Upper-case UUID strings from any iterable of values (a recorded
+    list, a set, one string); anything that is not a non-empty string is
+    skipped. Never raises."""
+    if isinstance(values, str):
+        values = [values]
+    try:
+        items = list(values or ())
+    except TypeError:
+        return frozenset()
+    return frozenset(value.strip().upper() for value in items
+                     if isinstance(value, str) and value.strip())
+
+
+def record_image_uuids(record: dict[str, Any]) -> list[str]:
+    """The image UUIDs a unified-log record names (process, sender),
+    upper-cased; empty when it names none."""
+    return [value.strip().upper() for value in (record.get(key) for key in IMAGE_UUID_KEYS)
+            if isinstance(value, str) and value.strip()]
+
+
+def log_line_matches(line: str, bundle_id: str, *, executable: str | None = None,
+                     bundle_path: str | None = None,
+                     uuids: Any = None) -> bool:
+    """Client-side filter behind ``log_predicate``.
+
+    A JSON record matches on the app's subsystem; then, with ``uuids`` (the
+    installed binary's LC_UUIDs, ``app_identity``), on its image UUID alone:
+    a ``processImageUUID`` or ``senderImageUUID`` in the set passes — even
+    under a stale container path — and a record whose image UUIDs are all
+    outside it is rejected, even when its path looks right (another Flutter
+    app is a `Runner` too). Without UUIDs, or for a record that names none,
+    the path rules apply: the full bundle id anywhere in the line, then an
+    image under the installed bundle when that is known, else named
+    ``executable``, else containing the distinctive last component.
+    A line that is not JSON can only be judged by those substrings."""
+    if is_log_noise(line):
+        return False
+    try:
+        record = json.loads(line)
+    except ValueError:
+        record = None
+    if isinstance(record, dict):
+        if record.get("subsystem") == bundle_id:
+            return True
+        wanted = normalized_uuids(uuids)
+        seen = record_image_uuids(record) if wanted else []
+        if seen:
+            return any(value in wanted for value in seen)
+    if bundle_id in line:
+        return True
+    if isinstance(record, dict):
+        images = [str(record.get(key) or "") for key in ("processImagePath", "senderImagePath")]
+        if bundle_path:
+            prefixes = bundle_prefixes(bundle_path)
+            return any(image.startswith(prefix) for image in images for prefix in prefixes)
+        if executable:
+            return any(image.endswith("/" + executable) for image in images)
+        leaf = log_leaf(bundle_id)
+        return bool(leaf) and any(leaf in image for image in images)
+    # Not ndjson: only a substring can decide.
+    if bundle_path:
+        return any(prefix in line for prefix in bundle_prefixes(bundle_path))
+    if executable:
+        return executable in line
+    leaf = log_leaf(bundle_id)
+    return bool(leaf) and leaf in line
+
+
+def app_log_filter(xcrun: str, udid: str, bundle_id: str, *,
+                   app_path: Path | str | None = None,
+                   extra_uuids: Any = None) -> Any:
+    """A ``line -> bool`` filter for the installed app, resolved once now
+    (``app_identity``): its binary's UUIDs, plus ``extra_uuids`` (those a
+    session recorded for earlier installs of the app). The UUIDs it matches
+    on are on the filter as ``image_uuids`` (sorted; empty when none were
+    known), for a payload to report. Never raises."""
+    executable, bundle_path, uuids = app_identity(xcrun, udid, bundle_id, app_path=app_path)
+    uuids = uuids | normalized_uuids(extra_uuids)
+
+    def matches(line: str) -> bool:
+        return log_line_matches(line, bundle_id, executable=executable,
+                                bundle_path=bundle_path, uuids=uuids)
+
+    matches.image_uuids = sorted(uuids)  # type: ignore[attr-defined]
+    return matches
+
+
 def log_stream_argv(xcrun: str, udid: str, *, bundle_id: str | None = None,
-                    executable: str | None = None) -> list[str]:
+                    executable: str | None = None,
+                    bundle_path: str | None = None) -> list[str]:
     argv = [xcrun, "simctl", "spawn", udid, "log", "stream",
             "--style", "ndjson", "--level", "info"]
     if bundle_id:
-        argv += ["--predicate", log_predicate(bundle_id, executable=executable)]
+        argv += ["--predicate", log_predicate(bundle_id, executable=executable,
+                                              bundle_path=bundle_path)]
     return argv
 
 
@@ -464,14 +1246,39 @@ def spawn_bounded(argv: Sequence[str], destination: Path, *,
 def start_log_stream(xcrun: str, udid: str, destination: Path, *,
                      bundle_id: str | None = None,
                      executable: str | None = None,
-                     max_bytes: int | None = None) -> int | None:
+                     app_path: Path | str | None = None,
+                     bundle_path: str | None = None,
+                     max_bytes: int | None = None,
+                     identity: dict[str, Any] | None = None) -> int | None:
     """Session-long ndjson `log stream`, filtered to the app when known and
     capped on disk. Returns the writer pid (stopping it stops the stream), or
     None when it could not start — logs are supplementary evidence and must
-    never block the UI loop."""
+    never block the UI loop, so nothing here raises.
+
+    An executable that is not passed is resolved (``app_identity``;
+    ``app_path`` only helps find it). The predicate (``log_predicate``)
+    names the executable, not the container, so it keeps matching the app
+    across a reinstall — and admits other apps with the same executable
+    name: the file is narrowed when it is read (``log_line_matches`` with
+    the app's binary UUIDs), never when it is written.
+
+    With ``identity`` (a dict), what the writer was started with is put
+    there: ``executable`` (the one its predicate names, or None),
+    ``bundle_path`` and ``image_uuids`` (sorted; what this call resolved —
+    empty when the executable was passed in). A lookup here can succeed
+    where the caller's missed a moment earlier (misses are not cached), so
+    this, not the caller's lookup, is what a session must record."""
+    uuids: frozenset[str] = frozenset()
+    if bundle_id and not executable:
+        executable, found_path, uuids = app_identity(xcrun, udid, bundle_id, app_path=app_path)
+        bundle_path = bundle_path or found_path
+    if identity is not None:
+        identity.update({"executable": executable, "bundle_path": bundle_path,
+                         "image_uuids": sorted(uuids)})
     try:
         process = spawn_bounded(log_stream_argv(xcrun, udid, bundle_id=bundle_id,
-                                                executable=executable),
+                                                executable=executable,
+                                                bundle_path=bundle_path),
                                 destination, max_bytes=max_bytes)
     except OSError:
         return None

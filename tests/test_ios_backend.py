@@ -8,6 +8,7 @@ the system directories — never ``/opt/homebrew/bin`` — so a real ``axe`` or
 """
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import signal
@@ -49,6 +50,83 @@ def _dead_pid() -> int:
     child = subprocess.Popen([sys.executable, "-c", "pass"])
     child.wait()
     return child.pid
+
+
+# A `log stream` stand-in whose stdout never closes. It writes 100-byte lines
+# as fast as the pipe takes them until the `quiet` file appears, then one
+# FINAL_LINE and silence: still no EOF, the way an idle simulator stream
+# behaves. It holds an exclusive lock on `alive` (and writes its pid there)
+# while it runs; the kernel drops the lock when the process exits, whether or
+# not it has been reaped.
+ENDLESS_PRODUCER = r"""
+import fcntl, os, sys, time
+quiet, alive = sys.argv[1], sys.argv[2]
+lock = open(alive, "a")
+fcntl.flock(lock, fcntl.LOCK_EX)
+lock.write(str(os.getpid()))
+lock.flush()
+out = sys.stdout.buffer
+line = b"y" * 99 + b"\n"
+while not os.path.exists(quiet):
+    for _ in range(100):
+        out.write(line)
+out.write(b"z" * 99 + b"\n")
+out.flush()
+while True:
+    time.sleep(60)
+"""
+FINAL_LINE = b"z" * 99 + b"\n"
+
+
+def _stream_footprint(destination: Path) -> tuple:
+    """(inode, size) of a capped stream and of its rotation; None if absent."""
+    footprint = []
+    for path in (destination, destination.with_name(destination.name + ".1")):
+        try:
+            stat = path.stat()
+        except FileNotFoundError:
+            footprint.append(None)
+        else:
+            footprint.append((stat.st_ino, stat.st_size))
+    return tuple(footprint)
+
+
+def _last_line(path: Path) -> bytes | None:
+    try:
+        data = path.read_bytes()
+    except FileNotFoundError:
+        return None
+    lines = data.splitlines(keepends=True)
+    return lines[-1] if lines else None
+
+
+def _held_by_another_process(path: Path) -> bool:
+    """True while some other process holds an exclusive flock on ``path``."""
+    with open(path, "a") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        fcntl.flock(handle, fcntl.LOCK_UN)
+        return False
+
+
+def _kill_if_alive(alive: Path) -> None:
+    """Cleanup: never leave a producer behind when a stop assertion failed."""
+    if not alive.exists() or not _held_by_another_process(alive):
+        return
+    try:
+        os.kill(int(alive.read_text(encoding="utf-8").strip()), signal.SIGKILL)
+    except (ValueError, ProcessLookupError):
+        pass
+
+
+def _kill_and_reap(process: subprocess.Popen) -> None:
+    """Cleanup: a writer that ignored SIGTERM (or was never sent it) is
+    SIGKILLed and waited for, so a failing run leaves no process behind."""
+    if process.poll() is None:
+        process.kill()
+        process.wait(timeout=30)
 
 
 class IosBackendBase(EnvSandboxMixin, unittest.TestCase):
@@ -446,25 +524,71 @@ class BoundedLogStreamTests(EnvSandboxMixin, unittest.TestCase):
         self.set_env(AUTONOM_IOS_LOG_MAX_MB="nonsense")
         self.assertEqual(ios_simctl.log_max_bytes(), 50 * 1024 * 1024)
 
+    def await_stream(self, condition, what: str, destination: Path, *, cap: int,
+                     stall: float = 20.0, limit: float = 120.0) -> None:
+        """Poll ``condition`` for as long as the stream is making progress.
+
+        The deadline is driven by bytes written, not by a fixed sleep: it
+        moves every time the file or its rotation changes (a new size, or a
+        new inode swapped in), so a slow, loaded host just takes longer. Only
+        a stream stalled for ``stall`` seconds, or one past ``limit``, fails.
+        A file over ``cap`` fails at once: a broken cap would otherwise count
+        as progress and fill the temp directory for the whole ``limit``.
+        """
+        started = last_change = time.monotonic()
+        seen = None
+        while True:
+            footprint = _stream_footprint(destination)
+            for name, entry in zip((destination.name, destination.name + ".1"), footprint):
+                if entry is not None and entry[1] > cap:
+                    self.fail(f"{name} is {entry[1]} bytes, over the {cap}-byte cap, "
+                              f"while waiting for {what}")
+            if condition():
+                return
+            now = time.monotonic()
+            if footprint != seen:
+                seen, last_change = footprint, now
+            if now - last_change > stall or now - started > limit:
+                self.fail(f"{what} not observed after {now - started:.1f}s; "
+                          f"stream (inode, size), rotation (inode, size): {footprint}")
+            time.sleep(0.02)
+
     def test_endless_stream_is_capped_and_stops_on_sigterm(self) -> None:
-        producer = [sys.executable, "-c",
-                    "import sys\nwhile True:\n    sys.stdout.write('y' * 99 + '\\n')\n"]
+        quiet, alive = self.root / "quiet", self.root / "producer.lock"
+        producer = [sys.executable, "-c", ENDLESS_PRODUCER, str(quiet), str(alive)]
         destination = self.root / "endless.ndjson"
+        rotated = destination.with_name("endless.ndjson.1")
         writer = ios_simctl.spawn_bounded(producer, destination, max_bytes=10_000)
+        # LIFO: the writer is killed and reaped first, then the producer.
+        self.addCleanup(_kill_if_alive, alive)
+        self.addCleanup(_kill_and_reap, writer)
         try:
-            deadline = time.time() + 10
-            while time.time() < deadline and not destination.with_name(
-                    "endless.ndjson.1").exists():
-                time.sleep(0.05)
+            self.await_stream(rotated.exists, "the first rotation", destination, cap=10_000)
             for _ in range(50):
                 # Rotation swaps the file in atomically, so it never vanishes.
                 self.assertLessEqual(destination.stat().st_size, 10_000)
                 time.sleep(0.01)
+            self.assertTrue(_held_by_another_process(alive), "the producer is streaming")
+            # Stop at an observable point: once the producer's last line is on
+            # disk the writer has finished every rotation before it and waits
+            # on a pipe that never closes. A SIGTERM sent while lines are
+            # still pouring in lands at a random instruction of the writer.
+            quiet.touch()
+            self.await_stream(lambda: _last_line(destination) == FINAL_LINE,
+                              "the producer's last line", destination, cap=10_000)
         finally:
             writer.send_signal(signal.SIGTERM)
             writer.wait(timeout=10)
-        self.assertTrue(destination.with_name("endless.ndjson.1").exists())
+        self.assertEqual(writer.returncode, 0, "stopped by its SIGTERM handler, not killed")
+        self.assertTrue(rotated.exists())
+        self.assertLessEqual(rotated.stat().st_size, 10_000)
         self.assertLessEqual(destination.stat().st_size, 10_000)
+        # The handler takes the child down with it: no orphaned `log stream`.
+        deadline = time.monotonic() + 30
+        while _held_by_another_process(alive) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertFalse(_held_by_another_process(alive),
+                         "the producer outlived the writer's SIGTERM")
 
 
 class UninstallResultTests(unittest.TestCase):

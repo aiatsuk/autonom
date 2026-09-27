@@ -296,8 +296,9 @@ class BiometricTests(SweepBase):
             with self.subTest(action=action):
                 code, payload = self.ios("simulator", "biometric", action)
                 self.assertEqual(code, 0, payload)
-                self.assertFalse(payload["verified"], "notifyutil cannot confirm a match")
-                argv = self.argv_log("simctl")[-1]
+                # Enrollment is read back with `notifyutil -g`; a match is not.
+                self.assertEqual(payload["verified"], action == "enroll", payload)
+                argv = [call for call in self.argv_log("simctl") if "-p" in call][-1]
                 self.assertEqual(argv[:4], ["simctl", "spawn", UDID, "notifyutil"])
                 self.assertEqual(argv[4:], expected)
         code, payload = self.ios("simulator", "biometric", "wink")
@@ -514,13 +515,17 @@ class FreshLaunchTests(SweepBase):
         self.assertNotIn("--activity-new-task", starts[0], "not an am option")
         self.assertEqual([a for a in self.argv_log("adb") if "monkey" in a], [])
 
-    def test_resume_true_keeps_the_old_behaviour(self) -> None:
+    def test_resume_true_brings_the_task_back_without_clearing_it(self) -> None:
+        """`resume: true` starts the launcher activity with the launcher's own
+        flags (NEW_TASK | RESET_TASK_IF_NEEDED): no CLEAR_TASK, and no monkey,
+        whose rotation freeze/thaw undid a pinned orientation."""
         self.set_state(ui_dump=str(UI_FIXTURE))
         self.android("session", "start", "--app-id", "com.example.app")
         code, payload = self.android("flow", "run",
                                      str(self._flow("- launchApp:\n    resume: true\n")))
         self.assertEqual(code, 0, payload)
-        self.assertEqual(len([a for a in self.argv_log("adb") if "monkey" in a]), 1)
+        self.assertEqual(len([a for a in self.argv_log("adb") if "0x10200000" in a]), 1)
+        self.assertEqual([a for a in self.argv_log("adb") if "monkey" in a], [])
         self.assertEqual([a for a in self.argv_log("adb") if "0x10008000" in a], [])
 
     def test_no_launcher_activity_falls_back_to_resume(self) -> None:
@@ -600,15 +605,16 @@ class MaestroExportTests(SweepBase):
         self.assertIn("    timeout: 8000", text)
         self.assertIn("    timeout: 3000", text)
 
-    def test_timed_tap_still_refuses(self) -> None:
+    def test_timed_tap_exports_as_a_wait_then_the_tap(self) -> None:
         flow = Path(self.tmp.name) / "tap.yaml"
         flow.write_text("schema: autonom.dev/flow/v1\nappId: com.example.app\nname: t\n---\n"
                         "- tapOn:\n    selector:\n      text: Go\n    timeoutMs: 8000\n",
                         encoding="utf-8")
+        out = Path(self.tmp.name) / "tap.m.yaml"
         code, payload = self.run_cli("flow", "export", str(flow), "--format", "maestro",
-                                     "--out", str(Path(self.tmp.name) / "tap.m.yaml"))
-        self.assertEqual(code, 2)
-        self.assertEqual(payload["error_code"], errors.UNSUPPORTED_FLOW_COMMAND)
+                                     "--out", str(out))
+        self.assertEqual(code, 0, payload)
+        self.assertIn("    timeout: 8000\n- tapOn:\n", out.read_text(encoding="utf-8"))
 
 
 class LocationDeliveryTests(SweepBase):

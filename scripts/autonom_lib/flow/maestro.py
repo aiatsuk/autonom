@@ -11,14 +11,19 @@ Semantics preserved on import:
   regex metacharacters imports as ``match: exact`` (identical semantics);
   anything else imports as ``match: regex`` wrapped in ``^(?:...)$`` because
   Autonom's regex mode is a *search*, not a full match.
-- ``extendedWaitUntil`` becomes ``waitUntil``; ``takeScreenshot``'s path
-  becomes a label; ``launchApp.clearState`` carries over.
+- ``extendedWaitUntil`` becomes ``waitUntil`` (an optional one only right
+  before an optional tap on the same element, folded into that tap's
+  ``timeoutMs``); ``waitForAnimationToEnd`` becomes ``waitForSettled``;
+  ``takeScreenshot``'s path becomes a label; ``launchApp.clearState``
+  carries over.
 - JavaScript interpolation (``${output.x}``) has no Autonom equivalent and
   is refused, not approximated.
 
 On export, ``match: exact`` text is regex-escaped so Maestro's regex
-matching stays exact; Autonom-only commands refuse (evidence commands
-``checkpoint``/``note`` become comments instead — they carry no behavior).
+matching stays exact; a tap's ``timeoutMs`` becomes an ``extendedWaitUntil``
+on the same element before the tap; Autonom-only commands refuse (evidence
+commands ``checkpoint``/``note`` become comments instead — they carry no
+behavior).
 Export collects **every** refusal (each with its line) before failing, so
 one pass shows the whole gap, and every scalar is YAML-quoted when plain
 YAML would read it as something else.
@@ -70,7 +75,6 @@ _UNSUPPORTED_HINTS = {
     "inputRandomEmail": "flows are deterministic; pass the value via env or --secret",
     "inputRandomPersonName": "flows are deterministic; pass the value via env or --secret",
     "hideKeyboard": "no reliable cross-platform substrate; press KEYCODE_BACK on Android",
-    "waitForAnimationToEnd": "use waitUntil with an explicit timeoutMs",
     "travel": "location simulation imports only as setLocation",
     "startRecording": "recording is session-level: autonom record start",
     "stopRecording": "recording is session-level: autonom record stop",
@@ -303,7 +307,54 @@ def _env_into(target: dict, node, path: str) -> None:
 
 
 def _steps_from(sequence: Sequence, path: str) -> list[Step]:
-    return [_step_from(item, path) for item in sequence.items]
+    return _fold_optional_waits(
+        [_step_from(item, path) for item in sequence.items], path)
+
+
+# what the importer keeps from `extendedWaitUntil {visible, timeout, optional}`
+_FOLDABLE_WAIT_ARGS = frozenset({"visible", "timeoutMs", "optional"})
+
+
+def _same_selector(left: FlowSelector, right: FlowSelector) -> bool:
+    return (left.fields == right.fields and left.match == right.match
+            and left.index == right.index and left.relations == right.relations)
+
+
+def _fold_optional_waits(steps: list[Step], path: str) -> list[Step]:
+    """``extendedWaitUntil {visible: X, optional}`` + optional tap on X ->
+    one optional tap with ``timeoutMs``.
+
+    That pair is what ``flow export`` writes for an optional tap with a
+    timeout, and only that exact shape folds: a wait carrying anything
+    besides ``visible``, ``timeout`` and ``optional`` (a ``notVisible`` arm,
+    a label) would lose it in the fold. Autonom waits are assertions and
+    cannot be optional, so every other optional wait refuses instead of
+    silently becoming a required one — or vanishing.
+    """
+    out: list[Step] = []
+    index = 0
+    while index < len(steps):
+        step = steps[index]
+        if step.command != "waitUntil" or not step.args.get("optional"):
+            out.append(step)
+            index += 1
+            continue
+        tap = steps[index + 1] if index + 1 < len(steps) else None
+        if (tap is None or "visible" not in step.args
+                or set(step.args) - _FOLDABLE_WAIT_ARGS
+                or tap.command not in _TAP_COMMANDS
+                or not tap.args.get("optional") or "timeoutMs" in tap.args
+                or not _same_selector(step.args["visible"],
+                                      tap.args["selector"])):
+            _refuse(path, step.line, step.col, "optional extendedWaitUntil",
+                    "Autonom waits cannot be optional. An optional wait with "
+                    "only visible and timeout imports right before an "
+                    "optional tap on the same element, where it becomes that "
+                    "tap's timeoutMs.")
+        tap.args["timeoutMs"] = step.args["timeoutMs"]
+        out.append(tap)
+        index += 2
+    return out
 
 
 def _step_from(item, path: str) -> Step:
@@ -312,6 +363,10 @@ def _step_from(item, path: str) -> Step:
         if name in ("launchApp", "stopApp", "clearState", "back",
                     "takeScreenshot", "eraseText", "scroll", "pasteText"):
             return Step(name, {}, line, col)
+        if name == "waitForAnimationToEnd":
+            # Maestro waits for a static screen and never fails the flow;
+            # waitForSettled is the same contract over the UI tree
+            return Step("waitForSettled", {}, line, col)
         if name == "hideKeyboard" or name in _UNSUPPORTED_HINTS:
             _refuse(path, line, col, name,
                     _UNSUPPORTED_HINTS.get(name, "outside the Core Profile"))
@@ -589,6 +644,23 @@ def _step_from(item, path: str) -> Step:
             _refuse(path, line, col, "swipe without a direction",
                     "Point-to-point swipes do not import.")
         return Step("swipe", args, line, col)
+    if name == "waitForAnimationToEnd":
+        args = {}
+        if not isinstance(value, Mapping):
+            _refuse(path, line, col, "waitForAnimationToEnd shorthand",
+                    "Use the bare command or the map form with timeout.")
+        for arg_key, arg_value in value.pairs:
+            if arg_key.text == "timeout":
+                args["timeoutMs"] = _int_text(arg_value, path,
+                                              "waitForAnimationToEnd.timeout")
+            elif arg_key.text == "label":
+                args["label"] = _scalar_text(arg_value, path)
+            else:
+                _refuse(path, arg_key.line, arg_key.col,
+                        f"waitForAnimationToEnd.{arg_key.text}",
+                        "Core Profile waitForAnimationToEnd supports timeout "
+                        "and label.")
+        return Step("waitForSettled", args, line, col)
     if name == "extendedWaitUntil":
         args = {}
         for arg_key, arg_value in _require_mapping(value, path,
@@ -600,6 +672,11 @@ def _step_from(item, path: str) -> Step:
                                               "extendedWaitUntil.timeout")
             elif arg_key.text == "label":
                 args["label"] = _scalar_text(arg_value, path)
+            elif arg_key.text == "optional":
+                # only legal right before an optional tap on the same
+                # element (_fold_optional_waits); refused anywhere else
+                if _bool_text(arg_value, path, "extendedWaitUntil.optional"):
+                    args["optional"] = True
             else:
                 _refuse(path, arg_key.line, arg_key.col,
                         f"extendedWaitUntil.{arg_key.text}", "")
@@ -1031,24 +1108,24 @@ class _Exporter:
                 # Maestro's per-command lookup timeout lives on
                 # extendedWaitUntil, not on tapOn/assertVisible. A visibility
                 # assertion *is* an extendedWaitUntil, so export it as one and
-                # keep the timeout; a tap has no equivalent, so refuse rather
-                # than quietly change how long the step waits.
+                # keep the timeout. A tap's timeoutMs bounds the wait for its
+                # target to appear: in Maestro that is an extendedWaitUntil
+                # on the same element, then the tap. An optional tap makes
+                # the wait optional too (the import folds the pair back).
                 arm = _TIMED_ARMS.get(command)
-                if arm is None:
-                    refuse(f"{command}.timeoutMs has no Maestro equivalent",
-                           "Express the wait as extendedWaitUntil, or drop the "
-                           "explicit timeout before exporting.")
-                    return
                 selector = self.selector(body + "    ", step.selector, line,
                                          command)
                 if selector is None:
                     return
                 lines.append(f"{prefix}- extendedWaitUntil:")
-                lines.append(f"{body}{arm}:")
+                lines.append(f"{body}{arm or 'visible'}:")
                 lines.extend(selector)
                 lines.append(f"{body}timeout: {args['timeoutMs']}")
-                lines.extend(f"{body}{item}" for item in label_field)
-                return
+                if arm is not None:
+                    lines.extend(f"{body}{item}" for item in label_field)
+                    return
+                if args.get("optional"):
+                    lines.append(f"{body}optional: true")
             selector = self.selector(body, step.selector, line, command)
             if selector is None:
                 return
@@ -1095,6 +1172,16 @@ class _Exporter:
         if command == "takeScreenshot":
             lines.append(f"{prefix}- takeScreenshot: {_yaml(label)}" if label
                          else f"{prefix}- takeScreenshot")
+            return
+        if command == "waitForSettled":
+            if "quietMs" in args:
+                refuse("waitForSettled.quietMs has no Maestro equivalent",
+                       "Maestro's waitForAnimationToEnd has no quiet window; "
+                       "drop quietMs before exporting.")
+                return
+            fields = ([f"timeout: {args['timeoutMs']}"]
+                      if "timeoutMs" in args else [])
+            self.mapping(prefix, "waitForAnimationToEnd", fields + label_field)
             return
         if command == "waitUntil":
             arms: list[str] = []

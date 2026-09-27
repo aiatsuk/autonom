@@ -86,13 +86,19 @@ scripts/autonom_lib/
   metrics/
     meminfo.py                dumpsys meminfo / proc status / cpuinfo parsers
     process.py                pid resolution with sources_tried on failure
-    snapshot.py               per-platform load summary; iOS is host accounting, and says so
+    snapshot.py               per-platform load summary: Android CPU from two /proc reads
+                              (one-core scale, cpuinfo fallback marked stale); iOS is host
+                              accounting, and says so
     series.py                 first/last/delta/slope math; directional leads, never "leak"
     presets.py                which heavy profilers this host can run
     android_memory.py         evidence pack: metadata+meminfo+proc+gfxinfo+HPROF, analyze
-    frames.py                 gfxinfo reset/capture (best-effort parse) + Flutter timings
-    trace.py                  simpleperf / gfxinfo-flow / xctrace presets → artifacts
-  processes.py                machine-wide process registry, orphan detection, reaping
+    frames.py                 gfxinfo reset/capture (best-effort parse; 0 frames carry no
+                              percentiles) + Flutter timings
+    trace.py                  simpleperf (--app, PMU-aware event) / gfxinfo-flow / xctrace
+                              presets → artifacts
+  processes.py                machine-wide process registry (proxies, log streams, canvas
+                              pairs, idb companions), signature-checked reaping, group
+                              remnants reported never signalled, command-line redaction
   doctor.py                   toolchain, capabilities, session, orphans
   paths.py                    locate the bundled skill helper scripts
   flow/
@@ -121,6 +127,8 @@ scripts/autonom_lib/
     redact.py                 credential masking, applied before anything is written
     device_proxy_android.py   emulator attach via 10.0.2.2, CA seeding, detach restore
     device_proxy_ios.py       per-process proxy env at launch, keychain CA, manual fallback
+    attachment.py             `network status` evidence: only a flow whose client is the
+                              target proves attachment
 ```
 
 Two rules carry the design.
@@ -231,10 +239,19 @@ indistinguishable in shape, which is what lets one skill body drive both.
 ```json
 {"ref": "n5", "role": "button", "text": null, "desc": "General",
  "resource_id": "com.apple.settings.general", "class": "Button", "package": null,
- "bounds": [16, 380, 386, 432], "clickable": true, "enabled": true,
- "focusable": false, "scrollable": false, "selected": false, "checked": false,
- "depth": 0}
+ "bounds": [16, 380, 386, 432], "clickable": true, "long_clickable": false,
+ "checkable": false, "enabled": true, "focusable": false, "focused": false,
+ "scrollable": false, "selected": false, "checked": false, "depth": 0}
 ```
+
+`long_clickable` and `checkable` are UI Automator's attributes on Android; on iOS
+`checkable` marks a toggle (whose `checked` comes from `AXValue`) and
+`long_clickable` is always false, because accessibility has no long-press trait.
+Live trees add `parent`, and a node that cannot be on screen carries
+`visible: false` — iOS lists Flutter's scroll cache at a 0x0 frame, which a tap
+would have sent to the screen's origin. Such nodes stay in the tree (they are
+counted), `ui tap` refuses them with `element_offscreen`, `ui find` and `ui tap`
+resolve on-screen matches first, and a flow never selects them.
 
 iOS bounds are **points**, matching what idb's tap accepts. A computed tap outside
 the target's reported screen rectangle is refused rather than dispatched, because a

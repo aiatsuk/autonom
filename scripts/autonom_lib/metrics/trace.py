@@ -7,6 +7,7 @@ profiler that ran and failed is `trace_failed` with its stderr tail.
 """
 from __future__ import annotations
 
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -27,6 +28,10 @@ XCTRACE_TEMPLATES = {
     "hitches": "Animation Hitches",
 }
 ANDROID_PRESETS = {"simpleperf", "gfxinfo-flow"}
+# simpleperf events: the hardware counter when the device has a PMU, else
+# the software timer every kernel offers
+HARDWARE_EVENT = "cpu-cycles"
+SOFTWARE_EVENT = "cpu-clock"
 
 
 def run_preset(target: Target, app_id: str, preset: str, *, duration: float,
@@ -53,6 +58,23 @@ def run_preset(target: Target, app_id: str, preset: str, *, duration: float,
         "Run 'autonom metrics list-presets'.")
 
 
+def simpleperf_event(target: Target) -> tuple[str, str]:
+    """-> (event, why). `cpu-cycles` needs a PMU, which emulators lack —
+    simpleperf's default event then fails with "Event type 'cpu-cycles' is
+    not supported on the device". `simpleperf list hw` prints only the
+    hardware events the device can open, so the hardware event is taken
+    only when it is listed; the `cpu-clock` software timer works everywhere."""
+    listing = adb_mod.run_adb(target.tool, ["shell", "simpleperf", "list", "hw"],
+                              serial=target.target_id, check=False, timeout=60)
+    listed = listing.returncode == 0 and re.search(
+        rf"^\s*{re.escape(HARDWARE_EVENT)}(?:\s|$)", listing.stdout or "",
+        re.MULTILINE)
+    if listed:
+        return HARDWARE_EVENT, "listed by 'simpleperf list hw'"
+    return SOFTWARE_EVENT, ("'simpleperf list hw' did not list cpu-cycles "
+                            "(no PMU, e.g. an emulator); using the software timer")
+
+
 def _simpleperf(target: Target, app_id: str, duration: float, out_dir: Path,
                 label: str) -> dict[str, Any]:
     which = adb_mod.run_adb(target.tool, ["shell", "which", "simpleperf"],
@@ -63,19 +85,26 @@ def _simpleperf(target: Target, app_id: str, duration: float, out_dir: Path,
             "Modern emulator images ship /system/bin/simpleperf; otherwise "
             "push the NDK's simpleperf for your ABI to /data/local/tmp.",
             tool="simpleperf")
+    # the pid backs the running-app refusal and the report only: `--app` is
+    # simpleperf's documented way to profile an app from the shell (it enters
+    # a debuggable or profileable app's context and follows its processes)
     pid = process_mod.resolve(target, app_id)["pid"]
+    event, event_reason = simpleperf_event(target)
     remote = f"/data/local/tmp/autonom-{artifacts_mod.stamp()}-perf.data"
     try:
         record = adb_mod.run_adb(
             target.tool,
-            ["shell", "simpleperf", "record", "-p", str(pid), "-o", remote,
-             "--duration", str(int(max(duration, 1)))],
+            ["shell", "simpleperf", "record", "--app", app_id, "-e", event,
+             "-o", remote, "--duration", str(int(max(duration, 1)))],
             serial=target.target_id, check=False, timeout=duration + 120)
         if record.returncode != 0:
             raise errors.AutonomError(
                 errors.TRACE_FAILED,
                 f"simpleperf record failed: {(record.stdout or '').strip()[:300]}",
-                "Profiling may need a debuggable app or a userdebug image.")
+                "'simpleperf record --app' needs a debuggable app, or a "
+                "profileable one on Android 10+ (<profileable "
+                "android:shell=\"true\"/> in the manifest); otherwise use a "
+                "userdebug image.", event=event)
         local = out_dir / (artifacts_mod.unique_stem(
             out_dir, f"{artifacts_mod.stamp()}-{label}", "-perf.data")
             + "-perf.data")
@@ -89,6 +118,7 @@ def _simpleperf(target: Target, app_id: str, duration: float, out_dir: Path,
         adb_mod.run_adb(target.tool, ["shell", "rm", "-f", remote],
                         serial=target.target_id, check=False)
     return {"ok": True, "preset": "simpleperf", "pid": pid,
+            "event": event, "event_reason": event_reason,
             "duration_s": duration, "artifacts": [str(local)],
             "hint": "Inspect with the NDK's report.py / report_html.py."}
 
@@ -102,9 +132,13 @@ def _gfxinfo_flow(target: Target, app_id: str, duration: float, out_dir: Path,
         out_dir, f"{artifacts_mod.stamp()}-{label}", "-gfxinfo.txt")
     artifact = out_dir / f"{stem}-gfxinfo.txt"
     artifacts_mod.write_text(artifact, raw)
-    return {"ok": True, "preset": "gfxinfo-flow", "duration_s": duration,
-            "summary": summary, "artifacts": [str(artifact)],
-            "note": "reset → window → framestats; drive the flow during the window"}
+    payload: dict[str, Any] = {
+        "ok": True, "preset": "gfxinfo-flow", "duration_s": duration,
+        "summary": summary, "artifacts": [str(artifact)],
+        "note": "reset → window → framestats; drive the flow during the window"}
+    if summary.get("warnings"):
+        payload["warnings"] = list(summary["warnings"])
+    return payload
 
 
 def _xctrace(target: Target, app_id: str, preset: str, duration: float,

@@ -3,12 +3,13 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import re
-import socket
+import signal
 import subprocess
 import sys
 import tempfile
-import time
+import threading
 import unittest
 import urllib.error
 import urllib.parse
@@ -23,6 +24,36 @@ UI_DUMP = ROOT / "tests/fixtures/ui_dump.xml"
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from autonom_lib.flow import report as flow_report  # noqa: E402
+
+
+def _read_announcement(process: subprocess.Popen, out: "queue.Queue[dict | None]") -> None:
+    """The first JSON object on the server's stdout (it may span lines), or
+    None when stdout ends first."""
+    text = ""
+    for line in process.stdout:
+        text += line
+        try:
+            out.put(json.loads(text))
+            return
+        except ValueError:
+            continue
+    out.put(None)
+
+
+def _server_diagnostics(process: subprocess.Popen, stderr_path: Path) -> str:
+    """Why a server never announced itself: its exit status, or — while it
+    still runs — the stack of every thread, dumped by faulthandler on SIGABRT."""
+    state = "exited with %s" % process.poll()
+    if process.poll() is None:
+        state = "still running after 60 s; its stack follows"
+        process.send_signal(signal.SIGABRT)
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=10)
+    stderr = stderr_path.read_text(encoding="utf-8", errors="replace")
+    return f"report serve never announced its URL: {state}\n{stderr[-4000:]}"
 
 
 class ReportEndToEndTests(unittest.TestCase):
@@ -283,31 +314,34 @@ class ReportEndToEndTests(unittest.TestCase):
 
     def test_local_report_control_replays_to_selected_step(self) -> None:
         summary = self._run_passing_flow()
-        with socket.socket() as probe:
-            probe.bind(("127.0.0.1", 0))
-            port = probe.getsockname()[1]
-        process = subprocess.Popen(
-            [sys.executable, str(CLI), "--platform", "android",
-             "--serial", "emulator-5554",
-             "--adb", str(ROOT / "tests/fakes/fake_adb.py"),
-             "report", "serve", "--run", summary["run_id"],
-             "--port", str(port)],
-            cwd=ROOT, env=self.env, text=True,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        )
+        # The server picks its own port and announces it once it listens:
+        # probing for a free port and handing it over leaves a window in which
+        # another process can take it. stderr goes to a file, so a chatty
+        # server can never block on a full pipe, and PYTHONFAULTHANDLER lets a
+        # server that never announces itself be asked for its stack.
+        stderr_path = Path(self.tmp.name) / "report-serve.stderr"
+        with open(stderr_path, "w", encoding="utf-8") as stderr_file:
+            process = subprocess.Popen(
+                [sys.executable, str(CLI), "--platform", "android",
+                 "--serial", "emulator-5554",
+                 "--adb", str(ROOT / "tests/fakes/fake_adb.py"),
+                 "report", "serve", "--run", summary["run_id"], "--port", "0"],
+                cwd=ROOT, env={**self.env, "PYTHONFAULTHANDLER": "1"}, text=True,
+                stdout=subprocess.PIPE, stderr=stderr_file,
+            )
         try:
-            url = f"http://127.0.0.1:{port}/"
-            page = None
-            for _ in range(50):
-                try:
-                    with urllib.request.urlopen(url, timeout=1) as response:
-                        page = response.read().decode("utf-8")
-                    break
-                except urllib.error.URLError:
-                    if process.poll() is not None:
-                        break
-                    time.sleep(0.05)
-            self.assertIsNotNone(page, process.stderr.read() if process.poll() else "")
+            announced: queue.Queue[dict | None] = queue.Queue()
+            threading.Thread(target=_read_announcement, args=(process, announced),
+                             daemon=True).start()
+            try:
+                announcement = announced.get(timeout=60)
+            except queue.Empty:
+                announcement = None
+            if not announcement:
+                self.fail(_server_diagnostics(process, stderr_path))
+            url = announcement["url"]
+            with urllib.request.urlopen(url, timeout=30) as response:
+                page = response.read().decode("utf-8")
             self.assertIn("Replay to this step", page)
             token_match = re.search(r"name='token' value='([^']+)'", page)
             self.assertIsNotNone(token_match)

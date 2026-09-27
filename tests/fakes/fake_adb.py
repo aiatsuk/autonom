@@ -31,14 +31,27 @@ State keys (all optional):
 ``clipboard``       the text ``cmd clipboard set text`` stored, after the device
                     shell has parsed the line
 ``clipboard_unsupported`` answer "No shell command implementation." (API 36)
+``packages``        mapping of installed package -> uid for ``cmd package list
+                    packages -U``; absent = every queried package is installed
+                    with a stable uid (``packages: {}`` = nothing installed)
+``pid_uids``        mapping of pid -> uid, so ``logcat --uid`` keeps only the
+                    lines logged by that uid's processes
+``am_start_output`` the exact text ``am start`` prints (overrides the default
+                    ``-W`` report); ``am_launch_state`` / ``am_total_time`` /
+                    ``am_wait_time`` shape the default report instead
+``monkey_rotation`` false to stop ``monkey`` from resetting the rotation
+                    settings the way the real tool does (freeze to 0, thaw)
 """
 from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import sys
+import tempfile
 import time
+import zlib
 from pathlib import Path
 
 # 1x1 transparent PNG; enough for signature and size assertions.
@@ -49,11 +62,35 @@ PNG = bytes.fromhex(
 )
 
 
+# How long a reader waits out a state file that does not parse yet. Another
+# fake (the emulator, or this one in a parallel call) may be replacing it; a
+# file that stays corrupt past the window is still an error.
+READ_PATIENCE_SECONDS = 2.0
+
+
 def load_state() -> dict:
+    """The fake's state; {} when there is none.
+
+    A reader used to see the file after a writer had truncated it and before
+    it was refilled, and died on JSONDecodeError (the CI flake). Writers now
+    replace the file atomically, and a reader retries a torn read for up to
+    `READ_PATIENCE_SECONDS` before raising.
+    """
     path = os.environ.get("AUTONOM_FAKE_STATE")
-    if not path or not Path(path).exists():
+    if not path:
         return {}
-    return json.loads(Path(path).read_text(encoding="utf-8"))
+    deadline = time.monotonic() + READ_PATIENCE_SECONDS
+    while True:
+        try:
+            text = Path(path).read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return {}
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.01)
 
 
 def record(argv: list[str]) -> None:
@@ -65,9 +102,114 @@ def record(argv: list[str]) -> None:
 
 
 def write_state(state: dict) -> None:
+    """Replace the state file atomically: a temp file in the same directory,
+    then `os.replace`, so no reader ever sees a half-written file."""
     path = os.environ.get("AUTONOM_FAKE_STATE")
-    if path:
-        Path(path).write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+    if not path:
+        return
+    target = Path(path)
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp",
+                                             dir=str(target.parent))
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(state, indent=2) + "\n")
+        os.replace(temporary, target)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+# `threadtime`: "MM-DD HH:MM:SS.mmm  PID  TID P TAG: message"
+_THREADTIME = re.compile(r"^\S+\s+\S+\s+(\d+)\s+\d+\s+[VDIWEFA]\s+(.*?)\s*:\s")
+# `time`: "MM-DD HH:MM:SS.mmm P/TAG( PID): message"
+_TIME = re.compile(r"^\S+\s+\S+\s+[VDIWEFA]/(.*?)\(\s*(\d+)\):")
+
+
+def _line_pid_tag(line: str) -> tuple[str | None, str | None]:
+    match = _THREADTIME.match(line)
+    if match:
+        return match.group(1), match.group(2).strip()
+    match = _TIME.match(line)
+    if match:
+        return match.group(2), match.group(1).strip()
+    return None, None
+
+
+def _option(args: list[str], name: str) -> str | None:
+    """`--uid 10123` or `--uid=10123`; None when absent."""
+    for index, arg in enumerate(args):
+        if arg == name and index + 1 < len(args):
+            return args[index + 1]
+        if arg.startswith(name + "="):
+            return arg.split("=", 1)[1]
+    return None
+
+
+def _logcat_lines(args: list[str], state: dict) -> list[str]:
+    """Apply the filters a real logcat applies, so a test can prove which
+    ones were asked for: ``--uid`` (via ``pid_uids``), ``--pid`` and
+    ``-s TAG:LEVEL ...``. Without any of them every line is printed."""
+    lines = list(state.get("logcat", []))
+    uid = _option(args, "--uid")
+    if uid is not None:
+        owners = {str(pid): str(owner) for pid, owner in (state.get("pid_uids") or {}).items()}
+        lines = [line for line in lines if owners.get(_line_pid_tag(line)[0] or "") == uid]
+    pid = _option(args, "--pid")
+    if pid is not None:
+        lines = [line for line in lines if _line_pid_tag(line)[0] == pid]
+    if "-s" in args:
+        tags = {spec.split(":", 1)[0] for spec in args[args.index("-s") + 1:]
+                if ":" in spec and not spec.startswith("-")}
+        lines = [line for line in lines if _line_pid_tag(line)[1] in tags]
+    return lines
+
+
+def _package_uid(package: str) -> int:
+    """A stable app uid for a package the state does not list."""
+    return 10000 + zlib.crc32(package.encode("utf-8")) % 9000
+
+
+def _list_packages(words: list[str], state: dict) -> str:
+    """`cmd package list packages [-U] [filter]` — the filter is a substring
+    match on a real device, so `com.example` also lists `com.example.app`."""
+    show_uid = "-U" in words
+    operands = [word for word in words[3:] if not word.startswith("-")]
+    needle = operands[-1] if operands else ""
+    if "packages" in state:
+        table = {name: int(uid) for name, uid in (state.get("packages") or {}).items()}
+    else:
+        table = {needle: _package_uid(needle)} if needle else {}
+    rows = []
+    for name, uid in sorted(table.items()):
+        if needle and needle not in name:
+            continue
+        rows.append(f"package:{name}" + (f" uid:{uid}" if show_uid else ""))
+    return "".join(row + "\n" for row in rows)
+
+
+def _am_start(words: list[str], state: dict) -> str:
+    """What `am start` prints. `-W` adds the launch report a real device
+    gives after the activity has drawn."""
+    if "am_start_output" in state:
+        return state["am_start_output"]
+    component = words[words.index("-n") + 1] if "-n" in words[:-1] else ""
+    text = f"Starting: Intent {{ cmp={component} }}\n"
+    if "-W" not in words:
+        return text
+    launch_state = state.get("am_launch_state", "COLD")
+    if launch_state.upper().startswith("UNKNOWN"):
+        text += "Warning: Activity not started, its current task has been brought to the front\n"
+    return text + (
+        "Status: ok\n"
+        f"LaunchState: {launch_state}\n"
+        f"Activity: {component}\n"
+        f"TotalTime: {state.get('am_total_time', 412)}\n"
+        f"WaitTime: {state.get('am_wait_time', 430)}\n"
+        "Complete\n"
+    )
 
 
 def main(argv: list[str]) -> int:
@@ -127,7 +269,7 @@ def main(argv: list[str]) -> int:
         return 0
 
     if args[:1] == ["logcat"]:
-        for line in state.get("logcat", []):
+        for line in _logcat_lines(args, state):
             sys.stdout.write(line + "\n")
         return 0
 
@@ -207,6 +349,24 @@ def main(argv: list[str]) -> int:
                 state["night_mode"] = words[3]
                 write_state(state)
             sys.stdout.write(f"Night mode: {state.get('night_mode', 'no')}\n")
+            return 0
+        if words[:3] in (["cmd", "package", "list"], ["pm", "list", "packages"]):
+            if words[:1] == ["pm"]:
+                words = ["cmd", "package", "list", *words[2:]]
+            sys.stdout.write(_list_packages(words, state))
+            return 0
+        if words[:2] == ["am", "start"]:
+            sys.stdout.write(_am_start(words, state))
+            return 0
+        if words[:1] == ["monkey"]:
+            # The real tool freezes rotation to 0 and thaws it again when it
+            # finishes, which silently undoes a pinned orientation.
+            if state.get("monkey_rotation", True):
+                table = state.setdefault("settings_system", {})
+                table["user_rotation"] = "0"
+                table["accelerometer_rotation"] = "1"
+                write_state(state)
+            sys.stdout.write("Events injected: 1\n## Network stats: elapsed time=12ms\n")
             return 0
 
     if args[:3] == ["shell", "dumpsys", "location"]:

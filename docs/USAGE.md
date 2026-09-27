@@ -148,6 +148,26 @@ that `ui tap` reports backend axe and that the tree still comes from idb.
 Select iOS controls with --desc, not --text.
 ```
 
+## Tap one of several identical controls
+
+```text
+The catalog has several "Add" buttons. Run `autonom ui find --desc Add --mode
+exact --all`: on-screen matches come first, each with the `index` that
+selects it, and off-screen ones (visible: false, index null) last. Tap the
+second visible one with `autonom ui tap --desc Add --mode exact --index 1`,
+and if a tap answers element_offscreen, swipe it into view first instead of
+tapping coordinates.
+```
+
+## Check which app took a deep link
+
+```text
+Run `autonom open myapp://order/42` on the emulator and read `handled_by`: it
+names the activity that took the URL. If it is Chrome, or the warning says
+url_opened_chooser, the app's intent filter or App Link verification is the
+bug — report that, not a navigation failure inside the app.
+```
+
 ## Explain an iOS failure with evidence
 
 ```text

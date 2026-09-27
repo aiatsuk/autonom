@@ -60,7 +60,9 @@ from .schema import (
     Step,
     TEST_FAILURE,
     WhenClause,
+    android_only,
     failure_class,
+    settle_window,
 )
 
 _VAR_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
@@ -140,6 +142,8 @@ class StepOutcome:
     precondition_fingerprint: dict | None = None
     postcondition_fingerprint: dict | None = None
     finished_at_ms: int | None = None
+    # waitForSettled only: whether the UI tree held still within timeoutMs
+    settled: bool | None = None
 
 
 @dataclass
@@ -244,6 +248,9 @@ class Executor:
         self._last_nodes: list | None = None
         self._last_match: dict | None = None
         self._last_repin: dict | None = None
+        self._last_settle: dict | None = None
+        # run warnings raised while steps execute (screen_not_settled)
+        self._step_warnings: list[dict] = []
         self._source_occurrences: dict[str, int] = {}
         self._setup_catalog: dict[str, list] = {
             "available": [], "selected": [], "applied": [],
@@ -261,6 +268,7 @@ class Executor:
         self._terminal = None
         self.sensitive_env_names = set()
         self._artifact_steps = []
+        self._step_warnings = []
         self._source_occurrences = {}
         self._setup_catalog = {
             "available": [], "selected": [], "applied": [],
@@ -400,6 +408,7 @@ class Executor:
                             or any(self._declares_sensitive(child)
                                    for child in self._children.values()))
         result.finished_at_ms = self._wall_ms()
+        result.warnings.extend(self._step_warnings)
         writer.emit("flow.run.finished", {
             "status": result.status,
             "steps": len(result.steps),
@@ -752,7 +761,14 @@ class Executor:
 
     def _preflight_flow(self, flow: Flow, values: dict, *,
                         is_root: bool, _seen: dict | None = None,
-                        _defined: set | None = None) -> None:
+                        _defined: set | None = None,
+                        live: bool = True) -> None:
+        """Walk ``flow`` in execution order before any device action.
+
+        ``live`` is False below a runFlow whose ``when.platform`` names
+        another platform: those steps never run on this target, so they are
+        not refused for it (variables are still checked).
+        """
         seen = _seen if _seen is not None else {}
         # Runtime-variable names (copyTextFrom/setClipboard into:) available
         # at this point of execution order. Definitions escape only from
@@ -765,7 +781,7 @@ class Executor:
         # let the second inclusion's missing variables escape to run time.
         # The memo stores the DELTA of definitions the walk added, so a
         # cache hit still contributes them to the caller's live set.
-        key = (flow.path, tuple(sorted(values)), tuple(sorted(defined)))
+        key = (flow.path, tuple(sorted(values)), tuple(sorted(defined)), live)
         if key in seen:
             defined |= seen[key]
             return
@@ -774,11 +790,11 @@ class Executor:
             self._preflight_requires(flow)
         if not is_root:
             for step in flow.steps:
-                self._preflight_step(step, flow, values, seen, defined)
+                self._preflight_step(step, flow, values, seen, defined, live)
             seen[key] = frozenset(defined - before)
             return
         for step in flow.on_flow_start:
-            self._preflight_step(step, flow, values, seen, defined)
+            self._preflight_step(step, flow, values, seen, defined, live)
         # onFlowComplete runs after pass AND fail — a variable set mid-steps
         # is not guaranteed to exist there, so cleanup sees only what the
         # start hook (guaranteed to have run) defined; and because each
@@ -786,14 +802,14 @@ class Executor:
         # do not carry into the next.
         defined_after_start = set(defined)
         for step in flow.steps:
-            self._preflight_step(step, flow, values, seen, defined)
+            self._preflight_step(step, flow, values, seen, defined, live)
         for step in flow.on_flow_complete:
             self._preflight_step(step, flow, values, seen,
-                                 set(defined_after_start))
+                                 set(defined_after_start), live)
         seen[key] = frozenset(defined - before)
 
     def _preflight_step(self, step: Step, flow: Flow, values: dict,
-                        seen: dict, defined: set) -> None:
+                        seen: dict, defined: set, live: bool = True) -> None:
         if step.command == "runFlow":
             # The step's own env: values and when: clause resolve in the
             # PARENT frame — check them here before descending.
@@ -802,23 +818,30 @@ class Executor:
                     self._var_undefined(step, name)
             conditional = "when" in step.args
             child_defined = set(defined) if conditional else defined
+            when = step.args.get("when")
+            # `when: {platform: android}` never runs on iOS (and vice versa):
+            # its body is not refused for this target
+            child_live = live and not (
+                when is not None and when.platform
+                and when.platform != self.target.platform)
             if "commands" in step.args:
                 # inline subflow: parent frame stays visible, env: overlays
                 inline_values = {**values, **step.args.get("env", {})}
                 for sub in step.args["commands"]:
                     self._preflight_step(sub, flow, inline_values, seen,
-                                         child_defined)
+                                         child_defined, child_live)
                 return
             child = self._child_of(flow, step)
             child_values = {**child.env,
                             **{k: v for k, v in step.args.get("env", {}).items()},
                             **self.config.env, **self.config.secrets}
             self._preflight_flow(child, child_values, is_root=False,
-                                 _seen=seen, _defined=child_defined)
+                                 _seen=seen, _defined=child_defined,
+                                 live=child_live)
             return
         if step.command in ("retry", "group"):
             for sub in step.args["commands"]:
-                self._preflight_step(sub, flow, values, seen, defined)
+                self._preflight_step(sub, flow, values, seen, defined, live)
             return
         if step.command == "repeat":
             for name in self._step_var_names(step):
@@ -826,19 +849,19 @@ class Executor:
                     self._var_undefined(step, name)
             body_defined = set(defined)  # while: may allow zero iterations
             for sub in step.args["commands"]:
-                self._preflight_step(sub, flow, values, seen, body_defined)
+                self._preflight_step(sub, flow, values, seen, body_defined,
+                                     live)
             return
         if step.command in ("launchApp", "stopApp", "clearState") and not flow.app_id:
             self._definition(step, f"{step.command} needs an appId, and neither "
                                    "this flow nor the root flow provides one")
-        if self.target.platform == IOS:
-            if step.command in ("clearState", "back", "setOrientation"):
-                self._definition(step, f"{step.command} is not supported on iOS",
-                                 code=errors.UNSUPPORTED_ON_PLATFORM)
-            if step.command == "launchApp" and step.args.get("clearState"):
-                self._definition(step, "launchApp.clearState is not supported "
-                                       "on iOS (no 'pm clear' equivalent)",
-                                 code=errors.UNSUPPORTED_ON_PLATFORM)
+        if live and self.target.platform == IOS:
+            # one table with `flow check`'s platform inference
+            # (schema.android_only), refused here before any mutation
+            limit = android_only(step)
+            if limit is not None:
+                code, message, hint = limit
+                self._definition(step, message, code=code, flow=flow, hint=hint)
         for name in self._step_var_names(step):
             if name not in values and name not in defined:
                 self._var_undefined(step, name)
@@ -889,10 +912,16 @@ class Executor:
                         yield from _iter_var_names(text)
 
     def _definition(self, step: Step, message: str,
-                    code: str = errors.FLOW_COMMAND_INVALID) -> None:
+                    code: str = errors.FLOW_COMMAND_INVALID,
+                    flow: Flow | None = None, hint: str | None = None) -> None:
+        # `file` names the flow that holds the step (a runFlow child's own
+        # path), so the refusal points at a line someone can edit
+        where = {"file": flow.path} if flow is not None else {}
+        text = (f"{flow.path}:{step.line}:{step.col}: {message}" if flow is not None
+                else f"step {step.command} (line {step.line}): {message}")
         raise errors.AutonomError(
-            code, f"step {step.command} (line {step.line}): {message}",
-            line=step.line, column=step.col, command=step.command,
+            code, text, hint=hint, line=step.line, column=step.col,
+            command=step.command, **where,
         )
 
     def _preflight_requires(self, flow: Flow) -> None:
@@ -1623,6 +1652,7 @@ class Executor:
         self._last_nodes = None
         self._last_match = None
         self._last_repin = None
+        self._last_settle = None
         attempts = [0]
         try:
             secret_used = self._dispatch(step, flow, attempts)
@@ -1672,6 +1702,25 @@ class Executor:
             finished["target"] = outcome.target
         # a takeScreenshot re-asserted a live status-bar pin before its frame
         finished.update(_repin_fields(self._last_repin))
+        if self._last_settle is not None:
+            settle = self._last_settle
+            outcome.settled = bool(settle["settled"])
+            finished["settled"] = outcome.settled
+            finished["settle"] = settle
+            if not outcome.settled:
+                # the same honest text as `ui wait --settled`: "still changing"
+                # only when a change was seen between two snapshots
+                error, hint = ui_mod.unsettled_message(
+                    settle, settle["timeout_ms"], settle["quiet_ms"],
+                    timeout_name="timeoutMs",
+                    node_wait="wait for the node the next step needs with waitUntil")
+                self._step_warnings.append({
+                    "code": "screen_not_settled",
+                    "step_index": index, "file": flow.path, "line": step.line,
+                    "message": f"waitForSettled (line {step.line}): {error}; the flow "
+                               "went on",
+                    "hint": hint,
+                })
         event = writer.emit("flow.step.finished", finished, sensitive=sensitive)
         writer.journal_step(event)
 
@@ -1924,6 +1973,9 @@ class Executor:
                                  lambda m: bool(m) == want_visible,
                                  "visible" if want_visible else "gone")
             return secret
+        if command == "waitForSettled":
+            self._wait_for_settled(step, attempts)
+            return False
         if command == "setLocation":
             device_state.set_location(
                 target, f"{step.args['latitude']},{step.args['longitude']}")
@@ -2049,6 +2101,32 @@ class Executor:
                     timeout_ms=timeout_ms, attempts=attempts[0],
                 )
             self.sleep(self.config.interval_ms / 1000)
+
+    def _wait_for_settled(self, step: Step, attempts: list) -> None:
+        """Poll the tree until it holds still (``ui.settle``), bounded.
+
+        Never raises for an unsettled screen: the outcome is recorded
+        (``settled`` on the step, a ``screen_not_settled`` run warning) and
+        the flow continues — the next step polls for what it needs anyway.
+        """
+        timeout_ms, quiet_ms = settle_window(step.args)
+
+        def take() -> list:
+            attempts[0] += 1
+            nodes = ui_mod.snapshot(self.target)
+            self._last_nodes = nodes
+            return nodes
+
+        result = ui_mod.settle(self.target, timeout_ms=timeout_ms,
+                               quiet_ms=quiet_ms, snapshot_fn=take,
+                               clock=self.clock, sleep=self.sleep)
+        self._last_settle = {"settled": bool(result.get("settled")),
+                             "snapshots": result.get("snapshots"),
+                             "changes": result.get("changes"),
+                             "elapsed_ms": result.get("elapsed_ms"),
+                             "dump_ms": result.get("dump_ms"),
+                             "stable_ms": result.get("stable_ms"),
+                             "timeout_ms": timeout_ms, "quiet_ms": quiet_ms}
 
     def _scroll_until_visible(self, step: Step, attempts: list) -> bool:
         selector, secret = self._resolve_selector(step.selector)

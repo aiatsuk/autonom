@@ -79,6 +79,11 @@ python3 <autonom-root>/scripts/autonom.py session stop
 
 Target flags work before or after the subcommand. A shutdown simulator is booted
 automatically and the response reports `"booted": true` when this call did it.
+The response also says what `--install` and `--launch` did: `installed`
+(true/false) and `launched` (`null`, or the app id with the iOS `pid` / the
+Android `am start -W` report: `mode`, `component`, `launch`). An Android
+`session launch` (resume) is the launcher icon's own `am start -W` intent,
+not `monkey`, so it no longer resets a pinned orientation.
 
 `session start` refuses with `session_already_active` (naming the live
 session's id and target) while a session is current — run `session stop`
@@ -152,10 +157,19 @@ export AUTONOM_IDB_COMPANION=mac-farm-01:10882
 2. Do not print signing secrets, tokens, or `.env` values while installing/launching.
 3. One session per investigation; stop when done so artifacts stay coherent.
    `autonom session outputs` lists every followable file in the session dir
-   (device log stream, process output, network flows, `metrics/` artifacts)
-   with a `tail -f` hint for a human's second terminal.
-4. `session stop` tears down the log stream, recorder, and proxy best-effort and
-   reports each action — it never fails because teardown failed.
+   (device log stream, process output, network flows) with a `tail -f` hint
+   for a human's second terminal, plus the `metrics/` and `recordings/`
+   artifacts (`followable: false` for a binary, `directory: true` for an
+   Instruments `.trace`, with an `open` hint where the host has one).
+4. `session stop` tears down the log stream, recorder, and proxy best-effort,
+   then every process the session registered (the iOS log-stream writer, a
+   `canvas serve` pair, an idb companion its own idb calls started), and
+   reports each action under `teardown` — it never fails because teardown
+   failed. Every pid is signalled only once its registry row or its command
+   line shows it is still that process (a pid in a session file can be days
+   old); one `ps` cannot vouch for is skipped with `unverified_skipped`. A
+   companion it did not start is named in a `companion_left_running`
+   warning, never killed.
 5. If a session died without stopping, `autonom doctor` lists orphaned processes,
    any device left pointing at a dead proxy, and any emulator still routed
    through another session's *live* proxy (`device_attached_to_foreign_proxy`).

@@ -17,7 +17,28 @@ SEMANTIC_CAPABILITIES = (
     "simulator.appearance", "simulator.text_size", "simulator.status_bar",
     "simulator.battery", "simulator.network", "simulator.push",
     "simulator.sms", "simulator.call", "simulator.biometric",
+    "simulator.keyboard",
 )
+
+
+def _keyboard_capability(target: Target, simulated: bool) -> tuple[str, str | None]:
+    """`simulator keyboard` writes the simulator's on-disk preference store,
+    which is read at boot: iOS only, and only where that store exists (the
+    verb shuts the device down for the write, or refuses without
+    reboot=true)."""
+    if target.platform != IOS:
+        return ("unavailable", "Android keeps keyboard preferences inside the keyboard "
+                               "app; no host-level store reaches them")
+    if not simulated:
+        return ("unavailable", "requires an emulator or simulator")
+    from . import ios_prefs
+
+    try:
+        ios_prefs.require_preferences_dir(target.target_id)
+    except errors.AutonomError:
+        return ("unavailable", "no preference store for this simulator yet; boot it once")
+    return ("available", "applies at boot: the simulator is shut down for the write "
+                         "(pass reboot=true to have the verb do it)")
 
 
 class DeviceSession(Protocol):
@@ -91,6 +112,9 @@ class LocalDeviceSession:
             supported_simulator |= {"simulator.push"}
         for name in SEMANTIC_CAPABILITIES:
             if not name.startswith("simulator."):
+                continue
+            if name == "simulator.keyboard":
+                values[name] = _keyboard_capability(self.target, simulated)
                 continue
             available = simulated and name in supported_simulator
             values[name] = (

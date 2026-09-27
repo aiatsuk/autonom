@@ -266,10 +266,12 @@ def start(
                       mocks_file=mocks_file, ignore_hosts=ignore_hosts,
                       intercept_connectivity_checks=intercept_connectivity_checks)
     log = directory / "mitmdump.log"
-    handle = open(log, "ab")
-    process = subprocess.Popen(  # noqa: S603 - argv is constructed, never shell
-        argv, stdout=handle, stderr=handle, start_new_session=True
-    )
+    # The child gets its own copy of the descriptor; this process's copy was
+    # never closed, leaking one open file per `network start`.
+    with open(log, "ab") as handle:
+        process = subprocess.Popen(  # noqa: S603 - argv is constructed, never shell
+            argv, stdout=handle, stderr=handle, start_new_session=True
+        )
 
     deadline = time.time() + 15
     while time.time() < deadline:
@@ -299,8 +301,11 @@ def start(
     # Machine-level, so this proxy stays findable from any working directory —
     # the session file above is only reachable by someone already standing in
     # the right place.
+    # The signature lets `cleanup` and `session stop` verify the pid is still
+    # this mitmdump (its argv names the addon) before they kill it.
     processes_mod.register("proxy", process.pid, artifacts_dir=str(directory),
-                           port=chosen, session_id=record.get("session_id"))
+                           port=chosen, session_id=record.get("session_id"),
+                           signature=processes_mod.ADDON_MARKER)
     return {"running": True, **payload}
 
 

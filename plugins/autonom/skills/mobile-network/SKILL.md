@@ -74,15 +74,26 @@ device is never left pointing at a dead proxy.
 | Android physical | **refused** — the proxy is loopback-only and a physical device cannot reach it; widening the bind would expose an open proxy | none |
 | iOS Simulator | injects proxy environment variables into apps launched by `session launch` | clients honouring proxy env vars |
 
-**iOS limitation, state it in findings:** the per-process mechanism covers Dart /
-Flutter `HttpClient.findProxyFromEnvironment`, curl, and many SDKs. Native
+**iOS limitation, state it in findings:** the per-process mechanism covers
+clients that read the proxy environment — curl and many SDKs. Native
 `URLSession` reads the *system* proxy configuration and is **not** captured this
 way. The Simulator has no proxy pane of its own — it uses the host Mac's
 network stack — so the manual steps `network attach` prints set the **host's**
 system proxy (and switch it off again afterwards). Ask the operator before
 doing that, then confirm with `network status`. On iOS `network attach`
-answers `attached: false` with `attach_state: manual`: nothing has been
-observed yet.
+answers `attached: "unknown"` with `mode: manual` and `attach_state: manual`:
+nothing has been observed yet, and the attach is not automatable the way
+the emulator's is.
+
+**Flutter needs an in-app hook, on both platforms.** `dart:io`'s `HttpClient`
+ignores the proxy environment *and* Android's global proxy setting unless the
+app itself sets `findProxy`. Add a hook to the debug build — for example
+`HttpOverrides.global` with a `createHttpClient` that sets
+`client.findProxy = HttpClient.findProxyFromEnvironment` (iOS), or returns
+`'PROXY 10.0.2.2:<port>'` (Android emulator) — then relaunch. iOS
+`network attach` says so in a `flutter_proxy_hook_required` warning. Without
+the hook a Flutter app's requests never reach the proxy, whatever
+`network status` says about the device.
 
 Autonom never changes macOS network-service settings itself: that is a
 system-wide change whose blast radius is the operator's whole machine.
@@ -96,10 +107,12 @@ Decrypting TLS needs the app to trust the MITM CA.
   configuration on iOS.
 - **iOS Simulator:** `--install-ca` runs `simctl keychain add-root-cert`, scoped to
   that one simulator.
-- **Android: `--install-ca` is NOT implemented.** The flag is iOS-only and Android
-  `attach` refuses it rather than accepting it silently. Place the certificate
-  yourself on a rootable `google_apis` image (not `google_apis_playstore`, where
-  `adb root` is blocked); `/system` needs no remount:
+- **Android emulator:** `--install-ca` (with `--i-understand-mitm`) runs
+  `adb root` and copies the CA into the user trust store. It works only on a
+  rootable `google_apis` image: a `google_apis_playstore` image blocks
+  `adb root`, and the attach fails with `backend_failed` saying so. A
+  physical device is refused. The same steps by hand (`/system` needs no
+  remount):
 
   ```bash
   CA=~/.local/state/autonom/ca/mitmproxy-ca-cert.pem
@@ -198,10 +211,17 @@ exactly which flows were faked.
 ## Honest reporting
 
 1. Report status codes and bodies as **measured facts**, on-screen text separately.
-2. `network status` reports `attached` as `true`, `false`, or **`unknown`** — it
-   only claims success when traffic has actually been observed — and
-   `attach_state` (`automated`, `manual`, `not_attached`) for how far the
-   attach got. Do not upgrade `unknown` to "working" in a summary.
+2. `network status` reports `attached` as `true`, `false`, or **`unknown`**,
+   with the `evidence` behind it, and `attach_state` (`automated`, `manual`,
+   `not_attached`) for how far the attach got. Only traffic *from the target*
+   counts: a flow from the emulator's guest network (`target_flows`), else the
+   device's proxy setting read back (`device_setting`); a host `curl` through
+   the proxy never does. Loopback flows are unattributed
+   (`unattributed_flow_count`, with `recent_user_agents` so you can judge
+   them). On iOS the Simulator and the host share one network stack, so
+   traffic leaves it `unknown` (`host_traffic_indistinguishable`); an Android
+   device that cannot be read is `setting_unreadable`. Do not upgrade
+   `unknown` to "working" in a summary.
 3. A HAR exported without `--capture-bodies` carries previews; its `log.comment`
    says so. Do not present a preview as a full payload.
 4. If nothing was captured, distinguish the causes: not attached, pinning, the app
@@ -215,7 +235,7 @@ exactly which flows were faked.
 | `proxy_not_running` | `network start` first |
 | `mitmdump_required` | install mitmproxy; `autonom doctor` prints the command |
 | `physical_device_attach_unsupported` | use an emulator, or configure the Wi-Fi proxy by hand |
-| Requests list is empty | not attached, pinning, or `URLSession` on iOS |
+| Requests list is empty | not attached, pinning, `URLSession` on iOS, or a Flutter app without an in-app proxy hook |
 | App shows network errors after a crash | the device may still point at a dead proxy — `autonom doctor` reports it; run `network detach` |
 
 ## Related

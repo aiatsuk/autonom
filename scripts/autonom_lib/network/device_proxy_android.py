@@ -126,14 +126,10 @@ def install_ca_certificate(
 
 
 def _get_setting(target: Target) -> str | None:
-    completed = adb_mod.run_adb(
-        target.tool, ["shell", "settings", "get", "global", SETTING],
-        serial=target.target_id, timeout=15, check=False,
-    )
-    value = (completed.stdout or "").strip() if isinstance(completed.stdout, str) else ""
-    if not value or value == "null":
-        return None
-    return value
+    """`read_setting`: a failed adb read raises instead of being taken as the
+    value. It used to return adb's error text, which `attach` then saved as
+    the previous proxy and `detach` wrote back to the device."""
+    return read_setting(target)
 
 
 def _put_setting(target: Target, value: str) -> None:
@@ -268,3 +264,30 @@ def observed_setting(target: Target) -> str | None:
         return _get_setting(target)
     except errors.AutonomError:
         return None
+
+
+def read_setting(target: Target) -> str | None:
+    """The device's current global proxy, telling "unset" from "unreadable".
+
+    Returns None when the setting is empty or ``null``. Raises
+    `backend_failed` when adb itself failed — a device gone offline, a dead
+    server. `observed_setting` folds both into None, which made `network
+    status` report an unreachable device as "proxy cleared externally".
+    `run_adb` merges stderr into stdout, so a failed read must be caught by
+    its exit status, never taken as the setting's value.
+    """
+    completed = adb_mod.run_adb(
+        target.tool, ["shell", "settings", "get", "global", SETTING],
+        serial=target.target_id, timeout=15, check=False,
+    )
+    output = (completed.stdout or "").strip() if isinstance(completed.stdout, str) else ""
+    if getattr(completed, "returncode", 0):
+        raise errors.AutonomError(
+            errors.BACKEND_FAILED,
+            f"could not read {SETTING} on {target.target_id}: "
+            f"{output[:200] or 'adb exited ' + str(completed.returncode)}",
+            "Check the device with 'autonom devices'.",
+        )
+    if not output or output == "null":
+        return None
+    return output

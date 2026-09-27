@@ -9,20 +9,51 @@ State keys (all optional):
 ``avds``         list of AVD names for ``-list-avds`` (default ["Pixel_9"])
 ``boot_serial``  serial the booted AVD appears under (default emulator-5556)
 ``boot_hang``    when true, ``-avd`` starts nothing — reproduces a hung boot
+
+The state file is shared with fakes running at the same moment: a booting
+emulator writes it while ``boot_avd`` polls ``fake_adb.py devices``. So a
+write swaps a complete file in (``write_state``), and a read waits out a
+writer caught mid-write (``load_state``): no reader parses a torn document.
 """
 from __future__ import annotations
 
 import json
 import os
 import sys
+import tempfile
+import time
 from pathlib import Path
+
+# How long a read retries a document that does not parse. A writer that
+# rewrites the file in place (a test's plain ``write_text``) leaves it empty
+# or half-written for microseconds; a document still unparsable after this
+# long is genuinely corrupt and is raised, never read as an empty state.
+READ_PATIENCE_SECONDS = 2.0
+READ_RETRY_INTERVAL = 0.01
+
+
+def read_state(path: Path, *, patience: float | None = None) -> dict:
+    """The state document at ``path``; ``{}`` when there is none."""
+    budget = READ_PATIENCE_SECONDS if patience is None else patience
+    deadline = time.monotonic() + budget
+    while True:
+        try:
+            text = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return {}
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(READ_RETRY_INTERVAL)
 
 
 def load_state() -> dict:
     path = os.environ.get("AUTONOM_FAKE_STATE")
-    if not path or not Path(path).exists():
+    if not path:
         return {}
-    return json.loads(Path(path).read_text(encoding="utf-8"))
+    return read_state(Path(path))
 
 
 def record(argv: list[str]) -> None:
@@ -35,8 +66,24 @@ def record(argv: list[str]) -> None:
 
 def write_state(state: dict) -> None:
     path = os.environ.get("AUTONOM_FAKE_STATE")
-    if path:
-        Path(path).write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+    if not path:
+        return
+    target = Path(path)
+    # A sibling temp file, then an atomic rename over the target: a reader
+    # opens either the previous document or this one — never a file that
+    # `open(..., "w")` has truncated and the write has not yet refilled.
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=f".{target.name}.", suffix=".tmp", dir=str(target.parent))
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(state, indent=2) + "\n")
+        os.replace(temporary, target)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def main(argv: list[str]) -> int:

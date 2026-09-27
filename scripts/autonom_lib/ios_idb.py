@@ -12,6 +12,7 @@ adapter rather than a rewrite.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -22,6 +23,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from . import errors
+from . import processes as processes_mod
 from .platform import Target
 
 BUTTONS = ("APPLE_PAY", "HOME", "LOCK", "SIDE_BUTTON", "SIRI")
@@ -117,15 +119,22 @@ def run_idb(
     command = [idb, *(["--companion", endpoint] if endpoint else []), *args]
     if udid:
         command += ["--udid", udid]
+    # A local idb call may spawn an idb_companion for the simulator; the
+    # tracker registers one that appears during this call under the session
+    # that owns the simulator, so `session stop` can stop it. A remote
+    # companion is on another Mac and never ours to track.
+    tracker = (processes_mod.track_idb_companions(udid) if udid and not endpoint
+               else contextlib.nullcontext())
     try:
-        completed = subprocess.run(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-            timeout=timeout,
-            text=not binary,
-        )
+        with tracker:
+            completed = subprocess.run(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=timeout,
+                text=not binary,
+            )
     except FileNotFoundError as exc:
         raise errors.tool_missing("idb") from exc
     if check and completed.returncode != 0:
@@ -479,10 +488,48 @@ def screenshot(target: Target, output: Path, *, idb_path: str | None = None) -> 
 # --- diagnostics -------------------------------------------------------------
 
 
+# What the fb-idb client prints when it could not reach a companion, read
+# from fb-idb 1.1.7's own sources: an OSError surfaces as
+# `IdbConnectionException(<strerror>)` ("Connection refused", asyncio's
+# "Connect call failed (...)"), spawning fails with "Failed to spawn
+# companion ...", a dropped gRPC stream as "Connection lost"/"StreamTerminated",
+# and a gRPC UNAVAILABLE status by name. The client's INFO lines ("No existing
+# companion at ..., spawning one...", "Companion at ... spawned for <udid>")
+# mention the companion without being failures, so the bare words
+# "companion"/"connect" are never enough on their own.
+_COMPANION_FAILURE = re.compile(
+    r"IdbConnectionException|connection refused|connect call failed|failed to connect"
+    r"|could not connect|couldn't connect|failed to spawn companion|connection (?:lost|reset)"
+    r"|streamterminated|statuscode\.unavailable|companion (?:is )?not running"
+    r"|not connected to (?:a|any) companion|errno 61|econnrefused", re.I)
+
+
 def crash_list(target: Target, *, idb_path: str | None = None) -> str:
+    """idb's crash store listing, or a typed failure.
+
+    This ran with ``check=False`` and returned stdout whatever happened, so a
+    client that had lost its companion (seen on a real Mac: `crash show`
+    answered idb_companion_unavailable seconds later) printed nothing and the
+    verb reported ``count: 0`` — an empty crash store the device never
+    claimed. A non-zero exit now raises exactly like every other idb verb
+    (IDB_COMPANION_UNAVAILABLE for companion/connection trouble, else
+    BACKEND_FAILED); an exit 0 with no listing and a connection failure on
+    stderr (``_COMPANION_FAILURE``, never a mere mention of the companion) is
+    the same failure and raises the same way.
+    """
     idb = find_idb(idb_path)
-    return run_idb(idb, ["crash", "list"], udid=target.target_id, timeout=30, check=False,
-                   companion=target_companion(target)).stdout or ""
+    completed = run_idb(idb, ["crash", "list"], udid=target.target_id, timeout=30,
+                        companion=target_companion(target))
+    stdout = completed.stdout or ""
+    stderr = (completed.stderr or "").strip()
+    if not stdout.strip() and stderr and _COMPANION_FAILURE.search(stderr):
+        raise errors.AutonomError(
+            errors.IDB_COMPANION_UNAVAILABLE,
+            stderr[-400:],
+            "idb printed no crash listing because it could not reach its companion; "
+            "an empty store was not confirmed. Check 'idb list-targets', then retry.",
+        )
+    return stdout
 
 
 def crash_show(target: Target, name: str, *, idb_path: str | None = None) -> str:

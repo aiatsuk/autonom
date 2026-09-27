@@ -2,6 +2,8 @@
 
 `available` is a host-tool answer, not a promise: device-side checks (is
 simpleperf on this image?) happen at trace time with their own error codes.
+The one known target-side refusal is listed here too: every Autonom iOS
+target is a Simulator, and Instruments refuses some templates there.
 """
 from __future__ import annotations
 
@@ -17,6 +19,13 @@ PRESETS: tuple[dict[str, str], ...] = (
     {"id": "leaks", "platform": "ios", "tool": "xctrace"},
     {"id": "hitches", "platform": "ios", "tool": "xctrace"},
 )
+
+# preset id -> why it cannot run against the iOS Simulator
+SIMULATOR_UNSUPPORTED: dict[str, str] = {
+    "hitches": ("Instruments' Animation Hitches template is not supported on "
+                "the iOS Simulator; record it in Instruments on a physical "
+                "device, or use time-profiler for main-thread stalls here"),
+}
 
 
 def xctrace_available(xcrun: str | None) -> bool:
@@ -44,6 +53,12 @@ def listing(platform: str | None, *, adb: str | None,
         if platform and preset["platform"] != platform:
             rows.append({"id": preset["id"], "available": False,
                          "reason": f"{preset['platform']}_only",
+                         "tool": preset["tool"]})
+            continue
+        if preset["id"] in SIMULATOR_UNSUPPORTED:
+            rows.append({"id": preset["id"], "available": False,
+                         "reason": "unsupported_on_simulator",
+                         "note": SIMULATOR_UNSUPPORTED[preset["id"]],
                          "tool": preset["tool"]})
             continue
         rows.append({"id": preset["id"], "available": tools[preset["tool"]],

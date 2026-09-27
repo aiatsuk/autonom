@@ -85,6 +85,17 @@ tags: [smoke, auth]
   machine is wrong (definition/infrastructure) — stderr envelope as usual.
 - Assertions poll (default 10 s, per-step `timeoutMs`); mutating steps fire
   **exactly once** — a duplicate selector match refuses instead of tapping.
+- Selectors match **on-screen** nodes only, and duplicates and `index` are
+  counted among them: iOS lists Flutter's scroll cache at a 0x0 frame, and a
+  flow never asserts, taps, or counts such a node (`scrollUntilVisible` keeps
+  scrolling until it is really on screen). Whitespace in a label is
+  normalised, so one selector matches the label iOS joins with a newline and
+  Android with a space. Before a tap on a sheet that is still animating in,
+  add `waitForSettled` — it waits for a still tree and never fails the flow.
+- A directory suite runs on one target and skips a flow that cannot run there
+  (declared for the other platform, or an Android-only step on iOS) with a
+  `flow_skipped_for_platform` warning; `flow list` shows each flow's
+  inferred `platforms` up front.
 - Per-step events: `~/.autonom/sessions/<id>/flows/<run_id>/events.ndjson`;
   a failing step leaves a screenshot and a hierarchy dump automatically.
 - `onFlowComplete` cleanup always runs; its failures are reported separately

@@ -289,12 +289,14 @@ BAD_ACTIVITY = ("Starting: Intent { cmp=com.example.app/.Bad }\nError type 3\n"
 
 
 class LaunchTests(unittest.TestCase):
-    def test_resume_launch_disables_system_keys(self) -> None:
-        """Before: monkey exited 251 on an AVD with hw.keyboard=no."""
+    def test_monkey_fallback_disables_system_keys(self) -> None:
+        """With no resolvable launcher activity, resume falls back to monkey,
+        which must pass `--pct-syskeys 0`: it exited 251 on an AVD with
+        hw.keyboard=no."""
         fake = scripted()
         with mock.patch.object(adb_mod, "run_adb", fake):
             session.launch_app("adb", "emulator-5554", "com.android.settings")
-        monkey = fake.calls[0]
+        monkey = next(call for call in fake.calls if call[:2] == ["shell", "monkey"])
         self.assertEqual(monkey[:3], ["shell", "monkey", "-p"])
         index = monkey.index("--pct-syskeys")
         self.assertEqual(monkey[index + 1], "0")
@@ -446,7 +448,7 @@ class SelectorTests(unittest.TestCase):
         error = ui.no_match_error("ios", nodes, {"text": "Continue"})
         self.assertEqual(error.code, errors.NO_MATCHING_NODE)
         self.assertIn("--desc", error.hint)
-        self.assertIsNone(ui.no_match_hint("android", nodes, {"text": "Continue"}))
+        self.assertIn("--desc", ui.no_match_hint("android", nodes, {"text": "Continue"}))
         self.assertIsNone(ui.no_match_hint("ios", nodes, {"text": "Elsewhere"}))
 
     def test_clip_is_exact_at_the_limit(self) -> None:

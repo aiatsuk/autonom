@@ -215,7 +215,12 @@ node plugins/autonom/skills/android-emulator-browser/scripts/android-emulator-br
 The command prints a tokenized `127.0.0.1` URL. Open that exact URL in your
 agent’s browser side panel. When `ffmpeg` and device-side H.264 streaming are
 available, `--transport auto` uses them. Otherwise the bridge falls back to a
-persistent screenshot stream.
+persistent screenshot stream. `autonom canvas serve` starts the same bridge for
+the session's target, supervised and registered, so `processes` lists it and
+`session stop` or `cleanup --all` can stop it. An iOS Simulator
+(`--platform ios`) is mirrored from `simctl` screenshots only, with taps,
+drags, and text through the same input path as `ui`; the Android key buttons
+have no iOS equivalent.
 
 Browser mirroring is visual proof and interaction support, not a performance
 benchmark. Use a physical device plus native profilers for frame-rate review.

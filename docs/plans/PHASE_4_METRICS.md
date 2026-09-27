@@ -575,7 +575,11 @@ autonom metrics frames flutter-summary path/to/integration_response.json
 Reuses `frame_timings_summary.py` logic (build/raster, budget, over_budget).
 
 **iOS frames (0.18+):** only via `metrics trace --preset hitches` (xctrace),
-not a fake gfxinfo.
+not a fake gfxinfo — and only on a **physical device**: Instruments refuses
+Animation Hitches on the iOS Simulator ("not supported on this platform"), so
+`list-presets` marks `hitches` `unsupported_on_simulator`. On the Simulator,
+summarize Flutter frame timings with `metrics frames flutter-summary`, or look
+for main-thread stalls with `metrics trace --preset time-profiler`.
 
 ### 2.6 `metrics trace`
 

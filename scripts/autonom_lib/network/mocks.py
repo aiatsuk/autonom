@@ -118,6 +118,53 @@ def active(registry: Path | None = None) -> list[dict[str, Any]]:
     return [rule for rule in load(registry) if rule.get("enabled", True)]
 
 
+def persistent_mocks_warning(state: dict[str, Any] | None = None, *,
+                             registry: Path | None = None) -> dict[str, str] | None:
+    """The `persistent_mocks_active` warning, or None when no rule is enabled.
+
+    `network start` and `doctor` raised it; `network status` — the verb an
+    agent re-runs while judging evidence — did not, although the skill says
+    it does. One definition, so the three cannot drift apart again. `state`
+    is a `summary()` the caller already has.
+    """
+    state = state if state is not None else summary(registry)
+    if not state.get("active"):
+        return None
+    return {
+        "code": "persistent_mocks_active",
+        "error": f"{state['active']} mock rule(s) loaded from the persistent "
+                 f"registry — matching responses WILL be faked",
+        "hint": "Review with 'autonom network mock list', switch off with "
+                "'autonom network mock disable --all'.",
+    }
+
+
+def hit_counts(flows: Iterable[dict[str, Any]]) -> dict[str, int]:
+    """How often each rule actually fired, from recorded flows' `mock_id`."""
+    counts: dict[str, int] = {}
+    for flow in flows:
+        identifier = flow.get("mock_id") if isinstance(flow, dict) else None
+        if identifier:
+            counts[identifier] = counts.get(identifier, 0) + 1
+    return counts
+
+
+def session_hit_counts(record: dict[str, Any] | None = None) -> dict[str, int]:
+    """`hit_counts` over a session's flow store — the current session's when
+    `record` is None; empty when there is no session or no store."""
+    from .. import session as session_mod
+    from . import store
+
+    try:
+        record = record if record is not None else session_mod.load_current()
+        if not record:
+            return {}
+        flows, _warnings = store.read_all(record)
+    except (errors.AutonomError, OSError, ValueError, KeyError):
+        return {}
+    return hit_counts(flows)
+
+
 def summary(registry: Path | None = None) -> dict[str, Any]:
     """What `network start`, `network status` and `doctor` shout about."""
     rules = load(registry)
@@ -311,8 +358,22 @@ def add(
     return rule
 
 
-def get(identifier: str, registry: Path | None = None) -> dict[str, Any]:
-    return _find(load(registry), identifier)
+def get(identifier: str, registry: Path | None = None, *,
+        record: dict[str, Any] | None = None,
+        counts: dict[str, int] | None = None) -> dict[str, Any]:
+    """One rule, with `hits` — how often it fired in the session's flows —
+    exactly as `mock list` shows it (`mock show` used to omit it).
+
+    Hits come from `counts`, else from `record`'s flow store, else — for the
+    machine registry only — the current session's. An explicit `registry`
+    (a test seam) never reaches for the current session.
+    """
+    rule = dict(_find(load(registry), identifier))
+    if counts is None:
+        counts = (session_hit_counts(record) if record is not None or registry is None
+                  else {})
+    rule["hits"] = counts.get(identifier, 0)
+    return rule
 
 
 def update(
