@@ -16,11 +16,11 @@ import time
 from pathlib import Path
 from typing import Any
 
-# docs/INSTALL.md states 3.14, the only version CI tests. An older interpreter
-# must not die in an import traceback before any envelope could be printed:
-# checked before the library is imported, with the same stderr shape as every
-# other failure.
-MIN_PYTHON = (3, 14)
+# docs/INSTALL.md states 3.11 (CI tests 3.11 on pull requests and 3.14 on
+# main). An older interpreter must not die in an import traceback before any
+# envelope could be printed: checked before the library is imported, with the
+# same stderr shape as every other failure.
+MIN_PYTHON = (3, 11)
 
 
 def _python_too_old(version: tuple[int, ...]) -> dict[str, Any] | None:

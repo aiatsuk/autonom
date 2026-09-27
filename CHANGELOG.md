@@ -337,11 +337,10 @@ listed in `docs/COMPATIBILITY.md`.
   `no_frames` at the top level for a window of zero HWUI frames.
 
 ### Changed
-- Minimum Python raised from 3.11 to 3.14: `autonom` on an older interpreter
-  now exits 2 with a `tool_missing` envelope naming 3.14. CI tests 3.14 only.
-- CI: pull requests run one Linux 3.14 job (including the `tty_guard` pass);
-  the macOS job runs on pushes to `main` only, and it skips `tty_guard`
-  (`AUTONOM_SKIP_TTY_GUARD=1`). Local `run_checks.sh` is unchanged.
+- CI: pull requests run one Linux job on the minimum supported Python 3.11
+  (including the `tty_guard` pass); the macOS job runs Python 3.14 on pushes to
+  `main` only and skips `tty_guard` (`AUTONOM_SKIP_TTY_GUARD=1`). Local
+  `run_checks.sh` is unchanged.
 - `session start` refuses with the new `session_already_active` (naming the
   live session and hinting `session stop`) instead of silently replacing
   the current session and orphaning its proxy and recorders.

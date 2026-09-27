@@ -194,11 +194,11 @@ class CliCase(EnvSandboxMixin, unittest.TestCase):
 class EnvelopeTests(CliCase):
     def test_python_guard_names_the_minimum(self) -> None:
         cli = load_cli()
-        payload = cli._python_too_old((3, 13, 9))  # noqa: SLF001
+        payload = cli._python_too_old((3, 10, 9))  # noqa: SLF001
         self.assertEqual(payload["error_code"], "tool_missing")
-        self.assertIn("3.14", payload["error"])
-        self.assertIn("3.13.9", payload["error"])
-        self.assertIsNone(cli._python_too_old((3, 14, 0)))  # noqa: SLF001
+        self.assertIn("3.11", payload["error"])
+        self.assertIn("3.10.9", payload["error"])
+        self.assertIsNone(cli._python_too_old((3, 11, 0)))  # noqa: SLF001
         self.assertIsNone(cli._python_too_old(tuple(sys.version_info)))  # noqa: SLF001
 
     def test_logs_tail_bad_grep_is_invalid_value(self) -> None:

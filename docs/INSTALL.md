@@ -25,7 +25,7 @@ folder can be deleted. The sections below run the same layers one at a time.
 
 ## Prerequisites
 
-- `git`, `python3` ≥ 3.14 (the version CI tests), `node` ≥ 20.11 (the
+- `git`, `python3` ≥ 3.11 (CI tests 3.11 on pull requests and 3.14 on `main`), `node` ≥ 20.11 (the
   browser bridge tests use `import.meta.dirname`)
 - for the test suite: `openssl` on `PATH`; `shellcheck` recommended
   (mandatory in CI)

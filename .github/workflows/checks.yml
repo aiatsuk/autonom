@@ -19,8 +19,9 @@ jobs:
       - name: Lint workflow files
         run: docker run --rm -v "$PWD:/repo" --workdir /repo rhysd/actionlint:latest -color
 
-  # Python 3.14 is the minimum supported version (scripts/autonom.py
-  # MIN_PYTHON), so one Linux leg covers it; it also runs the tty_guard pass.
+  # One Linux job on the minimum supported Python (MIN_PYTHON in
+  # scripts/autonom.py); it also runs the tty_guard pass. The newest Python is
+  # covered by the macOS job on main.
   checks:
     runs-on: ubuntu-latest
     timeout-minutes: 35
@@ -28,7 +29,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.14"
+          python-version: "3.11"
       - uses: actions/setup-node@v4
         with:
           # import.meta.dirname in tests/browser-bridge.test.mjs needs >= 20.11.
