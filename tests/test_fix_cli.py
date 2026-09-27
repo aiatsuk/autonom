@@ -1121,9 +1121,19 @@ class GroupRemnantTests(_Cli):
 
 FAKE_NODE = textwrap.dedent("""\
     #!{python}
-    import json, os, pathlib, sys
+    import json, os, pathlib, sys, time
     registry = pathlib.Path(os.environ["AUTONOM_HOME"]) / "processes" / "processes.json"
-    rows = json.loads(registry.read_text())["processes"] if registry.exists() else []
+    # The supervisor can only register this child's row after the spawn
+    # returns: wait for it instead of racing it on a loaded runner.
+    rows, deadline = [], time.monotonic() + 10
+    while time.monotonic() < deadline:
+        try:
+            rows = json.loads(registry.read_text())["processes"]
+        except (OSError, ValueError, KeyError):
+            rows = []
+        if {{"canvas", "canvas_child"}} <= {{row.get("kind") for row in rows}}:
+            break
+        time.sleep(0.05)
     pathlib.Path(os.environ["FAKE_NODE_OUT"]).write_text(json.dumps(
         {{"argv": sys.argv[1:], "rows": rows}}))
 """)

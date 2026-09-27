@@ -24,10 +24,17 @@ python3 -m unittest discover -s tests -v
 # The suite above may run headless, where the consent gate's interactive branch
 # is never taken. Re-run it with a stdin that claims to be a TTY and raises on
 # read, so a test that would block a developer's terminal fails here instead.
-python3 tests/tty_guard.py >/dev/null || {
-  echo "A test read the terminal; re-run 'python3 tests/tty_guard.py' for details." >&2
-  exit 1
-}
+# CI runs this second pass on one matrix leg only (AUTONOM_SKIP_TTY_GUARD=1 on
+# the others): it re-runs the whole suite, and what it guards does not depend
+# on the OS or Python version. Locally it always runs.
+if [ "${AUTONOM_SKIP_TTY_GUARD:-0}" = "1" ]; then
+  echo "tty_guard skipped (AUTONOM_SKIP_TTY_GUARD=1)"
+else
+  python3 tests/tty_guard.py >/dev/null || {
+    echo "A test read the terminal; re-run 'python3 tests/tty_guard.py' for details." >&2
+    exit 1
+  }
+fi
 
 node --test tests/*.test.mjs
 

@@ -16,10 +16,10 @@ import time
 from pathlib import Path
 from typing import Any
 
-# docs/INSTALL.md states 3.11 (CI runs 3.11 and 3.14); the library uses 3.10+
-# constructs such as dataclass(slots=True), so an older interpreter died in an
-# import traceback before any envelope could be printed. Checked before the
-# library is imported, with the same stderr shape as every other failure.
+# docs/INSTALL.md states 3.11 (CI tests 3.11 on pull requests and 3.14 on
+# main). An older interpreter must not die in an import traceback before any
+# envelope could be printed: checked before the library is imported, with the
+# same stderr shape as every other failure.
 MIN_PYTHON = (3, 11)
 
 
