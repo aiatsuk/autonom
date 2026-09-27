@@ -844,7 +844,7 @@ class IosLogWiringTests(_Cli):
         stream = Path(record["artifacts_dir"]) / "logs/stream.ndjson"
         stream.write_text(f"{self.theirs}\n{self.mine}\n", encoding="utf-8")
         code, lines = self.ios_stream("logs", "follow", "--source", "device", "--package",
-                                      BUNDLE, "--from-start", "--max-seconds", "2")
+                                      BUNDLE, "--from-start", "--max-seconds", "0.2")
         self.assertEqual(code, 0, lines)
         emitted = [line for line in lines if line.get("kind") == "line"]
         self.assertEqual([json.loads(line["text"])["eventMessage"] for line in emitted],
@@ -861,7 +861,7 @@ class IosLogWiringTests(_Cli):
         session.stop_session(reap=False)
         code, lines = self.ios_stream("logs", "follow", "--source", "device",
                                       "--session-id", record["session_id"],
-                                      "--package", BUNDLE, "--max-seconds", "2")
+                                      "--package", BUNDLE, "--max-seconds", "0.2")
         self.assertEqual(code, 0, lines)
         self.assertEqual([json.loads(line["text"])["eventMessage"]
                           for line in lines if line.get("kind") == "line"], ["mine"])

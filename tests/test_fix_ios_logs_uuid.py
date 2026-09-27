@@ -1076,7 +1076,7 @@ class CliFollowTests(_Cli):
         session.save(record)
         self.stream_file(record, [self.old_build(), self.theirs, self.mine])
         code, lines = self.cli_stream("logs", "follow", "--source", "device", "--package",
-                                      BUNDLE, "--from-start", "--max-seconds", "2")
+                                      BUNDLE, "--from-start", "--max-seconds", "0.2")
         self.assertEqual(code, 0, lines)
         self.assertEqual(self.followed(lines), ["old build", "flutter: mine"])
         self.assertEqual(self.eof(lines)["image_uuids"],
@@ -1100,7 +1100,7 @@ class CliFollowTests(_Cli):
         self.write_state(app_info={}, app_bundle="(null)", installed=[])
         code, lines = self.cli_stream("logs", "follow", "--source", "device", "--session-id",
                                       record["session_id"], "--package", BUNDLE,
-                                      "--max-seconds", "2")
+                                      "--max-seconds", "0.2")
         self.assertEqual(code, 0, lines)
         self.assertEqual(self.followed(lines), ["flutter: mine", "flutter engine", "old build"])
         self.assertEqual(self.eof(lines)["image_uuids"], sorted({APP_ARM64, NEXT_BUILD}))
@@ -1111,7 +1111,7 @@ class CliFollowTests(_Cli):
         record = self.past_session(OTHER_BUNDLE, [OTHER_APP])
         code, lines = self.cli_stream("logs", "follow", "--source", "device", "--session-id",
                                       record["session_id"], "--package", BUNDLE,
-                                      "--max-seconds", "2")
+                                      "--max-seconds", "0.2")
         self.assertEqual(code, 0, lines)
         self.assertEqual(self.followed(lines), ["flutter: mine", "flutter engine"])
         self.assertEqual(self.eof(lines)["image_uuids"], sorted({APP_X86_64, APP_ARM64}))
@@ -1136,7 +1136,7 @@ class CliSessionStreamDefaultTests(_Cli):
 
     def follow(self, *argv: str) -> list[dict]:
         code, lines = self.cli_stream("logs", "follow", *argv, "--from-start",
-                                      "--max-seconds", "2")
+                                      "--max-seconds", "0.2")
         self.assertEqual(code, 0, lines)
         return lines
 

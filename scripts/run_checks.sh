@@ -19,22 +19,11 @@ while IFS= read -r -d '' module; do
   node --check "$module"
 done < <(find plugins tests -type f -name '*.mjs' -print0)
 
-python3 -m unittest discover -s tests -v
-
-# The suite above may run headless, where the consent gate's interactive branch
-# is never taken. Re-run it with a stdin that claims to be a TTY and raises on
-# read, so a test that would block a developer's terminal fails here instead.
-# CI runs this second pass on one matrix leg only (AUTONOM_SKIP_TTY_GUARD=1 on
-# the others): it re-runs the whole suite, and what it guards does not depend
-# on the OS or Python version. Locally it always runs.
-if [ "${AUTONOM_SKIP_TTY_GUARD:-0}" = "1" ]; then
-  echo "tty_guard skipped (AUTONOM_SKIP_TTY_GUARD=1)"
-else
-  python3 tests/tty_guard.py >/dev/null || {
-    echo "A test read the terminal; re-run 'python3 tests/tty_guard.py' for details." >&2
-    exit 1
-  }
-fi
+# One module per process, in parallel, each with its own AUTONOM_HOME and a
+# stdin that claims to be a TTY and raises on read (the tty_guard contract),
+# so a test that would block a developer's terminal fails here. Set
+# AUTONOM_TEST_JOBS to change the worker count (default: twice the CPU count).
+python3 tests/run_parallel.py
 
 node --test tests/*.test.mjs
 

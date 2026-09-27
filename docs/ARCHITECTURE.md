@@ -31,8 +31,8 @@ The core design is **routing first, evidence second**.
 6. `./scripts/run_checks.sh` validates manifests, frontmatter, Python/Node syntax,
    and the unit suite. The same script runs locally and in GitHub Actions:
    `checks` on every PR and push to main (ubuntu + macOS, pinned Python and
-   Node, shellcheck required), `android-smoke` on main (a real API-30 emulator
-   driven through the CLI), and `release` on `v*` tags. "Green" means CI green.
+   Node, shellcheck required) and `release` on `v*` tags. "Green" means CI
+   green.
 
 ## Control plane
 
@@ -296,8 +296,7 @@ validator fails the build when a plugin manifest disagrees with it.
   environment without restoring it (`tests/env_isolation.py` is the sanctioned
   idiom) fails the suite instead of silently redirecting later tests to the
   operator's real `~/.autonom`.
-- **Device-backed** — the `android-smoke` workflow drives a real emulator
-  through the CLI on every push to main; deeper simulator/emulator runs remain
+- **Device-backed** — CI runs no emulator or simulator; device runs are
   manual and evidenced by before/after artifacts, never by exit codes alone.
 
 ## Flutter-first boundary (current domain pack)
