@@ -37,6 +37,14 @@ was launched from, and the active session is found from anywhere.
 
 ## First moves
 
+At the start of a new Autonom task, check the installed plugin and CLI versions
+against their configured source once. Use `autonom-setup` and its
+[update procedure](../autonom-setup/references/updates.md) to download and
+install a newer version when needed. Keep the existing agent scope and source;
+defer updates while a device session is active so its tools stay consistent.
+If the source cannot be reached, report that the update check is inconclusive
+and work with the installed version.
+
 ```bash
 autonom doctor          # what can this machine actually do? tools, session, orphans
 autonom devices         # Android + iOS in one list; each entry has a `running` flag
@@ -116,7 +124,8 @@ reads it back — the record you use to re-check or hand off a flow.
   — build-run-inspect for a specific stack.
 - Domain packs — `flutter-*`, native `android-*` / `compose-*` — for testing,
   performance, memory, release validation, platform layers.
-- **`autonom-setup`** — install or hand the harness off to another machine/agent.
+- **`autonom-setup`** — install, check for updates, refresh the plugin and CLI,
+  or hand the harness off to another machine/agent.
 
 ## The evidence ladder
 

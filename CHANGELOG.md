@@ -817,6 +817,21 @@ listed in `docs/COMPATIBILITY.md`.
   `canvas serve --token` never appears in `processes` or `doctor`; the
   supervised canvas rows carry no command line at all.
 
+## [0.30.1] - 2026-09-30
+
+### Added
+- The Autonom entry skill instructs agents to check for updates at the start
+  of a new task. The setup skill documents comparing plugin and CLI versions,
+  downloading updates
+  from the configured source, refreshing Codex and Claude Code through their
+  native commands, and verifying the installed files before a new agent session.
+
+### Changed
+- Bump the library and both plugin manifests to `0.30.1` so agent caches can
+  distinguish the updated package with the compact app-and-orbit icon.
+- Correct the setup skill's inventory to 24 skills and include update requests
+  in its discovery description and UI prompt.
+
 ## [0.30.0] - 2026-08-28
 
 Autonom now implements the end-to-end product blueprint: strict portable

@@ -1,19 +1,29 @@
 ---
 name: autonom-setup
-description: Install or hand off the Autonom harness — the CLI plus all skills — onto a new machine or into another agent. Build a single transferable bundle, copy it, install with one command, verify, and register it with Claude, Grok, or Codex. Triggers when setting up Autonom somewhere new, packaging it for handoff, or asking how to get it onto another device or agent.
+description: Install, update, or hand off the Autonom harness — the CLI plus all skills — on a machine or in an agent. Use when checking for a newer Autonom version, downloading and installing an update in Codex or Claude Code, setting up a new machine, or packaging the harness for handoff.
 ---
 
 # Autonom Setup
 
-Autonom is a plugin: 23 skills plus a dependency-free CLI they drive. This skill
-packages the whole thing into one file you can carry to another machine and
-install with one command — the skills travel with the CLI and land in whatever
-agent is there.
+Autonom is a plugin: 24 skills plus a dependency-free CLI they drive. This skill
+checks and installs updates, or packages the whole thing into one file you can
+carry to another machine and install with one command.
 
 Not a compiled binary, on purpose: the CLI is stdlib-only Python (nothing to
 compile), and the network addon must be a real file on disk because `mitmdump`
 loads it by path. So the transferable artifact is a **tarball** — one file to
 copy, one command to install.
+
+## Check and install updates
+
+Read [references/updates.md](references/updates.md) when checking freshness or
+updating an existing install. Compare the agent's installed plugin version and
+`autonom version` separately with the configured source; plugin updates do not
+install the CLI. For GitHub installs, check `aiatsuk/autonom` on `main`, refresh
+the named marketplace, then update Autonom through the agent's native plugin
+commands. Verify the installed manifest and files, and start a new agent
+session so the refreshed skills load. Keep the user's existing scope and
+source, and defer changes during an active device session.
 
 ## Build the bundle
 
