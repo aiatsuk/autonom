@@ -121,7 +121,8 @@ autonom session force-stop|uninstall <app-id>
 autonom session clear <app-id> [--strategy auto|reinstall|privacy]
 
 autonom ui tree [--dump FILE] [--all] [--max-depth N] [--max-nodes N] [--format json|outline]
-                [--interactable]
+                [--interactable] [--no-accessibility-recovery]
+autonom ui accessibility <status|enable|reset>   # Android emulator session
 autonom ui wait --settled [--timeout-ms N] [--quiet-ms N]
 autonom ui find [--text|--desc|--resource-id|--class-name|--package|--role] [--mode exact|contains|regex]
                 [--case-sensitive] [--index N] [--clickable B] [--enabled B] [--all] [--dump FILE]

@@ -24,6 +24,12 @@ python3 <autonom-root>/scripts/autonom.py ui tree
 python3 <autonom-root>/scripts/autonom.py --platform ios --target <UDID> ui tree
 python3 <autonom-root>/scripts/autonom.py ui tree --format outline --interactable   # one indented line per actionable node
 
+# Android emulator Flutter semantics recovery (with an active app session)
+python3 <autonom-root>/scripts/autonom.py ui accessibility status
+python3 <autonom-root>/scripts/autonom.py ui accessibility enable   # explicit recovery
+python3 <autonom-root>/scripts/autonom.py ui accessibility reset    # restore saved settings
+python3 <autonom-root>/scripts/autonom.py ui tree --no-accessibility-recovery  # inspection only
+
 # Wait until the screen stops changing (animations, spinners, loading lists)
 python3 <autonom-root>/scripts/autonom.py ui wait --settled --timeout-ms 5000       # settled, snapshots, changes, elapsed_ms; exit 1 if never settled
 
@@ -251,18 +257,23 @@ computed in when you report a coordinate.
   `sparse_accessibility_tree`. That means "the app exposes little", not "the screen
   is empty" — add `Semantics` (Flutter) or `.accessibilityLabel` /
   `.accessibilityIdentifier` (SwiftUI), or fall back to a screenshot.
-- On Android, a live dump made entirely of unlabelled containers also reports
-  `sparse_accessibility_tree`. Confirm that the screen actually has controls in
-  a screenshot and compare the raw `adb exec-out uiautomator dump /dev/tty` XML;
-  `--all` cannot recover labels absent from that XML. On a Flutter build that
-  initializes semantics only at process startup, an accessibility service must
-  be active **before** the app is force-stopped and relaunched, and remain active
-  while navigating and reading trees. Enabling a service after launch did not
-  recover the tree in the observed build; turning it off left an old tree that
-  did not follow navigation. A service can read screen content, so use this
-  diagnostic only on an authorized test emulator and restore its original
-  accessibility settings afterward. Check a tree against a current screenshot
-  before treating its labels as the current screen.
+- On Android, a live dump made entirely of unlabelled containers reports
+  `sparse_accessibility_tree`. `--all` cannot recover labels absent from raw
+  `adb exec-out uiautomator dump /dev/tty` XML. With an active Android session
+  whose app is foreground on an emulator, `ui tree` confirms the sparse result
+  with an unfiltered second dump. It then enables the built-in Accessibility
+  Menu, force-stops and relaunches that app, and rereads the tree. The response
+  includes `accessibility_recovery.attempted` and `.recovered`; if labels do not
+  appear after bounded retries, it restores the settings before returning. No session,
+  another foreground app, a physical device, or an offline `--dump` cannot
+  trigger automatic changes. `--no-accessibility-recovery` disables this step.
+  `ui accessibility enable` is the explicit alternative; `status` reads state.
+  Autonom saves the original secure settings before enabling the service and
+  restores them with `ui accessibility reset` or `session stop`. If settings
+  change outside Autonom, reset refuses to overwrite them and retains the
+  snapshot. An accessibility service can read screen content; use this only on
+  an authorized test emulator. Turning it off can leave an old tree that does
+  not follow navigation, so compare results with a current screenshot.
 - When no element carries an identifier, `no_accessibility_identifiers` says so, so
   a zero-match `--resource-id` query is not mistaken for a missing control.
 - System dialogs (permissions) need the same selectors or coordinates.

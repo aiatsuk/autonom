@@ -70,16 +70,20 @@ status bar, and tell me which values were verified by read-back.
 
 ## Diagnose a Flutter screen with an empty Android UI tree
 
-If `autonom ui tree --all` shows only unlabelled root containers while a
-screenshot shows buttons, compare the raw UI Automator XML. This distinguishes
-missing Android accessibility nodes from Autonom's meaningful-node filter.
-Some Flutter builds need a system accessibility service active **before the
-app process starts**. On an authorized test emulator, enable a trusted service,
-force-stop and relaunch the app, and read the tree while the service remains
-active. Restore the original accessibility settings after the run. A service
-can read screen content; enabling one after launch may not recover the tree,
-and disabling it may leave stale nodes until the next restart. Check the tree
-against a current screenshot after navigation.
+Start an Android session with `--app-id`, then run `autonom ui tree`. If the
+foreground app exposes only unlabelled containers, Autonom checks an unfiltered
+dump. On an emulator with the built-in Accessibility Menu, it saves the secure
+settings, enables the service, force-stops and relaunches that app, and rereads
+the tree. Inspect `accessibility_recovery.recovered` in the result. Confirm the
+new labels against a current screenshot: a disabled service can leave a stale
+tree that does not follow navigation. `autonom ui accessibility status` shows
+the managed state; `autonom ui accessibility reset` or `autonom session stop`
+restores the saved settings. Use `ui tree --no-accessibility-recovery` to
+inspect without changing the emulator, or `ui accessibility enable` to enable
+the service explicitly. These changes apply only to an active Android emulator
+session. A service can read screen content, so use it on an authorized test
+emulator. A raw `adb exec-out uiautomator dump /dev/tty` comparison distinguishes
+missing Android nodes from Autonom's meaningful-node filter.
 
 ## Repair a flow the app outgrew
 

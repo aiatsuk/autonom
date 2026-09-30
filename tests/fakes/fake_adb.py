@@ -356,6 +356,9 @@ def main(argv: list[str]) -> int:
             sys.stdout.write(_list_packages(words, state))
             return 0
         if words[:2] == ["am", "start"]:
+            if state.get("ui_dump_after_launch"):
+                state["ui_dump"] = state["ui_dump_after_launch"]
+                write_state(state)
             sys.stdout.write(_am_start(words, state))
             return 0
         if words[:1] == ["monkey"]:
@@ -445,7 +448,9 @@ def main(argv: list[str]) -> int:
 
     if args[:2] == ["shell", "getprop"]:
         prop = args[2] if len(args) > 2 else ""
-        default = "1" if prop == "sys.boot_completed" else ""
+        default = "1" if prop in ("sys.boot_completed", "ro.kernel.qemu") else ""
+        if prop == "ro.kernel.qemu":
+            default = state.get("is_emulator", default)
         sys.stdout.write(str((state.get("getprop") or {}).get(prop, default)) + "\n")
         return 0
 
@@ -507,6 +512,18 @@ def main(argv: list[str]) -> int:
     if args[:2] == ["shell", "pidof"]:
         package = args[-1]
         sys.stdout.write((state.get("pidof", {}).get(package, "")) + "\n")
+        return 0
+
+    if args[:3] == ["shell", "pm", "query-services"]:
+        if state.get("accessibility_menu_available", True):
+            sys.stdout.write("packageName=com.android.systemui.accessibility.accessibilitymenu\n"
+                             "name=com.android.systemui.accessibility.accessibilitymenu."
+                             "AccessibilityMenuService\n")
+        return 0
+
+    if args[:4] == ["shell", "dumpsys", "activity", "activities"]:
+        app = state.get("foreground_app", "com.example.app")
+        sys.stdout.write(f"topResumedActivity=ActivityRecord{{abcd u0 {app}/.MainActivity}}\n")
         return 0
 
     if args[:2] == ["shell", "settings"] and len(args) > 4 and args[3] in (

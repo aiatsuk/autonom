@@ -456,6 +456,16 @@ class SessionVerbTests(CliCase):
 
 
 class UiTreeTests(CliCase):
+    def sparse_dump(self) -> Path:
+        sparse = self.root / "sparse.xml"
+        sparse.write_text(
+            '<hierarchy rotation="0"><node class="android.widget.FrameLayout" '
+            'package="com.example.app" resource-id="android:id/content" '
+            'bounds="[0,0][1080,2400]"><node class="android.view.View" '
+            'package="com.example.app" bounds="[0,0][1080,2400]"/>'
+            '</node></hierarchy>', encoding="utf-8")
+        return sparse
+
     def dump_count(self) -> int:
         completed = self.raw("ui", "tree", "--dump", str(UI_DUMP), "--max-nodes", "1000")
         return self.parse(completed)["count"]
@@ -495,16 +505,12 @@ class UiTreeTests(CliCase):
         self.assertTrue(all(ui_mod.is_interactable(node) for node in only["nodes"]))
 
     def test_sparse_live_android_tree_explains_missing_flutter_labels(self) -> None:
-        sparse = self.root / "sparse.xml"
-        sparse.write_text(
-            '<hierarchy rotation="0"><node class="android.widget.FrameLayout" '
-            'package="com.example.app" resource-id="android:id/content" '
-            'bounds="[0,0][1080,2400]"/></hierarchy>', encoding="utf-8")
+        sparse = self.sparse_dump()
         self.write_state(ui_dump=str(sparse))
 
         code, payload = self.android("ui", "tree")
         self.assertEqual(code, 0, payload)
-        self.assertEqual(payload["count"], 1)
+        self.assertLessEqual(payload["count"], 2)
         self.assertEqual(payload["warnings"][0]["code"], "sparse_accessibility_tree")
         self.assertIn("before it starts", payload["warnings"][0]["hint"])
         # An offline fixture is parsed, not diagnosed as a running screen.
@@ -515,6 +521,99 @@ class UiTreeTests(CliCase):
         code, payload = self.android("ui", "tree")
         self.assertEqual(code, 0, payload)
         self.assertNotIn("warnings", payload)
+
+    def test_sparse_tree_recovers_and_session_stop_restores_settings(self) -> None:
+        self.start_android()
+        self.write_state(ui_dump=str(self.sparse_dump()),
+                         ui_dump_after_launch=str(UI_DUMP),
+                         settings_secure={"accessibility_enabled": "0"})
+        code, payload = self.android("ui", "tree")
+        self.assertEqual(code, 0, payload)
+        self.assertTrue(payload["accessibility_recovery"]["recovered"])
+        self.assertGreater(payload["count"], 1)
+        self.assertNotIn("warnings", payload)
+        state = json.loads(self.state.read_text())
+        self.assertEqual(state["settings_secure"]["accessibility_enabled"], "1")
+        self.assertIn("AccessibilityMenuService",
+                      state["settings_secure"]["enabled_accessibility_services"])
+        commands = [row[2:] for row in self.calls("adb") if row[:2] == ["-s", SERIAL]]
+        self.assertIn(["shell", "am", "force-stop", "com.example.app"], commands)
+        self.assertEqual(self.android("session", "stop")[0], 0)
+        state = json.loads(self.state.read_text())
+        self.assertEqual(state["settings_secure"], {"accessibility_enabled": "0"})
+
+    def test_no_auto_recovery_without_session_or_on_wrong_app(self) -> None:
+        sparse = self.sparse_dump()
+        self.write_state(ui_dump=str(sparse))
+        self.android("ui", "tree")
+        self.assertFalse(any("settings" in row for row in self.calls("adb")))
+        self.start_android()
+        self.write_state(ui_dump=str(sparse), foreground_app="com.other.app")
+        code, payload = self.android("ui", "tree")
+        self.assertEqual(code, 0, payload)
+        self.assertNotIn("accessibility_recovery", payload)
+        self.assertFalse(any("settings" in row for row in self.calls("adb")))
+
+    def test_manual_accessibility_enable_reset_and_no_auto_flag(self) -> None:
+        self.start_android()
+        self.write_state(ui_dump=str(self.sparse_dump()),
+                         settings_secure={"accessibility_enabled": "0"})
+        code, payload = self.android("ui", "tree", "--no-accessibility-recovery")
+        self.assertEqual(code, 0, payload)
+        self.assertNotIn("accessibility_recovery", payload)
+        code, payload = self.android("ui", "accessibility", "enable")
+        self.assertEqual(code, 0, payload)
+        self.assertTrue(payload["enabled_by_autonom"])
+        code, payload = self.android("ui", "accessibility", "reset")
+        self.assertEqual(code, 0, payload)
+        self.assertTrue(payload["restored"])
+
+    def test_accessibility_recovery_refuses_physical_device(self) -> None:
+        self.start_android()
+        self.write_state(ui_dump=str(self.sparse_dump()), is_emulator="0")
+        code, payload = self.android("ui", "tree")
+        self.assertEqual(code, 0, payload)
+        self.assertEqual(payload["warnings"][-1]["code"],
+                         "accessibility_recovery_failed")
+        state = json.loads(self.state.read_text())
+        self.assertNotIn("settings_secure", state)
+
+    def test_unrecovered_tree_restores_settings_before_return(self) -> None:
+        self.start_android()
+        self.write_state(ui_dump=str(self.sparse_dump()),
+                         settings_secure={"accessibility_enabled": "0"})
+        code, payload = self.android("ui", "tree")
+        self.assertEqual(code, 0, payload)
+        self.assertFalse(payload["accessibility_recovery"]["recovered"])
+        self.assertTrue(payload["accessibility_recovery"]["settings_restored"])
+        self.assertEqual(json.loads(self.state.read_text())["settings_secure"],
+                         {"accessibility_enabled": "0"})
+        self.assertNotIn("accessibility", session_mod.load_current())
+
+    def test_reset_preserves_external_accessibility_change(self) -> None:
+        self.start_android()
+        self.write_state(settings_secure={"accessibility_enabled": "0"})
+        self.assertEqual(self.android("ui", "accessibility", "enable")[0], 0)
+        state = json.loads(self.state.read_text())
+        state["settings_secure"]["enabled_accessibility_services"] += ":other/service"
+        self.state.write_text(json.dumps(state), encoding="utf-8")
+        code, payload = self.android("ui", "accessibility", "reset")
+        self.assertEqual(code, 2)
+        self.assertEqual(payload["error_code"], "backend_failed")
+        self.assertIn("accessibility", session_mod.load_current())
+        self.assertEqual(self.android("session", "stop")[0], 2)
+
+    def test_enable_rolls_back_when_second_setting_fails(self) -> None:
+        self.start_android()
+        self.write_state(settings_secure={"accessibility_enabled": "0"}, fail={
+            "-s emulator-5554 shell settings put secure accessibility_enabled 1":
+                [1, "write refused"]})
+        code, payload = self.android("ui", "accessibility", "enable")
+        self.assertEqual(code, 2)
+        self.assertEqual(payload["error_code"], "backend_failed")
+        self.assertEqual(json.loads(self.state.read_text())["settings_secure"],
+                         {"accessibility_enabled": "0"})
+        self.assertNotIn("accessibility", session_mod.load_current())
 
 
 class UiSelectTests(CliCase):
