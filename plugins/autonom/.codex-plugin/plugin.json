@@ -51,12 +51,12 @@
     ],
     "websiteURL": "https://github.com/aiatsuk/autonom",
     "supportURL": "https://github.com/aiatsuk/autonom/issues",
-    "privacyPolicyURL": "https://github.com/aiatsuk/autonom/blob/codex/autonom-privacy-policy/PRIVACY.md",
+    "privacyPolicyURL": "https://github.com/aiatsuk/autonom/blob/main/PRIVACY.md",
     "defaultPrompt": [
       "Use Autonom to test, debug, profile, or validate this application with evidence-backed findings."
     ],
     "brandColor": "#00C2A8",
-    "composerIcon": "./assets/autonom-small.svg",
+    "composerIcon": "./assets/autonom.png",
     "logo": "./assets/autonom.png",
     "screenshots": []
   }
