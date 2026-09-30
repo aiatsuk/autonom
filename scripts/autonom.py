@@ -841,6 +841,18 @@ def cmd_ui_tree(args: argparse.Namespace) -> int:
         )
         source, label = "device", target.target_id
         identity = target.identity()
+        if (target.platform == ANDROID and not truncated and len(nodes) <= 8
+                and not any(node.get("text") or node.get("desc")
+                            or node.get("clickable") for node in nodes)):
+            warnings.append({
+                "code": "sparse_accessibility_tree",
+                "error": "Android exposed only unlabelled containers on this screen",
+                "hint": "If the screenshot shows Flutter controls, the app may need an "
+                        "accessibility service enabled before it starts. Enable a "
+                        "service on the test emulator, force-stop and relaunch the app, "
+                        "then read the tree again. Restore the emulator's original "
+                        "accessibility settings when testing is done.",
+            })
     if getattr(args, "interactable", False):
         nodes = ui_mod.interactable(nodes)
 

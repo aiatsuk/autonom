@@ -251,6 +251,18 @@ computed in when you report a coordinate.
   `sparse_accessibility_tree`. That means "the app exposes little", not "the screen
   is empty" — add `Semantics` (Flutter) or `.accessibilityLabel` /
   `.accessibilityIdentifier` (SwiftUI), or fall back to a screenshot.
+- On Android, a live dump made entirely of unlabelled containers also reports
+  `sparse_accessibility_tree`. Confirm that the screen actually has controls in
+  a screenshot and compare the raw `adb exec-out uiautomator dump /dev/tty` XML;
+  `--all` cannot recover labels absent from that XML. On a Flutter build that
+  initializes semantics only at process startup, an accessibility service must
+  be active **before** the app is force-stopped and relaunched, and remain active
+  while navigating and reading trees. Enabling a service after launch did not
+  recover the tree in the observed build; turning it off left an old tree that
+  did not follow navigation. A service can read screen content, so use this
+  diagnostic only on an authorized test emulator and restore its original
+  accessibility settings afterward. Check a tree against a current screenshot
+  before treating its labels as the current screen.
 - When no element carries an identifier, `no_accessibility_identifiers` says so, so
   a zero-match `--resource-id` query is not mistaken for a missing control.
 - System dialogs (permissions) need the same selectors or coordinates.

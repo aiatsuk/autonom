@@ -68,6 +68,19 @@ once it reports settled: true. Afterwards reset animations and clear the
 status bar, and tell me which values were verified by read-back.
 ```
 
+## Diagnose a Flutter screen with an empty Android UI tree
+
+If `autonom ui tree --all` shows only unlabelled root containers while a
+screenshot shows buttons, compare the raw UI Automator XML. This distinguishes
+missing Android accessibility nodes from Autonom's meaningful-node filter.
+Some Flutter builds need a system accessibility service active **before the
+app process starts**. On an authorized test emulator, enable a trusted service,
+force-stop and relaunch the app, and read the tree while the service remains
+active. Restore the original accessibility settings after the run. A service
+can read screen content; enabling one after launch may not recover the tree,
+and disabling it may leave stale nodes until the next restart. Check the tree
+against a current screenshot after navigation.
+
 ## Repair a flow the app outgrew
 
 ```text

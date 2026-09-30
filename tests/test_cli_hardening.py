@@ -494,6 +494,28 @@ class UiTreeTests(CliCase):
         self.assertTrue(only["nodes"])
         self.assertTrue(all(ui_mod.is_interactable(node) for node in only["nodes"]))
 
+    def test_sparse_live_android_tree_explains_missing_flutter_labels(self) -> None:
+        sparse = self.root / "sparse.xml"
+        sparse.write_text(
+            '<hierarchy rotation="0"><node class="android.widget.FrameLayout" '
+            'package="com.example.app" resource-id="android:id/content" '
+            'bounds="[0,0][1080,2400]"/></hierarchy>', encoding="utf-8")
+        self.write_state(ui_dump=str(sparse))
+
+        code, payload = self.android("ui", "tree")
+        self.assertEqual(code, 0, payload)
+        self.assertEqual(payload["count"], 1)
+        self.assertEqual(payload["warnings"][0]["code"], "sparse_accessibility_tree")
+        self.assertIn("before it starts", payload["warnings"][0]["hint"])
+        # An offline fixture is parsed, not diagnosed as a running screen.
+        offline = self.parse(self.raw("ui", "tree", "--dump", str(sparse)))
+        self.assertNotIn("warnings", offline)
+
+    def test_labeled_live_android_tree_has_no_sparse_warning(self) -> None:
+        code, payload = self.android("ui", "tree")
+        self.assertEqual(code, 0, payload)
+        self.assertNotIn("warnings", payload)
+
 
 class UiSelectTests(CliCase):
     def test_find_without_selector_is_selector_required(self) -> None:
