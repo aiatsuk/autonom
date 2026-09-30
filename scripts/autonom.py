@@ -49,6 +49,7 @@ if str(ROOT) not in sys.path:
 
 from autonom_lib import __version__  # noqa: E402
 from autonom_lib import actions as actions_mod  # noqa: E402
+from autonom_lib import accessibility as accessibility_mod  # noqa: E402
 from autonom_lib import adb as adb_mod  # noqa: E402
 from autonom_lib import consent as consent_mod  # noqa: E402
 from autonom_lib import device_state  # noqa: E402
@@ -485,6 +486,12 @@ def cmd_session_stop(args: argparse.Namespace) -> int:
             "Start one with 'autonom session start'.",
         )
 
+    # Keep the session pointer and its saved snapshot if device-side restore
+    # fails: a later `ui accessibility reset` can still finish the cleanup.
+    accessibility_teardown = None
+    if record.get("accessibility"):
+        accessibility_teardown = accessibility_mod.restore(_target(args), record)
+
     background = record.get("background") or {}
     # A session whose emulator was killed or simulator deleted must still be
     # clearable, or every later `session start` is refused for good.
@@ -535,6 +542,9 @@ def cmd_session_stop(args: argparse.Namespace) -> int:
         ("session_processes", lambda: session_mod.reap_owned_processes(record)),
     ]
     teardown = session_mod.run_teardown(actions)
+    if accessibility_teardown is not None:
+        teardown.insert(0, {"action": "accessibility_restore", "ok": True,
+                            "detail": accessibility_teardown})
     reaped: dict[str, Any] = next(
         (item.get("detail") or {} for item in teardown
          if item["action"] == "session_processes" and item.get("ok")), {})
@@ -802,6 +812,7 @@ def _snapshot(args: argparse.Namespace) -> tuple[list[dict[str, Any]], str, str,
 def cmd_ui_tree(args: argparse.Namespace) -> int:
     dump = getattr(args, "dump", None)
     warnings: list[dict[str, Any]] = []
+    recovery: dict[str, Any] | None = None
     if args.max_nodes is not None and args.max_nodes < 1:
         raise errors.AutonomError(
             errors.INVALID_VALUE, f"--max-nodes must be >= 1, got {args.max_nodes}",
@@ -841,6 +852,65 @@ def cmd_ui_tree(args: argparse.Namespace) -> int:
         )
         source, label = "device", target.target_id
         identity = target.identity()
+        if target.platform == ANDROID and not truncated and accessibility_mod.sparse(nodes):
+            warnings.append({
+                "code": "sparse_accessibility_tree",
+                "error": "Android exposed only unlabelled containers on this screen",
+                "hint": "If the screenshot shows Flutter controls, the app may need an "
+                        "accessibility service enabled before it starts. Enable a "
+                        "service on the test emulator, force-stop and relaunch the app, "
+                        "then read the tree again. Restore the emulator's original "
+                        "accessibility settings when testing is done.",
+            })
+            current = session_mod.load_current()
+            if (not getattr(args, "no_accessibility_recovery", False)
+                    and args.max_depth is None and (args.max_nodes is None or args.max_nodes >= 8)
+                    and accessibility_mod.eligible(target, current, nodes)
+                    and not current.get("accessibility")):
+                try:
+                    # A depth/filter limit can hide labels. Confirm against an
+                    # unfiltered second dump before touching device settings.
+                    whole = ui_mod.snapshot(target)
+                    if accessibility_mod.eligible(target, current, whole) and \
+                            accessibility_mod.flutter_shell(whole) and \
+                            accessibility_mod.foreground_app(target) == current["app_id"]:
+                        accessibility_mod.enable(target, current)
+                        session_mod.force_stop(target.tool, target.target_id,
+                                               current["app_id"])
+                        launch = session_mod.launch_app(target.tool, target.target_id,
+                                                        current["app_id"])
+                        for attempt in range(3):
+                            nodes, new_warnings, truncated = ui_mod.tree_clipped(
+                                target, meaningful_only=not args.all, max_depth=args.max_depth,
+                                max_nodes=args.max_nodes)
+                            if not accessibility_mod.sparse(nodes):
+                                break
+                            if attempt < 2:
+                                time.sleep(0.6)
+                        warnings.extend(new_warnings)
+                        warnings = [item for item in warnings
+                                    if item.get("code") != "sparse_accessibility_tree"]
+                        if accessibility_mod.sparse(nodes):
+                            accessibility_mod.restore(target, current)
+                            warnings.append({"code": "sparse_accessibility_tree",
+                                             "error": "tree remains sparse after accessibility recovery",
+                                             "hint": "Original accessibility settings were restored. "
+                                                     "Check the current screenshot and app semantics."})
+                        recovery = {"attempted": True,
+                                    "recovered": not accessibility_mod.sparse(nodes),
+                                    "settings_restored": accessibility_mod.sparse(nodes),
+                                    "service": accessibility_mod.SERVICE,
+                                    "launch": launch}
+                except errors.AutonomError as exc:
+                    if current.get("accessibility"):
+                        try:
+                            accessibility_mod.restore(target, current)
+                        except errors.AutonomError:
+                            pass  # snapshot stays in the session for explicit reset
+                    warnings.append({"code": "accessibility_recovery_failed",
+                                     "error": exc.message,
+                                     "hint": "Inspect the emulator and run "
+                                             "'autonom ui accessibility reset' if enabled."})
     if getattr(args, "interactable", False):
         nodes = ui_mod.interactable(nodes)
 
@@ -873,6 +943,8 @@ def cmd_ui_tree(args: argparse.Namespace) -> int:
             payload["screen"] = list(size)
     if warnings:
         payload["warnings"] = warnings
+    if recovery is not None:
+        payload["accessibility_recovery"] = recovery
     current = session_mod.load_current()
     if current and not dump:
         blob = json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
@@ -894,6 +966,21 @@ def cmd_ui_tree(args: argparse.Namespace) -> int:
         payload["outline"] = ui_mod.outline(nodes)
         payload.pop("nodes", None)
     return emit(payload, as_json=True)
+
+
+def cmd_ui_accessibility(args: argparse.Namespace) -> int:
+    target = _target(args)
+    record = session_mod.load_current()
+    if args.action == "status":
+        detail = accessibility_mod.status(target, record)
+    elif not record:
+        raise errors.AutonomError(errors.NO_ACTIVE_SESSION,
+                                  "an active session is required")
+    elif args.action == "enable":
+        detail = accessibility_mod.enable(target, record)
+    else:
+        detail = accessibility_mod.restore(target, record)
+    return emit({"ok": True, **detail, **target.identity()}, as_json=True)
 
 
 def cmd_ui_wait(args: argparse.Namespace) -> int:
@@ -4285,7 +4372,14 @@ def build_parser() -> argparse.ArgumentParser:
                    help="outline: one indented line per node instead of the nodes array")
     p.add_argument("--interactable", action="store_true",
                    help="only nodes an agent can act on (buttons, fields, switches, ...)")
+    p.add_argument("--no-accessibility-recovery", action="store_true",
+                   help="inspect a sparse Android tree without enabling Accessibility Menu")
     p.set_defaults(func=cmd_ui_tree)
+
+    p = ui_sub.add_parser("accessibility", help="inspect or manage Android emulator "
+                          "accessibility recovery", parents=[target_flags])
+    p.add_argument("action", choices=("status", "enable", "reset"))
+    p.set_defaults(func=cmd_ui_accessibility)
 
     p = ui_sub.add_parser("find", help="find nodes by selector", parents=[target_flags])
     p.add_argument("--dump", help="parse an offline UI dump")
