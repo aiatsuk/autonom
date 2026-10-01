@@ -43,7 +43,7 @@ python3 <autonom-root>/scripts/autonom.py flow run login.yaml --dry-run    # pre
 python3 <autonom-root>/scripts/autonom.py teach approve login.yaml --run --minimum-runs 3 --secret TEST_PASSWORD --env LOCALE=en_US
 ```
 
-`flow check` catches what used to fail only on the device: negative
+`flow check` catches, without a device: negative
 `timeoutMs`/`delayMs`/`durationMs`/`maxSwipes`/`chars`, a latitude or
 longitude out of range, an empty selector string, and a `match: regex`
 pattern that does not compile (`timeoutMs: 0` is legal: one check). An
@@ -129,9 +129,8 @@ tags: [smoke, auth]
    evidence first; the app state, not the harness, is what changed.
    `launchApp` starts the app fresh (cleared task; `resume: true` to
    continue where it was), and `inputText` polls for a focused field before
-   typing (`timeoutMs`), so the two first-step failures seen on real devices
-   — a resumed subscreen and typing before the field existed — no longer
-   need hand-written waits.
+   typing (`timeoutMs`), so a flow needs no hand-written waits for a resumed
+   subscreen or a field that is not there yet.
 4. Keep subflows atomic (login, dismiss-permissions) and let `runFlow`
    compose them; recursion and paths escaping the workspace are refused.
 5. Approvals are bound to content. `teach approve` counts only replays whose

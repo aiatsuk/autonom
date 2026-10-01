@@ -103,9 +103,8 @@ and so does any node entirely outside the app's frame, live or from `--dump`.
   that is unique on Android is not ambiguous on iOS because of an off-screen
   copy. Only when no match is on screen is every match counted.
 - `ui tap` on a node that was never laid out on screen refuses with
-  `element_offscreen` (with `ref`, `bounds`, `match_count`) and taps nothing —
-  it used to tap the screen's origin and report success. Swipe it into view,
-  then select it again.
+  `element_offscreen` (with `ref`, `bounds`, `match_count`) and taps nothing.
+  Swipe it into view, then select it again.
 - `ui find --all` lists on-screen matches first, then off-screen ones. Every
   match `ui find` reports, with or without `--all`, carries `index` — the
   `--index` that selects it (`null` for an off-screen match no index reaches
@@ -213,8 +212,8 @@ iOS has no host-level animation switch (`unsupported_capability`).
 Every `simulator` control answers `verified: true` only after reading the
 state back; otherwise `verified: false` with the reason in `verification`.
 
-`ui type` on iOS is at the mercy of autocorrect: a non-English keyboard
-rewrote "Sync conflicts when editing offline" into something else mid-flow.
+`ui type` on iOS is at the mercy of autocorrect: a non-English keyboard can
+rewrite typed text mid-flow.
 Pin the keyboard and locale on the **shut-down** simulator before typed text
 must be exact (`reboot=true` lets the verb cycle a booted one):
 

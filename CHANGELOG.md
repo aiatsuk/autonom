@@ -817,6 +817,17 @@ listed in `docs/COMPATIBILITY.md`.
   `canvas serve --token` never appears in `processes` or `doctor`; the
   supervised canvas rows carry no command line at all.
 
+## [0.30.2] - 2026-10-01
+
+### Changed
+- Bump the library and both plugin manifests to `0.30.2`.
+- Tighten the wording of the `autonom`, `mobile-flow`, `mobile-screen`, and
+  `mobile-session` skills: the evidence ladder asks agents to climb as far as
+  the claim needs and name the rung reached, and notes about past behaviour
+  ("used to", "no longer", "existing workflows are unchanged") now state the
+  current behaviour only. The Android `session launch` note also says when
+  `monkey` is still used.
+
 ## [0.30.1] - 2026-09-30
 
 ### Added
