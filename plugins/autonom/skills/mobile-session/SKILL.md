@@ -11,8 +11,8 @@ Give the agent a **single explicit target** and an artifact directory before UI,
 log, or network work. Prefer this skill over ad-hoc `adb` or `simctl` when testing
 or debugging.
 
-One verb set covers both platforms. `--serial` remains a permanent Android alias
-of `--target`, so existing Android workflows are unchanged.
+One verb set covers both platforms. `--serial` is an Android alias of
+`--target`.
 
 ## CLI entrypoint
 
@@ -82,8 +82,9 @@ automatically and the response reports `"booted": true` when this call did it.
 The response also says what `--install` and `--launch` did: `installed`
 (true/false) and `launched` (`null`, or the app id with the iOS `pid` / the
 Android `am start -W` report: `mode`, `component`, `launch`). An Android
-`session launch` (resume) is the launcher icon's own `am start -W` intent,
-not `monkey`, so it no longer resets a pinned orientation.
+`session launch` (resume) is the launcher icon's own `am start -W` intent, so
+it keeps a pinned orientation; `monkey` is used only when no launcher activity
+resolves.
 
 `session start` refuses with `session_already_active` (naming the live
 session's id and target) while a session is current — run `session stop`

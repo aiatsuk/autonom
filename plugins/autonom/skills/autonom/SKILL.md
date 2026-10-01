@@ -129,7 +129,8 @@ reads it back — the record you use to re-check or hand off a flow.
 
 ## The evidence ladder
 
-Climb it; do not skip:
+Each rung is stronger evidence than the one before it. Climb as far as the
+claim needs, and say which rung the evidence reached:
 
 ```
 code → unit/widget test → integration on an explicit target →
