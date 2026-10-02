@@ -27,6 +27,12 @@ Android emulator and iOS simulator: off-screen nodes, iOS logs of a Flutter
 with a regression test against the fakes. The non-additive changes are
 listed in `docs/COMPATIBILITY.md`.
 
+Then the Mobile Canvas scrcpy transport: on Android the Canvas streams the
+device's own H.264 from scrcpy-server 4.1 into a WebCodecs page and sends
+touch, wheel, keys, text and the clipboard to the device as they happen,
+without ffmpeg and without an npm dependency. Its compatibility notes are in
+`docs/COMPATIBILITY.md` too.
+
 ### Added
 - **Transparent Android network capture, no app change** — the fix for
   live WoolBox (a Flutter/Dio app) capturing zero requests: `dart:io` ignores
@@ -335,6 +341,61 @@ listed in `docs/COMPATIBILITY.md`.
 - `metrics snapshot` on Android adds `cpu_sampling` (how the CPU figure was
   obtained) and a `cpu_stale` warning; `metrics frames capture` warns
   `no_frames` at the top level for a window of zero HWUI frames.
+- **Mobile Canvas scrcpy transport (Android)** — `canvas serve --transport
+  scrcpy`, and `auto` whenever a scrcpy-server 4.1 is found, runs one
+  scrcpy-server per Canvas through an `adb forward` and forwards its H.264
+  packets byte for byte over the authenticated `/ws/video` WebSocket: no
+  ffmpeg, no transcoding. The page decodes them with WebCodecs (codec string
+  from the SPS, low-latency mode, newest frame only) and falls back to the
+  multipart picture, with its reason, when the browser cannot. A late joiner
+  starts at the last key frame; a client more than 4 MiB behind skips to the
+  next one while the others keep streaming. `/ws/control` carries real-time
+  touch (down, move, up and cancel, held fingers, up to 10 pointers,
+  Ctrl/Alt-drag pinch), wheel and trackpad scroll on both axes, key down/up
+  with Android meta state, Unicode text, paste, a device clipboard fetch, and
+  Back, Home, App switch, Power, Volume, Wake, Notifications, Quick settings,
+  Collapse and Rotate. Input after a paste through the device clipboard waits
+  for the device's acknowledgement (at most 1 s) and 200 ms more, so a burst
+  of text and pastes lands in the order it was sent. Keys of non-US layouts, of the AltGr and
+  macOS Option layers and after a dead key type their own characters (input
+  methods beyond dead keys are not covered). Rotation keeps input mapped; a
+  device server that dies is restarted (1 s doubling to 10 s) while pages stay
+  connected, and pages reconnect by themselves. A finger or key left down by a
+  rotation or by a server that died is lifted, so none stays pressed on
+  Android. The server starts with the first WebSocket client and stops 15 s
+  after the last one leaves; stopping the Canvas ends it and removes the
+  `adb forward`. `/status` gains `fallback_reason` and a `scrcpy` block
+  (version, source, session state, size, packets, bytes, key frames,
+  restarts, client counts, `journal_pending`, `journal_dropped`), and
+  `window.autonomCanvas` exposes the page's counters and a `send()` for
+  agents that drive the page. The WebSocket server and the scrcpy wire format
+  are written by hand; the encoders are tested against scrcpy's own
+  serialization test bytes.
+- **scrcpy-server discovery** — `--scrcpy-server PATH` (with
+  `--scrcpy-version` when the file name does not say), then
+  `AUTONOM_SCRCPY_SERVER`, `SCRCPY_SERVER_PATH`, then the server an installed
+  `scrcpy` ships beside itself. The first source that is set decides, and a
+  broken one is reported rather than skipped. Only 4.1 is used, and Autonom
+  never downloads a server. `canvas serve` gains `--scrcpy-server`,
+  `--scrcpy-version`, `--max-size` and `--bit-rate`; `--transport scrcpy`
+  without a usable server fails naming `canvas.scrcpy` and `brew install
+  scrcpy`. `doctor` reports `optional_tools.scrcpy` (never part of
+  `--strict`) and lists the two variables among its overrides;
+  `scripts/bootstrap.sh` reports scrcpy as an optional tool and installs it
+  with `--install --with-scrcpy`.
+- **Journal for streamed input** — the Canvas bridge gains a `record`
+  operation that journals an action the Canvas already performed and never
+  actuates. The scrcpy path writes exactly one entry per completed gesture,
+  wheel burst, key press, text entry, paste, system button and handoff change
+  (`ui gesture|scroll|key|text|paste|system|control`, with its origin and
+  `transport: scrcpy`), rebuilt from an allowlist so clipboard and sensitive
+  text never reach it. Pointers and keys the Canvas lifts on a pause, a
+  takeover, a disconnect or a server restart are journaled like released
+  ones.
+- `tests/live/canvas_scrcpy_live.mjs`, a live acceptance and benchmark run
+  against one explicit `--serial` (cases `picture`, `bench`, `tabs`,
+  `restart`, `input`, `journal`, one JSON report each in `--evidence-dir`),
+  in its own temporary `AUTONOM_HOME` and never run by the gate.
 
 ### Changed
 - `run_checks.sh` runs the unit suite through `tests/run_parallel.py`: one
@@ -507,6 +568,17 @@ listed in `docs/COMPATIBILITY.md`.
   fragment reaches `--max-lines` (was `stream_ended`).
 - Registry rows drop detail keys whose value is null and store a `command`
   redacted.
+- `canvas serve --transport auto` on Android prefers scrcpy, then
+  `screenrecord` + ffmpeg, then `screencap`, and names the reason for a
+  fallback at startup and in `/status`. `--fps` is passed on only when given:
+  the multipart default stays 15, and scrcpy streams at up to 60 fps unless
+  capped.
+- All multipart pages of one Canvas (screenrecord + ffmpeg, screencap, iOS
+  screenshots) share one capture loop instead of each starting its own, and
+  a page more than 2 MiB behind skips frames instead of buffering them.
+- A reloaded Canvas page resumes its session from its cookie, through a
+  same-origin fetch only.
+- `scripts/bootstrap.sh` refuses an argument it does not know (exit 2).
 
 ### Removed
 - The `android-smoke` workflow and `scripts/ci/android_smoke.sh`. It booted
@@ -767,6 +839,16 @@ listed in `docs/COMPATIBILITY.md`.
 - The fake emulator and fake adb write their state atomically and read it
   patiently, and the endless iOS log-stream test waits on progress instead
   of a timer — the two CI flakes of the hardening pass.
+- The Canvas detected device H.264 by looking for `--output-format` in
+  `screenrecord --help`, which Android 16 (API 36) no longer lists although
+  `--output-format=h264` still works, so those targets fell back to
+  screenshots. It now runs `screenrecord --output-format=h264 --time-limit 1`
+  for at most 5 s and looks for an H.264 SPS.
+- The Canvas bridge journaled into the current session whatever its target,
+  so a Canvas on one device wrote its actions into the journal of a session
+  on another. It now journals only when the current session is on the
+  Canvas target (same `target_id`, and same platform); otherwise the action
+  still runs and nothing is journaled.
 
 ### Security
 - A live status-bar pin (and the animation/status-bar snapshot `clear` and
@@ -816,6 +898,27 @@ listed in `docs/COMPATIBILITY.md`.
   name looks secret, and URL userinfo (`scheme://<redacted>@host`). A
   `canvas serve --token` never appears in `processes` or `doctor`; the
   supervised canvas rows carry no command line at all.
+- Every Canvas request and WebSocket upgrade must carry `Host:
+  127.0.0.1:<port>` or `localhost:<port>` (DNS-rebinding guard). A WebSocket
+  upgrade needs the session cookie plus its CSRF value in the `csrf` query
+  and the Canvas `Origin`, or the access token; a foreign `Origin` is refused
+  whatever it carries, because browsers apply no CORS to WebSockets. The
+  page cannot be framed (`frame-ancestors 'none'`, `X-Frame-Options: DENY`,
+  framed loads refused), since another local port is the same site and
+  shares the cookie.
+- Control messages are validated strictly (finite numbers, ranges, enums, an
+  Android keycode allowlist, at most 64 KiB), and an invalid one is answered
+  without touching the device. Canvas memory stays bounded whatever a client
+  sends: reading pauses while the device, the connection's replies or the
+  journal are behind, a connection that keeps sending past 1 MiB of held
+  input is closed with 1013, and a full journal queue drops and counts
+  records (`journal_dropped`). A client that already holds the token or the
+  cookie can still slow input or delay journaling; that is accepted, as it
+  can drive the device anyway.
+- On the scrcpy transport, Unicode text (anything outside printable ASCII)
+  and every paste go through the device clipboard and replace its content.
+  Clipboard text is never logged or journaled, and the HTTP `/text` endpoint
+  keeps its ASCII-only rule.
 
 ## [0.30.2] - 2026-10-01
 

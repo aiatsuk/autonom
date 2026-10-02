@@ -3,12 +3,17 @@ import test from "node:test";
 
 import {
   DEFAULT_FPS,
+  STREAM_KEYCODES,
   encodeAdbText,
   extractJpegFrames,
   generateToken,
+  isAllowedHost,
+  isCanvasOrigin,
   isSafeKeyCode,
   normalizeCoordinate,
   parseArgs,
+  parseControlMessage,
+  parseCookies,
   parseWmSize,
 } from "../plugins/autonom/skills/android-emulator-browser/scripts/browser-lib.mjs";
 
@@ -40,7 +45,22 @@ test("parseArgs rejects unsafe ranges and unknown modes", () => {
   assert.throws(() => parseArgs(["--fps", "0"]), /between 1 and 60/);
   assert.equal(parseArgs(["--port", "0"]).port, 0);
   assert.throws(() => parseArgs(["--port", "70000"]), /0 to 65535/);
-  assert.throws(() => parseArgs(["--transport", "magic"]), /auto, screenrecord, or screencap/);
+  assert.throws(() => parseArgs(["--transport", "magic"]), /auto, scrcpy, screenrecord, or screencap/);
+});
+
+test("parseArgs accepts the scrcpy transport and its server options", () => {
+  const values = parseArgs([
+    "--transport", "scrcpy",
+    "--scrcpy-server", "/tmp/scrcpy-server",
+    "--scrcpy-version", "4.1",
+  ]);
+  assert.equal(values.transport, "scrcpy");
+  assert.equal(values.scrcpyServer, "/tmp/scrcpy-server");
+  assert.equal(values.scrcpyVersion, "4.1");
+  assert.equal(values.fpsExplicit, undefined);
+  assert.equal(parseArgs(["--fps", "15"]).fpsExplicit, true);
+  assert.throws(() => parseArgs(["--scrcpy-version", "4.1"]), /--scrcpy-server/);
+  assert.throws(() => parseArgs(["--scrcpy-server", "x", "--scrcpy-version", "four"]), /look like 4\.1/);
 });
 
 test("tokens, keycodes, and conservative text encoding", () => {
@@ -77,4 +97,51 @@ test("coordinate normalization rounds and clamps", () => {
   assert.equal(normalizeCoordinate(-20, "x"), 0);
   assert.equal(normalizeCoordinate(200000, "x"), 100000);
   assert.throws(() => normalizeCoordinate("not-a-number", "x"), /must be a number/);
+});
+
+test("Host and Origin checks accept only this Canvas", () => {
+  assert.equal(isAllowedHost("127.0.0.1:3277", 3277), true);
+  assert.equal(isAllowedHost("LOCALHOST:3277", 3277), true);
+  assert.equal(isAllowedHost("127.0.0.1:3278", 3277), false);
+  assert.equal(isAllowedHost("evil.test:3277", 3277), false);
+  assert.equal(isAllowedHost(undefined, 3277), false);
+  assert.equal(isCanvasOrigin("http://127.0.0.1:3277", 3277), true);
+  assert.equal(isCanvasOrigin("http://localhost:3277", 3277), true);
+  assert.equal(isCanvasOrigin("https://127.0.0.1:3277", 3277), false);
+  assert.equal(isCanvasOrigin("http://evil.test", 3277), false);
+  assert.equal(isCanvasOrigin("null", 3277), false);
+  assert.deepEqual({ ...parseCookies("a=1; autonom_session=abc=; b") }, { a: "1", autonom_session: "abc=" });
+  assert.equal(parseCookies("__proto__=x").toString, undefined);
+});
+
+test("control messages are validated strictly and keep only known fields", () => {
+  assert.deepEqual(
+    parseControlMessage(JSON.stringify({ t: "touch", a: "move", id: 3, x: 0, y: 1, p: 0.5, extra: true })),
+    { t: "touch", a: "move", id: 3, x: 0, y: 1, p: 0.5 });
+  assert.deepEqual(parseControlMessage(JSON.stringify({ t: "key", a: "down", code: 29 })),
+    { t: "key", a: "down", code: 29, meta: 0, repeat: 0 });
+  assert.deepEqual(parseControlMessage(JSON.stringify({ t: "text", text: "Café ✓" })),
+    { t: "text", text: "Café ✓", sensitive: false });
+  assert.deepEqual(parseControlMessage(JSON.stringify({ t: "system", op: "quick-settings" })),
+    { t: "system", op: "quick-settings" });
+  assert.deepEqual(parseControlMessage(JSON.stringify({ t: "scroll", x: 0.5, y: 0.5, dx: -16, dy: 16 })),
+    { t: "scroll", x: 0.5, y: 0.5, dx: -16, dy: 16 });
+  // The allowlist is the browser key map plus the existing system keys.
+  assert.ok(STREAM_KEYCODES.has(29) && STREAM_KEYCODES.has(4) && STREAM_KEYCODES.has(224));
+  assert.equal(STREAM_KEYCODES.has(24), false);
+
+  const rejects = [
+    ["{", null], ["[1]", null], [JSON.stringify({ t: "fly" }), "fly"],
+    [JSON.stringify({ t: "touch", a: "down", id: 1, x: Number.MAX_VALUE, y: 0 }), "touch"],
+    [JSON.stringify({ t: "touch", a: "down", id: 1, x: 0.5 }), "touch"],
+    [JSON.stringify({ t: "scroll", x: 0.5, y: 0.5, dx: 0, dy: -17 }), "scroll"],
+    [JSON.stringify({ t: "key", a: "down", code: 24 }), "key"],
+    [JSON.stringify({ t: "key", a: "down", code: 29, meta: 0x800000 }), "key"],
+    [JSON.stringify({ t: "text", text: "é".repeat(151) }), "text"],
+    [JSON.stringify({ t: "paste", text: "x".repeat(64 * 1024 + 1) }), "paste"],
+    [JSON.stringify({ t: "control", mode: "steal" }), "control"],
+  ];
+  for (const [raw, type] of rejects) {
+    assert.throws(() => parseControlMessage(raw), (error) => error.for === type, raw.slice(0, 60));
+  }
 });

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -45,7 +46,29 @@ BINARY_OVERRIDES = (
 OVERRIDE_VARS = BINARY_OVERRIDES + (
     "AUTONOM_IDB_COMPANION", "AUTONOM_HOME", "AUTONOM_CORESIMULATOR_DEVICES",
     "AUTONOM_IOS_HID", "AUTONOM_IOS_LOG_MAX_MB", "AUTONOM_IDB_STATE_FILE",
+    "AUTONOM_SCRCPY_SERVER", "SCRCPY_SERVER_PATH",
 )
+
+# Mobile Canvas speaks exactly this scrcpy protocol (SCRCPY_PROTOCOL_VERSION
+# in scrcpy-lib.mjs); a server of any other version is reported, never used.
+# scrcpy is optional: without it `canvas serve --transport auto` falls back to
+# screenrecord or screencap, so it never gates `--strict`.
+SCRCPY_PROTOCOL_VERSION = "4.1"
+SCRCPY_CAPABILITY = "canvas.scrcpy"
+# The order the Canvas resolves a server in once no flag names one.
+SCRCPY_SERVER_VARS = ("AUTONOM_SCRCPY_SERVER", "SCRCPY_SERVER_PATH")
+SCRCPY_INSTALL_HINT = (
+    f"Install scrcpy {SCRCPY_PROTOCOL_VERSION} for the Mobile Canvas scrcpy transport: "
+    "brew install scrcpy (macOS) or sudo apt-get install scrcpy (Linux); or point "
+    f"AUTONOM_SCRCPY_SERVER at a scrcpy-server-v{SCRCPY_PROTOCOL_VERSION} file. "
+    "Autonom never downloads it."
+)
+# The same patterns as parseScrcpyVersion in scrcpy-lib.mjs, so doctor and the
+# Canvas read one file name or one `scrcpy --version` line the same way: the
+# whole token is kept, so a pre-release such as 4.1-rc1 never passes as 4.1.
+SCRCPY_VERSION_TOKEN = r"\d+(?:\.\d+)+(?:-[0-9A-Za-z.]+)?"
+_SERVER_FILE_VERSION = re.compile(rf"scrcpy-server-v({SCRCPY_VERSION_TOKEN})(?:\.jar)?")
+_CLI_VERSION = re.compile(rf"^\s*scrcpy\s+v?({SCRCPY_VERSION_TOKEN})(?=\s|$)", re.M)
 
 
 def _overrides() -> tuple[dict[str, Any], list[dict[str, Any]]]:
@@ -190,6 +213,84 @@ def _axe_version(path: str) -> str | None:
         return None
     lines = (completed.stdout or "").strip().splitlines()
     return lines[0].strip()[:64] if completed.returncode == 0 and lines else None
+
+
+def _scrcpy_cli_version(path: str) -> str | None:
+    try:
+        completed = subprocess.run(
+            [path, "--version"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL, text=True, check=False, timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    match = _CLI_VERSION.search(completed.stdout or "")
+    return match.group(1) if completed.returncode == 0 and match else None
+
+
+def scrcpy_server_version(path: str | Path) -> str | None:
+    """The version a `scrcpy-server-vX.Y[.jar]` file name states, or None."""
+    match = _SERVER_FILE_VERSION.fullmatch(Path(path).name)
+    return match.group(1) if match else None
+
+
+def scrcpy_source() -> tuple[str, Path, str | None] | None:
+    """(source, server file, scrcpy binary) as the Canvas resolves them once no
+    flag names a server, or None when nothing could provide one.
+
+    Order: AUTONOM_SCRCPY_SERVER, SCRCPY_SERVER_PATH, then the server an
+    installed `scrcpy` ships beside itself (`<prefix>/bin/scrcpy` ->
+    `<prefix>/share/scrcpy/scrcpy-server`, through the symlink Homebrew puts
+    on PATH).
+    """
+    binary = shutil.which("scrcpy")
+    variable = next((name for name in SCRCPY_SERVER_VARS if os.environ.get(name)), None)
+    if variable:
+        return variable, Path(os.environ[variable]).expanduser(), binary
+    if binary:
+        server = Path(os.path.realpath(binary)).parent.parent / "share/scrcpy/scrcpy-server"
+        return "scrcpy", server, binary
+    return None
+
+
+def _scrcpy_entry() -> dict[str, Any]:
+    """Where the Canvas would find scrcpy-server, and whether it can use it."""
+    found = scrcpy_source()
+    entry: dict[str, Any] = {
+        "state": "missing", "optional": True, "capability": SCRCPY_CAPABILITY,
+        "ready": False, "path": found[2] if found else None, "server_path": None,
+        "version": None, "required_version": SCRCPY_PROTOCOL_VERSION, "source": None,
+        "install_hint": SCRCPY_INSTALL_HINT,
+    }
+    if found is None:
+        return entry
+    source, server, binary = found
+    entry["source"] = source
+    entry["server_path"] = str(server)
+    if not server.is_file():
+        entry["state"] = "error"
+        entry["error"] = f"no scrcpy-server file at {server} (from {source})"
+        return entry
+    # Only the server an installed scrcpy ships takes that scrcpy's version:
+    # a file named by a variable may come from any release.
+    version = (_scrcpy_cli_version(binary) if source == "scrcpy"
+               else scrcpy_server_version(server))
+    entry["version"] = version
+    if version is None:
+        entry["state"] = "error"
+        entry["error"] = (f"'{binary} --version' did not name a version" if source == "scrcpy"
+                          else f"cannot tell which scrcpy version {server} is")
+        entry["install_hint"] = (
+            f"Name the file scrcpy-server-v{SCRCPY_PROTOCOL_VERSION}, or pass "
+            f"'canvas serve --scrcpy-server PATH --scrcpy-version {SCRCPY_PROTOCOL_VERSION}'.")
+    elif version != SCRCPY_PROTOCOL_VERSION:
+        entry["state"] = "error"
+        entry["error"] = (f"scrcpy-server {version} found; Mobile Canvas speaks "
+                          f"{SCRCPY_PROTOCOL_VERSION} only and falls back without it")
+    else:
+        entry["state"] = "ok"
+        entry["ready"] = True
+        entry["install_hint"] = None
+    return entry
 
 
 def _ios_state(tools: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any],
@@ -385,6 +486,8 @@ def collect(args: Any = None) -> dict[str, Any]:
     return {
         "ok": True,
         "tools": tools,
+        # Kept out of `tools`: is_healthy and `--strict` read every tool there.
+        "optional_tools": {"scrcpy": _scrcpy_entry()},
         "capabilities": capabilities,
         "ios": ios_state,
         "checks": checks,

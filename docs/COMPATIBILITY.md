@@ -209,6 +209,46 @@ the old answer must read them.
 `waitForSettled` is a new Flow command (additive), declared `since` 0.31.0 —
 the release that will carry it; the version is not bumped until then.
 
+### Mobile Canvas scrcpy transport (unreleased)
+
+No `error_code` is added. `canvas serve` refuses with existing codes, checked
+before node starts:
+
+| Situation | Code |
+| --- | --- |
+| `--scrcpy-version` that does not look like `4.1`, `--scrcpy-version` without `--scrcpy-server`, a `--scrcpy-server` that is not a file, `--max-size` outside 320..4096, `--bit-rate` outside 100000..100000000 | `invalid_value` |
+| `--transport scrcpy` or `--scrcpy-server` for an iOS Simulator | `unsupported_on_platform`, `capability: "canvas.scrcpy"` |
+| `--transport scrcpy` when no source is configured at all (no flag, no `AUTONOM_SCRCPY_SERVER`, no `SCRCPY_SERVER_PATH`, no `scrcpy` on `PATH`) | `tool_missing`, `tool: "scrcpy"`, `capability: "canvas.scrcpy"`, with the install hint |
+
+A configured server that is missing or is not 4.1 is found by the Canvas
+itself: with `--transport scrcpy` it exits non-zero with one stderr line
+that starts `android-emulator-browser: canvas.scrcpy:` and carries the
+install hint; with `auto` it falls back and says why. The Canvas speaks the
+scrcpy 4.1 protocol only (scrcpy keeps no compatibility between releases),
+so upgrading scrcpy turns the transport off until Autonom supports the new
+version; nothing else breaks.
+
+| Surface | Before | Now |
+| --- | --- | --- |
+| `canvas serve --transport auto` on Android | `screenrecord` + ffmpeg, else `screencap` | scrcpy when a scrcpy-server 4.1 resolves (`--scrcpy-server`, `AUTONOM_SCRCPY_SERVER`, `SCRCPY_SERVER_PATH`, an installed `scrcpy`), then `screenrecord` + ffmpeg, then `screencap`. On scrcpy the page streams over `/ws/video` and sends input over `/ws/control` instead of `/stream.mjpeg` and the HTTP input endpoints. `--transport screenrecord` or `screencap` keeps the earlier choice |
+| `canvas serve --fps` | always forwarded, default 15 | forwarded only when given: the multipart default stays 15, and scrcpy caps at 60 unless `--fps` is given |
+| `/status` | — | `transport` may be `scrcpy`; additive `fallback_reason` (null unless `auto` on Android skipped a transport) and `scrcpy` (null unless a 4.1 server resolved: `version`, `server_path`, `source`, `session_state`, `width`, `height`, `packets`, `bytes`, `key_frames`, `restarts`, `video_clients`, `control_clients`, `journal_pending`, `journal_dropped`) |
+| Android H.264 detection (`screenrecord_h264`, `/stream.h264`, the `screenrecord` transport) | `--output-format` listed by `screenrecord --help` | a `screenrecord --output-format=h264 --time-limit 1` run of at most 5 s must yield an H.264 SPS. API 36 targets, whose help omits the hidden option although it works, now get `screenrecord_h264: true`; Canvas start can take up to 5 s longer on a device without H.264 output |
+| Any Canvas request or upgrade whose `Host` is not `127.0.0.1:<port>` or `localhost:<port>` | served | 403 `Host not allowed`; a port forward must keep the Canvas port and use one of those names |
+| A plain HTTP request that carries an `Upgrade` header but is not a WebSocket handshake for `/ws/video` or `/ws/control` (`Upgrade: h2c` from `curl --http2` or Java's HttpClient) | served | still served by the normal handler; on Node versions whose `http.createServer` ignores `shouldUpgradeCallback`, on a connection closed after the answer, and a request with a body gets 400 asking to resend it without the `Upgrade` header |
+| The page loaded in a frame | shown | refused: 403 for framed loads (`Sec-Fetch-Dest` iframe, frame, embed, object, fencedframe), `frame-ancestors 'none'`, `X-Frame-Options: DENY` |
+| `POST /auth` without a token | 401 | with a valid session cookie, from a same-origin fetch, `{"ok": true, "csrf": ...}` so a reloaded page resumes; otherwise 401, or 403 for another origin |
+| Multipart clients (`/stream.mjpeg`) | one capture loop per page | one shared loop per Canvas; a client more than 2 MiB behind skips frames |
+| `doctor` | — | additive `optional_tools.scrcpy` (`state`, `ready`, `optional`, `capability`, `path`, `server_path`, `version`, `required_version`, `source`, `install_hint`, `error`), kept out of `tools` so it never affects `--strict`; `overrides` may list `AUTONOM_SCRCPY_SERVER` and `SCRCPY_SERVER_PATH` |
+| `scripts/bootstrap.sh` | arguments other than `--install` ignored | `--with-scrcpy` added (with `--install`, installs scrcpy); any other argument prints the usage and exits 2; an "Optional tools" section reports scrcpy without ever failing the check |
+| Journal | — | the scrcpy path adds the verbs `ui gesture`, `ui scroll`, `ui paste`, `ui system` and `ui control`, and writes `ui key` and `ui text`, all with argv `ui <kind> <canvas>` and a `canvas-<kind>` action detail carrying `transport: "scrcpy"`. Its `key` is the numeric Android keycode where the HTTP path writes a `KEYCODE_*` name |
+
+`/tap`, `/swipe`, `/key`, `/text`, `/control`, `/frame`, `/stream.mjpeg`,
+`/stream.h264` and the iOS path keep their behaviour; `/control` now also
+lifts the pointers and keys of WebSocket connections it refuses. `/text`
+keeps its conservative ASCII rule; Unicode text exists only on the scrcpy
+transport, where it replaces the device clipboard.
+
 ## Exit codes and streams
 
 - `0` success · `2` expected failure (`AutonomError` as one JSON object on

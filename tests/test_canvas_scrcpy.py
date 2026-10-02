@@ -1,0 +1,789 @@
+"""Mobile Canvas scrcpy: the bridge `record` op, `canvas serve` flags, and the
+optional scrcpy in doctor and bootstrap (CANVAS-009, CANVAS-013).
+
+Fakes only. The device tool handed to the bridge and the CLI is a sentinel
+that logs any call, `node`, `scrcpy`, `uname`, `brew`, `sudo` and `apt-get`
+are scripts in a temporary directory, and every PATH a child process sees
+holds nothing but those scripts.
+"""
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPTS = ROOT / "scripts"
+CLI = SCRIPTS / "autonom.py"
+BRIDGE = SCRIPTS / "autonom_canvas_bridge.py"
+BOOTSTRAP = SCRIPTS / "bootstrap.sh"
+
+sys.path.insert(0, str(SCRIPTS))
+import autonom_canvas_bridge as bridge  # noqa: E402
+from autonom_lib import actions, doctor, errors, session, ui  # noqa: E402
+from autonom_lib.platform import ANDROID, Target  # noqa: E402
+
+try:
+    from env_isolation import EnvSandboxMixin  # noqa: E402  (discover -s tests)
+except ImportError:  # direct `python3 -m unittest tests.test_...` runs
+    from tests.env_isolation import EnvSandboxMixin  # noqa: E402
+
+SERIAL = "fake-canvas-serial"
+UDID = "00000000-0000-0000-0000-00000000CAFE"
+SECRET = "clipboard-SECRET-7f3a"
+# Variables that would point a child process at a real tool on this machine.
+TOOL_ENV = ("AUTONOM_ADB", "AUTONOM_SIMCTL", "AUTONOM_IDB", "AUTONOM_MITMDUMP",
+            "AUTONOM_AXE", "AUTONOM_IOS_HID", "AUTONOM_IDB_COMPANION",
+            "AUTONOM_IDB_STATE_FILE", "AUTONOM_FAKE_STATE", "AUTONOM_FAKE_LOG",
+            "AUTONOM_EMULATOR", "DEVELOPER_DIR",
+            "AUTONOM_SCRCPY_SERVER", "SCRCPY_SERVER_PATH")
+
+
+def write_script(path: Path, body: str) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body, encoding="utf-8")
+    path.chmod(0o755)
+    return path
+
+
+def sentinel(path: Path, trace: Path, code: int = 1) -> Path:
+    """A tool that only appends its name and argv to `trace`."""
+    return write_script(path, f'#!/bin/sh\necho "{path.name} $*" >> "{trace}"\nexit {code}\n')
+
+
+def fake_scrcpy(path: Path, version: str) -> Path:
+    return write_script(path, (
+        "#!/bin/sh\n"
+        f'echo "scrcpy {version} <https://github.com/Genymobile/scrcpy>"\n'
+        'echo ""\n'
+        'echo "Dependencies (compiled / linked):"\n'))
+
+
+def hermetic_env(home: Path, path: str) -> dict[str, str]:
+    env = {key: value for key, value in os.environ.items() if key not in TOOL_ENV}
+    env.update({"AUTONOM_HOME": str(home), "PATH": path})
+    return env
+
+
+# --- bridge `record` op ------------------------------------------------------------
+
+
+GESTURE = {"kind": "gesture", "transport": "scrcpy", "pointers": 1, "moves": 40,
+           "duration_ms": 812.4, "start": [100, 900], "end": [110.4, 300]}
+ONE_OF_EACH = [
+    (GESTURE, "human"),
+    ({"kind": "scroll", "transport": "scrcpy", "events": 12, "dx": 0, "dy": -48.5}, "human"),
+    ({"kind": "key", "transport": "scrcpy", "key": "KEYCODE_ENTER"}, "agent"),
+    ({"kind": "text", "transport": "scrcpy", "text": "Café ✓", "text_len": 6}, "replay"),
+    ({"kind": "paste", "transport": "scrcpy", "text_len": 21}, "human"),
+    ({"kind": "system", "transport": "scrcpy", "op": "app-switch"}, "system"),
+    ({"kind": "control", "transport": "scrcpy", "mode": "takeover", "owner": "agent"}, "agent"),
+]
+
+
+class BridgeRecordTests(EnvSandboxMixin, unittest.TestCase):
+    """CANVAS-009: one journal entry per completed action, nothing actuated."""
+
+    def setUp(self) -> None:
+        self.sandbox_home()
+        self.record = session.start_session("/nonexistent/adb", serial=SERIAL,
+                                            app_id="com.example.app")
+        self.target = Target(ANDROID, SERIAL, "/nonexistent/adb", {"serial": SERIAL})
+        # Any actuator or child process reached by `record` fails the test.
+        for name in ("tap", "swipe", "press_key", "type_text", "screen_size"):
+            patcher = mock.patch.object(ui, name, side_effect=AssertionError(f"ui.{name} ran"))
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        for name in ("run", "Popen"):
+            patcher = mock.patch.object(subprocess, name,
+                                        side_effect=AssertionError(f"subprocess.{name} ran"))
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def send(self, payload: object, origin: str = "human") -> dict:
+        return bridge.dispatch(self.target, {"id": 7, "op": "record", "origin": origin,
+                                             "payload": payload})
+
+    def journal(self) -> list[dict]:
+        path = Path(self.record["artifacts_dir"]) / "journal.ndjson"
+        if not path.exists():
+            return []
+        return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+    def details(self) -> list[dict]:
+        return list(actions.read_details(self.record).values())
+
+    def everything_written(self) -> str:
+        root = Path(self.record["artifacts_dir"])
+        return "\n".join(path.read_text(encoding="utf-8")
+                         for path in sorted(root.rglob("*")) if path.is_file())
+
+    def assert_refused(self, payload: object, origin: str = "human") -> None:
+        with self.assertRaises(errors.AutonomError) as caught:
+            self.send(payload, origin)
+        self.assertEqual(caught.exception.code, errors.FLOW_COMMAND_INVALID)
+
+    def test_one_drag_with_forty_moves_is_one_gesture_entry(self) -> None:
+        """CANVAS-009-S01."""
+        result = self.send(GESTURE)
+        self.assertEqual(result, {"ok": True, "recorded": "gesture", "via": "scrcpy",
+                                  "detail": "actions/0001_canvas-gesture.json"})
+        (entry,) = self.journal()
+        self.assertEqual(
+            {key: entry[key] for key in ("kind", "verb", "origin", "ok", "result")},
+            {"kind": "action", "verb": "ui gesture", "origin": "human", "ok": True,
+             "result": {"via": "scrcpy", "detail": "actions/0001_canvas-gesture.json"}})
+        self.assertEqual(self.details(), [{
+            "kind": "gesture", "origin": "human", "canvas": True, "transport": "scrcpy",
+            "pointers": 1, "moves": 40, "duration_ms": 812,
+            "start": [100, 900], "end": [110, 300]}])
+
+    def test_each_kind_journals_exactly_one_entry_with_its_origin(self) -> None:
+        for payload, origin in ONE_OF_EACH:
+            self.send(payload, origin)
+        entries = self.journal()
+        self.assertEqual([(entry["verb"], entry["origin"]) for entry in entries],
+                         [(f"ui {payload['kind']}", origin) for payload, origin in ONE_OF_EACH])
+        self.assertEqual([entry["seq"] for entry in entries], list(range(1, 8)))
+        details = self.details()
+        self.assertEqual([detail["kind"] for detail in details], list(bridge.RECORD_KINDS))
+        self.assertTrue(all(detail["transport"] == "scrcpy" for detail in details))
+        by_kind = {detail["kind"]: detail for detail in details}
+        self.assertEqual((by_kind["scroll"]["events"], by_kind["scroll"]["dx"],
+                          by_kind["scroll"]["dy"]), (12, 0.0, -48.5))
+        self.assertEqual(by_kind["key"]["key"], "KEYCODE_ENTER")
+        self.assertEqual(by_kind["text"]["text"], "Café ✓")
+        self.assertEqual(by_kind["system"]["op"], "app-switch")
+        self.assertEqual((by_kind["control"]["mode"], by_kind["control"]["owner"]),
+                         ("takeover", "agent"))
+
+    def test_transport_defaults_to_scrcpy_and_key_numbers_are_kept(self) -> None:
+        self.send({"kind": "key", "key": 66}, "agent")
+        (detail,) = self.details()
+        self.assertEqual((detail["transport"], detail["key"]), ("scrcpy", 66))
+
+    def test_paste_never_journals_clipboard_text(self) -> None:
+        self.send({"kind": "paste", "transport": "scrcpy", "text": SECRET})
+        self.send({"kind": "paste", "transport": "scrcpy", "text_len": 5, "text": SECRET})
+        self.assertEqual([detail["text_len"] for detail in self.details()], [len(SECRET), 5])
+        self.assertTrue(all("text" not in detail for detail in self.details()))
+        self.assertEqual(len(self.journal()), 2)
+        self.assertNotIn(SECRET, self.everything_written())
+
+    def test_sensitive_text_keeps_only_its_length(self) -> None:
+        self.send({"kind": "text", "transport": "scrcpy", "text": SECRET, "sensitive": True})
+        (detail,) = self.details()
+        self.assertEqual((detail["sensitive"], detail["text"], detail["text_len"]),
+                         (True, None, len(SECRET)))
+        self.assertNotIn(SECRET, self.everything_written())
+
+    def test_fields_a_kind_does_not_name_are_dropped(self) -> None:
+        self.send({**GESTURE, "clipboard": SECRET, "text": SECRET, "raw": [SECRET]})
+        self.send({"kind": "system", "op": "home", "text": SECRET})
+        gesture, system = self.details()
+        self.assertEqual(set(gesture), {"kind", "origin", "canvas", "transport", "pointers",
+                                        "moves", "duration_ms", "start", "end"})
+        self.assertEqual(set(system), {"kind", "origin", "canvas", "transport", "op"})
+        self.assertNotIn(SECRET, self.everything_written())
+
+    def test_kinds_outside_the_set_are_refused_without_an_entry(self) -> None:
+        for kind in ("tap", "swipe", "clipboard", "clipboard-get", "", None, "GESTURE", 3):
+            with self.subTest(kind=kind):
+                self.assert_refused({"kind": kind, "transport": "scrcpy"})
+        self.assertEqual(self.journal(), [])
+        self.assertEqual(self.details(), [])
+
+    def test_malformed_records_are_refused_without_an_entry(self) -> None:
+        bad = [
+            ["not", "an", "object"],
+            {**GESTURE, "moves": -1},
+            {**GESTURE, "moves": "40"},
+            {**GESTURE, "moves": True},
+            {**GESTURE, "moves": 2.5},
+            {**GESTURE, "pointers": 101},
+            {**GESTURE, "duration_ms": -3},
+            {**GESTURE, "start": [1]},
+            {**GESTURE, "end": [float("nan"), 1]},
+            {**GESTURE, "end": [-5, 1]},
+            {"kind": "scroll", "dx": float("inf")},
+            {"kind": "key"},
+            {"kind": "key", "key": "KEYCODE ENTER"},
+            {"kind": "key", "key": -1},
+            {"kind": "text", "text": 42},
+            {"kind": "text", "text": "a", "sensitive": "yes"},
+            {"kind": "text", "text": "x" * (bridge.MAX_TEXT + 1)},
+            {"kind": "paste", "text_len": -1},
+            {"kind": "system", "op": "reboot"},
+            {"kind": "control", "mode": "steal"},
+            {"kind": "control", "mode": "takeover", "owner": "root"},
+            {**GESTURE, "transport": "screencap"},
+            {**GESTURE, "transport": None},
+        ]
+        for payload in bad:
+            with self.subTest(payload=payload):
+                self.assert_refused(payload)
+        self.assertEqual(self.journal(), [])
+        self.assertEqual(self.details(), [])
+
+    def test_origin_is_still_required(self) -> None:
+        for origin in ("admin", "", None):
+            with self.subTest(origin=origin):
+                self.assert_refused(GESTURE, origin)
+        self.assertEqual(self.journal(), [])
+
+    def test_without_a_session_record_still_answers(self) -> None:
+        session.stop_session(reap=False)
+        self.assertEqual(self.send(GESTURE), {"ok": True, "recorded": "gesture",
+                                              "via": "scrcpy"})
+
+
+OTHER_SERIAL = "fake-other-serial"
+# Every bridge op that journals: the scrcpy `record` and the four the bridge
+# actuates itself, each with the journal verb it writes.
+JOURNALED_OPS = [
+    ("record", GESTURE, "ui gesture"),
+    ("tap", {"x": 10, "y": 20}, "ui tap"),
+    ("swipe", {"x1": 1, "y1": 2, "x2": 3, "y2": 4, "duration": 300}, "ui swipe"),
+    ("key", {"key": "KEYCODE_BACK"}, "ui key"),
+    ("text", {"text": "hello"}, "ui text"),
+]
+
+
+class BridgeSessionTargetTests(EnvSandboxMixin, unittest.TestCase):
+    """Canvas journals into the current session only when that session is on
+    the Canvas's own target. Before: a Canvas on one emulator wrote its actions
+    into the journal of a session on another."""
+
+    def setUp(self) -> None:
+        self.home = self.sandbox_home()
+        self.target = Target(ANDROID, SERIAL, "/nonexistent/adb", {"serial": SERIAL})
+        self.actuated: list[tuple[str, str]] = []
+        for name in ("tap", "swipe", "press_key", "type_text"):
+            patcher = mock.patch.object(ui, name, side_effect=self.actuator(name))
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        for name in ("run", "Popen"):
+            patcher = mock.patch.object(subprocess, name,
+                                        side_effect=AssertionError(f"subprocess.{name} ran"))
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def actuator(self, name: str):
+        def actuate(target: Target, *_args: object) -> None:
+            self.actuated.append((name, target.target_id))
+        return actuate
+
+    def dispatch_each(self) -> list[dict]:
+        return [bridge.dispatch(self.target, {"id": index, "op": op, "origin": "human",
+                                              "payload": payload})
+                for index, (op, payload, _verb) in enumerate(JOURNALED_OPS)]
+
+    def journal(self, record: dict) -> list[dict]:
+        path = Path(record["artifacts_dir"]) / "journal.ndjson"
+        if not path.exists():
+            return []
+        return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+    def assert_ran_on_the_canvas_target(self, results: list[dict]) -> None:
+        self.assertTrue(all(result["ok"] for result in results), results)
+        self.assertEqual(self.actuated, [("tap", SERIAL), ("swipe", SERIAL),
+                                         ("press_key", SERIAL), ("type_text", SERIAL)])
+
+    def assert_nothing_journaled(self, results: list[dict], record: dict) -> None:
+        self.assertTrue(all("detail" not in result for result in results), results)
+        self.assertEqual(self.journal(record), [])
+        self.assertEqual(actions.read_details(record), {})
+
+    def test_a_session_on_the_canvas_target_gets_one_line_per_action(self) -> None:
+        record = session.start_session("/nonexistent/adb", serial=SERIAL)
+        for op, payload, verb in JOURNALED_OPS:
+            with self.subTest(op=op):
+                before = len(self.journal(record))
+                result = bridge.dispatch(self.target, {"id": 1, "op": op, "origin": "human",
+                                                       "payload": payload})
+                self.assertTrue(result["ok"])
+                self.assertIn("detail", result)
+                entries = self.journal(record)
+                self.assertEqual(len(entries), before + 1)
+                self.assertEqual((entries[-1]["verb"], entries[-1]["origin"]),
+                                 (verb, "human"))
+        self.assertEqual(len(actions.read_details(record)), len(JOURNALED_OPS))
+
+    def test_a_session_on_another_target_gets_nothing_and_the_action_still_runs(self) -> None:
+        record = session.start_session("/nonexistent/adb", serial=OTHER_SERIAL)
+        results = self.dispatch_each()
+        self.assert_ran_on_the_canvas_target(results)
+        self.assert_nothing_journaled(results, record)
+
+    def test_a_session_on_another_platform_with_the_same_id_gets_nothing(self) -> None:
+        record = session.start_session("/nonexistent/xcrun", platform="ios",
+                                       target_id=SERIAL)
+        results = self.dispatch_each()
+        self.assert_ran_on_the_canvas_target(results)
+        self.assert_nothing_journaled(results, record)
+
+    def test_a_v1_record_on_the_canvas_target_still_journals(self) -> None:
+        """A v1 record names only its serial; it is upgraded to an Android one."""
+        artifacts = self.home / "sessions" / "s_v1record"
+        artifacts.mkdir(parents=True)
+        record = {"session_id": "s_v1record", "serial": SERIAL, "adb": "/nonexistent/adb",
+                  "artifacts_dir": str(artifacts)}
+        (self.home / "sessions" / "current.json").write_text(json.dumps(record),
+                                                              encoding="utf-8")
+        self.dispatch_each()
+        self.assertEqual([entry["verb"] for entry in self.journal(record)],
+                         [verb for _op, _payload, verb in JOURNALED_OPS])
+
+    def test_without_a_session_every_action_answers_and_nothing_is_journaled(self) -> None:
+        results = self.dispatch_each()
+        self.assert_ran_on_the_canvas_target(results)
+        self.assertTrue(all("detail" not in result for result in results), results)
+        self.assertEqual([path for path in self.home.rglob("*") if path.is_file()], [])
+
+
+class BridgeProcessTests(EnvSandboxMixin, unittest.TestCase):
+    def test_the_bridge_process_records_without_running_the_device_tool(self) -> None:
+        home = self.sandbox_home()
+        record = session.start_session("adb", serial=SERIAL, app_id="com.example.app")
+        trace = home / "device-tool.log"
+        adb = sentinel(home / "bin" / "adb", trace)
+        messages = [
+            {"id": 1, "op": "record", "origin": "human", "payload": GESTURE},
+            {"id": 2, "op": "record", "origin": "human",
+             "payload": {"kind": "paste", "transport": "scrcpy", "text": SECRET}},
+            {"id": 3, "op": "record", "origin": "agent",
+             "payload": {"kind": "tap", "transport": "scrcpy"}},
+        ]
+        completed = subprocess.run(
+            [sys.executable, str(BRIDGE), "--platform", "android", "--target", SERIAL,
+             "--tool", str(adb)],
+            input="".join(json.dumps(message) + "\n" for message in messages),
+            env=hermetic_env(home, str(adb.parent)), text=True, capture_output=True,
+            check=False, timeout=60)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        replies = {reply["id"]: reply for reply in map(json.loads,
+                                                       completed.stdout.splitlines())}
+        self.assertEqual(sorted(replies), [1, 2, 3])
+        self.assertTrue(replies[1]["ok"] and replies[2]["ok"])
+        self.assertEqual(replies[1]["result"]["recorded"], "gesture")
+        self.assertEqual((replies[3]["ok"], replies[3]["error_code"]),
+                         (False, errors.FLOW_COMMAND_INVALID))
+        self.assertFalse(trace.exists(), "the record op reached the device tool")
+        journal = Path(record["artifacts_dir"]) / "journal.ndjson"
+        lines = [json.loads(line) for line in journal.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual([line["verb"] for line in lines], ["ui gesture", "ui paste"])
+        written = "".join(path.read_text(encoding="utf-8")
+                          for path in Path(record["artifacts_dir"]).rglob("*.json*"))
+        self.assertNotIn(SECRET, written + completed.stdout)
+
+
+# --- canvas serve flags ------------------------------------------------------------
+
+
+FAKE_NODE = """#!{python}
+import json, os, sys
+with open(os.environ["FAKE_NODE_OUT"], "w", encoding="utf-8") as handle:
+    json.dump(sys.argv[1:], handle)
+"""
+
+
+def flag_values(argv: list[str]) -> dict[str, str]:
+    return {flag: value for flag, value in zip(argv, argv[1:])
+            if flag.startswith("--") and not value.startswith("--")}
+
+
+class CanvasServeFlagsTests(EnvSandboxMixin, unittest.TestCase):
+    """CANVAS-013: `canvas serve` accepts the scrcpy options and forwards them."""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.trace = self.root / "device-tool.log"
+        self.adb = sentinel(self.root / "bin" / "adb", self.trace)
+        self.simctl = sentinel(self.root / "bin" / "xcrun", self.trace)
+        write_script(self.root / "bin" / "node", FAKE_NODE.format(python=sys.executable))
+        # The supervisor lists its process group with `ps` once node exits;
+        # without it every run waits out the 5 s stop timeout.
+        ps = shutil.which("ps")
+        if ps:
+            (self.root / "bin" / "ps").symlink_to(ps)
+        self.node_out = self.root / "node-argv.json"
+        self.server = self.root / "scrcpy-server-v4.1"
+        self.server.write_bytes(b"PK\x03\x04 not a real server")
+        self.env = hermetic_env(self.root / "home", str(self.root / "bin"))
+        self.env["FAKE_NODE_OUT"] = str(self.node_out)
+
+    def serve(self, *argv: str, ios: bool = False) -> subprocess.CompletedProcess:
+        target = (["--simctl", str(self.simctl), "--udid", UDID] if ios
+                  else ["--adb", str(self.adb), "--serial", SERIAL])
+        completed = subprocess.run(
+            [sys.executable, str(CLI), *target, "canvas", "serve", *argv],
+            cwd=self.root, env=self.env, text=True, stdin=subprocess.DEVNULL,
+            capture_output=True, check=False, timeout=60)
+        self.assertNotIn("Traceback", completed.stdout + completed.stderr)
+        self.assertFalse(self.trace.exists(), "canvas serve ran the device tool itself")
+        return completed
+
+    def node_argv(self, completed: subprocess.CompletedProcess) -> list[str]:
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        return json.loads(self.node_out.read_text(encoding="utf-8"))
+
+    def refused(self, completed: subprocess.CompletedProcess) -> dict:
+        self.assertEqual(completed.returncode, 2, completed.stdout)
+        self.assertFalse(self.node_out.exists(), "node started despite a bad value")
+        return json.loads(completed.stderr)
+
+    def test_scrcpy_flags_reach_the_canvas_server(self) -> None:
+        argv = self.node_argv(self.serve(
+            "--transport", "scrcpy", "--scrcpy-server", str(self.server),
+            "--scrcpy-version", "4.1", "--max-size", "1024", "--bit-rate", "4000000",
+            "--port", "3999"))
+        values = flag_values(argv)
+        self.assertEqual(
+            {flag: values.get(flag) for flag in (
+                "--platform", "--target", "--port", "--transport", "--scrcpy-server",
+                "--scrcpy-version", "--max-size", "--bit-rate", "--adb")},
+            {"--platform": "android", "--target": SERIAL, "--port": "3999",
+             "--transport": "scrcpy", "--scrcpy-server": str(self.server),
+             "--scrcpy-version": "4.1", "--max-size": "1024", "--bit-rate": "4000000",
+             "--adb": str(self.adb)})
+        self.assertNotIn("--fps", argv)
+
+    def test_a_relative_server_path_is_forwarded_absolute(self) -> None:
+        argv = self.node_argv(self.serve("--transport", "auto",
+                                         "--scrcpy-server", self.server.name))
+        forwarded = Path(flag_values(argv)["--scrcpy-server"])
+        self.assertTrue(forwarded.is_absolute(), forwarded)
+        self.assertEqual(forwarded.name, self.server.name)
+        self.assertEqual(forwarded.resolve(), self.server.resolve())
+        self.assertNotIn("--scrcpy-version", argv)
+
+    def test_a_versioned_link_is_forwarded_under_its_own_name(self) -> None:
+        """A link like scrcpy-server-v4.1 -> scrcpy-server keeps the name that says the version."""
+        target = self.root / "share" / "scrcpy-server"
+        target.parent.mkdir()
+        target.write_bytes(b"PK\x03\x04 not a real server")
+        link = self.root / "links" / "scrcpy-server-v4.1"
+        link.parent.mkdir()
+        link.symlink_to(target)
+        argv = self.node_argv(self.serve("--transport", "scrcpy", "--scrcpy-server", str(link)))
+        forwarded = flag_values(argv)["--scrcpy-server"]
+        self.assertEqual(forwarded, str(link.absolute()))
+        self.assertTrue(forwarded.endswith("scrcpy-server-v4.1"), forwarded)
+
+    def test_defaults_leave_tuning_to_the_canvas_server(self) -> None:
+        argv = self.node_argv(self.serve())
+        self.assertEqual(flag_values(argv)["--transport"], "auto")
+        for flag in ("--fps", "--max-size", "--bit-rate", "--scrcpy-server",
+                     "--scrcpy-version"):
+            self.assertNotIn(flag, argv)
+
+    def test_every_transport_is_accepted_and_an_explicit_fps_is_forwarded(self) -> None:
+        self.env["AUTONOM_SCRCPY_SERVER"] = str(self.server)
+        for transport in ("auto", "scrcpy", "screenrecord", "screencap"):
+            with self.subTest(transport=transport):
+                values = flag_values(self.node_argv(
+                    self.serve("--transport", transport, "--fps", "30")))
+                self.assertEqual((values["--transport"], values["--fps"]), (transport, "30"))
+
+    def test_bad_values_fail_before_node_starts(self) -> None:
+        cases = [
+            ("--max-size", "100"), ("--max-size", "5000"),
+            ("--bit-rate", "10"), ("--bit-rate", "200000000"),
+            ("--fps", "0"), ("--fps", "61"),
+            ("--scrcpy-server", str(self.server), "--scrcpy-version", "latest"),
+            ("--scrcpy-server", str(self.server), "--scrcpy-version", "v4.1"),
+            ("--scrcpy-version", "4.1"),
+            ("--scrcpy-server", str(self.root / "missing-server")),
+            ("--scrcpy-server", str(self.root)),
+        ]
+        for argv in cases:
+            with self.subTest(argv=argv):
+                self.assertEqual(self.refused(self.serve(*argv))["error_code"],
+                                 errors.INVALID_VALUE)
+        payload = self.refused(self.serve("--scrcpy-server", str(self.root / "missing-server")))
+        self.assertIn("brew install scrcpy", payload["hint"])
+
+    def test_scrcpy_without_any_server_fails_naming_canvas_scrcpy(self) -> None:
+        """CANVAS-013-S01: no flag, no variable, no scrcpy on PATH."""
+        payload = self.refused(self.serve("--transport", "scrcpy"))
+        self.assertEqual((payload["error_code"], payload["capability"], payload["tool"]),
+                         (errors.TOOL_MISSING, "canvas.scrcpy", "scrcpy"))
+        self.assertIn("brew install scrcpy", payload["hint"])
+
+    def test_a_configured_server_is_left_to_the_canvas_server_to_resolve(self) -> None:
+        """The CLI only checks that something could provide a server; which
+        one and its version stay the node server's job."""
+        fake_scrcpy(self.root / "bin" / "scrcpy", "4.1")
+        argv = self.node_argv(self.serve("--transport", "scrcpy"))
+        self.assertEqual(flag_values(argv)["--transport"], "scrcpy")
+        self.assertNotIn("--scrcpy-server", argv)
+        (self.root / "bin" / "scrcpy").unlink()
+        self.node_out.unlink()
+        self.env["AUTONOM_SCRCPY_SERVER"] = str(self.root / "elsewhere" / "scrcpy-server-v3.3")
+        argv = self.node_argv(self.serve("--transport", "scrcpy"))
+        self.assertNotIn("--scrcpy-server", argv)
+
+    def test_a_pre_release_version_reaches_the_canvas_server_to_be_refused_there(self) -> None:
+        argv = self.node_argv(self.serve("--scrcpy-server", str(self.server),
+                                         "--scrcpy-version", "4.1-rc1"))
+        self.assertEqual(flag_values(argv)["--scrcpy-version"], "4.1-rc1")
+
+    def test_an_unknown_transport_is_a_usage_error(self) -> None:
+        self.assertEqual(self.refused(self.serve("--transport", "webrtc"))["error_code"],
+                         errors.USAGE_ERROR)
+
+    def test_scrcpy_on_ios_is_refused_with_its_capability(self) -> None:
+        for argv in (("--transport", "scrcpy"), ("--scrcpy-server", str(self.server))):
+            with self.subTest(argv=argv):
+                payload = self.refused(self.serve(*argv, ios=True))
+                self.assertEqual((payload["error_code"], payload["capability"]),
+                                 (errors.UNSUPPORTED_ON_PLATFORM, "canvas.scrcpy"))
+
+    def test_ios_still_forwards_its_own_transport(self) -> None:
+        values = flag_values(self.node_argv(self.serve("--transport", "screencap", ios=True)))
+        self.assertEqual((values["--platform"], values["--transport"], values["--simctl"]),
+                         ("ios", "screencap", str(self.simctl)))
+
+
+# --- doctor --------------------------------------------------------------------------
+
+
+class DoctorScrcpyTests(EnvSandboxMixin, unittest.TestCase):
+    """CANVAS-013: doctor reports scrcpy as optional, capability canvas.scrcpy."""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.links = self.root / "links"
+        self.links.mkdir()
+        self.set_env(PATH=str(self.links), AUTONOM_SCRCPY_SERVER=None, SCRCPY_SERVER_PATH=None)
+
+    def install_scrcpy(self, version: str, *, with_server: bool = True) -> Path:
+        """The Homebrew layout: a PATH symlink into <prefix>/bin, the server in
+        <prefix>/share/scrcpy."""
+        prefix = self.root / "Cellar" / "scrcpy" / version
+        binary = fake_scrcpy(prefix / "bin" / "scrcpy", version)
+        if with_server:
+            server = prefix / "share" / "scrcpy" / "scrcpy-server"
+            server.parent.mkdir(parents=True)
+            server.write_bytes(b"server")
+        (self.links / "scrcpy").symlink_to(binary)
+        return Path(os.path.realpath(prefix))
+
+    def server_file(self, name: str) -> Path:
+        path = self.root / "servers" / name
+        path.parent.mkdir(exist_ok=True)
+        path.write_bytes(b"server")
+        return path
+
+    def test_missing_scrcpy_is_optional_with_an_install_hint(self) -> None:
+        entry = doctor._scrcpy_entry()  # noqa: SLF001
+        self.assertEqual(
+            {key: entry[key] for key in ("state", "optional", "capability", "ready",
+                                         "path", "server_path", "required_version")},
+            {"state": "missing", "optional": True, "capability": "canvas.scrcpy",
+             "ready": False, "path": None, "server_path": None, "required_version": "4.1"})
+        self.assertIn("brew install scrcpy", entry["install_hint"])
+        self.assertIn("apt-get install scrcpy", entry["install_hint"])
+
+    def test_installed_scrcpy_4_1_resolves_the_server_beside_it(self) -> None:
+        prefix = self.install_scrcpy("4.1")
+        entry = doctor._scrcpy_entry()  # noqa: SLF001
+        self.assertEqual(
+            {key: entry[key] for key in ("state", "ready", "source", "version",
+                                         "server_path", "path", "install_hint")},
+            {"state": "ok", "ready": True, "source": "scrcpy", "version": "4.1",
+             "server_path": str(prefix / "share" / "scrcpy" / "scrcpy-server"),
+             "path": str(self.links / "scrcpy"), "install_hint": None})
+
+    def test_another_scrcpy_version_is_reported_not_ready(self) -> None:
+        self.install_scrcpy("3.3")
+        entry = doctor._scrcpy_entry()  # noqa: SLF001
+        self.assertEqual((entry["state"], entry["ready"], entry["version"]),
+                         ("error", False, "3.3"))
+        self.assertIn("4.1", entry["error"])
+
+    def test_scrcpy_without_its_server_is_an_error(self) -> None:
+        self.install_scrcpy("4.1", with_server=False)
+        entry = doctor._scrcpy_entry()  # noqa: SLF001
+        self.assertEqual((entry["state"], entry["ready"], entry["source"]),
+                         ("error", False, "scrcpy"))
+        self.assertIn("no scrcpy-server file", entry["error"])
+
+    def test_environment_servers_come_first_in_the_canvas_order(self) -> None:
+        self.install_scrcpy("3.3")
+        autonom = self.server_file("scrcpy-server-v4.1")
+        upstream = self.server_file("scrcpy-server-v4.1.jar")
+        self.set_env(SCRCPY_SERVER_PATH=str(upstream))
+        entry = doctor._scrcpy_entry()  # noqa: SLF001
+        self.assertEqual((entry["source"], entry["server_path"], entry["version"], entry["ready"]),
+                         ("SCRCPY_SERVER_PATH", str(upstream), "4.1", True))
+        self.set_env(AUTONOM_SCRCPY_SERVER=str(autonom))
+        entry = doctor._scrcpy_entry()  # noqa: SLF001
+        self.assertEqual((entry["source"], entry["server_path"], entry["ready"]),
+                         ("AUTONOM_SCRCPY_SERVER", str(autonom), True))
+
+    def test_an_unversioned_environment_server_is_never_guessed(self) -> None:
+        """Its version comes from its name only: an installed scrcpy says
+        nothing about a file a variable names."""
+        plain = self.server_file("scrcpy-server")
+        self.set_env(AUTONOM_SCRCPY_SERVER=str(plain))
+        self.install_scrcpy("4.1")
+        entry = doctor._scrcpy_entry()  # noqa: SLF001
+        self.assertEqual((entry["state"], entry["version"], entry["ready"], entry["source"]),
+                         ("error", None, False, "AUTONOM_SCRCPY_SERVER"))
+        self.assertIn("--scrcpy-version 4.1", entry["install_hint"])
+
+    def test_server_file_names_are_read_like_the_canvas_reads_them(self) -> None:
+        cases = {"scrcpy-server-v4.1": "4.1", "scrcpy-server-v4.1.jar": "4.1",
+                 "scrcpy-server-v3.3.1": "3.3.1", "scrcpy-server-v4.1-rc1": "4.1-rc1",
+                 "scrcpy-server-v4.1.bak": None, "scrcpy-server": None,
+                 "old-scrcpy-server-v4.1": None, "scrcpy-server-v4": None}
+        for name, version in cases.items():
+            with self.subTest(name=name):
+                self.assertEqual(doctor.scrcpy_server_version(f"/x/{name}"), version)
+
+    def test_a_pre_release_is_not_4_1(self) -> None:
+        self.install_scrcpy("4.1-rc1")
+        entry = doctor._scrcpy_entry()  # noqa: SLF001
+        self.assertEqual((entry["state"], entry["ready"], entry["version"]),
+                         ("error", False, "4.1-rc1"))
+        self.set_env(SCRCPY_SERVER_PATH=str(self.server_file("scrcpy-server-v4.1-rc1")))
+        entry = doctor._scrcpy_entry()  # noqa: SLF001
+        self.assertEqual((entry["state"], entry["source"], entry["version"]),
+                         ("error", "SCRCPY_SERVER_PATH", "4.1-rc1"))
+
+    def test_scrcpy_that_names_no_version_is_an_error(self) -> None:
+        prefix = self.install_scrcpy("4.1")
+        write_script(prefix / "bin" / "scrcpy", "#!/bin/sh\necho 'usage: scrcpy'\nexit 1\n")
+        entry = doctor._scrcpy_entry()  # noqa: SLF001
+        self.assertEqual((entry["state"], entry["ready"], entry["version"]),
+                         ("error", False, None))
+        self.assertIn("did not name a version", entry["error"])
+
+    def test_an_environment_server_pointing_at_nothing_is_named(self) -> None:
+        self.set_env(AUTONOM_SCRCPY_SERVER=str(self.root / "missing" / "scrcpy-server-v4.1"))
+        entry = doctor._scrcpy_entry()  # noqa: SLF001
+        self.assertEqual((entry["state"], entry["ready"], entry["source"]),
+                         ("error", False, "AUTONOM_SCRCPY_SERVER"))
+
+    def test_optional_scrcpy_never_gates_strict(self) -> None:
+        report = {"tools": {"adb": {"state": "ok"}},
+                  "optional_tools": {"scrcpy": {"state": "missing"}}}
+        self.assertTrue(doctor.is_healthy(report))
+
+    def test_the_doctor_report_lists_scrcpy_as_optional(self) -> None:
+        home = self.root / "home"
+        (self.links / "python3").symlink_to(sys.executable)
+        self.install_scrcpy("4.1")
+        completed = subprocess.run(
+            [sys.executable, str(CLI), "doctor", "--strict"], cwd=self.root,
+            env=hermetic_env(home, str(self.links)), text=True, stdin=subprocess.DEVNULL,
+            capture_output=True, check=False, timeout=120)
+        self.assertNotIn("Traceback", completed.stdout + completed.stderr)
+        report = json.loads(completed.stdout)
+        entry = report["optional_tools"]["scrcpy"]
+        self.assertEqual((entry["state"], entry["optional"], entry["capability"]),
+                         ("ok", True, "canvas.scrcpy"))
+        self.assertNotIn("scrcpy", report["tools"])
+        # Strict fails on the missing device tools, never on the optional one.
+        self.assertEqual(completed.returncode, 1)
+        self.assertNotIn("scrcpy", report["strict_failures"])
+
+
+# --- bootstrap.sh --------------------------------------------------------------------
+
+
+class BootstrapScrcpyTests(unittest.TestCase):
+    """bootstrap.sh offers scrcpy as optional and never fails on it."""
+
+    def setUp(self) -> None:
+        bash = shutil.which("bash")
+        if not bash:
+            self.skipTest("bash is not installed")
+        self.bash = bash
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.bin = self.root / "bin"
+        self.trace = self.root / "installers.log"
+        for name in ("adb", "mitmdump", "idb", "xcrun"):
+            write_script(self.bin / name, "#!/bin/sh\nexit 0\n")
+        # A package manager reached here only logs; nothing is installed.
+        for name in ("brew", "sudo", "apt-get"):
+            sentinel(self.bin / name, self.trace, code=0)
+
+    def bootstrap(self, *args: str, system: str = "Linux") -> subprocess.CompletedProcess:
+        write_script(self.bin / "uname", f"#!/bin/sh\necho {system}\n")
+        return subprocess.run(
+            [self.bash, str(BOOTSTRAP), *args],
+            env={"PATH": str(self.bin), "HOME": str(self.root)}, cwd=self.root, text=True,
+            stdin=subprocess.DEVNULL, capture_output=True, check=False, timeout=60)
+
+    def installs(self) -> list[str]:
+        if not self.trace.exists():
+            return []
+        return self.trace.read_text(encoding="utf-8").splitlines()
+
+    def test_missing_scrcpy_is_offered_and_never_fails_the_check(self) -> None:
+        for system, command in (("Linux", "sudo apt-get install -y scrcpy"),
+                                ("Darwin", "brew install scrcpy")):
+            with self.subTest(system=system):
+                completed = self.bootstrap(system=system)
+                self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+                self.assertIn("Optional tools:", completed.stdout)
+                self.assertIn("[OPT]  scrcpy 4.1", completed.stdout)
+                self.assertIn(command, completed.stdout)
+                self.assertIn("Bootstrap check complete.", completed.stdout)
+        self.assertEqual(self.installs(), [])
+
+    def test_scrcpy_4_1_reads_ok(self) -> None:
+        fake_scrcpy(self.bin / "scrcpy", "4.1")
+        completed = self.bootstrap()
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("[ok]   scrcpy 4.1", completed.stdout)
+
+    def test_another_scrcpy_version_is_named(self) -> None:
+        fake_scrcpy(self.bin / "scrcpy", "2.4")
+        completed = self.bootstrap()
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("scrcpy 2.4 found; the Mobile Canvas scrcpy transport needs 4.1",
+                      completed.stdout)
+
+    def test_with_scrcpy_alone_installs_nothing(self) -> None:
+        completed = self.bootstrap("--with-scrcpy", system="Darwin")
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(self.installs(), [])
+
+    def test_install_alone_leaves_the_optional_tool_alone(self) -> None:
+        completed = self.bootstrap("--install", system="Darwin")
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("'--install --with-scrcpy' installs it", completed.stdout)
+        self.assertEqual(self.installs(), [])
+
+    def test_install_with_scrcpy_uses_the_package_manager(self) -> None:
+        for system, expected in (("Darwin", ["brew install scrcpy"]),
+                                 ("Linux", ["sudo apt-get install -y scrcpy"])):
+            with self.subTest(system=system):
+                self.trace.unlink(missing_ok=True)
+                completed = self.bootstrap("--install", "--with-scrcpy", system=system)
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                self.assertEqual(self.installs(), expected)
+
+    def test_an_unknown_argument_is_refused(self) -> None:
+        completed = self.bootstrap("--bogus")
+        self.assertEqual(completed.returncode, 2)
+        self.assertIn("usage:", completed.stderr)
+
+
+if __name__ == "__main__":
+    unittest.main()

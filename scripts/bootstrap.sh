@@ -4,15 +4,27 @@
 # Two classes, kept apart on purpose (FLARE-130's lesson):
 #   mechanical — a package manager can install it unattended (adb, mitmproxy, idb)
 #   human      — needs a person: Xcode from the App Store, an Android AVD, a login
+# plus optional tools, which unlock one extra capability and never fail the check:
+#   scrcpy     — ships scrcpy-server for the Mobile Canvas scrcpy transport
 #
 # Read-only by default: it reports what is missing and the exact command to fix
 # each, and exits non-zero if anything mechanical is missing. `--install` runs the
-# mechanical class; the human class is only ever printed. Idempotent — a tool
-# already present is left alone.
+# mechanical class; `--install --with-scrcpy` also installs scrcpy; the human class
+# is only ever printed. Idempotent — a tool already present is left alone.
 set -euo pipefail
 
+usage() { echo "usage: $0 [--install] [--with-scrcpy]"; }
+
 DO_INSTALL=0
-[ "${1:-}" = "--install" ] && DO_INSTALL=1
+WITH_SCRCPY=0
+for arg in "$@"; do
+  case "$arg" in
+    --install) DO_INSTALL=1 ;;
+    --with-scrcpy) WITH_SCRCPY=1 ;;
+    -h|--help) usage; exit 0 ;;
+    *) usage >&2; exit 2 ;;
+  esac
+done
 
 os="$(uname -s)"
 missing_mechanical=0
@@ -87,6 +99,43 @@ if [ "$os" = "Darwin" ]; then
       run brew install idb-companion
       have pipx && run pipx install fb-idb || echo "         then: pipx install fb-idb" >&2
     fi
+  fi
+fi
+
+# --- optional: scrcpy (Mobile Canvas scrcpy transport) ---------------------
+# Never sets missing_mechanical: without it `canvas serve --transport auto`
+# falls back to screenrecord or screencap. The Canvas speaks scrcpy 4.1 only,
+# and Autonom never downloads scrcpy-server itself — a package manager does.
+SCRCPY_WANTED="4.1"
+
+scrcpy_version() {
+  local name="" version=""
+  read -r name version _ < <(scrcpy --version 2>/dev/null) || true
+  if [ "$name" = "scrcpy" ]; then printf '%s' "$version"; fi
+}
+
+echo
+echo "Optional tools:"
+if have scrcpy; then
+  version="$(scrcpy_version)"
+  if [ "$version" = "$SCRCPY_WANTED" ]; then
+    report "scrcpy $version (Mobile Canvas scrcpy transport)" 1 ""
+  else
+    printf '  [OPT]  scrcpy %s found; the Mobile Canvas scrcpy transport needs %s\n' \
+      "${version:-of unknown version}" "$SCRCPY_WANTED"
+    printf '         or point AUTONOM_SCRCPY_SERVER at a scrcpy-server-v%s file\n' "$SCRCPY_WANTED"
+  fi
+else
+  if [ "$os" = "Darwin" ]; then cmd="brew install scrcpy"
+  else cmd="sudo apt-get install -y scrcpy   # distribution packages may predate $SCRCPY_WANTED"; fi
+  printf '  [OPT]  scrcpy %s (Mobile Canvas scrcpy transport)\n' "$SCRCPY_WANTED"
+  printf '         %s\n' "$cmd"
+  if [ "$DO_INSTALL" = "1" ] && [ "$WITH_SCRCPY" = "1" ]; then
+    if [ "$os" = "Darwin" ] && have brew; then run brew install scrcpy
+    elif have apt-get; then run sudo apt-get install -y scrcpy
+    else echo "         no supported package manager; install scrcpy $SCRCPY_WANTED manually" >&2; fi
+  else
+    echo "         optional: '--install --with-scrcpy' installs it"
   fi
 fi
 
