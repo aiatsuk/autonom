@@ -4133,17 +4133,80 @@ def cmd_agent_inspect(args: argparse.Namespace) -> int:
                  "attachments": attachments}, as_json=True)
 
 
+CANVAS_TRANSPORTS = ("auto", "scrcpy", "screenrecord", "screencap")
+# The same bounds as parseArgs in browser-lib.mjs.
+CANVAS_MAX_SIZE = (320, 4096)
+CANVAS_BIT_RATE = (100_000, 100_000_000)
+SCRCPY_VERSION_TEXT = re.compile(doctor_mod.SCRCPY_VERSION_TOKEN)
+
+
+def _canvas_bounded(flag: str, value: int | None, bounds: tuple[int, int],
+                    default: str) -> None:
+    if value is not None and not bounds[0] <= value <= bounds[1]:
+        raise errors.AutonomError(
+            errors.INVALID_VALUE, f"{flag} must be {bounds[0]}..{bounds[1]}, got {value}",
+            f"The default is {default}.")
+
+
+def _canvas_scrcpy_server(args: argparse.Namespace) -> str | None:
+    """The explicit scrcpy-server file as an absolute path, or None.
+
+    Discovery without the flag (environment, an installed scrcpy) and the
+    version check belong to the node server; only what the flags say is
+    checked here, so a typo fails before node starts.
+    """
+    version = args.scrcpy_version
+    if version is not None:
+        if not SCRCPY_VERSION_TEXT.fullmatch(version):
+            raise errors.AutonomError(
+                errors.INVALID_VALUE, f"--scrcpy-version must look like 4.1, got {version!r}",
+                "Pass the scrcpy release the server file came from.")
+        if args.scrcpy_server is None:
+            raise errors.AutonomError(
+                errors.INVALID_VALUE, "--scrcpy-version names the version of --scrcpy-server",
+                "Pass --scrcpy-server PATH as well, or neither to use the installed scrcpy.")
+    if args.scrcpy_server is None:
+        return None
+    server = Path(args.scrcpy_server).expanduser()
+    if not server.is_file():
+        raise errors.AutonomError(
+            errors.INVALID_VALUE, f"--scrcpy-server is not a file: {server}",
+            doctor_mod.SCRCPY_INSTALL_HINT, path=str(server))
+    # Absolute but not resolved: a link such as scrcpy-server-v4.1 -> scrcpy-server keeps
+    # the name the node server reads the version from.
+    return str(server.absolute())
+
+
 def cmd_canvas_serve(args: argparse.Namespace) -> int:
     # validated here: the node bridge answered a bad value with a stack trace
     if not 1 <= args.port <= 65535:
         raise errors.AutonomError(
             errors.INVALID_VALUE, f"--port must be 1..65535, got {args.port}",
             "The default is 3277.")
-    if not 1 <= args.fps <= 60:
+    if args.fps is not None and not 1 <= args.fps <= 60:
         raise errors.AutonomError(
             errors.INVALID_VALUE, f"--fps must be 1..60, got {args.fps}",
-            "The default is 15.")
+            "The default is 15, and 60 on the scrcpy transport.")
+    _canvas_bounded("--max-size", args.max_size, CANVAS_MAX_SIZE, "1280")
+    _canvas_bounded("--bit-rate", args.bit_rate, CANVAS_BIT_RATE, "8000000")
+    scrcpy_server = _canvas_scrcpy_server(args)
     target = _target(args)
+    if target.platform != ANDROID and (args.transport == "scrcpy" or scrcpy_server):
+        raise errors.AutonomError(
+            errors.UNSUPPORTED_ON_PLATFORM,
+            "the scrcpy transport mirrors Android targets only",
+            "On the iOS Simulator use --transport auto.",
+            capability=doctor_mod.SCRCPY_CAPABILITY)
+    if args.transport == "scrcpy" and not scrcpy_server and doctor_mod.scrcpy_source() is None:
+        # Nothing at all could provide a server, so the node server would
+        # refuse as well; refusing here keeps the JSON error contract. A
+        # configured server's version is still checked by the node server.
+        raise errors.AutonomError(
+            errors.TOOL_MISSING,
+            f"--transport scrcpy needs scrcpy-server {doctor_mod.SCRCPY_PROTOCOL_VERSION} "
+            "and none is configured",
+            doctor_mod.SCRCPY_INSTALL_HINT, tool="scrcpy",
+            capability=doctor_mod.SCRCPY_CAPABILITY)
     node = shutil.which("node")
     if not node:
         raise errors.AutonomError(
@@ -4154,7 +4217,17 @@ def cmd_canvas_serve(args: argparse.Namespace) -> int:
               "android-emulator-browser.mjs")
     command = [node, str(script), "--platform", target.platform,
                "--target", target.target_id, "--port", str(args.port),
-               "--transport", args.transport, "--fps", str(args.fps)]
+               "--transport", args.transport]
+    # Only explicit values are forwarded: an explicit --fps also caps scrcpy,
+    # which otherwise streams at up to 60 fps while multipart keeps 15.
+    for flag, value in (("--fps", args.fps), ("--max-size", args.max_size),
+                        ("--bit-rate", args.bit_rate)):
+        if value is not None:
+            command += [flag, str(value)]
+    if scrcpy_server:
+        command += ["--scrcpy-server", scrcpy_server]
+        if args.scrcpy_version:
+            command += ["--scrcpy-version", args.scrcpy_version]
     if target.platform == ANDROID:
         command += ["--adb", target.tool]
     else:
@@ -4557,9 +4630,18 @@ def build_parser() -> argparse.ArgumentParser:
     canvas_sub = canvas.add_subparsers(dest="canvas_command", required=True)
     p = canvas_sub.add_parser("serve", parents=[target_flags])
     p.add_argument("--port", type=int, default=3277)
-    p.add_argument("--transport", choices=("auto", "screenrecord", "screencap"),
-                   default="auto")
-    p.add_argument("--fps", type=int, default=15)
+    p.add_argument("--transport", choices=CANVAS_TRANSPORTS, default="auto",
+                   help="auto prefers scrcpy on Android when a 4.1 server is found")
+    p.add_argument("--fps", type=int,
+                   help="frame rate cap (default 15; 60 on the scrcpy transport)")
+    p.add_argument("--max-size", type=int, metavar="PX",
+                   help="maximum video width in pixels (default 1280)")
+    p.add_argument("--bit-rate", type=int, metavar="BPS",
+                   help="H.264 bit rate in bits per second (default 8000000)")
+    p.add_argument("--scrcpy-server", metavar="PATH",
+                   help="scrcpy-server file to push (default: discovered, see doctor)")
+    p.add_argument("--scrcpy-version", metavar="X.Y",
+                   help="version of --scrcpy-server when its file name does not say")
     p.add_argument("--token")
     p.add_argument("--no-auth", action="store_true")
     p.set_defaults(func=cmd_canvas_serve)

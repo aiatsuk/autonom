@@ -12,7 +12,7 @@ Legend: ✅ shipped · ⚠️ partial · 🔜 planned · ❌ not planned for nea
 | Bootable AVD discovery | ✅ | — | `devices` reports an `avds` array on Android, plus `avd_profiles` (hardware profile, screen, density, API) and the `avd` a running emulator booted from |
 | Explicit multi-target selection | ✅ | ✅ | `--platform` / `--target`; `--serial` and `--udid` are aliases |
 | Guided first run | ✅ | ✅ | `autonom tour` — what the harness has, the workflow, this Mac's targets, and an offer to boot one and walk three screens into Settings with per-step screenshots, hierarchies and logs, an HTML report and a written account (`--run`, `--human`) |
-| Environment diagnosis | ✅ | ✅ | `autonom doctor` — tools, capabilities (`ios_tree` and `ios_hid` separately: the tree needs idb, input needs a companion that loads SimulatorKit or AXe), orphans, every active `AUTONOM_*` override (`override_path_missing`), and emulators still routed through another session's live proxy (`device_attached_to_foreign_proxy`); `--strict` exits 1 with `ok: false` and the `strict_failures` list |
+| Environment diagnosis | ✅ | ✅ | `autonom doctor` — tools, capabilities (`ios_tree` and `ios_hid` separately: the tree needs idb, input needs a companion that loads SimulatorKit or AXe), orphans, every active `AUTONOM_*` override (`override_path_missing`), and emulators still routed through another session's live proxy (`device_attached_to_foreign_proxy`); `--strict` exits 1 with `ok: false` and the `strict_failures` list. `optional_tools.scrcpy` says where the Mobile Canvas would find scrcpy-server, from which `source`, at which `version`, and whether it is the 4.1 it needs (`ready`, `install_hint`); an optional tool never fails `--strict` |
 | Session + artifact dirs | ✅ | ✅ | machine-global `~/.autonom/sessions/<id>/`; `autonom session *`; `session start` refuses with `session_already_active` while one is live, reports what `--install`/`--launch` did (`installed`, `launched` with the launch report), and a failed `--install`/`--launch` rolls the new session back (`session_rolled_back`); `session stop` also stops every registered process the session owns (`process_teardown`) and names an idb companion it did not start (`companion_left_running`) |
 | Session journal (actions + notes) | ✅ | ✅ | `journal.ndjson`; `autonom journal` / `note`; secret-safe |
 | Boot / install / launch / terminate | ✅ | ✅ | simulator boots automatically on session start; an Android resume launch is `am start -W` on the launcher activity (`component`, `launch` report; `monkey` only when no launcher activity resolves) |
@@ -40,7 +40,7 @@ Legend: ✅ shipped · ⚠️ partial · 🔜 planned · ❌ not planned for nea
 | Media library seeding | ✅ | ✅ | `autonom media add` |
 | App-container file access | ✅ | ✅ | `autonom file ls\|pull`, confined to the container; a release/system app refuses with `app_not_debuggable` |
 | Remote target host | — | ✅ | idb client can drive a companion on another Mac: `--idb-host/--idb-port` or `AUTONOM_IDB_COMPANION` add `--companion host:port` to every idb call |
-| Emulator browser mirror | ✅ | ⚠️ | `canvas serve` (`android-emulator-browser` skill). iOS: frames are polled `simctl io screenshot` PNGs (no H.264 stream; the `screenrecord` transport is Android-only), and taps, drags and ASCII text go through the same action bridge as `ui` (idb, or AXe); the Android key buttons have no iOS equivalent and are refused. The node bridge runs supervised, registered to the target's session |
+| Emulator browser mirror | ✅ | ⚠️ | `canvas serve` (`android-emulator-browser` skill). Android `--transport auto` prefers **scrcpy** when a scrcpy-server 4.1 is found (`--scrcpy-server`, `AUTONOM_SCRCPY_SERVER`, `SCRCPY_SERVER_PATH`, then an installed `scrcpy`; never downloaded, any other version refused): one server per Canvas sends the device's own H.264 untranscoded over `/ws/video` to a WebCodecs page (the multipart picture, with the reason, when the browser cannot decode it), and touch (10 pointers, held fingers, Ctrl/Alt pinch), wheel scroll, key down/up with meta state, Unicode text, paste, clipboard fetch and system buttons go over an authenticated `/ws/control` as they happen. Unicode text and paste replace the device clipboard. One journal record per completed action (`transport: scrcpy`). Otherwise `screenrecord` + ffmpeg MJPEG (device H.264 probed by running it, since API 36 hides the option from `--help`), else screencap; `/status` `fallback_reason` says why, and all multipart pages share one capture loop. iOS: frames are polled `simctl io screenshot` PNGs (no H.264 stream; the `scrcpy` and `screenrecord` transports are Android-only), and taps, drags and ASCII text go through the same action bridge as `ui` (idb, or AXe); the Android key buttons have no iOS equivalent and are refused. The node bridge runs supervised, registered to the target's session |
 | Network capture (HTTP/HTTPS) | ✅ | ⚠️ | mitmproxy, loopback-only, consent-gated; `network status` counts a flow as the target's only when its client is the target (`target_flows`) — the iOS Simulator shares the host's network stack, so its traffic and a host `curl` are indistinguishable (`host_traffic_indistinguishable`), and an Android device that cannot be read is `setting_unreadable`; `persistent_mocks_active` is raised by `network start`, `network status` and `doctor`. `network status` reports `capture_mode` (`transparent`/`app_proxy`) and, on the transparent path, the installed `system_ca` |
 | Transparent Android capture (no app change) | ✅ | — | `network attach --system-ca` on a rooted `google_apis` emulator booted with `devices boot --http-proxy` to the session proxy: installs the MITM CA into the SYSTEM trust store (reversible tmpfs + zygote mount-namespace bind) and verifies it from a zygote namespace (`system_ca.verified`), so even Flutter `dart:io` and pinned-store traffic are captured with zero app modification. **Verified live on API ≥ 34** (APEX conscrypt); the API < 34 `/system/etc/security/cacerts` remount is implemented but not yet device-verified. In this mode every flow on the proxy is counted as the device's (they arrive from `127.0.0.1` by design; a host process using the port would be counted too, which is acceptable on a dedicated test host), so `network status` answers `attached: true`, `evidence: transparent_proxy`, `unattributed_flow_count: 0` — but only while the process registry still shows the emulator booted routed through the proxy; after a shutdown or an unrouted reboot it answers `attached: false`, `evidence: transparent_route_gone`. `network requests` lists all flows. `--system-ca` is refused (`reason: app_proxy_attached`) while an app-proxy attach is active; `network detach` first. A flow's `host` is the requested name (Host header), not the CONNECT IP (kept as `server_ip`), so `--host` filters and `--host` mocks match. Refuses (`unsupported_capability`, `network.system_ca`) on a non-rootable / Play image, and (`network.transparent_capture`) when the emulator was not booted proxy-routed. The device-proxy + user-CA path stays as a fallback with the honest warning that Flutter/pinned traffic is not captured that way |
 | Response mocking | ✅ | ⚠️ | exact URL or glob + method/host; first enabled rule wins |
@@ -93,6 +93,23 @@ surface and refuses anything outside it.
 
 Use `ui swipe` for anything reachable by a drag. Rotation and shake need a hand
 on the Simulator window (Device > Rotate).
+
+### Mobile Canvas transports
+
+| Transport | Picture | Input | Needs |
+| --- | --- | --- | --- |
+| `scrcpy` (Android) | device H.264 over `/ws/video`, decoded by WebCodecs in the page; up to 60 fps unless `--fps` caps it; `--max-size` is the longer side | `/ws/control`, as it happens: touch with hold and up to 10 pointers, scroll, key down/up with meta state, Unicode text and paste through the device clipboard, clipboard fetch, Back/Home/Apps/Power/Volume/Wake/Notifications/Quick settings/Collapse/Rotate | scrcpy-server 4.1; a browser with an H.264 `VideoDecoder` for the decoded picture, else the multipart picture |
+| `screenrecord` (Android) | device H.264 → ffmpeg → MJPEG at `--fps` (default 15); `--max-size` is the width | HTTP: tap, swipe, allowlisted keys, conservative ASCII text | ffmpeg; a device whose `screenrecord --output-format=h264` produces H.264 |
+| `screencap` (Android, iOS) | multipart screenshots, at most 10 fps | HTTP as above; iOS through idb or AXe, without the Android key buttons | nothing extra |
+
+`auto` takes the first available in that order on Android and reports
+`fallback_reason`; iOS always uses screenshots. On every transport,
+pause/resume/takeover/release govern all input and every action is journaled
+with its origin. The scrcpy path journals one record per completed gesture,
+wheel burst, key press, text entry, paste, system button and handoff change,
+never clipboard or sensitive text; `/status` `scrcpy.journal_pending` and
+`scrcpy.journal_dropped` count the records waiting for the bridge and those
+dropped because 256 were already waiting.
 
 ## CLI surface
 
@@ -231,7 +248,9 @@ autonom simulator text-size <action> [--value KEY=VALUE] [--json OBJECT]
 autonom simulator status-bar <action> [--value KEY=VALUE] [--json OBJECT]
 autonom simulator keyboard <action> [--value KEY=VALUE] [--json OBJECT]
 autonom simulator animations <action> [--value KEY=VALUE] [--json OBJECT]
-autonom canvas serve [--port N] [--transport auto|screenrecord|screencap] [--fps N] [--token TOKEN] [--no-auth]
+autonom canvas serve [--port N] [--transport auto|scrcpy|screenrecord|screencap] [--fps N]
+                     [--max-size PX] [--bit-rate BPS] [--scrcpy-server PATH [--scrcpy-version X.Y]]
+                     [--token TOKEN] [--no-auth]
 autonom media add <path>
 autonom file ls [remote] [--app-id ID] | file pull <remote> [--app-id ID] [--out PATH]
 
@@ -275,6 +294,7 @@ of the verb that rejected the flag.
 | `AUTONOM_IDB_COMPANION` | `host:port` of an idb companion on another Mac; every idb call gets `--companion host:port` (`--idb-host`/`--idb-port` set it) |
 | `AUTONOM_AXE` | Path to the AXe binary used for iOS input when idb's HID cannot run (`--axe`) |
 | `AUTONOM_IOS_HID` | iOS input backend: `auto` (default: idb, AXe when idb HID is known broken), `idb`, or `axe` (`--ios-hid`) |
+| `AUTONOM_SCRCPY_SERVER`, `SCRCPY_SERVER_PATH` | The scrcpy-server file of the Mobile Canvas scrcpy transport, read in this order after `canvas serve --scrcpy-server`; the version comes from the file name (`scrcpy-server-v4.1`), and a set variable that points at a missing or other-version file is reported, not skipped |
 | `AUTONOM_IOS_LOG_MAX_MB` | Per-file cap of the `session start --log-stream` file on iOS, in MB (default 50, one rotation) |
 | `AUTONOM_IDB_STATE_FILE` | The fb-idb client's companion registry (default `/tmp/idb/state`), read to decide whether a stale-companion retry pruned anything |
 | `AUTONOM_CORESIMULATOR_DEVICES` | The CoreSimulator `Devices` directory `simulator keyboard` edits (default `~/Library/Developer/CoreSimulator/Devices`); point it at a mounted tree to pin a remote Mac's simulator |
@@ -296,9 +316,9 @@ What each earlier limitation cost, and what replaced it.
 | Kotlin/Compose-first scope | Six Flutter-specific skills plus hybrid routing |
 | Codex-only packaging | Portable skills + one-command `install.sh` for Codex, Claude, Grok, generic agents |
 | Static toolchain snapshot | Repository/local inspection with no “latest” assertion |
-| Screenshot polling browser | H.264 + ffmpeg MJPEG path, persistent fallback, status and reconnect |
+| Screenshot polling browser | scrcpy H.264 decoded in the page with real-time touch, keys and clipboard; H.264 + ffmpeg MJPEG and screenshots as shared fallbacks with a stated reason; status and reconnect |
 | Android-only device control | One verb set over Android and the iOS Simulator, with a shared compact node schema |
-| Unauthenticated input bridge | Random token, localhost-only bind, allowlisted input, body limits |
+| Unauthenticated input bridge | Random token, localhost-only bind, Host check, cookie + CSRF + Origin for WebSockets, an unframeable page, allowlisted and strictly validated input, body and message limits |
 | Exact text-only UI targeting | text/semantics/id/class/package, exact/contains/regex, waits and duplicate control |
 | Directional memory capture only | Structured artifacts plus multi-capture trend analysis, while retaining proof rules |
 | Limited executable validation | Python and Node tests, fake adb/simctl/idb backends, a recorded contract golden, a bare-host sweep, a TTY guard, and a doc-drift check — all run locally by `./scripts/run_checks.sh` |

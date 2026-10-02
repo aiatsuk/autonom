@@ -40,13 +40,52 @@ reports exactly which are present and prints the install command for the rest.
 `./install.sh --tools` (or `./scripts/bootstrap.sh --install` directly) fetches
 the mechanical ones — adb, mitmproxy, idb — through `brew`, `pipx`, or
 `apt-get`. Without `--install` the script only reports what is missing and the
-exact command for each. The manual sections below explain what those commands
+exact command for each. It also reports the optional scrcpy, which it
+installs only with `--install --with-scrcpy` and whose absence never fails
+the check. The manual sections below explain what those commands
 do and cover the traps the automation cannot decide for you.
 
 ### Android targets
 
 Android platform-tools on `PATH`, or pass `--adb /path/to/adb`
 (or set `AUTONOM_ADB`).
+
+#### Optional: scrcpy for the Mobile Canvas
+
+`autonom canvas serve` mirrors an Android target fastest through
+scrcpy-server 4.1: the device's own H.264 is decoded in the page, and touch,
+keys and the clipboard go to the device as they happen. Without it,
+`--transport auto` falls back to `screenrecord` + ffmpeg or to screenshots
+and says why. Autonom never downloads the server; a package manager provides
+it:
+
+```bash
+brew install scrcpy                               # macOS
+sudo apt-get install scrcpy                       # Linux; distribution packages may predate 4.1
+./scripts/bootstrap.sh --install --with-scrcpy    # either of the above, through the bootstrap
+```
+
+`./install.sh --tools` does not install scrcpy. The Canvas finds the server
+in this order and uses the first source that is set, reporting it when it is
+broken instead of trying the next:
+
+1. `canvas serve --scrcpy-server PATH` (add `--scrcpy-version 4.1` when the
+   file name does not say the version);
+2. `AUTONOM_SCRCPY_SERVER`, then `SCRCPY_SERVER_PATH` — a file named
+   `scrcpy-server-v4.1` (or `.jar`), since its version is read from the name;
+3. the server an installed `scrcpy` ships under `<prefix>/share/scrcpy/`, at
+   the version `scrcpy --version` prints.
+
+`autonom doctor` reports the result under `optional_tools.scrcpy` and never
+fails `--strict` over it. Only 4.1 is accepted: after an upgrade to another
+scrcpy release the Canvas falls back until Autonom supports that version.
+
+The decoded picture needs a browser with an H.264 WebCodecs `VideoDecoder`;
+any other browser gets the multipart picture with the same streamed input.
+Emulators encode H.264 in software, so start one with `-gpu host` for a
+usable frame rate (in one measurement a `-no-window` emulator in its default
+GPU mode rendered about 13 fps, and `-gpu host` about 38), and lower
+`canvas serve --max-size` for more frames.
 
 ### iOS Simulator targets (macOS only)
 
@@ -148,7 +187,12 @@ screenshots, logs, and captured traffic: treat the directory as sensitive and
 delete it when an investigation ends.
 
 Binary paths can be pinned without flags: `AUTONOM_ADB`, `AUTONOM_SIMCTL`,
-`AUTONOM_IDB`, `AUTONOM_AXE`, `AUTONOM_EMULATOR`, `AUTONOM_MITMDUMP`.
+`AUTONOM_IDB`, `AUTONOM_AXE`, `AUTONOM_EMULATOR`, `AUTONOM_MITMDUMP`; the
+scrcpy-server file with `AUTONOM_SCRCPY_SERVER` or `SCRCPY_SERVER_PATH`.
+
+On an Android target, the Mobile Canvas scrcpy transport pushes its server
+to `/data/local/tmp/autonom-scrcpy-4.1.jar` and, while it streams, holds one
+`adb forward`, which it removes when it stops.
 
 ## Put `autonom` on PATH
 

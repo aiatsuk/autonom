@@ -139,7 +139,10 @@ Two rules carry the design.
    radius. The one AXe command line lives in `ui_ios.py` beside the routing
    decision. `doctor.py` is the deliberate exception: it probes `idb
    list-targets` and SimulatorKit's location itself, because a diagnostic must
-   keep working when the wrapper does not.
+   keep working when the wrapper does not. The Mobile Canvas scrcpy transport
+   is the other one: its Node process writes streamed input to scrcpy's
+   control socket itself and only journals through the Python bridge (see
+   [Mobile Canvas](#mobile-canvas)).
 2. **Platform knowledge stays below the CLI.** `autonom.py` still branches on
    `target.platform` where the *verb itself* differs between platforms — iOS has
    no `pm clear`, Android has no per-process launch environment, iOS attach is
@@ -231,6 +234,182 @@ device before the **first** pin, and `clear`/`reset` restores exactly that
 and deletes the section. `keyboard pin` keeps its own per-UDID snapshot under
 `simulator-prefs/` with the same merge rule.
 
+## Mobile Canvas
+
+`canvas serve` supervises one Node process that serves the page, the device
+picture and its input on `127.0.0.1`. It lives with its skill in
+`plugins/autonom/skills/android-emulator-browser/scripts/` and has no npm
+dependency: the WebSocket server and the scrcpy wire format are written by
+hand, and the encoders are tested against the byte arrays of scrcpy's own
+serialization tests.
+
+| File | Role |
+| --- | --- |
+| `android-emulator-browser.mjs` | HTTP and WebSocket endpoints, auth, transport choice, video fan-out, handoff, the journal queue, the page |
+| `browser-lib.mjs` | argument parsing, the Host and Origin checks, strict control-message validation |
+| `scrcpy-lib.mjs` | the scrcpy 4.1 protocol without I/O: video headers, control encoders, device messages, the codec string, the browser key map |
+| `scrcpy-session.mjs` | one scrcpy-server on the device (push, `adb forward`, start, sockets, restart, stop) and server discovery |
+| `ws.mjs` | the server side of RFC 6455 |
+| `scripts/autonom_canvas_bridge.py` | the persistent Python bridge: HTTP input through `ui.*`, and the `record` operation, which only journals |
+
+```text
+browser page
+  ├─ /ws/video ◀─────────── H.264 packets ──┐
+  ├─ /ws/control ────────── JSON input ────▶│
+  ├─ /stream.mjpeg ◀─────── frames ─────────│  Canvas (node)
+  └─ /tap /swipe /key /text ───────────────▶│
+                                            ├── adb forward ──▶ scrcpy-server 4.1 on the device
+                                            ├── one capture loop: screenrecord + ffmpeg, or screencap
+                                            └── NDJSON ──▶ autonom_canvas_bridge.py ──▶ ui.* actuators, journal
+```
+
+### Transport choice
+
+`auto` on Android takes the first that works: scrcpy when a scrcpy-server
+4.1 resolves, `screenrecord` + ffmpeg when the device produces H.264, then
+`screencap`. The server comes from `--scrcpy-server` (with `--scrcpy-version`
+when its file name does not say), `AUTONOM_SCRCPY_SERVER`,
+`SCRCPY_SERVER_PATH`, then the server an installed `scrcpy` ships beside its
+binary, found through the symlink to its real prefix and versioned by
+`scrcpy --version`. The first source that is set decides: a broken one is
+reported, never skipped, so the Canvas never quietly uses another file than
+the one configured. Any version but 4.1 is refused, because scrcpy keeps no
+protocol compatibility between releases, and Autonom never downloads a
+server. `doctor.py` repeats the same resolution for `optional_tools.scrcpy`.
+
+H.264 output from `screenrecord` is probed by running `screenrecord
+--output-format=h264 --time-limit 1` for at most 5 s and looking for an SPS:
+Android 16 (API 36) no longer lists that hidden option in `--help`, although
+it still works. `fallback_reason` in `/status` and in the startup output names
+every skipped step. A scrcpy server that never streams under `auto` (a device
+that cannot encode H.264, say) moves the Canvas to the multipart fallback at
+run time; an explicit `--transport scrcpy` keeps retrying instead.
+
+### Lifecycle and video
+
+One device server per Canvas. It starts with the first WebSocket client,
+stops 15 s after the last one leaves, and is stopped on shutdown, which waits
+up to 3 s for it. The server file is pushed to
+`/data/local/tmp/autonom-scrcpy-4.1.jar` and started through `adb shell
+app_process` with `tunnel_forward=true audio=false control=true cleanup=true
+video_codec=h264 clipboard_autosync=false` plus the size, bit-rate and fps
+caps. States run idle → starting → streaming ↔ restarting → stopped. An
+unexpected exit restarts after 1 s, doubling to 10 s and back to 1 s after
+30 s of streaming; a stopped session never restarts. Stopping closes both
+sockets, ends the `adb shell` child, removes the `adb forward`, and kills a
+server still waiting for its sockets by its `scid`.
+
+`/ws/video` carries binary messages — `1` session (u32 width, u32 height),
+`2` codec config (SPS/PPS), `3` packet (a flag byte whose bit 0 marks a key
+frame, u64 PTS in µs, the Annex B payload) — with each payload byte for byte
+as the server sent it, plus JSON `state` messages. A late joiner gets the
+session, the config and the packets since the last key frame. That cache is
+capped at 8 MiB; past it the cache is dropped and a key frame requested. A
+client more than 4 MiB behind gets no packets until the next key frame, which
+is requested for it (`RESET_VIDEO`, at most once a second), so one slow tab
+never holds the others back. Session and config messages come with every
+reset and rotation, so a client dropping packets, or 64 KiB behind, keeps only
+the latest of each, and gets them, session first, before its next packet. The page decodes with WebCodecs and falls back
+to `/stream.mjpeg`, with its reason, when it cannot. Multipart clients of
+every transport, iOS included, share one capture loop, and a client more
+than 2 MiB behind skips frames.
+
+### Input and the journal
+
+Streamed input is the one place the Canvas actuates without the bridge,
+because a process hop per pointer move is too slow. Each message is
+validated (finite numbers, ranges, enums, the key allowlist, at most 64 KiB),
+checked against the handoff state, and written to the control socket in
+arrival order. Coordinates arrive normalized and are mapped to the video size
+current when the message is handled. scrcpy ignores a positional event made
+for another size than its current one, and the Canvas learns of a rotation
+only from the next session header, so when that header brings a new size the
+Canvas lifts every pointer still down with the new size (their gestures end,
+and later moves for them are refused) and sends again, with the new size, the
+up of any pointer released in the second before. Device pointer ids 0..9 are
+unique across connections. Keycodes stand for US key positions, so the page
+(`keyInputFor` in `scrcpy-lib.mjs`) sends a printable key as text when its
+character differs from what a US layout types there, Shift considered, or its
+position has no keycode, unless Meta or a plain Ctrl makes it a shortcut:
+other layouts, the AltGr layer (Ctrl+Alt or the AltGraph modifier) and the
+macOS Option layer (Alt alone) type their own characters. Ctrl+V and Cmd+V
+send nothing, so the browser's paste event carries the clipboard. A dead key,
+and a keydown that only feeds an input method while it composes, sends
+nothing; the composed character comes with the next keydown. Composition beyond dead keys
+(CJK input methods) is not handled on the screen; the text box takes it.
+Printable ASCII is typed with `INJECT_TEXT`; any other text, and every paste,
+goes through `SET_CLIPBOARD` with paste, which replaces the device clipboard.
+scrcpy-server sets the clipboard and only injects the paste key, and the app
+reads the clipboard when it handles that key, so a later `SET_CLIPBOARD` or
+key could overtake it. Each such write therefore carries a non-zero sequence,
+and no other device input is written until the device's `ACK_CLIPBOARD` for
+it plus a 200 ms settle delay, or 1 s without an ack (noted in `last_error`).
+The settle delay is a heuristic: an app that handles the paste key later than
+that can still read a newer clipboard and lose text in a fast burst of
+Unicode text interleaved with other input.
+Messages that arrive meanwhile, on any connection, wait as held input and are
+handled in arrival order, with their handoff checks and journal records at
+that time. A connection is still read while only this wait holds it, up to
+64 KiB, then paused like for any other bound. A pointer or key lifted
+meanwhile waits behind the paste too. A server restart or stop drops the
+wait: no ack will come, and held input meets the session check and is refused.
+A paste takes effect only if the focused app handles `KEYCODE_PASTE` (Android
+7 and later); in an app that ignores it the text never arrives, while the
+journal records that the text was sent, not that the app accepted it.
+
+A pause, a takeover by another origin, a disconnect, a refusal or a server
+restart lifts every pointer and key the connection holds. What a dead server
+injected stays down on Android, so on a restart those pointers and keys are
+remembered (their device pointer ids stay taken) and lifted through the new
+server once its first session header gives the video size. So is every up
+and key-up the dead server may never have read: one still waiting behind a
+paste, or written to it in the last second. The Canvas sends
+one `record` per completed action — gesture, wheel burst, key press, text
+entry, paste, system button, control change — to the bridge, which rebuilds
+the summary from an allowlist (never clipboard text, never sensitive text),
+writes the `canvas-<kind>` action detail and the `ui <kind>` journal entry
+with the action's origin, and never calls an actuator. A pointer or key the
+Canvas lifted is journaled like one its client released.
+
+The bridge journals into the current Autonom session only when that session
+is on the Canvas's own target (same `target_id`, and same `platform` when the
+record names one). With no current session, or one on another device, the
+action still runs and answers ok, and nothing is journaled, so a Canvas on
+one device never writes into the record of a session on another. The rule is
+the same for `record` and for the HTTP input the bridge actuates (`tap`,
+`swipe`, `key`, `text`).
+
+### Backpressure
+
+Nothing a client sends is buffered without bound. A control connection stops
+being read while the device has not read 256 KiB of control bytes, while the
+connection has not read 256 KiB of replies, while 64 of its journal records
+are unanswered, or while 256 records wait in all; it is read again once each
+is back under half its bound. Messages already parsed from the read that
+paused it wait in order, up to 1 MiB; past that the connection is closed with
+1013. A client with more than 4 MiB of unread replies is closed with 1008,
+and one more than 64 KiB behind gets the current state once it catches up
+instead of every state message. Journal records go to the bridge in order,
+16 at a time; `/status` reports `scrcpy.journal_pending`, and a record
+produced while 256 are already pending (a pointer lifted by a takeover during
+a flood) is dropped and counted in `scrcpy.journal_dropped`. Bounded memory
+is the promise, not throughput: a client that already holds the token or the
+cookie can still make input slow, delay journaling, or get itself closed.
+That risk is accepted, because such a client can drive the device anyway.
+
+### Canvas security
+
+Every HTTP request and WebSocket upgrade must name the Canvas in its `Host`
+header (`127.0.0.1:<port>` or `localhost:<port>`), which defeats DNS
+rebinding. Browsers apply no CORS to WebSockets, so an upgrade from the page
+needs the HttpOnly `SameSite=Strict` session cookie, that session's CSRF
+value in the `csrf` query, and a Canvas `Origin`; API clients use the token
+(query or bearer) and may name their origin. A foreign `Origin` is refused
+whatever it carries. Another local port is the same site and shares the
+cookie, so the page refuses to be framed (`frame-ancestors 'none'`,
+`X-Frame-Options: DENY`, and a 403 for framed loads), and a reloaded page
+gets its CSRF value back only from a same-origin fetch.
+
 ## Compact node schema
 
 The single most important contract: an iOS node and an Android node are
@@ -296,8 +475,19 @@ validator fails the build when a plugin manifest disagrees with it.
   environment without restoring it (`tests/env_isolation.py` is the sanctioned
   idiom) fails the suite instead of silently redirecting later tests to the
   operator's real `~/.autonom`.
+- **Canvas against a fake device** — `tests/browser-scrcpy.test.mjs` runs
+  the real Canvas process against a fake adb, an in-process fake scrcpy
+  device behind the forward port, and a fake journal bridge: discovery, auth,
+  fan-out, input, journal, and a memory-bound flood test per message type.
+  `tests/scrcpy-lib.test.mjs` compares every encoder with the bytes of
+  scrcpy's own serialization tests.
 - **Device-backed** — CI runs no emulator or simulator; device runs are
   manual and evidenced by before/after artifacts, never by exit codes alone.
+  `tests/live/canvas_scrcpy_live.mjs` (cases `picture`, `bench`, `tabs`,
+  `restart`, `input`, `journal`) is such a run for the Canvas: it needs an
+  explicit `--serial`, runs in its own temporary `AUTONOM_HOME` so it never
+  reads, stops or writes the operator's sessions, writes one JSON report per
+  case into `--evidence-dir`, and is never run by `run_checks.sh`.
 
 ## Flutter-first boundary (current domain pack)
 
@@ -324,9 +514,13 @@ remaining uncertainty.
 
 The browser bridge and the network proxy bind to localhost — the proxy has no
 flag to widen it — use tokens or explicit confirmation for privileged setup, and
-must never be exposed publicly. Consent for MITM and CA installation is required
-per invocation: a flag plus a typed phrase on a terminal, never cached, never
-grantable by an environment variable or a prior run. App-container file access is
+must never be exposed publicly. The Canvas also refuses any request whose
+`Host` header is not its own, accepts a WebSocket only with the session
+cookie, its CSRF value and its own `Origin` (or the token), and cannot be
+framed ([Canvas security](#canvas-security)). Consent for MITM and CA
+installation is required per invocation: a flag plus a typed phrase on a
+terminal, never cached, never grantable by an environment variable or a prior
+run. App-container file access is
 confined to the container and never echoes file contents. Credentials are masked
 at capture time, so an archived artifact directory has never held them. The MITM
 CA private key lives in the machine-level state root (mode `0700`) outside
