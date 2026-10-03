@@ -354,14 +354,14 @@ export function h264CodecString(configPacket) {
   return `avc1.${hexByte(header[1])}${hexByte(header[2])}${hexByte(header[3])}`;
 }
 
-const VERSION_TOKEN = String.raw`(\d+(?:\.\d+)+(?:-[0-9A-Za-z.]+)?)`;
-const VERSION_OUTPUT = new RegExp(String.raw`^\s*scrcpy\s+v?${VERSION_TOKEN}(?=\s|$)`, "m");
-const SERVER_FILE = new RegExp(String.raw`^scrcpy-server-v${VERSION_TOKEN}(?:\.jar)?$`);
+const VERSION_NUMBER = String.raw`(\d+(?:\.\d+)+(?:-[0-9A-Za-z.]+)?)`;
+const VERSION_OUTPUT = new RegExp(String.raw`^\s*scrcpy\s+v?${VERSION_NUMBER}(?=\s|$)`, "m");
+const SERVER_FILE = new RegExp(String.raw`^scrcpy-server-v${VERSION_NUMBER}(?:\.jar)?$`);
 
 /**
  * Version from `scrcpy --version` output ("scrcpy 4.1 <https://...>") or from a
  * release file name such as `scrcpy-server-v4.1`; null when neither is present.
- * The full version token is kept so a pre-release never passes as 4.1.
+ * The full version string is kept so a pre-release never passes as 4.1.
  */
 export function parseScrcpyVersion(text) {
   if (typeof text !== "string") return null;
