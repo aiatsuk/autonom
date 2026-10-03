@@ -1,6 +1,6 @@
 ---
 name: android-emulator-browser
-description: Mirror and lightly control an Android target or iOS Simulator in the visible Codex browser through the authenticated Autonom Mobile Canvas.
+description: "Mirror and control an Android target or iOS Simulator in a browser through the authenticated Autonom Mobile Canvas: live scrcpy H.264 decoded with WebCodecs and real-time touch, keys, text and clipboard on Android, with screenrecord and screenshot fallbacks."
 ---
 
 # Mobile Canvas browser
@@ -29,6 +29,11 @@ the session through the cookie. The startup lines name the chosen transport
 and, for `auto`, why a faster one was skipped. Leave the process running and
 confirm the picture moves (the status panel's `fps` on scrcpy, `frames`
 otherwise) before calling the setup successful.
+
+Stop the Canvas with Ctrl+C in its terminal. For a background run, send
+SIGTERM to the `autonom canvas serve` process; a job started in the
+background from a script ignores SIGINT. There is no separate stop command.
+Stopping ends the scrcpy device server and removes its `adb forward`.
 
 ## Transport modes
 
