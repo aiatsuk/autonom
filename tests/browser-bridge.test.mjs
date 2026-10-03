@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawn } from "node:child_process";
@@ -10,6 +10,15 @@ const BRIDGE = join(
   ROOT,
   "plugins/autonom/skills/android-emulator-browser/scripts/android-emulator-browser.mjs",
 );
+
+// The Android display presets /status lists, in order (DISPLAY-001).
+const DISPLAY_PRESETS = [
+  { id: "small", label: "Small phone", width: 720, height: 1280, density: 320 },
+  { id: "pixel-11", label: "Pixel 11", width: 1080, height: 2424, density: 420 },
+  { id: "pixel-fold", label: "Pixel Fold (open)", width: 2208, height: 1840, density: 420 },
+  { id: "tablet", label: "Tablet", width: 2560, height: 1600, density: 320 },
+  { id: "default", label: "Device default" },
+];
 
 const PNG_BASE64 =
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9Wl8sAAAAASUVORK5CYII=";
@@ -61,6 +70,8 @@ elif args == ["shell", "screenrecord", "--help"]:
     print("screenrecord test stub", flush=True)
 elif args == ["shell", "wm", "size"]:
     print("Physical size: 1080x2400", flush=True)
+elif args == ["shell", "wm", "density"]:
+    print("Physical density: 420", flush=True)
 elif args == ["exec-out", "screencap", "-p"]:
     sys.stdout.buffer.write(base64.b64decode("${PNG_BASE64}"))
     sys.stdout.buffer.flush()
@@ -87,15 +98,21 @@ else:
     ],
     {
       cwd: ROOT,
-      env: { ...process.env, FAKE_ADB_LOG: adbLog,
+      // The real journal bridge runs on python3: it must leave no bytecode in the checkout.
+      env: { ...process.env, FAKE_ADB_LOG: adbLog, PYTHONDONTWRITEBYTECODE: "1",
         AUTONOM_HOME: join(directory, "autonom-home") },
       stdio: ["ignore", "pipe", "pipe"],
     },
   );
   let stderr = "";
   child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
-  t.after(() => {
-    if (!child.killed) child.kill("SIGTERM");
+  t.after(async () => {
+    if (child.exitCode === null && child.signalCode === null) {
+      const exited = new Promise((resolvePromise) => child.once("exit", resolvePromise));
+      child.kill("SIGTERM");
+      await exited;
+    }
+    await rm(directory, { recursive: true, force: true });
   });
 
   const preview = await waitForPreview(child);
@@ -122,7 +139,8 @@ else:
   const statusBody = await status.json();
   assert.equal(statusBody.serial, "emulator-5554");
   assert.equal(statusBody.transport, "screencap");
-  assert.deepEqual(statusBody.display, { width: 1080, height: 2400 });
+  assert.deepEqual(statusBody.display,
+    { width: 1080, height: 2400, density: 420, preset: "default", presets: DISPLAY_PRESETS });
 
   const frame = await fetch(`${origin}/frame`, { headers: { Cookie: cookie } });
   assert.equal(frame.status, 200);

@@ -147,6 +147,28 @@ const SYSTEM_PANELS = Object.freeze({
   collapse: CONTROL_MESSAGE_TYPE.COLLAPSE_PANELS,
   rotate: CONTROL_MESSAGE_TYPE.ROTATE_DEVICE,
 });
+// Android display presets (DISPLAY-001), from the SDK device profiles small_phone,
+// pixel_fold and pixel_tablet and the published Pixel 11 display. `default` resets the
+// target to its own size and density. The order is the order pages and /status show.
+const DISPLAY_PRESETS = Object.freeze([
+  { id: "small", label: "Small phone", width: 720, height: 1280, density: 320 },
+  { id: "pixel-11", label: "Pixel 11", width: 1080, height: 2424, density: 420 },
+  { id: "pixel-fold", label: "Pixel Fold (open)", width: 2208, height: 1840, density: 420 },
+  { id: "tablet", label: "Tablet", width: 2560, height: 1600, density: 320 },
+  { id: "default", label: "Device default" },
+].map((preset) => Object.freeze(preset)));
+const DISPLAY_PRESET_IDS = Object.freeze(DISPLAY_PRESETS.map((preset) => preset.id));
+// Each `wm` call; the stop-time restore runs inside SHUTDOWN_STOP_MS as a whole.
+const WM_TIMEOUT_MS = 5000;
+// /status and the state message show a `wm` reading at most this old (DISPLAY-001). Pages
+// poll /status about every second, so readings are shared instead of made per request.
+const DISPLAY_READ_MAX_AGE_MS = 2000;
+// State messages go to WebSocket clients, which need not ask /status: while one is
+// connected the reading is renewed once it is this old, so it stays within the age above
+// as long as adb answers a reading within the difference.
+const DISPLAY_WATCH_AGE_MS = 1500;
+// The largest display side `dw` and `dh` of POST /tap and /swipe may name, as the journal's.
+const MAX_SENT_DISPLAY_SIDE = 10_000;
 
 main().catch((error) => {
   console.error(`android-emulator-browser: ${error.message}`);
@@ -223,6 +245,8 @@ async function main() {
     clipboardHold: null,
     heldWrites: [],
     heldWriteBytes: 0,
+    // Waiting until no device write is held behind a paste (heldWritesSent).
+    heldWritesWaiters: [],
     clipboardSequence: 0n,
     // Arrival order of held control messages, across connections.
     heldOrder: 0,
@@ -234,6 +258,33 @@ async function main() {
     // through the next server once its video size is known.
     orphans: { pointers: new Map(), keys: new Set() },
     display: null,
+    // The newest `wm` reading (readWm, null when it failed), when it started, the reading
+    // in flight, and whether the last one failed (last_error says so once). The preset it
+    // stands for (presetInEffect), from the last preset whose commands succeeded and whose
+    // read-back matched it.
+    displayWm: null,
+    displayWmAt: -Infinity,
+    displayReading: null,
+    displayReadFailed: false,
+    displayPreset: null,
+    displayApplied: null,
+    // The timer renewing the reading while WebSocket clients are connected (watchDisplay),
+    // and whether a state message went out with a reading older than allowed, so the next
+    // reading is sent to every client even when it shows the same.
+    displayWatch: null,
+    displayStaleSent: false,
+    // The size and density overrides found before the first change, and whether a `wm`
+    // command may have changed the display since, so the stop puts them back.
+    displayOriginal: null,
+    displayWritten: false,
+    // The change waiting in the input queue, at most one, and the `wm` commands of the one
+    // running, which are all the restore at stop waits for.
+    displayWaiting: null,
+    displayRunning: null,
+    // The bridge of its own that writes the restore record while the shared one is busy.
+    restoreBridge: null,
+    // Tasks ever queued: a waiting change with nothing queued after it is the last one.
+    inputEnqueued: 0,
     journalQueue: [],
     journalDraining: false,
     journalInFlight: 0,
@@ -242,7 +293,12 @@ async function main() {
     broadcaster: null,
     shuttingDown: false,
     enqueueInput(task) {
-      inputQueue = inputQueue.catch(() => {}).then(task);
+      inputQueue = inputQueue.catch(() => {}).then(() => {
+        // Once the Canvas stops, queued input is dropped instead of delaying the restore.
+        if (context.shuttingDown) throw inputError(503, "Canvas is stopping");
+        return task();
+      });
+      context.inputEnqueued += 1;
       return inputQueue;
     },
   };
@@ -302,9 +358,15 @@ async function main() {
     }
     context.broadcaster.stop();
     clearTimeout(context.idleTimer);
-    // The device server and the adb forward must be gone before the process is.
-    await Promise.race([stopSession(context), sleep(SHUTDOWN_STOP_MS)]);
+    clearTimeout(context.displayWatch);
+    // The device server and the adb forward must be gone before the process is, and the
+    // display back as it was, within the 5 s the supervisor allows after SIGTERM.
+    await Promise.race([
+      Promise.all([stopSession(context), restoreDisplay(context)]),
+      sleep(SHUTDOWN_STOP_MS),
+    ]);
     actionBridge.close();
+    context.restoreBridge?.close();
     server.close(() => exit(0));
     server.closeAllConnections?.();
     setTimeout(() => exit(0), 1000).unref();
@@ -437,6 +499,8 @@ async function handleRequest(context, request, response) {
     await text(context, response, await readJsonBody(request), origin);
   } else if (request.method === "POST" && url.pathname === "/control") {
     await control(context, response, await readJsonBody(request), origin);
+  } else if (request.method === "POST" && url.pathname === "/display") {
+    await setDisplay(context, response, await readJsonBody(request), origin);
   } else {
     sendJson(response, 404, { error: "Not found" });
   }
@@ -654,13 +718,16 @@ function fallbackReason(context) {
 }
 
 async function sendStatus(context, response) {
-  const measured = await context.actionBridge.call("screen-size", {}, "system");
+  const [measured] = await Promise.all([
+    context.actionBridge.call("screen-size", {}, "system"),
+    freshDisplay(context),
+  ]);
   if (measured.display) context.display = measured.display;
   const transport = chooseTransport(context);
   sendJson(response, 200, {
     platform: context.options.platform,
     serial: context.serial,
-    display: measured.display,
+    display: displayStatus(context, measured.display),
     transport,
     requested_transport: context.options.transport,
     fallback_reason: fallbackReason(context),
@@ -783,6 +850,8 @@ class FrameBroadcaster {
   #clients = new Set();
   #running = false;
   #stopCapture = null;
+  // "screenrecord" or "screencap" while a capture of that kind runs.
+  #capture = null;
 
   constructor(context) {
     this.#context = context;
@@ -801,6 +870,14 @@ class FrameBroadcaster {
   stop() {
     this.#clients.clear();
     this.#stopCapture?.();
+  }
+
+  /**
+   * The display size changed (DISPLAY-008). screenrecord keeps the size it started with,
+   * so its capture ends and the loop starts a new one; each screencap has the new size.
+   */
+  restartCapture() {
+    if (this.#capture === "screenrecord") this.#stopCapture?.();
   }
 
   #broadcast(frame, contentType) {
@@ -822,6 +899,7 @@ class FrameBroadcaster {
     } finally {
       this.#running = false;
       this.#stopCapture = null;
+      this.#capture = null;
     }
     if (this.#clients.size) {
       setTimeout(() => {
@@ -832,6 +910,7 @@ class FrameBroadcaster {
 
   async #screencap() {
     const context = this.#context;
+    this.#capture = "screencap";
     let stopped = false;
     let wake = null;
     this.#stopCapture = () => {
@@ -884,11 +963,14 @@ class FrameBroadcaster {
     ffmpeg.stdin.on("error", () => {});
     let carry = Buffer.alloc(0);
     let receivedFrame = false;
+    let stopped = false;
     let stderr = "";
     const keepStderr = (chunk) => { stderr = (stderr + chunk.toString()).slice(-4000); };
     adb.stderr.on("data", keepStderr);
     ffmpeg.stderr.on("data", keepStderr);
+    this.#capture = "screenrecord";
     this.#stopCapture = () => {
+      stopped = true;
       adb.kill("SIGTERM");
       ffmpeg.kill("SIGTERM");
     };
@@ -912,7 +994,8 @@ class FrameBroadcaster {
       adb.once("error", failed);
       ffmpeg.once("close", (code) => {
         adb.kill("SIGTERM");
-        if (!receivedFrame && this.#clients.size) {
+        // A capture ended on purpose, before its first frame, has not failed.
+        if (!receivedFrame && this.#clients.size && !stopped) {
           state.acceleratedFailed = true;
           state.lastError = `accelerated stream failed${code === null ? "" : ` (exit ${code})`}: ${stderr.trim()}`;
         }
@@ -973,7 +1056,25 @@ function stateMessage(context) {
     height: context.video.size?.height ?? null,
     clients: { video: context.videoClients.size, control: context.controlClients.size },
     session: context.session?.state ?? "idle",
+    // Only Android has this transport, so state messages show the display preset.
+    ...stateDisplay(context),
+    presets: DISPLAY_PRESETS,
   });
+}
+
+/**
+ * The preset and density a state message shows, from a reading begun at most
+ * DISPLAY_READ_MAX_AGE_MS before (DISPLAY-001). The reading is renewed while clients are
+ * connected (watchDisplay); while it is older even so (the first client just connected,
+ * or adb is slow) both are left out, pages keep what they show, and the next reading
+ * then goes to every client.
+ */
+function stateDisplay(context) {
+  if (performance.now() - context.displayWmAt > DISPLAY_READ_MAX_AGE_MS) {
+    context.displayStaleSent = true;
+    return {};
+  }
+  return { preset: context.displayPreset, density: context.displayWm?.density ?? null };
 }
 
 function broadcastState(context) {
@@ -1105,6 +1206,7 @@ function openVideoClient(context, ws, socket) {
     context.videoClients.delete(client);
     broadcastState(context);
     scheduleIdleStop(context);
+    watchDisplay(context);
   });
   ensureSession(context);
   const video = context.video;
@@ -1118,6 +1220,7 @@ function openVideoClient(context, ws, socket) {
     context.session?.requestKeyFrame();
   }
   broadcastState(context);
+  watchDisplay(context);
 }
 
 function onVideoSession(context, size) {
@@ -1284,9 +1387,11 @@ function openControlClient(context, ws, origin, socket) {
     context.clipboardRequest?.clients.delete(client);
     broadcastState(context);
     scheduleIdleStop(context);
+    watchDisplay(context);
   });
   ensureSession(context);
   broadcastState(context);
+  watchDisplay(context);
 }
 
 /**
@@ -1443,10 +1548,23 @@ function refusal(context, origin) {
 
 class InputError extends Error {}
 
+/**
+ * The shared parser knows device input only; a display change is this server's own
+ * message, and its preset is checked once its sender may change the display.
+ */
+function parseCanvasMessage(raw) {
+  try {
+    return parseControlMessage(raw);
+  } catch (error) {
+    if (error.for !== "display") throw error;
+    return { t: "display", preset: JSON.parse(raw).preset };
+  }
+}
+
 function handleControlMessage(context, client, raw) {
   let message;
   try {
-    message = parseControlMessage(raw);
+    message = parseCanvasMessage(raw);
   } catch (error) {
     reply(context, client, { t: "error", message: error.message, for: error.for ?? null });
     return;
@@ -1487,6 +1605,15 @@ function dispatchControl(context, client, message) {
   // Handoff is checked per message, so a takeover stops a gesture already in progress.
   const refused = refusal(context, client.origin);
   if (refused) throw new InputError(refused);
+  if (message.t === "display") {
+    // `wm` goes through adb, not the device server, so no session is needed.
+    finishScroll(context, client);
+    assertDisplayPlatform(context);
+    requestDisplay(context, displayPreset(message.preset), client.origin, client).then(
+      (display) => reply(context, client, { t: "display", ok: true, display }),
+      (error) => replyDisplayError(context, client, error));
+    return;
+  }
   requireSession(context);
   // Any other input ends a wheel burst, so the journal keeps the order of actions.
   if (message.t !== "scroll") finishScroll(context, client);
@@ -1577,6 +1704,7 @@ function endClipboardHold(context, hold) {
     context.session.send(buffer, onWritten);
     if (clipboardSequence !== null) holdForClipboard(context, clipboardSequence);
   }
+  if (!context.heldWrites.length) wakeHeldWritesWaiters(context);
   resumeAllReading(context);
 }
 
@@ -1586,6 +1714,22 @@ function dropClipboardHold(context) {
   context.clipboardHold = null;
   context.heldWrites = [];
   context.heldWriteBytes = 0;
+  wakeHeldWritesWaiters(context);
+}
+
+/**
+ * Resolves once no device write waits behind a paste: every write made so far is on the
+ * device socket, or went with a device server that is gone.
+ */
+function heldWritesSent(context) {
+  if (!context.heldWrites.length) return Promise.resolve();
+  return new Promise((resolvePromise) => context.heldWritesWaiters.push(resolvePromise));
+}
+
+function wakeHeldWritesWaiters(context) {
+  const waiters = context.heldWritesWaiters;
+  context.heldWritesWaiters = [];
+  for (const wake of waiters) wake();
 }
 
 function videoSize(context) {
@@ -1939,6 +2083,404 @@ function applyControl(context, mode, origin) {
   broadcastState(context);
 }
 
+function inputError(statusCode, message) {
+  const error = new InputError(message);
+  error.statusCode = statusCode;
+  return error;
+}
+
+function assertDisplayPlatform(context) {
+  if (context.options.platform !== "android") throw inputError(400, "Display presets are Android-only");
+}
+
+/** The preset named `id`; anything else is refused naming the valid ids (DISPLAY-005). */
+function displayPreset(id) {
+  const preset = DISPLAY_PRESETS.find((item) => item.id === id);
+  if (!preset) {
+    throw inputError(400, `Unknown display preset; expected one of: ${DISPLAY_PRESET_IDS.join(", ")}`);
+  }
+  return preset;
+}
+
+function supersededError(preset) {
+  const error = inputError(409, `The display change to ${preset.id} was superseded by a later one`);
+  error.superseded = true;
+  return error;
+}
+
+function replyDisplayError(context, client, error) {
+  if (!(error instanceof InputError)) context.state.lastError = error.message;
+  const message = { t: "error", message: error.message, for: "display" };
+  if (error.superseded) message.superseded = true;
+  reply(context, client, message);
+}
+
+/**
+ * Ask for `preset` on the Canvas target; resolves with the display in effect once it is
+ * applied (DISPLAY-002). Changes run one at a time in the queue of HTTP input, in arrival
+ * order, and at most one waits (DISPLAY-007): a newer request answers the waiting one
+ * `superseded`, which then runs no `wm` command, and goes to the end of the queue. With
+ * nothing queued after the waiting change, that place is the end already and the newer
+ * request takes it over, so a flood of changes never grows the queue.
+ */
+function requestDisplay(context, preset, origin, client = null) {
+  return new Promise((resolvePromise, reject) => {
+    if (context.shuttingDown) {
+      reject(inputError(503, "Canvas is stopping"));
+      return;
+    }
+    const request = { preset, origin, client, resolve: resolvePromise, reject };
+    const waiting = context.displayWaiting;
+    if (waiting) {
+      waiting.request.reject(supersededError(waiting.request.preset));
+      if (waiting.ticket === context.inputEnqueued) {
+        waiting.request = request;
+        return;
+      }
+      waiting.request = null;
+    }
+    const entry = { request, ticket: 0 };
+    context.displayWaiting = entry;
+    context.enqueueInput(() => startDisplayChange(context, entry)).then(
+      (display) => entry.request?.resolve(display),
+      (error) => entry.request?.reject(error));
+    entry.ticket = context.inputEnqueued;
+  });
+}
+
+/** The change at the head of the queue; a superseded one was answered already and runs nothing. */
+function startDisplayChange(context, entry) {
+  if (context.displayWaiting === entry) context.displayWaiting = null;
+  const { request } = entry;
+  if (!request) return null;
+  return changeDisplay(context, request.preset, request.origin, request.client);
+}
+
+/**
+ * Held fingers and keys are lifted first, and those ups reach the device socket before any
+ * `wm` command (DISPLAY-007). The overrides in effect before the first change are kept for
+ * the restore at stop. A stop, a handoff or the asking connection closing ends a change
+ * before its first `wm` command that changes the display; once started, only a stop ends
+ * it, after the command running. The preset counts as in effect only once its commands
+ * succeeded and the display reads back as it (DISPLAY-001).
+ */
+async function changeDisplay(context, preset, origin, client) {
+  assertDisplayGoesOn(context, origin, client);
+  liftForDisplayChange(context);
+  await heldWritesSent(context);
+  assertDisplayGoesOn(context, origin, client);
+  if (!context.displayWritten) {
+    const original = await readWm(context).catch((error) => {
+      throw httpError(502, `wm could not read the display before changing it: ${adbFailure(error)}`);
+    });
+    context.displayOriginal = { size: original.sizeOverride, density: original.densityOverride };
+    assertDisplayGoesOn(context, origin, client);
+  }
+  // From here on the stop has something to put back.
+  context.displayWritten = true;
+  const commands = runWm(context, presetCommands(preset), { change: true });
+  context.displayRunning = commands;
+  const [failure] = await commands;
+  if (context.displayRunning === commands) context.displayRunning = null;
+  // The restore at stop runs now and reads the display itself.
+  if (context.shuttingDown) throw inputError(503, "Canvas is stopping");
+  const readAt = performance.now();
+  const wm = await readWm(context).catch(() => null);
+  if (context.shuttingDown) throw inputError(503, "Canvas is stopping");
+  const applied = !failure && matchesPreset(wm, preset);
+  if (applied) context.displayApplied = preset;
+  keepDisplayReading(context, wm, readAt);
+  // screenrecord keeps the size it started with (DISPLAY-008).
+  context.broadcaster.restartCapture();
+  if (failure) throw httpError(502, `${failure}; in effect: ${describeDisplay(wm)}`);
+  if (!wm) throw httpError(502, `${preset.id} was applied, but wm could not read the display back`);
+  if (!applied) throw httpError(502, `${preset.id} was applied, but wm reads ${describeDisplay(wm)}`);
+  console.log(`Display: ${preset.id} ${describeDisplay(wm)}`);
+  journal(context, client ?? { origin, journalWaiting: 0 }, {
+    kind: "display", transport: chooseTransport(context), preset: preset.id,
+    width: wm.width, height: wm.height, density: wm.density,
+  });
+  return displayInfo(context);
+}
+
+/** A change goes on only while the Canvas runs and its sender is connected and may send input. */
+function assertDisplayGoesOn(context, origin, client) {
+  if (context.shuttingDown) throw inputError(503, "Canvas is stopping");
+  if (client && !context.controlClients.has(client)) {
+    throw inputError(409, "The connection that asked for this display change closed");
+  }
+  // Control may have changed hands while this change waited for the ones before it.
+  const refused = refusal(context, origin);
+  if (refused) throw inputError(409, refused);
+}
+
+/** Lift every held finger and key before the display changes, as a takeover does. */
+function liftForDisplayChange(context) {
+  for (const client of context.controlClients) {
+    for (const id of client.pointers.keys()) liftedByCanvas(client, id, "the display size changed");
+    releaseInput(context, client);
+  }
+}
+
+function presetCommands(preset) {
+  if (preset.id === "default") return [["size", "reset"], ["density", "reset"]];
+  return [["size", `${preset.width}x${preset.height}`], ["density", String(preset.density)]];
+}
+
+/** Put back the overrides found before the first change, or reset a value that had none. */
+function restoreCommands(original) {
+  return [
+    ["size", original.size ? `${original.size.width}x${original.size.height}` : "reset"],
+    ["density", original.density ? String(original.density) : "reset"],
+  ];
+}
+
+/**
+ * Run `wm` commands on the Canvas target in order; returns what failed, as text. A change
+ * stops at its first failure, and before its next command once the Canvas stops, since
+ * the restore puts back both values; the restore runs every command.
+ */
+async function runWm(context, commands, { change }) {
+  const failures = [];
+  for (const command of commands) {
+    if (change && context.shuttingDown) break;
+    try {
+      await runAdb(context, ["shell", "wm", ...command], { timeout: WM_TIMEOUT_MS });
+    } catch (error) {
+      failures.push(`wm ${command.join(" ")} failed: ${adbFailure(error)}`);
+      if (change) break;
+    }
+  }
+  return failures;
+}
+
+function adbFailure(error) {
+  if (error.killed) return `no answer within ${WM_TIMEOUT_MS} ms`;
+  const output = `${error.stderr ?? ""}`.trim() || `${error.stdout ?? ""}`.trim() || error.message;
+  return output.split("\n")[0].slice(0, 200);
+}
+
+/**
+ * The target's size and density, with any overrides, from `wm size` and `wm density`.
+ * With `untilStop`, a reading nobody needs once the Canvas stops runs no second command.
+ */
+async function readWm(context, { untilStop = false } = {}) {
+  const size = await runAdb(context, ["shell", "wm", "size"], { timeout: WM_TIMEOUT_MS });
+  if (untilStop && context.shuttingDown) throw new Error("Canvas is stopping");
+  const density = await runAdb(context, ["shell", "wm", "density"], { timeout: WM_TIMEOUT_MS });
+  return parseWm(size.stdout, density.stdout);
+}
+
+function parseWm(sizeText, densityText) {
+  const sizes = {};
+  for (const [, kind, width, height] of sizeText.matchAll(/(Physical|Override) size: (\d+)x(\d+)/g)) {
+    sizes[kind] = { width: Number(width), height: Number(height) };
+  }
+  const densities = {};
+  for (const [, kind, value] of densityText.matchAll(/(Physical|Override) density: (\d+)/g)) {
+    densities[kind] = Number(value);
+  }
+  if (!sizes.Physical || !densities.Physical) {
+    throw new Error("wm did not report the physical display size and density");
+  }
+  const size = sizes.Override ?? sizes.Physical;
+  return {
+    sizeOverride: sizes.Override ?? null,
+    densityOverride: densities.Override ?? null,
+    width: size.width,
+    height: size.height,
+    density: densities.Override ?? densities.Physical,
+  };
+}
+
+/**
+ * Whether a reading shows `preset`: its values, or no override for `default`. Values are
+ * compared, not overrides, because Android drops an override equal to the physical value.
+ */
+function matchesPreset(wm, preset) {
+  if (!wm) return false;
+  if (!preset.width) return !wm.sizeOverride && !wm.densityOverride;
+  return wm.width === preset.width && wm.height === preset.height && wm.density === preset.density;
+}
+
+/**
+ * The preset a reading stands for: the last one this Canvas applied while the values still
+ * match it, else `default` without overrides, else null, an override this Canvas did not make.
+ */
+function presetInEffect(wm, applied) {
+  if (!wm) return null;
+  if (applied && matchesPreset(wm, applied)) return applied.id;
+  return wm.sizeOverride || wm.densityOverride ? null : "default";
+}
+
+function describeDisplay(wm) {
+  return wm ? `${wm.width}x${wm.height} @ ${wm.density}` : "unknown (wm could not read the display)";
+}
+
+function displayInfo(context) {
+  const wm = context.displayWm;
+  return {
+    preset: context.displayPreset,
+    width: wm?.width ?? null,
+    height: wm?.height ?? null,
+    density: wm?.density ?? null,
+  };
+}
+
+/**
+ * Keep a `wm` reading begun at `at` (null when it failed) unless one begun later is kept
+ * already, whichever finished first, and tell every page of a new preset or density, or
+ * of the same ones when a state message showed a reading too old.
+ */
+function keepDisplayReading(context, wm, at) {
+  const before = { preset: context.displayPreset, density: context.displayWm?.density ?? null };
+  if (at >= context.displayWmAt) {
+    context.displayWm = wm;
+    context.displayWmAt = at;
+    // Journaled gestures and HTTP input use the size read back.
+    if (wm) context.display = { width: wm.width, height: wm.height };
+  }
+  context.displayPreset = presetInEffect(context.displayWm, context.displayApplied);
+  const density = context.displayWm?.density ?? null;
+  const changed = context.displayPreset !== before.preset || density !== before.density;
+  if (changed || context.displayStaleSent) {
+    context.displayStaleSent = false;
+    broadcastState(context);
+  }
+}
+
+/**
+ * The display as /status and the state message show it (DISPLAY-001): a reading begun at
+ * most `maxAge` ago, else a new one, which requests made meanwhile share, so a change made
+ * outside this Canvas shows within that time. Nothing is read once the Canvas stops.
+ * Never rejects.
+ */
+async function freshDisplay(context, maxAge = DISPLAY_READ_MAX_AGE_MS) {
+  if (context.options.platform !== "android" || context.shuttingDown) return;
+  if (performance.now() - context.displayWmAt <= maxAge) return;
+  context.displayReading ??= readDisplayNow(context).finally(() => {
+    context.displayReading = null;
+  });
+  await context.displayReading;
+}
+
+async function readDisplayNow(context) {
+  const at = performance.now();
+  let wm = null;
+  try {
+    wm = await readWm(context, { untilStop: true });
+    context.displayReadFailed = false;
+  } catch (error) {
+    if (context.shuttingDown) return;
+    // Pages poll /status every second or so: a reading that keeps failing is reported once.
+    if (!context.displayReadFailed) {
+      context.state.lastError = `display: wm could not read the display: ${adbFailure(error)}`;
+    }
+    context.displayReadFailed = true;
+  }
+  keepDisplayReading(context, wm, at);
+}
+
+/**
+ * State messages go to WebSocket clients and show the display read at most
+ * DISPLAY_READ_MAX_AGE_MS before (DISPLAY-001), whether or not a client asks /status.
+ * So while a client is connected the reading is renewed once it is DISPLAY_WATCH_AGE_MS
+ * old; with none, and once the Canvas stops, nothing reads the display unasked. Called
+ * whenever a client comes or goes.
+ */
+function watchDisplay(context) {
+  const watched = context.options.platform === "android" && !context.shuttingDown &&
+    (context.videoClients.size > 0 || context.controlClients.size > 0);
+  if (!watched) {
+    clearTimeout(context.displayWatch);
+    context.displayWatch = null;
+    return;
+  }
+  if (context.displayWatch) return;
+  const due = Math.max(0, context.displayWmAt + DISPLAY_WATCH_AGE_MS - performance.now());
+  const watch = setTimeout(() => {
+    freshDisplay(context, DISPLAY_WATCH_AGE_MS).then(() => {
+      // A watch ended meanwhile, by the last client leaving, leaves any newer one alone.
+      if (context.displayWatch !== watch) return;
+      context.displayWatch = null;
+      watchDisplay(context);
+    });
+  }, due);
+  context.displayWatch = watch;
+}
+
+/**
+ * /status `display`: on Android the size and density of one reading, the preset in effect
+ * and every preset (DISPLAY-001); the bridge's size when wm could not be read.
+ */
+function displayStatus(context, measured) {
+  if (context.options.platform !== "android") return measured;
+  const wm = context.displayWm;
+  return {
+    width: wm?.width ?? measured?.width ?? null,
+    height: wm?.height ?? measured?.height ?? null,
+    density: wm?.density ?? null,
+    preset: context.displayPreset,
+    presets: DISPLAY_PRESETS,
+  };
+}
+
+/**
+ * At stop, put back the overrides found before the first change (DISPLAY-003). Only the
+ * `wm` commands of a change already running are waited for, and that change runs no other;
+ * queued input and queued changes are dropped by the stop, never waited for. A Canvas whose
+ * `wm` commands never changed the display runs none. Written to the journal as preset
+ * `restore` by `system` (DISPLAY-006), and on stdout either way.
+ */
+async function restoreDisplay(context) {
+  await context.displayRunning;
+  const original = context.displayOriginal;
+  if (!context.displayWritten || !original) return;
+  try {
+    const failures = await runWm(context, restoreCommands(original), { change: false });
+    const wm = await readWm(context).catch(() => null);
+    console.log(failures.length
+      ? `Display restore failed: ${failures.join("; ")}; in effect: ${describeDisplay(wm)}`
+      : `Display restored: ${describeDisplay(wm)}`);
+    const record = { kind: "display", transport: chooseTransport(context), preset: "restore" };
+    if (wm) Object.assign(record, { width: wm.width, height: wm.height, density: wm.density });
+    await journalRestore(context, record);
+  } catch (error) {
+    console.log(`Display restore failed: ${error.message}`);
+  }
+}
+
+/**
+ * The restore record goes through the bridge like every other (DISPLAY-006). The bridge
+ * answers one line at a time, so behind a swipe or text still running it would wait past
+ * the shutdown budget and be lost with the bridge; then a bridge of its own, on the same
+ * target and with the same allowlist, writes it.
+ */
+async function journalRestore(context, record) {
+  if (!context.actionBridge.busy()) {
+    await new Promise((resolvePromise) => {
+      journal(context, { origin: "system", journalWaiting: 0 }, record, resolvePromise);
+    });
+    return;
+  }
+  let bridge = null;
+  try {
+    bridge = createActionBridge(context.options, context.adbPath, context.serial);
+    context.restoreBridge = bridge;
+    await new Promise((resolvePromise, reject) => {
+      // A bridge that cannot start answers nothing; its error must not end the stop.
+      bridge.child.on("error", reject);
+      journalPayload(context, record)
+        .then((payload) => bridge.call("record", payload, "system"))
+        .then(resolvePromise, reject);
+    });
+  } catch (error) {
+    context.state.lastError = `journal: ${error.message}`;
+  } finally {
+    bridge?.close();
+  }
+}
+
 function codePoints(value) {
   let count = 0;
   for (const _ of value) count += 1;
@@ -1949,16 +2491,18 @@ function codePoints(value) {
  * One journal record per completed action, through the bridge; never actuates.
  * Each connection counts its records until the bridge answers them, for inputPressure,
  * which stops reading input before the journal fills. A record that finds
- * JOURNAL_QUEUE_RECORDS already pending is dropped and counted.
+ * JOURNAL_QUEUE_RECORDS already pending is dropped and counted. `onAnswered` runs once
+ * the bridge answered the record, or at once for a dropped one.
  */
-function journal(context, client, record) {
+function journal(context, client, record, onAnswered = null) {
   if (journalPending(context) >= JOURNAL_QUEUE_RECORDS) {
     context.journalDropped += 1;
     context.state.lastError = `journal: ${context.journalDropped} actions were not journaled ` +
       `because ${JOURNAL_QUEUE_RECORDS} records were waiting for the bridge`;
+    onAnswered?.();
     return;
   }
-  context.journalQueue.push({ client, origin: client.origin, record });
+  context.journalQueue.push({ client, origin: client.origin, record, onAnswered });
   client.journalWaiting += 1;
   if (!context.journalDraining) drainJournal(context);
 }
@@ -1982,7 +2526,10 @@ async function drainJournal(context) {
     const payload = await journalPayload(context, entry.record);
     context.actionBridge.call("record", payload, entry.origin).catch((error) => {
       context.state.lastError = `journal: ${error.message}`;
-    }).finally(() => journalAnswered(context, entry.client));
+    }).finally(() => {
+      journalAnswered(context, entry.client);
+      entry.onAnswered?.();
+    });
   }
   context.journalDraining = false;
 }
@@ -2021,12 +2568,46 @@ function assertControl(context, origin) {
   if (refused) throw httpError(409, refused);
 }
 
+/**
+ * The display size a page computed its points for, from the optional `dw` and `dh` of
+ * POST /tap and /swipe, or null for a request without them, as an agent's. Both or
+ * neither, each an integer from 1 to MAX_SENT_DISPLAY_SIDE.
+ */
+function sentDisplaySize(body) {
+  if (body.dw === undefined && body.dh === undefined) return null;
+  const valid = (value) => Number.isInteger(value) && value >= 1 && value <= MAX_SENT_DISPLAY_SIDE;
+  if (!valid(body.dw) || !valid(body.dh)) {
+    throw httpError(400, `dw and dh must both be integers from 1 to ${MAX_SENT_DISPLAY_SIDE}`);
+  }
+  return { width: body.dw, height: body.dh };
+}
+
+/**
+ * Points a page computed for the display size `sent`, on the display read back now. A page
+ * on a multipart transport learns of a display change made by an agent or another page
+ * only at its next status poll, and its taps carry the old size until then (DISPLAY-007).
+ * Points without a size, or for the size in effect, are left as they are.
+ */
+function onCurrentDisplay(context, sent, points) {
+  const current = context.displayWm ?? context.display;
+  if (!sent || !current?.width || !current?.height) return points;
+  if (sent.width === current.width && sent.height === current.height) return points;
+  return points.map(([x, y]) => [
+    normalizeCoordinate(x * current.width / sent.width, "x"),
+    normalizeCoordinate(y * current.height / sent.height, "y"),
+  ]);
+}
+
 async function tap(context, response, body, origin) {
   assertControl(context, origin);
   const x = normalizeCoordinate(body.x, "x");
   const y = normalizeCoordinate(body.y, "y");
-  const result = await context.enqueueInput(
-    () => context.actionBridge.call("tap", { x, y }, origin));
+  const sent = sentDisplaySize(body);
+  // Scaled when its turn comes, so after any display change queued before it.
+  const result = await context.enqueueInput(() => {
+    const [[tx, ty]] = onCurrentDisplay(context, sent, [[x, y]]);
+    return context.actionBridge.call("tap", { x: tx, y: ty }, origin);
+  });
   sendJson(response, 200, result);
 }
 
@@ -2037,8 +2618,11 @@ async function swipe(context, response, body, origin) {
   const x2 = normalizeCoordinate(body.x2, "x2");
   const y2 = normalizeCoordinate(body.y2, "y2");
   const duration = Math.min(5000, Math.max(1, normalizeCoordinate(body.duration ?? 250, "duration")));
-  const result = await context.enqueueInput(() => context.actionBridge.call(
-    "swipe", { x1, y1, x2, y2, duration }, origin));
+  const sent = sentDisplaySize(body);
+  const result = await context.enqueueInput(() => {
+    const [[sx1, sy1], [sx2, sy2]] = onCurrentDisplay(context, sent, [[x1, y1], [x2, y2]]);
+    return context.actionBridge.call("swipe", { x1: sx1, y1: sy1, x2: sx2, y2: sy2, duration }, origin);
+  });
   sendJson(response, 200, result);
 }
 
@@ -2067,6 +2651,21 @@ async function control(context, response, body, origin) {
   applyControl(context, String(body.mode ?? ""), origin);
   sendJson(response, 200, { ok: true, control_owner: context.state.controlOwner,
     input_paused: context.state.inputPaused });
+}
+
+async function setDisplay(context, response, body, origin) {
+  assertDisplayPlatform(context);
+  assertControl(context, origin);
+  const preset = displayPreset(body?.preset);
+  let display;
+  try {
+    display = await requestDisplay(context, preset, origin);
+  } catch (error) {
+    if (!error.superseded) throw error;
+    sendJson(response, 409, { error: error.message, superseded: true });
+    return;
+  }
+  sendJson(response, 200, { ok: true, display });
 }
 
 function createActionBridge(options, adbPath, serial) {
@@ -2106,10 +2705,16 @@ function createActionBridge(options, adbPath, serial) {
       }
       const id = ++nextId;
       return new Promise((resolvePromise, reject) => {
-        pending.set(id, { resolve: resolvePromise, reject });
+        pending.set(id, { op, resolve: resolvePromise, reject });
         child.stdin.write(`${JSON.stringify({ id, op, payload, origin })}\n`);
       });
     },
+    /** Whether a call other than a journal record waits for its answer: input can take seconds. */
+    busy() {
+      for (const waiter of pending.values()) if (waiter.op !== "record") return true;
+      return false;
+    },
+    child,
     close() { child.kill("SIGTERM"); },
   };
 }
@@ -2255,41 +2860,310 @@ async function findExecutable(name) {
   throw new Error(`${name} not found on PATH`);
 }
 
+// Inline SVG paths of the page's icons, on a 24 px grid; stroke and size come from the CSS.
+const PAGE_ICONS = Object.freeze({
+  mark: '<path d="M12 3 4 20h4l4-9 4 9h4z"/>',
+  phone: '<rect x="7" y="2.5" width="10" height="19" rx="2.5"/><path d="M11 18.5h2"/>',
+  phoneLandscape: '<rect x="2.5" y="7" width="19" height="10" rx="2.5"/><path d="M18.5 11v2"/>',
+  chevron: '<path d="m7 10 5 5 5-5"/>',
+  check: '<path d="m5 12.5 4.5 4.5L19 7.5"/>',
+  people: '<circle cx="9" cy="8" r="3"/><path d="M3.5 19a5.5 5.5 0 0 1 11 0"/><path d="M16 5.5a3 3 0 0 1 0 5.5M18 19a5.5 5.5 0 0 0-2.5-4.6"/>',
+  inspector: '<rect x="3" y="4.5" width="18" height="15" rx="3"/><path d="M15 4.5v15"/>',
+  back: '<path d="M15 5 8 12l7 7"/>',
+  home: '<circle cx="12" cy="12" r="6.5"/>',
+  recent: '<rect x="6" y="6" width="12" height="12" rx="2.5"/>',
+  rotate: '<path d="M4.5 12a7.5 7.5 0 0 1 13-5.1L20 9.5M20 4.5v5h-5"/><path d="M19.5 12a7.5 7.5 0 0 1-13 5.1L4 14.5M4 19.5v-5h5"/>',
+  volumeDown: '<path d="M4 9.5h3l4.5-4v13L7 14.5H4z"/><path d="M16 12h4"/>',
+  volumeUp: '<path d="M4 9.5h3l4.5-4v13L7 14.5H4z"/><path d="M16 12h4M18 10v4"/>',
+  power: '<path d="M12 3.5v8"/><path d="M7 6.8a7 7 0 1 0 10 0"/>',
+  up: '<path d="m6 14 6-6 6 6"/>',
+  left: '<path d="m14 6-6 6 6 6"/>',
+  right: '<path d="m10 6 6 6-6 6"/>',
+  down: '<path d="m6 10 6 6 6-6"/>',
+  delete: '<path d="M9 6h10a1.5 1.5 0 0 1 1.5 1.5v9A1.5 1.5 0 0 1 19 18H9l-5.5-6z"/><path d="m11.5 9.5 5 5M16.5 9.5l-5 5"/>',
+  wake: '<path d="M12 4v2M12 18v2M4 12h2M18 12h2M6.3 6.3l1.4 1.4M16.3 16.3l1.4 1.4M6.3 17.7l1.4-1.4M16.3 7.7l1.4-1.4"/><circle cx="12" cy="12" r="3"/>',
+  notifications: '<path d="M6 15V10a6 6 0 0 1 12 0v5l1.5 2.5h-15z"/><path d="M10 20a2 2 0 0 0 4 0"/>',
+  quickSettings: '<rect x="4" y="4" width="7" height="7" rx="2"/><rect x="13" y="4" width="7" height="7" rx="2"/><rect x="4" y="13" width="7" height="7" rx="2"/><rect x="13" y="13" width="7" height="7" rx="2"/>',
+  collapse: '<path d="m7 14 5-5 5 5"/><path d="M5 19h14"/>',
+  clipboard: '<rect x="7" y="4" width="10" height="16" rx="2"/><path d="M10 4V3h4v1"/>',
+});
+
+/** A decorative icon: the control around it carries the accessible name. */
+function icon(name, className = "") {
+  const classes = className ? ` class="${className}"` : "";
+  return `<svg${classes} viewBox="0 0 24 24" aria-hidden="true" focusable="false">${PAGE_ICONS[name]}</svg>`;
+}
+
+/** An icon-only button, named for assistive technology and in its tooltip alike (PAGE-004). */
+function iconButton(name, label, attributes, className = "") {
+  const classes = className ? ` class="${className}"` : "";
+  return `<button type="button"${classes} ${attributes} title="${label}" aria-label="${label}">${icon(name)}</button>`;
+}
+
+/**
+ * The Size menu of an Android page (DISPLAY-004, PAGE-001): a popup button over a listbox of
+ * the presets with their sizes. The button is enabled once the page may send input.
+ */
+function displayPicker(context) {
+  if (context.options.platform !== "android") return "";
+  const options = DISPLAY_PRESETS.map(({ id, label, width, height }) =>
+    `${id === "default" ? '<hr aria-hidden="true">' : ""}` +
+    `<button type="button" class="option" role="option" data-preset="${id}" aria-selected="false" tabindex="-1">` +
+    `${icon("check", "check")}<span>${escapeHtml(label)}</span>` +
+    `<small${id === "default" ? ' id="display-default-size"' : ""}>${width ? `${width} × ${height}` : ""}</small></button>`).join("");
+  return `<button type="button" class="popup" id="display-preset" aria-haspopup="listbox" aria-expanded="false" ` +
+    `aria-controls="display-list" title="Display size" disabled>${icon("phone", "portrait")}${icon("phoneLandscape", "landscape")}<span class="sr">Display size: </span>` +
+    `<span id="display-label">Size</span>${icon("chevron", "chev")}</button>` +
+    `<div class="menu" id="display-menu"><div role="listbox" id="display-list" aria-label="Display size">${options}</div>` +
+    `<p class="note">Changes the device's screen size and density. Restored when the Canvas stops.</p></div>`;
+}
+
+/**
+ * The Canvas page (PAGE-001..004): toolbar, the device in a frame that follows the video's
+ * aspect, a floating pill of device buttons and an inspector. Styles, icons and code are
+ * inline (the CSP loads nothing else); device and status strings reach the DOM as text only.
+ */
 function renderPage(context) {
   const serial = escapeHtml(context.serial);
+  const android = context.options.platform === "android";
+  const platform = android ? "Android" : "iOS";
+  // iOS refuses the Android key buttons, so its page keeps them out of sight (PAGE-003).
+  const androidOnly = android ? "" : " hidden";
   return `<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Autonom</title>
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Autonom Canvas · ${serial}</title>
 <link rel="icon" href="data:,">
 <style>
-:root{color-scheme:dark;font-family:ui-sans-serif,system-ui,-apple-system,sans-serif;background:#111418;color:#f5f7f7}
-*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;grid-template-columns:minmax(280px,1fr) 290px;gap:20px;padding:20px}
-main{display:flex;align-items:center;justify-content:center;min-width:0}.device{height:calc(100vh - 40px);max-width:100%;aspect-ratio:9/19.5;background:#030506;border:9px solid #030506;border-radius:30px;overflow:hidden;box-shadow:0 24px 70px #0009;display:flex;align-items:center;justify-content:center;touch-action:none}
-img,canvas{width:100%;height:100%;object-fit:contain;background:#000;user-select:none;-webkit-user-drag:none;touch-action:none;cursor:crosshair;outline:none}[hidden]{display:none!important}
-aside{display:flex;flex-direction:column;gap:12px;min-width:0}h1{font-size:20px;margin:0}.meta,.status{font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;color:#b8c3c0;white-space:pre-wrap;overflow-wrap:anywhere}
-.controls{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}button,input{min-height:38px;border-radius:8px;border:1px solid #3b4643;background:#202724;color:#f5f7f7;padding:8px;font:inherit}button{cursor:pointer}button:hover{background:#2a3531}input{grid-column:1/-1}.wide{grid-column:1/-1}.accent{border-color:#00C2A8}
-@media(max-width:780px){body{grid-template-columns:1fr;padding:12px}.device{height:auto;width:min(100%,420px)}}
+:root{
+  color-scheme:light dark;
+  --bg:#f5f5f7;--surface:#fff;--raised:#fff;--text:#1d1d1f;--text-2:#6e6e73;--line:rgba(0,0,0,.09);--line-2:rgba(0,0,0,.14);
+  --fill:rgba(0,0,0,.045);--fill-2:rgba(0,0,0,.08);--accent:#0071e3;--accent-fill:#0071e3;--on-accent:#fff;--live:#1f9d55;--warn:#b25000;--idle:#8e8e93;
+  --bezel:#1d1d1f;--shadow:0 1px 1px rgba(0,0,0,.04),0 10px 30px rgba(0,0,0,.08);--device-shadow:0 2px 6px rgba(0,0,0,.08),0 24px 60px rgba(0,0,0,.16);
+  --material:rgba(255,255,255,.96);--r-sm:8px;--video-ratio:.4615;
+  --font:-apple-system,BlinkMacSystemFont,"SF Pro Text","Helvetica Neue",system-ui,sans-serif;
+  --mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,monospace;
+}
+@media (prefers-color-scheme:dark){:root{
+  --bg:#0b0b0c;--surface:#161617;--raised:#1f1f21;--text:#f5f5f7;--text-2:#a1a1a6;--line:rgba(255,255,255,.09);--line-2:rgba(255,255,255,.16);
+  --fill:rgba(255,255,255,.06);--fill-2:rgba(255,255,255,.11);--accent:#0a84ff;--accent-fill:#0068d6;--live:#32d74b;--warn:#ff9f0a;
+  --bezel:#1c1c1e;--shadow:0 1px 1px rgba(0,0,0,.4),0 12px 32px rgba(0,0,0,.45);--device-shadow:0 0 0 1px rgba(255,255,255,.16),0 24px 70px rgba(0,0,0,.7);
+  --material:rgba(36,36,38,.95);
+}}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{margin:0;background:var(--bg);color:var(--text);font:13px/1.4 var(--font);-webkit-font-smoothing:antialiased;
+  display:grid;grid-template-rows:52px minmax(0,1fr);grid-template-columns:minmax(0,1fr) 300px;grid-template-areas:"bar bar" "stage side"}
+body.no-inspector{grid-template-columns:minmax(0,1fr);grid-template-areas:"bar" "stage"}
+body.no-inspector .side{display:none}
+[hidden]{display:none!important}
+button,input{font:inherit;color:inherit}
+button{cursor:pointer;-webkit-tap-highlight-color:transparent;touch-action:manipulation;transition:transform .1s ease-out,background-color .12s ease-out}
+button:not(:disabled):active{transform:scale(.96)}
+button:disabled,input:disabled{cursor:default;opacity:.4}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round;flex:none}
+.sr{position:absolute;width:1px;height:1px;margin:-1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+
+/* toolbar */
+.bar{grid-area:bar;position:relative;z-index:4;display:grid;grid-template-columns:minmax(0,1fr) auto minmax(0,1fr);align-items:center;gap:12px;padding:0 14px;border-bottom:1px solid var(--line);background:var(--surface)}
+.brand{display:flex;align-items:center;gap:10px;min-width:0}
+.mark{width:22px;height:22px;border-radius:6px;background:var(--text);color:var(--bg);display:grid;place-items:center;flex:none}
+.mark svg{width:14px;height:14px;stroke-width:2}
+.brand b{font-weight:600;font-size:14px}
+.target{display:flex;align-items:center;gap:6px;min-width:0;color:var(--text-2);white-space:nowrap;overflow:hidden}
+.target strong{color:var(--text);font-weight:500;overflow:hidden;text-overflow:ellipsis}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--idle);flex:none}
+.dot[data-state=live]{background:var(--live);box-shadow:0 0 0 3px color-mix(in srgb,var(--live) 18%,transparent)}
+.dot[data-state=warn]{background:var(--warn)}
+.center{position:relative;display:flex;align-items:center;gap:10px;min-width:0}
+.popup{display:flex;align-items:center;gap:7px;height:30px;padding:0 10px 0 9px;border-radius:var(--r-sm);border:1px solid var(--line-2);background:var(--raised);font-weight:500;white-space:nowrap;box-shadow:0 1px 1px rgba(0,0,0,.04)}
+.popup .chev{width:12px;height:12px;color:var(--text-2)}
+.popup .landscape,.popup.wide .portrait{display:none}
+.popup.wide .landscape{display:block}
+.dims{color:var(--text-2);font-variant-numeric:tabular-nums;white-space:nowrap}
+.actions{display:flex;justify-content:flex-end;align-items:center;gap:6px;min-width:0}
+.chip{display:flex;align-items:center;gap:6px;height:28px;padding:0 10px;border-radius:999px;background:var(--fill);color:var(--text-2);font-weight:500;white-space:nowrap}
+.chip svg{width:14px;height:14px}
+.icon{width:32px;height:32px;display:grid;place-items:center;border-radius:var(--r-sm);border:0;background:transparent;color:var(--text-2)}
+.icon[aria-pressed=true]{color:var(--accent)}
+
+/* size menu */
+.menu{position:absolute;top:calc(100% + 5px);left:50%;z-index:5;width:288px;padding:6px;border-radius:12px;background:var(--material);
+  -webkit-backdrop-filter:blur(24px) saturate(1.6);backdrop-filter:blur(24px) saturate(1.6);border:1px solid var(--line-2);box-shadow:var(--shadow);
+  opacity:0;visibility:hidden;transform:translateX(-50%) scale(.98);transform-origin:50% 0;transition:opacity .12s ease-out,transform .12s ease-out,visibility 0s linear .12s}
+.menu.open{opacity:1;visibility:visible;transform:translateX(-50%);transition-delay:0s}
+.option{display:grid;grid-template-columns:18px minmax(0,1fr) auto;align-items:center;gap:8px;width:100%;height:34px;padding:0 10px 0 8px;border:0;border-radius:7px;background:none;text-align:left;transition:none}
+.menu .option:active{transform:none}
+/* The fill follows the keyboard (focus-visible) and the pointer (hover); a menu opened by pointer
+   or touch focuses the selected row without it, and the check mark alone shows the selection. */
+.option:focus{outline:none}
+.option:focus-visible{background:var(--accent-fill);color:var(--on-accent)}
+.option small{color:var(--text-2);font-size:12px;font-variant-numeric:tabular-nums}
+.option:focus-visible small{color:inherit}
+.check{width:14px;height:14px;stroke-width:2.2;visibility:hidden}
+.option[aria-selected=true] .check{visibility:visible}
+.menu hr{border:0;border-top:1px solid var(--line);margin:5px 6px}
+.menu .note{margin:0;padding:6px 10px 4px;color:var(--text-2);font-size:11.5px;line-height:1.35}
+
+/* stage */
+.stage{grid-area:stage;position:relative;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;min-width:0;min-height:0;padding:28px 24px 96px;overflow:hidden}
+.device{position:relative;flex:none;box-sizing:content-box;aspect-ratio:9/19.5;padding:9px;border-radius:44px;background:var(--bezel);box-shadow:var(--device-shadow);touch-action:none;
+  width:min(calc(100% - 18px),calc((100vh - 224px) * var(--video-ratio)));width:min(calc(100% - 18px),calc((100dvh - 224px) * var(--video-ratio)))}
+.surface{position:absolute;inset:9px;display:block;width:calc(100% - 18px);height:calc(100% - 18px);object-fit:contain;border-radius:35px;background:#000;
+  user-select:none;-webkit-user-select:none;-webkit-user-drag:none;touch-action:none;cursor:crosshair;outline:none}
+.surface:focus-visible{outline:2px solid var(--accent);outline-offset:4px}
+.caption{margin:0;min-height:17px;color:var(--text-2);font-size:12px;font-variant-numeric:tabular-nums;text-align:center}
+.notice{position:absolute;top:12px;left:50%;z-index:3;transform:translateX(-50%);width:max-content;max-width:calc(100% - 32px);margin:0;padding:6px 12px;border-radius:12px;
+  background:var(--material);border:1px solid var(--line);box-shadow:var(--shadow);font-size:12px;text-align:center;overflow-wrap:anywhere}
+.notice:empty{display:none}
+.dock{position:absolute;left:50%;bottom:22px;z-index:3;transform:translateX(-50%);display:flex;align-items:center;gap:2px;padding:5px;border-radius:999px;background:var(--material);
+  -webkit-backdrop-filter:blur(24px) saturate(1.6);backdrop-filter:blur(24px) saturate(1.6);border:1px solid var(--line);box-shadow:var(--shadow)}
+.dock button{width:40px;height:40px;display:grid;place-items:center;border:0;border-radius:999px;background:transparent;color:var(--text)}
+.dock .div{width:1px;height:20px;margin:0 4px;background:var(--line-2)}
+
+/* inspector */
+.side{grid-area:side;border-left:1px solid var(--line);background:var(--surface);overflow:auto;padding:6px 0 24px}
+.group{padding:14px 16px;border-bottom:1px solid var(--line)}
+.group:last-child{border-bottom:0}
+.group h2{margin:0 0 10px;font-size:12px;font-weight:600;color:var(--text-2);letter-spacing:.01em}
+.field{display:flex;gap:6px}
+.field input{flex:1;min-width:0;height:32px;padding:0 10px;border-radius:var(--r-sm);border:1px solid var(--line-2);background:var(--bg)}
+.field input::placeholder{color:var(--text-2);opacity:1}
+.btn{height:32px;padding:0 12px;border-radius:var(--r-sm);border:1px solid var(--line-2);background:var(--raised);font-weight:500}
+.btn.primary{background:var(--accent-fill);border-color:transparent;color:var(--on-accent)}
+.btn.primary:focus-visible{outline-color:var(--text)}
+.hint{margin:8px 0 0;color:var(--text-2);font-size:12px}
+.keys{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px}
+.key{height:34px;display:flex;align-items:center;justify-content:center;gap:6px;border-radius:var(--r-sm);border:0;background:var(--fill);font-weight:500}
+.key svg{width:16px;height:16px}
+.list{display:grid;gap:2px}
+.row{display:flex;align-items:center;gap:10px;width:calc(100% + 16px);height:32px;margin:0 -8px;padding:0 8px;border:0;border-radius:var(--r-sm);background:none;text-align:left}
+.row:not(:disabled):active{transform:none;background:var(--fill-2)}
+.row svg{width:16px;height:16px;color:var(--text-2)}
+.owner{display:flex;align-items:flex-start;gap:8px;margin:0;color:var(--text-2)}
+.owner .dot{margin-top:5px}
+.owner strong{color:var(--text);font-weight:600}
+.pair{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-top:10px}
+dl{margin:0;display:grid;grid-template-columns:auto minmax(0,1fr);gap:7px 12px}
+dt{color:var(--text-2)}
+dd{margin:0;text-align:right;font-variant-numeric:tabular-nums;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+dd code{font:12px var(--mono)}
+.linkbtn{margin-top:12px;padding:0;border:0;background:none;color:var(--accent);font-weight:500}
+.diag{margin-top:12px}
+.diag summary{width:max-content;cursor:pointer;color:var(--text-2);font-size:12px}
+.status{margin:8px 0 0;font:11.5px/1.45 var(--mono);color:var(--text-2);white-space:pre-wrap;overflow-wrap:anywhere}
+
+@media (hover:hover){
+  .option:hover{background:var(--accent-fill);color:var(--on-accent)}
+  .option:hover small{color:inherit}
+  .popup:not(:disabled):hover,.icon:hover,.btn:not(.primary):not(:disabled):hover,.row:not(:disabled):hover{background:var(--fill)}
+  .icon:hover{color:var(--text)}
+  .key:not(:disabled):hover,.dock button:not(:disabled):hover{background:var(--fill-2)}
+}
+@supports not ((backdrop-filter:blur(1px)) or (-webkit-backdrop-filter:blur(1px))){:root{--material:var(--raised)}}
+@media (forced-colors:active){.option:focus-visible{outline:2px solid CanvasText}}
+@media (max-width:900px){.dims{display:none}}
+
+/* phone: the inspector moves under the device, the pill stays above the safe area, 44 px targets */
+@media (max-width:760px){
+  body{display:block;height:auto;min-height:100%}
+  .bar{position:sticky;top:0;grid-template-columns:auto minmax(0,1fr) auto;min-height:calc(52px + env(safe-area-inset-top));padding:env(safe-area-inset-top) 12px 0}
+  .target,.chip,.brand b,.actions .icon{display:none}
+  .center{justify-content:center}
+  .menu{position:fixed;top:calc(56px + env(safe-area-inset-top));width:min(320px,calc(100vw - 24px))}
+  .stage{padding:16px 16px 92px;overflow:visible}
+  .device{padding:7px;border-radius:36px;width:min(calc(100% - 14px),calc((100svh - 208px) * var(--video-ratio)))}
+  .surface{inset:7px;width:calc(100% - 14px);height:calc(100% - 14px);border-radius:29px}
+  .notice{position:fixed;top:calc(60px + env(safe-area-inset-top))}
+  .dock{position:fixed;bottom:calc(14px + env(safe-area-inset-bottom));z-index:4}
+  .dock button{width:44px;height:44px}
+  .side{border-left:0;border-top:1px solid var(--line);padding-bottom:calc(110px + env(safe-area-inset-bottom))}
+  .popup,.option,.key,.btn,.field input,.row{height:44px}
+  body.no-inspector .side{display:block}
+  .linkbtn{min-height:44px}
+  .diag summary{line-height:44px}
+  .field input{font-size:16px}
+}
+@media (max-width:360px){.dock{gap:0;padding:2px}.dock .div{display:none}}
+@media (prefers-reduced-motion:reduce){*,*::before,*::after{transition:none!important;animation:none!important}button:active{transform:none!important}}
 </style>
 </head>
 <body>
-<main><div class="device" id="device"><canvas id="video" tabindex="0" aria-label="Android device screen" hidden></canvas><img id="screen" tabindex="0" alt="Android device screen"></div></main>
-<aside>
-  <div><h1>Autonom</h1><div class="meta">adb: ${serial}</div></div>
-  <div class="controls">
-    <button data-key="KEYCODE_BACK" data-system="back">Back</button><button data-key="KEYCODE_HOME" data-system="home">Home</button><button data-key="KEYCODE_APP_SWITCH" data-system="app-switch">Apps</button>
-    <button data-key="KEYCODE_DPAD_UP" data-code="19">↑</button><button data-key="KEYCODE_ENTER" data-code="66">Enter</button><button data-key="KEYCODE_DPAD_DOWN" data-code="20">↓</button>
-    <button data-key="KEYCODE_DPAD_LEFT" data-code="21">←</button><button data-key="KEYCODE_DEL" data-code="67">Delete</button><button data-key="KEYCODE_DPAD_RIGHT" data-code="22">→</button>
-    <button data-key="KEYCODE_WAKEUP" data-system="wake">Wake</button><button data-key="KEYCODE_POWER" data-system="power">Power</button><button data-system="rotate" data-scrcpy>Rotate</button>
-    <button data-system="volume-down" data-scrcpy>Vol −</button><button data-system="volume-up" data-scrcpy>Vol +</button><button data-system="notifications" data-scrcpy>Alerts</button>
-    <button data-system="quick-settings" data-scrcpy>Quick</button><button data-system="collapse" data-scrcpy>Collapse</button><button id="clipboard" data-scrcpy>Clipboard</button>
-    <button id="refresh" class="wide">Reconnect stream</button>
-    <input id="text" autocomplete="off" placeholder="Safe ASCII text">
-    <button id="sendText" class="wide accent">Type text</button>
+<header class="bar">
+  <div class="brand">
+    <span class="mark" aria-hidden="true">${icon("mark")}</span>
+    <b>Autonom</b>
+    <span class="target"><i class="dot" id="live-dot" aria-hidden="true"></i><strong>${serial}</strong><span id="target-detail">${platform} · connecting</span></span>
   </div>
-  <div class="status" id="status">Connecting…</div>
+  <div class="center">
+    ${displayPicker(context)}
+    <span class="dims" id="display-dims"></span>
+  </div>
+  <div class="actions">
+    <span class="chip" title="Who controls the device">${icon("people")}<span id="control-chip">Shared</span></span>
+    ${iconButton("inspector", "Inspector", 'id="inspector-toggle" aria-pressed="true" aria-controls="inspector"', "icon")}
+  </div>
+</header>
+<main class="stage">
+  <p class="notice" id="notice" role="status" aria-live="polite"></p>
+  <div class="device" id="device"><canvas id="video" class="surface" tabindex="0" aria-label="${platform} device screen" hidden></canvas><img id="screen" class="surface" tabindex="0" alt="${platform} device screen"></div>
+  <p class="caption" id="caption">Connecting…</p>
+  <nav class="dock" aria-label="Device buttons"${androidOnly}>
+    ${iconButton("back", "Back", 'data-key="KEYCODE_BACK" data-system="back"')}
+    ${iconButton("home", "Home", 'data-key="KEYCODE_HOME" data-system="home"')}
+    ${iconButton("recent", "Recent apps", 'data-key="KEYCODE_APP_SWITCH" data-system="app-switch"')}
+    <span class="div" aria-hidden="true"></span>
+    ${iconButton("rotate", "Rotate", 'data-system="rotate" data-scrcpy')}
+    ${iconButton("volumeDown", "Volume down", 'data-system="volume-down" data-scrcpy')}
+    ${iconButton("volumeUp", "Volume up", 'data-system="volume-up" data-scrcpy')}
+    ${iconButton("power", "Power", 'data-key="KEYCODE_POWER" data-system="power"')}
+  </nav>
+</main>
+<aside class="side" id="inspector" aria-label="Inspector">
+  <section class="group">
+    <h2>Type</h2>
+    <div class="field"><input id="text" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Text to type" aria-label="Text to type"><button type="button" id="sendText" class="btn primary">Send</button></div>
+    <p class="hint" id="text-hint">Any language. Longer text is pasted through the device clipboard.</p>
+  </section>
+  <section class="group"${androidOnly}>
+    <h2>Keys</h2>
+    <div class="keys">
+      <span></span>${iconButton("up", "Up", 'data-key="KEYCODE_DPAD_UP" data-code="19"', "key")}<span></span>
+      ${iconButton("left", "Left", 'data-key="KEYCODE_DPAD_LEFT" data-code="21"', "key")}<button type="button" class="key" data-key="KEYCODE_ENTER" data-code="66">Enter</button>${iconButton("right", "Right", 'data-key="KEYCODE_DPAD_RIGHT" data-code="22"', "key")}
+      <span></span>${iconButton("down", "Down", 'data-key="KEYCODE_DPAD_DOWN" data-code="20"', "key")}${iconButton("delete", "Delete", 'data-key="KEYCODE_DEL" data-code="67"', "key")}
+    </div>
+  </section>
+  <section class="group"${androidOnly}>
+    <h2>Device</h2>
+    <div class="list">
+      <button type="button" class="row" data-key="KEYCODE_WAKEUP" data-system="wake">${icon("wake")}Wake screen</button>
+      <button type="button" class="row" data-system="notifications" data-scrcpy>${icon("notifications")}Notifications</button>
+      <button type="button" class="row" data-system="quick-settings" data-scrcpy>${icon("quickSettings")}Quick settings</button>
+      <button type="button" class="row" data-system="collapse" data-scrcpy>${icon("collapse")}Collapse panels</button>
+      <button type="button" class="row" id="clipboard" data-scrcpy>${icon("clipboard")}Copy device clipboard</button>
+    </div>
+  </section>
+  <section class="group">
+    <h2>Control</h2>
+    <p class="owner"><i class="dot" id="owner-dot" aria-hidden="true"></i><span><strong id="owner-name">Shared</strong> <span id="owner-detail">· people and agents can send input</span></span></p>
+    <div class="pair"><button type="button" class="btn" id="control-take" disabled>Take control</button><button type="button" class="btn" id="control-pause" disabled>Pause input</button></div>
+  </section>
+  <section class="group">
+    <h2>Stream</h2>
+    <dl>
+      <dt>Transport</dt><dd id="stream-transport">connecting</dd>
+      <dt>Codec</dt><dd><code id="stream-codec">—</code></dd>
+      <dt>Frames</dt><dd id="stream-frames">—</dd>
+      <dt>Video</dt><dd id="stream-video">—</dd>
+      <dt>Display</dt><dd id="stream-display">—</dd>
+      <dt>Clients</dt><dd id="stream-clients">—</dd>
+    </dl>
+    <button type="button" class="linkbtn" id="refresh">Reconnect stream</button>
+    <details class="diag"><summary>Diagnostics</summary><pre class="status" id="status">Connecting…</pre></details>
+  </section>
 </aside>
 <script>
 ${pageScript()}
@@ -2314,10 +3188,19 @@ const MAX_CONTROL_BYTES=${MAX_CONTROL_MESSAGE_BYTES};
 ${metaStateFor.toString()}
 ${keyInputFor.toString()}
 const $=id=>document.getElementById(id);
-const image=$("screen"),video=$("video"),device=$("device"),statusEl=$("status"),textInput=$("text");
+const image=$("screen"),video=$("video"),device=$("device"),statusEl=$("status"),textInput=$("text"),sizePicker=$("display-preset");
+const sizeMenu=$("display-menu"),sizeLabel=$("display-label"),defaultSize=$("display-default-size"),sendButton=$("sendText");
+const ui={liveDot:$("live-dot"),target:$("target-detail"),dims:$("display-dims"),chip:$("control-chip"),inspector:$("inspector-toggle"),caption:$("caption"),notice:$("notice"),hint:$("text-hint"),ownerDot:$("owner-dot"),ownerName:$("owner-name"),ownerDetail:$("owner-detail"),take:$("control-take"),pause:$("control-pause"),transport:$("stream-transport"),codec:$("stream-codec"),frames:$("stream-frames"),videoSize:$("stream-video"),display:$("stream-display"),clients:$("stream-clients")};
+const PRESET_LABELS=${JSON.stringify(Object.fromEntries(DISPLAY_PRESETS.map(({ id, label }) => [id, label])))};
+const WIDE_PRESETS=${JSON.stringify(DISPLAY_PRESETS.filter(({ width, height }) => width > height).map(({ id }) => id))};
+const OWNERS={shared:["Shared","people and agents can send input"],human:["People","agents cannot send input"],agent:["Agent","this page cannot send input"]};
+const NOTICE_MS=8000;
+const sizeOptions=[...document.querySelectorAll("[data-preset]")];
+// Every device input control; the clipboard read, handoff and Reconnect act for anyone.
+const inputControls=[...document.querySelectorAll("[data-system],[data-code],[data-key]"),textInput,sendButton];
 const ctx=video.getContext("2d");
-let csrf=null,logicalDisplay=null,reconnectTimer=null,pointer=null;
-const view={transport:null,mode:null,reason:"",status:null,owner:"shared",paused:false,session:"idle",clients:null,width:0,height:0,note:"",rtt:null};
+let csrf=null,logicalDisplay=null,reconnectTimer=null,pointer=null,displayBusy=false,refocusPicker=false,menuOpen=false,noteAt=0,frameRatio=0;
+const view={transport:null,mode:null,reason:"",status:null,owner:"shared",paused:false,session:"idle",clients:null,width:0,height:0,note:"",rtt:null,preset:null,density:null};
 const stats={decoder:"none",codec:null,framesDecoded:0,framesRendered:0,framesDropped:0,packets:0,bytes:0,errors:0,renderTimes:[],lastFrameAt:0};
 let videoSocket=null,controlSocket=null,decoder=null,config=null,waitingKey=true,pendingFrame=null,drawScheduled=false,configuring=false,pendingChunks=[];
 let videoRetry=500,controlRetry=500,videoRefusals=0;
@@ -2329,10 +3212,15 @@ async function post(path,body){const headers={"Content-Type":"application/json",
 function scrcpyActive(){return view.transport==="scrcpy"}
 function surface(){return view.mode==="webcodecs"?video:image}
 function restart(){clearTimeout(reconnectTimer);image.src=url("/stream.mjpeg",true)}
-function note(message){view.note=message}
+function note(message){view.note=message;noteAt=Date.now()}
+function setText(element,value){if(element&&element.textContent!==value)element.textContent=value}
+function setState(element,state){if(element&&element.dataset.state!==state)element.dataset.state=state}
 
 // Multipart path (and HTTP input when the transport is not scrcpy).
-function point(event){const rect=image.getBoundingClientRect(),nw=image.naturalWidth,nh=image.naturalHeight;if(!nw||!nh)return null;const ratio=Math.min(rect.width/nw,rect.height/nh),rw=nw*ratio,rh=nh*ratio,xoff=(rect.width-rw)/2,yoff=(rect.height-rh)/2,px=(event.clientX-rect.left-xoff)/ratio,py=(event.clientY-rect.top-yoff)/ratio,dw=logicalDisplay?.width||nw,dh=logicalDisplay?.height||nh,x=Math.round(px*dw/nw),y=Math.round(py*dh/nh);if(x<0||y<0||x>dw||y>dh)return null;return{x,y}}
+// HTTP input names the display size its points were computed for once the page knows one,
+// so the Canvas moves them to a size changed meanwhile, before the next status poll here.
+function sentSize(){return logicalDisplay&&logicalDisplay.width&&logicalDisplay.height?{dw:logicalDisplay.width,dh:logicalDisplay.height}:null}
+function point(event){const rect=image.getBoundingClientRect(),nw=image.naturalWidth,nh=image.naturalHeight;if(!nw||!nh)return null;const sent=sentSize(),ratio=Math.min(rect.width/nw,rect.height/nh),rw=nw*ratio,rh=nh*ratio,xoff=(rect.width-rw)/2,yoff=(rect.height-rh)/2,px=(event.clientX-rect.left-xoff)/ratio,py=(event.clientY-rect.top-yoff)/ratio,dw=sent?sent.dw:nw,dh=sent?sent.dh:nh,x=Math.round(px*dw/nw),y=Math.round(py*dh/nh);if(x<0||y<0||x>dw||y>dh)return null;return sent?{x,y,...sent}:{x,y}}
 image.addEventListener("load",()=>note("video connected"));image.addEventListener("error",()=>{if(view.mode!=="multipart")return;note("stream reconnecting");reconnectTimer=setTimeout(restart,600)});
 function startMultipart(reason){view.mode="multipart";view.reason=reason||"";stats.decoder="multipart";closeVideoSocket();if(decoder&&decoder.state!=="closed")decoder.close();decoder=null;video.hidden=true;image.hidden=false;restart()}
 
@@ -2341,7 +3229,9 @@ function startWebCodecs(){view.mode="webcodecs";stats.decoder="webcodecs";clearT
 function closeVideoSocket(){const socket=videoSocket;videoSocket=null;if(socket)socket.close()}
 function connectVideo(){if(videoSocket||view.mode!=="webcodecs")return;const socket=new WebSocket(wsUrl("/ws/video"));let opened=false;socket.binaryType="arraybuffer";videoSocket=socket;socket.onopen=()=>{opened=true;videoRetry=500;videoRefusals=0};socket.onmessage=event=>onVideoMessage(event.data);socket.onclose=()=>{if(videoSocket!==socket)return;videoSocket=null;waitingKey=true;if(!opened&&++videoRefusals>=4){fallback("the video WebSocket was refused");return}if(view.mode==="webcodecs"&&scrcpyActive()){setTimeout(connectVideo,videoRetry);videoRetry=Math.min(5000,videoRetry*2)}}}
 function onVideoMessage(data){if(typeof data==="string"){try{applyState(JSON.parse(data))}catch{}return}const bytes=new Uint8Array(data);if(!bytes.length)return;const view8=new DataView(data);if(bytes[0]===1&&bytes.length>=9){setVideoSize(view8.getUint32(1),view8.getUint32(5));waitingKey=true}else if(bytes[0]===2){configure(bytes.slice(1))}else if(bytes[0]===3&&bytes.length>=10){stats.packets+=1;stats.bytes+=bytes.length-10;decode((bytes[1]&1)===1,Number(view8.getBigUint64(2)),bytes.subarray(10))}}
-function setVideoSize(width,height){if(!width||!height)return;view.width=width;view.height=height;if(video.width!==width||video.height!==height){video.width=width;video.height=height}device.style.aspectRatio=width+" / "+height}
+function setVideoSize(width,height){if(!width||!height)return;view.width=width;view.height=height;if(video.width!==width||video.height!==height){video.width=width;video.height=height}fitFrame(width,height)}
+// The device frame takes the picture's aspect; its width comes from the ratio and the room left.
+function fitFrame(width,height){const ratio=width/height;if(!ratio||ratio===frameRatio)return;frameRatio=ratio;device.style.aspectRatio=width+" / "+height;device.style.setProperty("--video-ratio",String(ratio))}
 function codecFromSps(data){for(let i=0;i+3<data.length;i++){if(data[i]===0&&data[i+1]===0&&data[i+2]===1&&(data[i+3]&31)===7){const out=[];let zeros=0;for(let j=i+3;j<data.length&&out.length<4;j++){const b=data[j];if(zeros>=2&&b===3){zeros=0;continue}zeros=b===0?zeros+1:0;out.push(b)}if(out.length<4)return null;return"avc1."+[out[1],out[2],out[3]].map(b=>b.toString(16).toUpperCase().padStart(2,"0")).join("")}}return null}
 function fallback(reason){note(reason);startMultipart(reason)}
 function configure(data){config=data;waitingKey=true;const codec=codecFromSps(data);if(!codec){fallback("the stream has no H.264 SPS");return}stats.codec=codec;const known=supportedCodecs.get(codec);if(known===true){applyDecoderConfig(codec);return}if(known===false){fallback("VideoDecoder rejects "+codec);return}configuring=true;VideoDecoder.isConfigSupported({codec,optimizeForLatency:true}).then(result=>{configuring=false;supportedCodecs.set(codec,Boolean(result.supported));if(!result.supported){pendingChunks=[];fallback("VideoDecoder rejects "+codec);return}applyDecoderConfig(codec);const queued=pendingChunks;pendingChunks=[];for(const item of queued)decode(item[0],item[1],item[2])}).catch(error=>{configuring=false;pendingChunks=[];fallback("VideoDecoder check failed: "+error.message)})}
@@ -2352,12 +3242,49 @@ function draw(){drawScheduled=false;const frame=pendingFrame;if(!frame)return;pe
 function onDecoderError(error){stats.errors+=1;note("decoder: "+(error&&error.message||error));try{if(decoder&&decoder.state!=="closed")decoder.close()}catch{}decoder=null;waitingKey=true;if(stats.codec&&supportedCodecs.get(stats.codec))applyDecoderConfig(stats.codec);sendControl({t:"system",op:"keyframe"})}
 
 // scrcpy control: one WebSocket carrying touch, wheel, keys, text and system actions.
-function connectControl(){if(controlSocket||!scrcpyActive())return;const socket=new WebSocket(wsUrl("/ws/control"));controlSocket=socket;socket.onopen=()=>{controlRetry=500};socket.onmessage=event=>{let message;try{message=JSON.parse(event.data)}catch{return}onControlMessage(message)};socket.onclose=()=>{if(controlSocket!==socket)return;controlSocket=null;activePointers.clear();if(scrcpyActive()){setTimeout(connectControl,controlRetry);controlRetry=Math.min(5000,controlRetry*2)}}}
+function connectControl(){if(controlSocket||!scrcpyActive())return;const socket=new WebSocket(wsUrl("/ws/control"));controlSocket=socket;socket.onopen=()=>{controlRetry=500};socket.onmessage=event=>{let message;try{message=JSON.parse(event.data)}catch{return}onControlMessage(message)};socket.onclose=()=>{if(controlSocket!==socket)return;controlSocket=null;activePointers.clear();displayBusy=false;if(scrcpyActive()){setTimeout(connectControl,controlRetry);controlRetry=Math.min(5000,controlRetry*2)}}}
 function closeControlSocket(){const socket=controlSocket;controlSocket=null;if(socket)socket.close()}
-function onControlMessage(message){if(message.t==="state")applyState(message);else if(message.t==="error"){stats.errors+=1;note(message.message)}else if(message.t==="clipboard"){if(typeof message.text!=="string"){note("the device clipboard has no text");return}textInput.value=message.text;if(navigator.clipboard&&navigator.clipboard.writeText)navigator.clipboard.writeText(message.text).catch(()=>{});note("device clipboard copied")}else if(message.t==="pong"){view.rtt=Math.round(performance.now()-message.ts)}}
+function onControlMessage(message){if(message.t==="state")applyState(message);else if(message.t==="display")onDisplay(message.display);else if(message.t==="error"){stats.errors+=1;note(message.message);if(message.for==="display"){displayBusy=false;syncPicker()}}else if(message.t==="clipboard"){if(typeof message.text!=="string"){note("the device clipboard has no text");return}textInput.value=message.text;if(navigator.clipboard&&navigator.clipboard.writeText)navigator.clipboard.writeText(message.text).catch(()=>{});note("device clipboard copied")}else if(message.t==="pong"){view.rtt=Math.round(performance.now()-message.ts)}}
 function sendControl(message){if(!controlSocket||controlSocket.readyState!==1)return false;controlSocket.send(JSON.stringify(message));return true}
-function applyState(message){view.owner=message.owner;view.paused=message.paused;view.session=message.session;view.clients=message.clients;if(view.mode==="webcodecs"&&message.width&&message.height)setVideoSize(message.width,message.height);if(message.transport&&message.transport!==view.transport){view.transport=message.transport;applyTransport()}}
-function applyTransport(){textInput.placeholder=scrcpyActive()?"Text (Unicode)":"Safe ASCII text";for(const button of document.querySelectorAll("[data-scrcpy]"))button.hidden=!scrcpyActive();if(scrcpyActive()){connectControl();if(!view.mode){if(typeof VideoDecoder==="function"&&typeof EncodedVideoChunk==="function")startWebCodecs();else startMultipart("VideoDecoder is not available in this browser")}}else{closeControlSocket();if(view.mode!=="multipart")startMultipart("")}}
+function applyState(message){view.owner=message.owner;view.paused=message.paused;view.session=message.session;view.clients=message.clients;if("preset" in message){view.preset=message.preset;view.density=message.density}syncPicker();if(view.mode==="webcodecs"&&message.width&&message.height)setVideoSize(message.width,message.height);if(message.transport&&message.transport!==view.transport){view.transport=message.transport;applyTransport()}}
+function applyTransport(){textInput.placeholder=scrcpyActive()?"Text to type":"ASCII text to type";setText(ui.hint,scrcpyActive()?"Any language. Longer text is pasted through the device clipboard.":"Letters, digits and punctuation of plain ASCII on this transport.");for(const button of document.querySelectorAll("[data-scrcpy]"))button.hidden=!scrcpyActive();if(scrcpyActive()){connectControl();if(!view.mode){if(typeof VideoDecoder==="function"&&typeof EncodedVideoChunk==="function")startWebCodecs();else startMultipart("VideoDecoder is not available in this browser")}}else{closeControlSocket();if(view.mode!=="multipart")startMultipart("")}}
+// Size picker (Android): the preset in effect is selected; a choice goes the way other input goes.
+function canSendInput(){return !view.paused&&(view.owner==="shared"||view.owner==="human")}
+// Called every render too: nothing already shown is set again, so an open menu stays as it is.
+// A button disabled while focused drops the focus to the page; when a change chosen from it
+// is answered and the button is enabled again, the focus comes back unless it moved on.
+function syncPicker(){syncControls();if(!sizePicker)return;const disabled=displayBusy||!view.status||!canSendInput(),value=view.preset||"";if(sizePicker.disabled!==disabled){sizePicker.disabled=disabled;if(!disabled&&refocusPicker&&(!document.activeElement||document.activeElement===document.body))sizePicker.focus()}if(!displayBusy)refocusPicker=false;if(disabled)closeMenu(false);if(!displayBusy&&sizePicker.value!==value)sizePicker.value=value;setText(sizeLabel,!view.status?"Size":PRESET_LABELS[sizePicker.value]||"Other size");const wide=wideDisplay();if(sizePicker.classList.contains("wide")!==wide)sizePicker.classList.toggle("wide",wide);for(const option of sizeOptions){const selected=String(option.dataset.preset===sizePicker.value);if(option.getAttribute("aria-selected")!==selected)option.setAttribute("aria-selected",selected)}}
+// The size button shows a landscape device for a landscape preset; for the device default or
+// a size this Canvas did not set, the orientation of the size in effect.
+function wideDisplay(){const value=sizePicker.value;if(value&&value!=="default"&&PRESET_LABELS[value])return WIDE_PRESETS.includes(value);return Boolean(logicalDisplay&&logicalDisplay.width>logicalDisplay.height)}
+function onDisplay(display){displayBusy=false;if(display){view.preset=display.preset;view.density=display.density;if(display.width&&display.height)logicalDisplay={width:display.width,height:display.height};rememberDefaultSize(display)}syncPicker()}
+// The menu shows the device's own size beside "Device default" once it has been in effect.
+function rememberDefaultSize(display){if(display&&display.preset==="default")setText(defaultSize,sizeText(display.width,display.height))}
+async function chooseDisplay(preset){if(!preset)return;displayBusy=true;refocusPicker=document.activeElement===sizePicker;syncPicker();if(scrcpyActive()&&sendControl({t:"display",preset}))return;try{onDisplay((await post("/display",{preset})).display)}catch(error){displayBusy=false;note(error.message);syncPicker()}}
+// The Size menu is a popup listbox (PAGE-004): a click or Enter opens it, the keyboard on its
+// first option (ArrowUp: the last), a pointer on the preset in effect; arrows, Home and End
+// move, Enter or a click chooses, Escape, Tab or a click elsewhere closes it unchanged.
+function openMenu(start){if(!sizePicker||sizePicker.disabled||menuOpen)return;menuOpen=true;sizeMenu.classList.add("open");sizePicker.setAttribute("aria-expanded","true");const selected=sizeOptions.findIndex(option=>option.dataset.preset===sizePicker.value),index=start==="last"?sizeOptions.length-1:start==="selected"&&selected>=0?selected:0;if(sizeOptions[index])sizeOptions[index].focus()}
+function closeMenu(refocus){if(!menuOpen)return;menuOpen=false;sizeMenu.classList.remove("open");sizePicker.setAttribute("aria-expanded","false");if(refocus)sizePicker.focus()}
+function optionOf(target){return sizeOptions.find(option=>option.contains(target))||null}
+function chooseFromMenu(preset){closeMenu(true);if(!preset||preset===view.preset)return;sizePicker.value=preset;chooseDisplay(preset)}
+function onMenuKey(event){const index=sizeOptions.indexOf(event.target),moves={ArrowDown:index+1,ArrowUp:index-1,Home:0,End:sizeOptions.length-1},next=moves[event.key];if(next!==undefined){event.preventDefault();sizeOptions[Math.min(sizeOptions.length-1,Math.max(0,next))].focus()}else if(event.key==="Escape"){event.preventDefault();closeMenu(true)}else if(event.key==="Tab")closeMenu(false)}
+if(sizePicker){
+  sizePicker.addEventListener("click",event=>{if(menuOpen)closeMenu(false);else openMenu(event.detail===0?"first":"selected")});
+  sizePicker.addEventListener("keydown",event=>{if(event.key==="ArrowDown"||event.key==="ArrowUp"){event.preventDefault();openMenu(event.key==="ArrowUp"?"last":"first")}else if(event.key==="Escape")closeMenu(true)});
+  sizeMenu.addEventListener("keydown",onMenuKey);
+  sizeMenu.addEventListener("click",event=>{const option=optionOf(event.target);if(option)chooseFromMenu(option.dataset.preset)});
+  sizeMenu.addEventListener("pointermove",event=>{const option=optionOf(event.target);if(option&&document.activeElement!==option)option.focus({preventScroll:true})});
+  document.addEventListener("pointerdown",event=>{if(menuOpen&&!sizeMenu.contains(event.target)&&!sizePicker.contains(event.target))closeMenu(false)});
+}
+// Controls that cannot act look and are disabled (PAGE-004); handoff goes the way input goes.
+function syncControls(){const ready=Boolean(view.status)&&canSendInput(),owner=OWNERS[view.owner]||[String(view.owner),"holds control"];for(const control of inputControls)if(control.disabled===ready)control.disabled=!ready;setText(ui.ownerName,owner[0]);setText(ui.ownerDetail,"· "+(view.paused?"input is paused":owner[1]));setText(ui.chip,owner[0]+(view.paused?" · Paused":""));setState(ui.ownerDot,ready?"live":"warn");setText(ui.take,view.owner==="human"?"Release":"Take control");setText(ui.pause,view.paused?"Resume input":"Pause input");for(const button of [ui.take,ui.pause])if(button.disabled===Boolean(view.status))button.disabled=!view.status}
+function setControl(mode){if(scrcpyActive()&&sendControl({t:"control",mode}))return;post("/control",{mode}).then(result=>{view.owner=result.control_owner;view.paused=result.input_paused;syncPicker()}).catch(error=>note(error.message))}
+ui.take.addEventListener("click",()=>setControl(view.owner==="human"?"release":"takeover"));
+ui.pause.addEventListener("click",()=>setControl(view.paused?"resume":"pause"));
+ui.inspector.addEventListener("click",()=>{const hidden=document.body.classList.toggle("no-inspector");ui.inspector.setAttribute("aria-pressed",String(!hidden));ui.inspector.title=hidden?"Show inspector":"Hide inspector"});
+// iOS Safari shows :active press feedback only while the document has a touch listener.
+document.addEventListener("touchstart",()=>{},{passive:true});
 function clamp01(value){return Math.min(1,Math.max(0,value))}
 function normalized(event,clampInside){const element=surface(),rect=element.getBoundingClientRect(),width=view.mode==="webcodecs"?video.width:image.naturalWidth,height=view.mode==="webcodecs"?video.height:image.naturalHeight;if(!width||!height||!rect.width||!rect.height)return null;const ratio=Math.min(rect.width/width,rect.height/height),rw=width*ratio,rh=height*ratio,x=(event.clientX-rect.left-(rect.width-rw)/2)/rw,y=(event.clientY-rect.top-(rect.height-rh)/2)/rh;if(clampInside)return{x:clamp01(x),y:clamp01(y)};if(x<0||y<0||x>1||y>1)return null;return{x,y}}
 function pressure(event){return event.pointerType==="mouse"||!event.pressure?1:Math.min(1,event.pressure)}
@@ -2368,7 +3295,8 @@ function onPointerDown(event){if(!scrcpyActive()){legacyPointerDown(event);retur
 function onPointerMove(event){const active=activePointers.get(event.pointerId);if(!active)return;const at=normalized(event,true);if(at)sendTouch("move",event.pointerId,at,active.pinch,pressure(event))}
 function onPointerEnd(event,action){const active=activePointers.get(event.pointerId);if(!active)return;activePointers.delete(event.pointerId);const at=normalized(event,true)||{x:0.5,y:0.5};sendTouch(action,event.pointerId,at,active.pinch,0)}
 function legacyPointerDown(event){const p=point(event);if(!p)return;image.setPointerCapture(event.pointerId);pointer={...p,time:performance.now(),id:event.pointerId}}
-async function legacyPointerUp(event){if(!pointer)return;const end=point(event)||pointer,start=pointer;pointer=null;const duration=Math.max(1,Math.round(performance.now()-start.time)),distance=Math.hypot(end.x-start.x,end.y-start.y);try{if(distance<12&&duration<500)await post("/tap",{x:end.x,y:end.y});else await post("/swipe",{x1:start.x,y1:start.y,x2:end.x,y2:end.y,duration:Math.min(5000,duration)})}catch(error){note(error.message)}}
+// A size that changed between down and up: the start moves to the size of the end.
+async function legacyPointerUp(event){if(!pointer)return;const end=point(event)||pointer,start=pointer;pointer=null;const both=Boolean(start.dw&&end.dw),sx=both?Math.round(start.x*end.dw/start.dw):start.x,sy=both?Math.round(start.y*end.dh/start.dh):start.y,size=end.dw?{dw:end.dw,dh:end.dh}:{},duration=Math.max(1,Math.round(performance.now()-start.time)),distance=Math.hypot(end.x-sx,end.y-sy);try{if(distance<12&&duration<500)await post("/tap",{x:end.x,y:end.y,...size});else await post("/swipe",{x1:sx,y1:sy,x2:end.x,y2:end.y,duration:Math.min(5000,duration),...(both?size:{})})}catch(error){note(error.message)}}
 for(const element of [image,video]){
   element.addEventListener("pointerdown",onPointerDown);
   element.addEventListener("pointermove",onPointerMove);
@@ -2381,7 +3309,7 @@ for(const element of [image,video]){
   element.addEventListener("blur",releaseKeys);
   element.addEventListener("paste",onPaste);
 }
-async function onWheel(event){event.preventDefault();if(scrcpyActive()){const at=normalized(event,false);if(!at)return;const scale=event.deltaMode===1?1/3:event.deltaMode===2?1:1/100;const dx=Math.max(-16,Math.min(16,event.deltaX*scale)),dy=Math.max(-16,Math.min(16,-event.deltaY*scale));if(dx||dy)sendControl({t:"scroll",x:at.x,y:at.y,dx,dy});return}if(!image.naturalWidth)return;const width=logicalDisplay?.width||image.naturalWidth,height=logicalDisplay?.height||image.naturalHeight,x=Math.round(width/2),y1=Math.round(height*.55),y2=Math.round(height*(event.deltaY>0?.25:.78));try{await post("/swipe",{x1:x,y1,x2:x,y2,duration:220})}catch(error){note(error.message)}}
+async function onWheel(event){event.preventDefault();if(scrcpyActive()){const at=normalized(event,false);if(!at)return;const scale=event.deltaMode===1?1/3:event.deltaMode===2?1:1/100;const dx=Math.max(-16,Math.min(16,event.deltaX*scale)),dy=Math.max(-16,Math.min(16,-event.deltaY*scale));if(dx||dy)sendControl({t:"scroll",x:at.x,y:at.y,dx,dy});return}if(!image.naturalWidth)return;const sent=sentSize(),width=sent?sent.dw:image.naturalWidth,height=sent?sent.dh:image.naturalHeight,x=Math.round(width/2),y1=Math.round(height*.55),y2=Math.round(height*(event.deltaY>0?.25:.78));try{await post("/swipe",{x1:x,y1,x2:x,y2,duration:220,...sent})}catch(error){note(error.message)}}
 function metaFor(event){return metaStateFor({shiftKey:event.shiftKey,ctrlKey:event.ctrlKey,altKey:event.altKey,metaKey:event.metaKey})}
 function onKeyDown(event){if(!scrcpyActive())return;const input=keyInputFor(event,KEYCODES,US_KEY_CHARS);if(!input)return;event.preventDefault();if(input.text!==undefined){sendControl({t:"text",text:input.text});return}const repeat=event.repeat?(heldKeys.get(event.code)||0)+1:0;heldKeys.set(event.code,repeat);sendControl({t:"key",a:"down",code:input.code,meta:metaFor(event),repeat})}
 function onKeyUp(event){if(!scrcpyActive()||!heldKeys.has(event.code))return;event.preventDefault();heldKeys.delete(event.code);sendControl({t:"key",a:"up",code:KEYCODES[event.code],meta:metaFor(event),repeat:0})}
@@ -2395,13 +3323,19 @@ $("refresh").onclick=()=>{if(view.mode==="webcodecs"){closeVideoSocket();waiting
 async function sendText(){const value=textInput.value;if(!value)return;if(scrcpyActive()){const message=utf8Length(value)<=300?{t:"text",text:value}:{t:"paste",text:value};if(!fitsControl(message,"the text"))return;const ok=sendControl(message);if(ok)textInput.value="";return}try{await post("/text",{text:value});textInput.value=""}catch(error){note(error.message)}}
 $("sendText").onclick=sendText;textInput.addEventListener("keydown",event=>{if(event.key==="Enter")sendText()});
 function transportLabel(){if(!view.transport)return"connecting";if(view.transport!=="scrcpy")return view.transport;if(view.mode==="webcodecs")return"scrcpy (webcodecs)";return"scrcpy (multipart"+(view.reason?": "+view.reason:"")+")"}
-function render(){const data=view.status||{},lines=["platform: "+(data.platform||"unknown"),"transport: "+transportLabel()];if(data.fallback_reason)lines.push("fallback: "+data.fallback_reason);if(view.mode==="webcodecs"){lines.push("decoder: "+(stats.codec||"waiting for config"));lines.push("fps: "+stats.renderTimes.length+" rendered, "+stats.framesDecoded+" decoded, "+stats.framesDropped+" dropped, queue "+(decoder?decoder.decodeQueueSize:0));lines.push("video: "+(view.width?view.width+"x"+view.height:"waiting")+", session "+view.session)}else{lines.push("frames: "+(data.frames_sent??0)+"\\nstream clients: "+(data.stream_clients??0))}if(view.clients)lines.push("clients: video "+view.clients.video+", control "+view.clients.control);lines.push("display: "+(data.display?data.display.width+"x"+data.display.height:"unknown"));lines.push("control: "+view.owner+(view.paused?" (paused)":""));if(data.last_error)lines.push("last error: "+data.last_error);if(view.note)lines.push("note: "+view.note);setStatus(lines.join("\\n"))}
-async function poll(){try{const response=await fetch(url("/status")),data=await response.json();if(!response.ok)throw new Error(data.error||response.statusText);view.status=data;logicalDisplay=data.display;view.owner=data.control_owner;view.paused=data.input_paused;if(data.transport!==view.transport){view.transport=data.transport;applyTransport()}}catch(error){note(error.message);if(!view.mode)startMultipart("status unavailable")}finally{setTimeout(poll,1200)}}
-function snapshot(){return{transport:view.transport,mode:view.mode,decoder:stats.decoder,fallbackReason:view.reason||null,codec:stats.codec,framesDecoded:stats.framesDecoded,framesRendered:stats.framesRendered,framesDropped:stats.framesDropped,decodeQueueSize:decoder?decoder.decodeQueueSize:0,fps:stats.renderTimes.length,packets:stats.packets,bytes:stats.bytes,errors:stats.errors,lastFrameAt:stats.lastFrameAt,width:view.width,height:view.height,session:view.session,owner:view.owner,paused:view.paused,clients:view.clients,control:controlSocket?controlSocket.readyState:-1,video:videoSocket?videoSocket.readyState:-1,rtt:view.rtt,note:view.note,status:statusEl.textContent}}
+function render(){const data=view.status||{},lines=["platform: "+(data.platform||"unknown"),"transport: "+transportLabel()];if(data.fallback_reason)lines.push("fallback: "+data.fallback_reason);if(view.mode==="webcodecs"){lines.push("decoder: "+(stats.codec||"waiting for config"));lines.push("fps: "+stats.renderTimes.length+" rendered, "+stats.framesDecoded+" decoded, "+stats.framesDropped+" dropped, queue "+(decoder?decoder.decodeQueueSize:0));lines.push("video: "+(view.width?view.width+"x"+view.height:"waiting")+", session "+view.session)}else{lines.push("frames: "+(data.frames_sent??0)+"\\nstream clients: "+(data.stream_clients??0))}if(view.clients)lines.push("clients: video "+view.clients.video+", control "+view.clients.control);lines.push("display: "+(data.display&&data.display.width?data.display.width+"x"+data.display.height+(view.density?" @ "+view.density:"")+(sizePicker?" ("+(view.preset||"other")+")":""):"unknown"));lines.push("control: "+view.owner+(view.paused?" (paused)":""));if(data.last_error)lines.push("last error: "+data.last_error);if(view.note)lines.push("note: "+view.note);setStatus(lines.join("\\n"));syncPicker();renderChrome()}
+// The toolbar, caption, notice and Stream details; every string reaches the page as text.
+function sizeText(width,height){return width&&height?width+" × "+height:""}
+function displayText(){const display=logicalDisplay||{},size=sizeText(display.width,display.height);return size&&view.density?size+" · "+view.density+" dpi":size}
+function liveState(){if(!view.status)return"idle";if(view.paused)return"warn";if(view.mode==="webcodecs")return view.session==="streaming"&&stats.framesRendered?"live":"idle";return view.mode==="multipart"&&image.naturalWidth?"live":"idle"}
+function captionText(){if(view.mode==="webcodecs")return stats.renderTimes.length+" fps"+(view.rtt!=null?" · "+view.rtt+" ms":"")+" · WebCodecs";if(view.mode==="multipart")return(view.transport?view.transport+" · ":"")+"multipart stream";return"Connecting…"}
+function renderChrome(){const data=view.status||{},webcodecs=view.mode==="webcodecs";if(view.status)setText(ui.target,(data.platform==="ios"?"iOS":"Android")+" · "+(view.transport||"connecting"));setState(ui.liveDot,liveState());setText(ui.dims,displayText());setText(ui.caption,captionText());setText(ui.notice,view.note&&Date.now()-noteAt<NOTICE_MS?view.note:"");setText(ui.transport,view.transport==="scrcpy"?"scrcpy · "+(webcodecs?"WebCodecs":"multipart"):view.transport||"connecting");setText(ui.codec,webcodecs?stats.codec||"waiting":"—");setText(ui.frames,webcodecs?stats.renderTimes.length+" fps · "+stats.framesDropped+" dropped":(data.frames_sent??0)+" sent");setText(ui.videoSize,(webcodecs?sizeText(view.width,view.height):sizeText(image.naturalWidth,image.naturalHeight))||"waiting");setText(ui.display,displayText()||"unknown");setText(ui.clients,view.clients?view.clients.video+" video · "+view.clients.control+" control":(data.stream_clients??0)+" stream");if(view.mode==="multipart"&&image.naturalWidth)fitFrame(image.naturalWidth,image.naturalHeight)}
+async function poll(){try{const response=await fetch(url("/status")),data=await response.json();if(!response.ok)throw new Error(data.error||response.statusText);view.status=data;logicalDisplay=data.display;view.owner=data.control_owner;view.paused=data.input_paused;if(data.display&&"preset" in data.display){view.preset=data.display.preset;view.density=data.display.density}rememberDefaultSize(data.display);syncPicker();if(data.transport!==view.transport){view.transport=data.transport;applyTransport()}}catch(error){note(error.message);if(!view.mode)startMultipart("status unavailable")}finally{setTimeout(poll,1200)}}
+function snapshot(){return{transport:view.transport,mode:view.mode,decoder:stats.decoder,fallbackReason:view.reason||null,codec:stats.codec,framesDecoded:stats.framesDecoded,framesRendered:stats.framesRendered,framesDropped:stats.framesDropped,decodeQueueSize:decoder?decoder.decodeQueueSize:0,fps:stats.renderTimes.length,packets:stats.packets,bytes:stats.bytes,errors:stats.errors,lastFrameAt:stats.lastFrameAt,width:view.width,height:view.height,session:view.session,owner:view.owner,paused:view.paused,clients:view.clients,control:controlSocket?controlSocket.readyState:-1,video:videoSocket?videoSocket.readyState:-1,rtt:view.rtt,note:view.note,display:{preset:view.preset,density:view.density,picker:sizePicker?sizePicker.value:null,pickerDisabled:sizePicker?sizePicker.disabled:null},status:statusEl.textContent}}
 window.autonomCanvas=Object.freeze({stats:snapshot,send:sendControl});
 async function authenticate(){const body=bootstrapToken?{token:bootstrapToken}:{};const response=await fetch("/auth",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});const payload=await response.json().catch(()=>({}));if(response.ok){csrf=payload.csrf;return}if(bootstrapToken)throw new Error(payload.error||"Authentication failed");note("open the Canvas URL with its #token to sign in")}
 async function bootstrap(){await authenticate();setInterval(render,500);await poll()}
-bootstrap().catch(error=>setStatus(error.message));`;
+bootstrap().catch(error=>{setStatus(error.message);setText(ui.notice,error.message)});`;
 }
 
 function sendJson(response, status, value, headers = {}) {

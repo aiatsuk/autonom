@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { rmSync, writeFileSync } from "node:fs";
+import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { request as httpRequest } from "node:http";
 import { connect, createServer } from "node:net";
@@ -32,9 +32,29 @@ const H264 = 0x68323634;
 const CONFIG = Buffer.from([0, 0, 0, 1, 0x67, 0x42, 0xc0, 0x29, 0x8d, 0x68, 0x0a, 0x02,
   0, 0, 0, 1, 0x68, 0xce, 0x3c, 0x80]);
 
+// The fake display, shared by the fake adb and the fake bridge: physical 1080x2400 @ 420.
+// Overrides live in the FAKE_WM_STATE file once wm sets one; before that,
+// FAKE_WM_OVERRIDE ("WxH@D", either side may be empty) is what the device had already.
+const FAKE_WM = String.raw`
+const PHYSICAL = { size: "1080x2400", density: 420 };
+function wmState() {
+  try {
+    return JSON.parse(readFileSync(process.env.FAKE_WM_STATE, "utf8"));
+  } catch {
+    const [size = "", density = ""] = (process.env.FAKE_WM_OVERRIDE ?? "").split("@");
+    return { size: size || null, density: density ? Number(density) : null };
+  }
+}
+function wmEffective(state = wmState()) {
+  const [width, height] = (state.size ?? PHYSICAL.size).split("x").map(Number);
+  return { width, height, density: state.density ?? PHYSICAL.density };
+}
+`;
+
 const FAKE_ADB = String.raw`
-import { appendFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { connect } from "node:net";
+${FAKE_WM}
 
 const args = process.argv.slice(2);
 appendFileSync(process.env.FAKE_ADB_LOG, JSON.stringify(args) + "\n");
@@ -45,10 +65,18 @@ const PNG = Buffer.from(process.env.FAKE_PNG, "base64");
 if (command === "get-state") {
   console.log("device");
 } else if (command === "exec-out" && tail[0] === "screencap") {
+  // Once the display was changed, each picture's PNG header carries its size.
+  if (existsSync(process.env.FAKE_WM_STATE ?? "")) {
+    const { width, height } = wmEffective();
+    PNG.writeUInt32BE(width, 16);
+    PNG.writeUInt32BE(height, 20);
+  }
   process.stdout.write(PNG);
 } else if (command === "exec-out" && tail[0] === "screenrecord") {
   if (process.env.FAKE_SCREENRECORD === "h264" && tail.includes("--output-format=h264")) {
     process.stdout.write(Buffer.from([0, 0, 0, 1, 0x67, 0x42, 0xc0, 0x29, 0, 0, 0, 1, 0x68, 0xce]));
+    // A capture runs until it is stopped; the start-up probe has a time limit.
+    if (process.env.FAKE_SCREENRECORD_HOLD && !tail.includes("--time-limit")) setInterval(() => {}, 1000);
   } else {
     console.error("screenrecord: unrecognized option '--output-format=h264'");
     process.exitCode = 1;
@@ -56,8 +84,30 @@ if (command === "get-state") {
 } else if (command === "shell" && tail.join(" ") === "screenrecord --help") {
   // Android 16 (API 36) help text: the hidden --output-format option is not listed.
   console.log("Usage: screenrecord [options] <filename>\n--size WIDTHxHEIGHT\n--bit-rate RATE\n--time-limit TIME");
-} else if (command === "shell" && tail.join(" ") === "wm size") {
-  console.log("Physical size: 1080x2400");
+} else if (command === "shell" && tail[0] === "wm" && ["size", "density"].includes(tail[1])) {
+  const [, what, value] = tail;
+  const state = wmState();
+  const physical = String(PHYSICAL[what]);
+  // While this file exists, setting or resetting the density fails; while it says
+  // "read", reading the density fails too.
+  const fails = existsSync(process.env.FAKE_WM_DENSITY_FAIL ?? "")
+    ? readFileSync(process.env.FAKE_WM_DENSITY_FAIL, "utf8") : null;
+  if (what === "density" && fails !== null && (value !== undefined || fails === "read")) {
+    console.error(value === undefined ? "Error: could not read the density" : "Error: could not set the density");
+    process.exitCode = 1;
+  } else if (value === undefined) {
+    console.log("Physical " + what + ": " + physical);
+    if (state[what] !== null) console.log("Override " + what + ": " + state[what]);
+  } else {
+    // A slow device: FAKE_WM_SET_MS after the call the value is set and adb answers.
+    setTimeout(() => {
+      const now = wmState();
+      // Like WindowManager, a value equal to the physical one clears the override.
+      const cleared = value === "reset" || value === physical;
+      now[what] = cleared ? null : what === "size" ? value : Number(value);
+      writeFileSync(process.env.FAKE_WM_STATE, JSON.stringify(now));
+    }, Number(process.env.FAKE_WM_SET_MS ?? 0));
+  }
 } else if (command === "push") {
   if (process.env.FAKE_PUSH_FAIL) {
     console.error("adb: error: failed to copy");
@@ -82,7 +132,8 @@ if (command === "get-state") {
 } else if (command === "shell" && tail.length === 1 && tail[0].startsWith("pkill -f ")) {
   process.exitCode = 1;
 } else if (command === "shell" && tail[0] === "input") {
-  // nothing to do
+  // A slow device: input answers FAKE_ADB_INPUT_MS after the call, as a long swipe does.
+  setTimeout(() => {}, Number(process.env.FAKE_ADB_INPUT_MS ?? 0));
 } else {
   console.error("unsupported fake adb command: " + rest.join(" "));
   process.exitCode = 2;
@@ -90,28 +141,52 @@ if (command === "get-state") {
 `;
 
 const FAKE_BRIDGE = String.raw`
-import { appendFileSync, existsSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { createInterface } from "node:readline";
+${FAKE_WM}
 
 // While this file exists, record answers wait: a journal slower than its input.
 const HOLD = process.env.FAKE_BRIDGE_LOG + ".hold";
 // A slow disk: each record is answered this long after it arrives.
 const RECORD_MS = Number(process.env.FAKE_BRIDGE_RECORD_MS ?? 0);
+// A slow device for HTTP input: taps, swipes, keys and text are answered this long after.
+const INPUT_MS = Number(process.env.FAKE_BRIDGE_INPUT_MS ?? 0);
+const INPUT_OPS = ["tap", "swipe", "key", "text"];
+// Like the real bridge, one line at a time: each is handled, and logged, only once the one
+// before it was answered, so a record behind a slow swipe waits for it.
+const IN_ORDER = Boolean(process.env.FAKE_BRIDGE_IN_ORDER);
 const held = [];
 const answer = (id, result) => process.stdout.write(JSON.stringify({ id, ok: true, result }) + "\n");
 setInterval(() => {
   while (held.length && !existsSync(HOLD)) answer(...held.shift());
 }, 20).unref();
 
-createInterface({ input: process.stdin }).on("line", (line) => {
+/** Handle one line; resolves once it is answered (a held record counts as answered). */
+function handle(line) {
   const message = JSON.parse(line);
   appendFileSync(process.env.FAKE_BRIDGE_LOG, line + "\n");
   let result = { ok: true };
-  if (message.op === "screen-size") result = { ok: true, display: { width: 1080, height: 2400 } };
+  if (message.op === "screen-size") {
+    // Like the real bridge, the size in effect: an override, else the physical size.
+    const { width, height } = wmEffective();
+    result = { ok: true, display: { width, height } };
+  }
   if (message.op === "record") result = { ok: true, recorded: message.payload.kind, via: "scrcpy" };
+  const later = (ms) => new Promise((resolvePromise) => setTimeout(() => {
+    answer(message.id, result);
+    resolvePromise();
+  }, ms));
   if (message.op === "record" && (held.length || existsSync(HOLD))) held.push([message.id, result]);
-  else if (message.op === "record" && RECORD_MS) setTimeout(() => answer(message.id, result), RECORD_MS);
+  else if (message.op === "record" && RECORD_MS) return later(RECORD_MS);
+  else if (INPUT_OPS.includes(message.op) && INPUT_MS) return later(INPUT_MS);
   else answer(message.id, result);
+  return Promise.resolve();
+}
+
+let turn = Promise.resolve();
+createInterface({ input: process.stdin }).on("line", (line) => {
+  if (IN_ORDER) turn = turn.then(() => handle(line));
+  else handle(line);
 });
 `;
 
@@ -699,6 +774,7 @@ async function makeWorld(t, { env = {}, device = {} } = {}) {
   await mkdir(bin);
   const adbLog = join(directory, "adb.log");
   const bridgeLog = join(directory, "bridge.log");
+  const wmState = join(directory, "wm-state.json");
   await writeFile(adbLog, "");
   await writeFile(bridgeLog, "");
   const fakeAdb = join(directory, "fake-adb.mjs");
@@ -711,7 +787,7 @@ async function makeWorld(t, { env = {}, device = {} } = {}) {
   const fake = new FakeScrcpyDevice(device);
   const ports = await fake.listen();
   const world = {
-    directory, bin, adbLog, bridgeLog, fakeAdb, fakeBridge, serverFile, device: fake, children: [],
+    directory, bin, adbLog, bridgeLog, wmState, fakeAdb, fakeBridge, serverFile, device: fake, children: [],
     env: {
       // Only the temporary bin directory: no real adb, scrcpy or ffmpeg can be found.
       PATH: bin,
@@ -719,6 +795,7 @@ async function makeWorld(t, { env = {}, device = {} } = {}) {
       AUTONOM_HOME: join(directory, "autonom-home"),
       FAKE_ADB_LOG: adbLog,
       FAKE_BRIDGE_LOG: bridgeLog,
+      FAKE_WM_STATE: wmState,
       FAKE_PNG: PNG_BASE64,
       FAKE_SCRCPY_PORT: String(ports.forwardPort),
       FAKE_SCRCPY_LAUNCHER_PORT: String(ports.launcherPort),
@@ -856,19 +933,27 @@ async function statusWithin(canvas, timeoutMs) {
   return await response.json();
 }
 
+// How long GET /status may take while a flood test samples it, unless the test allows more.
+const STATUS_SAMPLE_MS = 10_000;
+
 /**
  * Run `work` while sampling the Canvas process: its resident memory, and GET /status,
- * which must keep answering. Returns the peak memory growth over the start.
+ * which must keep answering within `statusTimeoutMs`. Returns the peak memory growth
+ * over the start. With more time allowed for /status, memory is also sampled on its own,
+ * so a slow answer does not thin out the memory samples.
  */
-async function watchCanvas(canvas, work) {
+async function watchCanvas(canvas, work, { statusTimeoutMs = STATUS_SAMPLE_MS } = {}) {
   const before = await residentBytes(canvas.child.pid);
   let peak = before;
   const latencies = [];
   let done = false;
-  const sample = async () => {
+  const measure = async () => {
     peak = Math.max(peak, await residentBytes(canvas.child.pid));
+  };
+  const sample = async () => {
+    await measure();
     const started = Date.now();
-    await statusWithin(canvas, 10_000);
+    await statusWithin(canvas, statusTimeoutMs);
     return Date.now() - started;
   };
   const sampling = (async () => {
@@ -877,11 +962,17 @@ async function watchCanvas(canvas, work) {
       await sleep(100);
     }
   })();
+  const measuring = statusTimeoutMs > STATUS_SAMPLE_MS ? (async () => {
+    while (!done) {
+      await measure();
+      await sleep(100);
+    }
+  })() : null;
   try {
     await work();
   } finally {
     done = true;
-    await sampling;
+    await Promise.all([sampling, measuring]);
   }
   await sample();
   return { growth: peak - before, latencies };
@@ -934,7 +1025,7 @@ async function stallDuring(flooding, stop, go) {
 }
 
 // The record kinds of the approved bridge contract; it refuses any other kind.
-const RECORD_KINDS = ["gesture", "scroll", "key", "text", "paste", "system", "control"];
+const RECORD_KINDS = ["gesture", "scroll", "key", "text", "paste", "system", "control", "display"];
 
 /** Journal records (of one kind); each stands for exactly one action, so none carries a count. */
 async function journaled(world, kind = null) {
@@ -2481,23 +2572,110 @@ test("input: a finger and a key held when the device server dies are lifted thro
   await stopCanvas(canvas);
 });
 
+const VOID_TAGS = new Set(["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr"]);
+
 /**
- * The Canvas page script, run in a node:vm sandbox with just enough of a browser to load
- * (its sign-in never answers), on the scrcpy transport with an open control socket.
+ * Just enough of a DOM for the page script, built from the served page: elements by id and
+ * by the attribute selectors it queries, attributes, classes, focus, and events that bubble
+ * through their parents to the document. Text is whatever the script sets. As in a browser,
+ * an element that is disabled while it has the focus loses it to the body.
+ */
+function fakeDocument(html) {
+  const listeners = new Map();
+  const listen = (node, type, listener) => {
+    if (!listeners.has(node)) listeners.set(node, new Map());
+    const byType = listeners.get(node);
+    byType.set(type, [...(byType.get(type) ?? []), listener]);
+  };
+  const dispatch = (target, type, init = {}) => {
+    const event = { type, target, defaultPrevented: false, stopped: false, ...init,
+      preventDefault() { this.defaultPrevented = true; }, stopPropagation() { this.stopped = true; } };
+    for (let node = target; node && !event.stopped; node = node === document ? null : node.parent ?? document) {
+      for (const listener of listeners.get(node)?.get(type) ?? []) listener.call(node, event);
+    }
+    return event;
+  };
+  const document = {
+    activeElement: null,
+    addEventListener: (type, listener) => listen(document, type, listener),
+    dispatch: (type, init) => dispatch(document, type, init),
+  };
+  const elements = [];
+  const make = (tag, attributes, parent) => {
+    const names = new Set((attributes.class ?? "").split(/\s+/).filter(Boolean));
+    const element = {
+      tagName: tag.toUpperCase(), parent, attributes: new Map(Object.entries(attributes)), dataset: {},
+      id: attributes.id ?? "", hidden: "hidden" in attributes,
+      value: attributes.value ?? "", textContent: "", title: attributes.title ?? "",
+      style: { setProperty(name, value) { this[name] = value; } },
+      classList: {
+        add: (name) => names.add(name), remove: (name) => names.delete(name), contains: (name) => names.has(name),
+        toggle: (name, force = !names.has(name)) => (force ? names.add(name) : names.delete(name), force),
+      },
+      getContext: () => ({}),
+      getAttribute: (name) => element.attributes.get(name) ?? null,
+      setAttribute: (name, value) => element.attributes.set(name, String(value)),
+      contains: (other) => {
+        for (let node = other; node; node = node.parent) if (node === element) return true;
+        return false;
+      },
+      focus: () => { document.activeElement = element; },
+      addEventListener: (type, listener) => listen(element, type, listener),
+      dispatch: (type, init) => dispatch(element, type, init),
+      click: () => { if (!element.disabled) dispatch(element, "click", { detail: 0 }); },
+    };
+    let disabled = "disabled" in attributes;
+    Object.defineProperty(element, "disabled", {
+      enumerable: true,
+      get: () => disabled,
+      set: (value) => {
+        disabled = Boolean(value);
+        if (disabled && document.activeElement === element) document.activeElement = document.body ?? null;
+      },
+    });
+    for (const [name, value] of Object.entries(attributes)) {
+      if (name.startsWith("data-")) element.dataset[name.slice(5).replace(/-(\w)/g, (_, letter) => letter.toUpperCase())] = value;
+    }
+    elements.push(element);
+    return element;
+  };
+  const markup = html.replace(/<script>[\s\S]*?<\/script>|<style>[\s\S]*?<\/style>/g, "");
+  const open = [];
+  for (const [, closing, tag, rest] of markup.matchAll(/<(\/?)([a-zA-Z][\w-]*)([^>]*)>/g)) {
+    if (closing) {
+      const index = open.findLastIndex((element) => element.tagName === tag.toUpperCase());
+      if (index >= 0) open.length = index;
+      continue;
+    }
+    const attributes = Object.fromEntries([...rest.matchAll(/([^\s="'/]+)(?:="([^"]*)")?/g)]
+      .map(([, name, value = ""]) => [name, value]));
+    const element = make(tag, attributes, open.at(-1) ?? null);
+    if (!VOID_TAGS.has(tag.toLowerCase()) && !rest.trimEnd().endsWith("/")) open.push(element);
+  }
+  document.elements = elements;
+  document.body = elements.find((element) => element.tagName === "BODY");
+  document.getElementById = (id) => elements.find((element) => element.id === id) ?? null;
+  document.querySelectorAll = (selector) => {
+    const names = selector.split(",").map((part) => part.trim().match(/^\[([\w-]+)\]$/)?.[1]);
+    if (names.some((name) => !name)) throw new Error(`the fake document cannot query ${selector}`);
+    return elements.filter((element) => names.some((name) => element.attributes.has(name)));
+  };
+  return document;
+}
+
+/**
+ * The Canvas page script of `html`, run in a node:vm sandbox over a fake document of that
+ * page (its sign-in never answers), on the scrcpy transport with an open control socket.
  * `sent` collects the control messages it sends; `run` evaluates code inside the page.
  */
-async function loadPage(t) {
-  const world = await makeWorld(t);
-  const canvas = await startCanvas(world, ["--scrcpy-server", world.serverFile]);
-  const html = await (await fetch(`${canvas.origin}/`)).text();
-  await stopCanvas(canvas);
+function runPage(html) {
   const script = html.match(/<script>([\s\S]*)<\/script>/)[1];
-  const element = () => ({ addEventListener() {}, getContext: () => ({}), style: {}, dataset: {} });
+  const document = fakeDocument(html);
   const sent = [];
   const sandbox = {
     location: { hash: "", pathname: "/", search: "", protocol: "http:", host: "127.0.0.1:1" },
     history: { replaceState() {} },
-    document: { getElementById: element, querySelectorAll: () => [] },
+    document,
     fetch: () => new Promise(() => {}),
     URLSearchParams, TextEncoder, setTimeout, clearTimeout, setInterval, clearInterval,
     record: (text) => sent.push(JSON.parse(text)),
@@ -2507,7 +2685,16 @@ async function loadPage(t) {
   new Script(script).runInContext(page);
   const run = (code) => new Script(code).runInContext(page);
   run("view.transport=\"scrcpy\";controlSocket={readyState:1,send:record};");
-  return { sandbox, sent, run };
+  return { sandbox, sent, run, document };
+}
+
+/** The Android page as served (`html`), run by runPage. */
+async function loadPage(t) {
+  const world = await makeWorld(t);
+  const canvas = await startCanvas(world, ["--scrcpy-server", world.serverFile]);
+  const html = await (await fetch(`${canvas.origin}/`)).text();
+  await stopCanvas(canvas);
+  return { ...runPage(html), html };
 }
 
 test("input: the page sends the characters of other keyboard layouts as text and keeps keycodes for US keys and shortcuts", async (t) => {
@@ -3373,4 +3560,1472 @@ test("fanout: restart backoff doubles from 1 s to 10 s and resets after 30 s of 
   }
   assert.deepEqual(delays, [1000, 2000, 4000, 8000, 10_000, 10_000]);
   assert.deepEqual(restartDelay(10_000, HEALTHY_STREAM_MS), { delay: 1000, next: 2000 });
+});
+
+// --- Display presets (DISPLAY-001..008) ----------------------------------------------
+// Against the fake adb's display (physical 1080x2400 @ 420, see FAKE_WM); no device.
+
+const PRESETS = [
+  { id: "small", label: "Small phone", width: 720, height: 1280, density: 320 },
+  { id: "pixel-11", label: "Pixel 11", width: 1080, height: 2424, density: 420 },
+  { id: "pixel-fold", label: "Pixel Fold (open)", width: 2208, height: 1840, density: 420 },
+  { id: "tablet", label: "Tablet", width: 2560, height: 1600, density: 320 },
+  { id: "default", label: "Device default" },
+];
+const PRESET_IDS = "small, pixel-11, pixel-fold, tablet, default";
+
+/** The fake device's display overrides now, null where there is none. */
+async function wmNow(world) {
+  const saved = await readFile(world.wmState, "utf8").catch(() => null);
+  if (saved) return JSON.parse(saved);
+  const [size = "", density = ""] = (world.env.FAKE_WM_OVERRIDE ?? "").split("@");
+  return { size: size || null, density: density ? Number(density) : null };
+}
+
+/** `wm` calls as "size", "density 320", ...; every one names the Canvas serial (I-1). */
+function wmCallsIn(calls) {
+  const wm = calls.filter((args) => args.includes("wm"));
+  for (const args of wm) assert.deepEqual(args.slice(0, 4), ["-s", SERIAL, "shell", "wm"], JSON.stringify(args));
+  return wm.map((args) => args.slice(4).join(" "));
+}
+
+async function wmCalls(world) {
+  return wmCallsIn(await adbCalls(world));
+}
+
+/** The same, read at once: for a check made the moment the device reads a message. */
+function wmCallsNow(world) {
+  return wmCallsIn(readFileSync(world.adbLog, "utf8").trim().split("\n").filter(Boolean)
+    .map((line) => JSON.parse(line)));
+}
+
+/** Only the calls that change the display; the others read it. */
+function wmChanges(calls) {
+  return calls.filter((call) => call.includes(" "));
+}
+
+/** POST /display as an API client, an agent unless `origin` says otherwise. */
+async function postDisplay(canvas, preset, origin = "agent") {
+  const response = await rawHttp(canvas.port, {
+    method: "POST", path: "/display", body: JSON.stringify({ preset }),
+    headers: { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json", "X-Autonom-Origin": origin },
+  });
+  return { status: response.status, body: JSON.parse(response.body) };
+}
+
+/** Ask for a preset on a control socket; resolves with its answer, a display or an error. */
+function wsDisplay(ws, preset) {
+  const answer = ws.reply((message) => message.t === "display" || (message.t === "error" && message.for === "display"));
+  ws.send({ t: "display", preset });
+  return answer;
+}
+
+/** Display journal records as "<origin> <preset> <W>x<H>@<density>", in bridge order. */
+async function displayRecords(world) {
+  return (await journaled(world, "display")).map(({ origin, payload }) =>
+    `${origin} ${payload.preset} ${payload.width}x${payload.height}@${payload.density}`);
+}
+
+/** Read /stream.mjpeg in the background; `frames` collects each part's bytes. */
+async function readMultipart(canvas) {
+  const controller = new AbortController();
+  const response = await fetch(`${canvas.origin}/stream.mjpeg`, {
+    headers: { Authorization: `Bearer ${TOKEN}` }, signal: controller.signal,
+  });
+  const reader = response.body.getReader();
+  const stream = { frames: [], close: () => controller.abort() };
+  let pending = Buffer.alloc(0);
+  (async () => {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) return;
+      pending = Buffer.concat([pending, Buffer.from(value)]);
+      for (;;) {
+        const head = pending.indexOf("\r\n\r\n");
+        if (head < 0) break;
+        const length = Number(pending.toString("latin1", 0, head).match(/Content-Length: (\d+)/)?.[1]);
+        if (!Number.isFinite(length) || pending.length < head + 4 + length + 2) break;
+        stream.frames.push(Buffer.from(pending.subarray(head + 4, head + 4 + length)));
+        pending = pending.subarray(head + 4 + length + 2);
+      }
+    }
+  })().catch(() => {});
+  return stream;
+}
+
+/** Width and height from a PNG header. */
+function pngSize(frame) {
+  return [frame.readUInt32BE(16), frame.readUInt32BE(20)];
+}
+
+// Answers the simulator list and screenshots like `xcrun simctl`, and logs every call.
+const FAKE_XCRUN = String.raw`
+import { appendFileSync } from "node:fs";
+const args = process.argv.slice(2);
+appendFileSync(process.env.FAKE_ADB_LOG, JSON.stringify(args) + "\n");
+if (args[0] === "simctl" && args[1] === "list") {
+  console.log(JSON.stringify({ devices: { "iOS 26.0": [{ udid: process.env.FAKE_UDID, state: "Booted", isAvailable: true }] } }));
+} else if (args[0] === "simctl" && args[1] === "io") {
+  process.stdout.write(Buffer.from(process.env.FAKE_PNG, "base64"));
+} else {
+  console.error("unsupported fake xcrun command: " + args.join(" "));
+  process.exitCode = 2;
+}
+`;
+
+// Reads H.264 on stdin and writes a small JPEG every 50 ms until stdin ends or it is stopped.
+const FAKE_FFMPEG = String.raw`
+const frame = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0, 4, 0, 0, 0xff, 0xd9]);
+process.stdin.resume();
+process.stdin.on("end", () => process.exit(0));
+setInterval(() => process.stdout.write(frame), 50);
+`;
+
+// /status and state messages show a `wm` reading at most this old (DISPLAY_READ_MAX_AGE_MS).
+const DISPLAY_READ_MAX_AGE_MS = 2000;
+// While a WebSocket client is connected the reading is renewed once it is this old.
+const DISPLAY_WATCH_AGE_MS = 1500;
+
+/** Until the Canvas has read the display it found when this page connected: the device default. */
+async function settledDisplay(control) {
+  await control.next((message) => message.json?.t === "state" && message.json.preset === "default");
+}
+
+/** The fake device's display overrides, read at once. */
+function wmStateNow(world) {
+  try {
+    return JSON.parse(readFileSync(world.wmState, "utf8"));
+  } catch {
+    return { size: null, density: null };
+  }
+}
+
+/** A /status display as [width, height, density, preset]. */
+function displayValues({ width, height, density, preset }) {
+  return [width, height, density, preset];
+}
+
+function agentHeaders() {
+  return { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json", "X-Autonom-Origin": "agent" };
+}
+
+/** Collect the display answers a control socket gets from now on. */
+function displayAnswers(control) {
+  const answers = [];
+  control.on("message", (message) => {
+    if (message.json?.t === "display" || message.json?.for === "display") answers.push(message.json);
+  });
+  return answers;
+}
+
+// How long GET /status may take during the display flood (STATUS_SAMPLE_MS for the others).
+const DISPLAY_FLOOD_STATUS_MS = 60_000;
+
+function supersededAnswer(preset) {
+  return { t: "error", for: "display", superseded: true,
+    message: `The display change to ${preset} was superseded by a later one` };
+}
+
+test("display: /status lists the five presets in order and reports the device default with its physical size and density", async (t) => {
+  const { world, canvas, control } = await connectedControl(t);
+  // A page's state messages carry the preset, read when it connected, without asking /status.
+  const state = (await control.next((message) => message.json?.t === "state" && message.json.preset === "default")).json;
+  assert.deepEqual([state.density, state.presets], [420, PRESETS]);
+  const body = await status(canvas);
+  assert.deepEqual(body.display, { width: 1080, height: 2400, density: 420, preset: "default", presets: PRESETS });
+  assert.equal(body.last_error, null);
+  // Only reads, each `wm size` then `wm density`, all with the Canvas serial.
+  const calls = await wmCalls(world);
+  assert.ok(calls.length >= 2 && calls.length % 2 === 0, JSON.stringify(calls));
+  assert.ok(calls.every((call, index) => call === (index % 2 ? "density" : "size")), JSON.stringify(calls));
+  await stopCanvas(canvas);
+});
+
+test("display: /status reads the display again once its reading is 2 s old, requests made together share one reading, and an override made outside this Canvas shows with its density and no preset", async (t) => {
+  // No WebSocket client, so only /status reads the display.
+  const { world, canvas } = await streamingCanvas(t);
+  assert.equal((await status(canvas)).display.preset, "default");
+  // Another Canvas, or `adb shell wm`, changes the device.
+  await writeFile(world.wmState, JSON.stringify({ size: "1600x2560", density: 300 }));
+  await sleep(DISPLAY_READ_MAX_AGE_MS + 100);
+  const reads = (await wmCalls(world)).length;
+  const answers = await Promise.all([status(canvas), status(canvas), status(canvas)]);
+  for (const body of answers) assert.deepEqual(displayValues(body.display), [1600, 2560, 300, null]);
+  assert.deepEqual((await wmCalls(world)).slice(reads), ["size", "density"]);
+  // A reading younger than 2 s is answered again without asking the device.
+  assert.deepEqual(displayValues((await status(canvas)).display), [1600, 2560, 300, null]);
+  assert.equal((await wmCalls(world)).length, reads + 2);
+  // An override this Canvas made is its preset while the values in effect match it.
+  assert.equal((await postDisplay(canvas, "tablet")).body.display.preset, "tablet");
+  assert.deepEqual(displayValues((await status(canvas)).display), [2560, 1600, 320, "tablet"]);
+  await writeFile(world.wmState, JSON.stringify({ size: "2560x1600", density: 280 }));
+  await sleep(DISPLAY_READ_MAX_AGE_MS + 100);
+  assert.deepEqual(displayValues((await status(canvas)).display), [2560, 1600, 280, null]);
+  // Reset from outside: the device default again.
+  await writeFile(world.wmState, JSON.stringify({ size: null, density: null }));
+  await sleep(DISPLAY_READ_MAX_AGE_MS + 100);
+  assert.deepEqual(displayValues((await status(canvas)).display), [1080, 2400, 420, "default"]);
+  // The stop puts back what the device had before this Canvas's first change.
+  const exit = await stopCanvas(canvas);
+  assert.equal(exit.code, 0);
+  assert.deepEqual(await wmNow(world), { size: "1600x2560", density: 300 });
+  assert.match(exit.stdout, /Display restored: 1600x2560 @ 300\n/);
+});
+
+test("display: a page that never asks /status gets state messages with the display read at most 2 s before: an outside change reaches it, a takeover after it shows it, and nothing reads the display once no page is connected", async (t) => {
+  const { world, canvas, control } = await connectedControl(t);
+  await settledDisplay(control);
+  // Nobody asks /status from here on; the Canvas renews its reading while a socket is open.
+  const changedAt = Date.now();
+  await writeFile(world.wmState, JSON.stringify({ size: "1600x2560", density: 300 }));
+  const outside = await control.until((message) => message.t === "state" && message.preset === null,
+    DISPLAY_READ_MAX_AGE_MS + 1500);
+  t.diagnostic(`the outside change reached the page ${Date.now() - changedAt} ms after it was made`);
+  assert.equal(outside.density, 300);
+  // A state message sent later for another reason shows the display as it is too.
+  await sleep(DISPLAY_READ_MAX_AGE_MS + 500);
+  const owned = control.until((message) => message.t === "state" && message.owner === "agent");
+  await agentTakeover(canvas);
+  const ownedState = await owned;
+  assert.deepEqual([ownedState.preset, ownedState.density], [null, 300]);
+  await writeFile(world.wmState, JSON.stringify({ size: null, density: null }));
+  const reset = await control.until((message) => message.t === "state" && message.preset === "default",
+    DISPLAY_READ_MAX_AGE_MS + 1500);
+  assert.equal(reset.density, 420);
+  // Renewed about every 1.5 s, not more often.
+  const readings = async () => (await wmCalls(world)).filter((call) => call === "size").length;
+  const before = await readings();
+  await sleep(4600);
+  const renewed = (await readings()) - before;
+  assert.ok(renewed >= 2 && renewed <= 4, `${renewed} readings in 4.6 s`);
+  // With no page connected nothing reads the display unasked.
+  control.close();
+  await control.closed;
+  await sleep(500);
+  const idle = await readings();
+  await sleep(DISPLAY_WATCH_AGE_MS + 1000);
+  assert.equal(await readings(), idle, "the display was read with no page connected");
+  await stopCanvas(canvas);
+});
+
+test("display: a socket that connects once the last reading is over 2 s old never gets that reading in a state message: its first one leaves the display out until one fresh reading, which then reaches it, on the control and the video socket", async (t) => {
+  // No socket yet, so only /status reads the display, and nothing renews that reading.
+  const { world, canvas, auth } = await streamingCanvas(t);
+  assert.equal((await status(canvas)).display.preset, "default");
+  // Socket, the overrides another Canvas or `adb shell wm` makes meanwhile, and the
+  // preset and density then in effect.
+  const rounds = [
+    ["/ws/control", { size: "1600x2560", density: 300 }, [null, 300]],
+    ["/ws/video", { size: null, density: null }, ["default", 420]],
+  ];
+  for (const [path, overrides, expected] of rounds) {
+    await writeFile(world.wmState, JSON.stringify(overrides));
+    await sleep(DISPLAY_READ_MAX_AGE_MS + 100);
+    const reads = (await wmCalls(world)).length;
+    const socket = await pageSocket(canvas, auth, path);
+    await socket.next((message) => message.json?.t === "state" && "preset" in message.json,
+      DISPLAY_READ_MAX_AGE_MS);
+    const states = socket.json("state");
+    for (const state of states.filter((message) => "preset" in message)) {
+      assert.deepEqual([state.preset, state.density], expected, `${path} got a reading over 2 s old`);
+    }
+    assert.ok(!("preset" in states[0]) && !("density" in states[0]), JSON.stringify(states[0]));
+    // One reading for the new socket, not one per state message.
+    assert.deepEqual((await wmCalls(world)).slice(reads), ["size", "density"]);
+    socket.close();
+    await socket.closed;
+  }
+  await stopCanvas(canvas);
+});
+
+test("display: while a change runs, /status and state messages never name its preset before both its commands took effect", async (t) => {
+  // Each wm command takes 1.5 s, so a /status reading falls between the two.
+  const { world, canvas, control } = await connectedControl(t, { env: { FAKE_WM_SET_MS: "1500" } });
+  await settledDisplay(control);
+  await sleep(DISPLAY_READ_MAX_AGE_MS + 100);
+  const tabletInEffect = () => {
+    const now = wmStateNow(world);
+    return now.size === "2560x1600" && now.density === 320;
+  };
+  const early = [];
+  control.on("message", (message) => {
+    if (message.json?.t === "state" && message.json.preset === "tablet" && !tabletInEffect()) early.push("state");
+  });
+  let answered = null;
+  wsDisplay(control, "tablet").then((answer) => { answered = answer; });
+  const seen = [];
+  while (!answered) {
+    // A new connection per poll: a reused fetch connection can stall for seconds here.
+    const polled = await rawHttp(canvas.port, { path: "/status", headers: { Authorization: `Bearer ${TOKEN}` } });
+    const { preset } = JSON.parse(polled.body).display;
+    if (preset === "tablet" && !tabletInEffect()) early.push("status");
+    seen.push(preset);
+    await sleep(100);
+  }
+  t.diagnostic(`/status during the change: ${[...new Set(seen)].map(String).join(", ")}`);
+  assert.deepEqual(early, [], "the preset was named before its commands took effect");
+  assert.ok(seen.includes(null), "no /status read the display half changed");
+  assert.equal(answered.display.preset, "tablet");
+  assert.equal((await status(canvas)).display.preset, "tablet");
+  await stopCanvas(canvas);
+});
+
+test("display: the owner switches to Tablet and back to the default over /ws/control, the video size follows without a restart, and each change is one journal record", async (t) => {
+  const { world, canvas, device, control } = await connectedControl(t);
+  await settledDisplay(control);
+  const reads = (await wmCalls(world)).length;
+  const tablet = await wsDisplay(control, "tablet");
+  assert.deepEqual(tablet, { t: "display", ok: true, display: { preset: "tablet", width: 2560, height: 1600, density: 320 } });
+  assert.deepEqual(await wmNow(world), { size: "2560x1600", density: 320 });
+  // The preset's two commands; the readings around them may share the log with the
+  // renewal that runs while a page is connected.
+  assert.deepEqual(wmChanges((await wmCalls(world)).slice(reads)), ["size 2560x1600", "density 320"]);
+  // scrcpy-server follows a wm size change with a new session at the new size (max 1280).
+  device.sendSession(1280, 800);
+  await control.next((message) => message.json?.t === "state" && message.json.width === 1280 &&
+    message.json.preset === "tablet");
+
+  const resets = (await wmCalls(world)).length;
+  const back = await wsDisplay(control, "default");
+  assert.deepEqual(back.display, { preset: "default", width: 1080, height: 2400, density: 420 });
+  assert.deepEqual(await wmNow(world), { size: null, density: null });
+  assert.deepEqual(wmChanges((await wmCalls(world)).slice(resets)), ["size reset", "density reset"]);
+  device.sendSession(570, 1280);
+  await control.next((message) => message.json?.t === "state" && message.json.width === 570 &&
+    message.json.preset === "default");
+
+  const body = await status(canvas);
+  assert.deepEqual([body.scrcpy.restarts, device.spawns.length, control.closeCode], [0, 1, null]);
+  assert.deepEqual(body.display, { width: 1080, height: 2400, density: 420, preset: "default", presets: PRESETS });
+  const records = await waitFor(async () => {
+    const found = await journaled(world, "display");
+    return found.length === 2 && found;
+  }, 5000, "one record per change");
+  assert.deepEqual(records.map(({ origin, payload }) => ({ origin, ...payload })), [
+    { origin: "human", kind: "display", transport: "scrcpy", preset: "tablet", width: 2560, height: 1600, density: 320 },
+    { origin: "human", kind: "display", transport: "scrcpy", preset: "default", width: 1080, height: 2400, density: 420 },
+  ]);
+  assert.match(canvas.output(), /Display: tablet 2560x1600 @ 320\n/);
+  assert.deepEqual(control.json("error"), []);
+  await stopCanvas(canvas);
+});
+
+test("display: an agent switches to Pixel 11 over POST /display, gets the size and density in effect, and the change is journaled as the agent's", async (t) => {
+  const { world, canvas } = await streamingCanvas(t);
+  const answer = await postDisplay(canvas, "pixel-11");
+  assert.deepEqual(answer, { status: 200, body: { ok: true, display: { preset: "pixel-11", width: 1080, height: 2424, density: 420 } } });
+  // 420 is the physical density, so Android keeps no density override.
+  assert.deepEqual(await wmNow(world), { size: "1080x2424", density: null });
+  assert.deepEqual(displayValues((await status(canvas)).display), [1080, 2424, 420, "pixel-11"]);
+  const records = await waitFor(async () => {
+    const found = await displayRecords(world);
+    return found.length === 1 && found;
+  }, 5000, "the display record");
+  assert.deepEqual(records, ["agent pixel-11 1080x2424@420"]);
+  await stopCanvas(canvas);
+});
+
+test("display: refused requests run no wm command and are not journaled: another owner, paused, unknown or malformed presets, no CSRF value, no token, a foreign Host", async (t) => {
+  const { world, canvas, auth, control } = await connectedControl(t);
+  await settledDisplay(control);
+  const readings = async () => (await wmCalls(world)).filter((call) => call === "size").length;
+  const readsBefore = await readings();
+  const refusalsFrom = Date.now();
+  await agentTakeover(canvas);
+  await control.next((message) => message.json?.t === "state" && message.json.owner === "agent");
+  const owned = await wsDisplay(control, "tablet");
+  assert.deepEqual(owned, { t: "error", for: "display", message: "Canvas control is owned by agent" });
+  assert.deepEqual(await postDisplay(canvas, "tablet", "human"), { status: 409, body: { error: "Canvas control is owned by agent" } });
+  // The agent holds control: an unknown preset is refused naming the valid ids.
+  const huge = await postDisplay(canvas, "huge");
+  assert.deepEqual(huge, { status: 400, body: { error: `Unknown display preset; expected one of: ${PRESET_IDS}` } });
+  for (const preset of [undefined, null, "", 3, true, "Tablet", "TABLET", "pixel_11", "restore", ["tablet"], { id: "tablet" }]) {
+    assert.equal((await postDisplay(canvas, preset)).status, 400, JSON.stringify(preset));
+  }
+  const opened = await openSocket(canvas.port, `/ws/control?token=${TOKEN}&origin=agent`);
+  assert.equal(opened.status, 101);
+  const agent = opened.ws;
+  await agent.next((message) => message.json?.t === "state");
+  for (const preset of [7, "huge", null]) {
+    const malformed = await wsDisplay(agent, preset);
+    assert.deepEqual([malformed.t, malformed.message], ["error", `Unknown display preset; expected one of: ${PRESET_IDS}`]);
+  }
+  // Paused, nobody may change the display.
+  const paused = control.reply((message) => message.t === "state" && message.owner === "shared" && message.paused);
+  agent.send({ t: "control", mode: "release" });
+  agent.send({ t: "control", mode: "pause" });
+  await paused;
+  assert.deepEqual(await postDisplay(canvas, "tablet"), { status: 409, body: { error: "Canvas input is paused" } });
+  assert.equal((await wsDisplay(control, "tablet")).message, "Canvas input is paused");
+  assert.equal((await wsDisplay(agent, "tablet")).message, "Canvas input is paused");
+  const resumed = control.reply((message) => message.t === "state" && message.paused === false);
+  agent.send({ t: "control", mode: "resume" });
+  await resumed;
+  // HTTP needs the page's CSRF value with its cookie, or the token, and the Canvas Host.
+  const body = JSON.stringify({ preset: "tablet" });
+  const json = { "Content-Type": "application/json" };
+  const noCsrf = await rawHttp(canvas.port, { method: "POST", path: "/display", body, headers: { ...json, Cookie: auth.cookie } });
+  assert.equal(noCsrf.status, 403);
+  const wrongCsrf = await rawHttp(canvas.port, { method: "POST", path: "/display", body,
+    headers: { ...json, Cookie: auth.cookie, "X-Autonom-CSRF": "wrong" } });
+  assert.equal(wrongCsrf.status, 403);
+  assert.equal((await rawHttp(canvas.port, { method: "POST", path: "/display", body, headers: json })).status, 401);
+  const rebound = await rawHttp(canvas.port, { method: "POST", path: "/display", body,
+    headers: { ...json, Authorization: `Bearer ${TOKEN}`, Host: "evil.test" } });
+  assert.equal(rebound.status, 403);
+  await sleep(200);
+  assert.deepEqual(wmChanges(await wmCalls(world)), [], "a refused request changed the display");
+  // Readings come only from the renewal while a page is connected, at most one per 1.5 s;
+  // any of the 30-odd refused requests reading the display would have added one each.
+  const renewals = Math.ceil((Date.now() - refusalsFrom) / DISPLAY_WATCH_AGE_MS) + 1;
+  assert.ok((await readings()) - readsBefore <= renewals, "a refused request read the display");
+  assert.deepEqual(await journaled(world, "display"), []);
+  // With its CSRF value the page's own POST goes through.
+  const page = await rawHttp(canvas.port, { method: "POST", path: "/display", body,
+    headers: { ...json, Cookie: auth.cookie, "X-Autonom-CSRF": auth.csrf } });
+  assert.equal(page.status, 200, page.body);
+  assert.deepEqual(wmChanges(await wmCalls(world)), ["size 2560x1600", "density 320"]);
+  agent.close();
+  await stopCanvas(canvas);
+});
+
+test("display: iOS refuses display presets without running anything and its page has no Size picker", async (t) => {
+  const udid = "FAKE-SIMULATOR-UDID";
+  const world = await makeWorld(t, { env: { FAKE_UDID: udid } });
+  const xcrun = join(world.directory, "fake-xcrun.mjs");
+  await writeFile(xcrun, `#!${process.execPath}\n${FAKE_XCRUN}`);
+  await chmod(xcrun, 0o755);
+  const canvas = await startCanvas(world, ["--platform", "ios", "--target", udid, "--simctl", xcrun]);
+  assert.deepEqual(await postDisplay(canvas, "tablet"), { status: 400, body: { error: "Display presets are Android-only" } });
+  assert.equal((await postDisplay(canvas, "huge")).status, 400);
+  const body = await status(canvas);
+  assert.equal(body.platform, "ios");
+  assert.deepEqual(body.display, { width: 1080, height: 2400 });
+  const html = await (await fetch(`${canvas.origin}/`)).text();
+  assert.doesNotMatch(html, /id="display-preset"|id="display-menu"|data-preset="/, "the iOS page has a Size picker");
+  assert.doesNotThrow(() => new Script(html.match(/<script>([\s\S]*)<\/script>/)[1]));
+  // Only the simulator lookup at start ran.
+  assert.deepEqual((await adbCalls(world)).map((args) => args.slice(0, 2).join(" ")), ["simctl list"]);
+  await stopCanvas(canvas);
+});
+
+test("display: a failed wm density names the command and the values in effect, sets no preset even once the values match it, is not journaled, and a later change and the restore at stop still work", async (t) => {
+  const world = await makeWorld(t);
+  const failing = join(world.directory, "density-fails");
+  world.env.FAKE_WM_DENSITY_FAIL = failing;
+  await writeFile(failing, "");
+  const canvas = await startCanvas(world, ["--transport", "scrcpy", "--scrcpy-server", world.serverFile]);
+  const failed = await postDisplay(canvas, "tablet");
+  assert.deepEqual(failed, { status: 502, body: {
+    error: "wm density 320 failed: Error: could not set the density; in effect: 2560x1600 @ 420" } });
+  assert.deepEqual(await wmNow(world), { size: "2560x1600", density: null });
+  // The size changed but not the density: an override that no preset stands for.
+  assert.deepEqual(displayValues((await status(canvas)).display), [2560, 1600, 420, null]);
+  // Even when the density then reaches Tablet's from outside, Tablet was never applied.
+  await writeFile(world.wmState, JSON.stringify({ size: "2560x1600", density: 320 }));
+  await sleep(DISPLAY_READ_MAX_AGE_MS + 100);
+  assert.deepEqual(displayValues((await status(canvas)).display), [2560, 1600, 320, null]);
+  assert.equal(canvas.child.exitCode, null);
+  await rm(failing);
+  assert.deepEqual(await postDisplay(canvas, "small"),
+    { status: 200, body: { ok: true, display: { preset: "small", width: 720, height: 1280, density: 320 } } });
+  const exit = await stopCanvas(canvas);
+  assert.equal(exit.code, 0);
+  assert.deepEqual(await wmNow(world), { size: null, density: null });
+  assert.deepEqual(wmChanges(await wmCalls(world)),
+    ["size 2560x1600", "density 320", "size 720x1280", "density 320", "size reset", "density reset"]);
+  assert.match(exit.stdout, /Display restored: 1080x2400 @ 420\n/);
+  // The change that failed is not journaled.
+  assert.deepEqual(await displayRecords(world), ["agent small 720x1280@320", "system restore 1080x2400@420"]);
+});
+
+test("display: when wm cannot read the display a change is refused before any wm command, nothing is journaled, and the stop runs none", async (t) => {
+  const world = await makeWorld(t);
+  const failing = join(world.directory, "density-fails");
+  world.env.FAKE_WM_DENSITY_FAIL = failing;
+  await writeFile(failing, "read");
+  const canvas = await startCanvas(world, ["--transport", "scrcpy", "--scrcpy-server", world.serverFile]);
+  const unread = await status(canvas);
+  assert.deepEqual(displayValues(unread.display), [1080, 2400, null, null]);
+  assert.equal(unread.display.presets.length, 5);
+  assert.equal(unread.last_error, "display: wm could not read the display: Error: could not read the density");
+  assert.deepEqual(await postDisplay(canvas, "tablet"), { status: 502, body: {
+    error: "wm could not read the display before changing it: Error: could not read the density" } });
+  assert.deepEqual(wmChanges(await wmCalls(world)), []);
+  // Once its failed reading is 2 s old, /status reads the display again.
+  await rm(failing);
+  await sleep(DISPLAY_READ_MAX_AGE_MS + 100);
+  assert.deepEqual(displayValues((await status(canvas)).display), [1080, 2400, 420, "default"]);
+  const exit = await stopCanvas(canvas);
+  assert.equal(exit.code, 0);
+  assert.deepEqual(wmChanges(await wmCalls(world)), [], "the stop changed a display this Canvas never changed");
+  assert.doesNotMatch(exit.stdout, /Display restore/);
+  assert.deepEqual(await journaled(world, "display"), []);
+});
+
+test("display: a restore whose wm density fails says so on stdout, still resets the size and is journaled", async (t) => {
+  const world = await makeWorld(t);
+  const failing = join(world.directory, "density-fails");
+  world.env.FAKE_WM_DENSITY_FAIL = failing;
+  const canvas = await startCanvas(world, ["--transport", "scrcpy", "--scrcpy-server", world.serverFile]);
+  assert.equal((await postDisplay(canvas, "tablet")).status, 200);
+  await writeFile(failing, "");
+  const exit = await stopCanvas(canvas);
+  assert.equal(exit.code, 0);
+  assert.match(exit.stdout,
+    /Display restore failed: wm density reset failed: Error: could not set the density; in effect: 1080x2400 @ 320\n/);
+  assert.deepEqual(await wmNow(world), { size: null, density: 320 });
+  assert.deepEqual(wmChanges(await wmCalls(world)), ["size 2560x1600", "density 320", "size reset", "density reset"]);
+  assert.deepEqual(await displayRecords(world), ["agent tablet 2560x1600@320", "system restore 1080x2400@320"]);
+});
+
+test("display: while Pixel Fold runs, Small then Tablet arrive: Small is answered superseded and runs no wm command, Tablet runs after Pixel Fold, and the display ends on Tablet", async (t) => {
+  const { world, canvas, control } = await connectedControl(t, { env: { FAKE_WM_SET_MS: "300" } });
+  await settledDisplay(control);
+  const answers = displayAnswers(control);
+  control.send({ t: "display", preset: "pixel-fold" });
+  await waitFor(async () => (await wmCalls(world)).includes("size 2208x1840"), 5000, "Pixel Fold running");
+  control.send({ t: "display", preset: "small" });
+  control.send({ t: "display", preset: "tablet" });
+  await waitFor(() => answers.length === 3, 10_000, "three answers");
+  assert.deepEqual(answers, [
+    supersededAnswer("small"),
+    { t: "display", ok: true, display: { preset: "pixel-fold", width: 2208, height: 1840, density: 420 } },
+    { t: "display", ok: true, display: { preset: "tablet", width: 2560, height: 1600, density: 320 } },
+  ]);
+  assert.deepEqual(wmChanges(await wmCalls(world)), ["size 2208x1840", "density 420", "size 2560x1600", "density 320"]);
+  assert.deepEqual(await wmNow(world), { size: "2560x1600", density: 320 });
+  assert.equal((await status(canvas)).display.preset, "tablet");
+  assert.deepEqual(await displayRecords(world), ["human pixel-fold 2208x1840@420", "human tablet 2560x1600@320"]);
+  await stopCanvas(canvas);
+});
+
+test("display: a newer change goes to the end of the queue: the waiting change it supersedes after an HTTP tap was queued runs nothing, and the newer one runs after that tap", async (t) => {
+  const { world, canvas, control } = await connectedControl(t,
+    { env: { FAKE_WM_SET_MS: "1000", FAKE_BRIDGE_INPUT_MS: "600" } });
+  await settledDisplay(control);
+  const answers = displayAnswers(control);
+  control.send({ t: "display", preset: "pixel-fold" });
+  await waitFor(async () => (await wmCalls(world)).includes("size 2208x1840"), 5000, "Pixel Fold running");
+  control.send({ t: "display", preset: "small" });
+  await sleep(250);
+  const tap = rawHttp(canvas.port, { method: "POST", path: "/tap", headers: agentHeaders(), body: JSON.stringify({ x: 10, y: 10 }) });
+  await sleep(250);
+  control.send({ t: "display", preset: "tablet" });
+  // Small was waiting with the tap queued after it: it is superseded at once.
+  await waitFor(() => answers.length === 1, 3000, "the superseded answer");
+  assert.deepEqual(answers[0], supersededAnswer("small"));
+  // The tap runs after Pixel Fold and before Tablet.
+  await waitFor(async () => (await bridgeCalls(world, "tap")).length === 1, 10_000, "the tap at the device");
+  assert.deepEqual(wmChanges(wmCallsNow(world)), ["size 2208x1840", "density 420"]);
+  assert.equal((await tap).status, 200);
+  await waitFor(() => answers.length === 3, 10_000, "every answer");
+  assert.deepEqual(answers.slice(1).map((answer) => answer.display?.preset), ["pixel-fold", "tablet"]);
+  assert.deepEqual(wmChanges(await wmCalls(world)), ["size 2208x1840", "density 420", "size 2560x1600", "density 320"]);
+  await stopCanvas(canvas);
+});
+
+test("display: of 12 POST /display sent at once one runs, one waits, and each of the others is answered 409 superseded without any wm command", async (t) => {
+  const { world, canvas } = await streamingCanvas(t, { env: { FAKE_WM_SET_MS: "300" } });
+  const asked = Array.from({ length: 12 }, (_, i) => PRESETS[i % 4].id);
+  const answers = await Promise.all(asked.map((preset) => postDisplay(canvas, preset)));
+  const applied = answers.filter((answer) => answer.status === 200);
+  const superseded = answers.filter((answer) => answer.status !== 200);
+  assert.equal(applied.length, 2, JSON.stringify(answers));
+  for (const answer of superseded) {
+    assert.equal(answer.status, 409);
+    assert.equal(answer.body.superseded, true);
+    assert.match(answer.body.error, /^The display change to (small|pixel-11|pixel-fold|tablet) was superseded by a later one$/);
+  }
+  // The commands of exactly the two applied changes, one change after the other.
+  const commandsOf = (preset) => [`size ${preset.width}x${preset.height}`, `density ${preset.density}`];
+  const changes = wmChanges(await wmCalls(world));
+  assert.equal(changes.length, 4, JSON.stringify(changes));
+  const ran = [changes.slice(0, 2), changes.slice(2)].map((pair) => pair.join(", ")).sort();
+  const answered = applied.map(({ body }) =>
+    commandsOf(PRESETS.find((preset) => preset.id === body.display.preset)).join(", ")).sort();
+  assert.deepEqual(ran, answered);
+  const last = PRESETS.find((preset) => commandsOf(preset).join(", ") === changes.slice(2).join(", "));
+  assert.deepEqual(await wmNow(world), {
+    size: `${last.width}x${last.height}`, density: last.density === 420 ? null : last.density });
+  await stopCanvas(canvas);
+});
+
+test("display: input flood: 100k display messages on one connection keep Canvas memory bounded, each is answered applied or superseded, the last one asked for is applied last, and the restore at stop still runs", async (t) => {
+  const { world, canvas, control } = await floodSetup(t);
+  await settledDisplay(control);
+  const count = 100_000;
+  const total = FLOOD_WARM_UP + count;
+  const others = [];
+  control.on("message", (message) => {
+    if (message.json?.t === "error" && !message.json.superseded) others.push(message.json.message);
+  });
+  // The last message, number total - 1, asks for Tablet.
+  const message = (i) => JSON.stringify({ t: "display", preset: i % 2 ? "tablet" : "small" });
+  await warmUp(control, message);
+  // Each applied change runs adb several times, so on a loaded host /status, which reads
+  // the display through adb too, may answer slowly during this authenticated flood: that
+  // slowness is accepted, as long as it answers and memory stays bounded.
+  const watched = await watchCanvas(canvas, async () => {
+    await control.flood(count, (i) => message(FLOOD_WARM_UP + i));
+    await allHandled(control);
+  }, { statusTimeoutMs: DISPLAY_FLOOD_STATUS_MS });
+  assertBounded(t, watched, `${count} display messages`);
+  await waitFor(() => control.count("display") + control.count("error") === total, 20_000,
+    "an answer to every display message");
+  assert.deepEqual(others, [], "a display message was refused for another reason than a later one");
+  const applied = control.count("display");
+  t.diagnostic(`${applied} of ${total} display changes were applied, the others superseded`);
+  assert.ok(applied >= 1 && applied <= 200, `${applied} display changes were applied`);
+  const changes = wmChanges(await wmCalls(world));
+  assert.equal(changes.length, 2 * applied);
+  assert.deepEqual(changes.slice(-2), ["size 2560x1600", "density 320"]);
+  assert.deepEqual(await wmNow(world), { size: "2560x1600", density: 320 });
+  const exit = await stopCanvas(canvas);
+  assert.equal(exit.code, 0);
+  assert.match(exit.stdout, /Display restored: 1080x2400 @ 420\n/);
+  assert.deepEqual(await wmNow(world), { size: null, density: null });
+});
+
+test("display: a waiting change whose connection closes runs no wm command, and the change running completes", async (t) => {
+  const { world, canvas, control } = await connectedControl(t, { env: { FAKE_WM_SET_MS: "300" } });
+  await settledDisplay(control);
+  control.send({ t: "display", preset: "small" });
+  await waitFor(async () => (await wmCalls(world)).includes("size 720x1280"), 5000, "the first change running");
+  // The close follows the request on the same socket, so the Canvas has it waiting by then.
+  control.send({ t: "display", preset: "tablet" });
+  control.close();
+  await control.closed;
+  await waitFor(async () => (await wmNow(world)).density === 320, 5000, "the first change done");
+  await sleep(1000);
+  assert.deepEqual(wmChanges(await wmCalls(world)), ["size 720x1280", "density 320"]);
+  assert.deepEqual(await wmNow(world), { size: "720x1280", density: 320 });
+  const exit = await stopCanvas(canvas);
+  assert.equal(exit.code, 0);
+  assert.deepEqual(wmChanges(await wmCalls(world)), ["size 720x1280", "density 320", "size reset", "density reset"]);
+});
+
+test("display: SIGTERM during a 4 s swipe restores the display within the 3 s shutdown budget, writes the restore to the journal through a bridge of its own while the busy one holds its lines, and drops the taps and the display change queued behind the swipe", async (t) => {
+  // The bridge handles one line at a time, as the real one does.
+  const world = await makeWorld(t, { env: { FAKE_BRIDGE_INPUT_MS: "4000", FAKE_BRIDGE_IN_ORDER: "1" } });
+  const canvas = await startCanvas(world, ["--transport", "screencap"]);
+  assert.equal((await postDisplay(canvas, "tablet")).status, 200);
+  await waitFor(async () => (await displayRecords(world)).length === 1, 5000, "the change's record");
+  // A swipe the device answers after 4 s, then taps and a display change queued behind it.
+  const swipe = JSON.stringify({ x1: 10, y1: 10, x2: 10, y2: 500, duration: 4000 });
+  const swiping = rawHttp(canvas.port, { method: "POST", path: "/swipe", headers: agentHeaders(), body: swipe })
+    .catch(() => null);
+  await waitFor(async () => (await bridgeCalls(world, "swipe")).length === 1, 5000, "the swipe at the device");
+  const tap = JSON.stringify({ x: 10, y: 10 });
+  const queued = [
+    rawHttp(canvas.port, { method: "POST", path: "/tap", headers: agentHeaders(), body: tap }),
+    rawHttp(canvas.port, { method: "POST", path: "/tap", headers: agentHeaders(), body: tap }),
+    postDisplay(canvas, "pixel-fold"),
+  ].map((request) => request.catch(() => null));
+  await sleep(300);
+  const started = Date.now();
+  const exit = await stopCanvas(canvas);
+  const elapsed = Date.now() - started;
+  t.diagnostic(`the Canvas stopped ${elapsed} ms after SIGTERM`);
+  assert.equal(exit.code, 0);
+  assert.ok(elapsed < 3000, `the Canvas stopped ${elapsed} ms after SIGTERM`);
+  assert.match(exit.stdout, /Display restored: 1080x2400 @ 420\n/);
+  assert.deepEqual(await wmNow(world), { size: null, density: null });
+  assert.deepEqual(wmChanges(await wmCalls(world)), ["size 2560x1600", "density 320", "size reset", "density reset"]);
+  assert.equal((await bridgeCalls(world, "tap")).length, 0, "a tap queued behind the swipe ran");
+  // The shared bridge never got to the restore record behind the swipe; the other one wrote it.
+  assert.deepEqual(await displayRecords(world), ["agent tablet 2560x1600@320", "system restore 1080x2400@420"]);
+  await Promise.all([swiping, ...queued]);
+});
+
+test("display: a change still running at SIGTERM stops before its density command and the restore puts the size back", async (t) => {
+  const world = await makeWorld(t, { env: { FAKE_WM_SET_MS: "300" } });
+  const canvas = await startCanvas(world, ["--transport", "screencap"]);
+  const answer = postDisplay(canvas, "tablet").catch(() => null);
+  await waitFor(async () => (await wmCalls(world)).includes("size 2560x1600"), 5000, "the size command running");
+  const exit = await stopCanvas(canvas);
+  assert.equal(exit.code, 0);
+  assert.deepEqual(wmChanges(await wmCalls(world)), ["size 2560x1600", "size reset", "density reset"]);
+  assert.match(exit.stdout, /Display restored: 1080x2400 @ 420\n/);
+  assert.doesNotMatch(exit.stdout, /Display: tablet/);
+  assert.deepEqual(await wmNow(world), { size: null, density: null });
+  await answer;
+});
+
+test("display: a held finger and key are lifted on the device before the first wm command that changes the display and journaled before the change, and the lifted finger's moves are refused", async (t) => {
+  const { world, canvas, device, control } = await connectedControl(t);
+  await settledDisplay(control);
+  control.send({ t: "touch", a: "down", id: 1, x: 0.5, y: 0.5 });
+  control.send({ t: "key", a: "down", code: 59 });
+  await waitFor(() => device.pointersDown.size === 1 && device.keysDown.size === 1, 3000, "the finger and key down");
+  // How many display-changing wm commands adb had run when the device read each up; the
+  // readings of the renewal that runs while a page is connected may come at any time.
+  const wmAtUp = [];
+  device.on("control", (message) => {
+    if (message.action === 1) wmAtUp.push([message.type, wmChanges(wmCallsNow(world)).length]);
+  });
+  assert.equal((await wsDisplay(control, "tablet")).ok, true);
+  assert.deepEqual(wmAtUp.slice(0, 2), [["touch", 0], ["key", 0]]);
+  assert.deepEqual([device.pointersDown.size, device.keysDown.size], [0, 0]);
+  const refused = control.reply((message) => message.t === "error");
+  control.send({ t: "touch", a: "move", id: 1, x: 0.5, y: 0.6 });
+  assert.match((await refused).message, /^Pointer 1 was lifted because the display size changed; put it down again$/);
+  // Its up finds it lifted already; a new finger works.
+  control.send({ t: "touch", a: "up", id: 1, x: 0.5, y: 0.6 });
+  const downs = device.touches().filter((message) => message.action === 0).length;
+  control.send({ t: "touch", a: "down", id: 2, x: 0.5, y: 0.5 });
+  control.send({ t: "touch", a: "up", id: 2, x: 0.5, y: 0.5 });
+  await waitFor(() => device.touches().filter((message) => message.action === 0).length === downs + 1, 3000, "a new finger");
+  assert.equal(control.json("error").length, 1);
+  // The lifted gesture and key are journaled before the change, as for a takeover.
+  const records = await waitFor(async () => {
+    const found = await journaled(world);
+    return found.length >= 4 && found;
+  }, 5000, "the journal records");
+  assert.deepEqual(recordSummaries(records), ["human gesture", "human key 59", "human display", "human gesture"]);
+  await stopCanvas(canvas);
+});
+
+test("display: a finger lifted while a paste waits for its ack still reaches the device before the first wm command that changes the display", async (t) => {
+  const { world, canvas, device, control } = await connectedControl(t, { device: { autoAck: false } });
+  await settledDisplay(control);
+  control.send({ t: "touch", a: "down", id: 1, x: 0.5, y: 0.5 });
+  control.send({ t: "paste", text: "x" });
+  await waitFor(() => device.pointersDown.size === 1 && device.count("set-clipboard") === 1, 3000,
+    "the finger and the paste");
+  const answer = wsDisplay(control, "tablet");
+  await sleep(300);
+  assert.deepEqual(wmChanges(wmCallsNow(world)), [], "wm changed the display while the finger's up waited behind the paste");
+  assert.equal(device.pointersDown.size, 1);
+  const wmAtUp = [];
+  device.on("control", (message) => {
+    if (message.type === "touch" && message.action === 1) wmAtUp.push(wmChanges(wmCallsNow(world)).length);
+  });
+  device.ack(clipboardWrites(device)[0].sequence);
+  assert.equal((await answer).ok, true);
+  assert.equal(wmAtUp[0], 0, "the display changed before the device read the finger's up");
+  assert.equal(device.pointersDown.size, 0);
+  assert.deepEqual(await wmNow(world), { size: "2560x1600", density: 320 });
+  await stopCanvas(canvas);
+});
+
+test("display: on screenrecord each change restarts the shared capture once, the transport stays screenrecord and the journal names it", async (t) => {
+  const world = await makeWorld(t, { env: { FAKE_SCREENRECORD: "h264", FAKE_SCREENRECORD_HOLD: "1" } });
+  const ffmpeg = join(world.directory, "fake-ffmpeg.mjs");
+  await writeFile(ffmpeg, `#!${process.execPath}\n${FAKE_FFMPEG}`);
+  await chmod(ffmpeg, 0o755);
+  const canvas = await startCanvas(world, ["--transport", "screenrecord", "--ffmpeg", ffmpeg]);
+  // Streaming captures, not the start-up probe, which has a time limit.
+  const captures = async () => (await adbCalls(world))
+    .filter((args) => args.includes("screenrecord") && !args.includes("--time-limit")).length;
+  const stream = await readMultipart(canvas);
+  await waitFor(() => stream.frames.length > 0, 5000, "frames from the first capture");
+  assert.equal(await captures(), 1);
+  assert.equal((await postDisplay(canvas, "tablet")).status, 200);
+  await waitFor(async () => (await captures()) === 2, 5000, "the capture restarted");
+  const seen = stream.frames.length;
+  await waitFor(() => stream.frames.length > seen, 5000, "frames from the new capture");
+  assert.equal((await postDisplay(canvas, "default")).status, 200);
+  await waitFor(async () => (await captures()) === 3, 5000, "the capture restarted again");
+  await sleep(800);
+  assert.equal(await captures(), 3, "a change restarted the capture more than once");
+  const body = await status(canvas);
+  assert.equal(body.transport, "screenrecord");
+  assert.doesNotMatch(String(body.last_error ?? ""), /accelerated stream failed/);
+  assert.deepEqual(await displayRecords(world), ["agent tablet 2560x1600@320", "agent default 1080x2400@420"]);
+  assert.ok((await journaled(world, "display")).every(({ payload }) => payload.transport === "screenrecord"));
+  stream.close();
+  await stopCanvas(canvas);
+});
+
+test("display: on screencap the frames after a change to Tablet have its size", async (t) => {
+  const world = await makeWorld(t);
+  const canvas = await startCanvas(world, ["--transport", "screencap"]);
+  const stream = await readMultipart(canvas);
+  await waitFor(() => stream.frames.length > 0, 5000, "a first frame");
+  assert.deepEqual(pngSize(stream.frames[0]), [1, 1]);
+  assert.equal((await postDisplay(canvas, "tablet")).status, 200);
+  const from = stream.frames.length;
+  const tablet = await waitFor(() => stream.frames.slice(from).find((frame) => pngSize(frame)[0] !== 1), 5000,
+    "a frame with the new size");
+  assert.deepEqual(pngSize(tablet), [2560, 1600]);
+  assert.equal((await status(canvas)).transport, "screencap");
+  stream.close();
+  await stopCanvas(canvas);
+});
+
+test("display: a second multipart page that still has the old size taps the centre right after an agent applies Tablet and the device gets the Tablet centre; agent input without dw and dh is sent as given, and a malformed dw or dh is refused with nothing sent", async (t) => {
+  const world = await makeWorld(t);
+  const canvas = await startCanvas(world, ["--transport", "screencap"]);
+  const stream = await readMultipart(canvas);
+  await waitFor(() => stream.frames.length > 0, 5000, "a first frame");
+  const auth = await login(canvas);
+  const page = (path, body) => rawHttp(canvas.port, { method: "POST", path, body: JSON.stringify(body), headers: {
+    "Content-Type": "application/json", Cookie: auth.cookie, "X-Autonom-CSRF": auth.csrf, "X-Autonom-Origin": "human" } });
+  const agent = (path, body) => rawHttp(canvas.port, { method: "POST", path, body: JSON.stringify(body), headers: agentHeaders() });
+  // The size the page polled last: the device default.
+  const known = (await status(canvas)).display;
+  assert.deepEqual([known.width, known.height], [1080, 2400]);
+  assert.equal((await postDisplay(canvas, "tablet")).status, 200);
+  // Before its next poll the page taps the centre it shows and drags down the middle.
+  assert.equal((await page("/tap", { x: 540, y: 1200, dw: 1080, dh: 2400 })).status, 200);
+  assert.equal((await page("/swipe", { x1: 540, y1: 1800, x2: 540, y2: 600, duration: 220, dw: 1080, dh: 2400 })).status, 200);
+  // A page that knows the size in effect, and an agent that names no size, are sent as given.
+  assert.equal((await page("/tap", { x: 100, y: 200, dw: 2560, dh: 1600 })).status, 200);
+  assert.equal((await agent("/tap", { x: 540, y: 1200 })).status, 200);
+  assert.equal((await agent("/swipe", { x1: 10, y1: 20, x2: 30, y2: 40, duration: 100 })).status, 200);
+  const sent = async (op) => (await bridgeCalls(world, op)).map(({ origin, payload }) => [origin, payload]);
+  assert.deepEqual(await sent("tap"), [["human", { x: 1280, y: 800 }], ["human", { x: 100, y: 200 }],
+    ["agent", { x: 540, y: 1200 }]]);
+  assert.deepEqual(await sent("swipe"), [["human", { x1: 1280, y1: 1200, x2: 1280, y2: 400, duration: 220 }],
+    ["agent", { x1: 10, y1: 20, x2: 30, y2: 40, duration: 100 }]]);
+  // Both or neither, each an integer from 1 to 10000; anything else is 400 and reaches no device.
+  for (const size of [{ dw: 1080 }, { dh: 2400 }, { dw: 0, dh: 2400 }, { dw: -1080, dh: 2400 }, { dw: 1080.5, dh: 2400 },
+    { dw: "1080", dh: 2400 }, { dw: 1080, dh: null }, { dw: 10_001, dh: 2400 }, { dw: 1080, dh: 1e9 }]) {
+    for (const [path, body] of [["/tap", { x: 1, y: 1 }], ["/swipe", { x1: 1, y1: 1, x2: 2, y2: 2 }]]) {
+      for (const send of [agent, page]) {
+        const answer = await send(path, { ...body, ...size });
+        assert.equal(answer.status, 400, `${path} ${JSON.stringify(size)}`);
+        assert.equal(JSON.parse(answer.body).error, "dw and dh must both be integers from 1 to 10000");
+      }
+    }
+  }
+  assert.equal((await sent("tap")).length, 3);
+  assert.equal((await sent("swipe")).length, 2);
+  stream.close();
+  await stopCanvas(canvas);
+});
+
+test("display: the multipart page sends the display size its taps, swipes and wheel swipes were computed for, none before it knows one, and moves a swipe's start to a size that changed during the drag", async (t) => {
+  const { sandbox, run } = await loadPage(t);
+  const posts = [];
+  sandbox.performance = performance;
+  sandbox.fetch = async (path, init) => {
+    posts.push([path, JSON.parse(init.body)]);
+    return { ok: true, json: async () => ({ ok: true }) };
+  };
+  // A 1080x2400 picture shown at half size.
+  run(`view.transport="screencap";controlSocket=null;image.naturalWidth=1080;image.naturalHeight=2400;
+    image.getBoundingClientRect=()=>({left:0,top:0,width:540,height:1200});image.setPointerCapture=()=>{};`);
+  const drag = async (from, to, between = "") => {
+    posts.length = 0;
+    run(`legacyPointerDown({clientX:${from[0]},clientY:${from[1]},pointerId:1});${between}`);
+    await run(`legacyPointerUp({clientX:${to[0]},clientY:${to[1]},pointerId:1})`);
+    return posts.map(([path, body]) => [path, path === "/swipe" ? { ...body, duration: "any" } : body]);
+  };
+  assert.deepEqual(await drag([270, 600], [270, 600]), [["/tap", { x: 540, y: 1200 }]]);
+  run("logicalDisplay={width:1080,height:2400}");
+  assert.deepEqual(await drag([270, 600], [270, 600]), [["/tap", { x: 540, y: 1200, dw: 1080, dh: 2400 }]]);
+  assert.deepEqual(await drag([270, 900], [270, 300]),
+    [["/swipe", { x1: 540, y1: 1800, x2: 540, y2: 600, duration: "any", dw: 1080, dh: 2400 }]]);
+  // The page polls a new size during the drag: the start goes to that size with the end.
+  assert.deepEqual(await drag([270, 900], [270, 300], "logicalDisplay={width:2160,height:4800};"),
+    [["/swipe", { x1: 1080, y1: 3600, x2: 1080, y2: 1200, duration: "any", dw: 2160, dh: 4800 }]]);
+  posts.length = 0;
+  await run("logicalDisplay={width:1080,height:2400};onWheel({preventDefault(){},deltaX:0,deltaY:100,deltaMode:0})");
+  assert.deepEqual(posts, [["/swipe", { x1: 540, y1: 1320, x2: 540, y2: 600, duration: 220, dw: 1080, dh: 2400 }]]);
+});
+
+test("display: SIGTERM after Pixel Fold resets size and density before the process exits, and the restore is journaled as the system's", async (t) => {
+  const { world, canvas } = await streamingCanvas(t);
+  assert.equal((await postDisplay(canvas, "pixel-fold")).body.display.preset, "pixel-fold");
+  assert.deepEqual(await wmNow(world), { size: "2208x1840", density: null });
+  const exit = await stopCanvas(canvas);
+  assert.equal(exit.code, 0);
+  assert.deepEqual((await wmCalls(world)).slice(-4), ["size reset", "density reset", "size", "density"]);
+  assert.deepEqual(await wmNow(world), { size: null, density: null });
+  assert.match(exit.stdout, /Display restored: 1080x2400 @ 420\n/);
+  assert.deepEqual(await displayRecords(world), ["agent pixel-fold 2208x1840@420", "system restore 1080x2400@420"]);
+});
+
+test("display: a size and density override the device had before the Canvas comes back at stop", async (t) => {
+  const { world, canvas } = await streamingCanvas(t, { env: { FAKE_WM_OVERRIDE: "1600x2560@300" } });
+  // An override this Canvas did not make is no preset.
+  assert.deepEqual(displayValues((await status(canvas)).display), [1600, 2560, 300, null]);
+  assert.equal((await postDisplay(canvas, "small")).status, 200);
+  assert.deepEqual(await wmNow(world), { size: "720x1280", density: 320 });
+  const exit = await stopCanvas(canvas);
+  assert.equal(exit.code, 0);
+  assert.deepEqual(await wmNow(world), { size: "1600x2560", density: 300 });
+  assert.deepEqual(wmChanges(await wmCalls(world)), ["size 720x1280", "density 320", "size 1600x2560", "density 300"]);
+  assert.match(exit.stdout, /Display restored: 1600x2560 @ 300\n/);
+});
+
+test("display: a Canvas that changed nothing runs no wm command at stop and journals nothing", async (t) => {
+  const { world, canvas } = await streamingCanvas(t);
+  await status(canvas);
+  // A refused request is no change either.
+  assert.equal((await postDisplay(canvas, "huge")).status, 400);
+  const before = await wmCalls(world);
+  assert.deepEqual(before, ["size", "density"]);
+  const exit = await stopCanvas(canvas);
+  assert.equal(exit.code, 0);
+  assert.deepEqual(await wmCalls(world), before);
+  assert.doesNotMatch(exit.stdout, /Display restore/);
+  assert.deepEqual(await journaled(world, "display"), []);
+});
+
+/** The Python that runs the real bridge, which writes no bytecode next to it. */
+async function bridgePython() {
+  return (await execFileAsync("python3", ["-c", "import sys; print(sys.executable)"],
+    { env: { ...process.env, PYTHONDONTWRITEBYTECODE: "1" } })).stdout.trim();
+}
+
+/** A current session on the Canvas target; returns its artifacts directory. */
+async function displaySession(world) {
+  const sessions = join(world.env.AUTONOM_HOME, "sessions");
+  const artifacts = join(sessions, "s_canvas_display");
+  await mkdir(artifacts, { recursive: true });
+  await writeFile(join(sessions, "current.json"), JSON.stringify({
+    schema_version: 2, session_id: "s_canvas_display", platform: "android", target_id: SERIAL, serial: SERIAL,
+    artifacts_dir: artifacts,
+  }));
+  return artifacts;
+}
+
+/** The session's journal entries, [] before the first. */
+async function journalEntries(artifacts) {
+  const text = await readFile(join(artifacts, "journal.ndjson"), "utf8").catch(() => "");
+  return text.split("\n").filter(Boolean).map((line) => JSON.parse(line));
+}
+
+/** Each entry's preset, width, height, density and transport, from its detail file. */
+async function displayDetails(artifacts, entries) {
+  return await Promise.all(entries.map(async (entry) => {
+    const detail = JSON.parse(await readFile(join(artifacts, entry.result.detail), "utf8"));
+    return [detail.preset, detail.width, detail.height, detail.density, detail.transport];
+  }));
+}
+
+test("display: journal: each applied change is one ui display entry and the restore at stop one system entry, from the real bridge", async (t) => {
+  // The real bridge, with its validation, journaling into a current session on the Canvas target.
+  const python = await bridgePython();
+  const world = await makeWorld(t, { env: { PYTHONDONTWRITEBYTECODE: "1" } });
+  const artifacts = await displaySession(world);
+  const canvas = await startCanvas(world, ["--transport", "scrcpy", "--scrcpy-server", world.serverFile,
+    "--python", python, "--bridge", join(ROOT, "scripts/autonom_canvas_bridge.py")]);
+  const auth = await login(canvas);
+  const control = await pageSocket(canvas, auth, "/ws/control");
+  await control.next((message) => message.json?.t === "state");
+  assert.equal((await wsDisplay(control, "small")).ok, true);
+  assert.equal((await wsDisplay(control, "tablet")).ok, true);
+  // Refused requests leave no entry.
+  assert.equal((await postDisplay(canvas, "huge")).status, 400);
+  assert.equal((await postDisplay(canvas, "tablet", "replay")).status, 200);
+  const exit = await stopCanvas(canvas);
+  assert.equal(exit.code, 0);
+  const entries = await journalEntries(artifacts);
+  assert.deepEqual(entries.map((entry) => [entry.verb, entry.origin, entry.ok]), [
+    ["ui display", "human", true], ["ui display", "human", true], ["ui display", "replay", true],
+    ["ui display", "system", true]]);
+  assert.deepEqual(await displayDetails(artifacts, entries), [
+    ["small", 720, 1280, 320, "scrcpy"], ["tablet", 2560, 1600, 320, "scrcpy"], ["tablet", 2560, 1600, 320, "scrcpy"],
+    ["restore", 1080, 2400, 420, "scrcpy"]]);
+  assert.match(exit.stdout, /Display restored: 1080x2400 @ 420\n/);
+});
+
+test("display: journal: the restore at stop is one system entry while the real bridge is still busy with a 4 s swipe, and the stop keeps within its 3 s budget", async (t) => {
+  // The real bridge handles one line at a time; the device holds its swipe for 4 s.
+  const python = await bridgePython();
+  const world = await makeWorld(t, { env: { PYTHONDONTWRITEBYTECODE: "1", FAKE_ADB_INPUT_MS: "4000" } });
+  const artifacts = await displaySession(world);
+  const canvas = await startCanvas(world, ["--transport", "screencap",
+    "--python", python, "--bridge", join(ROOT, "scripts/autonom_canvas_bridge.py")]);
+  assert.equal((await postDisplay(canvas, "tablet")).status, 200);
+  await waitFor(async () => (await journalEntries(artifacts)).length === 1, 5000, "the change's entry");
+  const swipe = JSON.stringify({ x1: 10, y1: 10, x2: 10, y2: 500, duration: 4000 });
+  const swiping = rawHttp(canvas.port, { method: "POST", path: "/swipe", headers: agentHeaders(), body: swipe })
+    .catch(() => null);
+  await waitFor(async () => (await adbCalls(world)).some((args) => args.includes("input") && args.includes("swipe")),
+    5000, "the swipe at the device");
+  await sleep(250);
+  const started = Date.now();
+  const exit = await stopCanvas(canvas);
+  const elapsed = Date.now() - started;
+  t.diagnostic(`the Canvas stopped ${elapsed} ms after SIGTERM`);
+  assert.equal(exit.code, 0);
+  assert.ok(elapsed < 3000, `the Canvas stopped ${elapsed} ms after SIGTERM`);
+  assert.match(exit.stdout, /Display restored: 1080x2400 @ 420\n/);
+  assert.deepEqual(await wmNow(world), { size: null, density: null });
+  const entries = await journalEntries(artifacts);
+  assert.deepEqual(entries.map((entry) => [entry.verb, entry.origin, entry.ok]),
+    [["ui display", "agent", true], ["ui display", "system", true]]);
+  assert.deepEqual(await displayDetails(artifacts, entries),
+    [["tablet", 2560, 1600, 320, "screencap"], ["restore", 1080, 2400, 420, "screencap"]]);
+  await swiping;
+});
+
+test("display: journal: when no second bridge can start for the restore record behind a busy one, the stop still restores the display and exits 0 within its budget", async (t) => {
+  const world = await makeWorld(t, { env: { FAKE_BRIDGE_INPUT_MS: "4000", FAKE_BRIDGE_IN_ORDER: "1" } });
+  // The bridge's interpreter is gone by the stop, so only the bridge already running works.
+  const python = join(world.directory, "bridge-python");
+  await writeFile(python, `#!/bin/sh\nexec "${process.execPath}" "$@"\n`);
+  await chmod(python, 0o755);
+  const canvas = await startCanvas(world, ["--transport", "screencap", "--python", python]);
+  assert.equal((await postDisplay(canvas, "tablet")).status, 200);
+  await waitFor(async () => (await displayRecords(world)).length === 1, 5000, "the change's record");
+  const swipe = JSON.stringify({ x1: 10, y1: 10, x2: 10, y2: 500, duration: 4000 });
+  const swiping = rawHttp(canvas.port, { method: "POST", path: "/swipe", headers: agentHeaders(), body: swipe })
+    .catch(() => null);
+  await waitFor(async () => (await bridgeCalls(world, "swipe")).length === 1, 5000, "the swipe at the device");
+  await rm(python);
+  const started = Date.now();
+  const exit = await stopCanvas(canvas);
+  const elapsed = Date.now() - started;
+  assert.equal(exit.code, 0, exit.stderr);
+  assert.ok(elapsed < 3000, `the Canvas stopped ${elapsed} ms after SIGTERM`);
+  assert.match(exit.stdout, /Display restored: 1080x2400 @ 420\n/);
+  assert.deepEqual(await wmNow(world), { size: null, density: null });
+  assert.deepEqual(await displayRecords(world), ["agent tablet 2560x1600@320"]);
+  await swiping;
+});
+
+test("display: the Android page shows a Size picker with the five presets, sends a choice over the control socket or POST /display, and disables it without control", async (t) => {
+  const { sandbox, sent, run, html } = await loadPage(t);
+  assert.match(html, /<button type="button" class="popup" id="display-preset" aria-haspopup="listbox"[^>]* disabled>/,
+    "the Android page has no Size picker");
+  assert.deepEqual(presetOptions(html), [["small", "Small phone", "720 × 1280"], ["pixel-11", "Pixel 11", "1080 × 2424"],
+    ["pixel-fold", "Pixel Fold (open)", "2208 × 1840"], ["tablet", "Tablet", "2560 × 1600"], ["default", "Device default", ""]]);
+  const picker = () => JSON.parse(run("JSON.stringify([sizePicker.value,sizePicker.disabled])"));
+
+  // Shown once the page knows the status; the preset in effect is selected.
+  run("view.status={platform:\"android\"};view.preset=\"default\";syncPicker()");
+  assert.deepEqual(picker(), ["default", false]);
+  // On scrcpy a choice goes over the control socket; the picker waits for the answer.
+  run("chooseDisplay(\"tablet\")");
+  assert.deepEqual(sent.at(-1), { t: "display", preset: "tablet" });
+  assert.equal(picker()[1], true);
+  run("onControlMessage({t:\"display\",ok:true,display:{preset:\"tablet\",width:2560,height:1600,density:320}})");
+  assert.deepEqual(picker(), ["tablet", false]);
+  assert.deepEqual(JSON.parse(run("JSON.stringify(logicalDisplay)")), { width: 2560, height: 1600 });
+  assert.deepEqual(JSON.parse(run("JSON.stringify(snapshot().display)")),
+    { preset: "tablet", density: 320, picker: "tablet", pickerDisabled: false });
+  // Another page's change arrives in a state message.
+  const state = (fields) => run(`applyState(${JSON.stringify({ t: "state", owner: "shared", paused: false,
+    session: "streaming", clients: null, preset: "small", density: 320, ...fields })})`);
+  state({});
+  assert.deepEqual(picker(), ["small", false]);
+  // Disabled while another origin holds control or input is paused.
+  state({ owner: "agent" });
+  assert.equal(picker()[1], true);
+  state({ paused: true });
+  assert.equal(picker()[1], true);
+  state({ owner: "human" });
+  assert.equal(picker()[1], false);
+  // A refused or superseded choice gives the picker back with the preset in effect.
+  run("sizePicker.value=\"pixel-fold\";chooseDisplay(\"pixel-fold\")");
+  run("onControlMessage({t:\"error\",for:\"display\",message:\"Canvas control is owned by agent\"})");
+  assert.deepEqual(picker(), ["small", false]);
+  assert.equal(run("view.note"), "Canvas control is owned by agent");
+  run("sizePicker.value=\"tablet\";chooseDisplay(\"tablet\")");
+  run(`onControlMessage(${JSON.stringify(supersededAnswer("tablet"))})`);
+  assert.deepEqual(picker(), ["small", false]);
+  // Without scrcpy it goes to POST /display as the human page, and the answer is shown.
+  const posts = [];
+  sandbox.fetch = async (path, init) => {
+    posts.push([path, JSON.parse(init.body), init.headers["X-Autonom-Origin"]]);
+    return { ok: true, json: async () => ({ ok: true, display: { preset: "pixel-fold", width: 2208, height: 1840, density: 420 } }) };
+  };
+  run("view.transport=\"screencap\";controlSocket=null");
+  await run("chooseDisplay(\"pixel-fold\")");
+  assert.deepEqual(posts, [["/display", { preset: "pixel-fold" }, "human"]]);
+  assert.deepEqual(picker(), ["pixel-fold", false]);
+  assert.equal(sent.filter((message) => message.t === "display").length, 3);
+});
+
+/** The Size menu's options as served: [preset id, label, size shown]. */
+function presetOptions(html) {
+  return [...html.matchAll(/<button[^>]* role="option" data-preset="([^"]+)"[^>]*>[\s\S]*?<span>([^<]*)<\/span><small[^>]*>([^<]*)<\/small><\/button>/g)]
+    .map(([, id, label, size]) => [id, label, size]);
+}
+
+/** Every button of a served page: its attributes, its text, and the name assistive technology reads. */
+function pageButtons(html) {
+  const markup = html.replace(/<script>[\s\S]*?<\/script>/, "");
+  return [...markup.matchAll(/<button\b([^>]*)>([\s\S]*?)<\/button>/g)].map(([, rest, inner]) => {
+    const attributes = Object.fromEntries([...rest.matchAll(/([^\s="'/]+)(?:="([^"]*)")?/g)]
+      .map(([, name, value = ""]) => [name, value]));
+    const text = inner.replace(/<[^>]*>/g, "").replace(/\s+/g, " ").trim();
+    return { attributes, text, name: attributes["aria-label"] ?? text };
+  });
+}
+
+// Each control of the former page, by the attributes its handlers read, with its name now.
+const FORMER_CONTROLS = [
+  ["Back", { "data-key": "KEYCODE_BACK", "data-system": "back" }],
+  ["Home", { "data-key": "KEYCODE_HOME", "data-system": "home" }],
+  ["Recent apps", { "data-key": "KEYCODE_APP_SWITCH", "data-system": "app-switch" }],
+  ["Up", { "data-key": "KEYCODE_DPAD_UP", "data-code": "19" }],
+  ["Enter", { "data-key": "KEYCODE_ENTER", "data-code": "66" }],
+  ["Down", { "data-key": "KEYCODE_DPAD_DOWN", "data-code": "20" }],
+  ["Left", { "data-key": "KEYCODE_DPAD_LEFT", "data-code": "21" }],
+  ["Delete", { "data-key": "KEYCODE_DEL", "data-code": "67" }],
+  ["Right", { "data-key": "KEYCODE_DPAD_RIGHT", "data-code": "22" }],
+  ["Wake screen", { "data-key": "KEYCODE_WAKEUP", "data-system": "wake" }],
+  ["Power", { "data-key": "KEYCODE_POWER", "data-system": "power" }],
+  ["Rotate", { "data-system": "rotate", "data-scrcpy": "" }],
+  ["Volume down", { "data-system": "volume-down", "data-scrcpy": "" }],
+  ["Volume up", { "data-system": "volume-up", "data-scrcpy": "" }],
+  ["Notifications", { "data-system": "notifications", "data-scrcpy": "" }],
+  ["Quick settings", { "data-system": "quick-settings", "data-scrcpy": "" }],
+  ["Collapse panels", { "data-system": "collapse", "data-scrcpy": "" }],
+  ["Copy device clipboard", { id: "clipboard", "data-scrcpy": "" }],
+  ["Reconnect stream", { id: "refresh" }],
+  ["Send", { id: "sendText" }],
+];
+const PAGE_IDS = ["video", "screen", "status", "text", "clipboard", "device", "refresh", "sendText"];
+
+test("page: the Android page keeps its element ids, window.autonomCanvas and every former control with the attributes its handlers read, names every button, and marks the scrcpy-only ones", async (t) => {
+  const { html } = await loadPage(t);
+  for (const id of [...PAGE_IDS, "display-preset", "display-menu", "control-take", "control-pause", "inspector-toggle"]) {
+    assert.equal(html.split(`id="${id}"`).length - 1, 1, `id ${id}`);
+  }
+  assert.match(html, /window\.autonomCanvas=Object\.freeze\(\{stats:snapshot,send:sendControl\}\)/);
+  assert.match(html, /<canvas id="video" class="surface" tabindex="0" aria-label="Android device screen" hidden>/);
+  assert.match(html, /<img id="screen" class="surface" tabindex="0" alt="Android device screen">/);
+  assert.match(html, /<input id="text" [^>]*aria-label="Text to type">/);
+  const buttons = pageButtons(html);
+  for (const [name, attributes] of FORMER_CONTROLS) {
+    const found = buttons.filter((button) => Object.entries(attributes).every(([key, value]) => button.attributes[key] === value));
+    assert.equal(found.length, 1, name);
+    assert.equal(found[0].name, name);
+    assert.deepEqual(Object.keys(found[0].attributes).filter((key) => key.startsWith("data-")).sort(),
+      Object.keys(attributes).filter((key) => key.startsWith("data-")).sort(), `${name} keeps exactly its data attributes`);
+  }
+  // Every button has a name; one without text is named by aria-label and shows it as its tooltip.
+  for (const button of buttons) {
+    assert.ok(button.name, JSON.stringify(button.attributes));
+    assert.equal(button.attributes.type, "button", button.name);
+    if (!button.text) assert.equal(button.attributes.title, button.attributes["aria-label"], button.name);
+  }
+  assert.deepEqual(buttons.filter((button) => "data-scrcpy" in button.attributes).map((button) => button.name),
+    ["Rotate", "Volume down", "Volume up", "Notifications", "Quick settings", "Collapse panels", "Copy device clipboard"]);
+  // The toolbar: wordmark, target with its live dot, the size menu with dimensions, control chip, inspector toggle.
+  assert.match(html, /<b>Autonom<\/b>/);
+  assert.match(html, /<i class="dot" id="live-dot" aria-hidden="true"><\/i><strong>fake-device-1<\/strong><span id="target-detail">Android · connecting<\/span>/);
+  assert.match(html, /<span class="dims" id="display-dims"><\/span>/);
+  assert.match(html, /<span class="chip" title="Who controls the device">[\s\S]*?<span id="control-chip">Shared<\/span>/);
+  assert.match(html, /id="inspector-toggle" aria-pressed="true" aria-controls="inspector" title="Inspector" aria-label="Inspector"/);
+  assert.match(html, /<div role="listbox" id="display-list" aria-label="Display size">/);
+  assert.equal(presetOptions(html).length, 5);
+  // The pill under the device: Back, Home, Recent apps | Rotate, Volume down, Volume up, Power.
+  const dock = html.match(/<nav class="dock" aria-label="Device buttons">([\s\S]*?)<\/nav>/);
+  assert.ok(dock, "the Android page has no pill of device buttons");
+  assert.deepEqual(pageButtons(dock[1]).map((button) => button.name),
+    ["Back", "Home", "Recent apps", "Rotate", "Volume down", "Volume up", "Power"]);
+  // The inspector sections, in order.
+  assert.deepEqual([...html.matchAll(/<section class="group"[^>]*>\s*<h2>([^<]+)<\/h2>/g)].map((match) => match[1]),
+    ["Type", "Keys", "Device", "Control", "Stream"]);
+  assert.doesNotMatch(html, /<section class="group" hidden>/, "an Android inspector section is hidden");
+});
+
+test("page: the page loads nothing from outside, has light and dark tokens with the approved accents, a phone layout with 44 px targets and the pill above the safe area, reduced motion, visible focus, and never builds DOM from strings", async (t) => {
+  const { html } = await loadPage(t);
+  const script = html.match(/<script>([\s\S]*)<\/script>/)[1];
+  assert.doesNotMatch(html, /https?:\/\//, "an absolute URL is on the page");
+  assert.doesNotMatch(html, /<script[^>]*\ssrc=|<link[^>]*stylesheet/i);
+  assert.doesNotMatch(html.match(/<style>([\s\S]*)<\/style>/)[1], /@import|url\(/);
+  for (const [, value] of html.matchAll(/\s(?:src|href)="([^"]*)"/g)) assert.match(value, /^data:/);
+  assert.doesNotMatch(script, /innerHTML|outerHTML|insertAdjacentHTML|document\.write/);
+  assert.match(html, /<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">/);
+  const light = html.match(/:root\{([\s\S]*?)\}/)[1];
+  const dark = html.match(/@media \(prefers-color-scheme:dark\)\{:root\{([\s\S]*?)\}\}/);
+  assert.ok(dark, "no dark color scheme block");
+  assert.match(light, /color-scheme:light dark/);
+  assert.match(light, /--accent-fill:#0071e3/);
+  assert.match(dark[1], /--accent-fill:#0068d6/);
+  assert.match(light, /--font:-apple-system,BlinkMacSystemFont/);
+  assert.match(html, /:focus-visible\{outline:2px solid var\(--accent\)/);
+  const phone = html.match(/@media \(max-width:760px\)\{([\s\S]*?)\n\}/);
+  assert.ok(phone, "no phone layout");
+  for (const rule of [".dock{position:fixed;bottom:calc(14px + env(safe-area-inset-bottom))", ".dock button{width:44px;height:44px}",
+    ".popup,.option,.key,.btn,.field input,.row{height:44px}", ".linkbtn{min-height:44px}", ".diag summary{line-height:44px}",
+    ".field input{font-size:16px}", "body{display:block;", "body.no-inspector .side{display:block}"]) {
+    assert.ok(phone[1].includes(rule), rule);
+  }
+  const reduced = html.match(/@media \(prefers-reduced-motion:reduce\)\{(.*)\}/);
+  assert.ok(reduced, "no reduced motion rule");
+  for (const rule of ["transition:none!important", "animation:none!important", "button:active{transform:none!important}"]) {
+    assert.ok(reduced[1].includes(rule), rule);
+  }
+});
+
+test("page: the size menu fills an option only for keyboard focus (:focus-visible) and pointer hover, so a menu opened by pointer or touch shows the selection by its check mark alone", async (t) => {
+  const { html } = await loadPage(t);
+  const css = html.match(/<style>([\s\S]*)<\/style>/)[1];
+  assert.match(css, /\n\.option:focus\{outline:none\}\n/);
+  assert.match(css, /\n\.option:focus-visible\{background:var\(--accent-fill\);color:var\(--on-accent\)\}\n/);
+  assert.match(css, /\n\.option:focus-visible small\{color:inherit\}\n/);
+  // No rule for plain :focus, which the selected row has as soon as a pointer opens the menu, fills it.
+  assert.doesNotMatch(css, /\.option:focus(?!-visible)[^{]*\{[^}]*(background|color)/);
+  const hover = css.match(/@media \(hover:hover\)\{([\s\S]*?)\n\}/);
+  assert.ok(hover, "no hover block");
+  assert.ok(hover[1].includes(".option:hover{background:var(--accent-fill);color:var(--on-accent)}"));
+  assert.ok(hover[1].includes(".option:hover small{color:inherit}"));
+  // Hover fills only where a pointer hovers; elsewhere no option rule fills on hover.
+  assert.doesNotMatch(css.replace(hover[0], ""), /\.option:hover/);
+  assert.match(css, /\n\.option\[aria-selected=true\] \.check\{visibility:visible\}\n/);
+  assert.match(css, /@media \(forced-colors:active\)\{\.option:focus-visible\{outline:2px solid CanvasText\}\}/);
+});
+
+test("page: the Size button shows a landscape device for Tablet and Pixel Fold, a portrait one for the phone presets, and the orientation of the size in effect for the device default or another size", async (t) => {
+  const { run, html } = await loadPage(t);
+  const button = html.match(/<button[^>]* id="display-preset"[^>]*>([\s\S]*?)<\/button>/)[1];
+  assert.match(button, /<svg class="portrait" [^>]*><rect x="7" y="2\.5" width="10" height="19" rx="2\.5"\/>/);
+  assert.match(button, /<svg class="landscape" [^>]*><rect x="2\.5" y="7" width="19" height="10" rx="2\.5"\/>/);
+  const css = html.match(/<style>([\s\S]*)<\/style>/)[1];
+  assert.ok(css.includes("\n.popup .landscape,.popup.wide .portrait{display:none}\n"));
+  assert.ok(css.includes("\n.popup.wide .landscape{display:block}\n"));
+  const wide = (preset, display = null) => run(`view.status={platform:"android"};view.preset=${JSON.stringify(preset)};` +
+    `logicalDisplay=${JSON.stringify(display)};syncPicker();sizePicker.classList.contains("wide")`);
+  assert.equal(wide("small"), false);
+  assert.equal(wide("pixel-11", { width: 2560, height: 1600 }), false);
+  assert.equal(wide("pixel-fold"), true);
+  assert.equal(wide("tablet", { width: 1080, height: 2400 }), true);
+  assert.equal(wide("default", { width: 1080, height: 2400 }), false);
+  assert.equal(wide("default", { width: 2400, height: 1080 }), true);
+  assert.equal(wide(null, { width: 1600, height: 1200 }), true);
+  assert.equal(wide(null), false);
+});
+
+/** A CSS color token (#rgb, #rrggbb or rgba()) as [r, g, b, alpha]. */
+function cssColor(value) {
+  const hex = value.match(/^#([0-9a-f]{3}|[0-9a-f]{6})$/i);
+  if (hex) {
+    const pairs = hex[1].length === 3 ? [...hex[1]].map((digit) => digit + digit) : hex[1].match(/../g);
+    return [...pairs.map((pair) => parseInt(pair, 16)), 1];
+  }
+  const rgba = value.match(/^rgba\(([^)]+)\)$/);
+  assert.ok(rgba, `not a color: ${value}`);
+  return rgba[1].split(",").map(Number);
+}
+
+function relativeLuminance([r, g, b]) {
+  const [red, green, blue] = [r, g, b].map((value) => {
+    const channel = value / 255;
+    return channel <= 0.04045 ? channel / 12.92 : ((channel + 0.055) / 1.055) ** 2.4;
+  });
+  return 0.2126 * red + 0.7152 * green + 0.0722 * blue;
+}
+
+function contrastRatio(first, second) {
+  const [high, low] = [relativeLuminance(first), relativeLuminance(second)].sort((a, b) => b - a);
+  return (high + 0.05) / (low + 0.05);
+}
+
+test("page: text, secondary text, links and filled-button text reach 4.5:1 against their backgrounds in light and in dark", async (t) => {
+  const { html } = await loadPage(t);
+  const tokens = (block) => Object.fromEntries([...block.matchAll(/--([\w-]+):([^;}]+)/g)].map(([, name, value]) => [name, value.trim()]));
+  const light = tokens(html.match(/:root\{([\s\S]*?)\}/)[1]);
+  const themes = { light, dark: { ...light, ...tokens(html.match(/@media \(prefers-color-scheme:dark\)\{:root\{([\s\S]*?)\}\}/)[1]) } };
+  // [text, background, what a translucent background lies on]: the menu, notice and pill
+  // material may lie over a black or a white device screen as well as the page.
+  const pairs = [["text", "bg"], ["text", "surface"], ["text", "raised"], ["text", "fill-2", "surface"],
+    ["text-2", "bg"], ["text-2", "surface"], ["text-2", "fill", "surface"], ["on-accent", "accent-fill"],
+    ["accent", "surface"], ...["bg", "#000", "#fff"].flatMap((base) => [["text", "material", base], ["text-2", "material", base]])];
+  for (const [theme, values] of Object.entries(themes)) {
+    for (const [foreground, background, base] of pairs) {
+      const [r, g, b, alpha] = cssColor(values[background]);
+      const under = base ? cssColor(values[base] ?? base) : [0, 0, 0];
+      const shown = [r, g, b].map((channel, index) => channel * alpha + under[index] * (1 - alpha));
+      const ratio = contrastRatio(cssColor(values[foreground]), shown);
+      assert.ok(ratio >= 4.5, `${theme}: ${foreground} on ${background}${base ? ` over ${base}` : ""} is ${ratio.toFixed(2)}:1`);
+    }
+  }
+});
+
+test("page: the size menu is a keyboard listbox: Enter opens it on the first preset, ArrowDown twice and Enter apply the third, and Escape, Tab, a click elsewhere or lost control close it without a change", async (t) => {
+  const { sent, run, document } = await loadPage(t);
+  const button = document.getElementById("display-preset");
+  const menu = document.getElementById("display-menu");
+  // A focused button is clicked by Enter and Space unless a handler took the key.
+  const press = (key) => {
+    const target = document.activeElement;
+    const event = target.dispatch("keydown", { key });
+    if (!event.defaultPrevented && (key === "Enter" || key === " ") && target.tagName === "BUTTON") target.click();
+  };
+  const focused = () => document.activeElement.dataset.preset ?? document.activeElement.id;
+  const isOpen = () => menu.classList.contains("open") && button.getAttribute("aria-expanded") === "true";
+  const selected = () => document.querySelectorAll("[data-preset]")
+    .filter((option) => option.getAttribute("aria-selected") === "true").map((option) => option.dataset.preset);
+  const displays = () => sent.filter((message) => message.t === "display").map((message) => message.preset);
+  run("view.status={platform:\"android\"};view.preset=\"default\";syncPicker()");
+  assert.equal(button.disabled, false);
+  assert.equal(document.getElementById("display-label").textContent, "Device default");
+  assert.deepEqual(selected(), ["default"]);
+
+  button.focus();
+  press("Enter");
+  assert.ok(isOpen(), "Enter did not open the menu");
+  assert.equal(focused(), "small");
+  press("ArrowDown");
+  press("ArrowDown");
+  assert.equal(focused(), "pixel-fold");
+  press("Enter");
+  assert.deepEqual(displays(), ["pixel-fold"]);
+  assert.equal(isOpen(), false);
+  // The menu waits for the answer, which then shows the preset and its size. The disabled
+  // button has lost the focus to the body; the answer gives it back to the button.
+  assert.equal(button.disabled, true);
+  assert.equal(document.activeElement, document.body);
+  assert.equal(document.getElementById("display-label").textContent, "Pixel Fold (open)");
+  run("onControlMessage({t:\"display\",ok:true,display:{preset:\"pixel-fold\",width:2208,height:1840,density:420}})");
+  assert.equal(button.disabled, false);
+  assert.equal(focused(), "display-preset", "the focus did not come back to the size button after the answer");
+  assert.deepEqual(selected(), ["pixel-fold"]);
+  run("render()");
+  assert.equal(document.getElementById("display-dims").textContent, "2208 × 1840 · 420 dpi");
+
+  // Escape closes without a change and gives the focus back.
+  press("Enter");
+  press("ArrowDown");
+  press("Escape");
+  assert.equal(isOpen(), false);
+  assert.equal(focused(), "display-preset");
+  // ArrowUp opens on the last option; Home and End move; Tab closes.
+  press("ArrowUp");
+  assert.equal(focused(), "default");
+  press("Home");
+  assert.equal(focused(), "small");
+  press("End");
+  assert.equal(focused(), "default");
+  press("ArrowDown");
+  assert.equal(focused(), "default", "the focus left the menu past its last option");
+  press("Tab");
+  assert.equal(isOpen(), false);
+  // A pointer opens it on the preset in effect and follows the pointer; a click elsewhere closes it.
+  button.dispatch("click", { detail: 1 });
+  assert.ok(isOpen());
+  assert.equal(focused(), "pixel-fold");
+  const option = (id) => document.querySelectorAll("[data-preset]").find((item) => item.dataset.preset === id);
+  option("small").dispatch("pointermove");
+  assert.equal(focused(), "small");
+  document.getElementById("caption").dispatch("pointerdown");
+  assert.equal(isOpen(), false);
+  assert.deepEqual(displays(), ["pixel-fold"]);
+  // A click on a preset's label chooses it; choosing the preset in effect sends nothing.
+  button.dispatch("click", { detail: 1 });
+  document.elements.find((element) => element.parent === option("tablet") && element.tagName === "SPAN").dispatch("click", { detail: 1 });
+  assert.deepEqual(displays(), ["pixel-fold", "tablet"]);
+  // Focus that moved on while the change ran stays where it went.
+  document.getElementById("text").focus();
+  run("onControlMessage({t:\"display\",ok:true,display:{preset:\"tablet\",width:2560,height:1600,density:320}})");
+  assert.equal(focused(), "text", "the answer took the focus back from the text box");
+  button.dispatch("click", { detail: 1 });
+  option("tablet").dispatch("click", { detail: 1 });
+  assert.equal(isOpen(), false);
+  assert.deepEqual(displays(), ["pixel-fold", "tablet"]);
+  // Losing control closes the menu, which then cannot open.
+  button.dispatch("click", { detail: 1 });
+  run(`applyState(${JSON.stringify({ t: "state", owner: "agent", paused: false, session: "streaming", clients: null,
+    preset: "tablet", density: 320 })})`);
+  assert.equal(isOpen(), false);
+  assert.equal(button.disabled, true);
+  button.focus();
+  press("Enter");
+  press("ArrowDown");
+  assert.equal(isOpen(), false);
+  assert.deepEqual(displays(), ["pixel-fold", "tablet"]);
+});
+
+test("page: controls that cannot act are disabled, the Control buttons hand control over through the control socket or POST /control, and the toolbar, caption, notice and Stream details are filled as text", async (t) => {
+  const { sandbox, sent, run, document } = await loadPage(t);
+  const byId = (id) => document.getElementById(id);
+  const text = (id) => byId(id).textContent;
+  const inputs = [...document.querySelectorAll("[data-system],[data-code],[data-key]"), byId("text"), byId("sendText")];
+  const disabled = () => [...new Set(inputs.map((control) => control.disabled))];
+  const state = (fields) => run(`applyState(${JSON.stringify({ t: "state", owner: "shared", paused: false,
+    session: "streaming", clients: { video: 1, control: 1 }, preset: "default", density: 420, ...fields })})`);
+  // Until the page knows the status nothing can act.
+  run("syncPicker()");
+  assert.deepEqual(disabled(), [true]);
+  assert.deepEqual([byId("control-take").disabled, byId("control-pause").disabled], [true, true]);
+  run("view.status={platform:\"android\",display:{width:1080,height:2400,density:420,preset:\"default\"}};logicalDisplay=view.status.display");
+  state({});
+  assert.deepEqual(disabled(), [false]);
+  assert.deepEqual([text("owner-name"), text("owner-detail"), text("control-chip")],
+    ["Shared", "· people and agents can send input", "Shared"]);
+  assert.equal(byId("owner-dot").dataset.state, "live");
+  // Another owner: input is disabled, handoff and the device clipboard still act.
+  state({ owner: "agent" });
+  assert.deepEqual(disabled(), [true]);
+  assert.deepEqual([byId("clipboard").disabled, byId("refresh").disabled, byId("control-take").disabled], [false, false, false]);
+  assert.deepEqual([text("owner-name"), text("control-chip"), text("control-take")], ["Agent", "Agent", "Take control"]);
+  assert.equal(byId("owner-dot").dataset.state, "warn");
+  byId("control-take").click();
+  assert.deepEqual(sent.at(-1), { t: "control", mode: "takeover" });
+  state({ owner: "human" });
+  assert.deepEqual(disabled(), [false]);
+  assert.equal(text("control-take"), "Release");
+  byId("control-take").click();
+  assert.deepEqual(sent.at(-1), { t: "control", mode: "release" });
+  byId("control-pause").click();
+  assert.deepEqual(sent.at(-1), { t: "control", mode: "pause" });
+  state({ paused: true });
+  assert.deepEqual(disabled(), [true]);
+  assert.deepEqual([text("control-pause"), text("owner-detail"), text("control-chip")],
+    ["Resume input", "· input is paused", "Shared · Paused"]);
+  byId("control-pause").click();
+  assert.deepEqual(sent.at(-1), { t: "control", mode: "resume" });
+  // Without scrcpy the handoff goes to POST /control as the human page, and the answer is shown.
+  const posts = [];
+  sandbox.fetch = async (path, init) => {
+    posts.push([path, JSON.parse(init.body), init.headers["X-Autonom-Origin"]]);
+    return { ok: true, json: async () => ({ ok: true, control_owner: "human", input_paused: false }) };
+  };
+  run("view.transport=\"screencap\";controlSocket=null");
+  byId("control-take").click();
+  await waitFor(() => text("owner-name") === "People", 2000, "the POST /control answer");
+  assert.deepEqual(posts, [["/control", { mode: "takeover" }, "human"]]);
+  assert.deepEqual(disabled(), [false]);
+
+  // The toolbar, caption and Stream details on scrcpy with WebCodecs.
+  run("view.transport=\"scrcpy\";view.mode=\"webcodecs\";view.width=570;view.height=1280;stats.codec=\"avc1.42C029\";" +
+    "stats.renderTimes=[1,2,3];stats.framesRendered=3;view.rtt=12;render()");
+  assert.deepEqual(["target-detail", "display-dims", "caption", "stream-transport", "stream-codec", "stream-frames",
+    "stream-video", "stream-display", "stream-clients"].map(text),
+  ["Android · scrcpy", "1080 × 2400 · 420 dpi", "3 fps · 12 ms · WebCodecs", "scrcpy · WebCodecs", "avc1.42C029",
+    "3 fps · 0 dropped", "570 × 1280", "1080 × 2400 · 420 dpi", "1 video · 1 control"]);
+  assert.equal(byId("live-dot").dataset.state, "live");
+  assert.match(text("status"), /transport: scrcpy \(webcodecs\)/);
+  assert.equal(text("display-default-size"), "", "the device default size was shown before it was read");
+  run("rememberDefaultSize(view.status.display)");
+  assert.equal(text("display-default-size"), "1080 × 2400");
+  // A note with markup is shown as text, then leaves.
+  const markup = "<img src=x onerror=alert(1)>Canvas control is owned by agent";
+  run(`note(${JSON.stringify(markup)});render()`);
+  assert.equal(text("notice"), markup);
+  run("noteAt-=NOTICE_MS+1;render()");
+  assert.equal(text("notice"), "");
+  // The inspector toggle hides and shows the inspector.
+  byId("inspector-toggle").click();
+  assert.equal(document.body.classList.contains("no-inspector"), true);
+  assert.deepEqual([byId("inspector-toggle").getAttribute("aria-pressed"), byId("inspector-toggle").title], ["false", "Show inspector"]);
+  byId("inspector-toggle").click();
+  assert.equal(document.body.classList.contains("no-inspector"), false);
+  assert.equal(byId("inspector-toggle").getAttribute("aria-pressed"), "true");
+});
+
+test("page: the iOS page runs without the Size menu, keeps every element id, and keeps the Android buttons iOS refuses out of sight", async (t) => {
+  const udid = "FAKE-SIMULATOR-UDID";
+  const world = await makeWorld(t, { env: { FAKE_UDID: udid } });
+  const xcrun = join(world.directory, "fake-xcrun.mjs");
+  await writeFile(xcrun, `#!${process.execPath}\n${FAKE_XCRUN}`);
+  await chmod(xcrun, 0o755);
+  const canvas = await startCanvas(world, ["--platform", "ios", "--target", udid, "--simctl", xcrun]);
+  const html = await (await fetch(`${canvas.origin}/`)).text();
+  await stopCanvas(canvas);
+  for (const id of PAGE_IDS) assert.equal(html.split(`id="${id}"`).length - 1, 1, `id ${id}`);
+  assert.doesNotMatch(html, /id="display-preset"|data-preset="/);
+  assert.match(html, /<img id="screen" class="surface" tabindex="0" alt="iOS device screen">/);
+  assert.match(html, /<nav class="dock" aria-label="Device buttons" hidden>/);
+  assert.deepEqual([...html.matchAll(/<section class="group"( hidden)?>\s*<h2>([^<]+)<\/h2>/g)].map((match) => [match[2], Boolean(match[1])]),
+    [["Type", false], ["Keys", true], ["Device", true], ["Control", false], ["Stream", false]]);
+  const { run, document } = runPage(html);
+  assert.equal(run("sizePicker"), null);
+  run("view.transport=\"screencap\";controlSocket=null;view.status={platform:\"ios\",display:{width:1179,height:2556}};" +
+    "logicalDisplay=view.status.display;render()");
+  assert.equal(document.getElementById("target-detail").textContent, "iOS · screencap");
+  assert.equal(document.getElementById("display-dims").textContent, "1179 × 2556");
+  assert.equal(document.getElementById("sendText").disabled, false);
 });

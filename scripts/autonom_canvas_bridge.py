@@ -10,7 +10,9 @@ target; a session on another device never receives this Canvas's actions.
 The one exception is the scrcpy transport: Canvas writes streamed input to
 the scrcpy control socket itself, because a process hop per pointer move is
 too slow.  It then sends one `record` per completed action, which only
-journals and never actuates.
+journals and never actuates.  Display size changes (`wm size`/`wm density`)
+follow the same path on every transport: Canvas runs them on its own serial,
+then sends one `display` record.
 """
 from __future__ import annotations
 
@@ -30,8 +32,16 @@ from autonom_lib import actions, errors, journal, session, ui  # noqa: E402
 from autonom_lib.platform import ANDROID, IOS, Target  # noqa: E402
 
 ORIGINS = ("human", "agent", "replay", "system")
-RECORD_KINDS = ("gesture", "scroll", "key", "text", "paste", "system", "control")
+RECORD_KINDS = ("gesture", "scroll", "key", "text", "paste", "system", "control", "display")
 RECORD_TRANSPORTS = ("scrcpy",)
+# Streamed input exists only on scrcpy, but Canvas changes the display size on
+# every transport, so a `display` record may name any of them.
+DISPLAY_TRANSPORTS = RECORD_TRANSPORTS + ("screenrecord", "screencap")
+# The presets Canvas applies, `default` (the device's own size) and `restore`
+# (the stop-time return to what the device had before the first change).
+DISPLAY_PRESETS = ("small", "pixel-11", "pixel-fold", "tablet", "default", "restore")
+MAX_DISPLAY_SIDE = 10_000
+MAX_DENSITY = 1_000
 SYSTEM_OPS = ("back", "home", "app-switch", "power", "volume-up", "volume-down", "wake",
               "notifications", "quick-settings", "collapse", "rotate", "keyframe")
 CONTROL_MODES = ("pause", "resume", "takeover", "release")
@@ -62,12 +72,13 @@ def _is_number(value: Any) -> bool:
             and math.isfinite(value))
 
 
-def _integer(payload: dict[str, Any], name: str, maximum: int = MAX_COUNT) -> int | None:
+def _integer(payload: dict[str, Any], name: str, maximum: int = MAX_COUNT,
+             minimum: int = 0) -> int | None:
     value = payload.get(name)
     if value is None:
         return None
-    if not _is_number(value) or value != int(value) or not 0 <= value <= maximum:
-        raise _invalid(f"Canvas record {name} must be an integer from 0 to {maximum}")
+    if not _is_number(value) or value != int(value) or not minimum <= value <= maximum:
+        raise _invalid(f"Canvas record {name} must be an integer from {minimum} to {maximum}")
     return int(value)
 
 
@@ -117,6 +128,21 @@ def _text_length(payload: dict[str, Any]) -> int | None:
     return length
 
 
+def _display_summary(payload: dict[str, Any]) -> dict[str, Any]:
+    """The preset and the size and density read back after it.
+
+    The numbers are optional, so a restore whose read-back failed still leaves
+    its record, but a size is never journaled with only one side.
+    """
+    summary = {"preset": _choice(payload, "preset", DISPLAY_PRESETS),
+               "width": _integer(payload, "width", MAX_DISPLAY_SIDE, minimum=1),
+               "height": _integer(payload, "height", MAX_DISPLAY_SIDE, minimum=1),
+               "density": _integer(payload, "density", MAX_DENSITY, minimum=1)}
+    if (summary["width"] is None) != (summary["height"] is None):
+        raise _invalid("Canvas record width and height must be given together")
+    return summary
+
+
 def record_summary(kind: str, payload: dict[str, Any]) -> dict[str, Any]:
     """The journaled fields of one completed action, rebuilt from an allowlist.
 
@@ -152,6 +178,8 @@ def record_summary(kind: str, payload: dict[str, Any]) -> dict[str, Any]:
         summary = {"text_len": _text_length(payload)}
     elif kind == "system":
         summary = {"op": _choice(payload, "op", SYSTEM_OPS)}
+    elif kind == "display":
+        summary = _display_summary(payload)
     else:
         summary = {"mode": _choice(payload, "mode", CONTROL_MODES)}
         if payload.get("owner") is not None:
@@ -169,8 +197,9 @@ def record_completed(record: dict[str, Any] | None, origin: str,
     if kind not in RECORD_KINDS:
         raise _invalid(f"unsupported Canvas record kind {kind!r}; "
                        f"expected one of: {', '.join(RECORD_KINDS)}")
+    transports = DISPLAY_TRANSPORTS if kind == "display" else RECORD_TRANSPORTS
     transport = payload.get("transport", RECORD_TRANSPORTS[0])
-    if transport not in RECORD_TRANSPORTS:
+    if transport not in transports:
         raise _invalid(f"unsupported Canvas record transport {transport!r}")
     detail_payload = {"kind": kind, "origin": origin, "canvas": True,
                       "transport": transport, **record_summary(kind, payload)}
