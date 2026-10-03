@@ -158,6 +158,9 @@ const DISPLAY_PRESETS = Object.freeze([
   { id: "default", label: "Device default" },
 ].map((preset) => Object.freeze(preset)));
 const DISPLAY_PRESET_IDS = Object.freeze(DISPLAY_PRESETS.map((preset) => preset.id));
+// The presets as every state message carries them, serialized once: a flood of handoff
+// changes sends one state message per change to every client.
+const DISPLAY_PRESETS_JSON = JSON.stringify(DISPLAY_PRESETS);
 // Each `wm` call; the stop-time restore runs inside SHUTDOWN_STOP_MS as a whole.
 const WM_TIMEOUT_MS = 5000;
 // /status and the state message show a `wm` reading at most this old (DISPLAY-001). Pages
@@ -1065,7 +1068,7 @@ function encodeVideoPacket({ keyFrame, pts, data }) {
 }
 
 function stateMessage(context) {
-  return JSON.stringify({
+  const fields = JSON.stringify({
     t: "state",
     owner: context.state.controlOwner,
     paused: context.state.inputPaused,
@@ -1076,8 +1079,9 @@ function stateMessage(context) {
     session: context.session?.state ?? "idle",
     // Only Android has this transport, so state messages show the display preset.
     ...stateDisplay(context),
-    presets: DISPLAY_PRESETS,
   });
+  // `presets` stays the last field, so the text is what serializing it in place gives.
+  return `${fields.slice(0, -1)},"presets":${DISPLAY_PRESETS_JSON}}`;
 }
 
 /**
