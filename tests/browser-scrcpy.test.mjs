@@ -3337,7 +3337,14 @@ test("journal flood: 100k control messages against a journal that stops answerin
   await waitFor(() => lastState?.paused === false, 5000, "the flooding client's current state");
   for (const ws of [deaf, blind]) {
     ws.socket.resume();
-    await quiet(ws);
+    // The current state follows once the backlog has drained, and on a busy machine Canvas
+    // may still be working through the flood then: a client that went quiet on an old
+    // state gets more time, and one that never catches up still fails below.
+    const caughtUp = async () => {
+      await quiet(ws);
+      return ws.json("state").at(-1).paused === false;
+    };
+    await waitFor(caughtUp, 10_000, "the current state").catch(() => {});
     assert.equal(ws.json("state").at(-1).paused, false, "a client that fell behind missed the current state");
   }
   t.diagnostic(`clients got ${control.count("state")}, ${deaf.json("state").length} and ` +
