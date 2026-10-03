@@ -7,6 +7,13 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
 
 ## [Unreleased]
 
+## [0.31.1] - 2026-10-03
+
+### Fixed
+- Declare the compact app-and-orbit PNG as the plugin's directory icon so it
+  appears on the first public listing submission.
+- Add documentation, support, and privacy links to the directory manifest.
+
 ## [0.31.0] - 2026-10-03
 
 Deterministic capture state and a repair hand-off, borrowed from
