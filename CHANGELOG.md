@@ -7,6 +7,31 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
 
 ## [Unreleased]
 
+### Added
+- **Mobile Canvas display presets (Android)** — the Canvas switches its
+  target's screen size and density live, with `wm size` and `wm density` on
+  its own serial, while the emulator, the Canvas, its device server and open
+  pages keep running: `small` (Small phone, 720x1280 @ 320), `pixel-11`
+  (Pixel 11, 1080x2424 @ 420), `pixel-fold` (Pixel Fold open, 2208x1840 @
+  420), `tablet` (Tablet, 2560x1600 @ 320) and `default` (the device's own).
+  A person picks one from the Size menu in the page toolbar; an agent sends
+  `{"t":"display","preset":...}` on `/ws/control` or `POST /display`, under
+  the same authentication and handoff rules as input. An unknown preset, iOS,
+  a paused Canvas or another owner is refused without running any `wm`
+  command; changes run one at a time, a newer waiting request supersedes the
+  older one, and held fingers and keys are lifted first. scrcpy follows the
+  new size without a restart, screenrecord restarts its capture. `/status`
+  `display` and the `state` message gain `preset`, `density` and `presets`,
+  read from the device at most every 2 s; each change is one `ui display`
+  journal record. When it stops on SIGINT, SIGTERM or SIGHUP, the Canvas puts
+  back the size and density it found before its first change (a Canvas killed
+  with SIGKILL cannot; the skill gives the `wm size reset` / `wm density
+  reset` commands). The page itself is rebuilt to an Apple-style layout: a
+  slim toolbar, the device in a frame that follows the video, a floating pill
+  of device buttons and an inspector, light and dark themes, and a phone
+  layout with 44 px targets; element ids and `window.autonomCanvas` are kept.
+  Compatibility notes are in `docs/COMPATIBILITY.md`.
+
 ## [0.31.2] - 2026-10-03
 
 ### Fixed

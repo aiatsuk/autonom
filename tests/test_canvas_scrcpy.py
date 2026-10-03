@@ -1,5 +1,6 @@
-"""Mobile Canvas scrcpy: the bridge `record` op, `canvas serve` flags, and the
-optional scrcpy in doctor and bootstrap (CANVAS-009, CANVAS-013).
+"""Mobile Canvas scrcpy: the bridge `record` op, including display changes,
+`canvas serve` flags, and the optional scrcpy in doctor and bootstrap
+(CANVAS-009, CANVAS-013, DISPLAY-006).
 
 Fakes only. The device tool handed to the bridge and the CLI is a sentinel
 that logs any call, `node`, `scrcpy`, `uname`, `brew`, `sudo` and `apt-get`
@@ -76,6 +77,10 @@ def hermetic_env(home: Path, path: str) -> dict[str, str]:
 
 GESTURE = {"kind": "gesture", "transport": "scrcpy", "pointers": 1, "moves": 40,
            "duration_ms": 812.4, "start": [100, 900], "end": [110.4, 300]}
+DISPLAY = {"kind": "display", "transport": "scrcpy", "preset": "tablet",
+           "width": 2560, "height": 1600, "density": 320}
+DISPLAY_FIELDS = {"kind", "origin", "canvas", "transport", "preset", "width", "height",
+                  "density"}
 ONE_OF_EACH = [
     (GESTURE, "human"),
     ({"kind": "scroll", "transport": "scrcpy", "events": 12, "dx": 0, "dy": -48.5}, "human"),
@@ -84,6 +89,7 @@ ONE_OF_EACH = [
     ({"kind": "paste", "transport": "scrcpy", "text_len": 21}, "human"),
     ({"kind": "system", "transport": "scrcpy", "op": "app-switch"}, "system"),
     ({"kind": "control", "transport": "scrcpy", "mode": "takeover", "owner": "agent"}, "agent"),
+    (DISPLAY, "human"),
 ]
 
 
@@ -150,7 +156,8 @@ class BridgeRecordTests(EnvSandboxMixin, unittest.TestCase):
         entries = self.journal()
         self.assertEqual([(entry["verb"], entry["origin"]) for entry in entries],
                          [(f"ui {payload['kind']}", origin) for payload, origin in ONE_OF_EACH])
-        self.assertEqual([entry["seq"] for entry in entries], list(range(1, 8)))
+        self.assertEqual([entry["seq"] for entry in entries],
+                         list(range(1, len(ONE_OF_EACH) + 1)))
         details = self.details()
         self.assertEqual([detail["kind"] for detail in details], list(bridge.RECORD_KINDS))
         self.assertTrue(all(detail["transport"] == "scrcpy" for detail in details))
@@ -162,6 +169,9 @@ class BridgeRecordTests(EnvSandboxMixin, unittest.TestCase):
         self.assertEqual(by_kind["system"]["op"], "app-switch")
         self.assertEqual((by_kind["control"]["mode"], by_kind["control"]["owner"]),
                          ("takeover", "agent"))
+        self.assertEqual({key: by_kind["display"][key] for key in
+                          ("preset", "width", "height", "density")},
+                         {"preset": "tablet", "width": 2560, "height": 1600, "density": 320})
 
     def test_transport_defaults_to_scrcpy_and_key_numbers_are_kept(self) -> None:
         self.send({"kind": "key", "key": 66}, "agent")
@@ -232,9 +242,10 @@ class BridgeRecordTests(EnvSandboxMixin, unittest.TestCase):
         self.assertEqual(self.details(), [])
 
     def test_origin_is_still_required(self) -> None:
-        for origin in ("admin", "", None):
-            with self.subTest(origin=origin):
-                self.assert_refused(GESTURE, origin)
+        for payload in (GESTURE, DISPLAY):
+            for origin in ("admin", "", None, "Human"):
+                with self.subTest(kind=payload["kind"], origin=origin):
+                    self.assert_refused(payload, origin)
         self.assertEqual(self.journal(), [])
 
     def test_without_a_session_record_still_answers(self) -> None:
@@ -242,12 +253,132 @@ class BridgeRecordTests(EnvSandboxMixin, unittest.TestCase):
         self.assertEqual(self.send(GESTURE), {"ok": True, "recorded": "gesture",
                                               "via": "scrcpy"})
 
+    # --- DISPLAY-006: `ui display` records --------------------------------------------
+
+    def test_a_display_change_is_one_entry_with_its_preset_and_size(self) -> None:
+        result = self.send(DISPLAY)
+        self.assertEqual(result, {"ok": True, "recorded": "display", "via": "scrcpy",
+                                  "detail": "actions/0001_canvas-display.json"})
+        (entry,) = self.journal()
+        self.assertEqual(
+            {key: entry[key] for key in ("kind", "verb", "argv", "origin", "ok", "result")},
+            {"kind": "action", "verb": "ui display", "argv": ["ui", "display", "<canvas>"],
+             "origin": "human", "ok": True,
+             "result": {"via": "scrcpy", "detail": "actions/0001_canvas-display.json"}})
+        self.assertEqual(self.details(), [{
+            "kind": "display", "origin": "human", "canvas": True, "transport": "scrcpy",
+            "preset": "tablet", "width": 2560, "height": 1600, "density": 320}])
+
+    def test_two_changes_are_exactly_two_entries_with_their_presets_and_sizes(self) -> None:
+        """DISPLAY-006-S01: the owner applies `small`, then `tablet`."""
+        self.send({**DISPLAY, "preset": "small", "width": 720, "height": 1280,
+                   "density": 320})
+        self.send(DISPLAY)
+        self.assertEqual([entry["verb"] for entry in self.journal()],
+                         ["ui display", "ui display"])
+        self.assertEqual([(detail["preset"], detail["width"], detail["height"],
+                           detail["density"]) for detail in self.details()],
+                         [("small", 720, 1280, 320), ("tablet", 2560, 1600, 320)])
+
+    def test_the_stop_time_restore_is_one_system_entry(self) -> None:
+        self.send({**DISPLAY, "preset": "restore", "width": 1080, "height": 2400,
+                   "density": 420}, "system")
+        (entry,) = self.journal()
+        self.assertEqual((entry["verb"], entry["origin"]), ("ui display", "system"))
+        (detail,) = self.details()
+        self.assertEqual((detail["preset"], detail["origin"], detail["width"],
+                          detail["height"], detail["density"]),
+                         ("restore", "system", 1080, 2400, 420))
+
+    def test_every_preset_transport_and_origin_is_accepted(self) -> None:
+        sent = [(preset, transport, origin)
+                for preset in bridge.DISPLAY_PRESETS
+                for transport in ("scrcpy", "screenrecord", "screencap")
+                for origin in bridge.ORIGINS]
+        for preset, transport, origin in sent:
+            with self.subTest(preset=preset, transport=transport, origin=origin):
+                result = self.send({**DISPLAY, "preset": preset, "transport": transport},
+                                   origin)
+                self.assertEqual((result["recorded"], result["via"]), ("display", transport))
+        self.assertEqual(bridge.DISPLAY_PRESETS,
+                         ("small", "pixel-11", "pixel-fold", "tablet", "default", "restore"))
+        self.assertEqual([(entry["verb"], entry["origin"]) for entry in self.journal()],
+                         [("ui display", origin) for _preset, _transport, origin in sent])
+        self.assertEqual([(detail["preset"], detail["transport"], detail["origin"])
+                          for detail in self.details()], sent)
+
+    def test_a_display_record_without_a_transport_names_scrcpy(self) -> None:
+        payload = {key: value for key, value in DISPLAY.items() if key != "transport"}
+        self.assertEqual(self.send(payload, "agent")["via"], "scrcpy")
+        (detail,) = self.details()
+        self.assertEqual(detail["transport"], "scrcpy")
+
+    def test_display_sizes_at_the_bounds_are_kept(self) -> None:
+        self.send({**DISPLAY, "width": 1, "height": 10_000, "density": 1})
+        self.send({**DISPLAY, "width": 10_000, "height": 1, "density": 1_000})
+        self.send({**DISPLAY, "width": 2560.0, "height": 1600.0, "density": 320.0})
+        self.assertEqual([(detail["width"], detail["height"], detail["density"])
+                          for detail in self.details()],
+                         [(1, 10_000, 1), (10_000, 1, 1_000), (2560, 1600, 320)])
+        self.assertTrue(all(type(detail[name]) is int for detail in self.details()
+                            for name in ("width", "height", "density")))
+
+    def test_a_display_record_without_a_read_back_keeps_only_its_preset(self) -> None:
+        """A restore whose read-back failed still leaves its record."""
+        self.send({"kind": "display", "preset": "restore"}, "system")
+        self.send({"kind": "display", "preset": "default", "density": 420})
+        restore, default = self.details()
+        self.assertEqual(set(restore), DISPLAY_FIELDS - {"width", "height", "density"})
+        self.assertEqual(set(default), DISPLAY_FIELDS - {"width", "height"})
+        self.assertEqual(len(self.journal()), 2)
+
+    def test_display_fields_outside_the_allowlist_are_dropped(self) -> None:
+        self.send({**DISPLAY, "label": "Tablet", "text": SECRET, "serial": SECRET,
+                   "command": f"wm size 2560x1600 {SECRET}", "physical": [1080, 2400],
+                   "override": {"size": SECRET}})
+        (detail,) = self.details()
+        self.assertEqual(set(detail), DISPLAY_FIELDS)
+        self.assertNotIn(SECRET, self.everything_written())
+
+    def test_malformed_display_records_are_refused_without_an_entry(self) -> None:
+        bad = [{"kind": "display"},
+               {**DISPLAY, "preset": None}]
+        bad += [{**DISPLAY, "preset": preset} for preset in (
+            "huge", "", "Tablet", "TABLET", "pixel_11", "pixel11", "custom", "null", 3,
+            True, ["tablet"], {"id": "tablet"})]
+        for name, maximum in (("width", 10_000), ("height", 10_000), ("density", 1_000)):
+            bad += [{**DISPLAY, name: value} for value in (
+                0, -1, maximum + 1, 2.5, str(maximum), True, False, float("nan"),
+                float("inf"), [maximum], {"value": maximum})]
+        bad += [{key: value for key, value in DISPLAY.items() if key != "height"},
+                {key: value for key, value in DISPLAY.items() if key != "width"},
+                {**DISPLAY, "height": None},
+                {**DISPLAY, "width": None}]
+        bad += [{**DISPLAY, "transport": transport} for transport in (
+            "webrtc", "mjpeg", "", None, "SCRCPY", 0, ["scrcpy"])]
+        for payload in bad:
+            with self.subTest(payload=payload):
+                self.assert_refused(payload)
+        self.assertEqual(self.journal(), [])
+        self.assertEqual(self.details(), [])
+
+    def test_other_kinds_still_name_only_the_scrcpy_transport(self) -> None:
+        """Only a display change happens on the multipart transports too."""
+        for transport in ("screenrecord", "screencap"):
+            for payload, origin in ONE_OF_EACH:
+                if payload["kind"] == "display":
+                    continue
+                with self.subTest(kind=payload["kind"], transport=transport):
+                    self.assert_refused({**payload, "transport": transport}, origin)
+        self.assertEqual(self.journal(), [])
+
 
 OTHER_SERIAL = "fake-other-serial"
-# Every bridge op that journals: the scrcpy `record` and the four the bridge
-# actuates itself, each with the journal verb it writes.
+# Every bridge op that journals: the `record` op (a scrcpy gesture and a display
+# change) and the four the bridge actuates itself, each with the journal verb it writes.
 JOURNALED_OPS = [
     ("record", GESTURE, "ui gesture"),
+    ("record", {**DISPLAY, "transport": "screencap"}, "ui display"),
     ("tap", {"x": 10, "y": 20}, "ui tap"),
     ("swipe", {"x1": 1, "y1": 2, "x2": 3, "y2": 4, "duration": 300}, "ui swipe"),
     ("key", {"key": "KEYCODE_BACK"}, "ui key"),
@@ -359,6 +490,10 @@ class BridgeProcessTests(EnvSandboxMixin, unittest.TestCase):
              "payload": {"kind": "paste", "transport": "scrcpy", "text": SECRET}},
             {"id": 3, "op": "record", "origin": "agent",
              "payload": {"kind": "tap", "transport": "scrcpy"}},
+            {"id": 4, "op": "record", "origin": "system",
+             "payload": {**DISPLAY, "preset": "restore", "transport": "screenrecord"}},
+            {"id": 5, "op": "record", "origin": "agent",
+             "payload": {**DISPLAY, "preset": "huge"}},
         ]
         completed = subprocess.run(
             [sys.executable, str(BRIDGE), "--platform", "android", "--target", SERIAL,
@@ -369,15 +504,22 @@ class BridgeProcessTests(EnvSandboxMixin, unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr)
         replies = {reply["id"]: reply for reply in map(json.loads,
                                                        completed.stdout.splitlines())}
-        self.assertEqual(sorted(replies), [1, 2, 3])
-        self.assertTrue(replies[1]["ok"] and replies[2]["ok"])
+        self.assertEqual(sorted(replies), [1, 2, 3, 4, 5])
+        self.assertTrue(replies[1]["ok"] and replies[2]["ok"] and replies[4]["ok"])
         self.assertEqual(replies[1]["result"]["recorded"], "gesture")
-        self.assertEqual((replies[3]["ok"], replies[3]["error_code"]),
-                         (False, errors.FLOW_COMMAND_INVALID))
+        self.assertEqual((replies[4]["result"]["recorded"], replies[4]["result"]["via"]),
+                         ("display", "screenrecord"))
+        for refused in (3, 5):
+            self.assertEqual((replies[refused]["ok"], replies[refused]["error_code"]),
+                             (False, errors.FLOW_COMMAND_INVALID))
+        self.assertIn("small, pixel-11, pixel-fold, tablet, default, restore",
+                      replies[5]["error"])
         self.assertFalse(trace.exists(), "the record op reached the device tool")
         journal = Path(record["artifacts_dir"]) / "journal.ndjson"
         lines = [json.loads(line) for line in journal.read_text(encoding="utf-8").splitlines()]
-        self.assertEqual([line["verb"] for line in lines], ["ui gesture", "ui paste"])
+        self.assertEqual([(line["verb"], line["origin"]) for line in lines],
+                         [("ui gesture", "human"), ("ui paste", "human"),
+                          ("ui display", "system")])
         written = "".join(path.read_text(encoding="utf-8")
                           for path in Path(record["artifacts_dir"]).rglob("*.json*"))
         self.assertNotIn(SECRET, written + completed.stdout)

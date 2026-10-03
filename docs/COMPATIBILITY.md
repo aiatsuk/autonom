@@ -249,6 +249,29 @@ lifts the pointers and keys of WebSocket connections it refuses. `/text`
 keeps its conservative ASCII rule; Unicode text exists only on the scrcpy
 transport, where it replaces the device clipboard.
 
+### Mobile Canvas display presets (unreleased)
+
+Additive. No `error_code`, CLI verb or flag is added, and a Canvas that never
+changes the display runs no `wm` command and behaves as before.
+
+| Surface | Before | Now |
+| --- | --- | --- |
+| `POST /display` | 404 | `{"preset": "small" \| "pixel-11" \| "pixel-fold" \| "tablet" \| "default"}`, under the token or cookie plus `X-Autonom-CSRF`, `Host` and handoff rules of `/tap`. 200 `{"ok": true, "display": {"preset", "width", "height", "density"}}` once the change reads back; 400 for an unknown preset (naming the valid ids) or on iOS (`Display presets are Android-only`); 409 when paused, owned by another origin, or replaced by a newer request (`superseded: true`); 502 when a `wm` command fails or the read-back differs (naming the command and the values in effect); 503 while the Canvas stops. A refused request runs no `wm` command |
+| `POST /tap`, `POST /swipe` | `x`, `y` (`x1`, `y1`, `x2`, `y2`, `duration`) in display pixels | additive optional `dw`, `dh`: the display size the points were computed for. When both are given and differ from the size read back when the input's turn comes, the points are scaled to that size, so a page that has not yet polled a display change made elsewhere still taps where it shows; the page sends them once it knows the size. 400 (`dw and dh must both be integers from 1 to 10000`) with no device action when only one is given or either is not such an integer. Requests without them, as agents send, behave as before |
+| `/ws/control` | `{"t": "display"}` refused as an unknown message type | `{"t": "display", "preset": ...}` accepted under the handoff rules; replies `{"t": "display", "ok": true, "display": {...}}`, or `error` with `for: "display"` (and `superseded: true` for a replaced request) |
+| `/status` `display` (Android) | `width`, `height` from the action bridge | `width`, `height` and the additive `density` from `wm size` / `wm density`, read at most every 2 s (the bridge's size when `wm` cannot be read); additive `preset` (a preset id, `default`, or null for an override the Canvas did not make) and `presets` (`id`, `label`, `width`, `height`, `density`; `default` has no numbers). iOS unchanged |
+| `state` message | — | additive `presets`, and `preset` and `density` from a reading at most 2 s old |
+| `window.autonomCanvas.stats()` | — | additive `display` (`preset`, `density`, `picker`, `pickerDisabled`) |
+| Journal | — | adds the verb `ui display` (argv `ui display <canvas>`, a `canvas-display` action detail) with `preset` (a preset id, or `restore` for the stop-time restore by `system`), `width`, `height`, `density`, origin and `transport` (`scrcpy`, `screenrecord` or `screencap`). The bridge allowlist grows by this kind only |
+| Canvas stdout | — | `Display: <preset> <W>x<H> @ <density>` per change; `Display restored: <W>x<H> @ <density>` or `Display restore failed: ...` at stop |
+| Canvas stop (SIGINT, SIGTERM, SIGHUP) | ends the device server and its `adb forward` | also puts back the size and density overrides found before the first display change, within the 3 s shutdown budget; nothing when the Canvas made no change |
+| The page | one side panel of text buttons | rebuilt: toolbar with the Android Size menu, device frame, a pill of icon buttons, an inspector, light and dark themes. Every control stays reachable, several under a new name: Apps is Recent apps, Vol − and Vol + are Volume down and Volume up, Wake is Wake screen, Alerts is Notifications, Quick is Quick settings, Collapse is Collapse panels, Clipboard is Copy device clipboard, Type text is Send, and the ↑ ↓ ← → text buttons are icon-only buttons named Up, Down, Left and Right. Back, Home, Recent apps, Rotate, Volume down, Volume up and Power (the pill) and Delete (Keys) are icon-only buttons named by `aria-label` and tooltip; Enter keeps its text; Reconnect stream moves under Stream in the inspector. Take control and Pause input buttons are new, and the ids `video`, `screen`, `status`, `text`, `clipboard`, `device`, `refresh`, `window.autonomCanvas` and its `stats()` / `send()` keep their meaning; the status text now sits in the collapsed Diagnostics panel |
+
+A Canvas killed with SIGKILL leaves the preset on the device until
+`adb -s <serial> shell wm size reset` and `wm density reset`; a second Canvas
+on the same device takes the first one's preset as its original. Both are
+documented in the `android-emulator-browser` skill.
+
 ## Exit codes and streams
 
 - `0` success · `2` expected failure (`AutonomError` as one JSON object on

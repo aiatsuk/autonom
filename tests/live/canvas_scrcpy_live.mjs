@@ -5,7 +5,8 @@
  * Not part of `node --test tests/*.test.mjs`: every case pushes and runs
  * scrcpy-server on the one explicit --serial, injects input there and drives a
  * headless browser through brow. Use a test emulator only. Device settings the
- * cases touch (show_touches, auto-rotate, rotation) are restored before they finish.
+ * cases touch (show_touches, auto-rotate, rotation, display size and density) are
+ * restored before they finish.
  *
  * Every run gets its own temporary AUTONOM_HOME under the OS temp directory, handed to
  * the Canvas (and so to its journal bridge) and to every Autonom CLI call, so a case can
@@ -18,7 +19,7 @@
  *
  * Without --scrcpy-server the Canvas finds the server itself (AUTONOM_SCRCPY_SERVER,
  * SCRCPY_SERVER_PATH, then an installed scrcpy), and the report records which source
- * it used. Cases: picture, bench, tabs, restart, input, journal. Each writes
+ * it used. Cases: picture, bench, tabs, restart, input, journal, display. Each writes
  * <evidence-dir>/<case>.json (--out is another name for --evidence-dir), with the steps
  * done so far also when the case fails midway, and exits non-zero when its oracle fails.
  */
@@ -32,7 +33,7 @@ import { parseArgs as parseCliArgs } from "node:util";
 const ROOT = resolve(import.meta.dirname, "../..");
 const CANVAS = join(ROOT, "plugins/autonom/skills/android-emulator-browser/scripts/android-emulator-browser.mjs");
 const AUTONOM = join(ROOT, "scripts/autonom.py");
-const CASES = ["picture", "bench", "tabs", "restart", "input", "journal"];
+const CASES = ["picture", "bench", "tabs", "restart", "input", "journal", "display"];
 const SERVER_CLASS = "com.genymobile.scrcpy.Server";
 // The scrcpy server itself; `sh -c CLASSPATH=... app_process ...` is only its launcher.
 const SERVER_COMMAND = /^(?:\S*\/)?app_process/;
@@ -86,6 +87,27 @@ const LAYOUT_KEYS = [
 const LAYOUT_TEXT = "\u0439\u0446azq@\u00e9";
 // The input dispatcher's line for a display without any finger down.
 const NO_TOUCH = "TouchStatesByDisplay: <no displays touched>";
+// The display case: the Size picker's presets in page order, with the values each one
+// must read back as (DISPLAY-001); `default` reads back as the physical display.
+const DISPLAY_PRESETS = [
+  { id: "small", width: 720, height: 1280, density: 320 },
+  { id: "pixel-11", width: 1080, height: 2424, density: 420 },
+  { id: "pixel-fold", width: 2208, height: 1840, density: 420 },
+  { id: "tablet", width: 2560, height: 1600, density: 320 },
+  { id: "default" },
+];
+// The override a second Canvas finds already set, and must put back at its stop.
+const PREEXISTING_DISPLAY = { size: "1600x2560", density: 300 };
+// scrcpy scales the video to max_size and rounds each side to a multiple of 8, so the
+// page's aspect ratio may differ from the preset's by this share.
+const ASPECT_TOLERANCE = 0.02;
+const DISPLAY_CHANGE_MS = 15_000;
+// Android crossfades the old and the new picture for a moment after the size changes. A
+// preset's screenshot waits until its size has been in effect this long and the page has
+// drawn this many frames since, so it shows a settled frame.
+const DISPLAY_SETTLE_MS = 1500;
+const DISPLAY_SETTLE_FRAMES = 3;
+const DISPLAY_SETTLE_WAIT_MS = 10_000;
 
 const { values: args } = parseCliArgs({
   options: {
@@ -298,6 +320,15 @@ async function startCanvas(transport, extraEnv = {}, { unsetEnv = [] } = {}) {
       });
       return await response.json();
     },
+    async display(preset, origin_ = "agent") {
+      const response = await fetch(`${origin}/display`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json",
+          "X-Autonom-Origin": origin_ },
+        body: JSON.stringify({ preset }),
+      });
+      return { status: response.status, body: await response.json() };
+    },
     async stop() {
       if (child.exitCode !== null) return child.exitCode;
       child.kill("SIGTERM");
@@ -496,7 +527,7 @@ async function benchTransport(transport, repeat, drags, into) {
       await sleep(1500);
       const status = await canvas.status();
       // The screencap path takes HTTP swipes in display pixels.
-      if (!status.display) throw new Error("the Canvas does not know the display size");
+      if (!status.display?.width) throw new Error("the Canvas does not know the display size");
       const expression = benchExpression(transport, drags, canvas.token, status.display);
       const cpuBefore = await cpuSeconds(canvas.child.pid);
       const framesBefore = transport === "scrcpy" ? (await stats(session)).framesRendered : status.frames_sent;
@@ -763,6 +794,59 @@ const cases = {
     }
   },
 
+  /**
+   * VER-005: every preset through the page's Size picker, one through POST /display, a
+   * refused request during an agent takeover, the restore at SIGTERM, and a second Canvas
+   * that finds an override already set and puts it back. The device server must keep
+   * running throughout (DISPLAY-002). The device's own values are read first and put back
+   * in the finally block whatever happens.
+   */
+  async display(report) {
+    const session = `${args.session}-display`;
+    const original = (report.original = await readDisplay());
+    if (!original) throw new Error("wm did not report the display size and density");
+    const steps = (report.steps = {});
+    try {
+      const canvas = await startCanvas("scrcpy");
+      try {
+        await openPage(session, canvas);
+        const presets = (steps.presets = []);
+        for (const preset of DISPLAY_PRESETS) {
+          const step = { preset: preset.id };
+          presets.push(step);
+          await displayThroughPicker(session, preset, original, step);
+        }
+        const http = await canvas.display("pixel-11");
+        const afterHttp = await readDisplay();
+        steps.http = {
+          status: http.status, body: http.body, wm: briefDisplay(afterHttp),
+          ok: http.status === 200 && http.body.display?.preset === "pixel-11" &&
+            showsValues(afterHttp, DISPLAY_PRESETS[1]),
+        };
+        steps.refused = await refusedDisplayStep(session, canvas);
+        const status = await canvas.status();
+        steps.status = status.display;
+        steps.server_restarts = status.scrcpy?.restarts ?? null;
+      } finally {
+        await brow(session, ["close"]).catch(() => {});
+        const exit = await canvas.stop();
+        const stopped = await readDisplay();
+        steps.stop = {
+          exit, line: canvas.output().match(/Display restore[^\n]*/)?.[0] ?? null, wm: briefDisplay(stopped),
+          ok: exit === 0 && sameOverrides(stopped, original),
+        };
+      }
+      steps.preexisting = await preexistingDisplayStep(original);
+      report.ok = steps.presets.length === DISPLAY_PRESETS.length && steps.presets.every((step) => step.ok) &&
+        steps.http.ok && steps.refused.ok && steps.server_restarts === 0 && steps.stop.ok &&
+        steps.preexisting.ok;
+    } finally {
+      const restored = await putDisplayBack(original);
+      report.restored = { wm: briefDisplay(restored), ok: sameOverrides(restored, original) };
+      if (!report.restored.ok) report.ok = false;
+    }
+  },
+
   async bench(report) {
     const repeat = (report.repeat = Number(args.repeat));
     const drags = (report.drags = Number(args.drags));
@@ -836,6 +920,172 @@ async function rotateStep(step) {
     await restoreSetting("accelerometer_rotation", rotation.accelerometer);
     await restoreSetting("user_rotation", rotation.user);
   }
+}
+
+/**
+ * The serial's `wm size` and `wm density`: the overrides (null for none), the physical
+ * values and those in effect, with the raw text. Null when wm reports no physical display.
+ */
+async function readDisplay() {
+  const sizeText = await shell("wm size");
+  const densityText = await shell("wm density");
+  const physical = sizeText.match(/Physical size: (\d+)x(\d+)/);
+  const override = sizeText.match(/Override size: (\d+)x(\d+)/);
+  const physicalDensity = densityText.match(/Physical density: (\d+)/);
+  const overrideDensity = densityText.match(/Override density: (\d+)/);
+  if (!physical || !physicalDensity) return null;
+  const size = override ?? physical;
+  return {
+    text: { size: sizeText, density: densityText },
+    size_override: override ? `${override[1]}x${override[2]}` : null,
+    density_override: overrideDensity ? Number(overrideDensity[1]) : null,
+    physical: { width: Number(physical[1]), height: Number(physical[2]), density: Number(physicalDensity[1]) },
+    width: Number(size[1]),
+    height: Number(size[2]),
+    density: Number((overrideDensity ?? physicalDensity)[1]),
+  };
+}
+
+function briefDisplay(wm) {
+  return wm && { width: wm.width, height: wm.height, density: wm.density,
+    size_override: wm.size_override, density_override: wm.density_override };
+}
+
+/** Whether the values in effect are `expected`'s width, height and density. */
+function showsValues(wm, expected) {
+  return Boolean(wm) && wm.width === expected.width && wm.height === expected.height &&
+    wm.density === expected.density;
+}
+
+function sameOverrides(wm, original) {
+  return Boolean(wm) && wm.size_override === original.size_override &&
+    wm.density_override === original.density_override;
+}
+
+/** Put the display back as `original` had it: its overrides, or none. Never throws. */
+async function putDisplayBack(original) {
+  if (!original) return null;
+  try {
+    await shell(original.size_override ? `wm size ${original.size_override}` : "wm size reset");
+    await shell(original.density_override ? `wm density ${original.density_override}` : "wm density reset");
+    return await readDisplay();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Choose `preset` in the page's Size picker as a person would (a select, or a menu button
+ * whose options carry data-preset), then check the picker, the device's read-back and the
+ * page's video aspect, and keep a screenshot.
+ */
+async function displayThroughPicker(session, preset, original, step) {
+  const expected = preset.width ? preset : original.physical;
+  const before = await stats(session);
+  step.choose = await pageJson(session, `(() => {
+    const id = ${JSON.stringify(preset.id)};
+    const picker = document.getElementById("display-preset");
+    if (!picker || picker.disabled) return JSON.stringify({ chosen: false, disabled: picker ? picker.disabled : null });
+    if (picker.tagName === "SELECT") {
+      picker.value = id;
+      picker.dispatchEvent(new Event("change", { bubbles: true }));
+      return JSON.stringify({ chosen: picker.value === id, via: "select" });
+    }
+    picker.click();
+    const option = [...document.querySelectorAll("[data-preset]")].find((item) => item.dataset.preset === id);
+    if (!option) return JSON.stringify({ chosen: false, via: "menu", missing: id });
+    option.click();
+    return JSON.stringify({ chosen: true, via: "menu" });
+  })()`);
+  const shown = await waitFor(async () => {
+    const value = await stats(session);
+    return value.display?.preset === preset.id && value.display.picker === preset.id &&
+      value.display.pickerDisabled === false ? value : null;
+  }, DISPLAY_CHANGE_MS, `the page to show ${preset.id} selected`);
+  step.picker = shown.display;
+  const wm = await readDisplay();
+  step.wm = briefDisplay(wm);
+  step.wm_text = wm?.text ?? null;
+  const aspect = expected.width / expected.height;
+  const video = await waitFor(async () => {
+    const value = await stats(session);
+    return value.width && value.height &&
+      Math.abs(value.width / value.height - aspect) <= aspect * ASPECT_TOLERANCE ? value : null;
+  }, DISPLAY_CHANGE_MS, `the page video at the ${preset.id} aspect`).catch(() => null);
+  step.video = video ? [video.width, video.height] : null;
+  step.video_before = [before.width, before.height];
+  // A settled frame at the new size before the screenshot: the size has been in effect for
+  // DISPLAY_SETTLE_MS, and DISPLAY_SETTLE_FRAMES frames were drawn since (each nudge asks
+  // the device for a key frame, as a still screen sends none).
+  const sizedAt = Date.now();
+  const rendered = video?.framesRendered ?? 0;
+  await sleep(DISPLAY_SETTLE_MS);
+  const settled = await waitFor(async () => {
+    const value = await stats(session);
+    if (value.framesRendered - rendered >= DISPLAY_SETTLE_FRAMES) return value;
+    await nudge(session).catch(() => {});
+    return null;
+  }, DISPLAY_SETTLE_WAIT_MS, `${DISPLAY_SETTLE_FRAMES} frames at the ${preset.id} size`).catch(() => null);
+  step.settle = { ms: Date.now() - sizedAt, frames: settled ? settled.framesRendered - rendered : null };
+  step.screenshot = join(outDir, `display-${preset.id}.png`);
+  await brow(session, ["screenshot", "-o", step.screenshot]);
+  const noOverride = !wm?.size_override && !wm?.density_override;
+  step.ok = step.choose.chosen === true && showsValues(wm, expected) && Boolean(video) &&
+    (preset.width ? true : noOverride);
+}
+
+/** During an agent takeover the page's request changes nothing and is refused. */
+async function refusedDisplayStep(session, canvas) {
+  const step = {};
+  await canvas.control("takeover", "agent");
+  try {
+    const owned = await waitFor(async () => {
+      const value = await stats(session);
+      return value.owner === "agent" && value.display?.pickerDisabled === true ? value : null;
+    }, 5000, "the page to see the agent's control");
+    step.picker_disabled = owned.display.pickerDisabled;
+    const before = await readDisplay();
+    step.sent = await send(session, [{ t: "display", preset: "tablet" }]);
+    await sleep(1500);
+    const after = await readDisplay();
+    step.note = (await stats(session)).note;
+    step.before = briefDisplay(before);
+    step.after = briefDisplay(after);
+    step.ok = step.picker_disabled === true && /owned by agent/.test(step.note ?? "") &&
+      JSON.stringify(step.before) === JSON.stringify(step.after);
+  } finally {
+    await canvas.control("release", "agent");
+  }
+  return step;
+}
+
+/**
+ * A second Canvas starts while the device already has an override (fault injection): its
+ * /status names no preset, it applies Small phone over HTTP, and its stop puts the
+ * override back exactly.
+ */
+async function preexistingDisplayStep(original) {
+  const step = {};
+  await shell(`wm size ${PREEXISTING_DISPLAY.size}`);
+  await shell(`wm density ${PREEXISTING_DISPLAY.density}`);
+  const set = await readDisplay();
+  step.set = briefDisplay(set);
+  const canvas = await startCanvas("scrcpy");
+  try {
+    step.status = (await canvas.status()).display;
+    step.applied = await canvas.display("small");
+    step.during = briefDisplay(await readDisplay());
+  } finally {
+    step.exit = await canvas.stop();
+  }
+  const after = await readDisplay();
+  step.after = briefDisplay(after);
+  step.line = canvas.output().match(/Display restore[^\n]*/)?.[0] ?? null;
+  const expected = { size_override: PREEXISTING_DISPLAY.size, density_override: PREEXISTING_DISPLAY.density };
+  step.ok = sameOverrides(set, expected) && step.status?.preset === null && step.applied.status === 200 &&
+    showsValues(step.during, DISPLAY_PRESETS[0]) && step.exit === 0 && sameOverrides(after, expected);
+  step.original = briefDisplay(original);
+  return step;
 }
 
 /** Put a finger down (pointer `id`) and move it a little, paced; no up. */
