@@ -10,10 +10,13 @@ than validation checks.
 from __future__ import annotations
 
 import importlib.util
+import json
+import struct
 import subprocess
 import sys
 import unittest
 from pathlib import Path
+from urllib.parse import urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
@@ -61,6 +64,35 @@ class BundlePreflightTests(unittest.TestCase):
         for name in ("LICENSE", "CHANGELOG.md", "README.md", "install.sh"):
             with self.subTest(file=name):
                 self.assertTrue((ROOT / name).exists(), f"{name} is required by build_release.sh")
+
+    def test_directory_png_icon_is_bundled(self) -> None:
+        """The directory reads this image once, at the first saved listing."""
+        plugin = ROOT / "plugins/autonom"
+        manifest = json.loads((plugin / ".claude-plugin/plugin.json").read_text())
+        reference = manifest["icon"]
+        self.assertTrue(reference.startswith("./"))
+        icon = (plugin / reference).resolve()
+        self.assertTrue(icon.is_relative_to(plugin.resolve()))
+        self.assertTrue(icon.is_file())
+        data = icon.read_bytes()
+        self.assertLess(len(data), 2 * 1024 * 1024)
+        self.assertEqual(data[:8], b"\x89PNG\r\n\x1a\n")
+        self.assertEqual(data[12:16], b"IHDR")
+        width, height = struct.unpack(">II", data[16:24])
+        self.assertEqual(width, height)
+        self.assertGreaterEqual(width, 512)
+        self.assertLessEqual(width, 2048)
+
+    def test_directory_links_use_https(self) -> None:
+        plugin = ROOT / "plugins/autonom"
+        manifest = json.loads((plugin / ".claude-plugin/plugin.json").read_text())
+        for field in ("documentationUrl", "supportUrl", "privacyPolicyUrl"):
+            with self.subTest(field=field):
+                url = urlsplit(manifest[field])
+                self.assertEqual(url.scheme, "https")
+                self.assertTrue(url.hostname)
+                self.assertIsNone(url.username)
+                self.assertIsNone(url.password)
 
 
 if __name__ == "__main__":
