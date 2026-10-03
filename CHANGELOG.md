@@ -7,6 +7,18 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
 
 ## [Unreleased]
 
+## [0.31.2] - 2026-10-03
+
+### Fixed
+- Redraw the plugin's directory icon as a rounded chip with transparent
+  corners and the glyph centred at 76% fill, so it fills its tile and reads as
+  an app icon on dark and light listings instead of a small mark in a white
+  box. The file shrinks from 770 KB to 88 KB.
+- Rename the scrcpy version pattern constant in `scrcpy-lib.mjs` from
+  `VERSION_TOKEN` to `VERSION_NUMBER`. It matches version numbers, not
+  credentials, and the directory scanner read the old name as a credential
+  read. No behaviour change.
+
 ## [0.31.1] - 2026-10-03
 
 ### Fixed
