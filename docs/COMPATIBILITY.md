@@ -15,7 +15,7 @@ strengthened, never silently weakened.
   It is reserved there forever. The Flow DSL (house Phase 5) uses a distinct
   code family (`flow_file_not_found`, `flow_parse_error`, …) and must never
   mint `flow_not_found`.
-- Codes added in the unreleased hardening pass, pinned by
+- Codes added in the 0.31.0 hardening pass, pinned by
   `tests/test_error_codes_additive.py` together with every older value:
 
   | Code | Emitted by |
@@ -44,7 +44,7 @@ strengthened, never silently weakened.
   `flow_command_invalid` itself is unchanged and still answers bad
   `--value` keys and values. An agent that matched the old code for unknown
   actions should match both.
-- The live-testing fix round (unreleased, after the hardening pass) adds one
+- The live-testing fix round (0.31.0, after the hardening pass) adds one
   code, pinned by `tests/test_fix_ui_core.py` (`ErrorCodeTests`):
 
   | Code | Emitted by |
@@ -206,10 +206,10 @@ the old answer must read them.
 | `flow export --format maestro` | a tap with `timeoutMs` refused | exported as `extendedWaitUntil: {visible: <selector>, timeout: N}` then the tap |
 | `session outputs` | session streams and the journal | also `metrics/` and `recordings/` entries (additive `followable`, `directory`); the open hint is `open` on macOS, `xdg-open` where installed, absent otherwise |
 
-`waitForSettled` is a new Flow command (additive), declared `since` 0.31.0 —
-the release that will carry it; the version is not bumped until then.
+`waitForSettled` is a new Flow command (additive), declared `since` 0.31.0,
+the release that carries it.
 
-### Mobile Canvas scrcpy transport (unreleased)
+### Mobile Canvas scrcpy transport (0.31.0)
 
 No `error_code` is added. `canvas serve` refuses with existing codes, checked
 before node starts:

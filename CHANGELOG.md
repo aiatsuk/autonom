@@ -7,6 +7,8 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
 
 ## [Unreleased]
 
+## [0.31.0] - 2026-10-03
+
 Deterministic capture state and a repair hand-off, borrowed from
 [goldie](https://github.com/kacperkapusciak/goldie) — an App Store screenshot
 generator that replays flows on the same simulators and emulators and had
@@ -579,6 +581,11 @@ without ffmpeg and without an npm dependency. Its compatibility notes are in
 - A reloaded Canvas page resumes its session from its cookie, through a
   same-origin fetch only.
 - `scripts/bootstrap.sh` refuses an argument it does not know (exit 2).
+- Bump the library and both plugin manifests to `0.31.0`, so plugin caches
+  keyed by version pick up everything in this release.
+- The Mobile Canvas skill's description and its Codex listing describe the
+  live scrcpy video and real-time control instead of an MJPEG bridge, and the
+  skill says how to stop the Canvas.
 
 ### Removed
 - The `android-smoke` workflow and `scripts/ci/android_smoke.sh`. It booted
