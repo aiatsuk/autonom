@@ -609,12 +609,31 @@ function authorizeUpgrade(context, request, url) {
   return { ok: true, origin: "human" };
 }
 
-/** A WebSocket handshake for /ws/video or /ws/control: the Upgrade tokens include `websocket`. */
+/**
+ * A WebSocket handshake for /ws/video or /ws/control: the Upgrade tokens include `websocket`.
+ * It never throws, since it also runs as the server's shouldUpgradeCallback.
+ */
 function isCanvasWebSocket(request) {
-  const tokens = String(request.headers.upgrade ?? "").split(",").map((token) => token.trim().toLowerCase());
-  if (!tokens.includes("websocket")) return false;
-  const url = requestUrl(request);
-  return url !== null && (url.pathname === "/ws/video" || url.pathname === "/ws/control");
+  try {
+    const tokens = String(request.headers.upgrade ?? "").split(",").map((token) => token.trim().toLowerCase());
+    if (!tokens.includes("websocket")) return false;
+    const url = requestUrl(request);
+    return url !== null && (url.pathname === "/ws/video" || url.pathname === "/ws/control");
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Whether an upgrade request says it carries a body: any Transfer-Encoding, or a
+ * Content-Length that is not digits only (signed, empty, not a number) or not zero.
+ * Any run of zeros, as in `Content-Length: 00`, is no body.
+ */
+function upgradeRequestHasBody(headers) {
+  if (headers["transfer-encoding"] !== undefined) return true;
+  if (headers["content-length"] === undefined) return false;
+  const length = String(headers["content-length"]).trim();
+  return !/^\d+$/.test(length) || Number(length) !== 0;
 }
 
 /**
@@ -633,8 +652,7 @@ function serveUpgradeAsRequest(request, socket, onRequest) {
     response.detachSocket(socket);
     socket.end();
   });
-  const length = request.headers["content-length"];
-  if (request.headers["transfer-encoding"] !== undefined || (length !== undefined && length.trim() !== "0")) {
+  if (upgradeRequestHasBody(request.headers)) {
     sendJson(response, 400, {
       error: "This Canvas cannot read a request body sent with an Upgrade header; " +
         "resend the request without the Upgrade header",

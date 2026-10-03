@@ -1326,6 +1326,29 @@ test("auth: where Node has no shouldUpgradeCallback, the upgrade fallback answer
   await stopCanvas(canvas);
 });
 
+test("auth: where Node has no shouldUpgradeCallback, the upgrade fallback reads Content-Length as digits: any run of zeros is no body, a signed length or a body gets 400", async (t) => {
+  const world = await makeWorld(t);
+  const canvas = await startCanvas(world, ["--transport", "scrcpy", "--scrcpy-server", world.serverFile],
+    { nodeArgs: ["--import", OLD_NODE_UPGRADE] });
+  const statusWith = (headers, body = "") => rawRequest(canvas.port, {
+    path: "/status", body, headers: { ...H2C_HEADERS, Authorization: `Bearer ${TOKEN}`, ...headers },
+  });
+  for (const length of ["0", "00", "0000"]) {
+    const answered = await statusWith({ "Content-Length": length });
+    assert.equal(answered.status, 200, `Content-Length: ${length} ${answered.body}`);
+    assert.equal(JSON.parse(answered.body).transport, "scrcpy");
+    assert.equal(answered.headers.connection, "close");
+  }
+  assert.match(canvas.output(), /createServer without shouldUpgradeCallback/, "the old-Node seam is not active");
+  // A signed length is refused: by Node's own parser where it checks, else by the fallback.
+  assert.equal((await statusWith({ "Content-Length": "+0" })).status, 400);
+  // Content-Length: 5 with its body.
+  const withBody = await statusWith({}, "hello");
+  assert.equal(withBody.status, 400, withBody.body);
+  assert.match(JSON.parse(withBody.body).error, /resend the request without the Upgrade header/);
+  await stopCanvas(canvas);
+});
+
 test("auth: WebSocket upgrades need cookie, csrf and same origin, or the token", async (t) => {
   const { canvas, auth, device } = await streamingCanvas(t);
   const port = canvas.port;
@@ -1900,12 +1923,16 @@ test("fanout: a stalled video client keeps only the latest session and config, g
   await stopCanvas(canvas);
 });
 
+// Input tests wait across clipboard holds and other multi-step device exchanges. Such a
+// step takes about 0.4 s alone but ran past a 3 s limit on a busy CI runner, so allow 10 s.
+const INPUT_WAIT_MS = 10_000;
+
 test("input: touches map to the current video size and every interruption lifts the pointer", async (t) => {
   const { canvas, auth, device, control } = await connectedControl(t);
   const touch = (a, id, x, y, extra = {}) => control.send({ t: "touch", a, id, x, y, ...extra });
   touch("down", 1, 0.5, 0.5);
   touch("move", 1, 0.25, 0.75);
-  await waitFor(() => device.touches().length === 2, 3000, "down and move");
+  await waitFor(() => device.touches().length === 2, INPUT_WAIT_MS, "down and move");
   let [down, move] = device.touches();
   assert.deepEqual([down.action, down.x, down.y, down.width, down.height, down.pressure],
     [0, 285, 640, 570, 1280, 0xffff]);
@@ -1916,7 +1943,7 @@ test("input: touches map to the current video size and every interruption lifts 
   // the Canvas lifts the finger itself with the new size and refuses its later moves.
   device.sendSession(1280, 570);
   await control.next((message) => message.json?.t === "state" && message.json.width === 1280);
-  await waitFor(() => device.touches().length === 3, 3000, "the finger lifted with the new size");
+  await waitFor(() => device.touches().length === 3, INPUT_WAIT_MS, "the finger lifted with the new size");
   const lifted = device.touches()[2];
   assert.deepEqual([lifted.action, lifted.pointerId, lifted.x, lifted.y, lifted.width, lifted.height],
     [1, down.pointerId, 320, 427, 1280, 570]);
@@ -1928,7 +1955,7 @@ test("input: touches map to the current video size and every interruption lifts 
   // The next gesture uses the new size, so scrcpy-server never ignores it.
   touch("down", 1, 0.5, 0.5);
   touch("up", 1, 0.5, 0.5);
-  await waitFor(() => device.touches().length === 5, 3000, "a gesture after the rotation");
+  await waitFor(() => device.touches().length === 5, INPUT_WAIT_MS, "a gesture after the rotation");
   const [rotated, up] = device.touches().slice(3);
   assert.deepEqual([rotated.action, rotated.x, rotated.y, rotated.width, rotated.height], [0, 640, 285, 1280, 570]);
   assert.deepEqual([up.action, up.pressure], [1, 0]);
@@ -1939,7 +1966,7 @@ test("input: touches map to the current video size and every interruption lifts 
   touch("down", 6, 0.8, 0.8);
   touch("up", 5, 0.2, 0.2);
   touch("cancel", 6, 0.8, 0.8);
-  await waitFor(() => device.touches().length === 10, 3000, "multitouch");
+  await waitFor(() => device.touches().length === 10, INPUT_WAIT_MS, "multitouch");
   const multi = device.touches().slice(5);
   assert.notEqual(multi[0].pointerId, multi[1].pointerId);
   assert.deepEqual(multi.map((message) => message.action), [0, 0, 1, 3, 1]);
@@ -1948,17 +1975,17 @@ test("input: touches map to the current video size and every interruption lifts 
   const other = await pageSocket(canvas, auth, "/ws/control");
   await other.next((message) => message.json?.t === "state");
   other.send({ t: "touch", a: "down", id: 9, x: 0.1, y: 0.1 });
-  await waitFor(() => device.touches().length === 11, 3000, "second client down");
+  await waitFor(() => device.touches().length === 11, INPUT_WAIT_MS, "second client down");
   other.close();
-  await waitFor(() => device.touches().length === 12, 3000, "up after disconnect");
+  await waitFor(() => device.touches().length === 12, INPUT_WAIT_MS, "up after disconnect");
   assert.equal(device.touches()[11].action, 1);
   assert.equal(device.touches()[11].pointerId, device.touches()[10].pointerId);
 
   // Pause mid-drag through the WebSocket.
   touch("down", 1, 0.5, 0.5);
-  await waitFor(() => device.touches().length === 13, 3000, "down before pause");
+  await waitFor(() => device.touches().length === 13, INPUT_WAIT_MS, "down before pause");
   control.send({ t: "control", mode: "pause" });
-  await waitFor(() => device.touches().length === 14, 3000, "up after pause");
+  await waitFor(() => device.touches().length === 14, INPUT_WAIT_MS, "up after pause");
   assert.equal(device.touches()[13].action, 1);
   const paused = control.reply((message) => message.t === "error");
   touch("move", 1, 0.5, 0.6);
@@ -1968,14 +1995,14 @@ test("input: touches map to the current video size and every interruption lifts 
 
   // An agent takes over through HTTP mid-drag: the human pointer is lifted and refused.
   touch("down", 1, 0.5, 0.5);
-  await waitFor(() => device.touches().length === 15, 3000, "down before takeover");
+  await waitFor(() => device.touches().length === 15, INPUT_WAIT_MS, "down before takeover");
   const takeover = await fetch(`${canvas.origin}/control`, {
     method: "POST",
     headers: { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json", "X-Autonom-Origin": "agent" },
     body: JSON.stringify({ mode: "takeover" }),
   });
   assert.equal(takeover.status, 200);
-  await waitFor(() => device.touches().length === 16, 3000, "up after takeover");
+  await waitFor(() => device.touches().length === 16, INPUT_WAIT_MS, "up after takeover");
   assert.equal(device.touches()[15].action, 1);
   await control.next((message) => message.json?.t === "state" && message.json.owner === "agent");
   const before = device.controlBytes;
@@ -1990,7 +2017,7 @@ test("input: touches map to the current video size and every interruption lifts 
   const agent = await openSocket(canvas.port, `/ws/control?token=${TOKEN}&origin=agent`);
   assert.equal(agent.status, 101);
   agent.ws.send({ t: "system", op: "home" });
-  await waitFor(() => device.messages.filter((message) => message.keycode === 3).length === 2, 3000,
+  await waitFor(() => device.messages.filter((message) => message.keycode === 3).length === 2, INPUT_WAIT_MS,
     "agent input");
   agent.ws.send({ t: "control", mode: "release" });
   await control.next((message) => message.json?.t === "state" && message.json.owner === "shared");
@@ -2009,7 +2036,7 @@ test("input: touches map to the current video size and every interruption lifts 
   control.send({ t: "system", op: "notifications" });
   control.send({ t: "system", op: "rotate" });
   control.send({ t: "clipboard-get" });
-  await waitFor(() => device.messages.length === count + 13, 3000, "control messages");
+  await waitFor(() => device.messages.length === count + 13, INPUT_WAIT_MS, "control messages");
   const sent = device.messages.slice(count);
   assert.deepEqual(sent.slice(0, 4).map((message) => [message.action, message.keycode, message.meta]),
     [[0, 59, 0x41], [0, 29, 0x41], [1, 29, 0x41], [1, 59, 0]]);
@@ -2053,7 +2080,7 @@ test("input: clipboard requests share one device answer and an empty clipboard a
   // The next device answer belongs to the client that asked next, not to the earlier one.
   const forAgent = agent.reply((message) => message.t === "clipboard");
   agent.send({ t: "clipboard-get" });
-  await waitFor(() => gets() === 2, 3000, "the agent request");
+  await waitFor(() => gets() === 2, INPUT_WAIT_MS, "the agent request");
   device.sendClipboard("answer-for-agent");
   assert.equal((await forAgent).text, "answer-for-agent");
   await sleep(100);
@@ -2095,7 +2122,7 @@ test("input: a device that stops reading stops the reading of input, in order, a
   };
   control.send({ t: "touch", a: "down", id: 1, x: 0.5, y: 0.5 });
   control.send({ t: "key", a: "down", code: 59 });
-  await waitFor(() => device.messages.length === 2, 3000, "the held pointer and key");
+  await waitFor(() => device.messages.length === 2, INPUT_WAIT_MS, "the held pointer and key");
   // A paused emulator or a stuck Controller: the device control socket is not read.
   device.running.control.pause();
   // Rounds of 200 texts of 300 bytes, the longest INJECT_TEXT: 60 KB of device input each,
@@ -2132,7 +2159,7 @@ test("input: a device that stops reading stops the reading of input, in order, a
   // The ping that was not read is read once the device has caught up.
   await handled(10_000);
   // Every text went out; nothing was lost or refused.
-  await waitFor(() => device.count("text") === (answered + 1) * perRound, 5000, "every text on the device");
+  await waitFor(() => device.count("text") === (answered + 1) * perRound, INPUT_WAIT_MS, "every text on the device");
   assert.deepEqual(device.messages.map((message) => message.type).filter((type) => type !== "text"),
     ["touch", "key", "touch", "key"]);
   assert.deepEqual(device.touches().map((message) => message.action), [0, 1]);
@@ -2145,7 +2172,7 @@ test("input: a device that stops reading stops the reading of input, in order, a
   control.send({ t: "touch", a: "down", id: 3, x: 0.1, y: 0.1 });
   control.send({ t: "touch", a: "up", id: 3, x: 0.1, y: 0.1 });
   await handled();
-  await waitFor(() => device.touches().length === 4, 3000, "input after the device read again");
+  await waitFor(() => device.touches().length === 4, INPUT_WAIT_MS, "input after the device read again");
   assert.deepEqual(control.json("error"), []);
   await stopCanvas(canvas);
 });
@@ -2192,7 +2219,7 @@ test("input: nothing follows a clipboard paste to the device until its ack and a
   const agent = opened.ws;
   await agent.next((message) => message.json?.t === "state");
   control.send({ t: "paste", text: "B2ü" });
-  await waitFor(() => device.count("set-clipboard") === 1, 3000, "the paste");
+  await waitFor(() => device.count("set-clipboard") === 1, INPUT_WAIT_MS, "the paste");
   const [paste] = device.messages;
   assert.equal(paste.paste, true);
   assert.ok(paste.sequence > 0n, "the paste asked for no acknowledgement");
@@ -2209,7 +2236,7 @@ test("input: nothing follows a clipboard paste to the device until its ack and a
   await expectNoDeviceWrite(device, pasted, 150);
   const ackedAt = Date.now();
   device.ack(paste.sequence);
-  await waitFor(() => device.messages.length === 6, 3000, "the held input");
+  await waitFor(() => device.messages.length === 6, INPUT_WAIT_MS, "the held input");
   const settled = device.arrivals[1] - ackedAt;
   // CLIPBOARD_SETTLE_MS is 200; a few ms less only for timer granularity.
   assert.ok(settled >= 195, `input followed the ack after ${settled} ms`);
@@ -2228,7 +2255,7 @@ test("input: a burst of text and pastes reaches a device that reads its clipboar
     device.field = "";
     const before = device.messages.length;
     for (const message of messages) control.send(message);
-    await waitFor(() => device.messages.length === before + messages.length, 5000, "the burst on the device");
+    await waitFor(() => device.messages.length === before + messages.length, INPUT_WAIT_MS, "the burst on the device");
     await sleep(100);
     return device.field;
   };
@@ -2254,7 +2281,7 @@ test("input: a key between two clipboard texts keeps two clipboard pastes, in or
   const { canvas, device, control } = await connectedControl(t);
   sendBurst(control, [{ t: "text", text: "é1" }, { t: "key", a: "down", code: 54 }, { t: "key", a: "up", code: 54 },
     { t: "text", text: "é2" }]);
-  await waitFor(() => device.messages.length === 4, 5000, "the burst on the device");
+  await waitFor(() => device.messages.length === 4, INPUT_WAIT_MS, "the burst on the device");
   await sleep(300);
   assert.deepEqual(deviceLabels(device.messages), ["paste é1", "key 0 54", "key 1 54", "paste é2"]);
   await stopCanvas(canvas);
@@ -2311,7 +2338,7 @@ test("input: a paste the device never acknowledges holds later input for 1 s, th
   const { canvas, device, control } = await connectedControl(t, { device: { autoAck: false } });
   control.send({ t: "paste", text: "q" });
   control.send({ t: "text", text: "after" });
-  await waitFor(() => device.messages.length === 2, 5000, "the input after the paste");
+  await waitFor(() => device.messages.length === 2, INPUT_WAIT_MS, "the input after the paste");
   const waited = device.arrivals[1] - device.arrivals[0];
   assert.ok(waited >= 950 && waited < 3000, `input followed an unacknowledged paste after ${waited} ms`);
   assert.deepEqual(deviceLabels(device.messages), ["paste q", "text after"]);
@@ -2319,7 +2346,7 @@ test("input: a paste the device never acknowledges holds later input for 1 s, th
   // Nothing is held any more: input without the clipboard goes straight on.
   const sentAt = Date.now();
   control.send({ t: "text", text: "more" });
-  await waitFor(() => device.messages.length === 3, 3000, "input after the timeout");
+  await waitFor(() => device.messages.length === 3, INPUT_WAIT_MS, "input after the timeout");
   assert.ok(device.arrivals[2] - sentAt < 500, "input after the timeout was held");
   assert.deepEqual(control.json("error"), []);
   assert.equal((await stopCanvas(canvas)).code, 0);
@@ -2328,7 +2355,7 @@ test("input: a paste the device never acknowledges holds later input for 1 s, th
 test("input: a device server restart while input waits for a clipboard ack refuses that input at once and holds nothing after it", async (t) => {
   const { canvas, device, control } = await connectedControl(t, { device: { autoAck: false } });
   control.send({ t: "paste", text: "é" });
-  await waitFor(() => device.count("set-clipboard") === 1, 3000, "the paste");
+  await waitFor(() => device.count("set-clipboard") === 1, INPUT_WAIT_MS, "the paste");
   const pasted = device.controlBytes;
   control.send({ t: "key", a: "down", code: 29 });
   control.send({ t: "key", a: "up", code: 29 });
@@ -2339,17 +2366,17 @@ test("input: a device server restart while input waits for a clipboard ack refus
   await restarting;
   const restartedAt = Date.now();
   const streaming = control.reply((message) => message.t === "state" && message.session === "streaming", 8000);
-  const refused = await waitFor(() => control.json("error").length >= 3 && control.json("error"), 3000,
+  const refused = await waitFor(() => control.json("error").length >= 3 && control.json("error"), INPUT_WAIT_MS,
     "the held input refused");
   assert.ok(Date.now() - restartedAt < 500, "held input waited past the restart");
   assert.deepEqual(refused.map((error) => error.for), ["key", "key", "text"]);
   for (const error of refused) assert.match(error.message, /not ready/);
   await streaming;
-  await waitFor(() => device.connected, 5000, "the new device server");
+  await waitFor(() => device.connected, INPUT_WAIT_MS, "the new device server");
   const before = device.messages.length;
   const sentAt = Date.now();
   control.send({ t: "text", text: "c" });
-  await waitFor(() => device.messages.length === before + 1, 3000, "input after the restart");
+  await waitFor(() => device.messages.length === before + 1, INPUT_WAIT_MS, "input after the restart");
   assert.ok(device.arrivals[before] - sentAt < 500, "input after the restart was held");
   assert.deepEqual(deviceLabels(device.messages), ["paste é", "text c"]);
   assert.equal((await stopCanvas(canvas)).code, 0);
@@ -2359,7 +2386,7 @@ test("input: a takeover while input waits for a clipboard ack lifts the pointer 
   const { world, canvas, device, control } = await connectedControl(t, { device: { autoAck: false } });
   control.send({ t: "touch", a: "down", id: 1, x: 0.5, y: 0.5 });
   control.send({ t: "paste", text: "ü" });
-  await waitFor(() => device.messages.length === 2, 3000, "the pointer and the paste");
+  await waitFor(() => device.messages.length === 2, INPUT_WAIT_MS, "the pointer and the paste");
   const pasted = device.controlBytes;
   control.send({ t: "touch", a: "move", id: 1, x: 0.5, y: 0.6 });
   control.send({ t: "text", text: "z" });
@@ -2372,10 +2399,10 @@ test("input: a takeover while input waits for a clipboard ack lifts the pointer 
   assert.equal(takeover.status, 200);
   // The lifted pointer waits behind the paste like any other device input.
   await expectNoDeviceWrite(device, pasted, 150);
-  const refused = waitFor(() => control.json("error").length === 2 && control.json("error"), 3000,
+  const refused = waitFor(() => control.json("error").length === 2 && control.json("error"), INPUT_WAIT_MS,
     "the held input refused");
   device.ack(device.messages[1].sequence);
-  await waitFor(() => device.messages.length === 3, 3000, "the lifted pointer");
+  await waitFor(() => device.messages.length === 3, INPUT_WAIT_MS, "the lifted pointer");
   assert.deepEqual(device.messages.map((message) => message.type === "touch" ? `touch ${message.action}`
     : message.type), ["touch 0", "set-clipboard", "touch 1"]);
   // Held input meets the handoff check when it is handled, after the takeover.
@@ -2386,7 +2413,7 @@ test("input: a takeover while input waits for a clipboard ack lifts the pointer 
   const records = await waitFor(async () => {
     const found = await journaled(world);
     return found.length === 2 && found;
-  }, 5000, "the journal records");
+  }, INPUT_WAIT_MS, "the journal records");
   assert.deepEqual(recordSummaries(records), ["human paste", "human gesture"]);
   assert.deepEqual([records[1].payload.pointers, records[1].payload.moves], [1, 0]);
   await stopCanvas(canvas);
@@ -2396,12 +2423,12 @@ test("input: a rotation lifts a finger still down with the new size, sends an up
   const { world, canvas, device, control } = await connectedControl(t, { device: { dropStaleSize: true } });
   control.send({ t: "touch", a: "down", id: 1, x: 0.5, y: 0.5 });
   control.send({ t: "touch", a: "move", id: 1, x: 0.5, y: 0.6 });
-  await waitFor(() => device.touches().length === 2, 3000, "the finger down");
+  await waitFor(() => device.touches().length === 2, INPUT_WAIT_MS, "the finger down");
   const [down] = device.touches();
   assert.deepEqual([...device.pointersDown], [down.pointerId]);
   // The device rotates with the finger down: events made for the old size would be ignored.
   device.sendSession(1280, 570);
-  await waitFor(() => device.pointersDown.size === 0, 3000, "the finger lifted on the device");
+  await waitFor(() => device.pointersDown.size === 0, INPUT_WAIT_MS, "the finger lifted on the device");
   const lifted = device.touches().at(-1);
   // Where the finger was, (0.5, 0.6), in the new size.
   assert.deepEqual([lifted.action, lifted.pointerId, lifted.x, lifted.y, lifted.width, lifted.height],
@@ -2414,20 +2441,20 @@ test("input: a rotation lifts a finger still down with the new size, sends an up
   // The device rotates back while an up leaves the Canvas, made for the size it still knows:
   // the device ignores that up, and the Canvas sends it again once it hears of the new size.
   control.send({ t: "touch", a: "down", id: 2, x: 0.2, y: 0.2 });
-  await waitFor(() => device.pointersDown.size === 1, 3000, "the second finger down");
+  await waitFor(() => device.pointersDown.size === 1, INPUT_WAIT_MS, "the second finger down");
   device.resize(570, 1280);
   control.send({ t: "touch", a: "up", id: 2, x: 0.2, y: 0.2 });
-  await waitFor(() => device.ignored.length === 1, 3000, "the up made for the old size");
+  await waitFor(() => device.ignored.length === 1, INPUT_WAIT_MS, "the up made for the old size");
   assert.equal(device.pointersDown.size, 1);
   device.sendSession();
-  await waitFor(() => device.pointersDown.size === 0, 3000, "the up sent again with the new size");
+  await waitFor(() => device.pointersDown.size === 0, INPUT_WAIT_MS, "the up sent again with the new size");
   const resent = device.touches().at(-1);
   assert.deepEqual([resent.action, resent.x, resent.y, resent.width, resent.height], [1, 114, 256, 570, 1280]);
 
   const records = await waitFor(async () => {
     const found = await journaled(world, "gesture");
     return found.length === 2 && found;
-  }, 5000, "one record per gesture");
+  }, INPUT_WAIT_MS, "one record per gesture");
   assert.deepEqual(records.map(({ payload }) => [payload.pointers, payload.moves]), [[1, 1], [1, 0]]);
   assert.equal(control.json("error").length, 1);
   await stopCanvas(canvas);
@@ -2436,9 +2463,9 @@ test("input: a rotation lifts a finger still down with the new size, sends an up
 test("input: an up written late, behind a paste, counts as recent at a rotation from when it was written", async (t) => {
   const { canvas, device, control } = await connectedControl(t, { device: { autoAck: false, dropStaleSize: true } });
   control.send({ t: "touch", a: "down", id: 1, x: 0.5, y: 0.5 });
-  await waitFor(() => device.pointersDown.size === 1, 3000, "the finger down");
+  await waitFor(() => device.pointersDown.size === 1, INPUT_WAIT_MS, "the finger down");
   control.send({ t: "paste", text: "x" });
-  await waitFor(() => device.count("set-clipboard") === 1, 3000, "the paste");
+  await waitFor(() => device.count("set-clipboard") === 1, INPUT_WAIT_MS, "the paste");
   // The device rotates; its server says so only later.
   device.resize(1280, 570);
   // An agent takes over: the finger is lifted, but its up waits behind the paste, which
@@ -2446,7 +2473,7 @@ test("input: an up written late, behind a paste, counts as recent at a rotation 
   await agentTakeover(canvas);
   // The up was made before the takeover answered, and written no later than it arrived.
   const madeBy = Date.now();
-  await waitFor(() => device.ignored.length === 1, 3000, "the up, written after the paste for the old size");
+  await waitFor(() => device.ignored.length === 1, INPUT_WAIT_MS, "the up, written after the paste for the old size");
   const writtenBy = device.ignoredAt[0];
   assert.equal(device.pointersDown.size, 1);
   // The new size comes more than RECENT_UP_MS after the up was made, so counting from then
@@ -2457,7 +2484,7 @@ test("input: an up written late, behind a paste, counts as recent at a rotation 
   assert.ok(sessionAt - writtenBy < RECENT_UP_MS - 100,
     `the size changed ${sessionAt - writtenBy} ms after the up was written; the takeover took too long to time this`);
   device.sendSession();
-  await waitFor(() => device.pointersDown.size === 0, 3000, "the up sent again with the new size");
+  await waitFor(() => device.pointersDown.size === 0, INPUT_WAIT_MS, "the up sent again with the new size");
   const resent = device.touches().at(-1);
   assert.deepEqual([resent.action, resent.width, resent.height], [1, 1280, 570]);
   await stopCanvas(canvas);
@@ -2467,7 +2494,7 @@ test("input: an up written more than a second before the video size changes is n
   const { canvas, device, control } = await connectedControl(t, { device: { dropStaleSize: true } });
   control.send({ t: "touch", a: "down", id: 1, x: 0.5, y: 0.5 });
   control.send({ t: "touch", a: "up", id: 1, x: 0.5, y: 0.5 });
-  await waitFor(() => device.touches().length === 2 && device.pointersDown.size === 0, 3000, "a tap");
+  await waitFor(() => device.touches().length === 2 && device.pointersDown.size === 0, INPUT_WAIT_MS, "a tap");
   await sleep(RECENT_UP_MS + 300);
   device.sendSession(1280, 570);
   await control.next((message) => message.json?.t === "state" && message.json.width === 1280);
@@ -2479,9 +2506,9 @@ test("input: an up written more than a second before the video size changes is n
 test("input: an up still held behind a paste when the video size changes goes out again after it with the new size", async (t) => {
   const { canvas, device, control } = await connectedControl(t, { device: { autoAck: false, dropStaleSize: true } });
   control.send({ t: "touch", a: "down", id: 1, x: 0.5, y: 0.5 });
-  await waitFor(() => device.pointersDown.size === 1, 3000, "the finger down");
+  await waitFor(() => device.pointersDown.size === 1, INPUT_WAIT_MS, "the finger down");
   control.send({ t: "paste", text: "x" });
-  await waitFor(() => device.count("set-clipboard") === 1, 3000, "the paste");
+  await waitFor(() => device.count("set-clipboard") === 1, INPUT_WAIT_MS, "the paste");
   const [paste] = device.messages.filter((message) => message.type === "set-clipboard");
   await agentTakeover(canvas);
   // The device rotates, and says so, while the finger's up still waits behind the paste.
@@ -2489,7 +2516,7 @@ test("input: an up still held behind a paste when the video size changes goes ou
   await control.next((message) => message.json?.t === "state" && message.json.width === 1280);
   assert.equal(device.touches().length, 1, "the up went out before the paste was acknowledged");
   device.ack(paste.sequence);
-  await waitFor(() => device.pointersDown.size === 0, 3000, "the up sent again with the new size");
+  await waitFor(() => device.pointersDown.size === 0, INPUT_WAIT_MS, "the up sent again with the new size");
   // The up made for the old size is ignored; the one sent again after it lifts the finger.
   assert.deepEqual(device.ignored.map((message) => [message.action, message.width, message.height]), [[1, 570, 1280]]);
   const lifted = device.touches().at(-1);
@@ -2501,10 +2528,10 @@ test("input: a finger and a key lifted behind a paste's ack are lifted through t
   const { canvas, device, control } = await connectedControl(t, { device: { autoAck: false } });
   control.send({ t: "touch", a: "down", id: 1, x: 0.5, y: 0.5 });
   control.send({ t: "key", a: "down", code: 59 });
-  await waitFor(() => device.pointersDown.size === 1 && device.keysDown.size === 1, 3000, "the finger and key down");
+  await waitFor(() => device.pointersDown.size === 1 && device.keysDown.size === 1, INPUT_WAIT_MS, "the finger and key down");
   const [down] = device.touches();
   control.send({ t: "paste", text: "x" });
-  await waitFor(() => device.count("set-clipboard") === 1, 3000, "the paste");
+  await waitFor(() => device.count("set-clipboard") === 1, INPUT_WAIT_MS, "the paste");
   // The takeover lifts them, but their up and key-up wait behind the paste...
   const pasted = device.controlBytes;
   await agentTakeover(canvas);
@@ -2514,7 +2541,7 @@ test("input: a finger and a key lifted behind a paste's ack are lifted through t
   device.crash();
   await restarting;
   await control.reply((message) => message.t === "state" && message.session === "streaming", 8000);
-  await waitFor(() => device.pointersDown.size === 0 && device.keysDown.size === 0, 5000,
+  await waitFor(() => device.pointersDown.size === 0 && device.keysDown.size === 0, INPUT_WAIT_MS,
     "the finger and key lifted through the restarted server");
   const lifted = device.messages.filter((message) => message.action === 1);
   assert.ok(lifted.some((message) => message.type === "touch" && message.pointerId === down.pointerId));
@@ -2526,7 +2553,7 @@ test("input: an up and a key-up the device has not read when its server dies are
   const { canvas, device, control } = await connectedControl(t);
   control.send({ t: "touch", a: "down", id: 1, x: 0.5, y: 0.5 });
   control.send({ t: "key", a: "down", code: 59 });
-  await waitFor(() => device.pointersDown.size === 1 && device.keysDown.size === 1, 3000, "the finger and key down");
+  await waitFor(() => device.pointersDown.size === 1 && device.keysDown.size === 1, INPUT_WAIT_MS, "the finger and key down");
   // A stuck Controller: the up and key-up are written but never read by this server.
   device.running.control.pause();
   control.send({ t: "touch", a: "up", id: 1, x: 0.5, y: 0.5 });
@@ -2536,7 +2563,7 @@ test("input: an up and a key-up the device has not read when its server dies are
   device.crash();
   await restarting;
   await control.reply((message) => message.t === "state" && message.session === "streaming", 8000);
-  await waitFor(() => device.pointersDown.size === 0 && device.keysDown.size === 0, 5000,
+  await waitFor(() => device.pointersDown.size === 0 && device.keysDown.size === 0, INPUT_WAIT_MS,
     "the finger and key lifted through the restarted server");
   assert.deepEqual(control.json("error"), []);
   await stopCanvas(canvas);
@@ -2546,14 +2573,14 @@ test("input: a finger and a key held when the device server dies are lifted thro
   const { world, canvas, device, control } = await connectedControl(t);
   control.send({ t: "touch", a: "down", id: 1, x: 0.5, y: 0.5 });
   control.send({ t: "key", a: "down", code: 59 });
-  await waitFor(() => device.messages.length === 2, 3000, "the held finger and key");
+  await waitFor(() => device.messages.length === 2, INPUT_WAIT_MS, "the held finger and key");
   const [down] = device.touches();
   const restarting = control.reply((message) => message.t === "state" && message.session === "restarting");
   device.crash();
   await restarting;
   const before = device.messages.length;
   await control.reply((message) => message.t === "state" && message.session === "streaming", 8000);
-  await waitFor(() => device.messages.length === before + 2, 5000, "the lifts through the restarted server");
+  await waitFor(() => device.messages.length === before + 2, INPUT_WAIT_MS, "the lifts through the restarted server");
   const [up, keyUp] = device.messages.slice(before);
   assert.deepEqual([up.type, up.action, up.pointerId, up.x, up.y, up.width, up.height],
     ["touch", 1, down.pointerId, 285, 640, 570, 1280]);
@@ -2564,8 +2591,8 @@ test("input: a finger and a key held when the device server dies are lifted thro
   // A new finger works through the new server.
   control.send({ t: "touch", a: "down", id: 1, x: 0.1, y: 0.1 });
   control.send({ t: "touch", a: "up", id: 1, x: 0.1, y: 0.1 });
-  await waitFor(() => device.messages.length === before + 4, 3000, "a new gesture");
-  await waitFor(async () => (await journaled(world)).length >= 3, 5000, "the journal records");
+  await waitFor(() => device.messages.length === before + 4, INPUT_WAIT_MS, "a new gesture");
+  await waitFor(async () => (await journaled(world)).length >= 3, INPUT_WAIT_MS, "the journal records");
   await sleep(300);
   // The interrupted gesture and key are journaled once, when the server died.
   assert.deepEqual(recordSummaries(await journaled(world)), ["human gesture", "human key 59", "human gesture"]);
@@ -2973,14 +3000,14 @@ test("input: a connection that keeps one message held after every paste keeps a 
   const cycles = 12;
   control.send({ t: "paste", text: "\u00e9" });
   for (let cycle = 1; cycle <= cycles; cycle += 1) {
-    await waitFor(() => clipboardWrites(device).length === cycle, 5000, `paste ${cycle}`);
+    await waitFor(() => clipboardWrites(device).length === cycle, INPUT_WAIT_MS, `paste ${cycle}`);
     // While this paste waits: 600 pings, the next paste, and one message after it, which
     // stays held behind that paste when the rest has been handled.
     sendBurst(control, [...Array.from({ length: 600 }, (_, i) => ({ t: "ping", ts: cycle * 1000 + i })),
       { t: "paste", text: "\u00e9" }, { t: "ping", ts: -cycle }]);
   }
-  await waitFor(() => clipboardWrites(device).length === cycles + 1, 5000, "the last paste");
-  await waitFor(() => control.json("pong").some((message) => message.ts === -cycles), 5000, "the last held message");
+  await waitFor(() => clipboardWrites(device).length === cycles + 1, INPUT_WAIT_MS, "the last paste");
+  await waitFor(() => control.json("pong").some((message) => message.ts === -cycles), INPUT_WAIT_MS, "the last held message");
   t.diagnostic(`the longest held queue had ${longest()} slots after ${cycles} pastes of 602 held messages each`);
   // Without compaction it grows by about 600 handled slots per paste.
   assert.ok(longest() > 0, "the probe saw no held queue");
