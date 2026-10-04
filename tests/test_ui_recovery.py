@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import contextlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -207,6 +208,37 @@ class BackendRecoveryTests(unittest.TestCase):
                 ui_ios.tap(TARGET, 20, 20)
         self.assertEqual(request.call_count, 1)
         idb.assert_not_called()
+
+    def test_auto_with_a_persisted_runner_observation_never_retaps_through_idb(self):
+        # REV-003: `auto` in a fresh invocation follows the session's persisted
+        # ui_observation (the runner served it); an unanswered tap is uncertain,
+        # sent to the runner once, and never dispatched through idb or AXe.
+        record = session.load_current()
+        record["ui_observation"] = {"ui_backend": "xcuitest", "observed_at": time.time(),
+                                    "fallback_reason": "empty_accessibility_tree"}
+        session.save(record)
+        ui_ios.set_preference("auto")  # a new invocation: no in-memory observation
+        mailbox = Path(self.tmp.name) / "mailbox"
+        mailbox.mkdir()
+        state = {"token": "owner", "mailbox": str(mailbox)}
+        with patch.object(ios_xctest, "_ensure", return_value=state), \
+                patch.object(ios_xctest, "REQUEST_TIMEOUT", 0), \
+                patch.object(ios_xctest, "_exchange", wraps=ios_xctest._exchange) as exchange, \
+                patch.object(ios_xctest, "_write", wraps=ios_xctest._write) as write, \
+                patch.object(ui_ios.ios_idb, "tap") as idb_tap, \
+                patch.object(ui_ios, "_dispatch") as dispatch, \
+                patch.object(ui_ios, "run_axe") as axe:
+            self.assertEqual(ui_ios.preference(TARGET), "auto")
+            with self.assertRaises(errors.AutonomError) as caught:
+                ui_ios.tap(TARGET, 20, 20)
+        self.assertEqual(caught.exception.code, errors.UI_ACTION_UNCERTAIN)
+        self.assertEqual(exchange.call_count, 1)
+        self.assertEqual(exchange.call_args.args[1], "tap")
+        requests = [c for c in write.call_args_list if c.args[0].name == "request.json"]
+        self.assertEqual(len(requests), 1)
+        idb_tap.assert_not_called()
+        dispatch.assert_not_called()
+        axe.assert_not_called()
 
     def test_timeout_submits_a_mutation_once_and_removes_unconsumed_text(self):
         mailbox = Path(self.tmp.name) / "mailbox"
@@ -681,6 +713,362 @@ class StoppedRecordTests(unittest.TestCase):
         build.assert_not_called()
         popen.assert_not_called()
         register.assert_not_called()
+
+
+def _load_cli():
+    spec = importlib.util.spec_from_file_location("autonom_cli_ui_recovery", CLI)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+class StoppingMarkTests(unittest.TestCase):
+    """Issue #31: `session stop` marks `stopping_at` before its teardown, and
+    a runner request refuses a stopping session on entry, under request.lock
+    and right before it would start a runner."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.env = patch.dict(os.environ, {"AUTONOM_HOME": self.tmp.name})
+        self.env.start()
+        self.token = session.select(None)
+        self.record = session.start_session(TARGET.tool, platform="ios",
+                                            target_id=TARGET.target_id, app_id="test.reader")
+        self.session_json = Path(self.record["artifacts_dir"]) / "session.json"
+        self.current_json = session.artifacts_root() / "current.json"
+
+    def tearDown(self):
+        session._SELECTED.reset(self.token)
+        self.env.stop()
+        self.tmp.cleanup()
+
+    def _template(self):
+        template = Path(self.tmp.name) / "Build" / "Products" / "runner.xctestrun"
+        template.parent.mkdir(parents=True, exist_ok=True)
+        template.write_bytes(plistlib.dumps({"AutonomUITests": {}}))
+        return template
+
+    def _assert_refused_without_runner(self, call, build=None):
+        build = build or Mock(return_value=self._template())
+        with patch.object(ios_xctest, "_build", build), \
+                patch.object(ios_xctest, "_alive", return_value=False), \
+                patch.object(ios_xctest.subprocess, "Popen") as popen, \
+                patch.object(ios_xctest.processes, "register") as register:
+            with self.assertRaises(errors.AutonomError) as caught:
+                call()
+        self.assertEqual(caught.exception.code, errors.SESSION_STOPPED)
+        popen.assert_not_called()
+        register.assert_not_called()
+        return build
+
+    def _stored(self):
+        return json.loads(self.session_json.read_text())
+
+    def _assert_served(self):
+        with patch.object(ios_xctest, "_ensure", return_value={"token": "t"}) as ensure, \
+                patch.object(ios_xctest, "_exchange", return_value={"dispatched": True}):
+            self.assertEqual(ios_xctest.request(TARGET, "tap", x=10, y=20), {"dispatched": True})
+        ensure.assert_called_once()
+
+    def test_mark_is_persisted_atomically_to_both_files(self):
+        token = session.mark_stopping(self.record)
+        for path in (self.session_json, self.current_json):
+            stored = json.loads(path.read_text())
+            self.assertTrue(stored["stopping_at"])
+            self.assertEqual(stored["stopping_tokens"], [token])
+        self.assertEqual(self.record["stopping_tokens"], [token])
+        self.assertNotIn("stopped_at", self._stored())
+        session.clear_stopping(self.record, token)
+        for path in (self.session_json, self.current_json):
+            stored = json.loads(path.read_text())
+            self.assertNotIn("stopping_at", stored)
+            self.assertNotIn("stopping_tokens", stored)
+        self.assertNotIn("stopping_tokens", self.record)
+
+    def test_each_stop_gets_its_own_token(self):
+        first = session.mark_stopping(self.record)
+        second = session.mark_stopping(self.record)
+        self.assertNotEqual(first, second)
+        self.assertEqual(self._stored()["stopping_tokens"], [first, second])
+
+    def test_one_of_two_stoppers_clearing_keeps_the_mark_and_refuses(self):
+        first = session.mark_stopping(self.record)
+        began = self._stored()["stopping_at"]
+        second = session.mark_stopping(self.record)
+        self.assertEqual(self._stored()["stopping_at"], began)  # the first stop's time
+        session.clear_stopping(self.record, first)
+        stored = self._stored()
+        self.assertEqual(stored["stopping_tokens"], [second])
+        self.assertEqual(stored["stopping_at"], began)
+        self.assertEqual(json.loads(self.current_json.read_text())["stopping_tokens"], [second])
+        build = self._assert_refused_without_runner(
+            lambda: ios_xctest.request(TARGET, "tap", x=10, y=20))
+        build.assert_not_called()
+        # Clearing the same token again, or an unknown one, changes nothing.
+        session.clear_stopping(self.record, first)
+        session.clear_stopping(self.record, "not-a-stopper")
+        self.assertEqual(self._stored()["stopping_tokens"], [second])
+        session.clear_stopping(self.record, second)
+        stored = self._stored()
+        self.assertNotIn("stopping_at", stored)
+        self.assertNotIn("stopping_tokens", stored)
+        self._assert_served()
+
+    def test_a_bare_stopping_at_counts_as_one_anonymous_stopper(self):
+        # A record written by the version before owner tokens.
+        stored = self._stored()
+        stored["stopping_at"] = "2026-10-04T00:00:00Z"
+        self.session_json.write_text(json.dumps(stored))
+        self.assertEqual(session.active_stoppers(stored), [session.ANONYMOUS_STOPPER])
+        build = self._assert_refused_without_runner(
+            lambda: ios_xctest.request(TARGET, "tap", x=10, y=20))
+        build.assert_not_called()
+        token = session.mark_stopping(self.record)
+        stored = self._stored()
+        self.assertEqual(stored["stopping_at"], "2026-10-04T00:00:00Z")
+        self.assertEqual(stored["stopping_tokens"], [session.ANONYMOUS_STOPPER, token])
+        session.clear_stopping(self.record, token)
+        stored = self._stored()
+        self.assertEqual(stored["stopping_at"], "2026-10-04T00:00:00Z")
+        self.assertEqual(session.active_stoppers(stored), [session.ANONYMOUS_STOPPER])
+        self._assert_refused_without_runner(
+            lambda: ios_xctest.request(TARGET, "tap", x=10, y=20))
+
+    def test_save_keeps_the_token_list_of_the_file(self):
+        stale = session.load_current()  # a copy from before both marks
+        first = session.mark_stopping(self.record)
+        second = session.mark_stopping(self.record)
+        session.save(stale)
+        self.assertEqual(self._stored()["stopping_tokens"], [first, second])
+        marked = session.load_current()  # a copy holding both tokens
+        session.clear_stopping(self.record, first)
+        session.save(marked)
+        self.assertEqual(self._stored()["stopping_tokens"], [second])
+        self.assertEqual(json.loads(self.current_json.read_text())["stopping_tokens"], [second])
+        session.clear_stopping(self.record, second)
+        session.save(marked)
+        self.assertNotIn("stopping_tokens", self._stored())
+        self.assertNotIn("stopping_at", self._stored())
+
+    def test_save_neither_drops_nor_revives_the_mark(self):
+        stale = session.load_current()  # a copy from before the mark
+        session.mark_stopping(self.record)
+        stale["ui_observation"] = {"ui_backend": "xcuitest"}
+        session.save(stale)
+        on_disk = json.loads(self.session_json.read_text())
+        self.assertTrue(on_disk["stopping_at"])
+        self.assertEqual(on_disk["ui_observation"], {"ui_backend": "xcuitest"})
+        marked = session.load_current()  # a copy taken during the stop
+        session.clear_stopping(self.record, session.active_stoppers(marked)[0])
+        session.save(marked)
+        self.assertNotIn("stopping_at", json.loads(self.session_json.read_text()))
+        self.assertNotIn("stopping_at", json.loads(self.current_json.read_text()))
+
+    def test_a_record_without_the_mark_is_served(self):
+        # Records written by older versions carry no stopping_at at all.
+        self.assertNotIn("stopping_at", json.loads(self.session_json.read_text()))
+        with patch.object(ios_xctest, "_ensure", return_value={"token": "t"}) as ensure, \
+                patch.object(ios_xctest, "_exchange", return_value={"dispatched": True}):
+            self.assertEqual(ios_xctest.request(TARGET, "tap", x=1, y=2), {"dispatched": True})
+        ensure.assert_called_once()
+
+    def test_a_request_during_teardown_is_refused_before_any_runner_work(self):
+        # `session stop` has marked the session and is tearing down; stopped_at
+        # is not written yet and the current pointer still names the session.
+        session.mark_stopping(self.record)
+        self.assertNotIn("stopped_at", json.loads(self.current_json.read_text()))
+        build = self._assert_refused_without_runner(
+            lambda: ios_xctest.request(TARGET, "tap", x=10, y=20))
+        build.assert_not_called()
+
+    def test_a_request_bound_by_session_id_during_teardown_is_refused(self):
+        session.select(self.record["session_id"])
+        session.mark_stopping(self.record)
+        build = self._assert_refused_without_runner(
+            lambda: ios_xctest.request(TARGET, "snapshot"))
+        build.assert_not_called()
+
+    def test_a_stop_that_begins_while_waiting_for_the_lock_is_refused(self):
+        real_lock = ios_xctest.lock
+
+        @contextlib.contextmanager
+        def mark_then_lock(path):
+            session.mark_stopping(self.record)
+            with real_lock(path):
+                yield
+        with patch.object(ios_xctest, "lock", side_effect=mark_then_lock):
+            build = self._assert_refused_without_runner(
+                lambda: ios_xctest.request(TARGET, "tap", x=10, y=20))
+        build.assert_not_called()
+
+    def test_a_stop_that_begins_while_the_runner_builds_gets_no_popen(self):
+        template = self._template()
+
+        def build_while_stop_begins():
+            session.mark_stopping(self.record)  # `session stop` elsewhere
+            return template
+        build = self._assert_refused_without_runner(
+            lambda: ios_xctest.request(TARGET, "tap", x=10, y=20),
+            build=Mock(side_effect=build_while_stop_begins))
+        build.assert_called_once()
+
+    def test_a_stop_that_finishes_while_the_runner_builds_gets_no_popen(self):
+        # The finished stop removed current.json: the session's own file decides.
+        template = self._template()
+
+        def build_while_stop_finishes():
+            session.stop_session(reap=False)
+            return template
+        build = self._assert_refused_without_runner(
+            lambda: ios_xctest.request(TARGET, "tap", x=10, y=20),
+            build=Mock(side_effect=build_while_stop_finishes))
+        build.assert_called_once()
+        self.assertFalse(self.current_json.exists())
+
+    def test_session_stop_marks_before_its_first_teardown_step(self):
+        cli = _load_cli()
+        seen = {}
+
+        def first_step(_target):
+            seen["mark"] = session.on_disk(self.record).get("stopping_at")
+            seen["stopped"] = session.on_disk(self.record).get("stopped_at")
+            return False
+        with patch.object(cli, "_target", return_value=TARGET), \
+                patch.object(cli, "_session_target_gone", return_value=False), \
+                patch.object(ios_xctest, "stop", side_effect=first_step), \
+                patch.object(session, "reap_owned_processes", return_value={}), \
+                patch.object(cli.logs_mod, "stop_log_writer", return_value={"result": "not_running"}), \
+                patch.object(cli, "_stop_recorder", return_value={"result": "not_running"}), \
+                patch.object(cli.proxy_mod, "stop", return_value={}), \
+                contextlib.redirect_stdout(open(os.devnull, "w")) as sink:
+            self.assertEqual(cli.cmd_session_stop(cli.argparse.Namespace()), 0)
+        sink.close()
+        self.assertTrue(seen["mark"])
+        self.assertIsNone(seen["stopped"])
+        stored = json.loads(self.session_json.read_text())
+        self.assertTrue(stored["stopped_at"])
+        self.assertFalse(self.current_json.exists())
+
+    def test_an_aborted_stop_clears_the_mark_and_requests_work_again(self):
+        cli = _load_cli()
+        record = session.load_current()
+        record["accessibility"] = {"previous": {}, "applied": {}, "enabled_by_autonom": True}
+        session.save(record)
+        during = {}
+
+        def restore_fails(_target, _record):
+            # While the stop runs, a runner request is refused.
+            try:
+                ios_xctest.request(TARGET, "tap", x=10, y=20)
+            except errors.AutonomError as exc:
+                during["code"] = exc.code
+            raise errors.AutonomError(errors.BACKEND_FAILED, "accessibility settings did not restore")
+        with patch.object(cli, "_target", return_value=TARGET), \
+                patch.object(cli.accessibility_mod, "restore", side_effect=restore_fails), \
+                patch.object(ios_xctest, "_build") as build, \
+                patch.object(ios_xctest, "stop") as runner_stop:
+            with self.assertRaises(errors.AutonomError) as caught:
+                cli.cmd_session_stop(cli.argparse.Namespace())
+        self.assertEqual(caught.exception.code, errors.BACKEND_FAILED)
+        self.assertEqual(during["code"], errors.SESSION_STOPPED)
+        build.assert_not_called()
+        runner_stop.assert_not_called()
+        stored = json.loads(self.session_json.read_text())
+        self.assertNotIn("stopping_at", stored)
+        self.assertNotIn("stopped_at", stored)
+        self.assertTrue(self.current_json.exists())
+        self.assertNotIn("stopping_at", json.loads(self.current_json.read_text()))
+        self.assertNotIn("stopping_tokens", stored)
+        # The session stays usable: the next request reaches the runner.
+        self._assert_served()
+
+    def test_an_interrupted_stop_clears_only_its_own_token(self):
+        # S2 (another terminal) is tearing down; S1 is interrupted (Ctrl-C)
+        # during its accessibility restore. S1 must withdraw only its own
+        # token: S2's mark stays and a request is still refused.
+        cli = _load_cli()
+        record = session.load_current()
+        record["accessibility"] = {"previous": {}, "applied": {}, "enabled_by_autonom": True}
+        session.save(record)
+        other = session.mark_stopping(self.record)  # S2
+        seen = {}
+
+        def restore_interrupted(_target, _record):
+            seen["tokens"] = list(session.on_disk(self.record)["stopping_tokens"])
+            raise KeyboardInterrupt
+        with patch.object(cli, "_target", return_value=TARGET), \
+                patch.object(cli.accessibility_mod, "restore", side_effect=restore_interrupted), \
+                patch.object(ios_xctest, "stop") as runner_stop:
+            with self.assertRaises(KeyboardInterrupt):
+                cli.cmd_session_stop(cli.argparse.Namespace())
+        runner_stop.assert_not_called()
+        self.assertEqual(len(seen["tokens"]), 2)
+        self.assertEqual(seen["tokens"][0], other)
+        stored = self._stored()
+        self.assertEqual(stored["stopping_tokens"], [other])
+        self.assertTrue(stored["stopping_at"])
+        self.assertNotIn("stopped_at", stored)
+        self.assertEqual(json.loads(self.current_json.read_text())["stopping_tokens"], [other])
+        build = self._assert_refused_without_runner(
+            lambda: ios_xctest.request(TARGET, "tap", x=10, y=20))
+        build.assert_not_called()
+        # Once S2 withdraws too, requests reach the runner again.
+        session.clear_stopping(self.record, other)
+        self.assertNotIn("stopping_at", self._stored())
+        self._assert_served()
+
+
+class LiveScriptHelperTests(unittest.TestCase):
+    """The live script's own checks: Xcode major parsing, typed-text redaction."""
+
+    @classmethod
+    def setUpClass(cls):
+        path = Path(__file__).resolve().parent / "live" / "ios_ui_recovery_live.py"
+        spec = importlib.util.spec_from_file_location("ios_ui_recovery_live", path)
+        cls.live = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(cls.live)
+
+    def test_xcode_major_parsing(self):
+        self.assertEqual(self.live.xcode_major("Xcode 27.0 Build version 27A266a"), 27)
+        self.assertEqual(self.live.xcode_major("Xcode 9.4.1 Build version 9F2000"), 9)
+        self.assertIsNone(self.live.xcode_major(""))
+        self.assertIsNone(self.live.xcode_major("xcode-select: error: tool 'xcodebuild' requires Xcode"))
+
+    def test_typed_text_never_reaches_the_recorded_calls(self):
+        autonom = self.live.Autonom("UDID", Path(self.id()), None)
+        typed = self.live.TYPED
+        answer = subprocess.CompletedProcess([], 0, stdout=json.dumps(
+            {"ok": True, "typed": typed, "backend": "xcuitest"}), stderr="")
+        with patch.object(self.live, "run", return_value=answer):
+            payload = autonom("ui", "type", typed, "--sensitive", secret=typed)
+        self.assertNotIn(typed, json.dumps(autonom.calls))
+        self.assertNotIn(typed, json.dumps(payload))
+        self.assertEqual(autonom.calls[0]["argv"], ["ui", "type", f"<{len(typed)} chars>", "--sensitive"])
+        self.assertEqual(payload["backend"], "xcuitest")
+
+    def test_a_failed_type_keeps_the_text_out_of_the_error(self):
+        autonom = self.live.Autonom("UDID", Path(self.id()), None)
+        typed = self.live.TYPED
+        answer = subprocess.CompletedProcess([], 2, stdout="", stderr=json.dumps(
+            {"ok": False, "error_code": "no_focused_field", "error": "Tap a text field"}))
+        with patch.object(self.live, "run", return_value=answer):
+            with self.assertRaises(self.live.StepFailed) as caught:
+                autonom("ui", "type", typed, secret=typed)
+        self.assertNotIn(typed, str(caught.exception))
+        self.assertIn("no_focused_field", str(caught.exception))
+
+    def test_row_helpers_on_partial_nodes(self):
+        nodes = [{"desc": "General", "resource_id": "com.apple.settings.general",
+                  "bounds": [16, 293, 386, 345]},
+                 {"desc": "General", "role": "text"},  # the row's label, not the row
+                 {"desc": "Wallet", "resource_id": "com.apple.settings.wallet"},
+                 {"resource_id": "com.apple.settings.empty"}]
+        self.assertEqual(self.live.row_labels(nodes), {"General", "Wallet"})
+        self.assertEqual(self.live.row_top(nodes, "General"), 293)
+        self.assertIsNone(self.live.row_top(nodes, "Wallet"))
+        self.assertIsNone(self.live.search_field(nodes))
 
 
 class SessionWriteSafetyTests(unittest.TestCase):

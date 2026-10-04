@@ -103,6 +103,25 @@ its own bundle and the log it writes. Concurrent journal appends allocate sequen
 under a file lock. `session stop` is recorded after teardown even though the
 current pointer has been removed.
 
+Before its first teardown step, `session stop` writes the stopping mark on the
+session record: `stopping_at` (when the first active stop began) and
+`stopping_tokens`, one owner token per `session stop` still tearing down
+(both `session.json` and the current pointer, atomically and under the
+record's lock). From then on a runner request for that session is refused
+with `session_stopped` while any stop holds the mark: when it starts, again
+once it holds the Simulator's request lock, and once more right before a new
+runner process would start, after the build (each check reads the session's
+own `session.json`, since a finished stop has already removed the pointer). So
+a command racing the stop never leaves a runner behind it. A stop that aborts
+before the session is stopped (an accessibility restore that fails keeps the
+pointer) withdraws only its own token: while another `session stop` is still
+tearing down the mark stays and requests are still refused, and once no token
+is left the mark is dropped and the session stays usable. A stop killed
+outright leaves its token, and running `session stop` again finishes the job.
+The mark stays on the stopped record beside `stopped_at`. A bare `stopping_at`
+without `stopping_tokens` counts as one stop in progress; records written by
+earlier versions simply have no mark. Other commands ignore it.
+
 Results and flow events include the selected UI backend and fallback reason.
 Screenshots and flow assertions supply outcome evidence; successful command exit
 alone only means dispatch succeeded.
@@ -136,18 +155,30 @@ for measured results and the limits of these fixture scenarios.
 
 Unit regressions (`tests/test_ui_recovery.py`) cover zero roots, valid child
 windows, partial extents, rotated PNG geometry, unknown-screen refusal, empty-tree
-fallback, uncertain single-dispatch input, the XCUITest and idb/AXe composition,
-runner stop, measured capabilities, session selection, flag abbreviations and
-resolved Android launch.
+fallback, uncertain single-dispatch input (also for `auto` following a persisted
+runner observation), the XCUITest and idb/AXe composition, runner stop, the
+stopping mark (a request during teardown, a stop that begins while the
+runner builds, an aborted stop, two concurrent stops of which one aborts),
+measured capabilities, session selection,
+flag abbreviations, resolved Android launch and the live script's redaction
+helpers.
 
 ## Live check
 
-`tests/live/ios_ui_recovery_live.py --udid <UDID> --evidence-dir DIR` runs the
-runner for real on one isolated simulator, under a temporary `AUTONOM_HOME`:
-an explicit `xcuitest` session against Settings, an `auto` session whose idb
-answers an empty tree (through a forwarding `AUTONOM_IDB` wrapper) with one
-semantic tap on the General row, a plain idb session, and a check that no runner
-`xcodebuild` is left after `session stop`. It boots the simulator only when it is
-shut down, and shuts it down again only then. It writes `ios_recovery.json`;
-nothing is typed and runner logs are never copied. See
-[validation evidence](IOS_UI_RECOVERY_VALIDATION.md).
+`tests/live/ios_ui_recovery_live.py --udid <UDID> --evidence-dir DIR
+[--expect-xcode-major N]` runs the runner for real on one isolated simulator,
+under a temporary `AUTONOM_HOME`: first a plain idb session (on the fresh
+boot), then an explicit `xcuitest` session against Settings, an `auto` session
+whose idb answers an empty tree (through a forwarding `AUTONOM_IDB` wrapper)
+with one semantic tap on the General row, and one `xcuitest` session that
+checks each runner input with its own pass/fail field: text entry (a fixed
+non-secret string typed into the Settings search field must be the field's
+value), long press (a 1 s press on that field must open the text edit menu),
+swipe (rows absent before must appear and the General row must move up) and
+Home (the next runner tree must no longer hold Settings). After every
+`session stop` no runner `xcodebuild` may be left. `ok` also requires the
+simulator to end in the state it started in and `xcodebuild -version` to
+report the expected Xcode major version (default 27). It boots the simulator
+only when it is shut down, and shuts it down again only then. It writes
+`ios_recovery.json`; of the typed text only its length is recorded, and runner
+logs are never copied. See [validation evidence](IOS_UI_RECOVERY_VALIDATION.md).

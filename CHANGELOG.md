@@ -82,6 +82,38 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
   permission prompt (`examples/flows/`), and `tests/live/ios_ui_recovery_live.py`,
   the live check of the runner on an isolated simulator. The release archive
   now carries `native/` and `examples/`.
+- The live check now also drives text entry, long press, swipe and Home
+  through the runner in Settings, each with its own pass/fail field and an
+  observed outcome (the field's value, the text edit menu, newly revealed
+  rows, Settings leaving the runner's tree); of the typed text only its
+  length reaches the evidence. Its `ok` also requires the simulator to end in
+  the state it started in and the expected Xcode major version
+  (`--expect-xcode-major`, default 27). The idb baseline now runs first, on
+  the fresh boot.
+
+### Fixed
+- **A runner request racing `session stop` no longer starts a runner after
+  the stop (#31).** `session stop` now writes `stopping_at` on the session
+  record, atomically and under the record lock, before its first teardown
+  step. A runner request refuses a stopping or stopped session with
+  `session_stopped` when it starts, again under the Simulator's request
+  lock, and once more right before it would launch a new runner (after the
+  build, which takes at least a second); the checks read the session's own
+  `session.json`, so a stop that already removed the current pointer is
+  seen too. A stop that aborts before the session is stopped (a failed
+  accessibility restore keeps the pointer) withdraws only its own owner token
+  (`stopping_tokens`): the mark stays while another `session stop` is still
+  tearing down, and once none is left the session stays usable.
+  `session.save` keeps whatever mark the file holds, so a
+  command holding an older copy neither drops nor revives it. Records from
+  earlier versions have no mark and behave as before. Closes #31: the window
+  in which a request could pass both checks and start a runner registered to
+  a stopped session is gone, so that runner no longer waits out its
+  5-minute idle timeout or needs `autonom cleanup`.
+- An unanswered runner tap under `--ui-backend auto`, in an invocation that
+  follows the session's persisted runner observation, is covered by a
+  regression: one runner request, `ui_action_uncertain`, nothing through idb
+  or AXe.
 
 ## [0.31.2] - 2026-10-03
 

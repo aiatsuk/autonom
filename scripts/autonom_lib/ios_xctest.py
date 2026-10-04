@@ -180,7 +180,10 @@ def _test_entry(configuration: dict) -> dict:
                               f"Delete the cached builds under {root() / 'builds'} and retry.")
 
 
-def _ensure(target: Target, directory: Path) -> dict:
+def _ensure(target: Target, directory: Path, owner: dict | None = None) -> dict:
+    """The live runner for this simulator, started when there is none.
+    `owner` is the session record the request began with; it is read again
+    from disk right before a new runner starts (the build takes time)."""
     state = _read(directory / "state.json")
     current = _owner(target)
     if _alive(state):
@@ -215,6 +218,10 @@ def _ensure(target: Target, directory: Path) -> dict:
     runfile.write_bytes(plistlib.dumps(configuration))
     runfile.chmod(0o600)
     log = directory / "runner.log"
+    # A `session stop` that began while the runner was being built must not
+    # find a new runner after it returns: checked last, right before Popen,
+    # still under request.lock.
+    _refuse_stopped(session.on_disk(owner or current))
     # XCTest logs can contain element labels and typed values. Keep private and
     # never return log contents in a JSON error or journal.
     with log.open("w") as stream:
@@ -259,27 +266,33 @@ def _ensure(target: Target, directory: Path) -> dict:
 
 
 def _refuse_stopped(record: dict) -> None:
-    """A session stopped while this command ran (`session stop` in another
-    terminal) must not get a new runner: `session stop` could never reach it."""
-    if record.get("stopped_at"):
+    """A session that is stopping or stopped (`session stop` in another
+    terminal) must not get a new runner, nor send one input: `session stop`
+    marks the session stopping before its teardown and could never reach a
+    runner started after that. Any active stopper refuses: one stop that
+    aborts leaves the mark of another that is still tearing down."""
+    if record.get("stopped_at") or session.is_stopping(record):
+        state = "has stopped" if record.get("stopped_at") else "is stopping"
         raise errors.AutonomError(
-            errors.SESSION_STOPPED, f"session {record.get('session_id')} has stopped",
+            errors.SESSION_STOPPED, f"session {record.get('session_id')} {state}",
             "Start a new session to drive the simulator.",
             session_id=record.get("session_id"))
 
 
 def request(target: Target, command: str, *, app_id: str | None = None, **values) -> dict:
     current = session.load_current() or {}
-    _refuse_stopped(current)
+    _refuse_stopped(session.on_disk(current))
     app_id = app_id or (current.get("app_id") if current.get("target_id") == target.target_id else None)
     if not app_id and command != "stop":
         raise errors.AutonomError(errors.APP_ID_REQUIRED, "XCUITest requires an explicit app session",
                                   "Start a session with --app-id and select it with --session-id.")
     directory = state_dir(target)
     with lock(directory / "request.lock"):
-        # Again under the lock: the stop may land while this waits for it.
-        _refuse_stopped(session.load_current() or {})
-        state = _ensure(target, directory)
+        # Again under the lock: the stop may begin while this waits for it.
+        # Read from the session's own file, since a finished stop has already
+        # removed the current pointer this command started from.
+        _refuse_stopped(session.on_disk(current))
+        state = _ensure(target, directory, current)
         return _exchange(state, command, app_id, values)
 
 
