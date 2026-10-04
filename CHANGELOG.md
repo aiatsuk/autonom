@@ -31,6 +31,57 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
   of device buttons and an inspector, light and dark themes, and a phone
   layout with 44 px targets; element ids and `window.autonomCanvas` are kept.
   Compatibility notes are in `docs/COMPATIBILITY.md`.
+- **iOS UI recovery through an optional XCUITest backend** — ported from the
+  September `fix/ios-ui-recovery` work onto the AXe input routing. A new
+  `--ui-backend auto|idb|xcuitest` (also `AUTONOM_UI_BACKEND`, and stored by
+  `session start --ui-backend`) chooses who serves the iOS tree and input.
+  `auto` (the default) keeps idb, with `--ios-hid auto|idb|axe` routing its
+  input exactly as before; only when an app session's idb tree is empty, has
+  no usable root frame, or fails does it switch to the bundled targetless
+  UI-test runner (`native/ios`), and it records `fallback_reason`
+  (`empty_accessibility_tree`, `invalid_accessibility_geometry`, or the idb
+  error code). The runner serves tree, find, selector and coordinate taps
+  (by element reference when the node came from its own tree), long press,
+  swipe, text and Home through a nonce-bound mailbox in the Simulator
+  container; it needs full Xcode, builds on first use (cached by source and
+  Xcode version; builds with Xcode 27), exits after five idle minutes, is
+  registered to the session with a process signature, and is stopped by
+  `session stop`. Every runner input is sent once: a lost answer is
+  `ui_action_uncertain`, never repeated and never re-sent through idb or AXe.
+  iOS results and flow events carry `ui_backend`, `input_backend`,
+  `fallback_reason` and `geometry` when a UI read or input measured them, and
+  the input verbs report `backend: xcuitest`.
+- **Screen geometry is validated, not guessed** — a zero or missing root
+  frame is no longer a screen and child extents are no longer taken as its
+  size; Autonom then measures Simulator points from the device type's screen
+  scale (`capabilities.plist` on Xcode 27, `profile.plist` before) checked
+  against a fresh screenshot's pixels and orientation. While the XCUITest
+  runner serves the session, an input whose screen size cannot be established
+  is refused before dispatch with `display_geometry_unavailable`; the idb/AXe
+  route still sends it unguarded, as before.
+- **`--session-id` on every device verb** — binds one invocation to a
+  session without moving the current pointer. A stopped session is accepted
+  only by read-only verbs (`journal`, `shots`, `logs`, `report` except
+  `report serve`, `session show|outputs`; others answer `session_stopped`;
+  its journal and `session.json` never change after the stop), another
+  target's flags
+  answer `session_target_mismatch`, and `session start` refuses it. `session
+  stop` is journaled after teardown. Journal appends allocate sequence numbers
+  under a file lock.
+- **Measured UI readiness** — `capabilities --probe` reads the current UI
+  once; a UI read in the last minute refines the installed-tooling view of
+  `ui.accessibility` (a degraded tree and its reason), and while the runner
+  serves a session `ui.input` is the runner's. Flows that require
+  `ui.accessibility` or `ui.input` on iOS measure once in preflight.
+- New additive error codes: `session_stopped`, `session_target_mismatch`,
+  `display_geometry_unavailable`, `ui_action_uncertain`, `app_id_required`,
+  `ui_bridge_in_use`, `xcuitest_unavailable`, `xcuitest_build_failed`,
+  `xcuitest_start_failed`, `xcuitest_timeout`, `xcuitest_failed`,
+  `stale_ui_element`, `no_focused_field`.
+- Reader fixture flows for a durable offline draft and a cancelled Google
+  permission prompt (`examples/flows/`), and `tests/live/ios_ui_recovery_live.py`,
+  the live check of the runner on an isolated simulator. The release archive
+  now carries `native/` and `examples/`.
 
 ## [0.31.2] - 2026-10-03
 

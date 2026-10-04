@@ -391,6 +391,23 @@ class StaleSessionTests(CliCase):
         self.assertIn("even if", payload["hint"])
 
 
+class BrokenPointerTests(CliCase):
+    """A truncated current.json must not break verbs that do not need a
+    session; the journal tolerates it as it always did."""
+
+    def test_session_independent_verbs_survive_a_truncated_pointer(self) -> None:
+        broken = '{"session_id": "s_x", trunc'
+        pointer = session_mod.sessions_home() / "current.json"
+        pointer.parent.mkdir(parents=True, exist_ok=True)
+        pointer.write_text(broken, encoding="utf-8")
+        for argv in (("version",), ("processes",), ("devices",)):
+            completed = self.raw("--adb", str(FAKE_ADB), "--serial", SERIAL, *argv)
+            payload = self.parse(completed)
+            self.assertEqual(completed.returncode, 0, (argv, payload))
+            self.assertNotIn("error_code", payload, argv)
+        self.assertEqual(pointer.read_text(encoding="utf-8"), broken)
+
+
 # --- session verbs ------------------------------------------------------------
 
 

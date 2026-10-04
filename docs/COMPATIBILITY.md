@@ -272,6 +272,43 @@ A Canvas killed with SIGKILL leaves the preset on the device until
 on the same device takes the first one's preset as its original. Both are
 documented in the `android-emulator-browser` skill.
 
+### iOS UI recovery and `--session-id` (unreleased)
+
+Additive, with two behaviour changes listed at the end. A host that passes
+neither `--ui-backend` nor `--session-id`, on a screen whose idb tree is
+usable, sees the same results plus additive keys.
+
+| Surface | Before | Now |
+| --- | --- | --- |
+| `--ui-backend auto\|idb\|xcuitest` | — | new flag (before or after the verb), `AUTONOM_UI_BACKEND`, and `session start --ui-backend`, stored as the session's `ui_backend_preference`. `auto` is the default and keeps idb; `--ios-hid` still routes idb-side input (idb or AXe) |
+| `--session-id ID` | `session outputs`, `journal` and `logs follow` only, to read a past session | every device verb, and the top-level parser (`autonom --session-id ID report build`). The command uses that session's record and artifacts, and an active session's journal, and never moves the current pointer. The three read-only uses keep working, also on stopped sessions, as do `shots`, `report` (except `report serve`, whose `/replay` drives the device: `session_stopped`) and `session show`; nothing rewrites a stopped session's `session.json`; a stopped session's journal never grows, and the command is journaled in the current session, if any, as before. `current` means the current session. A command without `--session-id` whose target flags name another device is still journaled in the current session |
+| iOS input verbs | `backend`: `idb` or `axe` | also `xcuitest` when the runner served the input |
+| iOS results (`ui *`, `screenshot`, flow events, journal summaries) | — | additive `ui_backend`, `input_backend`, `fallback_reason` and `geometry` when the invocation read the UI or sent input; flow events carry the first three |
+| iOS compact nodes | — | additive `xcuitest_ref` on nodes from the runner's tree |
+| `capabilities` | — | additive `--probe` (reads the current UI once). On iOS a UI read in the last 60 s refines `ui.accessibility` (`degraded` with the `fallback_reason` as reason); while the runner serves the session, `ui.input` is `available` after a runner input in the last 60 s, else `degraded`. Without such a read the installed-tooling values are unchanged |
+| Flow preflight | — | a flow requiring `ui.accessibility` or `ui.input` on iOS reads the UI once first; a failed read leaves the tooling values to decide |
+| Session record | — | additive `ui_backend_preference` and `ui_observation` |
+| Machine state | — | `$AUTONOM_HOME/xcuitest/` (or `~/.autonom/xcuitest/`): cached runner builds and per-simulator runner state, mode `0700`; the process registry gains rows of kind `xcuitest` with a signature and process group |
+| `session stop` teardown | — | an `xcuitest` action first: the runner is asked to stop and, if it does not exit, ended through its registry row; once it has exited, this run's result bundle, any older ones of that Simulator and the runner log are deleted, while a newer runner started concurrently and still alive keeps its own bundle and log (a new runner deletes the bundles an ended runner left; a runner that never got ready deletes its bundle and the runner log) |
+| Error codes | — | `session_stopped`, `session_target_mismatch`, `display_geometry_unavailable`, `ui_action_uncertain`, `app_id_required`, `ui_bridge_in_use`, `xcuitest_unavailable`, `xcuitest_build_failed`, `xcuitest_start_failed`, `xcuitest_timeout`, `xcuitest_failed`, `stale_ui_element`, `no_focused_field` (the last three come from the runner) |
+
+Behaviour changes:
+
+- An iOS tap, long press, double tap or swipe whose screen size cannot be
+  established is still dispatched unguarded on the idb/AXe route, as before
+  (Canvas taps, sessions without `--app-id`, a zero root frame under
+  `--ui-backend idb`). Only while the XCUITest runner serves the session is
+  such input refused with `display_geometry_unavailable` before anything is
+  sent: the runner maps coordinates in the points of the screen it reports.
+  The guard's screen size no longer falls back to the widest child extent; a
+  tree without a usable root frame is measured from the Simulator device type
+  (`capabilities.plist` on Xcode 27, `profile.plist` before) and a screenshot
+  instead, and is left unguarded when that fails too.
+- With `auto`, an app session whose idb tree is empty, has no usable root
+  frame, or fails is served by the XCUITest runner when full Xcode is
+  present, instead of returning the empty tree or the idb error.
+
+
 ## Exit codes and streams
 
 - `0` success · `2` expected failure (`AutonomError` as one JSON object on

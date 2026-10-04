@@ -54,6 +54,8 @@ mkdir -p "$stage"
 # Curated runnable set — no tests, no caches, no VCS.
 cp -R scripts "$stage/scripts"
 cp -R plugins "$stage/plugins"
+cp -R native "$stage/native"
+cp -R examples "$stage/examples"
 cp -R .agents "$stage/.agents"
 cp -R .claude-plugin "$stage/.claude-plugin"
 cp README.md CHANGELOG.md LICENSE "$stage/"

@@ -30,7 +30,7 @@ DOC = ROOT / "docs/CAPABILITIES.md"
 # sentence above the block rather than 40 times inside it.
 TARGET_FLAGS = frozenset({
     "--platform", "--target", "--serial", "--udid",
-    "--adb", "--simctl", "--idb", "--idb-host", "--idb-port",
+    "--adb", "--simctl", "--idb", "--idb-host", "--idb-port", "--session-id", "--ui-backend",
 })
 
 # The selector set is shared by `ui find` and `ui tap`; the doc spells it out on

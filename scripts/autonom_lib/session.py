@@ -8,17 +8,59 @@ not create, because a user may be mid-investigation when they update (INV-02).
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
+import re
 import subprocess
+import tempfile
 import time
 import uuid
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Callable
 
 from . import errors
 
+try:  # POSIX (macOS, Linux: every platform Autonom runs on); absent on Windows
+    import fcntl
+except ImportError:  # pragma: no cover
+    fcntl = None  # type: ignore[assignment]
+
 SCHEMA_VERSION = 2
+# The session one CLI invocation is bound to: None follows `current.json`,
+# a session id is that session (`--session-id`).
+_SELECTED: ContextVar[str | None] = ContextVar("autonom_session", default=None)
+_SESSION_ID = re.compile(r"s_[A-Za-z0-9]+")
+
+
+def select(session_id: str | None):
+    """Bind the rest of this invocation to `session_id`; returns the reset token."""
+    return _SELECTED.set(session_id)
+
+
+def load_by_id(session_id: str, cwd: Path | None = None) -> dict[str, Any]:
+    """A session record by id, stopped or not. The id is checked before it
+    becomes part of a path."""
+    if not _SESSION_ID.fullmatch(session_id or ""):
+        raise errors.AutonomError(
+            errors.SESSION_NOT_FOUND, f"no session {session_id!r}",
+            f"Session ids look like s_0123456789; sessions live under {artifacts_root(cwd)}.")
+    path = artifacts_root(cwd) / session_id / "session.json"
+    if not path.is_file():
+        raise errors.AutonomError(
+            errors.SESSION_NOT_FOUND, f"no session {session_id!r}",
+            f"Sessions live under {artifacts_root(cwd)}.")
+    return upgrade(json.loads(path.read_text(encoding="utf-8")))
+
+
+def _current_id(cwd: Path | None) -> str | None:
+    path = artifacts_root(cwd) / "current.json"
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return value.get("session_id") if isinstance(value, dict) else None
 
 
 def sessions_home() -> Path:
@@ -187,14 +229,73 @@ def start_session(
     return record
 
 
+def _write_atomic(path: Path, payload: str) -> None:
+    """Replace `path` in one step: a reader (the Canvas bridge, a parallel
+    verb) sees the old file or the new one, never a truncated one."""
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp",
+                                             dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+        try:
+            mode = path.stat().st_mode & 0o777
+        except OSError:
+            mode = 0o644  # what write_text gave a new file under the usual umask
+        os.chmod(temporary, mode)
+        os.replace(temporary, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(temporary)
+        raise
+
+
+@contextlib.contextmanager
+def _record_lock(directory: Path):
+    """Serialize writes of one session's record across processes (`save`
+    against `session stop`): an exclusive flock on the session directory
+    itself, so no lock file joins the session's artifacts."""
+    if fcntl is None:  # pragma: no cover - Windows
+        yield
+        return
+    descriptor = os.open(directory, os.O_RDONLY)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(descriptor)  # releases the lock
+
+
 def save(record: dict[str, Any], cwd: Path | None = None) -> dict[str, Any]:
-    """Persist to both the session directory and the current-session pointer."""
+    """Persist to both the session directory and the current-session pointer.
+
+    A stopped session is read-only: a record that carries `stopped_at`, or
+    whose `session.json` already does (a long-running command holding a copy
+    from before the stop), is returned unwritten. The check and both writes
+    hold the session's lock, which `stop_session` takes too, so a save racing
+    a stop can neither drop `stopped_at` nor bring `current.json` back. Each
+    file is replaced atomically."""
     path = Path(record["artifacts_dir"]) / "session.json"
+    if record.get("stopped_at"):
+        return record
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(record, indent=2, ensure_ascii=False) + "\n"
-    path.write_text(payload, encoding="utf-8")
-    _write_current(cwd, record)
+    with _record_lock(path.parent):
+        if _stopped_on_disk(path):
+            return record
+        _write_atomic(path, payload)
+        # A command bound to another session (--session-id) must not move the
+        # machine's current pointer; the current session itself is still mirrored.
+        if _SELECTED.get() is None or _current_id(cwd) == record.get("session_id"):
+            _write_current(cwd, record)
     return record
+
+
+def _stopped_on_disk(path: Path) -> bool:
+    try:
+        stored = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(stored, dict) and bool(stored.get("stopped_at"))
 
 
 def stop_session(cwd: Path | None = None, *, reap: bool = True) -> dict[str, Any] | None:
@@ -209,9 +310,9 @@ def stop_session(cwd: Path | None = None, *, reap: bool = True) -> dict[str, Any
     must not outlive the session it served.
     """
     current = artifacts_root(cwd) / "current.json"
-    if not current.exists():
+    record = load_current(cwd)
+    if not record:
         return None
-    record = upgrade(json.loads(current.read_text(encoding="utf-8")))
     record["stopped_at"] = _now()
     if reap:
         teardown = reap_owned_processes(record)
@@ -220,16 +321,40 @@ def stop_session(cwd: Path | None = None, *, reap: bool = True) -> dict[str, Any
             record["process_teardown"] = teardown
     session_path = Path(record["artifacts_dir"]) / "session.json"
     session_path.parent.mkdir(parents=True, exist_ok=True)
-    session_path.write_text(json.dumps(record, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    current.unlink(missing_ok=True)
+    with _record_lock(session_path.parent):
+        _write_atomic(session_path,
+                      json.dumps(record, indent=2, ensure_ascii=False) + "\n")
+        if _current_id(cwd) == record.get("session_id"):
+            current.unlink(missing_ok=True)
     return record
 
 
 def load_current(cwd: Path | None = None) -> dict[str, Any] | None:
+    selected = _SELECTED.get()
+    if selected:
+        return load_by_id(selected, cwd)
+    return _load_pointer(cwd)
+
+
+def _load_pointer(cwd: Path | None = None) -> dict[str, Any] | None:
+    """The machine's current session (`current.json`), whatever is selected."""
     path = artifacts_root(cwd) / "current.json"
     if not path.exists():
         return None
     return upgrade(json.loads(path.read_text(encoding="utf-8")))
+
+
+def journal_session(cwd: Path | None = None) -> dict[str, Any] | None:
+    """The session this invocation's journal entry belongs to.
+
+    A session that has stopped is read-only: `--session-id` may name one for
+    reading, but nothing is ever appended to its timeline after the stop. The
+    entry then goes where it always went, the machine's current session (or
+    nowhere when there is none)."""
+    record = load_current(cwd)
+    if record and record.get("stopped_at"):
+        return _load_pointer(cwd)
+    return record
 
 
 def require_current(cwd: Path | None = None) -> dict[str, Any]:
@@ -245,7 +370,7 @@ def require_current(cwd: Path | None = None) -> dict[str, Any]:
 
 def _write_current(cwd: Path | None, record: dict[str, Any]) -> None:
     path = artifacts_root(cwd) / "current.json"
-    path.write_text(json.dumps(record, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    _write_atomic(path, json.dumps(record, indent=2, ensure_ascii=False) + "\n")
 
 
 def artifact_path(record: dict[str, Any], *parts: str) -> Path:

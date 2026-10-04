@@ -109,6 +109,15 @@ _ROOT_PARSER: argparse.ArgumentParser | None = None
 
 def emit(data: Any, *, as_json: bool) -> int:
     global _LAST_EMIT
+    if isinstance(data, dict) and data.get("platform") == IOS:
+        # UI provenance measured by this invocation (which backend served the
+        # tree and the input, and why it fell back); never overrides a key
+        # the verb set itself.
+        from autonom_lib import ui_ios
+        observed = ui_ios.observation(data.get("target_id", ""))
+        for key in ui_ios.PROVENANCE_KEYS:
+            if observed.get(key) is not None:
+                data.setdefault(key, observed[key])
     _LAST_EMIT = data if isinstance(data, dict) else None
     if as_json or isinstance(data, (dict, list)):
         print(json.dumps(data, indent=2, ensure_ascii=False))
@@ -128,7 +137,17 @@ def fail_error(exc: errors.AutonomError, code: int = 2) -> int:
 
 
 def _target(args: argparse.Namespace) -> Target:
-    return platform_mod.resolve(args, session_record=session_mod.load_current())
+    record = session_mod.load_current()
+    target = platform_mod.resolve(args, session_record=record)
+    if record and (record.get("target_id") != target.target_id or record.get("platform") != target.platform):
+        if getattr(args, "session_id", None):
+            raise errors.AutonomError(
+                errors.SESSION_TARGET_MISMATCH,
+                f"session {record.get('session_id')} belongs to {record.get('target_id')}, "
+                f"not {target.target_id}",
+                "Drop the target flags, or name the session that owns that target.",
+                session_id=record.get("session_id"), target_id=record.get("target_id"))
+    return target
 
 
 def _selectors(args: argparse.Namespace) -> dict[str, Any]:
@@ -410,11 +429,12 @@ def cmd_session_start(args: argparse.Namespace) -> int:
         tooling=tooling,
     )
 
+    record["ui_backend_preference"] = getattr(args, "ui_backend", None) or "auto"
     warnings: list[dict[str, Any]] = []
     if target.platform == IOS and tooling.get("idb", {}).get("state") != "ready":
         warnings.append({
             "code": errors.IDB_REQUIRED,
-            "error": "idb is not available; 'ui' verbs will fail",
+            "error": "idb is not available; UI will try the XCUITest backend when Xcode is available",
             "hint": "simctl-backed verbs (screenshot, logs, open, permissions) still work.",
         })
 
@@ -529,9 +549,18 @@ def cmd_session_stop(args: argparse.Namespace) -> int:
         verification["recorder"] = outcome
         return outcome["result"] == "terminated"
 
+    def _stop_ui_bridge() -> bool:
+        # The optional XCUITest runner: asked to stop through its mailbox,
+        # then its registry row; session_processes below is the backstop.
+        if record.get("platform") != IOS:
+            return False
+        from autonom_lib import ios_xctest
+        return ios_xctest.stop(_target(argparse.Namespace()))
+
     # Order matters: restore the device's network before killing the proxy, or the
     # device is briefly pointed at a dead listener (INV-07, INV-10).
     actions: list[tuple[str, Any]] = [
+        ("xcuitest", _stop_ui_bridge),
         ("log_stream", _log_stream),
         ("recorder", _recorder),
         ("network_detach", _detach),
@@ -1352,7 +1381,7 @@ def cmd_ui_tap(args: argparse.Namespace) -> int:
     if duration:
         backend = _backend(ui_mod.long_press(target, x, y, duration))
     else:
-        backend = _backend(ui_mod.tap(target, x, y))
+        backend = _backend(ui_mod.tap(target, x, y, node=node))
     detail = actions_mod.record_detail(session_mod.load_current(), "tap", {
         "kind": "tap",
         "coordinate": node is None,
@@ -1586,7 +1615,9 @@ def cmd_logs_tail(args: argparse.Namespace) -> int:
         payload["image_uuids"] = detail["image_uuids"]
     if warnings:
         payload["warnings"] = warnings
-    if current:
+    # A stopped session named with --session-id is only read: its evidence
+    # is never overwritten with logs captured after the stop.
+    if current and not current.get("stopped_at"):
         out = session_mod.artifact_path(current, "logs", "latest.json")
         out.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
         payload["saved"] = str(out)
@@ -3831,6 +3862,15 @@ def cmd_capabilities(args: argparse.Namespace) -> int:
     if record is None or record.get("target_id") != target.target_id:
         record = {"platform": target.platform, "target_id": target.target_id,
                   "tooling": {}, "network": {}, "session_id": None}
+    if getattr(args, "probe", False):
+        # --probe reads the current UI once, so ui.accessibility / ui.input
+        # describe what was measured, not only what is installed.
+        ui_mod.tree(target)
+        if target.platform == IOS:
+            from autonom_lib import ui_ios
+            observed = ui_ios.observation(target.target_id)
+            if observed:
+                record = {**record, "ui_observation": observed}
     snapshot = providers_mod.open_session(target, record).capabilities()
     return emit({"ok": True, "session_id": record.get("session_id"),
                  **snapshot.as_dict()}, as_json=True)
@@ -4264,6 +4304,10 @@ def target_flags_parent() -> argparse.ArgumentParser:
     top-level parser already set with its own `None`.
     """
     parent = argparse.ArgumentParser(add_help=False)
+    parent.add_argument("--session-id", default=argparse.SUPPRESS,
+                        help="bind this command to a session (a stopped one: read-only verbs)")
+    parent.add_argument("--ui-backend", choices=("auto", "idb", "xcuitest"), default=argparse.SUPPRESS,
+                        help="iOS tree and input backend (default auto: idb, XCUITest on an unusable tree)")
     parent.add_argument("--platform", choices=("android", "ios"), default=argparse.SUPPRESS)
     parent.add_argument("--target", default=argparse.SUPPRESS)
     parent.add_argument("--serial", default=argparse.SUPPRESS)
@@ -4311,6 +4355,11 @@ def _add_selector_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--index", type=int)
 
 
+# `session outputs`, `journal` and `logs follow` had their own --session-id
+# before it became a target flag; its abbreviations keep working there.
+_ABBREVIABLE_SESSION_ID = journal_mod.EXACT_ONLY_OPTIONS - {"--session-id"}
+
+
 class _JsonArgumentParser(argparse.ArgumentParser):
     """argparse that fails the way every other Autonom failure does.
 
@@ -4319,6 +4368,16 @@ class _JsonArgumentParser(argparse.ArgumentParser):
     agent branching on `error_code` had nothing to read. Subparsers inherit
     this class, so the envelope covers every level.
     """
+
+    # Matched only when spelled in full: these flags came after abbreviations
+    # of the older ones were in use (`--u` is `--udid`, `--se` is `--serial`).
+    # journal._resolve_option mirrors this when it resolves argv.
+    exact_only_options = journal_mod.EXACT_ONLY_OPTIONS
+
+    def _get_option_tuples(self, option_string: str):  # type: ignore[override]
+        tuples = super()._get_option_tuples(option_string)
+        return [item for item in tuples
+                if not set(item[0].option_strings) & self.exact_only_options]
 
     def error(self, message: str) -> None:  # type: ignore[override]
         payload = {
@@ -4336,6 +4395,10 @@ def build_parser() -> argparse.ArgumentParser:
         prog="autonom",
         description="Universal mobile test/debug control plane for AI agents (Android + iOS).",
     )
+    parser.add_argument("--session-id",
+                        help="bind this command to a session (a stopped one: read-only verbs)")
+    parser.add_argument("--ui-backend", choices=("auto", "idb", "xcuitest"),
+                        help="iOS tree and input backend (default auto: idb, XCUITest on an unusable tree)")
     parser.add_argument("--platform", choices=("android", "ios"), help="target platform")
     parser.add_argument("--target", help="target id (adb serial or simulator udid)")
     parser.add_argument("--serial", help="adb serial / emulator id (Android alias of --target)")
@@ -4405,7 +4468,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = session_sub.add_parser("outputs", help="catalog followable session streams",
                                parents=[target_flags])
-    p.add_argument("--session-id", help="a past session instead of the current one")
+    p.exact_only_options = _ABBREVIABLE_SESSION_ID  # its --session-id predates the rule
     p.set_defaults(func=cmd_session_outputs)
     p = session_sub.add_parser("show", help="show current session", parents=[target_flags])
     p.set_defaults(func=cmd_session_show)
@@ -4526,6 +4589,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("journal", help="read the session timeline of actions and notes",
                        parents=[target_flags])
+    p.exact_only_options = _ABBREVIABLE_SESSION_ID  # its --session-id predates the rule
     p.add_argument("--kind", choices=("action", "note"), help="only actions or only notes")
     p.add_argument("--verb", help="only this verb, e.g. 'ui tap'")
     p.add_argument("--task", help="only entries under this task label")
@@ -4539,7 +4603,6 @@ def build_parser() -> argparse.ArgumentParser:
                    help="with --follow: stop after N seconds")
     p.add_argument("--max-lines", type=int, default=0,
                    help="with --follow: stop after N emitted lines")
-    p.add_argument("--session-id", help="a past session's journal (with or without --follow)")
     p.set_defaults(func=cmd_journal)
 
     shots = sub.add_parser("shots", help="browse captured screenshots")
@@ -4576,6 +4639,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("capabilities", help="immutable semantic capability snapshot",
                        parents=[target_flags])
+    p.add_argument("--probe", action="store_true", help="read the current UI to measure backend readiness")
+    # `--p` keeps meaning --platform here
+    p.exact_only_options = journal_mod.EXACT_ONLY_OPTIONS | {"--probe"}
     p.set_defaults(func=cmd_capabilities)
 
     p = sub.add_parser("processes", help="list Autonom-spawned processes machine-wide")
@@ -5198,10 +5264,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_logs_tail)
     p = logs_sub.add_parser("follow", help="stream a session file or the device "
                                            "log as NDJSON", parents=[target_flags])
+    p.exact_only_options = _ABBREVIABLE_SESSION_ID  # its --session-id predates the rule
     p.add_argument("--source", help="'device', a stream id, or output:<name> / "
                                     "logs:<name> / network:<name>")
     p.add_argument("--path", help="file to tail, relative to the session artifacts dir")
-    p.add_argument("--session-id", help="a past session instead of the current one")
     p.add_argument("--package", help="device mode: filter to this package / bundle id")
     p.add_argument("--from-start", action="store_true",
                    help="replay the existing file, then follow (default: start at end)")
@@ -5242,14 +5308,17 @@ def _verb_string(args: argparse.Namespace) -> str:
 
 
 def _journal_command(args: argparse.Namespace, argv: list[str], ok: bool,
-                     error_code: str | None) -> None:
+                     error_code: str | None, before_session: dict | None = None) -> None:
     command = getattr(args, "command", None)
     if command in _JOURNAL_SKIP:
         return
     try:
-        session = session_mod.load_current()
+        # Never a stopped session: one named with --session-id is only read.
+        session = session_mod.journal_session()
     except Exception:  # noqa: BLE001
         session = None
+    if getattr(args, "session_command", None) == "stop":
+        session = before_session
     if not session:
         return
     argv, args = _redact_pair_values(args, argv)
@@ -5363,18 +5432,69 @@ def _os_error(exc: OSError) -> errors.AutonomError:
     )
 
 
+# Verbs that only read what a session recorded: a stopped session may be
+# named with --session-id for these, and for nothing that drives a device.
+_READONLY_COMMANDS = {"journal", "shots", "logs", "report"}
+_READONLY_SESSION_COMMANDS = {"show", "outputs"}
+# `report serve` replays flow steps on the device through /replay, so it is
+# not a read-only verb for a stopped session named with --session-id.
+_DRIVING_REPORT_COMMANDS = {"serve"}
+
+
+def _select_session(args: argparse.Namespace) -> None:
+    """Bind this invocation to the session `--session-id` names.
+
+    `current` (or no flag) keeps the machine's current session. Any other id
+    must exist; a stopped one is accepted only by the read-only verbs, and
+    `session start` never takes one (it creates a session)."""
+    selected = getattr(args, "session_id", None)
+    if not selected or selected == "current":
+        return
+    if args.command == "session" and getattr(args, "session_command", None) == "start":
+        raise errors.AutonomError(
+            errors.USAGE_ERROR, "session start creates a new session; omit --session-id",
+            "Start the session without --session-id, then name it on later verbs.")
+    record = session_mod.load_by_id(selected)
+    session_mod.select(selected)
+    readonly = (args.command in _READONLY_COMMANDS and not (
+        args.command == "report"
+        and getattr(args, "report_command", None) in _DRIVING_REPORT_COMMANDS)) or (
+        args.command == "session"
+        and getattr(args, "session_command", None) in _READONLY_SESSION_COMMANDS)
+    if record.get("stopped_at") and not readonly:
+        raise errors.AutonomError(
+            errors.SESSION_STOPPED, f"session {selected} has stopped",
+            "Only read-only verbs (journal, shots, logs, report except report serve, "
+            "session show/outputs) accept a stopped session; start a new session to "
+            "drive the device.",
+            session_id=selected)
+
+
 def main(argv: list[str] | None = None) -> int:
-    global _ROOT_PARSER
+    global _ROOT_PARSER, _LAST_EMIT
+    _LAST_EMIT = None
     parser = build_parser()
     _ROOT_PARSER = parser
     argv_used = list(argv) if argv is not None else sys.argv[1:]
     args = _parse(parser, argv)
+    context_token = session_mod.select(None)
+    before_session = None
     ok, error_code = True, None
     try:
         code = None
         try:
             platform_mod.apply_tool_overrides(args)
             _apply_ios_overrides(args)
+            _select_session(args)
+            # Only `session stop` journals through this snapshot. A broken
+            # current.json must not fail session-independent verbs (version,
+            # processes, devices); verbs that need the session fail on their own.
+            try:
+                before_session = session_mod.load_current()
+            except Exception:  # noqa: BLE001
+                before_session = None
+            from autonom_lib import ui_ios
+            ui_ios.set_preference(getattr(args, "ui_backend", None))
             code = args.func(args)
             return code
         finally:
@@ -5436,7 +5556,10 @@ def main(argv: list[str] | None = None) -> int:
         ok = False
         return fail("interrupted", code=130)
     finally:
-        _journal_command(args, argv_used, ok, error_code)
+        try:
+            _journal_command(args, argv_used, ok, error_code, before_session)
+        finally:
+            session_mod._SELECTED.reset(context_token)
 
 
 if __name__ == "__main__":

@@ -66,12 +66,17 @@ _TARGET_VALUE_FLAGS = {
     "--platform", "--target", "--serial", "--udid", "--adb", "--simctl",
     "--idb", "--idb-host", "--idb-port",
 }
+# Value-taking target flags argparse matches only when spelled in full
+# (`EXACT_ONLY_OPTIONS`): added after abbreviations of the older flags were in
+# use, so `--u` stays `--udid` and `--se` stays `--serial`.
+EXACT_ONLY_OPTIONS = frozenset({"--session-id", "--ui-backend"})
 # Fields worth lifting from a command's result into the timeline summary.
 # Deliberately excludes anything free-form or body-shaped ("typed", previews).
 _SUMMARY_KEYS = (
     "target_id", "platform", "saved", "path", "count", "matched", "gesture",
     "booted", "stopped", "via", "mocks_active", "mocks", "hits", "port",
     "har", "url", "app_id", "note", "status", "run_id", "detail",
+    "ui_backend", "input_backend", "fallback_reason", "geometry", "component",
 )
 
 
@@ -135,7 +140,8 @@ def _target_flag(token: str) -> bool:
     """
     if not token.startswith("--") or len(token) <= 2 or "=" in token:
         return False
-    return any(flag.startswith(token) for flag in _TARGET_VALUE_FLAGS)
+    return token in EXACT_ONLY_OPTIONS or any(
+        flag.startswith(token) for flag in _TARGET_VALUE_FLAGS)
 
 
 def _is_ui_type(argv: list[str], args: Any = None) -> bool:
@@ -407,8 +413,10 @@ def _resolve_option(parser: Any, name: str) -> Any:
         return table[name]
     if not getattr(parser, "allow_abbrev", True) or not name.startswith("--"):
         return None
+    exact_only = getattr(parser, "exact_only_options", ())
     owners = {id(action): action for option, action in table.items()
-              if option.startswith(name)}
+              if option.startswith(name)
+              and not set(action.option_strings) & set(exact_only)}
     return next(iter(owners.values())) if len(owners) == 1 else None
 
 
@@ -650,6 +658,16 @@ def _summary(payload: dict[str, Any] | None) -> dict[str, Any]:
     return {key: payload[key] for key in _SUMMARY_KEYS if key in payload}
 
 
+def _lock(handle: Any) -> None:
+    """An exclusive lock for the append, held until the handle closes; a
+    no-op where `fcntl` does not exist."""
+    try:
+        import fcntl
+    except ImportError:  # pragma: no cover - Windows
+        return
+    fcntl.flock(handle, fcntl.LOCK_EX)
+
+
 def append(session: dict[str, Any] | None, entry: dict[str, Any]) -> None:
     """Append one entry. Never raises — journaling is best-effort."""
     if not session:
@@ -657,9 +675,13 @@ def append(session: dict[str, Any] | None, entry: dict[str, Any]) -> None:
     try:
         path = journal_path(session)
         path.parent.mkdir(parents=True, exist_ok=True)
-        full = {"seq": _next_seq(path), "ts": _now(), **entry}
         with path.open("a", encoding="utf-8") as handle:
+            # Serialize sequence allocation and append across independent CLI
+            # processes (a flow and a hand-run verb on one session).
+            _lock(handle)
+            full = {"seq": _next_seq(path), "ts": _now(), **entry}
             handle.write(json.dumps(full, ensure_ascii=False) + "\n")
+            handle.flush()
     except Exception:  # noqa: BLE001 — a broken journal must not break a command
         pass
 

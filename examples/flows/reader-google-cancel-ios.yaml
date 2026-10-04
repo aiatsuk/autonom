@@ -1,0 +1,61 @@
+schema: autonom.dev/flow/v1
+appId: com.iatsuk.reader
+name: Reader fixture — Google system prompt cancellation
+description: Requires the isolated fixture library and configured Google SDK; no credentials are entered
+tags:
+  - regression
+  - reader-fixture
+requires:
+  platform:
+    - ios
+---
+- launchApp
+- tapOn:
+    selector:
+      description: Account
+      role: button
+      match: exact
+- tapOn:
+    selector:
+      description: Sign in
+      role: button
+      match: exact
+- tapOn:
+    selector:
+      id: sign_in
+      match: exact
+- assertVisible:
+    selector:
+      description: accounts.google.com
+      role: alert
+      match: contains
+- assertVisible:
+    selector:
+      description: Continue
+      role: button
+      match: exact
+- takeScreenshot:
+    label: Google system prompt on fixture app
+- tapOn:
+    selector:
+      description: Cancel
+      role: button
+      match: exact
+- assertNotVisible:
+    selector:
+      description: Continue
+      role: button
+      match: exact
+- assertVisible:
+    selector:
+      id: sign_in
+      match: exact
+- tapOn:
+    selector:
+      description: Done
+      role: button
+      match: exact
+- assertVisible:
+    selector:
+      id: article_article-one
+      match: exact

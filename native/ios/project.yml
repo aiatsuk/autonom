@@ -1,0 +1,22 @@
+name: AutonomUI
+options:
+  deploymentTarget:
+    iOS: '17.0'
+targets:
+  AutonomUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources: [BridgeTests.swift]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.autonom.ui.tests
+        GENERATE_INFOPLIST_FILE: YES
+        SWIFT_VERSION: '5.0'
+        TARGETED_DEVICE_FAMILY: '1,2'
+schemes:
+  AutonomUI:
+    build:
+      targets:
+        AutonomUITests: [test]
+    test:
+      targets: [AutonomUITests]

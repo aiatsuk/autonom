@@ -1850,7 +1850,7 @@ class Executor:
             for i in range(taps):
                 if i:
                     self.sleep(delay_s)
-                self._tap(x, y)
+                self._tap(x, y, node=node if i == 0 else None)
             return secret
         if command == "longPressOn":
             selector, secret = self._resolve_selector(step.selector)
@@ -2175,17 +2175,17 @@ class Executor:
         self._screen_fetched = True
         return self._screen
 
-    def _tap(self, x: int, y: int) -> None:
+    def _tap(self, x: int, y: int, *, node: dict | None = None) -> None:
         """Tap with the cached screen size; on a coordinate guard refusal,
         refresh the cache once (the app may have rotated mid-flow) and retry
         the guard. The guard raises *before* dispatch, so this can never
         double-tap."""
         try:
-            ui_mod.tap(self.target, x, y, screen=self._screen_size())
+            ui_mod.tap(self.target, x, y, screen=self._screen_size(), **({"node": node} if node else {}))
         except errors.AutonomError as exc:
             if exc.code != errors.COORDINATE_SPACE_MISMATCH:
                 raise
-            ui_mod.tap(self.target, x, y, screen=self._refresh_screen())
+            ui_mod.tap(self.target, x, y, screen=self._refresh_screen(), **({"node": node} if node else {}))
 
     def _swipe(self, direction: str, duration_ms: int) -> None:
         def geometry(screen):
