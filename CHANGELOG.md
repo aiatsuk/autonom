@@ -7,6 +7,8 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
 
 ## [Unreleased]
 
+## [0.32.0] - 2026-10-04
+
 ### Added
 - **Mobile Canvas display presets (Android)** — the Canvas switches its
   target's screen size and density live, with `wm size` and `wm density` on
@@ -114,6 +116,14 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
   follows the session's persisted runner observation, is covered by a
   regression: one runner request, `ui_action_uncertain`, nothing through idb
   or AXe.
+- **Canvas Upgrade fallback accepts a zero `Content-Length` (#20).** On Node
+  versions that ignore `shouldUpgradeCallback`, a bodiless request with an
+  `Upgrade` header and `Content-Length: 00` got a 400. Any run of zeros now
+  means no body; a signed, empty or non-numeric length is still refused.
+- Steadier Canvas tests on busy CI runners (#22): the input tests wait for
+  the state they check instead of fixed delays, the journal flood test gives
+  a client up to 10 s to catch up, and state messages serialize the presets
+  list once.
 
 ## [0.31.2] - 2026-10-03
 
