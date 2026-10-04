@@ -1,3 +1,3 @@
 """Autonom control-plane library (Android + iOS Simulator + network)."""
 
-__version__ = "0.31.2"
+__version__ = "0.32.0"
