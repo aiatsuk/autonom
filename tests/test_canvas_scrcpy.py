@@ -28,7 +28,7 @@ BOOTSTRAP = SCRIPTS / "bootstrap.sh"
 sys.path.insert(0, str(SCRIPTS))
 import autonom_canvas_bridge as bridge  # noqa: E402
 from autonom_lib import actions, doctor, errors, session, ui  # noqa: E402
-from autonom_lib.platform import ANDROID, Target  # noqa: E402
+from autonom_lib.platform import ANDROID, IOS, Target  # noqa: E402
 
 try:
     from env_isolation import EnvSandboxMixin  # noqa: E402  (discover -s tests)
@@ -476,6 +476,34 @@ class BridgeSessionTargetTests(EnvSandboxMixin, unittest.TestCase):
         self.assert_ran_on_the_canvas_target(results)
         self.assertTrue(all("detail" not in result for result in results), results)
         self.assertEqual([path for path in self.home.rglob("*") if path.is_file()], [])
+
+
+class BridgeIosButtonTests(EnvSandboxMixin, unittest.TestCase):
+    """The page's Home and Power buttons send Android key names. Before: iOS
+    refused them, so a Canvas on a Simulator had no way to press Home."""
+
+    def setUp(self) -> None:
+        self.home = self.sandbox_home()
+        self.pressed: list[tuple[str, str]] = []
+        patcher = mock.patch.object(ui, "press_key",
+                                    side_effect=lambda target, key: self.pressed.append((target.platform, key)))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def press(self, target: Target, key: str) -> dict:
+        return bridge.dispatch(target, {"id": 1, "op": "key", "origin": "human", "payload": {"key": key}})
+
+    def test_ios_home_and_power_become_ios_buttons(self) -> None:
+        ios = Target(IOS, "FAKE-UDID", "/nonexistent/xcrun", {"udid": "FAKE-UDID"})
+        for key in ("KEYCODE_HOME", "KEYCODE_POWER", "KEYCODE_BACK", "HOME"):
+            self.assertTrue(self.press(ios, key)["ok"])
+        self.assertEqual(self.pressed, [(IOS, "HOME"), (IOS, "LOCK"), (IOS, "KEYCODE_BACK"), (IOS, "HOME")])
+
+    def test_android_keys_are_unchanged(self) -> None:
+        android = Target(ANDROID, SERIAL, "/nonexistent/adb", {"serial": SERIAL})
+        for key in ("KEYCODE_HOME", "KEYCODE_POWER"):
+            self.assertTrue(self.press(android, key)["ok"])
+        self.assertEqual(self.pressed, [(ANDROID, "KEYCODE_HOME"), (ANDROID, "KEYCODE_POWER")])
 
 
 class BridgeProcessTests(EnvSandboxMixin, unittest.TestCase):
