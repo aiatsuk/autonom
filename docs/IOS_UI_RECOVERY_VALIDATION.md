@@ -1,5 +1,34 @@
 # Reader UI recovery validation
 
+## Runner inputs and the stopping mark, Xcode 27 (2026-10-04)
+
+The same live script, extended, on the same machine, Xcode 27.0 (27A266a) and
+isolated simulator (`Autonom-Recovery-Test`, iOS 26.5), under a temporary
+`AUTONOM_HOME`. The simulator was shut down before; the script booted it and
+shut it down again (`initial_state` and `final_state` both `Shutdown`,
+`xcode_major` 27 as expected). The run passed (`ok: true`, about 3 minutes
+including a cold runner build):
+
+| Step | Measured result |
+| --- | --- |
+| Plain `--ui-backend idb` session (first, on the fresh boot) | `ui_backend: idb`, 15 nodes, General among them |
+| Explicit `--ui-backend xcuitest` session | `ui_backend: xcuitest`, 58 nodes, all with `xcuitest_ref` |
+| `auto` session, idb answering an empty tree | `ui_backend: xcuitest`, `fallback_reason: empty_accessibility_tree`, 57 nodes; the General tap went through the runner and the next tree showed `About` |
+| Text entry | The Settings search field tapped and a fixed 10-character string typed through the runner; the field's value in the next tree equalled it. Only the length is in the report; the command line is recorded with the text replaced, and the report does not contain the text |
+| Long press | A 1 s press on that field through the runner; the edit menu (`Select`, `Select All`) appeared, absent from the tree before |
+| Swipe | After a relaunch, an upward swipe through the runner revealed `Privacy & Security`, `Game Center`, `iCloud`, `Apps` and `Developer` (11 rows before); the General row left the tree |
+| Home | Home through the runner; the tree before held the Settings application, the next runner tree (answered ok) held none |
+| Runner lifecycle | No `xcodebuild test-without-building` for the UDID after each `session stop` |
+
+Separately, on the same simulator (booted for it and shut down again), an
+explicit `xcuitest` session served a 58-node tree with one runner process;
+`session stop` returned the stopped record with `stopping_at` beside
+`stopped_at`, every teardown action ok, and no runner process was left. A
+following plain idb session on a relaunched Settings returned 15 nodes. The
+race itself (a request during the teardown, a stop during the build) is
+covered by unit tests, not driven live. Not checked: physical iPhones, text
+entry into other apps, and the Reader example flows.
+
 ## Port onto the AXe input routing, Xcode 27 (2026-10-04)
 
 Checked with `tests/live/ios_ui_recovery_live.py` on macOS with Xcode 27.0

@@ -6,7 +6,7 @@ runner on the one explicit --udid and taps in Settings there. Use an isolated
 test simulator only.
 
     python3 tests/live/ios_ui_recovery_live.py --udid <UDID> --evidence-dir DIR \
-        [--idb PATH] [--keep-home]
+        [--idb PATH] [--keep-home] [--expect-xcode-major N]
 
 Every run uses its own temporary AUTONOM_HOME, so it never reads, stops or
 writes the user's sessions; the runner build is cached inside it and removed
@@ -15,6 +15,9 @@ Shutdown, and shut down at the end only when this run booted it.
 
 Steps, each against Settings (com.apple.Preferences), relaunched first:
 
+0. idb (run first, on the fresh boot): a normal `--ui-backend idb` session
+   returns a tree. It runs before any runner session so that the baseline
+   cannot depend on what a runner left behind.
 1. explicit: `--ui-backend xcuitest` session; the tree is served by the
    runner (`ui_backend: xcuitest`, nodes carry `xcuitest_ref`).
 2. fallback: `auto` session with AUTONOM_IDB pointing to a temporary wrapper
@@ -22,19 +25,42 @@ Steps, each against Settings (com.apple.Preferences), relaunched first:
    which answers an empty tree. The tree must come from the runner with
    `fallback_reason: empty_accessibility_tree`; then one semantic tap on the
    General row, and a following tree must show the General page.
-3. idb: a normal `--ui-backend idb` session still returns a tree.
+3. xcuitest_input: one `--ui-backend xcuitest` session, each sub-step a
+   pass/fail field of its own:
+   - text_entry: tap the Settings search field, type a fixed non-secret
+     string; the field's value in the next runner tree must equal it.
+   - long_press: a 1 s press on that field; the next tree must show the text
+     edit menu ("Select All", "Select", "Copy" or "Paste"), absent before.
+     The strongest oracle Settings offers: a plain tap on the field opens no
+     such menu here, and the press is the only input between the two trees.
+   - swipe: Settings relaunched; an upward swipe over the list must reveal at
+     least one row absent from the tree before it and move the General row
+     up by more than 50 points (or off the tree).
+   - home: Home through the runner; the tree before it must hold the
+     Settings application and the next runner tree, answered ok, must not:
+     the runner serves an app's tree only while the app is running, not
+     suspended, and Settings, sent to the background, stops being served.
+     (idb is not asked: a direct idb call would start a companion no
+     session owns.)
 4. runner stopped: after each `session stop`, no runner `xcodebuild` process
    for this UDID is left.
 
+`ok` also requires the Simulator to end in the state it started in
+(`final_state == initial_state`) and `xcodebuild -version` to report the
+expected Xcode major version (`--expect-xcode-major`, default 27).
+
 Writes <evidence-dir>/ios_recovery.json with per-step results and `ok`. It
-records backends, counts and a few element labels; never typed text (nothing
-is typed) and never runner logs. Exit 0 when every step passed.
+records backends, counts and a few element labels; never runner logs, and of
+the typed text only its length (the command line is recorded with the text
+replaced, and the report is checked for it before it is written). Exit 0
+when every step passed.
 """
 from __future__ import annotations
 
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -51,6 +77,11 @@ GENERAL_PAGE = ("About", "Software Update", "AirDrop", "iPhone Storage")
 # The first runner use builds it (minutes on a cold cache) and installs it.
 FIRST_UI_TIMEOUT = 900
 CLI_TIMEOUT = 180
+# Typed into the Settings search field: fixed and non-secret, yet distinctive
+# enough that the evidence can be checked for it. Only its length is recorded.
+TYPED = "kestrel 42"
+# The text edit menu a long press on a field with text opens.
+EDIT_MENU = ("Select All", "Select", "Copy", "Paste")
 
 
 class StepFailed(Exception):
@@ -88,7 +119,7 @@ class Autonom:
         self.calls: list[dict] = []
 
     def __call__(self, *argv: str, timeout: float = CLI_TIMEOUT, env: dict | None = None,
-                 expect_ok: bool = True) -> dict:
+                 expect_ok: bool = True, secret: str | None = None) -> dict:
         command = [sys.executable, str(CLI), *argv, "--udid", self.udid]
         started = time.monotonic()
         completed = run(command, timeout=timeout, env=env or self.env, check=False)
@@ -97,11 +128,17 @@ class Autonom:
             payload = json.loads(stream)
         except ValueError:
             payload = {"ok": False, "error": (stream or "").strip()[-300:]}
-        self.calls.append({"argv": list(argv), "exit": completed.returncode,
+        # A typed value never reaches the evidence: only its length.
+        recorded = [f"<{len(secret)} chars>" if secret is not None and item == secret else item
+                    for item in argv]
+        if secret is not None:
+            payload = {key: value for key, value in payload.items()
+                       if key in ("ok", "backend", "error_code", "input_backend")}
+        self.calls.append({"argv": recorded, "exit": completed.returncode,
                            "seconds": round(time.monotonic() - started, 1),
                            "error_code": payload.get("error_code")})
         if expect_ok and not payload.get("ok"):
-            raise StepFailed(f"autonom {' '.join(argv)}: {payload.get('error_code')} "
+            raise StepFailed(f"autonom {' '.join(recorded)}: {payload.get('error_code')} "
                              f"{payload.get('error')}")
         return payload
 
@@ -130,6 +167,31 @@ def relaunch_settings(udid: str) -> None:
 def labels(nodes: list[dict]) -> set[str]:
     return {str(node.get(key)) for node in nodes for key in ("desc", "text")
             if node.get(key)}
+
+
+def xcode_major(version: str) -> int | None:
+    match = re.search(r"\bXcode\s+(\d+)", version)
+    return int(match.group(1)) if match else None
+
+
+def row_labels(nodes: list[dict]) -> set[str]:
+    """Settings' top-level rows: buttons whose id is com.apple.settings.*."""
+    return {str(node.get("desc")) for node in nodes
+            if str(node.get("resource_id") or "").startswith("com.apple.settings.")
+            and node.get("desc")}
+
+
+def row_top(nodes: list[dict], label: str) -> int | None:
+    for node in nodes:
+        if node.get("desc") == label and str(node.get("resource_id") or "").startswith(
+                "com.apple.settings.") and node.get("bounds"):
+            return int(node["bounds"][1])
+    return None
+
+
+def search_field(nodes: list[dict]) -> dict | None:
+    return next((n for n in nodes if n.get("role") in ("textfield", "searchfield")
+                 and n.get("desc") == "Search"), None)
 
 
 def fake_idb(directory: Path, real_idb: str) -> Path:
@@ -205,6 +267,108 @@ def step_fallback(autonom: Autonom, udid: str, wrapper: Path) -> dict:
     return result
 
 
+def _substep(results: dict, name: str, body) -> None:
+    try:
+        results[name] = body()
+    except (StepFailed, subprocess.TimeoutExpired) as exc:
+        results[name] = {"ok": False, "error": str(exc)[-400:]}
+
+
+def step_inputs(autonom: Autonom, udid: str) -> dict:
+    relaunch_settings(udid)
+    autonom("session", "start", "--app-id", SETTINGS, "--ui-backend", "xcuitest")
+    result: dict = {}
+    try:
+        def text_entry() -> dict:
+            before = autonom("ui", "tree", timeout=FIRST_UI_TIMEOUT).get("nodes") or []
+            field = search_field(before)
+            out: dict = {"field_found": field is not None, "typed_length": len(TYPED)}
+            tap = autonom("ui", "tap", "--role", (field or {}).get("role") or "textfield",
+                          "--desc", "Search", "--mode", "exact", "--index", "0",
+                          expect_ok=False)
+            out["tap_backend"] = tap.get("backend")
+            time.sleep(1.5)
+            typed = autonom("ui", "type", TYPED, "--sensitive", expect_ok=False, secret=TYPED)
+            out["type_ok"] = bool(typed.get("ok"))
+            out["type_backend"] = typed.get("backend")
+            out["type_error_code"] = typed.get("error_code")
+            time.sleep(1.5)
+            after = autonom("ui", "tree").get("nodes") or []
+            value = (search_field(after) or {}).get("text") or ""
+            out["field_value_length"] = len(value)
+            out["field_value_matches"] = value == TYPED
+            out["ok"] = (out["field_found"] and tap.get("ok") is True
+                         and out["tap_backend"] == "xcuitest" and out["type_ok"]
+                         and out["type_backend"] == "xcuitest" and out["field_value_matches"])
+            return out
+
+        def long_press() -> dict:
+            before = labels(autonom("ui", "tree").get("nodes") or [])
+            press = autonom("ui", "tap", "--role", "textfield", "--desc", "Search",
+                            "--mode", "exact", "--index", "0", "--duration", "1000",
+                            expect_ok=False)
+            time.sleep(1.5)
+            after = labels(autonom("ui", "tree").get("nodes") or [])
+            out = {"press_ok": bool(press.get("ok")), "backend": press.get("backend"),
+                   "error_code": press.get("error_code"),
+                   "menu_before": sorted(before & set(EDIT_MENU)),
+                   "menu_after": sorted(after & set(EDIT_MENU))}
+            out["ok"] = (out["press_ok"] and out["backend"] == "xcuitest"
+                         and not out["menu_before"] and bool(out["menu_after"]))
+            return out
+
+        def swipe() -> dict:
+            relaunch_settings(udid)  # search closed, list at the top
+            before = autonom("ui", "tree").get("nodes") or []
+            move = autonom("ui", "swipe", "--from", "201,650", "--to", "201,250",
+                           "--duration", "0.3", expect_ok=False)
+            time.sleep(2)
+            after = autonom("ui", "tree").get("nodes") or []
+            revealed = sorted(row_labels(after) - row_labels(before))
+            top_before, top_after = row_top(before, ROW), row_top(after, ROW)
+            out = {"swipe_ok": bool(move.get("ok")), "backend": move.get("backend"),
+                   "error_code": move.get("error_code"), "rows_before": len(row_labels(before)),
+                   "rows_revealed": revealed, "general_top_before": top_before,
+                   "general_top_after": top_after}
+            moved = top_before is not None and (top_after is None or top_after < top_before - 50)
+            out["ok"] = (out["swipe_ok"] and out["backend"] == "xcuitest" and bool(revealed)
+                         and moved)
+            return out
+
+        def home() -> dict:
+            before = autonom("ui", "tree").get("nodes") or []
+            press = autonom("ui", "key", "HOME", expect_ok=False)
+            time.sleep(3)
+            after = autonom("ui", "tree")
+            nodes = after.get("nodes") or []
+
+            def holds_settings(items: list[dict]) -> bool:
+                return any(n.get("role") == "app" and n.get("desc") == "Settings" for n in items)
+            out = {"key_ok": bool(press.get("ok")), "backend": press.get("backend"),
+                   "error_code": press.get("error_code"),
+                   "settings_in_tree_before": holds_settings(before),
+                   "tree_ok": bool(after.get("ok")), "tree_backend": after.get("ui_backend"),
+                   "settings_in_tree_after": holds_settings(nodes)}
+            out["ok"] = (out["key_ok"] and out["backend"] == "xcuitest"
+                         and out["settings_in_tree_before"] and out["tree_ok"]
+                         and out["tree_backend"] == "xcuitest"
+                         and not out["settings_in_tree_after"])
+            return out
+
+        _substep(result, "text_entry", text_entry)
+        _substep(result, "long_press", long_press)
+        _substep(result, "swipe", swipe)
+        _substep(result, "home", home)
+        result["ok"] = all(result[name].get("ok")
+                           for name in ("text_entry", "long_press", "swipe", "home"))
+    finally:
+        stopped = autonom("session", "stop", expect_ok=False)
+    result["session_stop_ok"] = bool(stopped.get("ok"))
+    result["runner_left"] = wait_no_runner(udid)
+    result["ok"] = bool(result.get("ok")) and result["session_stop_ok"] and not result["runner_left"]
+    return result
+
+
 def step_idb(autonom: Autonom, udid: str) -> dict:
     relaunch_settings(udid)
     autonom("session", "start", "--app-id", SETTINGS, "--ui-backend", "idb")
@@ -228,12 +392,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--idb", help="the real idb client (default: idb on PATH)")
     parser.add_argument("--keep-home", action="store_true",
                         help="keep the temporary AUTONOM_HOME (runner build cache, sessions)")
+    parser.add_argument("--expect-xcode-major", type=int, default=27,
+                        help="the Xcode major version xcodebuild must report (default 27)")
     args = parser.parse_args(argv)
     args.evidence_dir.mkdir(parents=True, exist_ok=True)
     report: dict = {"udid": args.udid, "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                     "steps": {}, "ok": False}
     xcode = run(["xcodebuild", "-version"], timeout=30, check=False).stdout.split("\n")
     report["xcode"] = " ".join(line.strip() for line in xcode if line.strip())
+    report["xcode_major"] = xcode_major(report["xcode"])
+    report["expected_xcode_major"] = args.expect_xcode_major
+    report["xcode_ok"] = report["xcode_major"] == args.expect_xcode_major
+    steps_ok = False
     real_idb = args.idb or shutil.which("idb")
     home = Path(tempfile.mkdtemp(prefix="autonom-ios-recovery-"))
     scratch = Path(tempfile.mkdtemp(prefix="autonom-fake-idb-"))
@@ -249,11 +419,14 @@ def main(argv: list[str] | None = None) -> int:
             raise StepFailed(f"simulator is {state}; wait until it is Booted or Shutdown")
         if not real_idb:
             raise StepFailed("idb not found; pass --idb")
+        # The idb baseline goes first, on the fresh boot, so that it cannot
+        # depend on what a runner session left behind.
         steps = [
+            ("idb_tree", lambda: step_idb(autonom, args.udid)),
             ("explicit_xcuitest", lambda: step_explicit(autonom, args.udid)),
             ("auto_fallback", lambda: step_fallback(autonom, args.udid,
                                                     fake_idb(scratch, real_idb))),
-            ("idb_tree", lambda: step_idb(autonom, args.udid)),
+            ("xcuitest_input", lambda: step_inputs(autonom, args.udid)),
         ]
         for name, step in steps:
             try:
@@ -262,7 +435,7 @@ def main(argv: list[str] | None = None) -> int:
                 report["steps"][name] = {"ok": False, "error": str(exc)[-400:]}
         left = wait_no_runner(args.udid, 5)
         report["steps"]["runner_stopped"] = {"ok": not left, "runner_left": left}
-        report["ok"] = all(step.get("ok") for step in report["steps"].values())
+        steps_ok = all(step.get("ok") for step in report["steps"].values())
     except (StepFailed, subprocess.TimeoutExpired) as exc:
         report["error"] = str(exc)[-400:]
     finally:
@@ -272,7 +445,14 @@ def main(argv: list[str] | None = None) -> int:
         if booted_here:
             run(["xcrun", "simctl", "shutdown", args.udid], timeout=120, check=False)
         report["booted_here"] = booted_here
-        report["final_state"] = simulator_state(args.udid)
+        try:
+            report["final_state"] = simulator_state(args.udid)
+        except (StepFailed, subprocess.TimeoutExpired, ValueError) as exc:
+            report["final_state"] = None
+            report.setdefault("error", str(exc)[-400:])
+        report["state_restored"] = (report.get("initial_state") is not None
+                                    and report["final_state"] == report.get("initial_state"))
+        report["ok"] = bool(steps_ok and report["xcode_ok"] and report["state_restored"])
         shutil.rmtree(scratch, ignore_errors=True)
         if args.keep_home:
             report["autonom_home"] = str(home)
@@ -280,7 +460,14 @@ def main(argv: list[str] | None = None) -> int:
             shutil.rmtree(home, ignore_errors=True)
         report["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         out = args.evidence_dir / "ios_recovery.json"
-        out.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        text = json.dumps(report, indent=2, ensure_ascii=False) + "\n"
+        if TYPED in text:
+            # Belt and braces: a typed value that slipped into an error string.
+            report["ok"] = False
+            report["typed_text_redacted"] = True
+            text = json.dumps(report, indent=2, ensure_ascii=False).replace(
+                TYPED, f"<{len(TYPED)} chars>") + "\n"
+        out.write_text(text, encoding="utf-8")
         print(json.dumps({"ok": report["ok"], "report": str(out)}))
     return 0 if report["ok"] else 1
 

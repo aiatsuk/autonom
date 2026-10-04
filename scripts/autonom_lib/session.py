@@ -278,10 +278,17 @@ def save(record: dict[str, Any], cwd: Path | None = None) -> dict[str, Any]:
     if record.get("stopped_at"):
         return record
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps(record, indent=2, ensure_ascii=False) + "\n"
     with _record_lock(path.parent):
-        if _stopped_on_disk(path):
+        stored = _read_stored(path)
+        if stored.get("stopped_at"):
             return record
+        # The stopping mark (`stopping_at`, `stopping_tokens`) belongs to
+        # `session stop` alone (mark_stopping and clear_stopping): whatever
+        # this copy says, the file's mark is kept, so a command holding a
+        # copy from before the mark (or before an aborted stop cleared it)
+        # neither drops nor revives it.
+        _copy_stopping(stored, record)
+        payload = json.dumps(record, indent=2, ensure_ascii=False) + "\n"
         _write_atomic(path, payload)
         # A command bound to another session (--session-id) must not move the
         # machine's current pointer; the current session itself is still mirrored.
@@ -290,12 +297,115 @@ def save(record: dict[str, Any], cwd: Path | None = None) -> dict[str, Any]:
     return record
 
 
-def _stopped_on_disk(path: Path) -> bool:
+def _read_stored(path: Path) -> dict[str, Any]:
+    """The record file as it is on disk, or {} when missing or unreadable."""
     try:
         stored = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return False
-    return isinstance(stored, dict) and bool(stored.get("stopped_at"))
+        return {}
+    return stored if isinstance(stored, dict) else {}
+
+
+def _stopped_on_disk(path: Path) -> bool:
+    return bool(_read_stored(path).get("stopped_at"))
+
+
+def on_disk(record: dict[str, Any]) -> dict[str, Any]:
+    """The latest `session.json` of `record`'s session, read from its own
+    artifacts directory: what a long-running command checks to learn that
+    the session began stopping (`stopping_at`) or stopped (`stopped_at`)
+    since it loaded its copy. Falls back to `record` when the file is
+    missing or unreadable."""
+    directory = record.get("artifacts_dir")
+    if not directory:
+        return record
+    return _read_stored(Path(directory) / "session.json") or record
+
+
+_STOPPING_FIELDS = ("stopping_at", "stopping_tokens")
+# The one stopper a record from before owner tokens stands for: it carries a
+# bare `stopping_at`, which no token of this version can clear.
+ANONYMOUS_STOPPER = "anonymous"
+
+
+def _copy_stopping(source: dict[str, Any], target: dict[str, Any]) -> None:
+    """Make `target`'s stopping mark exactly `source`'s."""
+    for field in _STOPPING_FIELDS:
+        if field in source:
+            value = source[field]
+            target[field] = list(value) if isinstance(value, list) else value
+        else:
+            target.pop(field, None)
+
+
+def active_stoppers(record: dict[str, Any]) -> list[str]:
+    """The owner tokens of the `session stop` commands still tearing this
+    session down. A bare `stopping_at` (a record from the version before
+    owner tokens, or one whose token list is unreadable) counts as one
+    anonymous stopper."""
+    tokens = record.get("stopping_tokens")
+    if isinstance(tokens, list):
+        tokens = [token for token in tokens if isinstance(token, str) and token]
+        if tokens:
+            return tokens
+    return [ANONYMOUS_STOPPER] if record.get("stopping_at") else []
+
+
+def is_stopping(record: dict[str, Any]) -> bool:
+    """True while any `session stop` holds the stopping mark."""
+    return bool(active_stoppers(record))
+
+
+def _set_stopping(record: dict[str, Any], *, add: str | None = None,
+                  remove: str | None = None, cwd: Path | None = None) -> None:
+    path = Path(record["artifacts_dir"]) / "session.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _record_lock(path.parent):
+        stored = _read_stored(path) or dict(record)
+        if stored.get("stopped_at"):
+            return  # a stopped session is read-only
+        before = {field: stored.get(field) for field in _STOPPING_FIELDS}
+        tokens = active_stoppers(stored)
+        if add is not None:
+            tokens.append(add)
+            stored["stopping_at"] = stored.get("stopping_at") or _now()
+            stored["stopping_tokens"] = tokens
+        elif remove in tokens:
+            tokens.remove(remove)
+            if tokens:
+                stored["stopping_tokens"] = tokens
+            else:
+                for field in _STOPPING_FIELDS:
+                    stored.pop(field, None)
+        if {field: stored.get(field) for field in _STOPPING_FIELDS} != before:
+            payload = json.dumps(stored, indent=2, ensure_ascii=False) + "\n"
+            _write_atomic(path, payload)
+            if _current_id(cwd) == stored.get("session_id"):
+                _write_current(cwd, stored)
+        _copy_stopping(stored, record)
+
+
+def mark_stopping(record: dict[str, Any], cwd: Path | None = None) -> str:
+    """Enter this `session stop` as an active stopper before it tears
+    anything down, atomically and under the record lock, so a command racing
+    the stop (an XCUITest runner request) refuses with `session_stopped`
+    instead of starting what the teardown can no longer reach. `stopping_at`
+    keeps the time the first active stopper began; `stopping_tokens` lists
+    one owner token per active stopper. Returns this stopper's token, which
+    `clear_stopping` takes. Records written by older versions simply lack
+    the mark."""
+    token = uuid.uuid4().hex
+    _set_stopping(record, add=token, cwd=cwd)
+    return token
+
+
+def clear_stopping(record: dict[str, Any], token: str,
+                   cwd: Path | None = None) -> None:
+    """Withdraw the stopper `token` names when its `session stop` aborts
+    before the session is stopped (an accessibility restore that failed
+    keeps the pointer). The mark stays while another stopper is still
+    active; once none is, it is dropped and the session is usable again."""
+    _set_stopping(record, remove=token, cwd=cwd)
 
 
 def stop_session(cwd: Path | None = None, *, reap: bool = True) -> dict[str, Any] | None:

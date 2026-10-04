@@ -506,6 +506,22 @@ def cmd_session_stop(args: argparse.Namespace) -> int:
             "Start one with 'autonom session start'.",
         )
 
+    # Marked before any teardown step (issue #31): a runner request racing
+    # this stop is refused with session_stopped instead of starting a runner
+    # the teardown below could no longer reach. A stop that aborts before the
+    # session is stopped withdraws its own owner token again: the mark stays
+    # while another `session stop` is still tearing down, and is gone (the
+    # session usable again) once no stopper is left.
+    stopper = session_mod.mark_stopping(record)
+    try:
+        return _session_stop_marked(args, record)
+    except BaseException:
+        if not (session_mod.on_disk(record).get("stopped_at")):
+            session_mod.clear_stopping(record, stopper)
+        raise
+
+
+def _session_stop_marked(args: argparse.Namespace, record: dict[str, Any]) -> int:
     # Keep the session pointer and its saved snapshot if device-side restore
     # fails: a later `ui accessibility reset` can still finish the cleanup.
     accessibility_teardown = None
