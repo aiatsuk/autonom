@@ -91,7 +91,8 @@ size and density beside it, the control status, and the inspector toggle.
 Below it the device picture sits in a frame whose aspect ratio follows the
 video, with a caption under it (fps, round trip and decoder on scrcpy; the
 transport otherwise) and a floating pill of device buttons: Back, Home,
-Recent apps | Rotate, Volume down, Volume up, Power. The inspector beside it
+Recent apps | Rotate, Volume down, Volume up, Power (on iOS only Home and
+Power, which press the Simulator's Home and Lock buttons). The inspector beside it
 has Type (text box and Send), Keys (Up, Down, Left, Right, Enter, Delete),
 Device (Wake screen, Notifications, Quick settings, Collapse panels, Copy
 device clipboard), Control (Take control or Release, Pause input or Resume
@@ -170,7 +171,8 @@ On the scrcpy transport (focus the screen for keys):
 On the other transports and on iOS: tap, drag (sent as a swipe on release),
 wheel-as-swipe, the Back, Home, Recent apps, Up, Down, Left, Right, Enter,
 Delete, Wake screen and Power buttons, and conservative ASCII typing over
-HTTP. iOS refuses the Android key buttons, and its page does not show them.
+HTTP. On iOS the page shows only Home and Power, sent as the Simulator's
+Home and Lock buttons; the Android-only buttons are not shown.
 Structural selection still belongs to Autonom `ui` commands.
 
 ### The device clipboard

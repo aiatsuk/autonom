@@ -1,7 +1,8 @@
 #!/usr/bin/env node
-import { access, constants } from "node:fs/promises";
+import { mkdtempSync, rmSync } from "node:fs";
+import { access, constants, readFile, rm } from "node:fs/promises";
 import { ServerResponse, createServer } from "node:http";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { delimiter, join, resolve } from "node:path";
 import { env, exit, platform } from "node:process";
 import { execFile, spawn } from "node:child_process";
@@ -1026,12 +1027,33 @@ class FrameBroadcaster {
   }
 }
 
+// One private folder per Canvas for iOS screenshots, removed when the process exits, so a
+// capture still running at shutdown leaves nothing behind.
+let screenshotFolder = null;
+let screenshotCount = 0;
+
+function screenshotPath() {
+  if (!screenshotFolder) {
+    screenshotFolder = mkdtempSync(join(tmpdir(), "autonom-canvas-"));
+    process.once("exit", () => rmSync(screenshotFolder, { recursive: true, force: true }));
+  }
+  screenshotCount += 1;
+  return join(screenshotFolder, `frame-${screenshotCount}.png`);
+}
+
 async function capturePng(context) {
   if (context.options.platform === "ios") {
-    const result = await execFileAsync(context.adbPath, [
-      "simctl", "io", context.serial, "screenshot", "--type=png", "-",
-    ], { timeout: 8000, maxBuffer: 32 * 1024 * 1024, encoding: null });
-    return result.stdout;
+    // A file, never "-": since Xcode 27 `simctl io screenshot -` writes a file named "-"
+    // in the working directory instead of PNG on stdout.
+    const frame = screenshotPath();
+    try {
+      await execFileAsync(context.adbPath, [
+        "simctl", "io", context.serial, "screenshot", "--type=png", frame,
+      ], { timeout: 8000, maxBuffer: 1024 * 1024 });
+      return await readFile(frame);
+    } finally {
+      await rm(frame, { force: true });
+    }
   }
   const { stdout } = await runAdb(context, ["exec-out", "screencap", "-p"], {
     timeout: 8000, encoding: "buffer",
@@ -2949,7 +2971,8 @@ function renderPage(context) {
   const serial = escapeHtml(context.serial);
   const android = context.options.platform === "android";
   const platform = android ? "Android" : "iOS";
-  // iOS refuses the Android key buttons, so its page keeps them out of sight (PAGE-003).
+  // iOS refuses the Android key buttons, so its page keeps them out of sight (PAGE-003);
+  // Home and Power stay, as the bridge presses the Simulator's Home and Lock for them.
   const androidOnly = android ? "" : " hidden";
   return `<!doctype html>
 <html lang="en">
@@ -3133,14 +3156,14 @@ dd code{font:12px var(--mono)}
   <p class="notice" id="notice" role="status" aria-live="polite"></p>
   <div class="device" id="device"><canvas id="video" class="surface" tabindex="0" aria-label="${platform} device screen" hidden></canvas><img id="screen" class="surface" tabindex="0" alt="${platform} device screen"></div>
   <p class="caption" id="caption">Connecting…</p>
-  <nav class="dock" aria-label="Device buttons"${androidOnly}>
-    ${iconButton("back", "Back", 'data-key="KEYCODE_BACK" data-system="back"')}
+  <nav class="dock" aria-label="Device buttons">
+    ${iconButton("back", "Back", `data-key="KEYCODE_BACK" data-system="back"${androidOnly}`)}
     ${iconButton("home", "Home", 'data-key="KEYCODE_HOME" data-system="home"')}
-    ${iconButton("recent", "Recent apps", 'data-key="KEYCODE_APP_SWITCH" data-system="app-switch"')}
-    <span class="div" aria-hidden="true"></span>
-    ${iconButton("rotate", "Rotate", 'data-system="rotate" data-scrcpy')}
-    ${iconButton("volumeDown", "Volume down", 'data-system="volume-down" data-scrcpy')}
-    ${iconButton("volumeUp", "Volume up", 'data-system="volume-up" data-scrcpy')}
+    ${iconButton("recent", "Recent apps", `data-key="KEYCODE_APP_SWITCH" data-system="app-switch"${androidOnly}`)}
+    <span class="div" aria-hidden="true"${androidOnly}></span>
+    ${iconButton("rotate", "Rotate", `data-system="rotate" data-scrcpy${androidOnly}`)}
+    ${iconButton("volumeDown", "Volume down", `data-system="volume-down" data-scrcpy${androidOnly}`)}
+    ${iconButton("volumeUp", "Volume up", `data-system="volume-up" data-scrcpy${androidOnly}`)}
     ${iconButton("power", "Power", 'data-key="KEYCODE_POWER" data-system="power"')}
   </nav>
 </main>

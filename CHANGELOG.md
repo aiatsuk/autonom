@@ -7,6 +7,17 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
 
 ## [Unreleased]
 
+### Fixed
+- **iOS Canvas shows the screen on Xcode 27.** Since Xcode 27, `simctl io
+  screenshot -` writes a file named `-` in the working directory instead of
+  PNG on stdout, so the iOS Canvas sent no frames and left a stray `-` file.
+  The Canvas now captures into a private temporary file and removes it.
+- **iOS Canvas can press Home.** The page's Home and Power buttons sent
+  Android key names that iOS refuses, so the iOS page hid its buttons and a
+  Simulator had no Home from the Canvas. The bridge now presses the
+  Simulator's Home and Lock buttons for them, and the iOS page shows Home and
+  Power; the Android-only buttons stay hidden.
+
 ## [0.32.0] - 2026-10-04
 
 ### Added

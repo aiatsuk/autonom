@@ -5,12 +5,12 @@ import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { request as httpRequest } from "node:http";
 import { connect, createServer } from "node:net";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
 import { Script, createContext } from "node:vm";
@@ -3697,13 +3697,19 @@ function pngSize(frame) {
 
 // Answers the simulator list and screenshots like `xcrun simctl`, and logs every call.
 const FAKE_XCRUN = String.raw`
-import { appendFileSync } from "node:fs";
+import { appendFileSync, writeFileSync } from "node:fs";
 const args = process.argv.slice(2);
 appendFileSync(process.env.FAKE_ADB_LOG, JSON.stringify(args) + "\n");
 if (args[0] === "simctl" && args[1] === "list") {
   console.log(JSON.stringify({ devices: { "iOS 26.0": [{ udid: process.env.FAKE_UDID, state: "Booted", isAvailable: true }] } }));
 } else if (args[0] === "simctl" && args[1] === "io") {
-  process.stdout.write(Buffer.from(process.env.FAKE_PNG, "base64"));
+  // Like Xcode 27: the last argument is always a file path, and "-" is a file named "-".
+  const write = () => {
+    writeFileSync(args.at(-1), Buffer.from(process.env.FAKE_PNG, "base64"));
+    console.log("Wrote screenshot to: " + args.at(-1));
+  };
+  if (process.env.FAKE_SCREENSHOT_DELAY_MS) setTimeout(write, Number(process.env.FAKE_SCREENSHOT_DELAY_MS));
+  else write();
 } else {
   console.error("unsupported fake xcrun command: " + args.join(" "));
   process.exitCode = 2;
@@ -4044,6 +4050,58 @@ test("display: iOS refuses display presets without running anything and its page
   // Only the simulator lookup at start ran.
   assert.deepEqual((await adbCalls(world)).map((args) => args.slice(0, 2).join(" ")), ["simctl list"]);
   await stopCanvas(canvas);
+});
+
+test("screen: iOS frames come from a simctl screenshot file, never from stdout, and the file is removed", async (t) => {
+  const udid = "FAKE-SIMULATOR-UDID";
+  const world = await makeWorld(t, { env: { FAKE_UDID: udid } });
+  const xcrun = join(world.directory, "fake-xcrun.mjs");
+  await writeFile(xcrun, `#!${process.execPath}\n${FAKE_XCRUN}`);
+  await chmod(xcrun, 0o755);
+  const canvas = await startCanvas(world, ["--platform", "ios", "--target", udid, "--simctl", xcrun,
+    "--transport", "screencap"]);
+  // The stream answers only with its first frame, so a broken capture would hold fetch for minutes.
+  let stream;
+  try {
+    stream = await Promise.race([readMultipart(canvas),
+      sleep(10_000).then(() => { throw new Error("timed out waiting for an iOS frame"); })]);
+    await waitFor(() => stream.frames.length >= 1, 10_000, "an iOS frame");
+  } finally {
+    stream?.close();
+    await stopCanvas(canvas);
+  }
+  assert.deepEqual(stream.frames[0], Buffer.from(PNG_BASE64, "base64"));
+  const shots = (await adbCalls(world)).filter((args) => args[0] === "simctl" && args[1] === "io");
+  assert.ok(shots.length >= 1, "no screenshot ran");
+  for (const args of shots) {
+    // Xcode 27 writes "-" as a file named "-" in the working directory.
+    assert.notEqual(args.at(-1), "-");
+    assert.match(args.at(-1), /autonom-canvas-[^/]+\/frame-\d+\.png$/);
+    assert.equal(existsSync(dirname(args.at(-1))), false, "the screenshot folder was left behind");
+  }
+  assert.equal(existsSync(join(ROOT, "-")), false, "a file named - was written");
+});
+
+test("screen: an iOS Canvas stopped during a screenshot leaves no screenshot folder behind", async (t) => {
+  const udid = "FAKE-SIMULATOR-UDID";
+  const world = await makeWorld(t, { env: { FAKE_UDID: udid, FAKE_SCREENSHOT_DELAY_MS: "1500" } });
+  const temporary = join(world.directory, "tmp");
+  await mkdir(temporary);
+  world.env.TMPDIR = temporary;
+  const xcrun = join(world.directory, "fake-xcrun.mjs");
+  await writeFile(xcrun, `#!${process.execPath}\n${FAKE_XCRUN}`);
+  await chmod(xcrun, 0o755);
+  const canvas = await startCanvas(world, ["--platform", "ios", "--target", udid, "--simctl", xcrun,
+    "--transport", "screencap"]);
+  // The stream answers with its first frame, which this slow screenshot holds back.
+  const controller = new AbortController();
+  fetch(`${canvas.origin}/stream.mjpeg`, { headers: { Authorization: `Bearer ${TOKEN}` }, signal: controller.signal })
+    .catch(() => {});
+  await waitFor(async () => (await adbCalls(world)).some((args) => args[1] === "io"), 10_000, "a screenshot");
+  await stopCanvas(canvas);
+  controller.abort();
+  await sleep(2000);
+  assert.deepEqual(readdirSync(temporary).filter((name) => name.startsWith("autonom-canvas-")), []);
 });
 
 test("display: a failed wm density names the command and the values in effect, sets no preset even once the values match it, is not journaled, and a later change and the restore at stop still work", async (t) => {
@@ -5043,7 +5101,7 @@ test("page: controls that cannot act are disabled, the Control buttons hand cont
   assert.equal(byId("inspector-toggle").getAttribute("aria-pressed"), "true");
 });
 
-test("page: the iOS page runs without the Size menu, keeps every element id, and keeps the Android buttons iOS refuses out of sight", async (t) => {
+test("page: the iOS page runs without the Size menu, keeps every element id, shows Home and Power, and keeps the Android buttons iOS refuses out of sight", async (t) => {
   const udid = "FAKE-SIMULATOR-UDID";
   const world = await makeWorld(t, { env: { FAKE_UDID: udid } });
   const xcrun = join(world.directory, "fake-xcrun.mjs");
@@ -5055,7 +5113,11 @@ test("page: the iOS page runs without the Size menu, keeps every element id, and
   for (const id of PAGE_IDS) assert.equal(html.split(`id="${id}"`).length - 1, 1, `id ${id}`);
   assert.doesNotMatch(html, /id="display-preset"|data-preset="/);
   assert.match(html, /<img id="screen" class="surface" tabindex="0" alt="iOS device screen">/);
-  assert.match(html, /<nav class="dock" aria-label="Device buttons" hidden>/);
+  assert.match(html, /<nav class="dock" aria-label="Device buttons">/);
+  const dock = html.match(/<nav class="dock"[^>]*>([\s\S]*?)<\/nav>/)[1];
+  const shown = [...dock.matchAll(/<button [^>]*aria-label="([^"]+)"[^>]*>/g)]
+    .filter((match) => !/ hidden[ >]/.test(match[0])).map((match) => match[1]);
+  assert.deepEqual(shown, ["Home", "Power"]);
   assert.deepEqual([...html.matchAll(/<section class="group"( hidden)?>\s*<h2>([^<]+)<\/h2>/g)].map((match) => [match[2], Boolean(match[1])]),
     [["Type", false], ["Keys", true], ["Device", true], ["Control", false], ["Stream", false]]);
   const { run, document } = runPage(html);

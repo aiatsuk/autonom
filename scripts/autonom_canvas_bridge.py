@@ -32,6 +32,8 @@ from autonom_lib import actions, errors, journal, session, ui  # noqa: E402
 from autonom_lib.platform import ANDROID, IOS, Target  # noqa: E402
 
 ORIGINS = ("human", "agent", "replay", "system")
+# The page's buttons that iOS has a hardware button for.
+IOS_BUTTON_FOR_KEY = {"KEYCODE_HOME": "HOME", "KEYCODE_POWER": "LOCK"}
 RECORD_KINDS = ("gesture", "scroll", "key", "text", "paste", "system", "control", "display")
 RECORD_TRANSPORTS = ("scrcpy",)
 # Streamed input exists only on scrcpy, but Canvas changes the display size on
@@ -262,6 +264,9 @@ def dispatch(target: Target, message: dict[str, Any]) -> dict[str, Any]:
                   "x2": x2, "y2": y2, "duration": duration_ms}
     elif operation == "key":
         key = str(payload["key"])
+        if target.platform == IOS:
+            # The page's Home and Power buttons send Android names; iOS has buttons.
+            key = IOS_BUTTON_FOR_KEY.get(key, key)
         ui.press_key(target, key)
         detail_payload["key"] = key
         result = {"ok": True, "key": key}
