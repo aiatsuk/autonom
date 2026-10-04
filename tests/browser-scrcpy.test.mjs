@@ -2019,8 +2019,11 @@ test("input: touches map to the current video size and every interruption lifts 
   agent.ws.send({ t: "system", op: "home" });
   await waitFor(() => device.messages.filter((message) => message.keycode === 3).length === 2, INPUT_WAIT_MS,
     "agent input");
+  // Wait for the state this release produces: the page's earlier states say "shared" too,
+  // and the agent's release and the page's keys travel on different connections.
+  const released = control.reply((message) => message.t === "state" && message.owner === "shared", INPUT_WAIT_MS);
   agent.ws.send({ t: "control", mode: "release" });
-  await control.next((message) => message.json?.t === "state" && message.json.owner === "shared");
+  await released;
 
   // Keys, wheel, text, paste, clipboard and system actions.
   const count = device.messages.length;
