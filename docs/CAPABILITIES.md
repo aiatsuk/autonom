@@ -72,7 +72,7 @@ Legend: ✅ shipped · ⚠️ partial · 🔜 planned · ❌ not planned for nea
 | Performance traces (simpleperf / xctrace) | ✅ | ⚠️ | `metrics trace` — simpleperf records `--app` with `cpu-cycles` when `simpleperf list hw` lists it, else `cpu-clock` (emulators have no PMU); simpleperf/gfxinfo-flow proven against the fake adb; xctrace presets build correct argv and are fake-tested, unproven against a real Xcode recording in CI; `list-presets` marks `hitches` `unsupported_on_simulator` |
 | Frame stats (gfxinfo / Flutter timings) | ✅ | ⚠️ | `metrics frames reset|capture` (best-effort parse, raw always kept) + `flutter-summary`; a window of 0 HWUI frames (Flutter draws outside HWUI) carries no percentiles and a `no_frames` warning. The iOS Simulator has no frame stats: Instruments refuses Animation Hitches there (`hitches` is physical-device only), so use `flutter-summary` on Flutter timings or `trace --preset time-profiler` |
 | Flutter VM Service (widget tree, heap) | 🔜 | 🔜 | deliberately unshipped (Phase 4 D4) — profile-mode DevTools workflow stays documented in the Flutter skills |
-| XCUITest execution | — | 🔜 | Separate from metrics |
+| XCUITest UI backend | — | ✅ | optional bundled runner (`native/ios`) behind `--ui-backend auto|idb|xcuitest`: `auto` keeps idb and falls back for an app session whose idb tree is empty, has no usable root frame or fails, and records `fallback_reason`; tree, find, selector and coordinate tap, long press, swipe, text and Home; single dispatch (`ui_action_uncertain`, never repeated or re-sent); stopped by `session stop`; Simulator only, builds on first use; see `docs/IOS_UI_RECOVERY.md`. Running an app's own XCUITest suites is not a goal |
 | Optional MCP wrapper | 🔜 | 🔜 | CLI is source of truth first |
 
 ### `ui pinch|rotate|shake` have no backend
@@ -115,12 +115,17 @@ more with origin `system`.
 
 ## CLI surface
 
-Every leaf command also accepts the target flags
+Device command leaves also accept the target flags
+`--session-id <id>`, `--ui-backend auto|idb|xcuitest`,
 `--platform android|ios`, `--target`, `--serial`, `--udid`, and the tool
 overrides `--adb`, `--simctl`, `--idb`, `--idb-host`, `--idb-port`, before or
 after the verb. Two iOS input overrides are global and go before the verb:
 `--axe PATH` (the AXe binary, `AUTONOM_AXE`) and `--ios-hid auto|idb|axe`
-(`AUTONOM_IOS_HID`).
+(`AUTONOM_IOS_HID`). `--ui-backend` chooses who serves the iOS tree and
+input (`AUTONOM_UI_BACKEND`, or the choice `session start --ui-backend`
+stored); `--ios-hid` only routes HID input while idb serves the tree. For
+artifact commands such as reports, put session selection before the verb:
+`autonom --session-id <id> report build`.
 
 ```bash
 autonom version
@@ -130,7 +135,7 @@ autonom devices boot [--avd NAME | --target ID] [--no-wait] [--timeout S] [--emu
 autonom devices shutdown [--target ID]
 autonom doctor [--strict] [--mitmdump PATH]
 autonom tour [--run] [--avd NAME] [--flow PATH] [--human] [--shutdown]
-autonom capabilities
+autonom capabilities [--probe]
 
 autonom session start [--app-id ID] [--install PATH] [--launch [ID]] [--activity C] [--log-stream]
 autonom session show|stop

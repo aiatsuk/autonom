@@ -142,6 +142,21 @@ SIMULATOR_MUST_BE_SHUTDOWN = "simulator_must_be_shutdown"
 SIMULATOR_DATA_NOT_FOUND = "simulator_data_not_found"
 
 
+# --- UI recovery (optional XCUITest backend) ----------------------------------
+SESSION_STOPPED = "session_stopped"  # --session-id named a stopped session for a mutating verb
+SESSION_TARGET_MISMATCH = "session_target_mismatch"  # --session-id with another target's flags
+DISPLAY_GEOMETRY_UNAVAILABLE = "display_geometry_unavailable"  # no screen size; no input sent
+UI_ACTION_UNCERTAIN = "ui_action_uncertain"  # an input was sent and not acknowledged; never repeated
+APP_ID_REQUIRED = "app_id_required"  # the XCUITest backend needs a session with --app-id
+UI_BRIDGE_IN_USE = "ui_bridge_in_use"  # another session owns this simulator's XCUITest runner
+XCUITEST_UNAVAILABLE = "xcuitest_unavailable"  # no full Xcode, or the runner sources are absent
+XCUITEST_BUILD_FAILED = "xcuitest_build_failed"
+XCUITEST_START_FAILED = "xcuitest_start_failed"
+XCUITEST_TIMEOUT = "xcuitest_timeout"  # a read (tree, geometry) was not answered
+XCUITEST_FAILED = "xcuitest_failed"  # the runner reported an unexpected failure
+STALE_UI_ELEMENT = "stale_ui_element"  # the observed element changed; refresh the tree
+NO_FOCUSED_FIELD = "no_focused_field"  # text typed through the runner with no focused field
+
 class AutonomError(RuntimeError):
     """An expected failure with a stable code and an actionable hint."""
 

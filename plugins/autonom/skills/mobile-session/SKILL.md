@@ -189,6 +189,40 @@ export AUTONOM_IDB_COMPANION=mac-farm-01:10882
 | `simulator_must_be_shutdown` | `simulator keyboard pin` needs a shut-down simulator; pass `--value reboot=true` or shut it down first |
 | `simulator_data_not_found` | the simulator has no data directory yet — boot it once, or set `AUTONOM_CORESIMULATOR_DEVICES` |
 
+## Backend recovery and explicit sessions
+
+Keep device actions inside the Autonom CLI, including screenshots and recovery.
+`--session-id <id>` binds one command to that session (its artifacts and journal)
+without changing the current session. A stopped session stays readable (`journal`,
+`shots`, `logs`, `report` but not `report serve`, `session show|outputs`) and refuses
+everything else with `session_stopped`; another target's flags are refused with `session_target_mismatch`.
+One session per machine store still applies: `session start` refuses a second one.
+A stopped session's journal never grows: a command that names it is journaled in the
+current session, if there is one.
+
+On iOS, `--ui-backend auto` tries idb (its input still routed by `--ios-hid`, AXe
+included) and falls back to the bundled XCUITest runner when idb's tree is empty, has
+no usable root frame, or fails; the runner then serves both tree and input. An app
+session with `--app-id` and full Xcode are required for the optional runner; its first
+use builds and starts the helper. `--ui-backend xcuitest` selects it directly;
+`--ui-backend idb` isolates idb diagnosis. The option on `session start` persists the
+choice. `capabilities --probe` measures current UI readiness; without a recent read,
+`ui.accessibility` describes installed tooling only.
+
+For duplicate labels use the observed identifier or add `--role button --mode exact`.
+A `stale_ui_element` refusal happened before input: refresh the tree and reselect.
+A `ui_action_uncertain` result means input may have happened: inspect the screen
+before doing anything else and never automatically repeat the mutation.
+A `display_geometry_unavailable` refusal must not be worked around with guessed scale.
+Screenshots remain `autonom screenshot` even when the tree is empty.
+
+Android launcher failures can be handled with
+`session launch <app> --activity <component>`; normal launch now resolves the
+launcher Activity automatically.
+Use before/after trees or screenshots to verify the actual result. Fallback choices
+and flow steps remain in the session journal. See `docs/IOS_UI_RECOVERY.md` in the
+Autonom repository for implementation details and the Reader regression flows.
+
 ## Related skills
 
 - `mobile-screen` — UI tree, find, tap, screenshot

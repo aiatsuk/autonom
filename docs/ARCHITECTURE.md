@@ -37,7 +37,7 @@ The core design is **routing first, evidence second**.
 ## Control plane
 
 ```text
-Host agent  →  skills  →  scripts/autonom.py  →  adb / xcrun simctl / idb / axe / mitmdump
+Host agent  →  skills  →  scripts/autonom.py  →  adb / xcrun simctl / idb / axe / XCUITest / mitmdump
                               ↓
                      ~/.autonom/sessions/<id>/
 ```
@@ -540,3 +540,14 @@ restore.
 - `docs/USAGE.md` — prompts and workflows
 - `docs/plans/` — phase plans and spike verdicts
 - `SECURITY.md` — the enforced security model
+
+### Optional XCUITest backend
+
+`ios_xctest.py` owns a targetless, cached UI-test runner from `native/ios`.
+`ui_ios.py` selects it after unusable idb snapshots (or when `--ui-backend
+xcuitest` asks); otherwise idb keeps the tree and the idb/AXe HID route keeps
+the input. `ios_geometry.py` can measure Simulator points independently of
+accessibility. A nonce-bound,
+single-dispatch mailbox stays inside the selected Simulator container.
+Commands and flow events keep backend provenance. Explicit `--session-id`
+binds state without changing the global pointer. See [UI recovery](IOS_UI_RECOVERY.md).

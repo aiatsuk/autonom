@@ -16,6 +16,7 @@ import json
 import os
 import shutil
 import subprocess
+import time
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -81,7 +82,7 @@ def _flatten(payload: Any) -> list[dict[str, Any]]:
                 children = node[key]
                 break
         record = {key: value for key, value in node.items() if key not in CHILD_KEYS}
-        record["_depth"] = depth
+        record["_depth"] = node.get("_depth", depth)
         elements.append(record)
         for child in children:
             walk(child, depth + 1)
@@ -153,7 +154,7 @@ def compact_node(element: dict[str, Any], ref: str) -> dict[str, Any]:
     role = _role(element)
     traits = element.get("traits") or element.get("AXTraits") or []
     trait_text = " ".join(traits) if isinstance(traits, list) else str(traits)
-    return {
+    result = {
         "ref": ref,
         "role": role,
         "text": _first(element, "AXValue", "value", "title") or None,
@@ -182,6 +183,9 @@ def compact_node(element: dict[str, Any], ref: str) -> dict[str, Any]:
         "checked": _checked(element, role),
         "depth": int(element.get("_depth") or 0),
     }
+    if element.get("xcuitest_ref"):
+        result["xcuitest_ref"] = element["xcuitest_ref"]
+    return result
 
 
 def is_meaningful(node: dict[str, Any]) -> bool:
@@ -266,8 +270,148 @@ def parse_tree(
 # --- actuation ---------------------------------------------------------------
 
 
+# --- UI backend: idb tree, or the optional XCUITest runner ---------------------
+#
+# --ui-backend (or AUTONOM_UI_BACKEND, or the session's stored preference)
+# chooses who serves the tree: ``idb``, ``xcuitest``, or ``auto`` - idb first,
+# and the bundled XCUITest runner for an app session whose idb tree is empty,
+# has no usable root frame, or fails. Once auto selected XCUITest, the session
+# stays on it. What was measured (backend, reason, geometry, last input) is
+# kept per target in this process and on the session record.
+
+UI_BACKENDS = ("auto", "idb", "xcuitest")
+UI_BACKEND_ENV = "AUTONOM_UI_BACKEND"
+# Keys a CLI result and a flow event carry to say which backend served them.
+PROVENANCE_KEYS = ("ui_backend", "input_backend", "fallback_reason", "geometry")
+
+_PREFERENCE: str | None = None
+_OBSERVATIONS: dict[str, dict] = {}
+
+
+def set_preference(value: str | None) -> None:
+    global _PREFERENCE
+    _PREFERENCE = value
+    _OBSERVATIONS.clear()
+
+
+def preference(target: Target | None = None) -> str:
+    from . import session
+    current = session.load_current() or {}
+    configured = current.get("ui_backend_preference") if target and current.get("target_id") == target.target_id else None
+    value = (_PREFERENCE or os.environ.get(UI_BACKEND_ENV) or configured or "auto").strip().lower()
+    if value not in UI_BACKENDS:
+        raise errors.AutonomError(
+            errors.INVALID_VALUE, f"UI backend {value!r} is not one of " + ", ".join(UI_BACKENDS),
+            "Pass --ui-backend auto|idb|xcuitest (or set AUTONOM_UI_BACKEND).")
+    return value
+
+
+def observation(target_id: str) -> dict:
+    return _OBSERVATIONS.get(target_id, {})
+
+
+# The timestamps _record refreshes. A stored observation that differs only in
+# these, and only by less than OBSERVATION_REWRITE_S, is not written again:
+# every iOS read and input calls _record, and capabilities judges freshness
+# against a 60 s window (providers.OBSERVATION_TTL), so a few seconds of lag
+# change nothing while sparing session.json a rewrite per call.
+_OBSERVATION_TIMES = ("observed_at", "accessibility_at", "input_at")
+OBSERVATION_REWRITE_S = 10.0
+
+
+def _observation_unchanged(stored: dict, facts: dict, now: float) -> bool:
+    if {k: v for k, v in stored.items() if k not in _OBSERVATION_TIMES} != \
+            {k: v for k, v in facts.items() if k not in _OBSERVATION_TIMES}:
+        return False
+    for key in _OBSERVATION_TIMES:
+        if key not in facts:
+            continue
+        try:
+            age = now - float(stored.get(key))
+        except (TypeError, ValueError):
+            return False
+        if not 0 <= age < OBSERVATION_REWRITE_S:
+            return False
+    return True
+
+
+def _record(target: Target, backend: str, **details) -> None:
+    from . import session
+    current = session.load_current()
+    stored = (current.get("ui_observation") or {}) if current and current.get("target_id") == target.target_id else {}
+    previous = _OBSERVATIONS.get(target.target_id, stored)
+    if previous.get("ui_backend") != backend:
+        previous = {}
+    now = time.time()
+    facts = {"ui_backend": backend, "observed_at": now, **details}
+    if "accessibility" in details:
+        facts["accessibility_at"] = now
+    if "input_verified" in details:
+        facts["input_at"] = now
+    facts = {**previous, **facts}
+    _OBSERVATIONS[target.target_id] = facts
+    # A stopped session's record is never rewritten (report serve replaying
+    # its flow, for one, still reads the UI); session.save re-checks the file
+    # under the session lock, so a stop that lands meanwhile still wins.
+    if current and current.get("target_id") == target.target_id and not current.get("stopped_at"):
+        if _observation_unchanged(stored, facts, now):
+            return
+        current["ui_observation"] = facts
+        session.save(current)
+
+
+def selected_backend(target: Target) -> str:
+    from . import session
+    if preference(target) != "auto":
+        return preference(target)
+    current = session.load_current() or {}
+    if current.get("target_id") == target.target_id:
+        return (current.get("ui_observation") or {}).get("ui_backend", "idb")
+    return "idb"
+
+
+def _xctest_snapshot(target: Target, reason: str | None = None) -> str:
+    from . import ios_xctest
+    result = ios_xctest.request(target, "snapshot")
+    payload = json.dumps(result.get("nodes", []))
+    count = sum(is_meaningful(n) for n in parse_all(payload))
+    details = {"fallback_reason": reason} if reason else {}
+    _record(target, "xcuitest", meaningful_nodes=count, geometry=result.get("screen"),
+            accessibility="available" if count else "degraded", **details)
+    return payload
+
+
 def describe_all(target: Target) -> str:
-    return ios_idb.describe_all(target)
+    from . import ios_xctest, session
+    if selected_backend(target) == "xcuitest":
+        return _xctest_snapshot(target)
+    reason = None
+    backend_error = None
+    count = 0
+    payload = "[]"
+    try:
+        payload = ios_idb.describe_all(target)
+        nodes = parse_all(payload)
+        count = sum(is_meaningful(n) for n in nodes)
+        if count and screen_size_from(payload):
+            _record(target, "idb", meaningful_nodes=count, accessibility="available")
+            return payload
+        reason = "empty_accessibility_tree" if not count else "invalid_accessibility_geometry"
+    except errors.AutonomError as exc:
+        reason = exc.code
+        backend_error = exc
+        if preference(target) == "idb":
+            raise
+    current = session.load_current() or {}
+    can_fallback = (preference(target) == "auto" and current.get("target_id") == target.target_id
+                    and current.get("app_id") and Path(target.tool).name == "xcrun"
+                    and ios_xctest.available())
+    if can_fallback:
+        return _xctest_snapshot(target, reason)
+    _record(target, "idb", meaningful_nodes=count, accessibility="degraded", fallback_reason=reason)
+    if backend_error:
+        raise backend_error
+    return payload
 
 
 def screen_size(target: Target) -> tuple[int, int] | None:
@@ -277,27 +421,41 @@ def screen_size(target: Target) -> tuple[int, int] | None:
     the same coordinate space as the nodes; a mismatch is exactly what the guard
     exists to catch.
     """
+    from . import ios_geometry, ios_xctest
+    if selected_backend(target) == "xcuitest":
+        screen = ios_xctest.request(target, "geometry").get("screen", {})
+        if screen.get("width", 0) > 0 and screen.get("height", 0) > 0:
+            _record(target, "xcuitest", geometry=screen)
+            return int(screen["width"]), int(screen["height"])
     try:
-        return screen_size_from(describe_all(target))
+        size = screen_size_from(ios_idb.describe_all(target))
+        if size:
+            _record(target, selected_backend(target), geometry={"width": size[0], "height": size[1],
+                                                               "units": "points", "source": "idb.application_window"})
+            return size
     except errors.AutonomError:
-        return None
+        pass
+    measured = ios_geometry.measure(target)
+    if measured:
+        _record(target, selected_backend(target), geometry=measured)
+        return measured["width"], measured["height"]
+    return None
 
 
 def screen_size_from(payload: str | dict | list) -> tuple[int, int] | None:
-    """The root application/window frame, else the widest extent seen."""
+    """The root application/window frame with a real area, else None.
+
+    The widest node extent is no longer used as a stand-in: a tree whose root
+    has no usable frame is reported as unusable geometry instead, and
+    ``screen_size`` then measures the screen another way."""
     nodes = parse_all(payload)
     for node in nodes:
         if node["depth"] == 0 and node.get("role") in {"app", "window"} and node.get("bounds"):
             bounds = node["bounds"]
-            return bounds[2] - bounds[0], bounds[3] - bounds[1]
-    widest = 0
-    tallest = 0
-    for node in nodes:
-        bounds = node.get("bounds")
-        if bounds:
-            widest = max(widest, bounds[2])
-            tallest = max(tallest, bounds[3])
-    return (widest, tallest) if widest and tallest else None
+            width, height = bounds[2] - bounds[0], bounds[3] - bounds[1]
+            if width > 0 and height > 0:
+                return width, height
+    return None
 
 
 # --- HID backend: idb or AXe ---------------------------------------------------
@@ -306,6 +464,11 @@ def screen_size_from(payload: str | dict | list) -> tuple[int, int] | None:
 # HID verb fails while the accessibility tree still works. AXe drives the same
 # simulator HID through its own FBSimulatorControl build and works there. The
 # tree stays on idb either way: only input is routed.
+#
+# The XCUITest runner is a separate, higher-level choice (--ui-backend): when
+# it is selected, or when ``auto`` fell back to it because the idb tree or its
+# geometry was unusable, it serves both the tree and the input, and the HID
+# route below is not consulted.
 #
 # AUTONOM_IOS_HID (or a ``ios_hid`` alias on the Target) selects the route:
 #   idb  - always idb;
@@ -452,18 +615,50 @@ def _seconds(value: float) -> str:
     return f"{float(value):g}"
 
 
-def tap(target: Target, x: int, y: int, *, duration: float | None = None) -> str:
-    """Tap (or, with ``duration`` seconds, long-press). Returns the backend."""
+def _xctest_input(target: Target, verb: str, **values: Any) -> str:
+    """One XCUITest runner input. Never retried and never re-sent through idb or
+    AXe: a runner that does not answer raises ``ui_action_uncertain`` (REC-004)."""
+    global _last_backend
+    from . import ios_xctest
+    ios_xctest.request(target, verb, **values)
+    _record(target, "xcuitest", input_verified=True, input_backend="xcuitest")
+    _last_backend = "xcuitest"
+    return "xcuitest"
+
+
+def _hid_input(target: Target, via_idb: Callable[[], None], axe_args: list[str],
+               *, input_text: str | None = None) -> str:
+    backend = _dispatch(target, via_idb, axe_args, input_text=input_text)
+    _record(target, "idb", input_verified=True, input_backend=backend)
+    return backend
+
+
+def tap(target: Target, x: int, y: int, *, node: dict | None = None,
+        duration: float | None = None) -> str:
+    """Tap (or, with ``duration`` seconds, long-press). Returns the backend.
+
+    With the XCUITest backend selected the runner taps, and a ``node`` that
+    came from its own tree is tapped by reference; otherwise idb or AXe."""
+    if selected_backend(target) == "xcuitest":
+        values: dict[str, Any] = {"x": x, "y": y}
+        if duration is not None:
+            values["duration"] = duration
+        elif node and node.get("xcuitest_ref"):
+            values.update(ref=node["xcuitest_ref"], identifier=node.get("resource_id") or "",
+                          label=node.get("desc") or "")
+        return _xctest_input(target, "tap", **values)
     if duration is not None:
         axe_args = ["touch", "-x", str(x), "-y", str(y), "--down", "--up",
                     "--delay", _seconds(duration)]
     else:
         axe_args = ["tap", "-x", str(x), "-y", str(y)]
-    return _dispatch(target, lambda: ios_idb.tap(target, x, y, duration=duration), axe_args)
+    return _hid_input(target, lambda: ios_idb.tap(target, x, y, duration=duration), axe_args)
 
 
 def swipe(target: Target, x1: int, y1: int, x2: int, y2: int, duration: float) -> str:
-    return _dispatch(
+    if selected_backend(target) == "xcuitest":
+        return _xctest_input(target, "swipe", x1=x1, y1=y1, x2=x2, y2=y2, duration=duration)
+    return _hid_input(
         target,
         lambda: ios_idb.swipe(target, x1, y1, x2, y2, duration),
         ["swipe", "--start-x", str(x1), "--start-y", str(y1),
@@ -472,10 +667,12 @@ def swipe(target: Target, x1: int, y1: int, x2: int, y2: int, duration: float) -
 
 
 def type_text(target: Target, text: str) -> str:
+    if selected_backend(target) == "xcuitest":
+        return _xctest_input(target, "type", text=text)
     # Through stdin, so text that starts with '-' is not read as a flag and
     # the typed value never shows up in a process listing.
-    return _dispatch(target, lambda: ios_idb.text(target, text), ["type", "--stdin"],
-                     input_text=text)
+    return _hid_input(target, lambda: ios_idb.text(target, text), ["type", "--stdin"],
+                      input_text=text)
 
 
 def press_key(target: Target, key: str) -> str:
@@ -485,12 +682,18 @@ def press_key(target: Target, key: str) -> str:
     silently doing nothing — and iOS genuinely has no global Back button, which
     the message says so an agent taps the navigation control instead.
     """
+    if selected_backend(target) == "xcuitest" and key.upper() == "HOME":
+        return _xctest_input(target, "home")
     upper = key.upper()
     if upper in ios_idb.BUTTONS:
-        return _dispatch(target, lambda: ios_idb.button(target, upper),
-                         ["button", upper.lower().replace("_", "-")])
+        backend = _dispatch(target, lambda: ios_idb.button(target, upper),
+                            ["button", upper.lower().replace("_", "-")])
+        _record(target, selected_backend(target), input_verified=True, input_backend=backend)
+        return backend
     if key.isdigit():
-        return _dispatch(target, lambda: ios_idb.key(target, key), ["key", key])
+        backend = _dispatch(target, lambda: ios_idb.key(target, key), ["key", key])
+        _record(target, selected_backend(target), input_verified=True, input_backend=backend)
+        return backend
     hint = "Valid iOS buttons: " + ", ".join(ios_idb.BUTTONS) + "; or a numeric HID keycode."
     if upper.startswith("KEYCODE_"):
         hint += (" iOS has no global Back button — tap the navigation bar's back control "
@@ -504,6 +707,7 @@ def press_key(target: Target, key: str) -> str:
 
 def gesture(target: Target, name: str, **kwargs: Any) -> None:
     ios_idb.gesture(target, name, **kwargs)
+    _record(target, selected_backend(target), input_verified=True, input_backend="idb")
 
 
 def screenshot(target: Target, output: Path) -> Path:

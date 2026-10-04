@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import time
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -9,6 +10,9 @@ from . import errors
 from .contracts import Capability, CapabilitySnapshot, utc_now
 from .platform import ANDROID, IOS, Target
 
+
+# How long a measured UI observation outranks the installed-tooling view.
+OBSERVATION_TTL = 60.0
 
 SEMANTIC_CAPABILITIES = (
     "ui.accessibility", "ui.input", "screenshots", "screen.stream", "logs",
@@ -123,6 +127,8 @@ class LocalDeviceSession:
                     "requires an emulator or simulator" if not simulated
                     else "the platform exposes no provider-neutral control"),
             )
+        if not is_android:
+            self._apply_ui_observation(values)
         capabilities = tuple(
             Capability(name, state, reason)
             for name, (state, reason) in sorted(values.items())
@@ -133,6 +139,33 @@ class LocalDeviceSession:
             device_class=self._device_class(), captured_at=utc_now(),
             capabilities=capabilities,
         )
+
+    def _apply_ui_observation(self, values: dict[str, tuple[str, str | None]]) -> None:
+        """Refine the iOS tooling view with what Autonom last measured.
+
+        Installed tooling stays the baseline (an idb that is ready still means
+        `ui.accessibility: available`). A UI read in the last minute replaces
+        it with the measured state and, when the tree was unusable, the
+        reason. While the XCUITest runner serves the session, input is the
+        runner's: available after a recent dispatch, degraded until then.
+        """
+        observed = self.record.get("ui_observation") or {}
+        if not observed:
+            return
+        now = time.time()
+        accessibility_fresh = now - float(
+            observed.get("accessibility_at", observed.get("observed_at", 0)) or 0) < OBSERVATION_TTL
+        input_fresh = now - float(observed.get("input_at", 0) or 0) < OBSERVATION_TTL
+        if accessibility_fresh and observed.get("accessibility"):
+            state = observed["accessibility"]
+            values["ui.accessibility"] = (
+                state, None if state == "available" else observed.get("fallback_reason"))
+        if observed.get("ui_backend") == "xcuitest" and (accessibility_fresh or input_fresh):
+            if input_fresh and observed.get("input_verified"):
+                values["ui.input"] = ("available", None)
+            else:
+                values["ui.input"] = ("degraded",
+                                      "XCUITest backend selected; no recent input dispatch")
 
     def _device_class(self) -> str:
         if self.target.platform == IOS:
@@ -179,6 +212,17 @@ def open_session(target: Target, record: dict[str, Any]) -> LocalDeviceSession:
 
 def preflight(target: Target, record: dict[str, Any],
               required: list[str]) -> CapabilitySnapshot:
+    if target.platform == IOS and any(name in {"ui.accessibility", "ui.input"} for name in required):
+        # Measure the UI once, so the snapshot reflects the backend that
+        # actually serves it; a failed read leaves the tooling view to decide.
+        from . import ui, ui_ios
+        try:
+            ui.tree(target)
+        except errors.AutonomError:
+            pass
+        observed = ui_ios.observation(target.target_id)
+        if observed:
+            record = {**record, "ui_observation": observed}
     snapshot = open_session(target, record).capabilities()
     unknown = sorted(set(required) - set(SEMANTIC_CAPABILITIES))
     if unknown:

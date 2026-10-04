@@ -255,3 +255,9 @@ Use Autonom: route this repository, pick the smallest skill set, run the
 narrowest useful checks first, and report measured evidence separately from
 hypotheses.
 ```
+
+## Recovering iOS UI and naming a session
+
+See [UI recovery](IOS_UI_RECOVERY.md) for `--ui-backend auto|idb|xcuitest` (and how
+it sits above `--ios-hid`), `--session-id`, measured `capabilities --probe`, and
+repeatable Reader fixture flows.

@@ -1,0 +1,65 @@
+schema: autonom.dev/flow/v1
+appId: com.iatsuk.reader
+name: Reader fixture — offline draft survives restart
+description: Requires the isolated Reader fixture-account library; never run against a personal library
+tags:
+  - regression
+  - reader-fixture
+requires:
+  platform:
+    - ios
+---
+- launchApp
+- tapOn:
+    selector:
+      id: article_article-one
+      match: exact
+- assertVisible:
+    selector:
+      description: Read with attention. Your next thought belongs here.
+      match: exact
+    timeoutMs: 10000
+- tapOn:
+    selector:
+      id: notebook
+      match: exact
+- tapOn:
+    selector:
+      description: Note draft
+      role: textfield
+      match: exact
+- inputText:
+    value: Autonom XCUITest draft survives restart.
+- assertVisible:
+    selector:
+      text: Autonom XCUITest draft survives restart.
+      match: contains
+- assertVisible:
+    selector:
+      description: Done
+      role: button
+      enabled: true
+      match: exact
+- takeScreenshot:
+    label: Fixture draft saved before restart
+- stopApp
+- launchApp
+- tapOn:
+    selector:
+      id: article_article-one
+      match: exact
+- tapOn:
+    selector:
+      id: notebook
+      match: exact
+- assertVisible:
+    selector:
+      text: Autonom XCUITest draft survives restart.
+      match: contains
+- takeScreenshot:
+    label: Fixture draft restored after restart
+- tapOn:
+    selector:
+      description: Done
+      role: button
+      match: exact

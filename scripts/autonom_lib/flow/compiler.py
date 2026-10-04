@@ -44,8 +44,10 @@ _NOISE_VERBS = {
 # The value-taking options of the verbs compiled below, as build_parser() in
 # scripts/autonom.py declares them: the target flags every leaf verb repeats
 # (plus the global-only --axe/--ios-hid), then each verb's own. A journal
-# argv is read with these, so `open URL --serial S` yields URL — never S.
+# argv is read with these, so `open URL --serial S` yields URL — never S, and
+# `open --session-id s_abc URL` yields URL — never the session id.
 _TARGET_VALUE_FLAGS = (
+    "--session-id", "--ui-backend",
     "--platform", "--target", "--serial", "--udid", "--adb", "--simctl",
     "--idb", "--idb-host", "--idb-port", "--axe", "--ios-hid",
 )

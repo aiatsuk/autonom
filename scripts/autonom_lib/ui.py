@@ -627,18 +627,21 @@ def screen_size(target: Target) -> tuple[int, int] | None:
 
 
 # The actuation verbs return the backend that delivered the input: "adb" on
-# Android; on iOS "idb" or "axe" as `ui_ios` resolved it (AUTONOM_IOS_HID,
-# AXe fallback), so a payload can say which one ran. Callers that ignore the
-# return value are unaffected. `ui_ios.last_backend()` reports the same.
+# Android; on iOS "idb", "axe" or "xcuitest" as `ui_ios` resolved it
+# (--ui-backend, AUTONOM_IOS_HID, AXe fallback), so a payload can say which
+# one ran. Callers that ignore the return value are unaffected.
+# `ui_ios.last_backend()` reports the same.
 ANDROID_BACKEND = "adb"
 
 
-def tap(target: Target, x: int, y: int, *, screen: tuple[int, int] | None = None) -> str:
+def tap(target: Target, x: int, y: int, *, screen: tuple[int, int] | None = None,
+        node: dict | None = None) -> str:
     _guard_point(target, x, y, screen=screen)
     if target.platform == ANDROID:
         ui_android.tap(target.tool, target.target_id, x, y)
         return ANDROID_BACKEND
-    return _ios().tap(target, x, y)
+    # the node lets the XCUITest backend tap the element it resolved itself
+    return _ios().tap(target, x, y, node=node)
 
 
 def long_press(target: Target, x: int, y: int, duration_ms: int = 600,
@@ -647,7 +650,7 @@ def long_press(target: Target, x: int, y: int, duration_ms: int = 600,
     if target.platform == ANDROID:
         ui_android.long_press(target.tool, target.target_id, x, y, duration_ms)
         return ANDROID_BACKEND
-    # through ui_ios, not idb directly: AXe carries it when idb's HID cannot
+    # through ui_ios, not idb directly: AXe or the XCUITest runner may carry it
     return _ios().tap(target, x, y, duration=duration_ms / 1000)
 
 
@@ -713,7 +716,18 @@ def _guard_point(target: Target, x: int, y: int,
     full accessibility dump, so the default path costs one extra dump per tap.
     """
     size = screen if screen is not None else screen_size(target)
-    if not size:
+    if not size or min(size) <= 0:
+        # No known screen: the idb/AXe route sends the input unguarded, as it
+        # always has (Canvas taps, sessions without --app-id, a zero root
+        # frame). Only the XCUITest runner refuses: it serves the session
+        # because the idb geometry was unusable, and maps coordinates in the
+        # points of the screen it reports, so without one nothing is sent.
+        if target.platform == IOS and _ios().selected_backend(target) == "xcuitest":
+            raise errors.AutonomError(
+                errors.DISPLAY_GEOMETRY_UNAVAILABLE,
+                "Could not measure the iOS screen in points for the XCUITest runner",
+                "Read the UI tree again (the runner reports the screen) and retry; "
+                "no input was sent.")
         return
     width, height = size
     if 0 <= x <= width and 0 <= y <= height:

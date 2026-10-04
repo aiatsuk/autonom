@@ -97,8 +97,10 @@ xcode-select -p
 xcrun simctl list devices available
 ```
 
-The accessibility tree (`ui tree`, `ui find`, `ui tap`, gestures) additionally
-needs the iOS Development Bridge:
+The UI uses idb first and can recover through the bundled XCUITest runner when
+an explicit app session is selected. Full Xcode is required for XCUITest; its
+first use builds and caches the helper. See [UI recovery](IOS_UI_RECOVERY.md).
+Install idb for the primary backend and additional hardware gestures:
 
 ```bash
 brew tap facebook/fb

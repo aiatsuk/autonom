@@ -295,6 +295,14 @@ class CompilerMatchesTheRealParserTests(unittest.TestCase):
              "permissions", ["action", "service", "app_id"]),
             (["session", "clear", "a.b", "--strategy", "privacy"],
              "session clear", ["app_id"]),
+            # the session-binding and iOS backend flags take a value too
+            (["open", "--session-id", "s_abc", "https://example.com"],
+             "open", ["url"]),
+            (["--ui-backend", "xcuitest", "session", "launch", "com.app"],
+             "session launch", ["app_id"]),
+            (["--session-id", "s_abc", "session", "launch", "com.app",
+              "--ui-backend", "idb"], "session launch", ["app_id"]),
+            (["ui", "key", "--ui-backend=xcuitest", "home"], "ui key", ["keycode"]),
         ]
         for argv, verb, dests in cases:
             with self.subTest(argv=argv):
@@ -304,6 +312,17 @@ class CompilerMatchesTheRealParserTests(unittest.TestCase):
                                  [getattr(namespace, dest) for dest in dests])
                 if verb == "session launch":
                     self.assertEqual("--fresh" in options, namespace.fresh)
+
+    def test_session_and_backend_flag_values_are_never_positionals(self) -> None:
+        positionals, options = compiler._parse_argv(  # noqa: SLF001
+            "open", ["open", "--session-id", "s_abc", "https://example.com"])
+        self.assertEqual(positionals, ["https://example.com"])
+        self.assertIn("--session-id", options)
+        parsed = compiler._parse_argv(  # noqa: SLF001
+            "session launch", ["--ui-backend", "xcuitest", "session", "launch", "com.app"])
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed[0], ["com.app"])
+        self.assertIn("--ui-backend", parsed[1])
 
 
 # --- flow check: openLink needs a scheme -------------------------------------

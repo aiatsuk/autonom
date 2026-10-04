@@ -81,6 +81,12 @@ class EventWriter:
             "sensitive": sensitive,
             "payload": payload,
         }
+        if self.platform == "ios":
+            from .. import ui_ios
+            observed = ui_ios.observation(self.target_id)
+            for key in ("ui_backend", "input_backend", "fallback_reason"):
+                if observed.get(key) is not None:
+                    event[key] = observed[key]
         if self.serial:
             event["serial"] = self.serial  # DEC-004: permanent on Android
         line = json.dumps(event, ensure_ascii=False)
@@ -109,5 +115,6 @@ class EventWriter:
             "status": payload.get("status"),
             "error_code": payload.get("error_code"),
         }
+        entry.update({key: step_event[key] for key in ("ui_backend", "input_backend", "fallback_reason") if key in step_event})
         journal_mod.append(self.session,
                            {k: v for k, v in entry.items() if v is not None})
