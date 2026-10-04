@@ -249,7 +249,7 @@ lifts the pointers and keys of WebSocket connections it refuses. `/text`
 keeps its conservative ASCII rule; Unicode text exists only on the scrcpy
 transport, where it replaces the device clipboard.
 
-### Mobile Canvas display presets (unreleased)
+### Mobile Canvas display presets (0.32.0)
 
 Additive. No `error_code`, CLI verb or flag is added, and a Canvas that never
 changes the display runs no `wm` command and behaves as before.
@@ -272,7 +272,7 @@ A Canvas killed with SIGKILL leaves the preset on the device until
 on the same device takes the first one's preset as its original. Both are
 documented in the `android-emulator-browser` skill.
 
-### iOS UI recovery and `--session-id` (unreleased)
+### iOS UI recovery and `--session-id` (0.32.0)
 
 Additive, with two behaviour changes listed at the end. A host that passes
 neither `--ui-backend` nor `--session-id`, on a screen whose idb tree is

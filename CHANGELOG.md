@@ -120,10 +120,10 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
   versions that ignore `shouldUpgradeCallback`, a bodiless request with an
   `Upgrade` header and `Content-Length: 00` got a 400. Any run of zeros now
   means no body; a signed, empty or non-numeric length is still refused.
-- Steadier Canvas tests on busy CI runners (#22): the input tests wait for
-  the state they check instead of fixed delays, the journal flood test gives
-  a client up to 10 s to catch up, and state messages serialize the presets
-  list once.
+- Steadier Canvas tests on busy CI runners (#22): the input tests allow up
+  to 10 s (was 3-5 s) for multi-step device exchanges such as clipboard
+  holds, the journal flood test gives a lagging client up to 10 s to catch
+  up, and state messages serialize the presets list once.
 
 ## [0.31.2] - 2026-10-03
 
