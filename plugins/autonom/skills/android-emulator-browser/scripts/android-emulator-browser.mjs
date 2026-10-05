@@ -72,8 +72,9 @@ const BOUNDARY = "autonom-frame";
 const CLIENT_BACKLOG_BYTES = 4 * 1024 * 1024;
 // Any control message can change the state that goes to every client, and a state
 // message is a snapshot: a client with this much unsent data gets no new one, only the
-// current state once it has caught up. Many small messages cost far more memory than
-// their bytes, so this bound is small.
+// current state once its socket drains or ahead of the next packet or reply it is sent
+// (catchUpState). Many small messages cost far more memory than their bytes, so this
+// bound is small.
 const STATE_BACKLOG_BYTES = 64 * 1024;
 // Backpressure instead of buffering: a control connection stops reading new messages
 // while the device has not read this many control bytes, while the connection has not
@@ -1686,11 +1687,12 @@ function broadcastState(context) {
 
 /**
  * A client behind by STATE_BACKLOG_BYTES skips state messages, so a flood of handoff
- * changes leaves at most one bound of them per client; catchUpState sends it the
- * current state when its socket drains (and a video client before its next packet).
+ * changes leaves at most one bound of them per client. It skips them only while its
+ * socket owes a "drain" event (past the socket's high-water mark, which may be above
+ * this bound), so that event always comes once the backlog has gone.
  */
 function sendState(client, message) {
-  if (client.ws.bufferedAmount > STATE_BACKLOG_BYTES) {
+  if (client.ws.bufferedAmount > STATE_BACKLOG_BYTES && client.ws.writableNeedDrain) {
     client.stateStale = true;
     return;
   }
@@ -1698,8 +1700,16 @@ function sendState(client, message) {
   client.ws.send(message);
 }
 
+/**
+ * A client that skipped a state gets the current one when its socket drains, and ahead
+ * of the next video packet or control reply it is sent anyway, whatever its backlog: a
+ * client on a slow link whose backlog never empties gets no "drain". That is at most one
+ * state for each message it gets, and those have their own bounds.
+ */
 function catchUpState(context, client) {
-  if (client.stateStale) sendState(client, stateMessage(context));
+  if (!client.stateStale) return;
+  client.stateStale = false;
+  client.ws.send(stateMessage(context));
 }
 
 /** Start the device server (or companion) for the first WebSocket client; at most one per Canvas. */
@@ -2170,7 +2180,8 @@ function reply(context, client, message) {
  * Replies (pongs, errors, clipboard answers of up to 256 KiB) share the per-client
  * bound of video. A client that does not read them stops being read (inputPressure),
  * so only answers to requests it made before that can reach the bound; past it the
- * client is closed and its pointers lifted, instead of growing Canvas memory.
+ * client is closed and its pointers lifted, instead of growing Canvas memory. A client
+ * that skipped a state gets the current one first (catchUpState).
  */
 function sendControlText(context, client, text) {
   if (client.ws.readyState !== READY_STATE.OPEN) return;
@@ -2180,6 +2191,7 @@ function sendControlText(context, client, text) {
     releaseInput(context, client);
     return;
   }
+  catchUpState(context, client);
   client.ws.send(text);
 }
 

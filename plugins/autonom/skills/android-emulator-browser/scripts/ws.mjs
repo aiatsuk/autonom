@@ -226,6 +226,11 @@ class WebSocketConnection extends EventEmitter {
     return this.#socket.writableLength;
   }
 
+  /** True while the socket owes a "drain" event: a write went past its high-water mark. */
+  get writableNeedDrain() {
+    return this.#socket.writableNeedDrain === true;
+  }
+
   get readyState() {
     return this.#readyState;
   }
