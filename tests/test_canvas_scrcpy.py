@@ -1,6 +1,6 @@
-"""Mobile Canvas scrcpy: the bridge `record` op, including display changes,
-`canvas serve` flags, and the optional scrcpy in doctor and bootstrap
-(CANVAS-009, CANVAS-013, DISPLAY-006).
+"""Mobile Canvas scrcpy and idb: the bridge `record` op, including display
+changes and the iOS idb transport, `canvas serve` flags, and the optional
+scrcpy in doctor and bootstrap (CANVAS-009, CANVAS-013, DISPLAY-006, IOSF-004).
 
 Fakes only. The device tool handed to the bridge and the CLI is a sentinel
 that logs any call, `node`, `scrcpy`, `uname`, `brew`, `sudo` and `apt-get`
@@ -9,6 +9,8 @@ holds nothing but those scripts.
 """
 from __future__ import annotations
 
+import argparse
+import importlib.util
 import json
 import os
 import shutil
@@ -40,7 +42,7 @@ UDID = "00000000-0000-0000-0000-00000000CAFE"
 SECRET = "clipboard-SECRET-7f3a"
 # Variables that would point a child process at a real tool on this machine.
 TOOL_ENV = ("AUTONOM_ADB", "AUTONOM_SIMCTL", "AUTONOM_IDB", "AUTONOM_MITMDUMP",
-            "AUTONOM_AXE", "AUTONOM_IOS_HID", "AUTONOM_IDB_COMPANION",
+            "AUTONOM_AXE", "AUTONOM_IOS_HID", "AUTONOM_IDB_COMPANION", "AUTONOM_IDB_COMPANION_BIN",
             "AUTONOM_IDB_STATE_FILE", "AUTONOM_FAKE_STATE", "AUTONOM_FAKE_LOG",
             "AUTONOM_EMULATOR", "DEVELOPER_DIR",
             "AUTONOM_SCRCPY_SERVER", "SCRCPY_SERVER_PATH")
@@ -248,6 +250,24 @@ class BridgeRecordTests(EnvSandboxMixin, unittest.TestCase):
                     self.assert_refused(payload, origin)
         self.assertEqual(self.journal(), [])
 
+    def test_ios_idb_records_of_every_streamed_kind_name_idb(self) -> None:
+        """IOSF-004: one entry per completed action on the iOS fast transport."""
+        for payload, origin in ONE_OF_EACH:
+            if payload["kind"] == "display":
+                continue
+            with self.subTest(kind=payload["kind"]):
+                result = self.send({**payload, "transport": "idb"}, origin)
+                self.assertEqual((result["recorded"], result["via"]), (payload["kind"], "idb"))
+        self.assertEqual([(entry["verb"], entry["origin"]) for entry in self.journal()],
+                         [(f"ui {payload['kind']}", origin) for payload, origin in ONE_OF_EACH
+                          if payload["kind"] != "display"])
+        self.assertTrue(all(detail["transport"] == "idb" for detail in self.details()))
+
+    def test_ios_idb_never_names_a_display_change(self) -> None:
+        """Display presets are Android-only, so no `display` record names idb."""
+        self.assert_refused({**DISPLAY, "transport": "idb"})
+        self.assertEqual(self.journal(), [])
+
     def test_without_a_session_record_still_answers(self) -> None:
         session.stop_session(reap=False)
         self.assertEqual(self.send(GESTURE), {"ok": True, "recorded": "gesture",
@@ -355,7 +375,7 @@ class BridgeRecordTests(EnvSandboxMixin, unittest.TestCase):
                 {**DISPLAY, "height": None},
                 {**DISPLAY, "width": None}]
         bad += [{**DISPLAY, "transport": transport} for transport in (
-            "webrtc", "mjpeg", "", None, "SCRCPY", 0, ["scrcpy"])]
+            "webrtc", "mjpeg", "", None, "SCRCPY", 0, ["scrcpy"], "idb", "IDB")]
         for payload in bad:
             with self.subTest(payload=payload):
                 self.assert_refused(payload)
@@ -478,6 +498,47 @@ class BridgeSessionTargetTests(EnvSandboxMixin, unittest.TestCase):
         self.assertEqual([path for path in self.home.rglob("*") if path.is_file()], [])
 
 
+class BridgeIosTextTests(EnvSandboxMixin, unittest.TestCase):
+    """IOSF-004: text from the idb transport's control socket goes through the
+    bridge `text` op, which types it and journals one `ui text` entry naming idb."""
+
+    def setUp(self) -> None:
+        self.sandbox_home()
+        self.typed: list[str] = []
+        patcher = mock.patch.object(ui, "type_text",
+                                    side_effect=lambda target, text: self.typed.append(text))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.target = Target(IOS, UDID, "/nonexistent/xcrun", {"udid": UDID})
+        self.record = session.start_session("/nonexistent/xcrun", platform="ios", target_id=UDID)
+
+    def details(self) -> list[dict]:
+        return list(actions.read_details(self.record).values())
+
+    def type(self, payload: dict) -> dict:
+        return bridge.dispatch(self.target, {"id": 1, "op": "text", "origin": "human",
+                                             "payload": payload})
+
+    def test_idb_text_is_typed_and_journaled_once_with_its_transport(self) -> None:
+        self.assertTrue(self.type({"text": "wifi", "transport": "idb"})["ok"])
+        self.assertTrue(self.type({"text": SECRET, "sensitive": True, "transport": "idb"})["ok"])
+        self.assertEqual(self.typed, ["wifi", SECRET])
+        first, second = self.details()
+        self.assertEqual((first["transport"], first["text"], first["text_len"]), ("idb", "wifi", 4))
+        self.assertEqual((second["transport"], second["text"], second["sensitive"]),
+                         ("idb", None, True))
+        journal = Path(self.record["artifacts_dir"]) / "journal.ndjson"
+        self.assertEqual([json.loads(line)["verb"] for line in
+                          journal.read_text(encoding="utf-8").splitlines()], ["ui text", "ui text"])
+        self.assertNotIn(SECRET, journal.read_text(encoding="utf-8"))
+
+    def test_text_without_a_known_transport_names_none(self) -> None:
+        for payload in ({"text": "a"}, {"text": "b", "transport": "webrtc"},
+                        {"text": "c", "transport": ["idb"]}):
+            self.type(payload)
+        self.assertTrue(all("transport" not in detail for detail in self.details()))
+
+
 class BridgeIosButtonTests(EnvSandboxMixin, unittest.TestCase):
     """The page's Home and Power buttons send Android key names. Before: iOS
     refused them, so a Canvas on a Simulator had no way to press Home."""
@@ -560,6 +621,10 @@ FAKE_NODE = """#!{python}
 import json, os, sys
 with open(os.environ["FAKE_NODE_OUT"], "w", encoding="utf-8") as handle:
     json.dump(sys.argv[1:], handle)
+if os.environ.get("FAKE_NODE_ENV"):
+    with open(os.environ["FAKE_NODE_ENV"], "w", encoding="utf-8") as handle:
+        json.dump({{key: os.environ.get(key) for key in
+                   ("AUTONOM_IDB_COMPANION", "AUTONOM_IDB_COMPANION_BIN")}}, handle)
 """
 
 
@@ -717,6 +782,109 @@ class CanvasServeFlagsTests(EnvSandboxMixin, unittest.TestCase):
                 self.assertEqual((payload["error_code"], payload["capability"]),
                                  (errors.UNSUPPORTED_ON_PLATFORM, "canvas.scrcpy"))
 
+    def test_idb_on_ios_forwards_an_explicit_companion_as_an_absolute_path(self) -> None:
+        """IOSF-001: `--transport idb` and `--idb-companion` reach the canvas server."""
+        companion = write_script(self.root / "tools" / "idb_companion", "#!/bin/sh\nexit 0\n")
+        argv = self.node_argv(self.serve("--transport", "idb", "--idb-companion",
+                                         "tools/idb_companion", ios=True))
+        values = flag_values(argv)
+        self.assertEqual((values["--platform"], values["--transport"]), ("ios", "idb"))
+        self.assertEqual(Path(values["--idb-companion"]).resolve(), companion.resolve())
+        self.assertTrue(Path(values["--idb-companion"]).is_absolute())
+
+    def test_idb_on_ios_is_left_to_the_canvas_server_when_a_companion_can_be_found(self) -> None:
+        companion = write_script(self.root / "bin" / "idb_companion", "#!/bin/sh\nexit 0\n")
+        argv = self.node_argv(self.serve("--transport", "idb", ios=True))
+        self.assertNotIn("--idb-companion", argv)
+        companion.unlink()
+        self.node_out.unlink()
+        elsewhere = write_script(self.root / "elsewhere" / "idb_companion", "#!/bin/sh\nexit 0\n")
+        self.env["AUTONOM_IDB_COMPANION_BIN"] = str(elsewhere)
+        argv = self.node_argv(self.serve("--transport", "idb", ios=True))
+        self.assertEqual(flag_values(argv)["--transport"], "idb")
+        self.assertNotIn("--idb-companion", argv)
+
+    def test_idb_without_any_companion_fails_naming_canvas_idb(self) -> None:
+        """IOSF-005: no flag, no AUTONOM_IDB_COMPANION_BIN, nothing on PATH.
+        AUTONOM_IDB_COMPANION is the remote companion of idb calls: neither a
+        `host:port` nor a file path there is the Canvas's binary."""
+        binary = write_script(self.root / "elsewhere" / "idb_companion", "#!/bin/sh\nexit 0\n")
+        for value in (None, "mac-farm-01:10882", str(binary)):
+            with self.subTest(value=value):
+                if value:
+                    self.env["AUTONOM_IDB_COMPANION"] = value
+                payload = self.refused(self.serve("--transport", "idb", ios=True))
+                self.assertEqual((payload["error_code"], payload["capability"], payload["tool"]),
+                                 (errors.TOOL_MISSING, "canvas.idb", "idb_companion"))
+                self.assertEqual(payload["error"],
+                                 "--transport idb is unavailable: idb_companion was not found "
+                                 "(--idb-companion, AUTONOM_IDB_COMPANION_BIN or PATH)")
+                self.assertIn("brew install facebook/fb/idb-companion", payload["hint"])
+                self.assertIn("AUTONOM_IDB_COMPANION_BIN", payload["hint"])
+
+    def test_idb_lookup_is_the_flag_then_the_bin_variable_then_path(self) -> None:
+        """A set AUTONOM_IDB_COMPANION_BIN that names no executable file is
+        reported, never skipped for PATH; the flag comes before it."""
+        on_path = write_script(self.root / "bin" / "idb_companion", "#!/bin/sh\nexit 0\n")
+        plain = self.root / "plain" / "idb_companion"
+        plain.parent.mkdir()
+        plain.write_text("not executable\n", encoding="utf-8")
+        for bad in (self.root / "missing", plain, self.root):
+            with self.subTest(bad=bad):
+                self.env["AUTONOM_IDB_COMPANION_BIN"] = str(bad)
+                payload = self.refused(self.serve("--transport", "idb", ios=True))
+                self.assertEqual((payload["error_code"], payload["capability"], payload["tool"]),
+                                 (errors.TOOL_MISSING, "canvas.idb", "idb_companion"))
+                self.assertEqual(payload["error"], "--transport idb is unavailable: "
+                                 f"AUTONOM_IDB_COMPANION_BIN is not an executable file: {bad}")
+        argv = self.node_argv(self.serve("--transport", "idb", "--idb-companion", str(on_path),
+                                         ios=True))
+        self.assertEqual(flag_values(argv)["--idb-companion"], str(on_path))
+        self.node_out.unlink()
+        # A flag that names no executable file: tool_missing for --transport idb, as the
+        # canvas server refuses it, and invalid_value otherwise.
+        self.env.pop("AUTONOM_IDB_COMPANION_BIN")
+        payload = self.refused(self.serve("--transport", "idb", "--idb-companion", str(plain),
+                                          ios=True))
+        self.assertEqual((payload["error_code"], payload["error"]), (
+            errors.TOOL_MISSING,
+            f"--transport idb is unavailable: --idb-companion is not an executable file: {plain}"))
+        payload = self.refused(self.serve("--idb-companion", str(plain), ios=True))
+        self.assertEqual(payload["error_code"], errors.INVALID_VALUE)
+
+    def test_a_remote_companion_variable_is_left_untouched_for_idb_calls(self) -> None:
+        """AUTONOM_IDB_COMPANION keeps its meaning: node gets it unchanged, and
+        the Canvas binary comes from AUTONOM_IDB_COMPANION_BIN."""
+        binary = write_script(self.root / "elsewhere" / "idb_companion", "#!/bin/sh\nexit 0\n")
+        node_env = self.root / "node-env.json"
+        self.env.update({"AUTONOM_IDB_COMPANION": "mac-farm-01:10882",
+                         "AUTONOM_IDB_COMPANION_BIN": str(binary),
+                         "FAKE_NODE_ENV": str(node_env)})
+        argv = self.node_argv(self.serve("--transport", "idb", ios=True))
+        self.assertNotIn("--idb-companion", argv)
+        self.assertEqual(json.loads(node_env.read_text(encoding="utf-8")),
+                         {"AUTONOM_IDB_COMPANION": "mac-farm-01:10882",
+                          "AUTONOM_IDB_COMPANION_BIN": str(binary)})
+
+    def test_auto_on_ios_starts_without_a_companion(self) -> None:
+        """auto falls back to screencap inside the canvas server, never refuses here."""
+        values = flag_values(self.node_argv(self.serve(ios=True)))
+        self.assertEqual(values["--transport"], "auto")
+
+    def test_a_missing_companion_file_fails_before_node_starts(self) -> None:
+        for path in (self.root / "missing", self.root):
+            with self.subTest(path=path):
+                payload = self.refused(self.serve("--idb-companion", str(path), ios=True))
+                self.assertEqual(payload["error_code"], errors.INVALID_VALUE)
+
+    def test_idb_on_android_is_refused_with_its_capability(self) -> None:
+        companion = write_script(self.root / "tools" / "idb_companion", "#!/bin/sh\nexit 0\n")
+        for argv in (("--transport", "idb"), ("--idb-companion", str(companion))):
+            with self.subTest(argv=argv):
+                payload = self.refused(self.serve(*argv))
+                self.assertEqual((payload["error_code"], payload["capability"]),
+                                 (errors.UNSUPPORTED_ON_PLATFORM, "canvas.idb"))
+
     def test_ios_still_forwards_its_own_transport(self) -> None:
         values = flag_values(self.node_argv(self.serve("--transport", "screencap", ios=True)))
         self.assertEqual((values["--platform"], values["--transport"], values["--simctl"]),
@@ -724,6 +892,99 @@ class CanvasServeFlagsTests(EnvSandboxMixin, unittest.TestCase):
 
 
 # --- doctor --------------------------------------------------------------------------
+
+
+IDB_MODULE = (ROOT / "plugins/autonom/skills/android-emulator-browser/scripts/"
+              "ios-idb-companion.mjs")
+NODE_LOOKUP = """
+const [moduleUrl, flag, env] = JSON.parse(process.argv[1]);
+const { resolveIdbCompanionBinary } = await import(moduleUrl);
+console.log(JSON.stringify(await resolveIdbCompanionBinary({ flag: flag ?? undefined, env })));
+"""
+
+
+def load_cli():
+    spec = importlib.util.spec_from_file_location("autonom_cli_canvas_idb", CLI)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+@unittest.skipUnless(shutil.which("node"), "node is not installed")
+class CanvasIdbLookupAgreementTests(unittest.TestCase):
+    """The pre-check of `canvas serve` and the canvas server find idb_companion
+    by the same rules: --idb-companion, AUTONOM_IDB_COMPANION_BIN, then PATH,
+    never AUTONOM_IDB_COMPANION, with the same answer and reason for each case."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.cli = load_cli()
+        cls.node = shutil.which("node")
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+
+    def node_lookup(self, flag: str | None, env: dict[str, str]) -> dict:
+        completed = subprocess.run(
+            [self.node, "--input-type=module", "-e", NODE_LOOKUP,
+             json.dumps([IDB_MODULE.as_uri(), flag, env])],
+            text=True, capture_output=True, check=False, timeout=30,
+            env={"PATH": os.environ.get("PATH", "")})
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        return json.loads(completed.stdout)
+
+    def python_lookup(self, flag: str | None, env: dict[str, str]) -> dict:
+        with mock.patch.dict(os.environ, env, clear=True):
+            return self.cli._canvas_idb_lookup(argparse.Namespace(idb_companion=flag))
+
+    def test_both_layers_give_the_same_answer_for_every_case(self) -> None:
+        first = write_script(self.root / "first" / "idb_companion", "#!/bin/sh\nexit 0\n")
+        second = write_script(self.root / "second" / "idb_companion", "#!/bin/sh\nexit 0\n")
+        plain = self.root / "plain" / "idb_companion"
+        plain.parent.mkdir()
+        plain.write_text("not executable\n", encoding="utf-8")
+        folder = self.root / "folder"
+        (folder / "idb_companion").mkdir(parents=True)
+        empty = self.root / "empty"
+        empty.mkdir()
+        path_both = os.pathsep.join(["", str(folder), str(plain.parent), str(first.parent),
+                                     str(second.parent)])
+        remote = {"AUTONOM_IDB_COMPANION": "mac-farm-01:10882"}
+        cases = {
+            "flag before the variable and PATH": (
+                str(second), {"AUTONOM_IDB_COMPANION_BIN": str(first), "PATH": path_both},
+                ("--idb-companion", str(second))),
+            "variable before PATH": (
+                None, {"AUTONOM_IDB_COMPANION_BIN": str(second), "PATH": str(first.parent)},
+                ("AUTONOM_IDB_COMPANION_BIN", str(second))),
+            "PATH skips empty entries, folders and plain files": (
+                None, {"PATH": path_both, **remote}, ("PATH", str(first))),
+            "an empty variable is unset": (
+                None, {"AUTONOM_IDB_COMPANION_BIN": "", "PATH": str(second.parent)},
+                ("PATH", str(second))),
+            "a bad flag is reported": (str(plain), {"PATH": path_both}, None),
+            "a folder flag is reported": (str(folder), {"PATH": path_both}, None),
+            "a bad variable is reported, not skipped": (
+                None, {"AUTONOM_IDB_COMPANION_BIN": str(self.root / "missing"),
+                       "PATH": path_both}, None),
+            "the remote companion variable names no binary": (
+                None, {"AUTONOM_IDB_COMPANION": str(first), "PATH": str(empty)}, None),
+            "nothing anywhere": (None, {"PATH": str(empty), **remote}, None),
+        }
+        for name, (flag, env, expected) in cases.items():
+            with self.subTest(name):
+                python, node = self.python_lookup(flag, env), self.node_lookup(flag, env)
+                self.assertEqual(python, node)
+                if expected:
+                    self.assertTrue(python["available"])
+                    self.assertEqual((python["source"], python["path"]), expected)
+                else:
+                    self.assertFalse(python["available"])
+                    self.assertTrue(python["reason"])
+                    self.assertNotIn("AUTONOM_IDB_COMPANION ", python["reason"] + " ")
 
 
 class DoctorScrcpyTests(EnvSandboxMixin, unittest.TestCase):

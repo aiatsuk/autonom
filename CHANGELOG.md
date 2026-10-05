@@ -7,6 +7,44 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
 
 ## [Unreleased]
 
+### Added
+- **iOS Canvas at 60 fps (idb transport).** On an iOS Simulator `canvas serve
+  --transport auto` now streams the Simulator's own H.264 at up to 60 fps and
+  full resolution into the WebCodecs page when idb_companion is found
+  (`--idb-companion PATH`, the new `AUTONOM_IDB_COMPANION_BIN`, or `PATH`;
+  `AUTONOM_IDB_COMPANION` keeps its meaning, the remote companion of idb
+  calls, and is never read by the Canvas; `--transport idb` requires a
+  usable binary and refuses with `tool_missing`, `capability: "canvas.idb"`,
+  from the CLI and from the canvas server alike). The Canvas starts and owns one companion on
+  a private socket, shares its one stream with every tab (a late tab starts
+  at the cached key frame; a key frame every 2 s, forced by Stop and Start
+  only when one does not come), always ends a stream with Stop, restarts the
+  companion after a stream ends without one (also when a forced restart's
+  Stop is not written or not answered, before any new Start, so two encoders
+  never run), restarts the stream when the
+  Simulator boots again, and stops 15 s after the last page. The page shows
+  the decoded frames in order, one per screen refresh with at most two
+  waiting, so a frame that arrives together with the next one is no longer
+  lost (Android still shows only the newest). The page turns
+  the portrait picture for the Simulator's orientation (`orientation` and
+  `rotation` in `state` and `/status` `idb`). Input on `/ws/control` is live:
+  one finger over the companion's HID stream (a second pointer is refused),
+  the wheel as a short drag that never taps (it starts inside the screen and
+  always moves past the tap slop), Home and Power as Home and Lock, and text
+  through the action bridge, all in one ordered queue, so input sent after
+  text waits until it is typed, under the same authentication and handoff
+  rules as Android (pause and takeover are checked again when each queued
+  item runs); a finger or button held down when the companion is lost is
+  lifted through the next companion; each
+  completed action is one journal record with `transport:
+  idb`. Without idb_companion, or when the stream cannot start, the Canvas
+  falls back to screenshots and `/status` `fallback_reason` says why.
+  `tests/live/canvas_ios_live.mjs` measures decoded, dropped, presented and
+  distinct-frame fps in headed Chromium (a static control window, then
+  Settings flung for 10 s), frame intervals, host load, SSIM outside the
+  screen's rounded corners and camera cutout, sharing and input on a test
+  Simulator.
+
 ### Fixed
 - **iOS Canvas shows the screen on Xcode 27.** Since Xcode 27, `simctl io
   screenshot -` writes a file named `-` in the working directory instead of

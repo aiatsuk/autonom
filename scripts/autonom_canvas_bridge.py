@@ -7,12 +7,14 @@ with an explicit human/agent/replay/system origin.  Journaling goes into the
 current Autonom session only when that session is on this Canvas's own
 target; a session on another device never receives this Canvas's actions.
 
-The one exception is the scrcpy transport: Canvas writes streamed input to
-the scrcpy control socket itself, because a process hop per pointer move is
-too slow.  It then sends one `record` per completed action, which only
-journals and never actuates.  Display size changes (`wm size`/`wm density`)
-follow the same path on every transport: Canvas runs them on its own serial,
-then sends one `display` record.
+The exceptions are the streamed transports: on scrcpy (Android) Canvas
+writes streamed input to the scrcpy control socket itself, and on idb (the iOS
+Simulator) touches, the wheel and Home/Power go to the HID stream of the
+idb_companion it owns, because a process hop per pointer move is too slow.
+It then sends one `record` per completed action, which only journals and
+never actuates.  Text on idb still comes here as a `text` operation.  Display
+size changes (`wm size`/`wm density`) follow the record path on every Android
+transport: Canvas runs them on its own serial, then sends one `display` record.
 """
 from __future__ import annotations
 
@@ -35,10 +37,12 @@ ORIGINS = ("human", "agent", "replay", "system")
 # The page's buttons that iOS has a hardware button for.
 IOS_BUTTON_FOR_KEY = {"KEYCODE_HOME": "HOME", "KEYCODE_POWER": "LOCK"}
 RECORD_KINDS = ("gesture", "scroll", "key", "text", "paste", "system", "control", "display")
-RECORD_TRANSPORTS = ("scrcpy",)
-# Streamed input exists only on scrcpy, but Canvas changes the display size on
-# every transport, so a `display` record may name any of them.
-DISPLAY_TRANSPORTS = RECORD_TRANSPORTS + ("screenrecord", "screencap")
+# The transports whose input Canvas streams itself: scrcpy on Android, idb on
+# the iOS Simulator. A record without a transport names scrcpy, as before idb.
+RECORD_TRANSPORTS = ("scrcpy", "idb")
+# Canvas changes the display size on every Android transport, so a `display`
+# record may name any of them; display presets are Android-only, so never idb.
+DISPLAY_TRANSPORTS = ("scrcpy", "screenrecord", "screencap")
 # The presets Canvas applies, `default` (the device's own size) and `restore`
 # (the stop-time return to what the device had before the first change).
 DISPLAY_PRESETS = ("small", "pixel-11", "pixel-fold", "tablet", "default", "restore")
@@ -277,6 +281,10 @@ def dispatch(target: Target, message: dict[str, Any]) -> dict[str, Any]:
         detail_payload.update({"sensitive": sensitive,
                                "text": None if sensitive else text,
                                "text_len": len(text)})
+        # Text typed from the idb transport's control socket says so; any other
+        # value is dropped rather than copied into the journal.
+        if payload.get("transport") in RECORD_TRANSPORTS:
+            detail_payload["transport"] = payload["transport"]
         result = {"ok": True, "typed": f"<{len(text)} chars>"}
     else:
         raise errors.AutonomError(errors.FLOW_COMMAND_INVALID,

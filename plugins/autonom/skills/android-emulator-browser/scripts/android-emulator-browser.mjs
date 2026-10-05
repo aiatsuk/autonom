@@ -6,6 +6,7 @@ import { homedir, tmpdir } from "node:os";
 import { delimiter, join, resolve } from "node:path";
 import { env, exit, platform } from "node:process";
 import { execFile, spawn } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { createInterface } from "node:readline";
 import { promisify } from "node:util";
 
@@ -53,6 +54,15 @@ import {
   resolveScrcpyServer,
 } from "./scrcpy-session.mjs";
 import { CLOSE_CODE, READY_STATE, acceptWebSocket, rejectUpgrade } from "./ws.mjs";
+import {
+  DEFAULT_VIDEO_OPTIONS,
+  ERROR_CODE,
+  IDB_CAPABILITY,
+  IdbCompanion,
+  StructuredError,
+  idbUnavailableError,
+  resolveIdbCompanionBinary,
+} from "./ios-idb-companion.mjs";
 
 const execFileAsync = promisify(execFile);
 const BOUNDARY = "autonom-frame";
@@ -173,8 +183,51 @@ const DISPLAY_READ_MAX_AGE_MS = 2000;
 const DISPLAY_WATCH_AGE_MS = 1500;
 // The largest display side `dw` and `dh` of POST /tap and /swipe may name, as the journal's.
 const MAX_SENT_DISPLAY_SIDE = 10_000;
+// Transports whose video and input go over /ws/video and /ws/control: scrcpy on Android,
+// idb (one idb_companion H.264 stream and its HID stream) on the iOS Simulator.
+const FAST_TRANSPORTS = new Set(["scrcpy", "idb"]);
+// A fast stream that sends no frame this long after it opened is ended and opened again.
+const IDB_FIRST_FRAME_MS = 10_000;
+// The companion has no key frame on demand; it sends one every DEFAULT_VIDEO_OPTIONS
+// .keyFrameRate seconds (DEC-004). A key frame asked for and not seen within this wait is
+// forced with Stop and Start on the same stream, at most once per IDB_FORCED_KEY_FRAME_MS.
+const IDB_KEY_FRAME_WAIT_MS = 2500;
+const IDB_FORCED_KEY_FRAME_MS = 5000;
+// The Simulator state is read this often while the fast stream runs, so a reboot restarts
+// the frozen stream (IOSF-006); the orientation is read this often for rotated pictures.
+const IDB_SIMULATOR_WATCH_MS = 2000;
+const IDB_ORIENTATION_MS = 1000;
+const IDB_RETRY_MIN_MS = 500;
+const IDB_RETRY_MAX_MS = 5000;
+// A stream that ran this long resets the restart backoff.
+const IDB_STABLE_MS = 10_000;
+// The page's system buttons the Simulator has a hardware button for.
+const IOS_BUTTONS = Object.freeze({ home: "HOME", power: "LOCK" });
+// Clockwise degrees that turn the Simulator's portrait picture upright for each
+// orientation; the picture itself stays portrait when the Simulator rotates.
+const IOS_ROTATION = Object.freeze({ LANDSCAPE_LEFT: 270, LANDSCAPE_RIGHT: 90, PORTRAIT_UPSIDE_DOWN: 180 });
+// A wheel burst is one synthetic drag: the finger moves this many points per wheel step and
+// lifts once the wheel has been still IOS_WHEEL_IDLE_MS, so iOS sees no fling at the end.
+// It never taps: every drag goes down at an anchor at least IOS_WHEEL_MARGIN_POINTS inside
+// each edge and its first move goes at least IOS_WHEEL_MIN_POINTS in the wheel's direction,
+// past the iOS tap slop (about 10 points); its points stay IOS_WHEEL_EDGE_POINTS inside the screen.
+const IOS_WHEEL_POINTS = 24;
+const IOS_WHEEL_MIN_POINTS = 16;
+const IOS_WHEEL_MARGIN_POINTS = 32;
+const IOS_WHEEL_EDGE_POINTS = 2;
+const IOS_WHEEL_IDLE_MS = 150;
+// A HID write the companion has not taken within this long no longer holds the input queue;
+// the HID stream still keeps its order, and the companion is restarted when it is gone.
+const IOS_HID_WRITE_MS = 5000;
+const IOS_ONE_FINGER = "The iOS Simulator takes one finger at a time: this pointer was refused while another is down";
 
 main().catch((error) => {
+  // A refusal with a code is the CLI's JSON error object on stderr and exit code 2, as
+  // `autonom canvas serve` prints it when it refuses first.
+  if (error instanceof StructuredError) {
+    console.error(JSON.stringify(error));
+    exit(2);
+  }
   console.error(`android-emulator-browser: ${error.message}`);
   exit(1);
 });
@@ -190,6 +243,11 @@ async function main() {
   if (isIos && options.transport === "scrcpy") {
     throw scrcpyError("the scrcpy transport mirrors Android targets only");
   }
+  if (!isIos && (options.transport === "idb" || options.idbCompanion !== undefined)) {
+    throw new StructuredError(ERROR_CODE.UNSUPPORTED_ON_PLATFORM, "the idb transport mirrors iOS Simulators only", {
+      hint: "On Android use --transport auto or scrcpy.", capability: IDB_CAPABILITY,
+    });
+  }
   const adbPath = isIos
     ? (options.simctl ?? await findExecutable("xcrun"))
     : (options.adb ?? await findAdb());
@@ -200,11 +258,13 @@ async function main() {
 
   let ffmpegPath = options.ffmpeg;
   if (!ffmpegPath) ffmpegPath = await findExecutable("ffmpeg").catch(() => null);
-  const [scrcpy, screenrecordSupported] = await Promise.all([
+  const [scrcpy, screenrecordSupported, idb] = await Promise.all([
     resolveScrcpy(options, isIos),
     isIos ? false : supportsScreenrecord(adbPath, serial),
+    resolveIdbCompanion(options, isIos),
   ]);
   if (options.transport === "scrcpy" && !scrcpy.available) throw scrcpyError(scrcpy.reason);
+  if (options.transport === "idb" && !idb.available) throw idbUnavailableError(idb.reason);
   if (options.transport === "screenrecord" && (!ffmpegPath || !screenrecordSupported)) {
     throw new Error("screenrecord transport requires device H.264 output support and ffmpeg on PATH");
   }
@@ -218,6 +278,7 @@ async function main() {
     streamClients: 0,
     acceleratedFailed: false,
     scrcpyFailed: null,
+    idbFailed: null,
     lastError: null,
     controlOwner: "shared",
     inputPaused: false,
@@ -232,6 +293,7 @@ async function main() {
     ffmpegPath,
     screenrecordSupported,
     scrcpy,
+    idb,
     token,
     state,
     port: null,
@@ -254,6 +316,22 @@ async function main() {
     clipboardSequence: 0n,
     // Arrival order of held control messages, across connections.
     heldOrder: 0,
+    // iOS: the one finger down on the Simulator as its connection sees it,
+    // {client, id, x, y, point, wheel, pressed}.
+    iosFinger: null,
+    // iOS input in message order (iosEnqueue): HID events, text for the bridge and records,
+    // each run once the one before it is done, and whether the queue is running.
+    iosInput: [],
+    iosInputRunning: false,
+    iosResumeQueued: false,
+    // Counts companion losses: HID events queued before one never reach the next companion.
+    iosEpoch: 0,
+    // What the HID stream of the current session and epoch holds down, by the events written
+    // to it: {session, epoch, touch: point or null, buttons}. When the companion or stream is
+    // lost (or the session stops) it becomes the orphan, {touch, buttons}, lifted with UPs
+    // through the next companion that streams, whatever the queue held then.
+    iosHeld: null,
+    iosOrphan: null,
     // Device pointer id → the last up for it: {x, y, at}, `at` null until it is written.
     recentUps: new Map(),
     // Android keycode → the last key-up for it: {at}, `at` null until it is written.
@@ -396,11 +474,14 @@ Options:
   --adb PATH                  adb executable path.
   --simctl PATH               xcrun executable path for iOS screenshots.
   --idb PATH                  idb executable path for iOS input.
+  --idb-companion PATH        idb_companion for the iOS idb transport (default:
+                              AUTONOM_IDB_COMPANION_BIN, then PATH).
   --ffmpeg PATH               ffmpeg executable path.
   --port, -p PORT             Localhost port (default: 3277; 0 chooses a free port).
-  --transport MODE            auto, scrcpy, screenrecord, or screencap (default: auto).
-                              auto prefers scrcpy on Android when a ${SCRCPY_PROTOCOL_VERSION} server is found.
-  --fps FPS                   Frame rate cap (default: 15; ${DEFAULT_SCRCPY_MAX_FPS} on the scrcpy transport).
+  --transport MODE            auto, scrcpy, idb, screenrecord, or screencap (default: auto).
+                              auto prefers scrcpy on Android when a ${SCRCPY_PROTOCOL_VERSION} server is found,
+                              and idb on the iOS Simulator when idb_companion is found.
+  --fps FPS                   Frame rate cap (default: 15; ${DEFAULT_SCRCPY_MAX_FPS} on scrcpy and idb).
   --max-size PX               Maximum video width (default: 1280).
   --bit-rate BPS              H.264 bitrate (default: 8000000).
   --scrcpy-server PATH        scrcpy-server file to push (default: AUTONOM_SCRCPY_SERVER,
@@ -415,6 +496,18 @@ Options:
 
 function scrcpyError(reason) {
   return new Error(`${SCRCPY_CAPABILITY}: --transport scrcpy is unavailable: ${reason}. ${SCRCPY_INSTALL_HINT}`);
+}
+
+/**
+ * The idb_companion of the iOS fast transport (resolveIdbCompanionBinary): --idb-companion,
+ * else AUTONOM_IDB_COMPANION_BIN, else idb_companion on PATH. AUTONOM_IDB_COMPANION is the
+ * remote companion of the CLI's idb calls and is never read here.
+ */
+async function resolveIdbCompanion(options, isIos) {
+  if (!isIos || options.transport === "screencap" || options.transport === "screenrecord") {
+    return { available: false, path: null, source: null, reason: null };
+  }
+  return resolveIdbCompanionBinary({ flag: options.idbCompanion, env });
 }
 
 async function resolveScrcpy(options, isIos) {
@@ -696,8 +789,8 @@ function handleUpgrade(context, request, socket, head) {
     rejectUpgrade(socket, authorization.status, authorization.message);
     return;
   }
-  if (chooseTransport(context) !== "scrcpy") {
-    rejectUpgrade(socket, 409, "The scrcpy transport is not active on this Canvas");
+  if (!FAST_TRANSPORTS.has(chooseTransport(context))) {
+    rejectUpgrade(socket, 409, `The ${isIosCanvas(context) ? "idb" : "scrcpy"} transport is not active on this Canvas`);
     return;
   }
   const ws = acceptWebSocket(request, socket, head, {
@@ -709,10 +802,17 @@ function handleUpgrade(context, request, socket, head) {
 }
 
 function chooseTransport(context) {
-  const { options, scrcpy, state } = context;
+  const { options, scrcpy, idb, state } = context;
   if (options.transport === "scrcpy") return "scrcpy";
+  if (options.transport === "idb") return "idb";
   if (options.transport === "auto" && scrcpy.available && !state.scrcpyFailed) return "scrcpy";
+  if (options.transport === "auto" && idb.available && !state.idbFailed) return "idb";
   return multipartTransport(context);
+}
+
+/** An iOS Canvas: its only WebSocket transport is idb. */
+function isIosCanvas(context) {
+  return context.options.platform === "ios";
 }
 
 /** The transport behind /stream.mjpeg, also used when a page cannot decode scrcpy video. */
@@ -724,9 +824,13 @@ function multipartTransport(context) {
   return "screencap";
 }
 
-/** Why auto mode on Android is not on its first choice, or null. */
+/** Why auto mode is not on its first choice, or null. */
 function fallbackReason(context) {
-  const { options, scrcpy, state, ffmpegPath, screenrecordSupported } = context;
+  const { options, scrcpy, idb, state, ffmpegPath, screenrecordSupported } = context;
+  if (options.transport === "auto" && isIosCanvas(context)) {
+    if (chooseTransport(context) === "idb") return null;
+    return state.idbFailed ? `idb failed to start: ${state.idbFailed}` : idb.reason;
+  }
   if (options.transport !== "auto" || options.platform !== "android") return null;
   const chosen = chooseTransport(context);
   if (chosen === "scrcpy") return null;
@@ -741,7 +845,7 @@ function fallbackReason(context) {
 
 async function sendStatus(context, response) {
   const [measured] = await Promise.all([
-    context.actionBridge.call("screen-size", {}, "system"),
+    iosStreamDisplay(context) ?? context.actionBridge.call("screen-size", {}, "system"),
     freshDisplay(context),
   ]);
   if (measured.display) context.display = measured.display;
@@ -764,7 +868,39 @@ async function sendStatus(context, response) {
     control_owner: context.state.controlOwner,
     input_paused: context.state.inputPaused,
     scrcpy: scrcpyStatus(context),
+    idb: idbStatus(context),
   });
+}
+
+/** The iOS fast transport in /status: where the companion came from and what the stream did. */
+function idbStatus(context) {
+  if (!context.idb.available) return null;
+  const session = context.session instanceof IosFastSession ? context.session : null;
+  const stats = session?.stats;
+  return {
+    companion_path: context.idb.path,
+    source: context.idb.source,
+    session_state: session?.state ?? "idle",
+    companion_pid: stats?.companionPid ?? null,
+    width: context.video.size?.width ?? null,
+    height: context.video.size?.height ?? null,
+    points: stats?.points ?? null,
+    orientation: session?.orientation ?? null,
+    rotation: iosRotation(context),
+    packets: stats?.packets ?? 0,
+    bytes: stats?.bytes ?? 0,
+    key_frames: stats?.keyFrames ?? 0,
+    restarts: stats?.restarts ?? 0,
+    companion_starts: stats?.companionStarts ?? 0,
+    streams_opened: stats?.streamsOpened ?? 0,
+    stream_restarts: stats?.streamRestarts ?? 0,
+    forced_key_frames: stats?.forcedKeyFrames ?? 0,
+    hid_events: stats?.hidEvents ?? 0,
+    video_clients: context.videoClients.size,
+    control_clients: context.controlClients.size,
+    journal_pending: journalPending(context),
+    journal_dropped: context.journalDropped,
+  };
 }
 
 function scrcpyStatus(context) {
@@ -1027,6 +1163,423 @@ class FrameBroadcaster {
   }
 }
 
+/**
+ * The iOS Simulator fast transport (IOSF-001..006): one idb_companion owned by this Canvas,
+ * one H.264 video stream on it that every tab shares through the scrcpy /ws/video messages,
+ * and the companion's HID stream for input. States: idle → starting → streaming ↔
+ * restarting → stopped. Events: state(name), session({width, height}), config(Buffer),
+ * packet({keyFrame, pts, data}), orientation(name), error(Error).
+ *
+ * Every stream ends with an explicit Stop (the client sends it); a stream that ended without
+ * one may leave its encoder running in the companion, so the companion is restarted then.
+ * There is never a second stream: a late joiner waits for the periodic key frame, and a key
+ * frame that does not come is forced with Stop and Start on the same stream (DEC-004).
+ */
+class IosFastSession extends EventEmitter {
+  #udid;
+  #xcrun;
+  #binary;
+  #video;
+  #companion = null;
+  #stream = null;
+  #state = "idle";
+  #stopped = false;
+  #stopPromise = null;
+  #loop = null;
+  #everStreamed = false;
+  #first = null;
+  #wake = null;
+  #t0 = performance.now();
+  #config = null;
+  #size = null;
+  #points = null;
+  #orientation = "PORTRAIT";
+  #booted = true;
+  #watchTimer = null;
+  #orientationTimer = null;
+  #keyFrameWantedAt = null;
+  #keyFrameTimer = null;
+  #forcedKeyFrameAt = -Infinity;
+  #streamRestarting = false;
+  #stats = {
+    packets: 0, bytes: 0, keyFrames: 0, restarts: 0, companionStarts: 0, streamsOpened: 0,
+    streamRestarts: 0, forcedKeyFrames: 0, hidEvents: 0,
+  };
+
+  constructor({ udid, xcrunPath, binary, video }) {
+    super();
+    this.#udid = udid;
+    this.#xcrun = xcrunPath;
+    this.#binary = binary;
+    this.#video = video;
+  }
+
+  get state() {
+    return this.#state;
+  }
+
+  get everStreamed() {
+    return this.#everStreamed;
+  }
+
+  /** Input can go out: the stream runs, the Simulator is booted and the companion answers. */
+  get connected() {
+    const client = this.#companion?.client;
+    return this.#state === "streaming" && this.#booted && Boolean(client) && !client.closed;
+  }
+
+  /** HID events are a few bytes written straight to the companion; nothing waits in Canvas memory. */
+  get controlBacklog() {
+    return 0;
+  }
+
+  /** The screen in logical points, portrait. */
+  get points() {
+    return this.#points;
+  }
+
+  get orientation() {
+    return this.#orientation;
+  }
+
+  get stats() {
+    return { ...this.#stats, state: this.#state, points: this.#points, companionPid: this.#companion?.pid ?? null };
+  }
+
+  /** Resolves with the first frame; rejects when the first attempt fails. Later restarts only emit. */
+  start() {
+    if (this.#stopped) return Promise.reject(new Error("idb session is stopped"));
+    if (this.#loop) return Promise.reject(new Error("idb session already started"));
+    this.#setState("starting");
+    const first = new Promise((resolvePromise, reject) => {
+      this.#first = { resolve: resolvePromise, reject };
+    });
+    this.#loop = this.#run();
+    this.#watchSimulator();
+    this.#watchOrientation();
+    return first;
+  }
+
+  /** One HID event on the companion's HID stream, in call order. */
+  hid(event) {
+    try {
+      const client = this.#companion?.client;
+      if (!client || client.closed) throw new Error("the idb companion is not running");
+      this.#stats.hidEvents += 1;
+      return client.hid().send(event);
+    } catch (error) {
+      return Promise.reject(error);
+    }
+  }
+
+  /**
+   * A tab needs a key frame. The companion sends one every few seconds; only one that does
+   * not arrive within IDB_KEY_FRAME_WAIT_MS is forced, by Stop and Start on the same stream.
+   */
+  requestKeyFrame() {
+    if (!this.connected) return;
+    this.#keyFrameWantedAt ??= performance.now();
+    if (!this.#keyFrameTimer) this.#armKeyFrameTimer(IDB_KEY_FRAME_WAIT_MS);
+  }
+
+  /** Stop for good: Stop on the stream, then the companion and its process group. Idempotent. */
+  stop() {
+    if (this.#stopPromise) return this.#stopPromise;
+    this.#stopped = true;
+    clearTimeout(this.#watchTimer);
+    clearTimeout(this.#orientationTimer);
+    clearTimeout(this.#keyFrameTimer);
+    this.#wake?.();
+    this.#setState("stopped");
+    this.#settleFirst(new Error("the idb session stopped"));
+    this.#stopPromise = (async () => {
+      await this.#stream?.stop().catch(() => {});
+      await this.#stopCompanion();
+    })();
+    return this.#stopPromise;
+  }
+
+  #setState(state) {
+    if (this.#state === state) return;
+    this.#state = state;
+    this.emit("state", state);
+  }
+
+  #settleFirst(error) {
+    const first = this.#first;
+    if (!first) return;
+    this.#first = null;
+    if (error) first.reject(error);
+    else first.resolve(true);
+  }
+
+  #sleep(milliseconds) {
+    return new Promise((resolvePromise) => {
+      const done = () => {
+        clearTimeout(timer);
+        if (this.#wake === done) this.#wake = null;
+        resolvePromise();
+      };
+      const timer = setTimeout(done, milliseconds);
+      this.#wake = done;
+    });
+  }
+
+  async #run() {
+    let backoff = IDB_RETRY_MIN_MS;
+    while (!this.#stopped) {
+      const result = await this.#streamOnce().catch((error) => ({ error, abnormal: true, ranMs: 0 }));
+      if (this.#stopped) break;
+      const error = result.error ?? new Error("the idb companion ended the video stream");
+      this.#settleFirst(error);
+      if (this.listenerCount("error")) this.emit("error", error);
+      this.#setState("restarting");
+      // No Stop reached the companion, so its encoder may still run: start a new one.
+      if (result.abnormal) await this.#stopCompanion();
+      if (result.ranMs >= IDB_STABLE_MS) backoff = IDB_RETRY_MIN_MS;
+      await this.#sleep(backoff);
+      backoff = Math.min(IDB_RETRY_MAX_MS, backoff * 2);
+      if (!this.#stopped) this.#stats.restarts += 1;
+    }
+  }
+
+  async #stopCompanion() {
+    const companion = this.#companion;
+    this.#companion = null;
+    await companion?.stop().catch(() => {});
+  }
+
+  /** One stream on the current companion (started first when needed), until it ends. */
+  async #streamOnce() {
+    // A companion whose process is gone is replaced, even after a stream that ended with a
+    // status: each process is one companion start.
+    if (this.#companion && !this.#companion.running) await this.#stopCompanion();
+    if (!this.#companion) {
+      const companion = new IdbCompanion({ udid: this.#udid, binary: this.#binary });
+      companion.on("exit", ({ code, signal, expected }) => {
+        if (expected || !this.listenerCount("error")) return;
+        const tail = companion.logTail().slice(-3).join(" | ");
+        this.emit("error", new Error(`idb_companion exited (${signal ?? `code ${code}`})${tail ? `: ${tail}` : ""}`));
+      });
+      this.#companion = companion;
+      this.#stats.companionStarts += 1;
+    }
+    const client = await this.#companion.start();
+    if (this.#stopped) return { abnormal: false, ranMs: 0 };
+    await this.#describe(client);
+    await this.#readOrientation(client);
+    if (this.#stopped) return { abnormal: false, ranMs: 0 };
+    const stream = await client.openVideoStream(this.#video);
+    this.#stream = stream;
+    this.#stats.streamsOpened += 1;
+    const openedAt = performance.now();
+    let framed = false;
+    let error = null;
+    const timer = setTimeout(() => {
+      if (framed) return;
+      error = new Error(`the idb video stream sent no frame within ${IDB_FIRST_FRAME_MS / 1000} s`);
+      stream.stop().catch(() => {});
+    }, IDB_FIRST_FRAME_MS);
+    timer.unref?.();
+    try {
+      for await (const frame of stream) {
+        framed = true;
+        this.#onFrame(frame);
+      }
+    } catch (thrown) {
+      error ??= thrown;
+    } finally {
+      clearTimeout(timer);
+      if (this.#stream === stream) this.#stream = null;
+    }
+    const closed = await stream.closed;
+    return { abnormal: closed.abnormal, error: error ?? closed.error ?? null, ranMs: performance.now() - openedAt };
+  }
+
+  /** The screen size in points, for HID coordinates; the last known one is kept on failure. */
+  async #describe(client) {
+    try {
+      const { screen } = await client.describe({ timeoutMs: 3000 });
+      if (screen?.widthPoints && screen?.heightPoints) {
+        this.#points = { width: screen.widthPoints, height: screen.heightPoints };
+      } else if (screen?.width && screen?.height && screen?.density) {
+        this.#points = { width: Math.round(screen.width / screen.density), height: Math.round(screen.height / screen.density) };
+      }
+    } catch (error) {
+      if (this.listenerCount("error")) this.emit("error", new Error(`idb describe failed: ${error.message}`));
+    }
+  }
+
+  async #readOrientation(client) {
+    let name;
+    try {
+      name = await client.getOrientation({ timeoutMs: 2000 });
+    } catch {
+      return;
+    }
+    // Face up or down and unknown keep the orientation the screen is drawn in.
+    if (!["PORTRAIT", "PORTRAIT_UPSIDE_DOWN", "LANDSCAPE_LEFT", "LANDSCAPE_RIGHT"].includes(name)) return;
+    if (name === this.#orientation) return;
+    this.#orientation = name;
+    this.emit("orientation", name);
+  }
+
+  #onFrame(frame) {
+    if (frame.config && (!this.#config || !frame.config.equals(this.#config))) {
+      this.#config = Buffer.from(frame.config);
+      if (frame.width && frame.height &&
+        (frame.width !== this.#size?.width || frame.height !== this.#size?.height)) {
+        this.#size = { width: frame.width, height: frame.height };
+        // Without a describe answer, an iPhone's picture is three pixels per point.
+        this.#points ??= { width: Math.round(frame.width / 3), height: Math.round(frame.height / 3) };
+        this.emit("session", { ...this.#size });
+      }
+      this.emit("config", this.#config);
+    }
+    // A stream frozen while the Simulator is down is not streaming yet.
+    if (this.#state !== "streaming" && this.#booted) {
+      this.#everStreamed = true;
+      this.#setState("streaming");
+      this.#settleFirst(null);
+    }
+    // The CONFIG message carries SPS and PPS, which the page puts before each key frame.
+    const data = frame.key && frame.config ? withoutParameterSets(frame.data) : frame.data;
+    if (frame.key) {
+      this.#stats.keyFrames += 1;
+      this.#keyFrameWantedAt = null;
+      clearTimeout(this.#keyFrameTimer);
+      this.#keyFrameTimer = null;
+    }
+    this.#stats.packets += 1;
+    this.#stats.bytes += frame.data.length;
+    const pts = Math.max(0, Math.round((frame.receivedAt - this.#t0) * 1000));
+    this.emit("packet", { keyFrame: frame.key, pts, data });
+  }
+
+  #armKeyFrameTimer(milliseconds) {
+    this.#keyFrameTimer = setTimeout(() => {
+      this.#keyFrameTimer = null;
+      if (this.#keyFrameWantedAt === null || this.#stopped) return;
+      const wait = this.#forcedKeyFrameAt + IDB_FORCED_KEY_FRAME_MS - performance.now();
+      if (wait > 0) {
+        this.#armKeyFrameTimer(wait);
+        return;
+      }
+      this.#forcedKeyFrameAt = performance.now();
+      this.#stats.forcedKeyFrames += 1;
+      this.#restartStream("a key frame was asked for");
+    }, milliseconds);
+    this.#keyFrameTimer.unref?.();
+  }
+
+  /**
+   * Stop, then Start on the same stream: SPS, PPS and an IDR follow within about 0.15 s.
+   * A Stop the companion did not confirm ends the stream as abnormal instead, so the run
+   * loop replaces the companion before the next stream opens: never two encoders.
+   */
+  #restartStream(reason) {
+    const stream = this.#stream;
+    if (!stream || stream.done || this.#streamRestarting) return;
+    this.#streamRestarting = true;
+    this.#stats.streamRestarts += 1;
+    stream.restart().then(() => {
+      this.#stats.streamsOpened += 1;
+    }, (error) => {
+      // An abnormal end is reported by the run loop, with this same error.
+      if (stream.abnormal || !this.listenerCount("error")) return;
+      this.emit("error", new Error(`idb stream restart (${reason}) failed: ${error.message}`));
+    }).finally(() => {
+      this.#streamRestarting = false;
+    });
+  }
+
+  /** A Simulator that shuts down freezes the stream; once it is Booted again the stream restarts. */
+  #watchSimulator() {
+    const tick = async () => {
+      this.#watchTimer = null;
+      if (this.#stopped) return;
+      const state = await simulatorState(this.#xcrun, this.#udid).catch(() => null);
+      if (this.#stopped) return;
+      try {
+        if (state !== null) {
+          const booted = state === "Booted";
+          if (!booted && this.#booted) {
+            this.#booted = false;
+            if (this.#state === "streaming") this.#setState("restarting");
+          } else if (booted && !this.#booted) {
+            this.#booted = true;
+            this.#restartStream("the Simulator booted again");
+          }
+        }
+      } catch (error) {
+        // A listener that throws must not end the watch, nor the Canvas.
+        if (this.listenerCount("error")) this.emit("error", error);
+      }
+      this.#watchTimer = setTimeout(tick, IDB_SIMULATOR_WATCH_MS);
+      this.#watchTimer.unref?.();
+    };
+    this.#watchTimer = setTimeout(tick, IDB_SIMULATOR_WATCH_MS);
+    this.#watchTimer.unref?.();
+  }
+
+  /** The picture stays portrait when the Simulator rotates; the page turns it (IOSF-006). */
+  #watchOrientation() {
+    const tick = async () => {
+      this.#orientationTimer = null;
+      if (this.#stopped) return;
+      const client = this.#companion?.client;
+      try {
+        if (client && !client.closed && this.#state === "streaming" && this.#booted) await this.#readOrientation(client);
+      } catch (error) {
+        if (this.listenerCount("error")) this.emit("error", error);
+      }
+      if (this.#stopped) return;
+      this.#orientationTimer = setTimeout(tick, IDB_ORIENTATION_MS);
+      this.#orientationTimer.unref?.();
+    };
+    this.#orientationTimer = setTimeout(tick, IDB_ORIENTATION_MS);
+    this.#orientationTimer.unref?.();
+  }
+}
+
+/** The state `simctl` reports for one Simulator ("Booted", "Shutdown", ...), "Unknown" when it is gone. */
+async function simulatorState(xcrunPath, udid) {
+  const { stdout } = await execFileAsync(xcrunPath, ["simctl", "list", "devices", "--json"],
+    { timeout: 5000, encoding: "utf8" });
+  const devices = Object.values(JSON.parse(stdout).devices ?? {}).flat();
+  return devices.find((device) => device.udid === udid)?.state ?? "Unknown";
+}
+
+const ANNEX_B_START = Buffer.from([0, 0, 0, 1]);
+
+/**
+ * A key frame access unit without its SPS and PPS NAL units, which go to pages in the
+ * CONFIG message; any other NAL unit before the first slice is kept, the slices untouched.
+ */
+function withoutParameterSets(data) {
+  const units = [];
+  for (let i = 0; i + 3 < data.length;) {
+    if (data[i] !== 0 || data[i + 1] !== 0 || data[i + 2] !== 1) {
+      i += 1;
+      continue;
+    }
+    const type = data[i + 3] & 0x1f;
+    units.push({ codeAt: i > 0 && data[i - 1] === 0 ? i - 1 : i, nalAt: i + 3, type });
+    if (type >= 1 && type <= 5) break;
+    i += 3;
+  }
+  const slice = units.at(-1);
+  if (!slice || slice.type < 1 || slice.type > 5 || !units.some(({ type }) => type === 7 || type === 8)) return data;
+  const parts = [];
+  for (let index = 0; index + 1 < units.length; index += 1) {
+    const unit = units[index];
+    if (unit.type === 7 || unit.type === 8) continue;
+    parts.push(ANNEX_B_START, data.subarray(unit.nalAt, units[index + 1].codeAt));
+  }
+  parts.push(data.subarray(slice.codeAt));
+  return Buffer.concat(parts);
+}
+
 // One private folder per Canvas for iOS screenshots, removed when the process exits, so a
 // capture still running at shutdown leaves nothing behind.
 let screenshotFolder = null;
@@ -1099,6 +1652,10 @@ function stateMessage(context) {
     height: context.video.size?.height ?? null,
     clients: { video: context.videoClients.size, control: context.controlClients.size },
     session: context.session?.state ?? "idle",
+    // iOS: the Simulator orientation, and how far the page turns the portrait picture.
+    ...(isIosCanvas(context)
+      ? { orientation: context.session?.orientation ?? null, rotation: iosRotation(context) }
+      : {}),
     // Only Android has this transport, so state messages show the display preset.
     ...stateDisplay(context),
   });
@@ -1145,24 +1702,44 @@ function catchUpState(context, client) {
   if (client.stateStale) sendState(client, stateMessage(context));
 }
 
-/** Start the device server for the first WebSocket client; at most one per Canvas. */
+/** Start the device server (or companion) for the first WebSocket client; at most one per Canvas. */
 function ensureSession(context) {
   clearTimeout(context.idleTimer);
   context.idleTimer = null;
-  if (context.shuttingDown || context.session || chooseTransport(context) !== "scrcpy") return;
+  const transport = chooseTransport(context);
+  if (context.shuttingDown || context.session || !FAST_TRANSPORTS.has(transport)) return;
   const { options, adbPath, serial, scrcpy } = context;
-  const session = new ScrcpySession({
-    adbPath,
-    serial,
-    serverPath: scrcpy.serverPath,
-    version: scrcpy.version,
-    maxSize: options.maxSize,
-    bitRate: options.bitRate,
-    maxFps: options.fpsExplicit ? options.fps : DEFAULT_SCRCPY_MAX_FPS,
-  });
+  const maxFps = options.fpsExplicit ? options.fps : DEFAULT_SCRCPY_MAX_FPS;
+  const session = transport === "idb"
+    ? new IosFastSession({
+      udid: serial,
+      xcrunPath: adbPath,
+      binary: context.idb.path,
+      video: { ...DEFAULT_VIDEO_OPTIONS, fps: maxFps, avgBitrate: options.bitRate },
+    })
+    : new ScrcpySession({
+      adbPath,
+      serial,
+      serverPath: scrcpy.serverPath,
+      version: scrcpy.version,
+      maxSize: options.maxSize,
+      bitRate: options.bitRate,
+      maxFps,
+    });
   context.session = session;
+  session.on("orientation", () => {
+    // A rotation ends a finger or wheel drag: its points belong to the old orientation.
+    for (const client of context.controlClients) iosReleaseInput(context, client, "the Simulator rotated");
+    const streamed = iosStreamDisplay(context);
+    if (streamed) context.display = streamed.display;
+    broadcastState(context);
+  });
   session.on("state", (name) => {
     if (name === "restarting") {
+      // What the lost companion's HID stream held down is lifted through the next one,
+      // even an UP still waiting in the queue, which the new epoch drops.
+      iosOrphanHeld(context);
+      context.iosEpoch += 1;
       // The server is gone, but what it injected is still down on Android: lifted through
       // the next server. The old server will not answer old requests either.
       for (const client of context.controlClients) orphanInput(context, client);
@@ -1171,7 +1748,10 @@ function ensureSession(context) {
       // No ack comes for a paste the old server took along: held input is refused below.
       dropClipboardHold(context);
     }
-    if (name === "streaming") refreshDisplay(context);
+    if (name === "streaming") {
+      refreshDisplay(context);
+      liftIosOrphan(context);
+    }
     broadcastState(context);
     // A new or stopped control socket holds no backlog, and it never drains the old one.
     resumeAllReading(context);
@@ -1194,18 +1774,34 @@ function ensureSession(context) {
     session.start().catch((error) => {
       if (context.session !== session || context.options.transport !== "auto" || session.everStreamed) return;
       // auto promised a picture: fall back instead of retrying a server that never worked.
-      context.state.scrcpyFailed = error.message;
+      if (transport === "idb") context.state.idbFailed = error.message;
+      else context.state.scrcpyFailed = error.message;
       stopSession(context);
       broadcastState(context);
       for (const client of [...context.videoClients, ...context.controlClients]) {
-        client.ws.close(CLOSE_CODE.NORMAL, "scrcpy is unavailable; the Canvas falls back");
+        client.ws.close(CLOSE_CODE.NORMAL, `${transport} is unavailable; the Canvas falls back`);
       }
     });
   });
 }
 
 /** The display size puts journaled gestures in device pixels, like HTTP input. */
+/**
+ * On the idb transport the companion already reported the screen in points, as the bridge
+ * would read it from the accessibility tree; asking the bridge on every /status would run an
+ * accessibility dump per page poll and hold journal records behind it. Null otherwise.
+ */
+function iosStreamDisplay(context) {
+  if (!isIosCanvas(context) || !(context.session instanceof IosFastSession) || !context.session.points) return null;
+  return { display: iosLogicalSize(context) };
+}
+
 function refreshDisplay(context) {
+  const streamed = iosStreamDisplay(context);
+  if (streamed) {
+    context.display = streamed.display;
+    return Promise.resolve(context.display);
+  }
   return context.actionBridge.call("screen-size", {}, "system").then((measured) => {
     if (measured?.display) context.display = measured.display;
     return context.display;
@@ -1216,6 +1812,7 @@ function stopSession(context) {
   const session = context.session;
   if (!session) return context.sessionStopping ?? Promise.resolve();
   context.session = null;
+  if (isIosCanvas(context)) iosOrphanHeld(context);
   for (const client of context.controlClients) forgetInput(context, client);
   cancelClipboardRequest(context, "The scrcpy session stopped before the device answered");
   dropClipboardHold(context);
@@ -1416,6 +2013,9 @@ function openControlClient(context, ws, origin, socket) {
     ws, socket, origin, pointers: new Map(), lifted: new Map(), keys: new Set(), gesture: null,
     scroll: null, journalWaiting: 0, paused: false, socketPaused: false, held: [], heldNext: 0, heldBytes: 0,
     stateStale: false,
+    // iOS: pointers refused while another finger was down (their moves and ups are ignored),
+    // and this connection's input waiting in the iOS input queue.
+    refused: new Set(), iosWaiting: 0,
   };
   context.controlClients.add(client);
   ws.on("message", (data, isBinary) => receive(context, client, data, isBinary));
@@ -1476,6 +2076,7 @@ function pastBounds(context, client, share) {
   return deviceBacklog(context) > DEVICE_BACKLOG_PAUSE_BYTES * share ||
     client.ws.bufferedAmount > REPLY_BACKLOG_PAUSE_BYTES * share ||
     client.journalWaiting >= JOURNAL_CLIENT_PAUSE_RECORDS * share ||
+    (client.iosWaiting ?? 0) >= JOURNAL_CLIENT_PAUSE_RECORDS * share ||
     journalPending(context) >= JOURNAL_QUEUE_RECORDS * share;
 }
 
@@ -1634,6 +2235,7 @@ function dispatchControl(context, client, message) {
       });
       return;
     case "clipboard-get":
+      if (isIosCanvas(context)) throw new InputError("The iOS Simulator clipboard is not available on this Canvas");
       requestClipboard(context, client);
       return;
     case "system":
@@ -1661,6 +2263,10 @@ function dispatchControl(context, client, message) {
   requireSession(context);
   // Any other input ends a wheel burst, so the journal keeps the order of actions.
   if (message.t !== "scroll") finishScroll(context, client);
+  if (isIosCanvas(context)) {
+    dispatchIosInput(context, client, message);
+    return;
+  }
   switch (message.t) {
     case "touch":
       touch(context, client, message);
@@ -1688,7 +2294,8 @@ function dispatchControl(context, client, message) {
 
 function requireSession(context) {
   if (!context.session?.connected) {
-    throw new InputError(`The scrcpy session is not ready (${context.session?.state ?? "idle"})`);
+    const name = isIosCanvas(context) ? "idb" : "scrcpy";
+    throw new InputError(`The ${name} session is not ready (${context.session?.state ?? "idle"})`);
   }
 }
 
@@ -1888,7 +2495,7 @@ function finishGesture(context, client) {
     duration_ms: performance.now() - gesture.startedAt,
     start: gesture.start,
     end: gesture.end ?? gesture.start,
-  });
+  }, null, gesture.action ?? null);
 }
 
 function scroll(context, client, message) {
@@ -1913,7 +2520,9 @@ function finishScroll(context, client) {
   client.scroll = null;
   if (!burst) return;
   clearTimeout(burst.timer);
-  journal(context, client, { kind: "scroll", events: burst.events, dx: burst.dx, dy: burst.dy });
+  if (burst.wheel) iosWheelUp(context, client, burst);
+  journal(context, client, { kind: "scroll", events: burst.events, dx: burst.dx, dy: burst.dy }, null,
+    burst.action ?? null);
 }
 
 function keyEvent(context, client, message) {
@@ -1960,6 +2569,10 @@ function systemAction(context, client, op) {
 
 /** Lift every pointer and key of one connection on the device and journal what it did. */
 function releaseInput(context, client) {
+  if (isIosCanvas(context)) {
+    iosReleaseInput(context, client);
+    return;
+  }
   const session = context.session;
   const size = context.video.size;
   for (const pointer of client.pointers.values()) {
@@ -1984,6 +2597,10 @@ function releaseInput(context, client) {
 
 /** The device server went away with its pointer state: drop ours without device writes. */
 function forgetInput(context, client) {
+  if (isIosCanvas(context)) {
+    iosForgetInput(context, client);
+    return;
+  }
   for (const pointer of client.pointers.values()) context.devicePointers.delete(pointer.deviceId);
   client.pointers.clear();
   finishGesture(context, client);
@@ -1998,6 +2615,10 @@ function forgetInput(context, client) {
  * here, journaled like other interruptions, and its later moves for them are refused.
  */
 function orphanInput(context, client) {
+  if (isIosCanvas(context)) {
+    iosOrphanInput(context, client);
+    return;
+  }
   for (const [id, pointer] of client.pointers) {
     context.orphans.pointers.set(pointer.deviceId, { x: pointer.x, y: pointer.y });
     liftedByCanvas(client, id, "the device server restarted");
@@ -2076,6 +2697,8 @@ function rememberKeyUp(context, code) {
  * with the new size and their gestures end; later moves for them are refused.
  */
 function liftForNewSize(context, previous, size) {
+  // The Simulator picture keeps its size when it rotates; HID points do not depend on it.
+  if (isIosCanvas(context)) return;
   const connected = Boolean(context.session?.connected);
   const lift = (deviceId, x, y) => {
     if (connected) deviceWrite(context, touchMessage(MOTION_ACTION.UP, deviceId, toVideoPixels(x, y, size), size, 0));
@@ -2112,6 +2735,476 @@ function liftedByCanvas(client, id, reason) {
 function finishKeys(context, client) {
   for (const code of client.keys) journal(context, client, { kind: "key", key: code });
   client.keys.clear();
+}
+
+// ---------------------------------------------------------------------------
+// iOS input on the idb transport (IOSF-004): one finger over the companion's HID stream.
+// ---------------------------------------------------------------------------
+
+/** Clockwise degrees the page turns the portrait picture to show it upright. */
+function iosRotation(context) {
+  if (!isIosCanvas(context)) return 0;
+  return IOS_ROTATION[context.session?.orientation] ?? 0;
+}
+
+/** The Simulator screen in logical points as the user sees it now: landscape is turned. */
+function iosLogicalSize(context) {
+  const points = context.session?.points;
+  if (!points) throw new InputError("The Simulator screen size is not known yet");
+  return iosRotation(context) % 180 ? { width: points.height, height: points.width } : points;
+}
+
+/** 0..1 coordinates of the upright picture → HID logical points in the current orientation. */
+function iosPoint(context, x, y) {
+  const size = iosLogicalSize(context);
+  const round = (value) => Math.round(value * 100) / 100;
+  return {
+    x: round(Math.min(size.width, Math.max(0, x * size.width))),
+    y: round(Math.min(size.height, Math.max(0, y * size.height))),
+  };
+}
+
+/** A gesture point for the journal, with the upright picture size it was taken against. */
+function iosGesturePoint(context, x, y) {
+  const size = context.video.size;
+  const upright = size && iosRotation(context) % 180 ? { width: size.height, height: size.width } : size;
+  return { x, y, size: upright };
+}
+
+/**
+ * iOS input runs in one queue, in message order across connections, as one device socket
+ * keeps it on Android: HID events (each written before the next item runs), text (typed
+ * by the bridge before the next item runs) and the records of the actions before them.
+ * Pause and takeover are checked again when each item's turn comes: the input of a
+ * connection refused by then is dropped, except an UP that lifts what the HID stream holds
+ * down. Until it has run an item counts against its connection's bound, so a flood behind
+ * slow text pauses reading instead of queueing without end.
+ */
+function iosEnqueue(context, item) {
+  item.session = context.session;
+  item.epoch = context.iosEpoch;
+  if (item.client) item.client.iosWaiting = (item.client.iosWaiting ?? 0) + 1;
+  if (item.first) context.iosInput.unshift(item);
+  else context.iosInput.push(item);
+  if (!context.iosInputRunning) drainIosInput(context);
+}
+
+async function drainIosInput(context) {
+  context.iosInputRunning = true;
+  try {
+    while (context.iosInput.length) {
+      const item = context.iosInput.shift();
+      try {
+        await runIosItem(context, item);
+      } catch (error) {
+        if (!(error instanceof InputError)) context.state.lastError = error.message;
+      } finally {
+        if (item.client) {
+          item.client.iosWaiting -= 1;
+          iosResumeReading(context);
+        }
+      }
+    }
+  } finally {
+    context.iosInputRunning = false;
+  }
+}
+
+/**
+ * Paused connections may read again once their input ran. An item can finish while a
+ * message is still being handled (a record, a dropped event), so this waits until that
+ * handling is done instead of handling held messages in the middle of it.
+ */
+function iosResumeReading(context) {
+  if (context.iosResumeQueued) return;
+  context.iosResumeQueued = true;
+  queueMicrotask(() => {
+    context.iosResumeQueued = false;
+    resumeAllReading(context);
+  });
+}
+
+function runIosItem(context, item) {
+  if (item.kind === "hid") return runIosHid(context, item);
+  if (item.kind === "text") return runIosText(context, item);
+  runIosRecord(context, item);
+  return undefined;
+}
+
+/** True while iOS input waits or runs, so what comes next must wait behind it. */
+function iosBusy(context) {
+  return context.iosInputRunning || context.iosInput.length > 0;
+}
+
+/**
+ * One HID event for the queue. `action` ({sent, written, broken}) counts the events of one
+ * action and those a live companion took: an action with events is journaled only when one
+ * of them was taken. `start` marks the DOWN that puts a finger on the screen: once it is
+ * refused or dropped, the moves and the UP of that contact are dropped too (`broken`), until
+ * the next start of the action, instead of pressing where the user never pressed.
+ */
+function hidSend(context, event, client = null, action = null, start = false) {
+  if (action) action.sent += 1;
+  if (!(context.session instanceof IosFastSession)) return;
+  iosEnqueue(context, { kind: "hid", event, client, action, start });
+}
+
+/** What the HID stream of the current session and epoch holds down. */
+function hidHeld(context) {
+  const held = context.iosHeld;
+  if (held && held.session === context.session && held.epoch === context.iosEpoch) return held;
+  context.iosHeld = { session: context.session, epoch: context.iosEpoch, touch: null, buttons: new Set() };
+  return context.iosHeld;
+}
+
+async function runIosHid(context, item) {
+  const { session, event, client, action } = item;
+  const contact = Boolean(action && !event.button);
+  // A new contact of the action starts clean; the rest of a contact whose DOWN was refused
+  // or dropped is dropped with it.
+  if (contact && item.start) action.broken = false;
+  else if (contact && action.broken) return;
+  const drop = () => {
+    if (contact && item.start) action.broken = true;
+  };
+  const current = context.session === session && context.iosEpoch === item.epoch;
+  if (!current || !session.connected) {
+    // An orphan UP that found no companion streaming waits for the next one.
+    if (item.orphan) iosAddOrphan(context, event);
+    drop();
+    return;
+  }
+  const held = hidHeld(context);
+  const down = event.direction === "down";
+  const isHeld = event.button ? held.buttons.has(event.button) : held.touch !== null;
+  // An UP for nothing held down is not sent (its DOWN was dropped), unless it is an orphan
+  // UP for what a lost companion held.
+  if (!down && !isHeld && !item.orphan) return;
+  let sent = event;
+  if (client && refusal(context, client.origin)) {
+    if (down) {
+      drop();
+      return;
+    }
+    // A refused connection's UP only lets go of what is held, where it is held: its moves
+    // since were dropped.
+    if (!event.button) sent = { ...event, touch: held.touch };
+  }
+  if (event.button) {
+    if (down) held.buttons.add(event.button);
+    else held.buttons.delete(event.button);
+  } else {
+    held.touch = down ? event.touch : null;
+  }
+  let timer = null;
+  const timeout = new Promise((resolvePromise) => {
+    timer = setTimeout(() => resolvePromise("timeout"), IOS_HID_WRITE_MS);
+    timer.unref?.();
+  });
+  // Only an event the companion took counts for its action's record.
+  const written = session.hid(sent).then(() => {
+    if (action) action.written += 1;
+  });
+  try {
+    const result = await Promise.race([written, timeout]);
+    if (result === "timeout") context.state.lastError = `idb hid: a write took more than ${IOS_HID_WRITE_MS} ms`;
+  } catch (error) {
+    context.state.lastError = `idb hid: ${error.message}`;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * The companion or stream was lost, or the session stops: what its HID stream held down
+ * becomes the orphan, lifted through the next companion that streams (liftIosOrphan).
+ */
+function iosOrphanHeld(context) {
+  const held = context.iosHeld;
+  context.iosHeld = null;
+  if (!held) return;
+  if (held.touch) iosAddOrphan(context, { touch: held.touch, direction: "up" });
+  for (const button of held.buttons) iosAddOrphan(context, { button, direction: "up" });
+}
+
+function iosAddOrphan(context, event) {
+  const orphan = context.iosOrphan ?? (context.iosOrphan = { touch: null, buttons: new Set() });
+  if (event.button) orphan.buttons.add(event.button);
+  else orphan.touch = event.touch;
+}
+
+/** A companion streams: an UP for each orphan goes first, before any input queued after. */
+function liftIosOrphan(context) {
+  const orphan = context.iosOrphan;
+  if (!orphan || !isIosCanvas(context) || !(context.session instanceof IosFastSession)) return;
+  context.iosOrphan = null;
+  const events = [
+    ...(orphan.touch ? [{ touch: orphan.touch, direction: "up" }] : []),
+    ...[...orphan.buttons].map((button) => ({ button, direction: "up" })),
+  ];
+  for (const event of events.reverse()) iosEnqueue(context, { kind: "hid", event, client: null, orphan: true, first: true });
+}
+
+/** Text is typed by the bridge, behind HTTP input too; refused by its turn, it is not typed. */
+async function runIosText(context, item) {
+  const { client, payload } = item;
+  try {
+    const refused = refusal(context, client.origin);
+    if (refused) throw new InputError(refused);
+    await context.enqueueInput(() => {
+      const late = refusal(context, client.origin);
+      if (late) throw new InputError(late);
+      return context.actionBridge.call("text", payload, client.origin);
+    });
+  } catch (error) {
+    reply(context, client, { t: "error", message: error.message, for: "text" });
+  }
+}
+
+/**
+ * A record waits behind the input before it. An action none of whose events a live
+ * companion took (refused by their turn, or dropped with a lost companion or a stopped
+ * session) did not happen: its record is dropped. An action without events (a wheel burst
+ * that did not move) is journaled unless refused by its turn.
+ */
+function runIosRecord(context, item) {
+  const { client, record, onAnswered, action } = item;
+  if (action && !action.written && (action.sent || refusal(context, client.origin))) {
+    onAnswered?.();
+    return;
+  }
+  journalNow(context, client, record, onAnswered);
+}
+
+function dispatchIosInput(context, client, message) {
+  switch (message.t) {
+    case "touch":
+      iosTouch(context, client, message);
+      break;
+    case "scroll":
+      iosScroll(context, client, message);
+      break;
+    case "text":
+      iosText(context, client, message);
+      break;
+    case "system":
+      iosSystem(context, client, message.op);
+      break;
+    case "key":
+      throw new InputError("Android keycodes have no iOS Simulator equivalent; send text instead");
+    case "paste":
+      throw new InputError("The iOS Simulator has no clipboard paste on this Canvas; send text instead");
+    default:
+      throw new InputError("Unsupported control message.");
+  }
+}
+
+/**
+ * Touch down/move/up live: a held finger moves by repeating DOWN at its new point, then UP.
+ * The HID touch has no finger id, so a second pointer, from any connection, is refused.
+ */
+function iosTouch(context, client, message) {
+  const { id } = message;
+  if (message.a === "down") {
+    client.lifted.delete(id);
+    client.refused.delete(id);
+    const finger = context.iosFinger;
+    if (finger) {
+      if (finger.client === client && finger.id === id) throw new InputError(`Pointer ${id} is already down`);
+      client.refused.add(id);
+      if (client.refused.size > LIFTED_POINTERS_MAX) client.refused.delete(client.refused.values().next().value);
+      throw new InputError(IOS_ONE_FINGER);
+    }
+    const point = iosPoint(context, message.x, message.y);
+    context.iosFinger = { client, id, x: message.x, y: message.y, point, wheel: false };
+    client.gesture = {
+      startedAt: performance.now(), pointers: 1, moves: 0,
+      start: iosGesturePoint(context, message.x, message.y), end: null, action: { sent: 0, written: 0, broken: false },
+    };
+    hidSend(context, { touch: point, direction: "down" }, client, client.gesture.action, true);
+    return;
+  }
+  const finger = context.iosFinger;
+  if (!finger || finger.client !== client || finger.id !== id || finger.wheel) {
+    // The refusal went with the down; its moves and up need no answer.
+    if (client.refused.has(id)) {
+      if (message.a !== "move") client.refused.delete(id);
+      return;
+    }
+    const lifted = client.lifted.get(id);
+    if (!lifted) throw new InputError(`Pointer ${id} is not down`);
+    if (message.a === "move") {
+      throw new InputError(`Pointer ${id} was lifted because ${lifted}; put it down again`);
+    }
+    client.lifted.delete(id);
+    return;
+  }
+  finger.x = message.x;
+  finger.y = message.y;
+  finger.point = iosPoint(context, message.x, message.y);
+  const action = client.gesture?.action ?? null;
+  if (message.a === "move") {
+    if (client.gesture) client.gesture.moves += 1;
+    hidSend(context, { touch: finger.point, direction: "down" }, client, action);
+    return;
+  }
+  // up, or cancel: the HID touch has no cancel, so both lift the finger where it is.
+  hidSend(context, { touch: finger.point, direction: "up" }, client, action);
+  context.iosFinger = null;
+  if (client.gesture) client.gesture.end = iosGesturePoint(context, message.x, message.y);
+  finishGesture(context, client);
+}
+
+const roundPoints = (value) => Math.round(value * 100) / 100;
+
+/** `point` moved inside the screen, at least `margin` points from each edge. */
+function iosInside(size, point, margin) {
+  return {
+    x: roundPoints(Math.min(size.width - margin, Math.max(margin, point.x))),
+    y: roundPoints(Math.min(size.height - margin, Math.max(margin, point.y))),
+  };
+}
+
+/**
+ * A wheel burst is one short synthetic drag that never taps: the finger goes down at an
+ * anchor (where the wheel turns, kept IOS_WHEEL_MARGIN_POINTS inside every edge) with its
+ * first move, which goes at least IOS_WHEEL_MIN_POINTS in the wheel's direction, past the
+ * tap slop; later steps move it by the wheel's delta. At the screen edge it lifts there and
+ * starts over from the anchor. It lifts where it is once the wheel is still (finishScroll)
+ * and is journaled as one scroll record.
+ */
+function iosScroll(context, client, message) {
+  const finger = context.iosFinger;
+  if (finger && !(finger.wheel && finger.client === client)) {
+    throw new InputError("A finger is down on the Simulator; the wheel scrolls once it is lifted");
+  }
+  const size = iosLogicalSize(context);
+  let burst = client.scroll;
+  if (!burst) {
+    const margin = Math.min(IOS_WHEEL_MARGIN_POINTS, size.width / 4, size.height / 4);
+    const anchor = iosInside(size, iosPoint(context, message.x, message.y), margin);
+    burst = client.scroll = { events: 0, dx: 0, dy: 0, timer: null, wheel: { anchor }, action: { sent: 0, written: 0, broken: false } };
+    context.iosFinger = { client, id: null, x: message.x, y: message.y, point: anchor, wheel: true, pressed: false };
+  }
+  burst.events += 1;
+  burst.dx += message.dx;
+  burst.dy += message.dy;
+  // Wheel down (dy < 0) shows what is below: the finger moves up; dx > 0 moves it left.
+  const move = { x: -message.dx * IOS_WHEEL_POINTS, y: message.dy * IOS_WHEEL_POINTS };
+  if (move.x || move.y) iosWheelMove(context, client, burst, context.iosFinger, move, size);
+  clearTimeout(burst.timer);
+  burst.timer = setTimeout(() => finishScroll(context, client), IOS_WHEEL_IDLE_MS);
+  burst.timer.unref?.();
+}
+
+function iosWheelMove(context, client, burst, wheel, move, size) {
+  const send = (point, direction, start = false) => hidSend(context, { touch: point, direction }, client, burst.action, start);
+  const same = (a, b) => a.x === b.x && a.y === b.y;
+  if (wheel.pressed) {
+    const wanted = { x: wheel.point.x + move.x, y: wheel.point.y + move.y };
+    const next = iosInside(size, wanted, IOS_WHEEL_EDGE_POINTS);
+    if (next.x === roundPoints(wanted.x) && next.y === roundPoints(wanted.y)) {
+      if (!same(next, wheel.point)) send(next, "down");
+      wheel.point = next;
+      return;
+    }
+    // The edge: the drag, already past the slop, goes to the edge and lifts there; a new one
+    // starts from the anchor below.
+    if (!same(next, wheel.point)) send(next, "down");
+    send(next, "up");
+    wheel.point = next;
+    wheel.pressed = false;
+  }
+  const { anchor } = burst.wheel;
+  const scale = Math.max(1, IOS_WHEEL_MIN_POINTS / Math.hypot(move.x, move.y));
+  const target = iosInside(size, { x: anchor.x + move.x * scale, y: anchor.y + move.y * scale }, IOS_WHEEL_EDGE_POINTS);
+  // A screen too small to move past the slop from the anchor gets no drag at all.
+  if (Math.hypot(target.x - anchor.x, target.y - anchor.y) < IOS_WHEEL_MIN_POINTS) {
+    wheel.point = anchor;
+    return;
+  }
+  send(anchor, "down", true);
+  send(target, "down");
+  wheel.point = target;
+  wheel.pressed = true;
+}
+
+/** The wheel's finger lifts where it is (no fling: it has been still a moment). */
+function iosWheelUp(context, client, burst) {
+  const finger = context.iosFinger;
+  if (!finger?.wheel || finger.client !== client) return;
+  context.iosFinger = null;
+  if (finger.pressed) hidSend(context, { touch: finger.point, direction: "up" }, client, burst.action);
+}
+
+/** Home and Power press the Simulator's HOME and LOCK buttons; nothing else has one. */
+function iosSystem(context, client, op) {
+  const button = IOS_BUTTONS[op];
+  if (!button) throw new InputError(`${op} is not available on the iOS Simulator`);
+  const action = { sent: 0, written: 0, broken: false };
+  hidSend(context, { button, direction: "down" }, client, action);
+  hidSend(context, { button, direction: "up" }, client, action);
+  journal(context, client, { kind: "system", op }, null, action);
+}
+
+/**
+ * Text goes through the bridge, like the HTTP text of every transport (the bridge journals
+ * it), at its place in the iOS input queue: input sent after it waits until it is typed.
+ * Pause and takeover are checked again when its turn comes: text refused by then is not
+ * typed, and the connection is told why.
+ */
+function iosText(context, client, message) {
+  const payload = { text: message.text, sensitive: message.sensitive, transport: "idb" };
+  iosEnqueue(context, { kind: "text", client, payload });
+}
+
+/**
+ * Lift this connection's finger or wheel on the Simulator and journal what it did (pause,
+ * takeover, disconnect, rotation). With a reason, later moves of the finger are refused.
+ */
+function iosReleaseInput(context, client, reason = null) {
+  if (!isIosCanvas(context)) return;
+  finishScroll(context, client);
+  const finger = context.iosFinger;
+  if (finger && finger.client === client && !finger.wheel) {
+    context.iosFinger = null;
+    // Queued behind the finger's DOWN, the UP lifts it even when the connection is refused;
+    // it is not sent when that DOWN was dropped.
+    hidSend(context, { touch: finger.point, direction: "up" }, client, client.gesture?.action ?? null);
+    if (reason) liftedByCanvas(client, finger.id, reason);
+    if (client.gesture) client.gesture.end = iosGesturePoint(context, finger.x, finger.y);
+  }
+  finishGesture(context, client);
+}
+
+/** The session stopped with the companion (its held input is the orphan): drop the finger. */
+function iosForgetInput(context, client) {
+  const finger = context.iosFinger;
+  if (finger?.client === client) context.iosFinger = null;
+  finishScroll(context, client);
+  if (finger?.client === client && !finger.wheel && client.gesture) {
+    client.gesture.end = iosGesturePoint(context, finger.x, finger.y);
+  }
+  finishGesture(context, client);
+}
+
+/**
+ * The companion or the Simulator went away with a finger down: its gesture ends here and its
+ * later moves are refused. What the HID stream held is lifted through the next companion
+ * (iosOrphanHeld, liftIosOrphan), whether or not its UP was still queued.
+ */
+function iosOrphanInput(context, client) {
+  const finger = context.iosFinger;
+  if (finger?.client === client) {
+    context.iosFinger = null;
+    if (!finger.wheel) {
+      liftedByCanvas(client, finger.id, "the idb companion restarted");
+      if (client.gesture) client.gesture.end = iosGesturePoint(context, finger.x, finger.y);
+    }
+  }
+  // The wheel's finger is no longer ours to lift: finishScroll only journals the burst.
+  finishScroll(context, client);
+  finishGesture(context, client);
 }
 
 /** Pause/resume/takeover/release for HTTP and WebSocket alike. */
@@ -2538,7 +3631,19 @@ function codePoints(value) {
  * JOURNAL_QUEUE_RECORDS already pending is dropped and counted. `onAnswered` runs once
  * the bridge answered the record, or at once for a dropped one.
  */
-function journal(context, client, record, onAnswered = null) {
+function journal(context, client, record, onAnswered = null, action = null) {
+  if (record.kind !== "control" && isIosCanvas(context) && client.ws) {
+    // iOS: the record of an action goes through the input queue behind its HID events and
+    // any text before it, so the journal keeps the order of actions. Refused by its turn
+    // with none of its own events (`action`) written, the action did not happen and is not
+    // journaled.
+    iosEnqueue(context, { kind: "record", client, record, onAnswered, action });
+    return;
+  }
+  journalNow(context, client, record, onAnswered);
+}
+
+function journalNow(context, client, record, onAnswered) {
   if (journalPending(context) >= JOURNAL_QUEUE_RECORDS) {
     context.journalDropped += 1;
     context.state.lastError = `journal: ${context.journalDropped} actions were not journaled ` +
@@ -2590,7 +3695,7 @@ function journalAnswered(context, client) {
 
 /** The bridge payload, with gesture points in display pixels. */
 async function journalPayload(context, record) {
-  const payload = { transport: "scrcpy", ...record };
+  const payload = { transport: isIosCanvas(context) ? "idb" : "scrcpy", ...record };
   if (record.kind === "gesture") {
     const display = context.display ?? await refreshDisplay(context);
     payload.start = devicePixels(display, record.start);
@@ -3244,10 +4349,11 @@ const sizeOptions=[...document.querySelectorAll("[data-preset]")];
 // Every device input control; the clipboard read, handoff and Reconnect act for anyone.
 const inputControls=[...document.querySelectorAll("[data-system],[data-code],[data-key]"),textInput,sendButton];
 const ctx=video.getContext("2d");
-let csrf=null,logicalDisplay=null,reconnectTimer=null,pointer=null,displayBusy=false,refocusPicker=false,menuOpen=false,noteAt=0,frameRatio=0;
+let csrf=null,logicalDisplay=null,reconnectTimer=null,pointer=null,displayBusy=false,refocusPicker=false,menuOpen=false,noteAt=0,frameRatio=0,rotation=0;
 const view={transport:null,mode:null,reason:"",status:null,owner:"shared",paused:false,session:"idle",clients:null,width:0,height:0,note:"",rtt:null,preset:null,density:null};
 const stats={decoder:"none",codec:null,framesDecoded:0,framesRendered:0,framesDropped:0,packets:0,bytes:0,errors:0,renderTimes:[],lastFrameAt:0};
 let videoSocket=null,controlSocket=null,decoder=null,config=null,waitingKey=true,pendingFrame=null,drawScheduled=false,configuring=false,pendingChunks=[];
+const MAX_QUEUED_FRAMES=2,frameQueue=[];
 let videoRetry=500,controlRetry=500,videoRefusals=0;
 const supportedCodecs=new Map(),activePointers=new Map(),heldKeys=new Map();
 function setStatus(value){statusEl.textContent=value}
@@ -3255,6 +4361,9 @@ function url(path,cacheBust=false){const params=new URLSearchParams();if(cacheBu
 function wsUrl(path){const params=new URLSearchParams();if(csrf)params.set("csrf",csrf);const query=params.toString();return(location.protocol==="https:"?"wss://":"ws://")+location.host+path+(query?"?"+query:"")}
 async function post(path,body){const headers={"Content-Type":"application/json","X-Autonom-Origin":"human"};if(csrf)headers["X-Autonom-CSRF"]=csrf;const response=await fetch(url(path),{method:"POST",headers,body:JSON.stringify(body)});const payload=await response.json().catch(()=>({}));if(!response.ok)throw new Error(payload.error||response.statusText);return payload}
 function scrcpyActive(){return view.transport==="scrcpy"}
+// Video over /ws/video and input over /ws/control: scrcpy on Android, idb on the iOS Simulator.
+function fastActive(){return view.transport==="scrcpy"||view.transport==="idb"}
+function iosFast(){return view.transport==="idb"}
 function surface(){return view.mode==="webcodecs"?video:image}
 function restart(){clearTimeout(reconnectTimer);image.src=url("/stream.mjpeg",true)}
 function note(message){view.note=message;noteAt=Date.now()}
@@ -3267,14 +4376,18 @@ function setState(element,state){if(element&&element.dataset.state!==state)eleme
 function sentSize(){return logicalDisplay&&logicalDisplay.width&&logicalDisplay.height?{dw:logicalDisplay.width,dh:logicalDisplay.height}:null}
 function point(event){const rect=image.getBoundingClientRect(),nw=image.naturalWidth,nh=image.naturalHeight;if(!nw||!nh)return null;const sent=sentSize(),ratio=Math.min(rect.width/nw,rect.height/nh),rw=nw*ratio,rh=nh*ratio,xoff=(rect.width-rw)/2,yoff=(rect.height-rh)/2,px=(event.clientX-rect.left-xoff)/ratio,py=(event.clientY-rect.top-yoff)/ratio,dw=sent?sent.dw:nw,dh=sent?sent.dh:nh,x=Math.round(px*dw/nw),y=Math.round(py*dh/nh);if(x<0||y<0||x>dw||y>dh)return null;return sent?{x,y,...sent}:{x,y}}
 image.addEventListener("load",()=>note("video connected"));image.addEventListener("error",()=>{if(view.mode!=="multipart")return;note("stream reconnecting");reconnectTimer=setTimeout(restart,600)});
-function startMultipart(reason){view.mode="multipart";view.reason=reason||"";stats.decoder="multipart";closeVideoSocket();if(decoder&&decoder.state!=="closed")decoder.close();decoder=null;video.hidden=true;image.hidden=false;restart()}
+function startMultipart(reason){view.mode="multipart";view.reason=reason||"";stats.decoder="multipart";closeVideoSocket();if(decoder&&decoder.state!=="closed")decoder.close();decoder=null;dropQueuedFrames();video.hidden=true;image.hidden=false;restart()}
 
-// scrcpy video: WebSocket packets decoded by WebCodecs, newest frame drawn per animation frame.
+// Fast video (scrcpy, idb): WebSocket packets decoded by WebCodecs and drawn on animation frames.
 function startWebCodecs(){view.mode="webcodecs";stats.decoder="webcodecs";clearTimeout(reconnectTimer);image.removeAttribute("src");image.hidden=true;video.hidden=false;connectVideo()}
 function closeVideoSocket(){const socket=videoSocket;videoSocket=null;if(socket)socket.close()}
-function connectVideo(){if(videoSocket||view.mode!=="webcodecs")return;const socket=new WebSocket(wsUrl("/ws/video"));let opened=false;socket.binaryType="arraybuffer";videoSocket=socket;socket.onopen=()=>{opened=true;videoRetry=500;videoRefusals=0};socket.onmessage=event=>onVideoMessage(event.data);socket.onclose=()=>{if(videoSocket!==socket)return;videoSocket=null;waitingKey=true;if(!opened&&++videoRefusals>=4){fallback("the video WebSocket was refused");return}if(view.mode==="webcodecs"&&scrcpyActive()){setTimeout(connectVideo,videoRetry);videoRetry=Math.min(5000,videoRetry*2)}}}
+function connectVideo(){if(videoSocket||view.mode!=="webcodecs")return;const socket=new WebSocket(wsUrl("/ws/video"));let opened=false;socket.binaryType="arraybuffer";videoSocket=socket;socket.onopen=()=>{opened=true;videoRetry=500;videoRefusals=0};socket.onmessage=event=>onVideoMessage(event.data);socket.onclose=()=>{if(videoSocket!==socket)return;videoSocket=null;waitingKey=true;if(!opened&&++videoRefusals>=4){fallback("the video WebSocket was refused");return}if(view.mode==="webcodecs"&&fastActive()){setTimeout(connectVideo,videoRetry);videoRetry=Math.min(5000,videoRetry*2)}}}
 function onVideoMessage(data){if(typeof data==="string"){try{applyState(JSON.parse(data))}catch{}return}const bytes=new Uint8Array(data);if(!bytes.length)return;const view8=new DataView(data);if(bytes[0]===1&&bytes.length>=9){setVideoSize(view8.getUint32(1),view8.getUint32(5));waitingKey=true}else if(bytes[0]===2){configure(bytes.slice(1))}else if(bytes[0]===3&&bytes.length>=10){stats.packets+=1;stats.bytes+=bytes.length-10;decode((bytes[1]&1)===1,Number(view8.getBigUint64(2)),bytes.subarray(10))}}
-function setVideoSize(width,height){if(!width||!height)return;view.width=width;view.height=height;if(video.width!==width||video.height!==height){video.width=width;video.height=height}fitFrame(width,height)}
+function setVideoSize(width,height){if(!width||!height)return;view.width=width;view.height=height;const size=upright(width,height);if(video.width!==size.width||video.height!==size.height){video.width=size.width;video.height=size.height}fitFrame(size.width,size.height)}
+// The iOS picture stays portrait when the Simulator rotates: the canvas holds it turned upright,
+// so pointer positions on the canvas are already in the orientation the Simulator uses.
+function upright(width,height){return rotation%180?{width:height,height:width}:{width,height}}
+function setRotation(value){const next=[0,90,180,270].includes(value)?value:0;if(next===rotation)return;rotation=next;if(view.width)setVideoSize(view.width,view.height)}
 // The device frame takes the picture's aspect; its width comes from the ratio and the room left.
 function fitFrame(width,height){const ratio=width/height;if(!ratio||ratio===frameRatio)return;frameRatio=ratio;device.style.aspectRatio=width+" / "+height;device.style.setProperty("--video-ratio",String(ratio))}
 function codecFromSps(data){for(let i=0;i+3<data.length;i++){if(data[i]===0&&data[i+1]===0&&data[i+2]===1&&(data[i+3]&31)===7){const out=[];let zeros=0;for(let j=i+3;j<data.length&&out.length<4;j++){const b=data[j];if(zeros>=2&&b===3){zeros=0;continue}zeros=b===0?zeros+1:0;out.push(b)}if(out.length<4)return null;return"avc1."+[out[1],out[2],out[3]].map(b=>b.toString(16).toUpperCase().padStart(2,"0")).join("")}}return null}
@@ -3282,17 +4395,25 @@ function fallback(reason){note(reason);startMultipart(reason)}
 function configure(data){config=data;waitingKey=true;const codec=codecFromSps(data);if(!codec){fallback("the stream has no H.264 SPS");return}stats.codec=codec;const known=supportedCodecs.get(codec);if(known===true){applyDecoderConfig(codec);return}if(known===false){fallback("VideoDecoder rejects "+codec);return}configuring=true;VideoDecoder.isConfigSupported({codec,optimizeForLatency:true}).then(result=>{configuring=false;supportedCodecs.set(codec,Boolean(result.supported));if(!result.supported){pendingChunks=[];fallback("VideoDecoder rejects "+codec);return}applyDecoderConfig(codec);const queued=pendingChunks;pendingChunks=[];for(const item of queued)decode(item[0],item[1],item[2])}).catch(error=>{configuring=false;pendingChunks=[];fallback("VideoDecoder check failed: "+error.message)})}
 function applyDecoderConfig(codec){if(view.mode!=="webcodecs")return;if(!decoder||decoder.state==="closed")decoder=new VideoDecoder({output:onFrame,error:onDecoderError});decoder.configure({codec,optimizeForLatency:true});waitingKey=true}
 function decode(key,pts,data){if(configuring){if(pendingChunks.length<300)pendingChunks.push([key,pts,data]);else{pendingChunks=[];waitingKey=true}return}if(!decoder||decoder.state!=="configured"){stats.framesDropped+=1;waitingKey=true;return}if(waitingKey&&!key){stats.framesDropped+=1;return}if(!key&&decoder.decodeQueueSize>30){waitingKey=true;stats.framesDropped+=1;sendControl({t:"system",op:"keyframe"});return}let chunk=data;if(key&&config){chunk=new Uint8Array(config.length+data.length);chunk.set(config);chunk.set(data,config.length)}try{decoder.decode(new EncodedVideoChunk({type:key?"key":"delta",timestamp:pts,data:chunk}));waitingKey=false}catch(error){onDecoderError(error)}}
-function onFrame(frame){stats.framesDecoded+=1;if(pendingFrame){pendingFrame.close();stats.framesDropped+=1}pendingFrame=frame;if(!drawScheduled){drawScheduled=true;requestAnimationFrame(draw)}}
-function draw(){drawScheduled=false;const frame=pendingFrame;if(!frame)return;pendingFrame=null;if(video.width!==frame.displayWidth||video.height!==frame.displayHeight){video.width=frame.displayWidth;video.height=frame.displayHeight}ctx.drawImage(frame,0,0,video.width,video.height);frame.close();const now=performance.now();stats.framesRendered+=1;stats.lastFrameAt=now;stats.renderTimes.push(now);while(stats.renderTimes.length&&now-stats.renderTimes[0]>1000)stats.renderTimes.shift()}
+// Decoded frames waiting for an animation frame. On the iOS fast transport (idb) they are shown
+// in order: at most MAX_QUEUED_FRAMES wait, one is drawn per animation frame and another is asked
+// for while frames remain, and the oldest beyond that is closed and counted as dropped. Two frames
+// decoded between two refreshes are then both shown instead of losing the first. Android (scrcpy)
+// still keeps only the newest frame; the Android 60 fps run will extend the in-order queue to it.
+function presentInOrder(){return iosFast()}
+function scheduleDraw(){if(!drawScheduled){drawScheduled=true;requestAnimationFrame(draw)}}
+function dropQueuedFrames(){while(frameQueue.length)frameQueue.shift().close()}
+function onFrame(frame){stats.framesDecoded+=1;if(presentInOrder()){frameQueue.push(frame);while(frameQueue.length>MAX_QUEUED_FRAMES){frameQueue.shift().close();stats.framesDropped+=1}scheduleDraw();return}if(pendingFrame){pendingFrame.close();stats.framesDropped+=1}pendingFrame=frame;scheduleDraw()}
+function draw(){drawScheduled=false;let frame=frameQueue.shift();if(!frame){frame=pendingFrame;pendingFrame=null}if(!frame)return;if(frameQueue.length)scheduleDraw();const size=upright(frame.displayWidth,frame.displayHeight);if(video.width!==size.width||video.height!==size.height){video.width=size.width;video.height=size.height;fitFrame(size.width,size.height)}if(rotation){ctx.setTransform(1,0,0,1,video.width/2,video.height/2);ctx.rotate(rotation*Math.PI/180);ctx.drawImage(frame,-frame.displayWidth/2,-frame.displayHeight/2,frame.displayWidth,frame.displayHeight);ctx.setTransform(1,0,0,1,0,0)}else ctx.drawImage(frame,0,0,video.width,video.height);frame.close();const now=performance.now();stats.framesRendered+=1;stats.lastFrameAt=now;stats.renderTimes.push(now);while(stats.renderTimes.length&&now-stats.renderTimes[0]>1000)stats.renderTimes.shift()}
 function onDecoderError(error){stats.errors+=1;note("decoder: "+(error&&error.message||error));try{if(decoder&&decoder.state!=="closed")decoder.close()}catch{}decoder=null;waitingKey=true;if(stats.codec&&supportedCodecs.get(stats.codec))applyDecoderConfig(stats.codec);sendControl({t:"system",op:"keyframe"})}
 
 // scrcpy control: one WebSocket carrying touch, wheel, keys, text and system actions.
-function connectControl(){if(controlSocket||!scrcpyActive())return;const socket=new WebSocket(wsUrl("/ws/control"));controlSocket=socket;socket.onopen=()=>{controlRetry=500};socket.onmessage=event=>{let message;try{message=JSON.parse(event.data)}catch{return}onControlMessage(message)};socket.onclose=()=>{if(controlSocket!==socket)return;controlSocket=null;activePointers.clear();displayBusy=false;if(scrcpyActive()){setTimeout(connectControl,controlRetry);controlRetry=Math.min(5000,controlRetry*2)}}}
+function connectControl(){if(controlSocket||!fastActive())return;const socket=new WebSocket(wsUrl("/ws/control"));controlSocket=socket;socket.onopen=()=>{controlRetry=500};socket.onmessage=event=>{let message;try{message=JSON.parse(event.data)}catch{return}onControlMessage(message)};socket.onclose=()=>{if(controlSocket!==socket)return;controlSocket=null;activePointers.clear();displayBusy=false;if(fastActive()){setTimeout(connectControl,controlRetry);controlRetry=Math.min(5000,controlRetry*2)}}}
 function closeControlSocket(){const socket=controlSocket;controlSocket=null;if(socket)socket.close()}
 function onControlMessage(message){if(message.t==="state")applyState(message);else if(message.t==="display")onDisplay(message.display);else if(message.t==="error"){stats.errors+=1;note(message.message);if(message.for==="display"){displayBusy=false;syncPicker()}}else if(message.t==="clipboard"){if(typeof message.text!=="string"){note("the device clipboard has no text");return}textInput.value=message.text;if(navigator.clipboard&&navigator.clipboard.writeText)navigator.clipboard.writeText(message.text).catch(()=>{});note("device clipboard copied")}else if(message.t==="pong"){view.rtt=Math.round(performance.now()-message.ts)}}
 function sendControl(message){if(!controlSocket||controlSocket.readyState!==1)return false;controlSocket.send(JSON.stringify(message));return true}
-function applyState(message){view.owner=message.owner;view.paused=message.paused;view.session=message.session;view.clients=message.clients;if("preset" in message){view.preset=message.preset;view.density=message.density}syncPicker();if(view.mode==="webcodecs"&&message.width&&message.height)setVideoSize(message.width,message.height);if(message.transport&&message.transport!==view.transport){view.transport=message.transport;applyTransport()}}
-function applyTransport(){textInput.placeholder=scrcpyActive()?"Text to type":"ASCII text to type";setText(ui.hint,scrcpyActive()?"Any language. Longer text is pasted through the device clipboard.":"Letters, digits and punctuation of plain ASCII on this transport.");for(const button of document.querySelectorAll("[data-scrcpy]"))button.hidden=!scrcpyActive();if(scrcpyActive()){connectControl();if(!view.mode){if(typeof VideoDecoder==="function"&&typeof EncodedVideoChunk==="function")startWebCodecs();else startMultipart("VideoDecoder is not available in this browser")}}else{closeControlSocket();if(view.mode!=="multipart")startMultipart("")}}
+function applyState(message){view.owner=message.owner;view.paused=message.paused;view.session=message.session;view.clients=message.clients;if("preset" in message){view.preset=message.preset;view.density=message.density}syncPicker();if("rotation" in message)setRotation(message.rotation);if(view.mode==="webcodecs"&&message.width&&message.height)setVideoSize(message.width,message.height);if(message.transport&&message.transport!==view.transport){view.transport=message.transport;applyTransport()}}
+function applyTransport(){textInput.placeholder=fastActive()?"Text to type":"ASCII text to type";setText(ui.hint,iosFast()?"Typed into the Simulator, up to 300 bytes at a time.":scrcpyActive()?"Any language. Longer text is pasted through the device clipboard.":"Letters, digits and punctuation of plain ASCII on this transport.");for(const button of document.querySelectorAll("[data-scrcpy]"))button.hidden=!scrcpyActive();if(fastActive()){connectControl();if(!view.mode){if(typeof VideoDecoder==="function"&&typeof EncodedVideoChunk==="function")startWebCodecs();else startMultipart("VideoDecoder is not available in this browser")}}else{closeControlSocket();if(view.mode!=="multipart")startMultipart("")}}
 // Size picker (Android): the preset in effect is selected; a choice goes the way other input goes.
 function canSendInput(){return !view.paused&&(view.owner==="shared"||view.owner==="human")}
 // Called every render too: nothing already shown is set again, so an open menu stays as it is.
@@ -3324,7 +4445,7 @@ if(sizePicker){
 }
 // Controls that cannot act look and are disabled (PAGE-004); handoff goes the way input goes.
 function syncControls(){const ready=Boolean(view.status)&&canSendInput(),owner=OWNERS[view.owner]||[String(view.owner),"holds control"];for(const control of inputControls)if(control.disabled===ready)control.disabled=!ready;setText(ui.ownerName,owner[0]);setText(ui.ownerDetail,"· "+(view.paused?"input is paused":owner[1]));setText(ui.chip,owner[0]+(view.paused?" · Paused":""));setState(ui.ownerDot,ready?"live":"warn");setText(ui.take,view.owner==="human"?"Release":"Take control");setText(ui.pause,view.paused?"Resume input":"Pause input");for(const button of [ui.take,ui.pause])if(button.disabled===Boolean(view.status))button.disabled=!view.status}
-function setControl(mode){if(scrcpyActive()&&sendControl({t:"control",mode}))return;post("/control",{mode}).then(result=>{view.owner=result.control_owner;view.paused=result.input_paused;syncPicker()}).catch(error=>note(error.message))}
+function setControl(mode){if(fastActive()&&sendControl({t:"control",mode}))return;post("/control",{mode}).then(result=>{view.owner=result.control_owner;view.paused=result.input_paused;syncPicker()}).catch(error=>note(error.message))}
 ui.take.addEventListener("click",()=>setControl(view.owner==="human"?"release":"takeover"));
 ui.pause.addEventListener("click",()=>setControl(view.paused?"resume":"pause"));
 ui.inspector.addEventListener("click",()=>{const hidden=document.body.classList.toggle("no-inspector");ui.inspector.setAttribute("aria-pressed",String(!hidden));ui.inspector.title=hidden?"Show inspector":"Hide inspector"});
@@ -3336,7 +4457,7 @@ function pressure(event){return event.pointerType==="mouse"||!event.pressure?1:M
 // Ctrl- or Alt-drag adds a second finger mirrored around the centre: a pinch.
 function mirrorId(id){return -1000-id}
 function sendTouch(action,id,at,pinch,p){sendControl({t:"touch",a:action,id,x:at.x,y:at.y,p});if(pinch)sendControl({t:"touch",a:action,id:mirrorId(id),x:1-at.x,y:1-at.y,p})}
-function onPointerDown(event){if(!scrcpyActive()){legacyPointerDown(event);return}if(event.pointerType==="mouse"&&event.button!==0)return;const at=normalized(event,false);if(!at)return;event.preventDefault();surface().focus();surface().setPointerCapture(event.pointerId);const pinch=event.pointerType==="mouse"&&(event.ctrlKey||event.altKey);activePointers.set(event.pointerId,{pinch});sendTouch("down",event.pointerId,at,pinch,pressure(event))}
+function onPointerDown(event){if(!fastActive()){legacyPointerDown(event);return}if(event.pointerType==="mouse"&&event.button!==0)return;const at=normalized(event,false);if(!at)return;event.preventDefault();if(iosFast()&&activePointers.size){note("the iOS Simulator takes one finger at a time");return}surface().focus();surface().setPointerCapture(event.pointerId);const pinch=!iosFast()&&event.pointerType==="mouse"&&(event.ctrlKey||event.altKey);activePointers.set(event.pointerId,{pinch});sendTouch("down",event.pointerId,at,pinch,pressure(event))}
 function onPointerMove(event){const active=activePointers.get(event.pointerId);if(!active)return;const at=normalized(event,true);if(at)sendTouch("move",event.pointerId,at,active.pinch,pressure(event))}
 function onPointerEnd(event,action){const active=activePointers.get(event.pointerId);if(!active)return;activePointers.delete(event.pointerId);const at=normalized(event,true)||{x:0.5,y:0.5};sendTouch(action,event.pointerId,at,active.pinch,0)}
 function legacyPointerDown(event){const p=point(event);if(!p)return;image.setPointerCapture(event.pointerId);pointer={...p,time:performance.now(),id:event.pointerId}}
@@ -3345,38 +4466,40 @@ async function legacyPointerUp(event){if(!pointer)return;const end=point(event)|
 for(const element of [image,video]){
   element.addEventListener("pointerdown",onPointerDown);
   element.addEventListener("pointermove",onPointerMove);
-  element.addEventListener("pointerup",event=>{if(scrcpyActive())onPointerEnd(event,"up");else legacyPointerUp(event)});
-  element.addEventListener("pointercancel",event=>{if(scrcpyActive())onPointerEnd(event,"cancel");else pointer=null});
-  element.addEventListener("contextmenu",event=>{if(scrcpyActive())event.preventDefault()});
+  element.addEventListener("pointerup",event=>{if(fastActive())onPointerEnd(event,"up");else legacyPointerUp(event)});
+  element.addEventListener("pointercancel",event=>{if(fastActive())onPointerEnd(event,"cancel");else pointer=null});
+  element.addEventListener("contextmenu",event=>{if(fastActive())event.preventDefault()});
   element.addEventListener("wheel",onWheel,{passive:false});
   element.addEventListener("keydown",onKeyDown);
   element.addEventListener("keyup",onKeyUp);
   element.addEventListener("blur",releaseKeys);
   element.addEventListener("paste",onPaste);
 }
-async function onWheel(event){event.preventDefault();if(scrcpyActive()){const at=normalized(event,false);if(!at)return;const scale=event.deltaMode===1?1/3:event.deltaMode===2?1:1/100;const dx=Math.max(-16,Math.min(16,event.deltaX*scale)),dy=Math.max(-16,Math.min(16,-event.deltaY*scale));if(dx||dy)sendControl({t:"scroll",x:at.x,y:at.y,dx,dy});return}if(!image.naturalWidth)return;const sent=sentSize(),width=sent?sent.dw:image.naturalWidth,height=sent?sent.dh:image.naturalHeight,x=Math.round(width/2),y1=Math.round(height*.55),y2=Math.round(height*(event.deltaY>0?.25:.78));try{await post("/swipe",{x1:x,y1,x2:x,y2,duration:220,...sent})}catch(error){note(error.message)}}
+async function onWheel(event){event.preventDefault();if(fastActive()){const at=normalized(event,false);if(!at)return;const scale=event.deltaMode===1?1/3:event.deltaMode===2?1:1/100;const dx=Math.max(-16,Math.min(16,event.deltaX*scale)),dy=Math.max(-16,Math.min(16,-event.deltaY*scale));if(dx||dy)sendControl({t:"scroll",x:at.x,y:at.y,dx,dy});return}if(!image.naturalWidth)return;const sent=sentSize(),width=sent?sent.dw:image.naturalWidth,height=sent?sent.dh:image.naturalHeight,x=Math.round(width/2),y1=Math.round(height*.55),y2=Math.round(height*(event.deltaY>0?.25:.78));try{await post("/swipe",{x1:x,y1,x2:x,y2,duration:220,...sent})}catch(error){note(error.message)}}
 function metaFor(event){return metaStateFor({shiftKey:event.shiftKey,ctrlKey:event.ctrlKey,altKey:event.altKey,metaKey:event.metaKey})}
-function onKeyDown(event){if(!scrcpyActive())return;const input=keyInputFor(event,KEYCODES,US_KEY_CHARS);if(!input)return;event.preventDefault();if(input.text!==undefined){sendControl({t:"text",text:input.text});return}const repeat=event.repeat?(heldKeys.get(event.code)||0)+1:0;heldKeys.set(event.code,repeat);sendControl({t:"key",a:"down",code:input.code,meta:metaFor(event),repeat})}
+// iOS: a printable character typed on the screen goes as text; Android keycodes have no equivalent there.
+function onIosKey(event){if(event.ctrlKey||event.metaKey||event.isComposing||typeof event.key!=="string"||[...event.key].length!==1)return;event.preventDefault();sendControl({t:"text",text:event.key})}
+function onKeyDown(event){if(iosFast()){onIosKey(event);return}if(!scrcpyActive())return;const input=keyInputFor(event,KEYCODES,US_KEY_CHARS);if(!input)return;event.preventDefault();if(input.text!==undefined){sendControl({t:"text",text:input.text});return}const repeat=event.repeat?(heldKeys.get(event.code)||0)+1:0;heldKeys.set(event.code,repeat);sendControl({t:"key",a:"down",code:input.code,meta:metaFor(event),repeat})}
 function onKeyUp(event){if(!scrcpyActive()||!heldKeys.has(event.code))return;event.preventDefault();heldKeys.delete(event.code);sendControl({t:"key",a:"up",code:KEYCODES[event.code],meta:metaFor(event),repeat:0})}
 function releaseKeys(){for(const name of heldKeys.keys()){const code=KEYCODES[name];if(code!==undefined)sendControl({t:"key",a:"up",code,meta:0,repeat:0})}heldKeys.clear()}
-function onPaste(event){if(!scrcpyActive())return;const text=event.clipboardData&&event.clipboardData.getData("text/plain");if(!text)return;event.preventDefault();const message={t:"paste",text};if(!fitsControl(message,"clipboard text"))return;sendControl(message)}
+function onPaste(event){if(!fastActive())return;const text=event.clipboardData&&event.clipboardData.getData("text/plain");if(!text)return;event.preventDefault();if(iosFast()){if(utf8Length(text)>300){note("the iOS Simulator takes at most 300 bytes of text at a time; nothing was sent");return}sendControl({t:"text",text});return}const message={t:"paste",text};if(!fitsControl(message,"clipboard text"))return;sendControl(message)}
 function utf8Length(text){return new TextEncoder().encode(text).length}
 function fitsControl(message,what){const size=utf8Length(JSON.stringify(message));if(size<=MAX_CONTROL_BYTES)return true;note(what+" is too large: "+size+" bytes as a control message after JSON escaping, at most "+MAX_CONTROL_BYTES+"; nothing was sent");return false}
-for(const button of document.querySelectorAll("[data-system],[data-code],[data-key]")){button.addEventListener("click",()=>{if(scrcpyActive()){if(button.dataset.system)sendControl({t:"system",op:button.dataset.system});else if(button.dataset.code){const code=Number(button.dataset.code);sendControl({t:"key",a:"down",code,meta:0,repeat:0});sendControl({t:"key",a:"up",code,meta:0,repeat:0})}return}if(button.dataset.key)post("/key",{key:button.dataset.key}).catch(error=>note(error.message))})}
+for(const button of document.querySelectorAll("[data-system],[data-code],[data-key]")){button.addEventListener("click",()=>{if(fastActive()){if(button.dataset.system)sendControl({t:"system",op:button.dataset.system});else if(button.dataset.code){const code=Number(button.dataset.code);sendControl({t:"key",a:"down",code,meta:0,repeat:0});sendControl({t:"key",a:"up",code,meta:0,repeat:0})}return}if(button.dataset.key)post("/key",{key:button.dataset.key}).catch(error=>note(error.message))})}
 $("clipboard").onclick=()=>sendControl({t:"clipboard-get"});
 $("refresh").onclick=()=>{if(view.mode==="webcodecs"){closeVideoSocket();waitingKey=true;videoRetry=500;connectVideo()}else restart()};
-async function sendText(){const value=textInput.value;if(!value)return;if(scrcpyActive()){const message=utf8Length(value)<=300?{t:"text",text:value}:{t:"paste",text:value};if(!fitsControl(message,"the text"))return;const ok=sendControl(message);if(ok)textInput.value="";return}try{await post("/text",{text:value});textInput.value=""}catch(error){note(error.message)}}
+async function sendText(){const value=textInput.value;if(!value)return;if(iosFast()){if(utf8Length(value)>300){note("the iOS Simulator takes at most 300 bytes of text at a time; nothing was sent");return}if(sendControl({t:"text",text:value}))textInput.value="";return}if(scrcpyActive()){const message=utf8Length(value)<=300?{t:"text",text:value}:{t:"paste",text:value};if(!fitsControl(message,"the text"))return;const ok=sendControl(message);if(ok)textInput.value="";return}try{await post("/text",{text:value});textInput.value=""}catch(error){note(error.message)}}
 $("sendText").onclick=sendText;textInput.addEventListener("keydown",event=>{if(event.key==="Enter")sendText()});
-function transportLabel(){if(!view.transport)return"connecting";if(view.transport!=="scrcpy")return view.transport;if(view.mode==="webcodecs")return"scrcpy (webcodecs)";return"scrcpy (multipart"+(view.reason?": "+view.reason:"")+")"}
+function transportLabel(){if(!view.transport)return"connecting";if(!fastActive())return view.transport;if(view.mode==="webcodecs")return scrcpyActive()?"scrcpy (webcodecs)":view.transport+" (webcodecs)";return view.transport+" (multipart"+(view.reason?": "+view.reason:"")+")"}
 function render(){const data=view.status||{},lines=["platform: "+(data.platform||"unknown"),"transport: "+transportLabel()];if(data.fallback_reason)lines.push("fallback: "+data.fallback_reason);if(view.mode==="webcodecs"){lines.push("decoder: "+(stats.codec||"waiting for config"));lines.push("fps: "+stats.renderTimes.length+" rendered, "+stats.framesDecoded+" decoded, "+stats.framesDropped+" dropped, queue "+(decoder?decoder.decodeQueueSize:0));lines.push("video: "+(view.width?view.width+"x"+view.height:"waiting")+", session "+view.session)}else{lines.push("frames: "+(data.frames_sent??0)+"\\nstream clients: "+(data.stream_clients??0))}if(view.clients)lines.push("clients: video "+view.clients.video+", control "+view.clients.control);lines.push("display: "+(data.display&&data.display.width?data.display.width+"x"+data.display.height+(view.density?" @ "+view.density:"")+(sizePicker?" ("+(view.preset||"other")+")":""):"unknown"));lines.push("control: "+view.owner+(view.paused?" (paused)":""));if(data.last_error)lines.push("last error: "+data.last_error);if(view.note)lines.push("note: "+view.note);setStatus(lines.join("\\n"));syncPicker();renderChrome()}
 // The toolbar, caption, notice and Stream details; every string reaches the page as text.
 function sizeText(width,height){return width&&height?width+" × "+height:""}
 function displayText(){const display=logicalDisplay||{},size=sizeText(display.width,display.height);return size&&view.density?size+" · "+view.density+" dpi":size}
 function liveState(){if(!view.status)return"idle";if(view.paused)return"warn";if(view.mode==="webcodecs")return view.session==="streaming"&&stats.framesRendered?"live":"idle";return view.mode==="multipart"&&image.naturalWidth?"live":"idle"}
 function captionText(){if(view.mode==="webcodecs")return stats.renderTimes.length+" fps"+(view.rtt!=null?" · "+view.rtt+" ms":"")+" · WebCodecs";if(view.mode==="multipart")return(view.transport?view.transport+" · ":"")+"multipart stream";return"Connecting…"}
-function renderChrome(){const data=view.status||{},webcodecs=view.mode==="webcodecs";if(view.status)setText(ui.target,(data.platform==="ios"?"iOS":"Android")+" · "+(view.transport||"connecting"));setState(ui.liveDot,liveState());setText(ui.dims,displayText());setText(ui.caption,captionText());setText(ui.notice,view.note&&Date.now()-noteAt<NOTICE_MS?view.note:"");setText(ui.transport,view.transport==="scrcpy"?"scrcpy · "+(webcodecs?"WebCodecs":"multipart"):view.transport||"connecting");setText(ui.codec,webcodecs?stats.codec||"waiting":"—");setText(ui.frames,webcodecs?stats.renderTimes.length+" fps · "+stats.framesDropped+" dropped":(data.frames_sent??0)+" sent");setText(ui.videoSize,(webcodecs?sizeText(view.width,view.height):sizeText(image.naturalWidth,image.naturalHeight))||"waiting");setText(ui.display,displayText()||"unknown");setText(ui.clients,view.clients?view.clients.video+" video · "+view.clients.control+" control":(data.stream_clients??0)+" stream");if(view.mode==="multipart"&&image.naturalWidth)fitFrame(image.naturalWidth,image.naturalHeight)}
+function renderChrome(){const data=view.status||{},webcodecs=view.mode==="webcodecs";if(view.status)setText(ui.target,(data.platform==="ios"?"iOS":"Android")+" · "+(view.transport||"connecting"));setState(ui.liveDot,liveState());setText(ui.dims,displayText());setText(ui.caption,captionText());setText(ui.notice,view.note&&Date.now()-noteAt<NOTICE_MS?view.note:"");setText(ui.transport,fastActive()?view.transport+" · "+(webcodecs?"WebCodecs":"multipart"):view.transport||"connecting");setText(ui.codec,webcodecs?stats.codec||"waiting":"—");setText(ui.frames,webcodecs?stats.renderTimes.length+" fps · "+stats.framesDropped+" dropped":(data.frames_sent??0)+" sent");setText(ui.videoSize,(webcodecs?sizeText(view.width,view.height):sizeText(image.naturalWidth,image.naturalHeight))||"waiting");setText(ui.display,displayText()||"unknown");setText(ui.clients,view.clients?view.clients.video+" video · "+view.clients.control+" control":(data.stream_clients??0)+" stream");if(view.mode==="multipart"&&image.naturalWidth)fitFrame(image.naturalWidth,image.naturalHeight)}
 async function poll(){try{const response=await fetch(url("/status")),data=await response.json();if(!response.ok)throw new Error(data.error||response.statusText);view.status=data;logicalDisplay=data.display;view.owner=data.control_owner;view.paused=data.input_paused;if(data.display&&"preset" in data.display){view.preset=data.display.preset;view.density=data.display.density}rememberDefaultSize(data.display);syncPicker();if(data.transport!==view.transport){view.transport=data.transport;applyTransport()}}catch(error){note(error.message);if(!view.mode)startMultipart("status unavailable")}finally{setTimeout(poll,1200)}}
-function snapshot(){return{transport:view.transport,mode:view.mode,decoder:stats.decoder,fallbackReason:view.reason||null,codec:stats.codec,framesDecoded:stats.framesDecoded,framesRendered:stats.framesRendered,framesDropped:stats.framesDropped,decodeQueueSize:decoder?decoder.decodeQueueSize:0,fps:stats.renderTimes.length,packets:stats.packets,bytes:stats.bytes,errors:stats.errors,lastFrameAt:stats.lastFrameAt,width:view.width,height:view.height,session:view.session,owner:view.owner,paused:view.paused,clients:view.clients,control:controlSocket?controlSocket.readyState:-1,video:videoSocket?videoSocket.readyState:-1,rtt:view.rtt,note:view.note,display:{preset:view.preset,density:view.density,picker:sizePicker?sizePicker.value:null,pickerDisabled:sizePicker?sizePicker.disabled:null},status:statusEl.textContent}}
+function snapshot(){return{transport:view.transport,mode:view.mode,decoder:stats.decoder,fallbackReason:view.reason||null,codec:stats.codec,framesDecoded:stats.framesDecoded,framesRendered:stats.framesRendered,framesDropped:stats.framesDropped,decodeQueueSize:decoder?decoder.decodeQueueSize:0,fps:stats.renderTimes.length,packets:stats.packets,bytes:stats.bytes,errors:stats.errors,lastFrameAt:stats.lastFrameAt,width:view.width,height:view.height,rotation,session:view.session,owner:view.owner,paused:view.paused,clients:view.clients,control:controlSocket?controlSocket.readyState:-1,video:videoSocket?videoSocket.readyState:-1,rtt:view.rtt,note:view.note,display:{preset:view.preset,density:view.density,picker:sizePicker?sizePicker.value:null,pickerDisabled:sizePicker?sizePicker.disabled:null},status:statusEl.textContent}}
 window.autonomCanvas=Object.freeze({stats:snapshot,send:sendControl});
 async function authenticate(){const body=bootstrapToken?{token:bootstrapToken}:{};const response=await fetch("/auth",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});const payload=await response.json().catch(()=>({}));if(response.ok){csrf=payload.csrf;return}if(bootstrapToken)throw new Error(payload.error||"Authentication failed");note("open the Canvas URL with its #token to sign in")}
 async function bootstrap(){await authenticate();setInterval(render,500);await poll()}
