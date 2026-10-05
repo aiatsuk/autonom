@@ -844,13 +844,20 @@ function abortError(signal) {
   return error;
 }
 
+/**
+ * Waits for `promise`, at most `ms`. The timer stays referenced on purpose: the
+ * session is unref'd, and on Node 22 the socket teardown that ends a graceful
+ * `session.close()` or a call does not keep the event loop alive by itself, so with an
+ * unref'd timer the loop could drain first and leave the caller's await pending for
+ * good. A referenced timer keeps the loop running until the wait settles, never longer
+ * than `ms`.
+ */
 function withTimeout(promise, ms) {
   let timer;
   return Promise.race([
     promise.then((value) => ({ value, timedOut: false })),
     new Promise((resolve) => {
       timer = setTimeout(() => resolve({ timedOut: true }), ms);
-      timer.unref?.();
     }),
   ]).finally(() => clearTimeout(timer));
 }

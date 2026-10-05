@@ -1017,8 +1017,19 @@ test("the client speaks to a TCP endpoint too", async (t) => {
       stream.end();
     });
   });
+  const sessions = new Set();
+  server.on("session", (session) => {
+    sessions.add(session);
+    session.on("close", () => sessions.delete(session));
+    session.on("error", () => {});
+  });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
-  t.after(() => new Promise((resolve) => server.close(resolve)));
+  // This hook runs before the client's: on Node 22, server.close() waits for open
+  // sessions instead of closing idle ones, so end them here like fakeServer() does.
+  t.after(async () => {
+    for (const session of sessions) session.destroy();
+    await new Promise((resolve) => server.close(resolve));
+  });
   const client = clientFor(t, { port: server.address().port });
   assert.equal(await client.getOrientation(), "LANDSCAPE_LEFT");
   const port = await freeLoopbackPort();
