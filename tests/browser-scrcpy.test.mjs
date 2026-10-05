@@ -11,7 +11,7 @@ import { request as httpRequest } from "node:http";
 import { connect, createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import test from "node:test";
+import test, { describe } from "node:test";
 import { promisify } from "node:util";
 import { Script, createContext } from "node:vm";
 
@@ -208,6 +208,16 @@ createInterface({ input: process.stdin }).on("line", (line) => {
 
 function sleep(milliseconds) {
   return new Promise((resolvePromise) => setTimeout(resolvePromise, milliseconds));
+}
+
+// Tests that spend nearly all their time waiting on the Canvas's own timers: the 200 ms
+// clipboard settle after each paste, the 15 s idle stop, the 2 s display reading, the
+// 2.5 s key frame wait. Each has its own Canvas process, fake device and temporary
+// directory, so they run side by side at the end of this file (see the describe below),
+// which keeps the whole file well inside the time its gate allows.
+const waitingTests = [];
+function waitingTest(name, fn) {
+  waitingTests.push([name, fn]);
 }
 
 async function waitFor(predicate, timeoutMs = 5000, what = "condition") {
@@ -1631,7 +1641,7 @@ test("fanout: one device server feeds every client, late joiners start at a key 
   assert.equal(device.spawns.length, 1);
   assert.match(spawns[0][3], /^CLASSPATH=\/data\/local\/tmp\/autonom-scrcpy-4\.1\.jar app_process \/ com\.genymobile\.scrcpy\.Server 4\.1 scid=[0-9a-f]{8} /);
   for (const option of ["tunnel_forward=true", "audio=false", "control=true", "cleanup=true", "max_size=1280",
-    "video_bit_rate=8000000", "max_fps=60", "video_codec=h264", "clipboard_autosync=false"]) {
+    "video_bit_rate=12000000", "max_fps=60", "video_codec=h264", "clipboard_autosync=false"]) {
     assert.ok(spawns[0][3].split(" ").includes(option), option);
   }
   const statusBody = await status(canvas);
@@ -1652,7 +1662,7 @@ test("fanout: one device server feeds every client, late joiners start at a key 
   assert.ok(calls.some((args) => args[2] === "shell" && args[3] === `pkill -f 'scid=[${scid[0]}]${scid.slice(1)}'`));
 });
 
-test("fanout: the session restarts after the device server dies and stops when idle", async (t) => {
+waitingTest("fanout: the session restarts after the device server dies and stops when idle", async (t) => {
   const { world, canvas, auth, device } = await streamingCanvas(t);
   const viewer = await pageSocket(canvas, auth, "/ws/video");
   await waitFor(() => device.connected, 8000, "the fake device connection");
@@ -2332,7 +2342,7 @@ test("input: text and pastes reach a device that reads its clipboard 120 ms afte
   await stopCanvas(canvas);
 });
 
-test("input: a burst of 300 one-character Unicode texts gets 300 clipboard pastes in order and 300 journal records, none dropped", async (t) => {
+waitingTest("input: a burst of 300 one-character Unicode texts gets 300 clipboard pastes in order and 300 journal records, none dropped", async (t) => {
   const { world, canvas, device, control } = await connectedControl(t);
   // More than the 256 journal records the Canvas lets wait: each text waits behind the
   // paste before it, so the burst is held as input, never as pending records.
@@ -3800,7 +3810,7 @@ test("display: /status lists the five presets in order and reports the device de
   await stopCanvas(canvas);
 });
 
-test("display: /status reads the display again once its reading is 2 s old, requests made together share one reading, and an override made outside this Canvas shows with its density and no preset", async (t) => {
+waitingTest("display: /status reads the display again once its reading is 2 s old, requests made together share one reading, and an override made outside this Canvas shows with its density and no preset", async (t) => {
   // No WebSocket client, so only /status reads the display.
   const { world, canvas } = await streamingCanvas(t);
   assert.equal((await status(canvas)).display.preset, "default");
@@ -3831,7 +3841,7 @@ test("display: /status reads the display again once its reading is 2 s old, requ
   assert.match(exit.stdout, /Display restored: 1600x2560 @ 300\n/);
 });
 
-test("display: a page that never asks /status gets state messages with the display read at most 2 s before: an outside change reaches it, a takeover after it shows it, and nothing reads the display once no page is connected", async (t) => {
+waitingTest("display: a page that never asks /status gets state messages with the display read at most 2 s before: an outside change reaches it, a takeover after it shows it, and nothing reads the display once no page is connected", async (t) => {
   const { world, canvas, control } = await connectedControl(t);
   await settledDisplay(control);
   // Nobody asks /status from here on; the Canvas renews its reading while a socket is open.
@@ -3867,7 +3877,7 @@ test("display: a page that never asks /status gets state messages with the displ
   await stopCanvas(canvas);
 });
 
-test("display: a socket that connects once the last reading is over 2 s old never gets that reading in a state message: its first one leaves the display out until one fresh reading, which then reaches it, on the control and the video socket", async (t) => {
+waitingTest("display: a socket that connects once the last reading is over 2 s old never gets that reading in a state message: its first one leaves the display out until one fresh reading, which then reaches it, on the control and the video socket", async (t) => {
   // No socket yet, so only /status reads the display, and nothing renews that reading.
   const { world, canvas, auth } = await streamingCanvas(t);
   assert.equal((await status(canvas)).display.preset, "default");
@@ -3897,7 +3907,7 @@ test("display: a socket that connects once the last reading is over 2 s old neve
   await stopCanvas(canvas);
 });
 
-test("display: while a change runs, /status and state messages never name its preset before both its commands took effect", async (t) => {
+waitingTest("display: while a change runs, /status and state messages never name its preset before both its commands took effect", async (t) => {
   // Each wm command takes 1.5 s, so a /status reading falls between the two.
   const { world, canvas, control } = await connectedControl(t, { env: { FAKE_WM_SET_MS: "1500" } });
   await settledDisplay(control);
@@ -4211,7 +4221,7 @@ test("display: while Pixel Fold runs, Small then Tablet arrive: Small is answere
   await stopCanvas(canvas);
 });
 
-test("display: a newer change goes to the end of the queue: the waiting change it supersedes after an HTTP tap was queued runs nothing, and the newer one runs after that tap", async (t) => {
+waitingTest("display: a newer change goes to the end of the queue: the waiting change it supersedes after an HTTP tap was queued runs nothing, and the newer one runs after that tap", async (t) => {
   const { world, canvas, control } = await connectedControl(t,
     { env: { FAKE_WM_SET_MS: "1000", FAKE_BRIDGE_INPUT_MS: "600" } });
   await settledDisplay(control);
@@ -5382,7 +5392,7 @@ test("ios: auto picks idb when idb_companion is on PATH; its frames reach /ws/vi
   const starts = events.filter((event) => event.type === "start");
   assert.equal(starts.length, 1);
   assert.deepEqual({ ...starts[0], pid: undefined, call: undefined },
-    { type: "start", pid: undefined, call: undefined, fps: 60, format: 0, keyFrameRate: 2, quality: 0.5, avgBitrate: 8_000_000, scale: 1 });
+    { type: "start", pid: undefined, call: undefined, fps: 60, format: 0, keyFrameRate: 2, quality: 0.5, avgBitrate: 12_000_000, scale: 1 });
   const body = await status(canvas);
   assert.equal(body.idb.session_state, "streaming");
   assert.deepEqual(body.idb.points, IOS_POINTS);
@@ -5437,7 +5447,7 @@ test("ios: tabs share one companion stream; a late joiner starts at the cached k
   await stopCanvas(canvas);
 });
 
-test("ios: a key frame asked for that does not come within 2.5 s is forced by Stop and Start on the same companion, at most once per 5 s", async (t) => {
+waitingTest("ios: a key frame asked for that does not come within 2.5 s is forced by Stop and Start on the same companion, at most once per 5 s", async (t) => {
   // A key frame only every 100 s: the periodic one never comes during the test.
   const { world, canvas, auth } = await iosCanvas(t, { env: { FAKE_IDB_KEY_EVERY: "10000", FAKE_IDB_INTERVAL_MS: "10" } });
   const tab = await pageSocket(canvas, auth, "/ws/video");
@@ -5499,7 +5509,7 @@ test("ios: a forced restart whose Stop the companion does not answer replaces th
   await stopCanvas(canvas);
 });
 
-test("ios: SIGTERM stops the stream with Stop and ends the companion; the last tab leaving does the same 15 s later", async (t) => {
+waitingTest("ios: SIGTERM stops the stream with Stop and ends the companion; the last tab leaving does the same 15 s later", async (t) => {
   const { world, canvas, auth } = await iosCanvas(t);
   const tab = await pageSocket(canvas, auth, "/ws/video");
   await waitFor(() => tab.packets().length >= 5, 10_000, "packets");
@@ -5578,7 +5588,7 @@ test("ios: a stream dropped without Stop leaves the companion's encoder running,
   await stopCanvas(canvas);
 });
 
-test("ios: a Simulator that shuts down and boots again gets its stream restarted with Stop and Start on the same companion", async (t) => {
+waitingTest("ios: a Simulator that shuts down and boots again gets its stream restarted with Stop and Start on the same companion", async (t) => {
   const { world, canvas, auth } = await iosCanvas(t);
   const tab = await pageSocket(canvas, auth, "/ws/video");
   await waitFor(() => tab.packets().length >= 5, 10_000, "packets");
@@ -6159,17 +6169,18 @@ test("ios: the page uses WebCodecs and the control socket on idb, turns the canv
   assert.equal(run("controlSocket!==null"), true);
 });
 
-test("ios: the page shows decoded frames in order on idb with at most two waiting, and scrcpy keeps only the newest", async (t) => {
-  const world = await iosWorld(t);
-  const canvas = await startCanvas(world, ["--platform", "ios", "--target", IOS_UDID, "--simctl", world.xcrun]);
-  const html = await (await fetch(`${canvas.origin}/`)).text();
-  await stopCanvas(canvas);
+/**
+ * Checks the page of `html` on `transport`: decoded frames are shown in order, one per
+ * animation frame, with at most two waiting; the oldest beyond that is closed and counted
+ * as dropped, and frames still waiting are closed when the page leaves WebCodecs.
+ */
+function assertFramesShownInOrder(html, transport, size) {
   const { sandbox, run } = runPage(html);
   const frames = [];
   const animationFrames = [];
   const drawn = [];
   sandbox.frame = (id) => {
-    const made = { id, displayWidth: 1206, displayHeight: 2622, closed: false, close() { this.closed = true; } };
+    const made = { id, displayWidth: size.width, displayHeight: size.height, closed: false, close() { this.closed = true; } };
     frames.push(made);
     return made;
   };
@@ -6181,7 +6192,7 @@ test("ios: the page shows decoded frames in order on idb with at most two waitin
   const counts = () => JSON.parse(run("JSON.stringify([stats.framesDecoded,stats.framesRendered,stats.framesDropped])"));
   const closed = () => frames.filter((made) => made.closed).map((made) => made.id);
 
-  run("view.transport=\"idb\";view.mode=\"webcodecs\";");
+  run(`view.transport=${JSON.stringify(transport)};view.mode="webcodecs";`);
   // Two frames decoded between two refreshes are both shown, one per refresh, in order.
   run("onFrame(frame(1));onFrame(frame(2))");
   assert.equal(animationFrames.length, 1, "one animation frame is asked for at a time");
@@ -6201,23 +6212,42 @@ test("ios: the page shows decoded frames in order on idb with at most two waitin
   refresh();
   refresh();
   assert.deepEqual(drawn, [1, 2, 4, 5]);
+  assert.equal(animationFrames.length, 0);
   assert.deepEqual(counts(), [5, 4, 1]);
   assert.equal(run("window.autonomCanvas.stats().framesRendered"), 4);
+  assert.equal(run("window.autonomCanvas.stats().framesDropped"), 1);
+  // A frame decoded while another waits for its refresh asks for no second animation frame.
+  run("onFrame(frame(6))");
+  assert.equal(animationFrames.length, 1);
+  run("onFrame(frame(7))");
+  assert.equal(animationFrames.length, 1, "a second animation frame was asked for while one was pending");
+  refresh();
+  refresh();
+  assert.deepEqual(drawn, [1, 2, 4, 5, 6, 7]);
+  assert.deepEqual(counts(), [7, 6, 1]);
   // Frames still waiting are closed when the page leaves WebCodecs.
-  run("onFrame(frame(6));onFrame(frame(7));startMultipart(\"test\")");
-  assert.deepEqual(closed(), [1, 2, 3, 4, 5, 6, 7]);
+  run("onFrame(frame(8));onFrame(frame(9));startMultipart(\"test\")");
+  assert.deepEqual(closed(), [1, 2, 3, 4, 5, 6, 7, 8, 9]);
   assert.equal(run("frameQueue.length"), 0);
   refresh();
-  assert.deepEqual(drawn, [1, 2, 4, 5], "a closed frame was drawn");
+  assert.deepEqual(drawn, [1, 2, 4, 5, 6, 7], "a closed frame was drawn");
+  assert.deepEqual(counts(), [9, 6, 1], "frames closed by leaving WebCodecs were counted as dropped");
+}
 
-  // scrcpy (Android) is unchanged: only the newest frame waits and it is drawn on the next refresh.
-  run("view.transport=\"scrcpy\";view.mode=\"webcodecs\";stats.framesDecoded=0;stats.framesRendered=0;stats.framesDropped=0;");
-  drawn.length = 0;
-  run("onFrame(frame(8));onFrame(frame(9))");
-  assert.deepEqual(closed().filter((id) => id >= 8), [8]);
-  assert.equal(run("frameQueue.length"), 0);
-  refresh();
-  assert.deepEqual(drawn, [9]);
-  assert.equal(animationFrames.length, 0);
-  assert.deepEqual(counts(), [2, 1, 1]);
+test("ios: the page shows decoded frames in order on idb with at most two waiting", async (t) => {
+  const world = await iosWorld(t);
+  const canvas = await startCanvas(world, ["--platform", "ios", "--target", IOS_UDID, "--simctl", world.xcrun]);
+  const html = await (await fetch(`${canvas.origin}/`)).text();
+  await stopCanvas(canvas);
+  assertFramesShownInOrder(html, "idb", { width: 1206, height: 2622 });
+});
+
+test("page: the Android page shows decoded scrcpy frames in order with at most two waiting, not only the newest", async (t) => {
+  const { html } = await loadPage(t);
+  assert.doesNotMatch(html, /pendingFrame|presentInOrder/, "the newest-frame-only path is still in the page");
+  assertFramesShownInOrder(html, "scrcpy", { width: 576, height: 1280 });
+});
+
+describe("tests that wait on Canvas timers, run side by side", { concurrency: true }, () => {
+  for (const [name, fn] of waitingTests) test(name, fn);
 });

@@ -64,7 +64,9 @@ one capture loop.
 and idb (otherwise up to 60; scrcpy sends frames only when the screen
 changes). `--max-size` (default 1280) is the longer side of the scrcpy video
 and the width of the MJPEG stream; idb always streams at full resolution.
-`--bit-rate` defaults to 8 Mbit/s, on idb too.
+`--bit-rate` defaults to 12 Mbit/s (8 Mbit/s before), on idb and screenrecord
+too: at 60 fps each frame keeps at least the bits it had at about 36 fps and
+8 Mbit/s.
 
 ## scrcpy-server
 
@@ -103,7 +105,7 @@ refused.
 
 - **Video.** With the first page the Canvas starts its own idb_companion on a
   private socket and opens one H.264 stream at 60 fps, full resolution
-  (1206x2622 on an iPhone 17), about 8 Mbit/s and a key frame every 2 s. The
+  (1206x2622 on an iPhone 17), about 12 Mbit/s and a key frame every 2 s. The
   page decodes it with WebCodecs exactly like scrcpy video (`/ws/video`
   SESSION, CONFIG, PACKET), so the caption shows the rendered fps.
 - **One stream.** Every tab shares that stream; a second stream would halve
@@ -189,7 +191,12 @@ menu, Keys or Device section, and its pill shows only Home and Power. The elemen
 ## The scrcpy page
 
 - Decodes with WebCodecs (`VideoDecoder`, codec string from the stream's SPS,
-  low-latency mode) and draws only the newest frame. The Diagnostics panel
+  low-latency mode) and shows the decoded frames in order, on scrcpy as on idb:
+  at most two wait, one is drawn per screen refresh and another refresh is
+  asked for while frames remain, and the oldest beyond two is closed and
+  counted as dropped. A frame that arrives together with the next one is no
+  longer lost (keeping only the newest lost 10-20% of frames on Android); the
+  queue adds about 6-13 ms of latency on average. The Diagnostics panel
   reads `transport: scrcpy (webcodecs)` with the codec, rendered/decoded/dropped
   frames, decoder queue, video size, session state, client counts and owner.
 - Without `VideoDecoder`, when it rejects the codec, or after four refused
@@ -467,8 +474,17 @@ more frames. In one measurement on an API 36 emulator (1080x2424), a
 `-no-window` emulator in its default GPU mode rendered about 13 fps;
 `-gpu host` gave about 38 fps at `--max-size 1280` with about 100 ms from
 touch to picture, and the device produced about 44 frames/s at 1024 and 56 at
-720. Use scrcpy itself for high-fidelity manual review and Macrobenchmark /
-Perfetto / Flutter profile mode for claims.
+720. With frames shown in order and 12 Mbit/s, the live bench
+(`tests/live/canvas_scrcpy_live.mjs --case bench`, a finger dragging the
+Settings list every 16 ms, headed Chromium) measured on the API 36 emulator
+started with `-gpu host -cores 8 -memory 4096` at the default `--max-size
+1280` (570x1280 video): 59.4 frames/s produced by the device, 58.9 decoded,
+59 presented and 59 distinct (median of 3 runs of 10 s), none dropped, about
+99 ms median and 117 ms p95 from touch to picture, 0.67 ms of Canvas and adb
+CPU per frame, host load average about 3.4 on 10 cores. At the native
+1080x2424 the emulator's software encoder reaches only about 52-54 fps. Use
+scrcpy itself for high-fidelity manual review and Macrobenchmark / Perfetto /
+Flutter profile mode for claims.
 
 On an emulator with auto-rotate on, the sensor turns the screen back to
 portrait right after Rotate; turn auto-rotate off on the device for a
