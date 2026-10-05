@@ -4189,7 +4189,15 @@ def cmd_agent_inspect(args: argparse.Namespace) -> int:
                  "attachments": attachments}, as_json=True)
 
 
-CANVAS_TRANSPORTS = ("auto", "scrcpy", "screenrecord", "screencap")
+CANVAS_TRANSPORTS = ("auto", "scrcpy", "idb", "screenrecord", "screencap")
+# The iOS Simulator fast transport: an idb_companion the Canvas starts and owns. Its
+# binary comes from --idb-companion, AUTONOM_IDB_COMPANION_BIN, then PATH, exactly as
+# resolveIdbCompanionBinary in ios-idb-companion.mjs finds it. AUTONOM_IDB_COMPANION is
+# the remote companion of every idb call and never names this binary.
+CANVAS_IDB_CAPABILITY = "canvas.idb"
+CANVAS_IDB_BIN_ENV = "AUTONOM_IDB_COMPANION_BIN"
+CANVAS_IDB_HINT = ("Install it with `brew install facebook/fb/idb-companion`, set "
+                   "AUTONOM_IDB_COMPANION_BIN to its path, or pass --idb-companion PATH.")
 # The same bounds as parseArgs in browser-lib.mjs.
 CANVAS_MAX_SIZE = (320, 4096)
 CANVAS_BIT_RATE = (100_000, 100_000_000)
@@ -4233,6 +4241,37 @@ def _canvas_scrcpy_server(args: argparse.Namespace) -> str | None:
     return str(server.absolute())
 
 
+def _canvas_executable_file(path: str) -> bool:
+    # A directory passes the execute check too: it must be a file.
+    return os.path.isfile(path) and os.access(path, os.X_OK)
+
+
+def _canvas_idb_lookup(args: argparse.Namespace) -> dict[str, Any]:
+    """The idb_companion binary of the Canvas, found as the node server finds it.
+
+    `--idb-companion`, else AUTONOM_IDB_COMPANION_BIN when set, else the first
+    executable `idb_companion` file in PATH; a flag or variable that names no
+    executable file is reported, never skipped. Returns `available`, `path`
+    (absolute for the flag), `source` and `reason`, with the reasons of
+    resolveIdbCompanionBinary in ios-idb-companion.mjs.
+    """
+    if args.idb_companion is not None:
+        source, path = "--idb-companion", str(Path(args.idb_companion).expanduser())
+    elif os.environ.get(CANVAS_IDB_BIN_ENV):
+        source, path = CANVAS_IDB_BIN_ENV, os.environ[CANVAS_IDB_BIN_ENV]
+    else:
+        for directory in os.environ.get("PATH", "").split(os.pathsep):
+            candidate = os.path.join(directory, "idb_companion") if directory else ""
+            if candidate and _canvas_executable_file(candidate):
+                return {"available": True, "path": candidate, "source": "PATH", "reason": None}
+        return {"available": False, "path": None, "source": None,
+                "reason": f"idb_companion was not found (--idb-companion, {CANVAS_IDB_BIN_ENV} or PATH)"}
+    if _canvas_executable_file(path):
+        return {"available": True, "path": os.path.abspath(path), "source": source, "reason": None}
+    return {"available": False, "path": path, "source": source,
+            "reason": f"{source} is not an executable file: {path}"}
+
+
 def cmd_canvas_serve(args: argparse.Namespace) -> int:
     # validated here: the node bridge answered a bad value with a stack trace
     if not 1 <= args.port <= 65535:
@@ -4242,11 +4281,29 @@ def cmd_canvas_serve(args: argparse.Namespace) -> int:
     if args.fps is not None and not 1 <= args.fps <= 60:
         raise errors.AutonomError(
             errors.INVALID_VALUE, f"--fps must be 1..60, got {args.fps}",
-            "The default is 15, and 60 on the scrcpy transport.")
+            "The default is 15, and 60 on the scrcpy and idb transports.")
     _canvas_bounded("--max-size", args.max_size, CANVAS_MAX_SIZE, "1280")
     _canvas_bounded("--bit-rate", args.bit_rate, CANVAS_BIT_RATE, "8000000")
     scrcpy_server = _canvas_scrcpy_server(args)
+    idb = _canvas_idb_lookup(args)
     target = _target(args)
+    if target.platform == ANDROID and (args.transport == "idb" or args.idb_companion is not None):
+        raise errors.AutonomError(
+            errors.UNSUPPORTED_ON_PLATFORM,
+            "the idb transport mirrors iOS Simulators only",
+            "On Android use --transport auto or scrcpy.",
+            capability=CANVAS_IDB_CAPABILITY)
+    if args.transport == "idb" and not idb["available"]:
+        # The node server refuses with this same object when it is started directly.
+        raise errors.AutonomError(
+            errors.TOOL_MISSING, f"--transport idb is unavailable: {idb['reason']}",
+            CANVAS_IDB_HINT, tool="idb_companion", capability=CANVAS_IDB_CAPABILITY)
+    if args.idb_companion is not None and not idb["available"]:
+        # A typo in the flag fails before node starts, whatever the transport.
+        raise errors.AutonomError(
+            errors.INVALID_VALUE, f"--idb-companion is not an executable file: {idb['path']}",
+            CANVAS_IDB_HINT, path=idb["path"])
+    idb_companion = idb["path"] if args.idb_companion is not None else None
     if target.platform != ANDROID and (args.transport == "scrcpy" or scrcpy_server):
         raise errors.AutonomError(
             errors.UNSUPPORTED_ON_PLATFORM,
@@ -4290,6 +4347,8 @@ def cmd_canvas_serve(args: argparse.Namespace) -> int:
         command += ["--simctl", target.tool]
         if getattr(args, "idb", None):
             command += ["--idb", args.idb]
+        if idb_companion:
+            command += ["--idb-companion", idb_companion]
     if args.no_auth:
         command.append("--no-auth")
     if args.token:
@@ -4713,9 +4772,10 @@ def build_parser() -> argparse.ArgumentParser:
     p = canvas_sub.add_parser("serve", parents=[target_flags])
     p.add_argument("--port", type=int, default=3277)
     p.add_argument("--transport", choices=CANVAS_TRANSPORTS, default="auto",
-                   help="auto prefers scrcpy on Android when a 4.1 server is found")
+                   help="auto prefers scrcpy on Android when a 4.1 server is found, "
+                        "and idb on the iOS Simulator when idb_companion is found")
     p.add_argument("--fps", type=int,
-                   help="frame rate cap (default 15; 60 on the scrcpy transport)")
+                   help="frame rate cap (default 15; 60 on the scrcpy and idb transports)")
     p.add_argument("--max-size", type=int, metavar="PX",
                    help="maximum video width in pixels (default 1280)")
     p.add_argument("--bit-rate", type=int, metavar="BPS",
@@ -4724,6 +4784,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="scrcpy-server file to push (default: discovered, see doctor)")
     p.add_argument("--scrcpy-version", metavar="X.Y",
                    help="version of --scrcpy-server when its file name does not say")
+    p.add_argument("--idb-companion", metavar="PATH",
+                   help="idb_companion of the iOS idb transport "
+                        "(default: AUTONOM_IDB_COMPANION_BIN, then PATH)")
     p.add_argument("--token")
     p.add_argument("--no-auth", action="store_true")
     p.set_defaults(func=cmd_canvas_serve)

@@ -272,6 +272,31 @@ A Canvas killed with SIGKILL leaves the preset on the device until
 on the same device takes the first one's preset as its original. Both are
 documented in the `android-emulator-browser` skill.
 
+### Mobile Canvas iOS idb transport (Unreleased)
+
+Additive. No `error_code` is added. `canvas serve` gains `--transport idb`
+and `--idb-companion PATH` and refuses with existing codes, checked before
+node starts:
+
+| Situation | Code |
+| --- | --- |
+| `--idb-companion` that is not an executable file, without `--transport idb` | `invalid_value` |
+| `--transport idb` or `--idb-companion` for an Android target | `unsupported_on_platform`, `capability: "canvas.idb"` |
+| `--transport idb` without a usable idb_companion: `--idb-companion`, else `AUTONOM_IDB_COMPANION_BIN`, else `idb_companion` on `PATH`, where a set flag or variable that is not an executable file is reported, not skipped (`AUTONOM_IDB_COMPANION` is never read) | `tool_missing`, `tool: "idb_companion"`, `capability: "canvas.idb"`, with the install hint |
+
+The canvas server started directly makes the same two `canvas.idb` refusals
+with the same JSON object on stderr and exit code 2.
+
+| Surface | Before | Now |
+| --- | --- | --- |
+| `canvas serve --transport auto` on an iOS Simulator | `simctl` screenshots, input over HTTP | idb when idb_companion is found: the page streams H.264 over `/ws/video` and sends input over `/ws/control`, as on scrcpy; screenshots otherwise, with `fallback_reason`. `--transport screencap` keeps the earlier choice. A Canvas on a machine with idb_companion installed now starts one companion process while a page is open |
+| `/status` | — | `transport` may be `idb`; `fallback_reason` is also set for `auto` on iOS; additive `idb` (null unless idb_companion resolved: `companion_path`, `source`, `session_state`, `companion_pid`, `width`, `height`, `points`, `orientation`, `rotation`, `packets`, `bytes`, `key_frames`, `restarts`, `companion_starts`, `streams_opened`, `stream_restarts`, `forced_key_frames`, `hid_events`, `video_clients`, `control_clients`, `journal_pending`, `journal_dropped`) |
+| `state` message on iOS | — | additive `orientation` and `rotation` (clockwise degrees the page turns the portrait picture); Android `state` messages are unchanged |
+| `/ws/video`, `/ws/control` on iOS | 409 | served on the idb transport; a second pointer, Android keycodes, paste, clipboard, Back, volume, rotate, notifications and display presets are answered with an `error` naming why |
+| Journal records | `transport: scrcpy` | the bridge also accepts `transport: idb` for every kind except `display`; iOS text from the control socket is a `ui text` entry whose detail names `transport: idb` |
+| `AUTONOM_IDB_COMPANION` | `host:port` of a remote companion | unchanged; the Canvas never reads it |
+| `AUTONOM_IDB_COMPANION_BIN` | — | new: the Canvas's idb_companion binary, after `--idb-companion` and before `PATH` |
+
 ### iOS UI recovery and `--session-id` (0.32.0)
 
 Additive, with two behaviour changes listed at the end. A host that passes

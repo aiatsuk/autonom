@@ -1,6 +1,6 @@
 ---
 name: android-emulator-browser
-description: "Mirror and control an Android target or iOS Simulator in a browser through the authenticated Autonom Mobile Canvas: live scrcpy H.264 decoded with WebCodecs and real-time touch, keys, text and clipboard on Android, with screenrecord and screenshot fallbacks."
+description: "Mirror and control an Android target or iOS Simulator in a browser through the authenticated Autonom Mobile Canvas: live H.264 decoded with WebCodecs and real-time input from scrcpy on Android and from an idb_companion on the iOS Simulator (60 fps at full resolution), with screenrecord and screenshot fallbacks."
 ---
 
 # Mobile Canvas browser
@@ -8,10 +8,11 @@ description: "Mirror and control an Android target or iOS Simulator in a browser
 Stream one explicit target into a localhost browser for visual proof and
 control. Install and launch the app first. HTTP input (`/tap`, `/swipe`,
 `/key`, `/text`) uses the same Autonom action pipeline and journal as CLI
-input. On the scrcpy transport the Canvas writes streamed input to the device
-itself, because a process hop per pointer move is too slow, and then journals
-one record per completed action through the same bridge. The browser is not a
-second runner.
+input. On the scrcpy and idb transports the Canvas writes streamed input to
+the device itself (the scrcpy control socket, or the HID stream of its own
+idb_companion), because a process hop per pointer move is too slow, and then
+journals one record per completed action through the same bridge. The browser
+is not a second runner.
 
 ## Launch
 
@@ -19,6 +20,8 @@ second runner.
 autonom canvas serve --platform android --serial <adb-serial> --transport auto
 
 autonom canvas serve --platform android --serial <adb-serial> --transport scrcpy --max-size 1024
+
+autonom canvas serve --platform ios --target <simulator-udid> --transport auto
 
 autonom canvas serve --platform ios --target <simulator-udid> --transport screencap
 ```
@@ -28,7 +31,7 @@ exchanges it for an HttpOnly cookie and removes the fragment; a reload keeps
 the session through the cookie. The startup lines name the chosen transport
 and, for `auto`, why a faster one was skipped. Leave the process running and
 confirm the picture moves (the `fps` in the caption under the device on
-scrcpy, the Stream `Frames` count otherwise) before calling the setup
+scrcpy and idb, the Stream `Frames` count otherwise) before calling the setup
 successful.
 
 Stop the Canvas with Ctrl+C in its terminal. For a background run, send
@@ -36,14 +39,16 @@ SIGTERM to the `autonom canvas serve` process; a job started in the
 background from a script ignores SIGINT. There is no separate stop command.
 Stopping ends the scrcpy device server, removes its `adb forward`, and puts
 back the display size and density if the Canvas changed them (see Display
-size).
+size); on iOS it sends Stop on the video stream and ends the Canvas's
+idb_companion.
 
 ## Transport modes
 
 | Mode | Android | iOS Simulator |
 | --- | --- | --- |
-| `auto` | scrcpy when a scrcpy-server 4.1 is found, else `screenrecord` + ffmpeg, else `screencap`; `/status` `fallback_reason` names what was skipped and why | screenshots |
+| `auto` | scrcpy when a scrcpy-server 4.1 is found, else `screenrecord` + ffmpeg, else `screencap`; `/status` `fallback_reason` names what was skipped and why | idb when idb_companion is found, else screenshots; `/status` `fallback_reason` says why |
 | `scrcpy` | the device's own H.264 from scrcpy-server 4.1, decoded in the page, with real-time input; refuses to start (`canvas.scrcpy`) without a usable server | refused |
+| `idb` | refused | the Simulator's H.264 from an idb_companion the Canvas owns, decoded in the page, with real-time input; refuses to start (`canvas.idb`) without idb_companion |
 | `screenrecord` | device H.264 → ffmpeg → MJPEG; fails loudly when ffmpeg or device H.264 output is missing | refused |
 | `screencap` | multipart screenshots, at most 10 fps, no ffmpeg | `simctl` screenshots |
 
@@ -56,9 +61,10 @@ handled by the Canvas status channel. All multipart pages of one Canvas share
 one capture loop.
 
 `--fps` caps the multipart stream (default 15) and, only when given, scrcpy
-(otherwise up to 60; scrcpy sends frames only when the screen changes).
-`--max-size` (default 1280) is the longer side of the scrcpy video and the
-width of the MJPEG stream. `--bit-rate` defaults to 8 Mbit/s.
+and idb (otherwise up to 60; scrcpy sends frames only when the screen
+changes). `--max-size` (default 1280) is the longer side of the scrcpy video
+and the width of the MJPEG stream; idb always streams at full resolution.
+`--bit-rate` defaults to 8 Mbit/s, on idb too.
 
 ## scrcpy-server
 
@@ -83,6 +89,76 @@ scrcpy` (distribution packages may predate 4.1), or `scripts/bootstrap.sh
 --install --with-scrcpy`. Another scrcpy release turns the transport off:
 `auto` falls back and says why.
 
+## iOS Simulator fast transport (idb)
+
+On the iOS Simulator `--transport auto` prefers `idb` when it finds
+idb_companion: `--idb-companion PATH`, else `AUTONOM_IDB_COMPANION_BIN`,
+else `idb_companion` on `PATH`. `AUTONOM_IDB_COMPANION` is not read: it is
+the `host:port` of a remote companion that every `autonom ui` idb call uses,
+so never put a binary path there. A flag or variable that names no
+executable is reported in `fallback_reason`, not skipped. Install with
+`brew install facebook/fb/idb-companion`. `--transport idb` refuses to start
+without it (`tool_missing`, `capability: "canvas.idb"`); on Android it is
+refused.
+
+- **Video.** With the first page the Canvas starts its own idb_companion on a
+  private socket and opens one H.264 stream at 60 fps, full resolution
+  (1206x2622 on an iPhone 17), about 8 Mbit/s and a key frame every 2 s. The
+  page decodes it with WebCodecs exactly like scrcpy video (`/ws/video`
+  SESSION, CONFIG, PACKET), so the caption shows the rendered fps.
+- **One stream.** Every tab shares that stream; a second stream would halve
+  the frame rate of both. A tab that joins later starts at the cached last
+  key frame. A tab that asks for a key frame waits for the next periodic one;
+  only when none comes within 2.5 s does the Canvas force one by Stop and
+  Start on the same stream, at most once every 5 s.
+- **No leaks.** Every stream ends with an explicit Stop. A stream that ends
+  without one (a dropped connection, a crashed companion) may leave its
+  encoder running inside the companion, so that companion is ended and a new
+  one started, after 0.5 s doubling to 5 s. The same holds for a forced Stop
+  and Start whose Stop cannot be written or is not answered within 2 s: no
+  Start goes to that companion, so two encoders never run. The stream stops 15 s after the
+  last page leaves, and stopping the Canvas ends the companion. A Canvas
+  killed with SIGKILL cannot end it: `pgrep -fl "idb_companion --udid"`
+  shows one left behind, to be ended by hand.
+- **Restart and rotation.** The Canvas reads the Simulator state every 2 s
+  and restarts the frozen stream once the Simulator is Booted again. It reads
+  the orientation every second: the picture stays portrait when the
+  Simulator rotates, the `state` message and `/status` `idb` carry
+  `orientation` and `rotation` (clockwise degrees), and the page turns the
+  picture upright. A finger down during a rotation is lifted.
+- **Input.** One finger: down, move and up reach the Simulator live over the
+  companion's HID stream (a held finger moves by repeated touch-down at the
+  new point), in logical points of the current orientation. A second pointer
+  is refused with a message while the first keeps working. A wheel burst is
+  one short synthetic drag that lifts once the wheel is still (so no fling)
+  and never taps: it goes down at an anchor at least 32 points inside every
+  edge (where the pointer is, moved inward when it is near an edge), its
+  first move goes at least 16 points in the wheel's direction (past the iOS
+  tap slop, even for a tiny trackpad delta), and at the screen edge it lifts
+  and starts over from the anchor. Home and Power press the Simulator's Home
+  and Lock buttons, and text (up to 300 bytes per entry, also characters typed
+  on the screen and a paste) is typed through the action bridge, like HTTP
+  text. All iOS input goes through one queue in message order: each touch,
+  wheel or button event is written to the HID stream, and each text typed,
+  before the next one runs, so input sent after text waits until it is
+  typed. Pause and takeover are checked again when each queued item runs:
+  input refused by then is dropped (each dropped text gets an error), except
+  an UP that lets go of what the Simulator holds down. When the companion or
+  its stream is lost, whatever it held down is lifted through the next
+  companion, even when its UP was still queued. Android
+  keycodes, clipboard, paste, Back, volume, rotate, notifications and display
+  presets have no iOS equivalent and are refused with a message; the page
+  hides them.
+- **Fallback.** Without idb_companion, or when the first stream fails to
+  start, `auto` serves screenshots and `/status` `fallback_reason` says why;
+  a browser without WebCodecs gets the multipart picture with input still on
+  the control socket.
+
+Not equal to Android: one finger only (the HID touch has no finger id), no
+key frame on demand, a portrait picture the page turns, no clipboard, Back,
+volume, notifications or display presets, and Home takes about 0.5 s because
+iOS waits for a possible double press.
+
 ## The page
 
 A slim toolbar holds the Autonom wordmark, the target with a live dot and the
@@ -106,7 +182,7 @@ the safe area, and every tap target is at least 44 px. Controls that cannot
 act (paused, another owner) are disabled; the scrcpy-only ones (Rotate,
 Volume down, Volume up, Notifications, Quick settings, Collapse panels, Copy
 device clipboard) are hidden on the other transports. The iOS page has no Size
-menu, pill, Keys or Device section. The element ids `video`, `screen`,
+menu, Keys or Device section, and its pill shows only Home and Power. The element ids `video`, `screen`,
 `status`, `text`, `clipboard`, `device` and `refresh` and
 `window.autonomCanvas` are stable for scripts.
 
@@ -168,10 +244,12 @@ On the scrcpy transport (focus the screen for keys):
   clipboard under Device. Copy device clipboard fetches the device clipboard
   into the text box and, when the browser allows it, the host clipboard.
 
-On the other transports and on iOS: tap, drag (sent as a swipe on release),
-wheel-as-swipe, the Back, Home, Recent apps, Up, Down, Left, Right, Enter,
-Delete, Wake screen and Power buttons, and conservative ASCII typing over
-HTTP. On iOS the page shows only Home and Power, sent as the Simulator's
+On the idb transport (iOS Simulator), see iOS Simulator fast transport above.
+
+On the other transports and on iOS screenshots: tap, drag (sent as a swipe on
+release), wheel-as-swipe, the Back, Home, Recent apps, Up, Down, Left, Right,
+Enter, Delete, Wake screen and Power buttons, and conservative ASCII typing
+over HTTP. On iOS the page shows only Home and Power, sent as the Simulator's
 Home and Lock buttons; the Android-only buttons are not shown.
 Structural selection still belongs to Autonom `ui` commands.
 
@@ -333,7 +411,8 @@ keep a record. This holds for HTTP input and the scrcpy path alike.
 
 Every completed action on the scrcpy path becomes exactly one journal entry
 (`ui gesture|scroll|key|text|paste|system|control`) with its origin and
-`transport: scrcpy`:
+`transport: scrcpy`; on the idb path the same, with `transport: idb` (text
+there is one `ui text` entry written by the bridge as it types, naming idb):
 
 | Kind | One record per | Recorded |
 | --- | --- | --- |
@@ -353,7 +432,7 @@ and preset `restore`.
 Input the Canvas lifts on pause, takeover, disconnect or restart is
 journaled like input its client released. Page text and key presses are
 journaled; type secrets with `autonom ui type --sensitive` instead.
-`/status` `scrcpy.journal_pending` counts records waiting for the bridge.
+`/status` `scrcpy.journal_pending` (`idb.journal_pending` on iOS) counts records waiting for the bridge.
 The Canvas stops reading a connection's input while 64 of its records, or
 256 in all, are unanswered, so ordinary input waits instead of being lost; a
 record produced while 256 wait (a pointer lifted by a takeover during a
@@ -399,5 +478,6 @@ rotation that sticks.
 
 Side-panel screenshot, platform and target id, the Diagnostics panel's
 transport and decoder lines, `fallback_reason`, `scrcpy.version`/`scrcpy.source`
+(`idb.companion_path`/`idb.source` and `idb.streams_opened` on iOS)
 and the display preset, size and density from `/status`, package/activity,
 variant, control owner, and the exact flow replayed.

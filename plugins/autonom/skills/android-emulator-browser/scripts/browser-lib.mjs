@@ -73,7 +73,9 @@ export const SYSTEM_OPS = Object.freeze([
 export const CONTROL_MODES = Object.freeze(["pause", "resume", "takeover", "release"]);
 export const ORIGINS = Object.freeze(["human", "agent", "replay", "system"]);
 
-const TRANSPORTS = new Set(["auto", "scrcpy", "screenrecord", "screencap"]);
+// `idb` is the iOS Simulator fast transport (idb_companion H.264); scrcpy and screenrecord
+// are Android-only. The platform check lives in the server, which knows the target.
+const TRANSPORTS = new Set(["auto", "scrcpy", "idb", "screenrecord", "screencap"]);
 const VERSION_TEXT = /^\d+(?:\.\d+)+(?:-[0-9A-Za-z.]+)?$/;
 const ASCII_TEXT = /^[A-Za-z0-9 ._@:/,+\-=!?]*$/;
 const SOI = Buffer.from([0xff, 0xd8]);
@@ -142,6 +144,9 @@ export function parseArgs(argv) {
       case "--idb":
         options.idb = requireFlagValue(argv, ++i, flag);
         break;
+      case "--idb-companion":
+        options.idbCompanion = requireFlagValue(argv, ++i, flag);
+        break;
       case "--ffmpeg":
         options.ffmpeg = requireFlagValue(argv, ++i, flag);
         break;
@@ -205,7 +210,7 @@ export function parseArgs(argv) {
     throw new Error("--bit-rate must be an integer from 100000 to 100000000.");
   }
   if (!TRANSPORTS.has(options.transport)) {
-    throw new Error("--transport must be auto, scrcpy, screenrecord, or screencap.");
+    throw new Error("--transport must be auto, scrcpy, screenrecord, or screencap (or idb on the iOS Simulator).");
   }
   if (options.scrcpyVersion !== undefined) {
     if (!VERSION_TEXT.test(options.scrcpyVersion)) {

@@ -165,6 +165,16 @@ that `ui tap` reports backend axe and that the tree still comes from idb.
 Select iOS controls with --desc, not --text.
 ```
 
+## Watch and drive the Simulator at 60 fps in the browser
+
+```text
+Start `autonom canvas serve --platform ios --target <udid>` and open the printed
+URL. Confirm the Diagnostics panel says `transport: idb (webcodecs)` and the
+caption shows about 60 fps while you scroll Settings; if it says screencap,
+report `/status` `fallback_reason`. Drag a list with the mouse, press Home, then
+stop the Canvas with SIGTERM and check that no idb_companion is left running.
+```
+
 ## Tap one of several identical controls
 
 ```text

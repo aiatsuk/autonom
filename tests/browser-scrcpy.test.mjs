@@ -152,6 +152,12 @@ const RECORD_MS = Number(process.env.FAKE_BRIDGE_RECORD_MS ?? 0);
 // A slow device for HTTP input: taps, swipes, keys and text are answered this long after.
 const INPUT_MS = Number(process.env.FAKE_BRIDGE_INPUT_MS ?? 0);
 const INPUT_OPS = ["tap", "swipe", "key", "text"];
+// While this file exists, input answers wait too: input that never finishes until a test says so.
+const INPUT_HOLD = process.env.FAKE_BRIDGE_LOG + ".input-hold";
+// While this one exists, only the text "<text>" waits.
+const textHold = (message) => message.op === "text" && typeof message.payload?.text === "string"
+  ? INPUT_HOLD + "." + message.payload.text : null;
+const inputHeld = (message) => existsSync(INPUT_HOLD) || existsSync(textHold(message) ?? "");
 // Like the real bridge, one line at a time: each is handled, and logged, only once the one
 // before it was answered, so a record behind a slow swipe waits for it.
 const IN_ORDER = Boolean(process.env.FAKE_BRIDGE_IN_ORDER);
@@ -178,6 +184,16 @@ function handle(line) {
   }, ms));
   if (message.op === "record" && (held.length || existsSync(HOLD))) held.push([message.id, result]);
   else if (message.op === "record" && RECORD_MS) return later(RECORD_MS);
+  else if (INPUT_OPS.includes(message.op) && inputHeld(message)) {
+    return new Promise((resolvePromise) => {
+      const poll = setInterval(() => {
+        if (inputHeld(message)) return;
+        clearInterval(poll);
+        answer(message.id, result);
+        resolvePromise();
+      }, 10);
+    });
+  }
   else if (INPUT_OPS.includes(message.op) && INPUT_MS) return later(INPUT_MS);
   else answer(message.id, result);
   return Promise.resolve();
@@ -5127,4 +5143,1081 @@ test("page: the iOS page runs without the Size menu, keeps every element id, sho
   assert.equal(document.getElementById("target-detail").textContent, "iOS · screencap");
   assert.equal(document.getElementById("display-dims").textContent, "1179 × 2556");
   assert.equal(document.getElementById("sendText").disabled, false);
+});
+
+// ---------------------------------------------------------------------------
+// iOS Simulator fast transport (idb): a fake idb_companion executable, the same kind the
+// companion client tests use, extended with describe, get_orientation and HID, real
+// simulator SPS/PPS, a periodic key frame, and files the test writes to steer it.
+// ---------------------------------------------------------------------------
+
+const IDB_MODULE_URL = new URL(
+  "../plugins/autonom/skills/android-emulator-browser/scripts/ios-idb-companion.mjs", import.meta.url).href;
+const IOS_UDID = "3760A5A8-E59D-4AE6-B1AF-A626908D7B61";
+// SPS and PPS of the real 1206x2622 simulator stream (avc1.640033).
+const IOS_SPS = Buffer.from("27640033ac13143c04c0149e6a9a80868083c20108f8", "hex");
+const IOS_PPS = Buffer.from("28ee3cb0", "hex");
+const IOS_POINTS = { width: 402, height: 874 };
+
+const FAKE_IDB_COMPANION = String.raw`
+import { appendFileSync, existsSync, readFileSync } from "node:fs";
+import * as http2 from "node:http2";
+import { GrpcMessageParser, decodeHidEvent, decodeVideoStreamRequest, encodeVideoStreamResponse, grpcFrame } from "${IDB_MODULE_URL}";
+
+const args = process.argv.slice(2);
+const arg = (name) => { const i = args.indexOf(name); return i >= 0 ? args[i + 1] : undefined; };
+const record = (event) => appendFileSync(process.env.FAKE_IDB_EVENTS, JSON.stringify({ pid: process.pid, ...event }) + "\n");
+// A file named <FAKE_IDB_CONTROL>.<name> steers the fake while it runs.
+const control = (name) => {
+  const path = process.env.FAKE_IDB_CONTROL + "." + name;
+  return existsSync(path) ? readFileSync(path, "utf8").trim() : null;
+};
+record({ type: "spawn", args });
+if (process.env.FAKE_IDB_MODE === "crash") { process.stderr.write("cannot find target\n"); process.exit(3); }
+process.on("SIGTERM", () => { record({ type: "term" }); process.exit(0); });
+
+const varint = (value) => { const out = []; let v = value; while (v >= 0x80) { out.push((v & 0x7f) | 0x80); v = Math.floor(v / 128); } out.push(v); return Buffer.from(out); };
+const tag = (field, wire) => varint(field * 8 + wire);
+const len = (field, bytes) => Buffer.concat([tag(field, 2), varint(bytes.length), bytes]);
+const uint = (field, value) => Buffer.concat([tag(field, 0), varint(value)]);
+const dbl = (field, value) => { const b = Buffer.alloc(8); b.writeDoubleLE(value); return Buffer.concat([tag(field, 1), b]); };
+const str = (field, text) => len(field, Buffer.from(text));
+const ORIENTATIONS = ["UNKNOWN", "PORTRAIT", "PORTRAIT_UPSIDE_DOWN", "LANDSCAPE_LEFT", "LANDSCAPE_RIGHT"];
+const SC = Buffer.from([0, 0, 0, 1]);
+const SPS = Buffer.from("${IOS_SPS.toString("hex")}", "hex");
+const PPS = Buffer.from("${IOS_PPS.toString("hex")}", "hex");
+const KEY_EVERY = Number(process.env.FAKE_IDB_KEY_EVERY ?? 50);
+const INTERVAL_MS = Number(process.env.FAKE_IDB_INTERVAL_MS ?? 10);
+let seq = 0;
+const frame = (key) => {
+  const body = Buffer.alloc(5);
+  body[0] = key ? 0x65 : 0x41;
+  body.writeUInt32BE(seq++, 1);
+  return key ? Buffer.concat([SC, SPS, SC, PPS, SC, body]) : Buffer.concat([SC, body]);
+};
+let calls = 0;
+const server = http2.createServer();
+server.on("session", (session) => session.on("error", () => {}));
+server.on("stream", (stream, headers) => {
+  const method = headers[":path"].split("/").pop();
+  const parser = new GrpcMessageParser();
+  stream.on("error", () => {});
+  stream.respond({ ":status": 200, "content-type": "application/grpc" }, { waitForTrailers: true });
+  stream.on("wantTrailers", () => stream.sendTrailers({ "grpc-status": "0" }));
+  if (method === "video_stream") {
+    const call = ++calls;
+    let timer = null;
+    let running = false;
+    let sent = 0;
+    stream.on("data", (chunk) => {
+      for (const message of parser.push(chunk)) {
+        const request = decodeVideoStreamRequest(message);
+        record({ type: request.type, call, fps: request.fps, format: request.format, keyFrameRate: request.keyFrameRate,
+          quality: request.compressionQuality, avgBitrate: request.avgBitrate, scale: request.scaleFactor });
+        if (request.type === "start") {
+          running = true;
+          timer = setInterval(() => {
+            if (control("rst") === "now") {
+              record({ type: "rst", call });
+              clearInterval(timer);
+              stream.close(http2.constants.NGHTTP2_INTERNAL_ERROR);
+              return;
+            }
+            if (control("freeze")) return;
+            stream.write(grpcFrame(encodeVideoStreamResponse({ data: frame(sent % KEY_EVERY === 0) })));
+            sent += 1;
+          }, INTERVAL_MS);
+        } else if (request.type === "stop") {
+          // A wedged companion: Stop arrives but is never answered, and the encoder runs on.
+          if (control("ignore-stop")) continue;
+          clearInterval(timer);
+          running = false;
+          stream.end();
+        }
+      }
+    });
+    // Like idb_companion: a call gone without Stop leaves its encoder running.
+    stream.on("close", () => { if (running) record({ type: "leak", call }); clearInterval(timer); });
+  } else if (method === "hid") {
+    stream.on("data", (chunk) => { for (const message of parser.push(chunk)) record({ type: "hid", event: decodeHidEvent(message) }); });
+    stream.on("end", () => stream.end());
+  } else {
+    stream.on("data", (chunk) => {
+      for (const message of parser.push(chunk)) {
+        if (method === "describe") {
+          const screen = Buffer.concat([uint(1, 1206), uint(2, 2622), dbl(3, 3), uint(4, ${IOS_POINTS.width}), uint(5, ${IOS_POINTS.height})]);
+          stream.write(grpcFrame(len(1, Buffer.concat([str(1, arg("--udid")), str(2, "Autonom-Fast-Test"), len(3, screen), str(4, "Booted")]))));
+        } else if (method === "get_orientation") {
+          const name = control("orientation") ?? "PORTRAIT";
+          stream.write(grpcFrame(uint(1, Math.max(0, ORIENTATIONS.indexOf(name)))));
+        }
+        stream.end();
+      }
+    });
+  }
+});
+const socketPath = arg("--grpc-domain-sock");
+server.listen(socketPath, () => process.stdout.write(JSON.stringify({ grpc_path: socketPath }) + "\n"));
+`;
+
+// simctl for the iOS fast tests: the Simulator's state comes from FAKE_SIM_STATE (Booted by default).
+const FAKE_IOS_XCRUN = String.raw`
+import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+const args = process.argv.slice(2);
+appendFileSync(process.env.FAKE_ADB_LOG, JSON.stringify(args) + "\n");
+if (args[0] === "simctl" && args[1] === "list") {
+  const path = process.env.FAKE_SIM_STATE;
+  const state = path && existsSync(path) ? readFileSync(path, "utf8").trim() : "Booted";
+  console.log(JSON.stringify({ devices: { "iOS 27.0": [{ udid: process.env.FAKE_UDID, state, isAvailable: true }] } }));
+} else if (args[0] === "simctl" && args[1] === "io") {
+  writeFileSync(args.at(-1), Buffer.from(process.env.FAKE_PNG, "base64"));
+} else {
+  console.error("unsupported fake xcrun command: " + args.join(" "));
+  process.exitCode = 2;
+}
+`;
+
+/** A world for an iOS Canvas: fake simctl, and a fake idb_companion on PATH unless `companion` is false. */
+async function iosWorld(t, { env = {}, companion = true } = {}) {
+  const world = await makeWorld(t, { env: { FAKE_UDID: IOS_UDID, ...env } });
+  world.xcrun = join(world.directory, "fake-xcrun.mjs");
+  await writeFile(world.xcrun, `#!${process.execPath}\n${FAKE_IOS_XCRUN}`);
+  await chmod(world.xcrun, 0o755);
+  world.companion = join(world.directory, "companion-bin", "idb_companion");
+  await mkdir(dirname(world.companion));
+  await writeFile(world.companion, `#!${process.execPath}\n${FAKE_IDB_COMPANION}`);
+  await chmod(world.companion, 0o755);
+  if (companion) await symlink(world.companion, join(world.bin, "idb_companion"));
+  world.idbEvents = join(world.directory, "idb-events.jsonl");
+  await writeFile(world.idbEvents, "");
+  world.idbControl = join(world.directory, "idb-control");
+  world.simState = join(world.directory, "sim-state");
+  Object.assign(world.env, { FAKE_IDB_EVENTS: world.idbEvents, FAKE_IDB_CONTROL: world.idbControl, FAKE_SIM_STATE: world.simState });
+  // A companion a failed test left behind goes too, with the Canvas, before the folder is removed.
+  world.children.push({
+    exitCode: null, signalCode: null,
+    kill: () => {
+      for (const { pid } of idbEventsNow(world).filter((event) => event.type === "spawn")) {
+        try { process.kill(pid, "SIGKILL"); } catch {}
+      }
+    },
+  });
+  return world;
+}
+
+function idbEventsNow(world) {
+  return readFileSync(world.idbEvents, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line));
+}
+
+function idbControl(world, name, value) {
+  const path = `${world.idbControl}.${name}`;
+  if (value === null) rmSync(path, { force: true });
+  else writeFileSync(path, value);
+}
+
+function hidEvents(world) {
+  return idbEventsNow(world).filter((event) => event.type === "hid").map((event) => event.event);
+}
+
+function alive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function iosCanvas(t, { args = [], env = {}, companion = true } = {}) {
+  const world = await iosWorld(t, { env, companion });
+  const canvas = await startCanvas(world, ["--platform", "ios", "--target", IOS_UDID, "--simctl", world.xcrun, ...args]);
+  const auth = await login(canvas);
+  return { world, canvas, auth };
+}
+
+/** An iOS Canvas on idb with a control socket whose session streams. */
+async function iosControl(t, options) {
+  const setup = await iosCanvas(t, options);
+  const control = await pageSocket(setup.canvas, setup.auth, "/ws/control");
+  await control.next((message) => message.json?.t === "state" && message.json.session === "streaming", 10_000);
+  return { ...setup, control };
+}
+
+/** Wait until the HID stream has seen `count` events, then return them all. */
+async function hidAtLeast(world, count) {
+  await waitFor(() => hidEvents(world).length >= count, 5000, `${count} HID events`);
+  return hidEvents(world);
+}
+
+const touchAt = (direction, x, y) => ({ touch: { x, y }, direction });
+
+test("ios: auto picks idb when idb_companion is on PATH; its frames reach /ws/video as SESSION, CONFIG and PACKET, the Start asks for 60 fps, quality 0.5 and 2 s key frames", async (t) => {
+  const { world, canvas, auth } = await iosCanvas(t);
+  assert.match(canvas.output(), /Transport: idb/);
+  const before = await status(canvas);
+  assert.equal(before.transport, "idb");
+  assert.equal(before.fallback_reason, null);
+  assert.equal(before.idb.source, "PATH");
+  assert.equal(before.idb.session_state, "idle");
+  assert.equal(idbEventsNow(world).length, 0, "the companion started before a page asked for video");
+  const tab = await pageSocket(canvas, auth, "/ws/video");
+  await waitFor(() => tab.packets().length >= 60, 10_000, "60 packets");
+  const video = tab.video();
+  assert.deepEqual(video.find((message) => message.kind === "session"), { kind: "session", width: 1206, height: 2622 });
+  const config = video.find((message) => message.kind === "config");
+  assert.ok(config.data.equals(Buffer.concat([Buffer.from([0, 0, 0, 1]), IOS_SPS, Buffer.from([0, 0, 0, 1]), IOS_PPS])));
+  assert.ok(video.findIndex((message) => message.kind === "config") < video.findIndex((message) => message.kind === "packet"));
+  const packets = tab.packets();
+  assert.equal(packets[0].keyFrame, true);
+  // The key frame goes without its SPS and PPS: they are in CONFIG.
+  assert.deepEqual([...packets[0].data.subarray(0, 5)], [0, 0, 0, 1, 0x65]);
+  assert.deepEqual(packets.map((packet) => packet.seq), packets.map((_, index) => index), "a frame was lost");
+  assert.ok(packets.every((packet, index) => index === 0 || packet.pts >= packets[index - 1].pts));
+  assert.equal(packets.filter((packet) => packet.keyFrame).length, Math.ceil(packets.length / 50));
+  const events = idbEventsNow(world);
+  const spawns = events.filter((event) => event.type === "spawn");
+  assert.equal(spawns.length, 1);
+  assert.deepEqual(spawns[0].args.slice(0, 2), ["--udid", IOS_UDID]);
+  assert.ok(spawns[0].args.includes("--grpc-domain-sock"), "the companion listens on TCP");
+  const starts = events.filter((event) => event.type === "start");
+  assert.equal(starts.length, 1);
+  assert.deepEqual({ ...starts[0], pid: undefined, call: undefined },
+    { type: "start", pid: undefined, call: undefined, fps: 60, format: 0, keyFrameRate: 2, quality: 0.5, avgBitrate: 8_000_000, scale: 1 });
+  const body = await status(canvas);
+  assert.equal(body.idb.session_state, "streaming");
+  assert.deepEqual(body.idb.points, IOS_POINTS);
+  assert.equal(body.idb.orientation, "PORTRAIT");
+  assert.equal(body.idb.companion_starts, 1);
+  assert.equal(body.idb.streams_opened, 1);
+  assert.ok(body.idb.packets >= 60);
+  const state = tab.json("state").at(-1);
+  assert.equal(state.transport, "idb");
+  assert.equal(state.orientation, "PORTRAIT");
+  assert.equal(state.rotation, 0);
+  // A browser without WebCodecs still gets a picture: the multipart stream serves screenshots.
+  const multipart = await readMultipart(canvas);
+  try {
+    await waitFor(() => multipart.frames.length >= 1, 10_000, "a multipart frame on the idb transport");
+  } finally {
+    multipart.close();
+  }
+  assert.deepEqual(multipart.frames[0], Buffer.from(PNG_BASE64, "base64"));
+  assert.equal(idbEventsNow(world).filter((event) => event.type === "start").length, 1, "the multipart page opened a stream");
+  await stopCanvas(canvas);
+});
+
+test("ios: tabs share one companion stream; a late joiner starts at the cached key frame and a tab that asks for one waits for the periodic key frame, never a second stream", async (t) => {
+  const { world, canvas, auth } = await iosCanvas(t, { env: { FAKE_IDB_KEY_EVERY: "100", FAKE_IDB_INTERVAL_MS: "10" } });
+  const first = await pageSocket(canvas, auth, "/ws/video");
+  await waitFor(() => first.packets().length >= 30, 10_000, "the first tab's packets");
+  const late = await pageSocket(canvas, auth, "/ws/video");
+  await waitFor(() => late.packets().length >= 5, 5000, "the late tab's packets");
+  const latePackets = late.packets();
+  assert.equal(latePackets[0].keyFrame, true, "the late tab did not start at a key frame");
+  assert.equal(latePackets[0].seq, 0, "the late tab did not start at the cached key frame");
+  assert.deepEqual(latePackets.map((packet) => packet.seq).slice(0, 5), [0, 1, 2, 3, 4]);
+  assert.equal(late.video()[0].kind, "session");
+  assert.equal(late.video()[1].kind, "config");
+  // A page asks for a key frame (as after a decoder error): the next periodic one answers it.
+  const control = await pageSocket(canvas, auth, "/ws/control");
+  const keysBefore = (await status(canvas)).idb.key_frames;
+  control.send({ t: "system", op: "keyframe" });
+  await waitFor(async () => (await status(canvas)).idb.key_frames > keysBefore, 5000, "the periodic key frame");
+  await sleep(300);
+  const third = await pageSocket(canvas, auth, "/ws/video");
+  await waitFor(() => third.packets().length >= 3, 5000, "the third tab's packets");
+  assert.equal(third.packets()[0].keyFrame, true);
+  const events = idbEventsNow(world);
+  assert.equal(events.filter((event) => event.type === "spawn").length, 1, "a second companion");
+  assert.equal(events.filter((event) => event.type === "start").length, 1, "a second stream");
+  assert.equal(events.filter((event) => event.type === "stop").length, 0);
+  const body = await status(canvas);
+  assert.equal(body.idb.video_clients, 3);
+  assert.equal(body.idb.forced_key_frames, 0, "a key frame was forced although a periodic one came");
+  await stopCanvas(canvas);
+});
+
+test("ios: a key frame asked for that does not come within 2.5 s is forced by Stop and Start on the same companion, at most once per 5 s", async (t) => {
+  // A key frame only every 100 s: the periodic one never comes during the test.
+  const { world, canvas, auth } = await iosCanvas(t, { env: { FAKE_IDB_KEY_EVERY: "10000", FAKE_IDB_INTERVAL_MS: "10" } });
+  const tab = await pageSocket(canvas, auth, "/ws/video");
+  await waitFor(() => tab.packets().length >= 10, 10_000, "packets");
+  const control = await pageSocket(canvas, auth, "/ws/control");
+  const asked = Date.now();
+  control.send({ t: "system", op: "keyframe" });
+  control.send({ t: "system", op: "keyframe" });
+  await waitFor(() => idbEventsNow(world).filter((event) => event.type === "start").length === 2, 6000, "the forced restart");
+  assert.ok(Date.now() - asked >= 2400, "the key frame was forced before the periodic one could come");
+  const events = idbEventsNow(world);
+  const pids = new Set(events.filter((event) => event.type === "spawn").map((event) => event.pid));
+  assert.equal(pids.size, 1, "the forced key frame restarted the companion");
+  // Stop on the old call went out before Start on the new one.
+  assert.deepEqual(events.filter((event) => ["start", "stop"].includes(event.type)).map((event) => `${event.type} ${event.call}`),
+    ["start 1", "stop 1", "start 2"]);
+  await waitFor(() => tab.packets().filter((packet) => packet.keyFrame).length === 2, 3000, "the forced key frame");
+  // Asked again at once: not forced again within 5 s.
+  control.send({ t: "system", op: "keyframe" });
+  await sleep(3500);
+  assert.equal(idbEventsNow(world).filter((event) => event.type === "start").length, 2, "forced twice within 5 s");
+  assert.equal((await status(canvas)).idb.forced_key_frames, 1);
+  await stopCanvas(canvas);
+});
+
+test("ios: a forced restart whose Stop the companion does not answer replaces the companion before the next stream, never two encoders", async (t) => {
+  const { world, canvas, auth } = await iosCanvas(t, { env: { FAKE_IDB_KEY_EVERY: "10000", FAKE_IDB_INTERVAL_MS: "10" } });
+  const tab = await pageSocket(canvas, auth, "/ws/video");
+  await waitFor(() => tab.packets().length >= 10, 10_000, "packets");
+  const pid = (await status(canvas)).idb.companion_pid;
+  idbControl(world, "ignore-stop", "1");
+  const control = await pageSocket(canvas, auth, "/ws/control");
+  control.send({ t: "system", op: "keyframe" });
+  await waitFor(() => idbEventsNow(world).some((event) => event.type === "term" && event.pid === pid), 12_000,
+    "the companion whose Stop went unanswered to be ended");
+  idbControl(world, "ignore-stop", null);
+  await waitFor(() => idbEventsNow(world).filter((event) => event.type === "start").length === 2, 10_000,
+    "a stream on a new companion");
+  const events = idbEventsNow(world);
+  // No Start went out on the old companion after its unanswered Stop ...
+  assert.deepEqual(events.filter((event) => event.pid === pid && ["start", "stop"].includes(event.type))
+    .map((event) => `${event.type} ${event.call}`), ["start 1", "stop 1"]);
+  // ... and it was ended before the new one was spawned, so only one encoder ever ran.
+  const spawns = events.filter((event) => event.type === "spawn");
+  assert.equal(spawns.length, 2);
+  assert.notEqual(spawns[1].pid, pid);
+  assert.ok(events.findIndex((event) => event.type === "term" && event.pid === pid) < events.indexOf(spawns[1]),
+    "the new companion started while the old encoder could still run");
+  const starts = events.filter((event) => event.type === "start");
+  assert.deepEqual(starts.map((event) => event.pid), [pid, spawns[1].pid]);
+  assert.equal(alive(pid), false);
+  const count = tab.packets().length;
+  await waitFor(() => tab.packets().length >= count + 3, 10_000, "packets from the new companion");
+  const body = await status(canvas);
+  assert.equal(body.idb.session_state, "streaming");
+  assert.equal(body.idb.companion_starts, 2);
+  assert.equal(body.idb.streams_opened, 2);
+  assert.equal(body.idb.companion_pid, spawns[1].pid);
+  await stopCanvas(canvas);
+});
+
+test("ios: SIGTERM stops the stream with Stop and ends the companion; the last tab leaving does the same 15 s later", async (t) => {
+  const { world, canvas, auth } = await iosCanvas(t);
+  const tab = await pageSocket(canvas, auth, "/ws/video");
+  await waitFor(() => tab.packets().length >= 5, 10_000, "packets");
+  const pid = (await status(canvas)).idb.companion_pid;
+  assert.ok(alive(pid));
+  tab.close();
+  await tab.closed;
+  await sleep(13_000);
+  assert.ok(alive(pid), "the companion stopped before 15 s without clients");
+  assert.equal(idbEventsNow(world).filter((event) => event.type === "stop").length, 0);
+  await waitFor(() => !alive(pid), 5000, "the idle stop");
+  let events = idbEventsNow(world);
+  assert.deepEqual(events.filter((event) => ["start", "stop", "term", "leak"].includes(event.type)).map((event) => event.type),
+    ["start", "stop", "term"]);
+  assert.equal((await status(canvas)).idb.session_state, "idle");
+
+  // A new tab starts a new companion; SIGTERM to the Canvas ends it with Stop first.
+  const again = await pageSocket(canvas, auth, "/ws/video");
+  await waitFor(() => again.packets().length >= 5, 10_000, "packets after the idle stop");
+  const second = (await status(canvas)).idb.companion_pid;
+  assert.notEqual(second, pid);
+  const exit = await stopCanvas(canvas);
+  assert.equal(exit.code, 0);
+  assert.equal(alive(second), false, "the companion outlived the Canvas");
+  events = idbEventsNow(world).filter((event) => event.pid === second);
+  assert.deepEqual(events.filter((event) => ["start", "stop", "term", "leak"].includes(event.type)).map((event) => event.type),
+    ["start", "stop", "term"]);
+  assert.ok(!idbEventsNow(world).some((event) => event.type === "leak"), "an encoder was left running");
+});
+
+test("ios: a companion that dies mid-stream is started again and the picture resumes on one stream", async (t) => {
+  const { world, canvas, auth } = await iosCanvas(t);
+  const tab = await pageSocket(canvas, auth, "/ws/video");
+  await waitFor(() => tab.packets().length >= 5, 10_000, "packets");
+  const pid = (await status(canvas)).idb.companion_pid;
+  process.kill(pid, "SIGKILL");
+  const restarting = await tab.next((message) => message.json?.t === "state" && message.json.session === "restarting", 5000);
+  await waitFor(() => idbEventsNow(world).filter((event) => event.type === "spawn").length === 2, 10_000, "a new companion");
+  // Messages on the socket keep their order and the old stream had ended before the state
+  // said restarting, so every packet after that message is from the new stream, however
+  // early its first frame came.
+  const packetsAfterRestart = () => {
+    const at = tab.messages.indexOf(restarting);
+    return tab.video.call({ messages: tab.messages.slice(at + 1) }).filter((message) => message.kind === "packet");
+  };
+  await waitFor(() => packetsAfterRestart().length >= 5, 10_000, "packets after the restart");
+  const after = packetsAfterRestart();
+  assert.equal(after[0].keyFrame, true, "the new stream did not start at a key frame");
+  assert.equal(after[0].seq, 0, "the first packet after the restart is not the new stream's first frame");
+  const body = await status(canvas);
+  assert.equal(body.idb.session_state, "streaming");
+  assert.equal(body.idb.companion_starts, 2);
+  assert.ok(body.idb.restarts >= 1);
+  assert.notEqual(body.idb.companion_pid, pid);
+  const starts = idbEventsNow(world).filter((event) => event.type === "start");
+  assert.deepEqual(starts.map((event) => event.pid), [pid, body.idb.companion_pid]);
+  await stopCanvas(canvas);
+});
+
+test("ios: a stream dropped without Stop leaves the companion's encoder running, so that companion is ended and a new one streams", async (t) => {
+  const { world, canvas, auth } = await iosCanvas(t);
+  const tab = await pageSocket(canvas, auth, "/ws/video");
+  await waitFor(() => tab.packets().length >= 5, 10_000, "packets");
+  const pid = (await status(canvas)).idb.companion_pid;
+  idbControl(world, "rst", "now");
+  await waitFor(() => idbEventsNow(world).some((event) => event.type === "leak" && event.pid === pid), 5000, "the dropped call");
+  idbControl(world, "rst", null);
+  await waitFor(() => idbEventsNow(world).some((event) => event.type === "term" && event.pid === pid), 10_000,
+    "the leaking companion to be ended");
+  await waitFor(() => idbEventsNow(world).filter((event) => event.type === "start").length === 2, 10_000, "a new stream");
+  const second = idbEventsNow(world).filter((event) => event.type === "start")[1];
+  assert.notEqual(second.pid, pid, "the new stream ran on the companion whose encoder leaked");
+  assert.equal(alive(pid), false);
+  const count = tab.packets().length;
+  await waitFor(() => tab.packets().length >= count + 3, 10_000, "packets from the new companion");
+  await stopCanvas(canvas);
+});
+
+test("ios: a Simulator that shuts down and boots again gets its stream restarted with Stop and Start on the same companion", async (t) => {
+  const { world, canvas, auth } = await iosCanvas(t);
+  const tab = await pageSocket(canvas, auth, "/ws/video");
+  await waitFor(() => tab.packets().length >= 5, 10_000, "packets");
+  const pid = (await status(canvas)).idb.companion_pid;
+  // Shut down: the stream freezes on its last picture.
+  writeFileSync(world.simState, "Shutdown");
+  idbControl(world, "freeze", "1");
+  await tab.next((message) => message.json?.t === "state" && message.json.session === "restarting", 6000);
+  writeFileSync(world.simState, "Booted");
+  idbControl(world, "freeze", null);
+  const bootedAt = Date.now();
+  await waitFor(() => idbEventsNow(world).filter((event) => event.type === "start").length === 2, 8000, "the stream restart");
+  await tab.next((message) => message.json?.t === "state" && message.json.session === "streaming" &&
+    tab.messages.indexOf(message) > tab.messages.findIndex((item) => item.json?.session === "restarting"), 5000);
+  assert.ok(Date.now() - bootedAt < 5000, "the picture took more than 5 s to resume after Booted");
+  const events = idbEventsNow(world);
+  assert.deepEqual(events.filter((event) => ["start", "stop"].includes(event.type)).map((event) => `${event.type} ${event.call}`),
+    ["start 1", "stop 1", "start 2"]);
+  assert.equal(new Set(events.filter((event) => event.type === "start").map((event) => event.pid)).size, 1);
+  assert.equal(events.filter((event) => event.type === "spawn").length, 1);
+  assert.equal((await status(canvas)).idb.companion_pid, pid);
+  await stopCanvas(canvas);
+});
+
+test("ios: without idb_companion auto falls back to screencap and says why; --transport idb then refuses to start, and Android refuses idb", async (t) => {
+  const { world, canvas, auth } = await iosCanvas(t, { companion: false });
+  const body = await status(canvas);
+  assert.equal(body.transport, "screencap");
+  assert.match(body.fallback_reason, /idb_companion was not found/);
+  assert.equal(body.idb, null);
+  const refused = await openSocket(canvas.port, `/ws/video?csrf=${encodeURIComponent(auth.csrf)}`, {
+    headers: { Cookie: auth.cookie, Origin: canvas.origin },
+  });
+  assert.equal(refused.status, 409);
+  assert.match(refused.body, /The idb transport is not active on this Canvas/);
+  await stopCanvas(canvas);
+
+  // The refusals are the CLI's JSON error objects with exit code 2, as `autonom canvas
+  // serve` prints them when it refuses first.
+  const refusal = (result) => {
+    assert.equal(result.code, 2, result.stderr);
+    return JSON.parse(result.stderr.trim().split("\n").at(-1));
+  };
+  const idbArgs = ["--platform", "ios", "--target", IOS_UDID, "--simctl", world.xcrun, "--transport", "idb"];
+  // AUTONOM_IDB_COMPANION is the remote companion of idb calls: neither a host:port nor a
+  // file path there is the Canvas's binary.
+  for (const remote of [null, "mac-farm-01:10882", world.companion]) {
+    const env = remote ? { ...world.env, AUTONOM_IDB_COMPANION: remote } : world.env;
+    const explicit = refusal(await startCanvas({ ...world, env }, idbArgs, { expectExit: true }));
+    assert.deepEqual(explicit, {
+      ok: false,
+      error_code: "tool_missing",
+      error: "--transport idb is unavailable: idb_companion was not found (--idb-companion, AUTONOM_IDB_COMPANION_BIN or PATH)",
+      hint: "Install it with `brew install facebook/fb/idb-companion`, set AUTONOM_IDB_COMPANION_BIN to its path, " +
+        "or pass --idb-companion PATH.",
+      tool: "idb_companion",
+      capability: "canvas.idb",
+    }, String(remote));
+  }
+  const badVariable = refusal(await startCanvas({ ...world, env: { ...world.env, AUTONOM_IDB_COMPANION_BIN: world.directory } },
+    idbArgs, { expectExit: true }));
+  assert.equal(badVariable.error_code, "tool_missing");
+  assert.equal(badVariable.error,
+    `--transport idb is unavailable: AUTONOM_IDB_COMPANION_BIN is not an executable file: ${world.directory}`);
+  for (const args of [["--transport", "idb"], ["--idb-companion", world.companion]]) {
+    const android = refusal(await startCanvas(world, args, { expectExit: true }));
+    assert.deepEqual([android.error_code, android.capability, android.error],
+      ["unsupported_on_platform", "canvas.idb", "the idb transport mirrors iOS Simulators only"]);
+  }
+
+  // AUTONOM_IDB_COMPANION_BIN or --idb-companion selects it, the flag first; a set
+  // AUTONOM_IDB_COMPANION is left alone.
+  for (const [extra, env, source] of [
+    [[], { AUTONOM_IDB_COMPANION_BIN: world.companion, AUTONOM_IDB_COMPANION: "mac-farm-01:10882" }, "AUTONOM_IDB_COMPANION_BIN"],
+    [["--idb-companion", world.companion], { AUTONOM_IDB_COMPANION_BIN: world.directory }, "--idb-companion"],
+  ]) {
+    const configured = await startCanvas({ ...world, env: { ...world.env, ...env } },
+      ["--platform", "ios", "--target", IOS_UDID, "--simctl", world.xcrun, ...extra]);
+    const configuredStatus = await status(configured);
+    assert.equal(configuredStatus.transport, "idb");
+    assert.equal(configuredStatus.idb.source, source);
+    assert.equal(configuredStatus.idb.companion_path, world.companion);
+    await stopCanvas(configured);
+  }
+  for (const remote of ["mac-farm-01:10882", world.companion]) {
+    const ignored = await startCanvas({ ...world, env: { ...world.env, AUTONOM_IDB_COMPANION: remote } },
+      ["--platform", "ios", "--target", IOS_UDID, "--simctl", world.xcrun]);
+    assert.equal((await status(ignored)).transport, "screencap", remote);
+    await stopCanvas(ignored);
+  }
+  for (const path of [join(world.directory, "nothing-here"), world.directory]) {
+    const missing = await startCanvas(world, ["--platform", "ios", "--target", IOS_UDID, "--simctl", world.xcrun,
+      "--idb-companion", path]);
+    const missingStatus = await status(missing);
+    assert.equal(missingStatus.transport, "screencap", path);
+    assert.equal(missingStatus.fallback_reason, `--idb-companion is not an executable file: ${path}`);
+    await stopCanvas(missing);
+  }
+});
+
+test("ios: a companion that cannot start falls back to screencap once, closes the sockets and names the reason", async (t) => {
+  const { world, canvas, auth } = await iosCanvas(t, { env: { FAKE_IDB_MODE: "crash" } });
+  const tab = await pageSocket(canvas, auth, "/ws/video");
+  const code = await tab.closed;
+  assert.equal(code, 1000);
+  const body = await status(canvas);
+  assert.equal(body.transport, "screencap");
+  assert.match(body.fallback_reason, /^idb failed to start: idb_companion exited before it was ready/);
+  assert.match(body.fallback_reason, /cannot find target/);
+  await sleep(1500);
+  assert.equal(idbEventsNow(world).filter((event) => event.type === "spawn").length, 1, "the companion was retried after the fallback");
+  await stopCanvas(canvas);
+});
+
+test("ios: a held finger moves live with repeated DOWN then UP in logical points; a second pointer is refused while the first keeps working; one gesture record names idb", async (t) => {
+  const { world, canvas, control } = await iosControl(t);
+  control.send({ t: "touch", a: "down", id: 1, x: 0.5, y: 0.5 });
+  control.send({ t: "touch", a: "move", id: 1, x: 0.5, y: 0.4 });
+  const refusal = control.reply((message) => message.t === "error" && message.for === "touch");
+  control.send({ t: "touch", a: "down", id: 2, x: 0.1, y: 0.1 });
+  assert.match((await refusal).message, /one finger at a time/);
+  // Its moves and up are ignored without more errors.
+  control.send({ t: "touch", a: "move", id: 2, x: 0.2, y: 0.2 });
+  control.send({ t: "touch", a: "up", id: 2, x: 0.2, y: 0.2 });
+  control.send({ t: "touch", a: "move", id: 1, x: 0.5, y: 0.3 });
+  control.send({ t: "touch", a: "up", id: 1, x: 0.5, y: 0.25 });
+  await allHandled(control);
+  assert.deepEqual(await hidAtLeast(world, 4), [
+    touchAt("down", 201, 437), touchAt("down", 201, 349.6), touchAt("down", 201, 262.2), touchAt("up", 201, 218.5),
+  ]);
+  assert.equal(control.json("error").length, 1, "the refused pointer's moves were answered");
+  await waitFor(async () => (await journaled(world, "gesture")).length === 1, 5000, "the gesture record");
+  const [record] = await journaled(world, "gesture");
+  assert.equal(record.origin, "human");
+  assert.equal(record.payload.transport, "idb");
+  assert.equal(record.payload.pointers, 1);
+  assert.equal(record.payload.moves, 2);
+  // Journal points are on the screen the companion described (402x874 points), as the bridge
+  // measures iOS screens, and no bridge screen-size call (an accessibility dump) was needed.
+  assert.deepEqual(record.payload.start, [201, 437]);
+  assert.deepEqual(record.payload.end, [201, 219]);
+  assert.deepEqual((await status(canvas)).display, { width: 402, height: 874 });
+  assert.equal((await bridgeCalls(world, "screen-size")).length, 0, "the bridge measured the screen while streaming");
+  await stopCanvas(canvas);
+});
+
+test("ios: the wheel is a short synthetic drag lifted once the wheel is still, Home and Power press HOME and LOCK, text goes through the bridge, and Android-only input is refused", async (t) => {
+  const { world, canvas, control } = await iosControl(t);
+  // Wheel down twice: the finger goes down at the pointer and moves up 24 points per step.
+  control.send({ t: "scroll", x: 0.5, y: 0.5, dx: 0, dy: -1 });
+  control.send({ t: "scroll", x: 0.5, y: 0.5, dx: 0, dy: -1 });
+  await allHandled(control);
+  assert.deepEqual(await hidAtLeast(world, 4), [
+    touchAt("down", 201, 437), touchAt("down", 201, 413), touchAt("down", 201, 389), touchAt("up", 201, 389),
+  ]);
+  control.send({ t: "system", op: "home" });
+  control.send({ t: "system", op: "power" });
+  await allHandled(control);
+  assert.deepEqual((await hidAtLeast(world, 8)).slice(4), [
+    { button: "HOME", direction: "down" }, { button: "HOME", direction: "up" },
+    { button: "LOCK", direction: "down" }, { button: "LOCK", direction: "up" },
+  ]);
+  control.send({ t: "text", text: "wifi" });
+  control.send({ t: "text", text: "s3cret", sensitive: true });
+  await waitFor(async () => (await bridgeCalls(world, "text")).length === 2, 5000, "the bridge text calls");
+  const texts = await bridgeCalls(world, "text");
+  assert.deepEqual(texts.map((call) => call.payload), [
+    { text: "wifi", sensitive: false, transport: "idb" }, { text: "s3cret", sensitive: true, transport: "idb" }]);
+  assert.deepEqual(texts.map((call) => call.origin), ["human", "human"]);
+  for (const [message, pattern] of [
+    [{ t: "key", a: "down", code: 66 }, /Android keycodes have no iOS Simulator equivalent/],
+    [{ t: "paste", text: "x" }, /no clipboard paste/],
+    [{ t: "clipboard-get" }, /clipboard is not available/],
+    [{ t: "system", op: "back" }, /back is not available on the iOS Simulator/],
+    [{ t: "system", op: "volume-up" }, /volume-up is not available/],
+    [{ t: "display", preset: "tablet" }, /Display presets are Android-only/],
+  ]) {
+    const answer = control.reply((reply) => reply.t === "error");
+    control.send(message);
+    assert.match((await answer).message, pattern, JSON.stringify(message));
+  }
+  await allHandled(control);
+  assert.equal(hidEvents(world).length, 8, "refused input reached the HID stream");
+  await waitFor(async () => (await journaled(world)).length === 3, 5000, "the records");
+  assert.deepEqual((await journaled(world)).map((record) => [record.payload.kind, record.payload.transport,
+    record.payload.op ?? record.payload.events]), [["scroll", "idb", 2], ["system", "idb", "home"], ["system", "idb", "power"]]);
+  const scroll = (await journaled(world, "scroll"))[0].payload;
+  assert.deepEqual([scroll.dx, scroll.dy], [0, -2]);
+  await stopCanvas(canvas);
+});
+
+/**
+ * Split HID touch events into drags (DOWN ... UP) and check none could be a tap: each moves
+ * past the iOS tap slop (about 10 points) from where it went down, and stays on the screen.
+ */
+function assertNoWheelTap(events, size = IOS_POINTS) {
+  let drag = null;
+  for (const event of events) {
+    assert.ok(event.touch, `not a touch: ${JSON.stringify(event)}`);
+    const { x, y } = event.touch;
+    assert.ok(x >= 2 && x <= size.width - 2 && y >= 2 && y <= size.height - 2, `a wheel point left the screen: ${JSON.stringify(event)}`);
+    if (!drag) {
+      assert.equal(event.direction, "down", "an UP without a DOWN");
+      drag = { start: event.touch, far: 0 };
+    }
+    drag.far = Math.max(drag.far, Math.hypot(x - drag.start.x, y - drag.start.y));
+    if (event.direction === "up") {
+      assert.ok(drag.far >= 16, `a wheel drag moved only ${drag.far} points, which iOS takes for a tap`);
+      drag = null;
+    }
+  }
+  assert.equal(drag, null, "a wheel drag was left down");
+}
+
+test("ios: the wheel never taps: tiny deltas still move past the tap slop, a pointer near an edge drags from an anchor inside the screen, the edge starts the drag over, and it waits while a finger is down", async (t) => {
+  const { world, canvas, control } = await iosControl(t);
+  control.send({ t: "touch", a: "down", id: 7, x: 0.5, y: 0.5 });
+  const wait = control.reply((message) => message.t === "error" && message.for === "scroll");
+  control.send({ t: "scroll", x: 0.5, y: 0.5, dx: 0, dy: -1 });
+  assert.match((await wait).message, /A finger is down/);
+  control.send({ t: "touch", a: "up", id: 7, x: 0.5, y: 0.5 });
+  await allHandled(control);
+  await hidAtLeast(world, 2);
+  let records = 0;
+  // One burst: its events, then its scroll record, which waits in the input queue behind its UP.
+  const burst = async (messages, expected) => {
+    const from = hidEvents(world).length;
+    for (const message of messages) control.send({ t: "scroll", dx: 0, dy: 0, ...message });
+    await allHandled(control);
+    records += 1;
+    await waitFor(async () => (await journaled(world, "scroll")).length === records, 5000, `scroll record ${records}`);
+    const events = (await hidAtLeast(world, from + expected.length)).slice(from);
+    assert.deepEqual(events, expected, JSON.stringify(messages));
+    assertNoWheelTap(events);
+  };
+  // A gentle trackpad (3 px, 0.72 points): the first move still goes 16 points, then the
+  // finger follows the deltas.
+  await burst([{ x: 0.5, y: 0.5, dy: -0.03 }, { x: 0.5, y: 0.5, dy: -0.03 }], [
+    touchAt("down", 201, 437), touchAt("down", 201, 421), touchAt("down", 201, 420.28), touchAt("up", 201, 420.28),
+  ]);
+  // A pointer 13 points from the top: the drag starts 32 points inside, lifts at the edge
+  // (2 points inside) and starts over from there for each step.
+  await burst([{ x: 0.5, y: 13 / 874, dy: -1 }, { x: 0.5, y: 13 / 874, dy: -1 }, { x: 0.5, y: 13 / 874, dy: -1 }], [
+    touchAt("down", 201, 32), touchAt("down", 201, 8),
+    touchAt("down", 201, 2), touchAt("up", 201, 2), touchAt("down", 201, 32), touchAt("down", 201, 8),
+    touchAt("down", 201, 2), touchAt("up", 201, 2), touchAt("down", 201, 32), touchAt("down", 201, 8),
+    touchAt("up", 201, 8),
+  ]);
+  // In the edge strip itself, sideways and at the bottom: the same, from the anchor inside.
+  await burst([{ x: 0.002, y: 0.5, dx: 1 }], [touchAt("down", 32, 437), touchAt("down", 8, 437), touchAt("up", 8, 437)]);
+  await burst([{ x: 0.5, y: 0.999, dy: 1 }], [touchAt("down", 201, 842), touchAt("down", 201, 866), touchAt("up", 201, 866)]);
+  // A flick (16 steps, 384 points) from a row drags to the edge, never taps the row.
+  await burst([{ x: 0.5, y: 0.3, dy: -16 }], [touchAt("down", 201, 262.2), touchAt("down", 201, 2), touchAt("up", 201, 2)]);
+  // A burst that does not move (no delta) sends nothing, yet it is one scroll record.
+  const before = hidEvents(world).length;
+  await burst([{ x: 0.5, y: 0.5 }], []);
+  await sleep(200);
+  assert.equal(hidEvents(world).length, before, "a wheel event without a delta reached the Simulator");
+  assertNoWheelTap(hidEvents(world).slice(2));
+  await stopCanvas(canvas);
+});
+
+test("ios: rotation is reported in state messages and /status, and touches map to rotated logical points", async (t) => {
+  const { world, canvas, control } = await iosControl(t);
+  control.send({ t: "touch", a: "down", id: 1, x: 0.5, y: 0.5 });
+  await allHandled(control);
+  idbControl(world, "orientation", "LANDSCAPE_LEFT");
+  const state = await control.until((message) => message.t === "state" && message.orientation === "LANDSCAPE_LEFT", 5000);
+  assert.equal(state.rotation, 270);
+  // The finger down in portrait was lifted by the rotation, and its moves are refused.
+  const refused = control.reply((message) => message.t === "error" && message.for === "touch");
+  control.send({ t: "touch", a: "move", id: 1, x: 0.5, y: 0.4 });
+  assert.match((await refused).message, /was lifted because the Simulator rotated/);
+  control.send({ t: "touch", a: "down", id: 2, x: 0.5, y: 0.25 });
+  control.send({ t: "touch", a: "up", id: 2, x: 1, y: 1 });
+  await allHandled(control);
+  // HID writes are not awaited by the server, so the fake companion may log them a moment later.
+  assert.deepEqual(await hidAtLeast(world, 4), [
+    touchAt("down", 201, 437), touchAt("up", 201, 437), touchAt("down", 437, 100.5), touchAt("up", 874, 402),
+  ]);
+  const body = await status(canvas);
+  assert.equal(body.idb.orientation, "LANDSCAPE_LEFT");
+  assert.equal(body.idb.rotation, 270);
+  idbControl(world, "orientation", "LANDSCAPE_RIGHT");
+  assert.equal((await control.until((message) => message.t === "state" && message.orientation === "LANDSCAPE_RIGHT", 5000)).rotation, 90);
+  idbControl(world, "orientation", "PORTRAIT_UPSIDE_DOWN");
+  assert.equal((await control.until((message) => message.t === "state" && message.orientation === "PORTRAIT_UPSIDE_DOWN", 5000)).rotation, 180);
+  // Face up keeps the orientation the screen is drawn in.
+  idbControl(world, "orientation", "UNKNOWN");
+  await sleep(1500);
+  assert.equal((await status(canvas)).idb.orientation, "PORTRAIT_UPSIDE_DOWN");
+  await stopCanvas(canvas);
+});
+
+test("ios: a takeover lifts the human finger on the Simulator and refuses human input; pause refuses everyone; nothing refused reaches the HID stream", async (t) => {
+  const { world, canvas, control } = await iosControl(t);
+  const agent = await openSocket(canvas.port, `/ws/control?token=${TOKEN}&origin=agent`);
+  assert.equal(agent.status, 101);
+  control.send({ t: "touch", a: "down", id: 1, x: 0.5, y: 0.5 });
+  control.send({ t: "touch", a: "move", id: 1, x: 0.5, y: 0.45 });
+  await allHandled(control);
+  agent.ws.send({ t: "control", mode: "takeover" });
+  await allHandled(agent.ws);
+  await hidAtLeast(world, 3);
+  assert.deepEqual(hidEvents(world).at(-1), touchAt("up", 201, 393.3), "the takeover did not lift the finger");
+  const before = hidEvents(world).length;
+  for (const message of [{ t: "touch", a: "move", id: 1, x: 0.5, y: 0.4 }, { t: "touch", a: "down", id: 3, x: 0.2, y: 0.2 },
+    { t: "scroll", x: 0.5, y: 0.5, dx: 0, dy: 1 }, { t: "system", op: "home" }, { t: "text", text: "no" }]) {
+    const answer = control.reply((reply) => reply.t === "error");
+    control.send(message);
+    assert.equal((await answer).message, "Canvas control is owned by agent", JSON.stringify(message));
+  }
+  // The agent's input goes through.
+  agent.ws.send({ t: "system", op: "home" });
+  await allHandled(agent.ws);
+  await hidAtLeast(world, before + 2);
+  agent.ws.send({ t: "control", mode: "pause" });
+  await allHandled(agent.ws);
+  const paused = agent.ws.reply((reply) => reply.t === "error");
+  agent.ws.send({ t: "system", op: "power" });
+  assert.equal((await paused).message, "Canvas input is paused");
+  await sleep(200);
+  assert.equal(hidEvents(world).length, before + 2, "refused input reached the HID stream");
+  assert.equal((await bridgeCalls(world, "text")).length, 0);
+  // The takeover ends the human gesture and is journaled itself; pause is one more control record.
+  await waitFor(async () => (await journaled(world)).length === 4, 5000, "the records");
+  const kinds = (await journaled(world)).map((record) => `${record.origin} ${record.payload.kind} ${record.payload.transport}`).sort();
+  assert.deepEqual(kinds, ["agent control idb", "agent control idb", "agent system idb", "human gesture idb"]);
+  await stopCanvas(canvas);
+});
+
+/** Bridge input (text) waits while the hold is on: input that is still being typed. */
+function holdBridgeInput(world, on) {
+  const path = `${world.bridgeLog}.input-hold`;
+  if (on) writeFileSync(path, "");
+  else rmSync(path, { force: true });
+}
+
+/** Only the text `text` waits at the bridge while this hold is on. */
+function holdBridgeText(world, text, on) {
+  const path = `${world.bridgeLog}.input-hold.${text}`;
+  if (on) writeFileSync(path, "");
+  else rmSync(path, { force: true });
+}
+
+test("ios: touches, Home and their records sent after text wait until the bridge has typed it, as one device socket keeps the order on Android", async (t) => {
+  const { world, canvas, control } = await iosControl(t);
+  holdBridgeInput(world, true);
+  control.send({ t: "text", text: "wifi" });
+  control.send({ t: "touch", a: "down", id: 1, x: 0.5, y: 0.5 });
+  control.send({ t: "touch", a: "up", id: 1, x: 0.5, y: 0.5 });
+  control.send({ t: "system", op: "home" });
+  control.send({ t: "scroll", x: 0.5, y: 0.5, dx: 0, dy: -1 });
+  await allHandled(control);
+  await waitFor(async () => (await bridgeCalls(world, "text")).length === 1, 5000, "the text call");
+  // The text is still being typed: nothing sent after it may reach the Simulator, however
+  // long it takes.
+  await sleep(300);
+  assert.deepEqual(hidEvents(world), [], "input sent after the text reached the Simulator before the text was typed");
+  assert.deepEqual((await journaled(world)).length, 0, "a record of input sent after the text came before it");
+  holdBridgeInput(world, false);
+  assert.deepEqual(await hidAtLeast(world, 7), [
+    touchAt("down", 201, 437), touchAt("up", 201, 437), { button: "HOME", direction: "down" }, { button: "HOME", direction: "up" },
+    touchAt("down", 201, 437), touchAt("down", 201, 413), touchAt("up", 201, 413),
+  ]);
+  await waitFor(async () => (await journaled(world)).length === 3, 5000, "the records");
+  const order = (await bridgeCalls(world)).filter((call) => call.op === "text" || call.op === "record")
+    .map((call) => (call.op === "text" ? "text" : call.payload.kind));
+  assert.deepEqual(order, ["text", "gesture", "system", "scroll"]);
+  assert.equal(control.json("error").length, 0);
+  await stopCanvas(canvas);
+});
+
+test("ios: input queued behind text when a takeover comes is neither typed nor sent nor journaled, each text says why, and the finger held down before it is lifted in order", async (t) => {
+  const { world, canvas, control } = await iosControl(t);
+  const agent = await openSocket(canvas.port, `/ws/control?token=${TOKEN}&origin=agent`);
+  assert.equal(agent.status, 101);
+  // A finger down before the text reaches the Simulator at once.
+  control.send({ t: "touch", a: "down", id: 1, x: 0.5, y: 0.5 });
+  await allHandled(control);
+  assert.deepEqual(await hidAtLeast(world, 1), [touchAt("down", 201, 437)]);
+  holdBridgeInput(world, true);
+  for (const text of ["w", "i", "f", "i"]) control.send({ t: "text", text });
+  control.send({ t: "touch", a: "move", id: 1, x: 0.5, y: 0.4 });
+  control.send({ t: "system", op: "home" });
+  await allHandled(control);
+  await waitFor(async () => (await bridgeCalls(world, "text")).length === 1, 5000, "the first text call");
+  agent.ws.send({ t: "control", mode: "takeover" });
+  await allHandled(agent.ws);
+  // The agent's input waits behind the human's and goes through.
+  agent.ws.send({ t: "system", op: "power" });
+  await allHandled(agent.ws);
+  await sleep(200);
+  assert.deepEqual(hidEvents(world), [touchAt("down", 201, 437)], "input reached the Simulator while text was being typed");
+  holdBridgeInput(world, false);
+  const textErrors = () => control.json("error").filter((message) => message.for === "text");
+  await waitFor(() => textErrors().length === 3, 5000, "a refusal for each text not typed yet");
+  for (const message of textErrors()) assert.equal(message.message, "Canvas control is owned by agent");
+  // The move and Home queued before the takeover are dropped; the takeover's UP lifts the
+  // finger where the Simulator has it, then the agent's Power goes out.
+  assert.deepEqual(await hidAtLeast(world, 4), [
+    touchAt("down", 201, 437), touchAt("up", 201, 437), { button: "LOCK", direction: "down" }, { button: "LOCK", direction: "up" },
+  ]);
+  await waitFor(async () => (await journaled(world)).length === 3, 5000, "the records");
+  await sleep(300);
+  assert.equal(hidEvents(world).length, 4, "human input sent before the takeover reached the Simulator after it");
+  assert.equal((await bridgeCalls(world, "text")).length, 1, "text refused by its turn was typed");
+  // Home never reached the Simulator, so it is not journaled, although the finger's DOWN was
+  // written for the same connection; the finger's gesture is.
+  assert.deepEqual((await journaled(world)).map((record) => `${record.origin} ${record.payload.kind}`),
+    ["agent control", "human gesture", "agent system"]);
+  await stopCanvas(canvas);
+});
+
+test("ios: a finger whose UP still waits behind text when the companion dies is lifted through the next companion, and the stale UP is not sent", async (t) => {
+  const { world, canvas, control } = await iosControl(t);
+  control.send({ t: "touch", a: "down", id: 1, x: 0.5, y: 0.5 });
+  await allHandled(control);
+  await hidAtLeast(world, 1);
+  holdBridgeInput(world, true);
+  control.send({ t: "text", text: "wifi" });
+  control.send({ t: "touch", a: "up", id: 1, x: 0.5, y: 0.5 });
+  await allHandled(control);
+  await waitFor(async () => (await bridgeCalls(world, "text")).length === 1, 5000, "the text call");
+  const pid = (await status(canvas)).idb.companion_pid;
+  process.kill(pid, "SIGKILL");
+  await control.until((message) => message.t === "state" && message.session === "restarting", 5000);
+  await control.until((message) => message.t === "state" && message.session === "streaming", 10_000);
+  const next = (await status(canvas)).idb.companion_pid;
+  assert.notEqual(next, pid);
+  holdBridgeInput(world, false);
+  await waitFor(() => idbEventsNow(world).filter((event) => event.type === "hid").length >= 2, 5000, "the orphan UP");
+  await waitFor(async () => (await journaled(world, "gesture")).length === 1, 5000, "the gesture record");
+  await sleep(300);
+  assert.deepEqual(idbEventsNow(world).filter((event) => event.type === "hid").map((event) => [event.pid, event.event]), [
+    [pid, touchAt("down", 201, 437)], [next, touchAt("up", 201, 437)],
+  ]);
+  // Input after it goes to the new companion as before.
+  control.send({ t: "touch", a: "down", id: 2, x: 0.25, y: 0.25 });
+  control.send({ t: "touch", a: "up", id: 2, x: 0.25, y: 0.25 });
+  await allHandled(control);
+  assert.deepEqual((await hidAtLeast(world, 4)).slice(2), [touchAt("down", 100.5, 218.5), touchAt("up", 100.5, 218.5)]);
+  await stopCanvas(canvas);
+});
+
+test("ios: a tap and Home queued behind text when the companion dies never reach a companion and are not journaled", async (t) => {
+  const { world, canvas, control } = await iosControl(t);
+  holdBridgeInput(world, true);
+  control.send({ t: "text", text: "wifi" });
+  control.send({ t: "touch", a: "down", id: 1, x: 0.5, y: 0.5 });
+  control.send({ t: "touch", a: "up", id: 1, x: 0.5, y: 0.5 });
+  control.send({ t: "system", op: "home" });
+  await allHandled(control);
+  await waitFor(async () => (await bridgeCalls(world, "text")).length === 1, 5000, "the text call");
+  const pid = (await status(canvas)).idb.companion_pid;
+  process.kill(pid, "SIGKILL");
+  await control.until((message) => message.t === "state" && message.session === "restarting", 5000);
+  await control.until((message) => message.t === "state" && message.session === "streaming", 10_000);
+  assert.notEqual((await status(canvas)).idb.companion_pid, pid);
+  holdBridgeInput(world, false);
+  // Input sent after the tap and Home goes out and is journaled: everything before it ran.
+  control.send({ t: "system", op: "power" });
+  await allHandled(control);
+  assert.deepEqual(await hidAtLeast(world, 2), [{ button: "LOCK", direction: "down" }, { button: "LOCK", direction: "up" }]);
+  await waitFor(async () => (await journaled(world)).length >= 1, 5000, "the power record");
+  await sleep(300);
+  assert.equal(hidEvents(world).length, 2, "input of the lost companion reached the next one");
+  assert.deepEqual((await journaled(world)).map((record) => `${record.payload.kind} ${record.payload.op ?? ""}`.trim()),
+    ["system power"], "an action that never reached a companion was journaled");
+  await stopCanvas(canvas);
+});
+
+test("ios: once a takeover refuses a gesture's DOWN, its queued move and UP are dropped after the release, and the gesture is not journaled", async (t) => {
+  const { world, canvas, control } = await iosControl(t);
+  const agent = await openSocket(canvas.port, `/ws/control?token=${TOKEN}&origin=agent`);
+  assert.equal(agent.status, 101);
+  holdBridgeText(world, "a", true);
+  holdBridgeText(world, "b", true);
+  control.send({ t: "text", text: "a" });
+  await allHandled(control);
+  await waitFor(async () => (await bridgeCalls(world, "text")).length === 1, 5000, "the human text call");
+  control.send({ t: "touch", a: "down", id: 1, x: 0.5, y: 0.5 });
+  await allHandled(control);
+  // The agent's text waits between the human's DOWN and the rest of the gesture.
+  agent.ws.send({ t: "text", text: "b" });
+  await allHandled(agent.ws);
+  control.send({ t: "touch", a: "move", id: 1, x: 0.5, y: 0.4 });
+  control.send({ t: "touch", a: "up", id: 1, x: 0.5, y: 0.4 });
+  await allHandled(control);
+  agent.ws.send({ t: "control", mode: "takeover" });
+  await allHandled(agent.ws);
+  // The human text ends; the DOWN's turn comes under the takeover and is refused; the agent's
+  // text is being typed.
+  holdBridgeText(world, "a", false);
+  await waitFor(async () => (await bridgeCalls(world, "text")).length === 2, 5000, "the agent text call");
+  agent.ws.send({ t: "control", mode: "release" });
+  await allHandled(agent.ws);
+  holdBridgeText(world, "b", false);
+  // Input after the gesture goes out: everything before it ran.
+  control.send({ t: "system", op: "home" });
+  await allHandled(control);
+  assert.deepEqual(await hidAtLeast(world, 2), [{ button: "HOME", direction: "down" }, { button: "HOME", direction: "up" }],
+    "the move of a refused DOWN pressed where the user never pressed");
+  await waitFor(async () => (await journaled(world, "system")).length === 1, 5000, "the home record");
+  await sleep(300);
+  assert.equal(hidEvents(world).length, 2);
+  assert.equal((await journaled(world, "gesture")).length, 0, "a gesture that never reached the Simulator was journaled");
+  assert.deepEqual((await journaled(world)).map((record) => `${record.origin} ${record.payload.kind}`),
+    ["agent control", "agent control", "human system"]);
+  await stopCanvas(canvas);
+});
+
+test("ios: the page uses WebCodecs and the control socket on idb, turns the canvas for landscape, sends Home and Power, one finger only, and typed characters as text", async (t) => {
+  const world = await iosWorld(t);
+  const canvas = await startCanvas(world, ["--platform", "ios", "--target", IOS_UDID, "--simctl", world.xcrun]);
+  const html = await (await fetch(`${canvas.origin}/`)).text();
+  await stopCanvas(canvas);
+  const { sandbox, sent, run, document } = runPage(html);
+  run("view.transport=\"idb\";view.mode=\"webcodecs\";");
+  assert.equal(run("fastActive()&&iosFast()&&!scrcpyActive()"), true);
+  run("applyTransport()");
+  assert.match(document.getElementById("text-hint").textContent, /Typed into the Simulator/);
+  // Home and Power go over the control socket as system actions.
+  const dock = document.elements.filter((element) => element.parent?.tagName === "NAV" && element.tagName === "BUTTON");
+  const byLabel = (label) => dock.find((element) => element.getAttribute("aria-label") === label);
+  for (const label of ["Home", "Power"]) assert.equal(byLabel(label).hidden, false, `${label} is hidden`);
+  for (const label of ["Back", "Recent apps", "Rotate", "Volume down", "Volume up"]) assert.equal(byLabel(label).hidden, true, `${label} shows`);
+  byLabel("Home").click();
+  byLabel("Power").click();
+  assert.deepEqual(sent, [{ t: "system", op: "home" }, { t: "system", op: "power" }]);
+  // A landscape Simulator: the canvas holds the portrait picture turned upright.
+  run("setVideoSize(1206,2622)");
+  assert.deepEqual(JSON.parse(run("JSON.stringify([video.width,video.height])")), [1206, 2622]);
+  run("applyState({t:\"state\",owner:\"shared\",paused:false,session:\"streaming\",clients:{video:1,control:1},transport:\"idb\",orientation:\"LANDSCAPE_LEFT\",rotation:270,width:1206,height:2622})");
+  assert.deepEqual(JSON.parse(run("JSON.stringify([video.width,video.height,rotation])")), [2622, 1206, 270]);
+  run("setRotation(0)");
+  assert.deepEqual(JSON.parse(run("JSON.stringify([video.width,video.height])")), [1206, 2622]);
+  // One finger at a time, and no mirrored pinch finger.
+  sent.length = 0;
+  const surfaceRect = { left: 0, top: 0, width: 1206, height: 2622 };
+  run("video.getBoundingClientRect=()=>(" + JSON.stringify(surfaceRect) + ");video.setPointerCapture=()=>{};");
+  const pointer = (pointerId, extra = {}) => ({ pointerId, pointerType: "mouse", button: 0, clientX: 603, clientY: 1311,
+    pressure: 0.5, ctrlKey: true, preventDefault() {}, ...extra });
+  sandbox.onPointerDown(pointer(1));
+  sandbox.onPointerDown(pointer(2, { pointerType: "touch" }));
+  sandbox.onPointerEnd(pointer(1), "up");
+  assert.deepEqual(sent.map((message) => `${message.t} ${message.a} ${message.id}`), ["touch down 1", "touch up 1"]);
+  assert.match(run("view.note"), /one finger at a time/);
+  // Typed characters on the screen become text; shortcuts and keys without a character do not.
+  sent.length = 0;
+  const key = (code, value, extra = {}) => ({ code, key: value, repeat: false, shiftKey: false, ctrlKey: false,
+    altKey: false, metaKey: false, preventDefault() {}, ...extra });
+  sandbox.onKeyDown(key("KeyA", "a"));
+  sandbox.onKeyDown(key("KeyQ", "\u0439"));
+  sandbox.onKeyDown(key("KeyC", "c", { metaKey: true }));
+  sandbox.onKeyDown(key("Enter", "Enter"));
+  assert.deepEqual(sent, [{ t: "text", text: "a" }, { t: "text", text: "\u0439" }]);
+  // The text box and a paste send text of at most 300 bytes.
+  sent.length = 0;
+  run("textInput.value=\"hello\"");
+  await run("sendText()");
+  run(`textInput.value=${JSON.stringify("x".repeat(301))}`);
+  await run("sendText()");
+  assert.deepEqual(sent, [{ t: "text", text: "hello" }]);
+  assert.equal(run("textInput.value.length"), 301, "the text box lost text it did not send");
+  sandbox.onPaste({ clipboardData: { getData: () => "pasted" }, preventDefault() {} });
+  assert.deepEqual(sent.at(-1), { t: "text", text: "pasted" });
+  run("render()");
+  assert.equal(document.getElementById("stream-transport").textContent, "idb · WebCodecs");
+  assert.equal(run("transportLabel()"), "idb (webcodecs)");
+  assert.equal(run("window.autonomCanvas.stats().rotation"), 0);
+  // Without VideoDecoder (as in this sandbox) the idb page shows the multipart picture and keeps
+  // its input on the control socket.
+  run("view.mode=null;applyTransport()");
+  assert.equal(run("view.mode"), "multipart");
+  assert.equal(run("view.reason"), "VideoDecoder is not available in this browser");
+  assert.equal(run("transportLabel()"), "idb (multipart: VideoDecoder is not available in this browser)");
+  assert.equal(run("controlSocket!==null"), true);
+});
+
+test("ios: the page shows decoded frames in order on idb with at most two waiting, and scrcpy keeps only the newest", async (t) => {
+  const world = await iosWorld(t);
+  const canvas = await startCanvas(world, ["--platform", "ios", "--target", IOS_UDID, "--simctl", world.xcrun]);
+  const html = await (await fetch(`${canvas.origin}/`)).text();
+  await stopCanvas(canvas);
+  const { sandbox, run } = runPage(html);
+  const frames = [];
+  const animationFrames = [];
+  const drawn = [];
+  sandbox.frame = (id) => {
+    const made = { id, displayWidth: 1206, displayHeight: 2622, closed: false, close() { this.closed = true; } };
+    frames.push(made);
+    return made;
+  };
+  sandbox.requestAnimationFrame = (callback) => animationFrames.push(callback);
+  sandbox.drawn = drawn;
+  sandbox.performance = performance;
+  run("ctx.drawImage=(frame)=>drawn.push(frame.id);ctx.setTransform=()=>{};ctx.rotate=()=>{};");
+  const refresh = () => animationFrames.splice(0).forEach((callback) => callback());
+  const counts = () => JSON.parse(run("JSON.stringify([stats.framesDecoded,stats.framesRendered,stats.framesDropped])"));
+  const closed = () => frames.filter((made) => made.closed).map((made) => made.id);
+
+  run("view.transport=\"idb\";view.mode=\"webcodecs\";");
+  // Two frames decoded between two refreshes are both shown, one per refresh, in order.
+  run("onFrame(frame(1));onFrame(frame(2))");
+  assert.equal(animationFrames.length, 1, "one animation frame is asked for at a time");
+  refresh();
+  assert.deepEqual(drawn, [1]);
+  assert.equal(animationFrames.length, 1, "no animation frame was asked for the frame still waiting");
+  refresh();
+  assert.deepEqual(drawn, [1, 2]);
+  assert.equal(animationFrames.length, 0, "an animation frame was asked for with nothing waiting");
+  assert.deepEqual(counts(), [2, 2, 0]);
+  assert.deepEqual(closed(), [1, 2], "a drawn frame was not closed");
+  // A third frame before the refresh: the oldest is closed and counted as dropped.
+  run("onFrame(frame(3));onFrame(frame(4));onFrame(frame(5))");
+  assert.deepEqual(closed(), [1, 2, 3]);
+  assert.equal(run("frameQueue.length"), 2);
+  refresh();
+  refresh();
+  refresh();
+  assert.deepEqual(drawn, [1, 2, 4, 5]);
+  assert.deepEqual(counts(), [5, 4, 1]);
+  assert.equal(run("window.autonomCanvas.stats().framesRendered"), 4);
+  // Frames still waiting are closed when the page leaves WebCodecs.
+  run("onFrame(frame(6));onFrame(frame(7));startMultipart(\"test\")");
+  assert.deepEqual(closed(), [1, 2, 3, 4, 5, 6, 7]);
+  assert.equal(run("frameQueue.length"), 0);
+  refresh();
+  assert.deepEqual(drawn, [1, 2, 4, 5], "a closed frame was drawn");
+
+  // scrcpy (Android) is unchanged: only the newest frame waits and it is drawn on the next refresh.
+  run("view.transport=\"scrcpy\";view.mode=\"webcodecs\";stats.framesDecoded=0;stats.framesRendered=0;stats.framesDropped=0;");
+  drawn.length = 0;
+  run("onFrame(frame(8));onFrame(frame(9))");
+  assert.deepEqual(closed().filter((id) => id >= 8), [8]);
+  assert.equal(run("frameQueue.length"), 0);
+  refresh();
+  assert.deepEqual(drawn, [9]);
+  assert.equal(animationFrames.length, 0);
+  assert.deepEqual(counts(), [2, 1, 1]);
 });
