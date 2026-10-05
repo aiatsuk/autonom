@@ -303,7 +303,7 @@ No flag, code or field is added or removed.
 
 | Surface | Before | Now |
 | --- | --- | --- |
-| `canvas serve --bit-rate` default (scrcpy, idb, screenrecord) | 8000000 | 12000000, so each frame at 60 fps keeps at least the bits it had at about 36 fps; `--bit-rate` still overrides it, and the out-of-range hint says `The default is 12000000.` |
+| `canvas serve --bit-rate` default (scrcpy, idb, screenrecord) | 8000000 | 12000000, so each frame at 60 fps gets about 90% of the bits it had at about 36 fps and 8 Mbit/s (8 Mbit/s would leave 60%); `--bit-rate` still overrides it, and the out-of-range hint says `The default is 12000000.` |
 | scrcpy page presentation | only the newest decoded frame waits for a screen refresh; an earlier one is closed and counted in `framesDropped` | decoded frames are shown in order, at most two waiting, one per refresh; only a third waiting frame is dropped. `framesRendered` rises and `framesDropped` falls for the same stream; latency grows by about 6-13 ms on average |
 | `tests/live/canvas_scrcpy_live.mjs --case bench` | brow, input moves tied to animation frames, scrcpy compared with screencap | Playwright Chromium (headed off screen, `--headless` optional), input from a 16 ms timer; reports device, received, decoded, presented and distinct fps, latency and host load; passes on presented median >= 55 with distinct median >= 45 |
 

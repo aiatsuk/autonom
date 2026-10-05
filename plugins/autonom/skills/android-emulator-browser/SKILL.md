@@ -65,8 +65,8 @@ and idb (otherwise up to 60; scrcpy sends frames only when the screen
 changes). `--max-size` (default 1280) is the longer side of the scrcpy video
 and the width of the MJPEG stream; idb always streams at full resolution.
 `--bit-rate` defaults to 12 Mbit/s (8 Mbit/s before), on idb and screenrecord
-too: at 60 fps each frame keeps at least the bits it had at about 36 fps and
-8 Mbit/s.
+too: at 60 fps each frame gets about 90% of the bits it had at about 36 fps
+and 8 Mbit/s (8 Mbit/s would leave 60%).
 
 ## scrcpy-server
 

@@ -52,8 +52,8 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
   order like the iOS page: at most two wait, one is drawn per screen refresh,
   and only a third waiting frame is dropped (keeping only the newest lost
   10-20% of frames). The default `--bit-rate` is 12 Mbit/s instead of 8
-  (scrcpy, idb and screenrecord), so a frame at 60 fps keeps at least the bits
-  it had at about 36 fps. The `bench` case of
+  (scrcpy, idb and screenrecord), so a frame at 60 fps gets about 90% of the
+  bits it had at about 36 fps and 8 Mbit/s (8 Mbit/s would leave 60%). The `bench` case of
   `tests/live/canvas_scrcpy_live.mjs` now drives the finger from a 16 ms
   timer, measures in headed off-screen Chromium through Playwright
   (`--headless`, `--playwright`, `--seconds`), and reports device-produced,
