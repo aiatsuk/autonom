@@ -483,7 +483,7 @@ Options:
                               and idb on the iOS Simulator when idb_companion is found.
   --fps FPS                   Frame rate cap (default: 15; ${DEFAULT_SCRCPY_MAX_FPS} on scrcpy and idb).
   --max-size PX               Maximum video width (default: 1280).
-  --bit-rate BPS              H.264 bitrate (default: 8000000).
+  --bit-rate BPS              H.264 bitrate (default: 12000000).
   --scrcpy-server PATH        scrcpy-server file to push (default: AUTONOM_SCRCPY_SERVER,
                               SCRCPY_SERVER_PATH, then the server of scrcpy on PATH).
   --scrcpy-version X.Y        Version of --scrcpy-server when its file name does not say.
@@ -4352,7 +4352,7 @@ const ctx=video.getContext("2d");
 let csrf=null,logicalDisplay=null,reconnectTimer=null,pointer=null,displayBusy=false,refocusPicker=false,menuOpen=false,noteAt=0,frameRatio=0,rotation=0;
 const view={transport:null,mode:null,reason:"",status:null,owner:"shared",paused:false,session:"idle",clients:null,width:0,height:0,note:"",rtt:null,preset:null,density:null};
 const stats={decoder:"none",codec:null,framesDecoded:0,framesRendered:0,framesDropped:0,packets:0,bytes:0,errors:0,renderTimes:[],lastFrameAt:0};
-let videoSocket=null,controlSocket=null,decoder=null,config=null,waitingKey=true,pendingFrame=null,drawScheduled=false,configuring=false,pendingChunks=[];
+let videoSocket=null,controlSocket=null,decoder=null,config=null,waitingKey=true,drawScheduled=false,configuring=false,pendingChunks=[];
 const MAX_QUEUED_FRAMES=2,frameQueue=[];
 let videoRetry=500,controlRetry=500,videoRefusals=0;
 const supportedCodecs=new Map(),activePointers=new Map(),heldKeys=new Map();
@@ -4395,16 +4395,14 @@ function fallback(reason){note(reason);startMultipart(reason)}
 function configure(data){config=data;waitingKey=true;const codec=codecFromSps(data);if(!codec){fallback("the stream has no H.264 SPS");return}stats.codec=codec;const known=supportedCodecs.get(codec);if(known===true){applyDecoderConfig(codec);return}if(known===false){fallback("VideoDecoder rejects "+codec);return}configuring=true;VideoDecoder.isConfigSupported({codec,optimizeForLatency:true}).then(result=>{configuring=false;supportedCodecs.set(codec,Boolean(result.supported));if(!result.supported){pendingChunks=[];fallback("VideoDecoder rejects "+codec);return}applyDecoderConfig(codec);const queued=pendingChunks;pendingChunks=[];for(const item of queued)decode(item[0],item[1],item[2])}).catch(error=>{configuring=false;pendingChunks=[];fallback("VideoDecoder check failed: "+error.message)})}
 function applyDecoderConfig(codec){if(view.mode!=="webcodecs")return;if(!decoder||decoder.state==="closed")decoder=new VideoDecoder({output:onFrame,error:onDecoderError});decoder.configure({codec,optimizeForLatency:true});waitingKey=true}
 function decode(key,pts,data){if(configuring){if(pendingChunks.length<300)pendingChunks.push([key,pts,data]);else{pendingChunks=[];waitingKey=true}return}if(!decoder||decoder.state!=="configured"){stats.framesDropped+=1;waitingKey=true;return}if(waitingKey&&!key){stats.framesDropped+=1;return}if(!key&&decoder.decodeQueueSize>30){waitingKey=true;stats.framesDropped+=1;sendControl({t:"system",op:"keyframe"});return}let chunk=data;if(key&&config){chunk=new Uint8Array(config.length+data.length);chunk.set(config);chunk.set(data,config.length)}try{decoder.decode(new EncodedVideoChunk({type:key?"key":"delta",timestamp:pts,data:chunk}));waitingKey=false}catch(error){onDecoderError(error)}}
-// Decoded frames waiting for an animation frame. On the iOS fast transport (idb) they are shown
-// in order: at most MAX_QUEUED_FRAMES wait, one is drawn per animation frame and another is asked
-// for while frames remain, and the oldest beyond that is closed and counted as dropped. Two frames
-// decoded between two refreshes are then both shown instead of losing the first. Android (scrcpy)
-// still keeps only the newest frame; the Android 60 fps run will extend the in-order queue to it.
-function presentInOrder(){return iosFast()}
+// Decoded frames waiting for an animation frame, on every fast transport (scrcpy and idb). They
+// are shown in order: at most MAX_QUEUED_FRAMES wait, one is drawn per animation frame and another
+// is asked for while frames remain, and the oldest beyond that is closed and counted as dropped.
+// Two frames decoded between two refreshes are then both shown instead of losing the first.
 function scheduleDraw(){if(!drawScheduled){drawScheduled=true;requestAnimationFrame(draw)}}
 function dropQueuedFrames(){while(frameQueue.length)frameQueue.shift().close()}
-function onFrame(frame){stats.framesDecoded+=1;if(presentInOrder()){frameQueue.push(frame);while(frameQueue.length>MAX_QUEUED_FRAMES){frameQueue.shift().close();stats.framesDropped+=1}scheduleDraw();return}if(pendingFrame){pendingFrame.close();stats.framesDropped+=1}pendingFrame=frame;scheduleDraw()}
-function draw(){drawScheduled=false;let frame=frameQueue.shift();if(!frame){frame=pendingFrame;pendingFrame=null}if(!frame)return;if(frameQueue.length)scheduleDraw();const size=upright(frame.displayWidth,frame.displayHeight);if(video.width!==size.width||video.height!==size.height){video.width=size.width;video.height=size.height;fitFrame(size.width,size.height)}if(rotation){ctx.setTransform(1,0,0,1,video.width/2,video.height/2);ctx.rotate(rotation*Math.PI/180);ctx.drawImage(frame,-frame.displayWidth/2,-frame.displayHeight/2,frame.displayWidth,frame.displayHeight);ctx.setTransform(1,0,0,1,0,0)}else ctx.drawImage(frame,0,0,video.width,video.height);frame.close();const now=performance.now();stats.framesRendered+=1;stats.lastFrameAt=now;stats.renderTimes.push(now);while(stats.renderTimes.length&&now-stats.renderTimes[0]>1000)stats.renderTimes.shift()}
+function onFrame(frame){stats.framesDecoded+=1;frameQueue.push(frame);while(frameQueue.length>MAX_QUEUED_FRAMES){frameQueue.shift().close();stats.framesDropped+=1}scheduleDraw()}
+function draw(){drawScheduled=false;const frame=frameQueue.shift();if(!frame)return;if(frameQueue.length)scheduleDraw();const size=upright(frame.displayWidth,frame.displayHeight);if(video.width!==size.width||video.height!==size.height){video.width=size.width;video.height=size.height;fitFrame(size.width,size.height)}if(rotation){ctx.setTransform(1,0,0,1,video.width/2,video.height/2);ctx.rotate(rotation*Math.PI/180);ctx.drawImage(frame,-frame.displayWidth/2,-frame.displayHeight/2,frame.displayWidth,frame.displayHeight);ctx.setTransform(1,0,0,1,0,0)}else ctx.drawImage(frame,0,0,video.width,video.height);frame.close();const now=performance.now();stats.framesRendered+=1;stats.lastFrameAt=now;stats.renderTimes.push(now);while(stats.renderTimes.length&&now-stats.renderTimes[0]>1000)stats.renderTimes.shift()}
 function onDecoderError(error){stats.errors+=1;note("decoder: "+(error&&error.message||error));try{if(decoder&&decoder.state!=="closed")decoder.close()}catch{}decoder=null;waitingKey=true;if(stats.codec&&supportedCodecs.get(stats.codec))applyDecoderConfig(stats.codec);sendControl({t:"system",op:"keyframe"})}
 
 // scrcpy control: one WebSocket carrying touch, wheel, keys, text and system actions.

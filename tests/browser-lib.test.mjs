@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  DEFAULT_BIT_RATE,
   DEFAULT_FPS,
   STREAM_KEYCODES,
   encodeAdbText,
@@ -22,13 +23,16 @@ test("parseArgs returns secure defaults and explicit overrides", () => {
   assert.equal(defaults.fps, DEFAULT_FPS);
   assert.equal(defaults.transport, "auto");
   assert.equal(defaults.noAuth, false);
+  // 12 Mbit/s keeps the bits per frame at 60 fps that 8 Mbit/s gave at about 36 fps.
+  assert.equal(DEFAULT_BIT_RATE, 12_000_000);
+  assert.equal(defaults.bitRate, 12_000_000);
 
   const values = parseArgs([
     "--serial", "emulator-5554",
     "--port", "8080",
     "--fps", "30",
     "--max-size", "1920",
-    "--bit-rate", "12000000",
+    "--bit-rate", "16000000",
     "--transport", "screenrecord",
     "--no-auth",
   ]);
@@ -36,7 +40,7 @@ test("parseArgs returns secure defaults and explicit overrides", () => {
   assert.equal(values.port, 8080);
   assert.equal(values.fps, 30);
   assert.equal(values.maxSize, 1920);
-  assert.equal(values.bitRate, 12_000_000);
+  assert.equal(values.bitRate, 16_000_000);
   assert.equal(values.transport, "screenrecord");
   assert.equal(values.noAuth, true);
 });

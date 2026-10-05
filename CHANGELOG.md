@@ -25,7 +25,7 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
   Simulator boots again, and stops 15 s after the last page. The page shows
   the decoded frames in order, one per screen refresh with at most two
   waiting, so a frame that arrives together with the next one is no longer
-  lost (Android still shows only the newest). The page turns
+  lost (Android does the same, see Changed). The page turns
   the portrait picture for the Simulator's orientation (`orientation` and
   `rotation` in `state` and `/status` `idb`). Input on `/ws/control` is live:
   one finger over the companion's HID stream (a second pointer is refused),
@@ -44,6 +44,23 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
   Settings flung for 10 s), frame intervals, host load, SSIM outside the
   screen's rounded corners and camera cutout, sharing and input on a test
   Simulator.
+
+### Changed
+- **Android Canvas at 60 fps.** The scrcpy page now shows decoded frames in
+  order like the iOS page: at most two wait, one is drawn per screen refresh,
+  and only a third waiting frame is dropped (keeping only the newest lost
+  10-20% of frames). The default `--bit-rate` is 12 Mbit/s instead of 8
+  (scrcpy, idb and screenrecord), so a frame at 60 fps keeps at least the bits
+  it had at about 36 fps. The `bench` case of
+  `tests/live/canvas_scrcpy_live.mjs` now drives the finger from a 16 ms
+  timer, measures in headed off-screen Chromium through Playwright
+  (`--headless`, `--playwright`, `--seconds`), and reports device-produced,
+  received, decoded, presented and distinct fps per second, latency and host
+  load; it passes on a presented median of at least 55 fps with a distinct
+  median of at least 45. On the API 36 test emulator (`-gpu host -cores 8
+  -memory 4096`, 570x1280 video) it measured 59.4 device, 58.9 decoded, 59
+  presented and 59 distinct fps, none dropped, and 99 ms median (117 ms p95)
+  from touch to picture.
 
 ### Fixed
 - **iOS Canvas shows the screen on Xcode 27.** Since Xcode 27, `simctl io

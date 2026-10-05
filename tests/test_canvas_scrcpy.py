@@ -746,6 +746,18 @@ class CanvasServeFlagsTests(EnvSandboxMixin, unittest.TestCase):
         payload = self.refused(self.serve("--scrcpy-server", str(self.root / "missing-server")))
         self.assertIn("brew install scrcpy", payload["hint"])
 
+    def test_bit_rate_default_is_12_mbit_in_hint_and_help(self) -> None:
+        """A60-003: the CLI states the canvas server's 12 Mbit/s default."""
+        payload = self.refused(self.serve("--bit-rate", "10"))
+        self.assertEqual(payload["hint"], "The default is 12000000.")
+        completed = subprocess.run(
+            [sys.executable, str(CLI), "canvas", "serve", "--help"],
+            cwd=self.root, env=self.env, text=True, stdin=subprocess.DEVNULL,
+            capture_output=True, check=False, timeout=60)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("(default 12000000)", " ".join(completed.stdout.split()))
+        self.assertNotIn("8000000", completed.stdout)
+
     def test_scrcpy_without_any_server_fails_naming_canvas_scrcpy(self) -> None:
         """CANVAS-013-S01: no flag, no variable, no scrcpy on PATH."""
         payload = self.refused(self.serve("--transport", "scrcpy"))

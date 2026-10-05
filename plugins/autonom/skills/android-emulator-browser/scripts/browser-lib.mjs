@@ -13,7 +13,8 @@ export const DEFAULT_FPS = 15;
 // the multipart default; an explicit --fps still applies to it.
 export const DEFAULT_SCRCPY_MAX_FPS = 60;
 export const DEFAULT_MAX_SIZE = 1280;
-export const DEFAULT_BIT_RATE = 8_000_000;
+// 12 Mbit/s: at 60 fps each frame keeps at least the bits it had at about 36 fps and 8 Mbit/s.
+export const DEFAULT_BIT_RATE = 12_000_000;
 export const MAX_BODY_BYTES = 64 * 1024;
 export const MAX_CONTROL_MESSAGE_BYTES = 64 * 1024;
 export const MAX_POINTERS = 10;

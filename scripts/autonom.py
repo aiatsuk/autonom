@@ -4283,7 +4283,7 @@ def cmd_canvas_serve(args: argparse.Namespace) -> int:
             errors.INVALID_VALUE, f"--fps must be 1..60, got {args.fps}",
             "The default is 15, and 60 on the scrcpy and idb transports.")
     _canvas_bounded("--max-size", args.max_size, CANVAS_MAX_SIZE, "1280")
-    _canvas_bounded("--bit-rate", args.bit_rate, CANVAS_BIT_RATE, "8000000")
+    _canvas_bounded("--bit-rate", args.bit_rate, CANVAS_BIT_RATE, "12000000")
     scrcpy_server = _canvas_scrcpy_server(args)
     idb = _canvas_idb_lookup(args)
     target = _target(args)
@@ -4779,7 +4779,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-size", type=int, metavar="PX",
                    help="maximum video width in pixels (default 1280)")
     p.add_argument("--bit-rate", type=int, metavar="BPS",
-                   help="H.264 bit rate in bits per second (default 8000000)")
+                   help="H.264 bit rate in bits per second (default 12000000)")
     p.add_argument("--scrcpy-server", metavar="PATH",
                    help="scrcpy-server file to push (default: discovered, see doctor)")
     p.add_argument("--scrcpy-version", metavar="X.Y",

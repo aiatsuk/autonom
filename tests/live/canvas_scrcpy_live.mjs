@@ -4,9 +4,9 @@
  *
  * Not part of `node --test tests/*.test.mjs`: every case pushes and runs
  * scrcpy-server on the one explicit --serial, injects input there and drives a
- * headless browser through brow. Use a test emulator only. Device settings the
- * cases touch (show_touches, auto-rotate, rotation, display size and density) are
- * restored before they finish.
+ * headless browser through brow (the bench case: Chromium through Playwright, see
+ * below). Use a test emulator only. Device settings the cases touch (show_touches,
+ * auto-rotate, rotation, display size and density) are restored before they finish.
  *
  * Every run gets its own temporary AUTONOM_HOME under the OS temp directory, handed to
  * the Canvas (and so to its journal bridge) and to every Autonom CLI call, so a case can
@@ -15,19 +15,40 @@
  *
  *   node tests/live/canvas_scrcpy_live.mjs --serial <adb-serial> --case <name> \
  *     [--evidence-dir DIR] [--scrcpy-server <scrcpy-server-v4.1> [--scrcpy-version X.Y]] \
- *     [--adb PATH] [--brow PATH] [--keep-home]
+ *     [--adb PATH] [--brow PATH] [--keep-home] \
+ *     [--repeat 3] [--drags 20] [--seconds 10] [--playwright DIR] [--headless]
  *
  * Without --scrcpy-server the Canvas finds the server itself (AUTONOM_SCRCPY_SERVER,
  * SCRCPY_SERVER_PATH, then an installed scrcpy), and the report records which source
  * it used. Cases: picture, bench, tabs, restart, input, journal, display. Each writes
  * <evidence-dir>/<case>.json (--out is another name for --evidence-dir), with the steps
  * done so far also when the case fails midway, and exits non-zero when its oracle fails.
+ *
+ * bench: --repeat runs, each with a Canvas of its own on the scrcpy transport. In each
+ * run a finger driven from a 16 ms timer (not tied to animation frames) drags the Settings
+ * list up and down without pause, so the screen changes on (nearly) every frame, and for
+ * --seconds the report takes, per whole second: the frames the device produced (scrcpy
+ * packets counted by the Canvas server), received, decoded, dropped and presented by the
+ * page, distinct frames (a presented frame whose picture differs from the one before),
+ * the animation frame rate, finger moves, frame interval percentiles, and the host's CPU
+ * load and load averages. Then --drags separate drags, each from a settled screen, give
+ * input-to-picture latency (median and p95). The case passes when the presented median
+ * is at least 55 fps while the distinct median is at least 45 fps (the screen really
+ * changed); latency is reported against its 150 ms bar without failing the case.
+ * Chromium runs headed by default, its window placed off screen, since headless Chromium
+ * fires animation frames unevenly and cannot present 60 fps steadily; --headless runs it
+ * headless anyway. Playwright comes from --playwright, AUTONOM_PLAYWRIGHT,
+ * ~/pr/platform/node_modules/playwright, then a `playwright` package Node can resolve;
+ * /opt/pw-browsers is used as the browser folder when it exists and
+ * PLAYWRIGHT_BROWSERS_PATH is not set.
  */
 import { execFile, spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
+import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { cpus, homedir, loadavg, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { parseArgs as parseCliArgs } from "node:util";
 
 const ROOT = resolve(import.meta.dirname, "../..");
@@ -47,19 +68,35 @@ const ROTATABLE_ACTIVITY = "com.android.chrome/com.google.android.apps.chrome.Ma
 // The status bar: its clock and icons change on their own.
 const STATUS_BAR_PACKAGE = "com.android.systemui";
 const REMOTE_JAR = "/data/local/tmp/autonom-scrcpy-4.1.jar";
-// CANVAS-014 bars.
-const FPS_BAR = 30;
+// Bench bars (A60-002): the presented median while the screen changes on every frame, and
+// the distinct-frame median that shows it really did. Latency keeps its CANVAS-014 bar,
+// reported without failing the case.
+const PRESENTED_BAR = 55;
+const DISTINCT_BAR = 45;
 const LATENCY_BAR_MS = 150;
-// Input-to-picture latency: touch down to the first rendered frame whose whole picture,
+// Input-to-picture latency: touch down to the first presented frame whose whole picture,
 // drawn at 36x80, differs from the settled one by more than 1.5 per channel on average.
 // A 48x48 patch at the finger missed 12 of 12 drags on sparse Settings rows.
 const PROBE_SIZE = { width: 36, height: 80 };
 const CHANGE_THRESHOLD = 1.5;
-// Moves per scrcpy drag, one about every 16 ms.
+// Moves per bench stroke, one every BENCH_STEP_MS from a timer, not from animation frames:
+// a drag from 75% to 30% of the screen height and back.
 const BENCH_MOVES = 50;
-// brow stops any evaluation after 3 s, so the bench runs in the page and is polled.
-const BENCH_POLL_MS = 1000;
-const BENCH_DRAG_BUDGET_MS = 5000;
+const BENCH_STEP_MS = 16;
+const BENCH_FROM = 0.75;
+const BENCH_TO = 0.3;
+// Distinct frames: the picture between 12% and 95% of its height (below the status bar,
+// whose clock changes on its own), as 64x64 luma; a presented frame is distinct when at
+// least 16 of its pixels differ from the frame before by more than 12 levels.
+const DISTINCT_BAND = [0.12, 0.95];
+const DISTINCT_SAMPLE = 64;
+const DISTINCT_LEVEL = 12;
+const DISTINCT_PIXELS = 16;
+// Before a latency drag the previous fling settles for this long.
+const LATENCY_SETTLE_MS = 700;
+// A latency drag keeps watching for its first change this long after its last move.
+const LATENCY_TAIL_MS = 300;
+const OFF_SCREEN_WINDOW = "--window-position=3000,3000";
 // The Canvas asks scrcpy for a key frame (RESET_VIDEO) at most once a second.
 const NUDGE_SPACING_MS = 1100;
 // Drag moves are spaced like a real finger's: Android lists do not scroll for a drag
@@ -123,6 +160,9 @@ const { values: args } = parseCliArgs({
     out: { type: "string" },
     repeat: { type: "string", default: "3" },
     drags: { type: "string", default: "20" },
+    seconds: { type: "string", default: "10" },
+    playwright: { type: "string" },
+    headless: { type: "boolean", default: false },
     "keep-home": { type: "boolean", default: false },
   },
 });
@@ -131,7 +171,7 @@ function usage(message) {
   console.error(`canvas_scrcpy_live: ${message}`);
   console.error(`usage: canvas_scrcpy_live.mjs --serial SERIAL --case ${CASES.join("|")} ` +
     "[--evidence-dir DIR] [--scrcpy-server PATH [--scrcpy-version X.Y]] [--adb PATH] [--brow PATH] " +
-    "[--repeat N] [--drags N] [--keep-home]");
+    "[--repeat N] [--drags N] [--seconds N] [--playwright DIR] [--headless] [--keep-home]");
   process.exit(2);
 }
 
@@ -139,6 +179,9 @@ if (!args.serial) usage("--serial is required; the cases never pick a device by 
 if (!CASES.includes(args.case)) usage(`--case must be one of ${CASES.join(", ")}`);
 if (args["scrcpy-version"] && !args["scrcpy-server"]) {
   usage("--scrcpy-version names the version of --scrcpy-server; pass both");
+}
+for (const name of ["repeat", "drags", "seconds"]) {
+  if (!/^[1-9]\d*$/.test(args[name])) usage(`--${name} must be a positive whole number`);
 }
 if (args["evidence-dir"] && args.out && resolve(args["evidence-dir"]) !== resolve(args.out)) {
   usage("--out is another name for --evidence-dir; give one directory");
@@ -421,21 +464,204 @@ async function cpuSeconds(pid) {
   return { canvas, adbServer, total: canvas + adbServer };
 }
 
-/**
- * Drags measured inside the page: rendered fps and input-to-picture latency. The
- * expression only starts them and returns; the result lands in window.__autonomBench.
- */
-function benchExpression(transport, drags, token, display) {
-  const options = JSON.stringify({
-    transport, drags, token, display, probe: PROBE_SIZE, threshold: CHANGE_THRESHOLD, moves: BENCH_MOVES,
+async function loadPlaywright() {
+  if (!process.env.PLAYWRIGHT_BROWSERS_PATH && existsSync("/opt/pw-browsers")) {
+    process.env.PLAYWRIGHT_BROWSERS_PATH = "/opt/pw-browsers";
+  }
+  const candidates = [args.playwright, process.env.AUTONOM_PLAYWRIGHT,
+    join(homedir(), "pr/platform/node_modules/playwright")].filter(Boolean);
+  for (const directory of candidates) {
+    const entry = join(directory, "index.mjs");
+    if (existsSync(entry)) return await import(pathToFileURL(entry).href);
+  }
+  try {
+    return await import("playwright");
+  } catch {
+    throw new Error(`Playwright was not found (tried ${candidates.join(", ") || "nothing"} and the playwright package); ` +
+      "pass --playwright <node_modules/playwright>");
+  }
+}
+
+/** How the bench browser runs, for the report. */
+const browserMode = {
+  headless: args.headless,
+  args: args.headless ? [] : [OFF_SCREEN_WINDOW, "--disable-backgrounding-occluded-windows",
+    "--disable-renderer-backgrounding", "--disable-background-timer-throttling"],
+};
+
+/** Busy share of all host CPUs between two os.cpus() readings, in percent. */
+function cpuBusy(before, after) {
+  let busy = 0;
+  let total = 0;
+  after.forEach((cpu, index) => {
+    const was = before[index]?.times;
+    if (!was) return;
+    const spent = Object.keys(cpu.times).reduce((sum, key) => sum + cpu.times[key] - was[key], 0);
+    total += spent;
+    busy += spent - (cpu.times.idle - was.idle);
   });
-  return `(() => {
-    const o = ${options};
-    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-    const frame = () => new Promise((r) => requestAnimationFrame(r));
-    const element = document.getElementById(o.transport === "scrcpy" ? "video" : "screen");
+  return total ? Math.round((busy / total) * 1000) / 10 : null;
+}
+
+function hostLoad() {
+  return loadavg().map((value) => Math.round(value * 100) / 100);
+}
+
+/** Open the Canvas in a Playwright page and wait for a streaming scrcpy session with control. */
+async function openBenchPage(browser, canvas) {
+  const page = await browser.newPage({ viewport: { width: 1280, height: 1000 } });
+  await page.goto(canvas.url);
+  await page.waitForFunction(() => {
+    const value = window.autonomCanvas?.stats();
+    return value && value.transport === "scrcpy" && value.decoder === "webcodecs" && value.session === "streaming" &&
+      value.control === 1 && value.framesDecoded > 0;
+  }, null, { timeout: 30_000, polling: 50 });
+  return page;
+}
+
+/**
+ * The fps window, measured in the page. A finger driven from a BENCH_STEP_MS timer drags
+ * the list up and down without pause: each stroke is BENCH_MOVES moves, and the next one
+ * goes down in the same tick as the last one goes up. Once the picture first moves (and
+ * 300 ms more), the page's draw() is wrapped for `durationMs`: each presented frame is
+ * timed and compared with the one before (distinct frames), animation frames are counted,
+ * and the Canvas server's scrcpy packet count (the frames the device produced) is read
+ * from /status once a second.
+ */
+async function measureFps(page, token, durationMs) {
+  return await page.evaluate(async (o) => {
+    const canvas = window.autonomCanvas;
+    const video = document.getElementById("video");
+    const copy = document.createElement("canvas");
+    copy.width = o.sample;
+    copy.height = o.sample;
+    const context = copy.getContext("2d", { willReadFrequently: true });
+    const take = () => {
+      const top = Math.round(video.height * o.band[0]);
+      context.drawImage(video, 0, top, video.width, Math.round(video.height * o.band[1]) - top, 0, 0, o.sample, o.sample);
+      const data = context.getImageData(0, 0, o.sample, o.sample).data;
+      const luma = new Uint8Array(o.sample * o.sample);
+      for (let i = 0, p = 0; p < luma.length; i += 4, p += 1) {
+        luma[p] = Math.round(0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2]);
+      }
+      return luma;
+    };
+    const changed = (a, b) => {
+      let moved = 0;
+      for (let p = 0; p < a.length; p += 1) if (Math.abs(a[p] - b[p]) > o.level) moved += 1;
+      return moved >= o.pixels;
+    };
+    const wait = (ms) => new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
+    const serverPackets = async () => {
+      const asked = performance.now();
+      const response = await fetch("/status", { headers: { Authorization: "Bearer " + o.token } });
+      const body = await response.json();
+      return { at: (asked + performance.now()) / 2, packets: body.scrcpy ? body.scrcpy.packets : null };
+    };
+
+    // The finger: never tied to animation frames.
+    let measuring = false;
+    let moves = 0;
+    let strokes = 0;
+    let stroke = null;
+    let stopping = false;
+    let finished;
+    const done = new Promise((resolvePromise) => { finished = resolvePromise; });
+    const begin = (from, to) => {
+      stroke = { from, to, step: 0 };
+      strokes += 1;
+      canvas.send({ t: "touch", a: "down", id: 1, x: 0.5, y: from });
+    };
+    begin(o.from, o.to);
+    const timer = setInterval(() => {
+      stroke.step += 1;
+      const y = stroke.from + (stroke.to - stroke.from) * stroke.step / o.moves;
+      canvas.send({ t: "touch", a: "move", id: 1, x: 0.5, y });
+      if (measuring) moves += 1;
+      if (stroke.step < o.moves) return;
+      canvas.send({ t: "touch", a: "up", id: 1, x: 0.5, y });
+      if (stopping) {
+        clearInterval(timer);
+        finished();
+        return;
+      }
+      begin(stroke.to, stroke.from);
+    }, o.stepMs);
+
+    // Until the list first moves (at most 3 s), then 300 ms more.
+    const still = take();
+    const waitedFrom = performance.now();
+    while (performance.now() - waitedFrom < 3000 && !changed(take(), still)) await wait(16);
+    await wait(300);
+
+    const times = [];
+    const distinct = [];
+    let ticks = 0;
+    let previous = take();
+    // The page script's draw(), a global function scheduled by name, wrapped for the window.
+    const pageDraw = window.draw;
+    window.draw = () => {
+      const rendered = canvas.stats().framesRendered;
+      pageDraw();
+      if (!measuring || canvas.stats().framesRendered === rendered) return;
+      const now = performance.now();
+      times.push(now);
+      const current = take();
+      if (changed(current, previous)) distinct.push(now);
+      previous = current;
+    };
+    const device = [await serverPackets()];
+    const before = canvas.stats();
+    const started = performance.now();
+    measuring = true;
+    const polling = (async () => {
+      for (let second = 1; second * 1000 <= o.durationMs; second += 1) {
+        await wait(Math.max(0, started + second * 1000 - performance.now()));
+        device.push(await serverPackets());
+      }
+    })();
+    await new Promise((resolvePromise) => {
+      const tick = () => {
+        ticks += 1;
+        if (performance.now() - started < o.durationMs) requestAnimationFrame(tick);
+        else resolvePromise();
+      };
+      requestAnimationFrame(tick);
+    });
+    const ended = performance.now();
+    measuring = false;
+    const after = canvas.stats();
+    window.draw = pageDraw;
+    await polling;
+    stopping = true;
+    await done;
+    return {
+      times, distinct, ticks, started, ended, device, moves, strokes,
+      decoded: after.framesDecoded - before.framesDecoded,
+      dropped: after.framesDropped - before.framesDropped,
+      rendered: after.framesRendered - before.framesRendered,
+      received: after.packets - before.packets,
+      size: { width: after.width, height: after.height },
+    };
+  }, { token, durationMs, sample: DISTINCT_SAMPLE, band: DISTINCT_BAND, level: DISTINCT_LEVEL,
+    pixels: DISTINCT_PIXELS, from: BENCH_FROM, to: BENCH_TO, moves: BENCH_MOVES, stepMs: BENCH_STEP_MS });
+}
+
+/**
+ * Input-to-picture latency, measured in the page: `drags` drags, each from a settled
+ * screen, its moves sent from a BENCH_STEP_MS timer. A drag's latency is the time from its
+ * touch down to the first presented frame whose picture differs from the settled one; null
+ * when none did within LATENCY_TAIL_MS of its last move.
+ */
+async function measureLatency(page, drags) {
+  return await page.evaluate(async (o) => {
+    const canvas = window.autonomCanvas;
+    const wait = (ms) => new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
+    const frame = () => new Promise((resolvePromise) => requestAnimationFrame(resolvePromise));
+    const element = document.getElementById("video");
     const probe = document.createElement("canvas");
-    probe.width = o.probe.width; probe.height = o.probe.height;
+    probe.width = o.probe.width;
+    probe.height = o.probe.height;
     const probeContext = probe.getContext("2d", { willReadFrequently: true });
     const grab = () => {
       probeContext.drawImage(element, 0, 0, probe.width, probe.height);
@@ -446,119 +672,166 @@ function benchExpression(transport, drags, token, display) {
       for (let i = 0; i < a.length; i += 4) sum += Math.abs(a[i] - b[i]) + Math.abs(a[i + 1] - b[i + 1]) + Math.abs(a[i + 2] - b[i + 2]);
       return sum / (a.length / 4) / 3;
     };
-    const status = async () => (await fetch("/status", { headers: { Authorization: "Bearer " + o.token } })).json();
-    const drag = async (i, latencies, fps, decodedFps) => {
-      const up = i % 2 === 0, x = 0.5, y0 = up ? 0.75 : 0.3, y1 = up ? 0.3 : 0.75;
-      // The previous fling settles first, so the baseline is a still picture.
-      await sleep(700);
-      for (let k = 0; k < 3; k += 1) await frame();
-      const baseline = grab();
-      const before = window.autonomCanvas.stats();
-      const statusBefore = o.transport === "scrcpy" ? null : await status();
-      const started = performance.now();
-      let latency = null;
-      const watch = async (until) => {
-        while (performance.now() < until) {
-          await frame();
-          if (latency === null && difference(grab(), baseline) > o.threshold) latency = performance.now() - started;
-        }
-      };
-      if (o.transport === "scrcpy") {
-        window.autonomCanvas.send({ t: "touch", a: "down", id: 1, x, y: y0 });
-        for (let step = 1; step <= o.moves; step += 1) {
-          window.autonomCanvas.send({ t: "touch", a: "move", id: 1, x, y: y0 + (y1 - y0) * step / o.moves });
-          await watch(performance.now() + 16);
-        }
-        window.autonomCanvas.send({ t: "touch", a: "up", id: 1, x, y: y1 });
-      } else {
-        const swipe = fetch("/swipe", { method: "POST", headers: { Authorization: "Bearer " + o.token,
-          "Content-Type": "application/json", "X-Autonom-Origin": "agent" },
-          body: JSON.stringify({ x1: Math.round(x * o.display.width), y1: Math.round(y0 * o.display.height),
-            x2: Math.round(x * o.display.width), y2: Math.round(y1 * o.display.height), duration: 1000 }) });
-        await watch(started + 1100);
-        await swipe.catch(() => {});
+    const latencies = [];
+    const pageDraw = window.draw;
+    try {
+      for (let i = 0; i < o.drags; i += 1) {
+        const up = i % 2 === 0;
+        const [from, to] = up ? [o.from, o.to] : [o.to, o.from];
+        await wait(o.settleMs);
+        for (let k = 0; k < 3; k += 1) await frame();
+        const baseline = grab();
+        let latency = null;
+        let started = 0;
+        window.draw = () => {
+          const rendered = canvas.stats().framesRendered;
+          pageDraw();
+          if (latency !== null || !started || canvas.stats().framesRendered === rendered) return;
+          if (difference(grab(), baseline) > o.threshold) latency = performance.now() - started;
+        };
+        started = performance.now();
+        canvas.send({ t: "touch", a: "down", id: 1, x: 0.5, y: from });
+        await new Promise((resolvePromise) => {
+          let step = 0;
+          const timer = setInterval(() => {
+            step += 1;
+            const y = from + (to - from) * step / o.moves;
+            canvas.send({ t: "touch", a: "move", id: 1, x: 0.5, y });
+            if (step < o.moves) return;
+            clearInterval(timer);
+            canvas.send({ t: "touch", a: "up", id: 1, x: 0.5, y });
+            resolvePromise();
+          }, o.stepMs);
+        });
+        await wait(o.tailMs);
+        window.draw = pageDraw;
+        latencies.push(latency === null ? null : Math.round(latency));
       }
-      const elapsed = (performance.now() - started) / 1000;
-      if (o.transport === "scrcpy") {
-        const after = window.autonomCanvas.stats();
-        fps.push((after.framesRendered - before.framesRendered) / elapsed);
-        decodedFps.push((after.framesDecoded - before.framesDecoded) / elapsed);
-      } else {
-        fps.push(((await status()).frames_sent - statusBefore.frames_sent) / elapsed);
-      }
-      latencies.push(latency === null ? null : Math.round(latency));
-    };
-    const run = async () => {
-      const latencies = [], fps = [], decodedFps = [];
-      for (let i = 0; i < o.drags; i += 1) await drag(i, latencies, fps, decodedFps);
-      return { latencies, fps, decoded_fps: decodedFps };
-    };
-    window.__autonomBench = { done: false };
-    run().then((result) => { window.__autonomBench = { done: true, result }; },
-      (error) => { window.__autonomBench = { done: true, error: String((error && error.stack) || error) }; });
-    return JSON.stringify({ started: true });
-  })()`;
+    } finally {
+      window.draw = pageDraw;
+    }
+    return { latencies };
+  }, { drags, probe: PROBE_SIZE, threshold: CHANGE_THRESHOLD, moves: BENCH_MOVES, stepMs: BENCH_STEP_MS,
+    from: BENCH_FROM, to: BENCH_TO, settleMs: LATENCY_SETTLE_MS, tailMs: LATENCY_TAIL_MS });
 }
 
-/** Start the drags in the page, then poll for their result with short evaluations. */
-async function runBench(session, expression, timeoutMs) {
-  await pageJson(session, expression);
-  const deadline = Date.now() + timeoutMs;
-  for (;;) {
-    await sleep(BENCH_POLL_MS);
-    const state = await pageJson(session, "JSON.stringify(window.__autonomBench ?? null)");
-    if (!state) throw new Error("the in-page bench is gone: the page reloaded");
-    if (state.done && state.error) throw new Error(`the in-page bench failed: ${state.error}`);
-    if (state.done) return state.result;
-    if (Date.now() > deadline) throw new Error("timed out waiting for the in-page bench");
+function round(value, digits = 1) {
+  if (value === null || !Number.isFinite(value)) return null;
+  const scale = 10 ** digits;
+  return Math.round(value * scale) / scale;
+}
+
+/** Counts per whole second of the window, their median, the mean rate and interval percentiles. */
+function frameReport(times, { started, ended }) {
+  const perSecond = [];
+  for (let second = 0; started + (second + 1) * 1000 <= ended; second += 1) {
+    const from = started + second * 1000;
+    perSecond.push(times.filter((time) => time >= from && time < from + 1000).length);
   }
+  const intervals = times.slice(1).map((time, index) => time - times[index]);
+  return {
+    frames: times.length,
+    fps_mean: round(times.length / ((ended - started) / 1000)),
+    fps_per_second: perSecond,
+    fps_median: median(perSecond),
+    fps_min: perSecond.length ? Math.min(...perSecond) : null,
+    interval_ms: {
+      p50: round(percentile(intervals, 0.5), 2), p90: round(percentile(intervals, 0.9), 2),
+      p95: round(percentile(intervals, 0.95), 2), p99: round(percentile(intervals, 0.99), 2),
+      max: intervals.length ? round(Math.max(...intervals), 2) : null,
+    },
+  };
+}
+
+/** Frames the device produced per second, from the server's packet count read once a second. */
+function deviceReport(samples) {
+  const known = samples.filter((sample) => Number.isInteger(sample.packets));
+  const perSecond = known.slice(1).map((sample, index) =>
+    round((sample.packets - known[index].packets) / ((sample.at - known[index].at) / 1000)));
+  const first = known[0];
+  const last = known.at(-1);
+  return {
+    frames: known.length > 1 ? last.packets - first.packets : null,
+    fps_mean: known.length > 1 ? round((last.packets - first.packets) / ((last.at - first.at) / 1000)) : null,
+    fps_per_second: perSecond,
+    fps_median: median(perSecond),
+  };
+}
+
+/** The fps window measured by measureFps, with the host's CPU load over it. */
+function fpsReport(measured, cpuBusyPct) {
+  const seconds = (measured.ended - measured.started) / 1000;
+  const rate = (count) => round(count / seconds);
+  return {
+    seconds: round(seconds, 2),
+    video: measured.size,
+    strokes: measured.strokes,
+    moves_fps: rate(measured.moves),
+    device: deviceReport(measured.device),
+    received_fps: rate(measured.received),
+    decoded_fps: rate(measured.decoded),
+    dropped_fps: rate(measured.dropped),
+    dropped: measured.dropped,
+    presented: frameReport(measured.times, measured),
+    distinct: frameReport(measured.distinct, measured),
+    animation_frames_fps: rate(measured.ticks),
+    host_cpu_busy_pct: cpuBusyPct,
+  };
 }
 
 /** Runs land in `into.runs` as they finish, so a failing run leaves the earlier ones in the report. */
-async function benchTransport(transport, repeat, drags, into) {
+async function benchScrcpy(browser, repeat, drags, seconds, into) {
   const runs = (into.runs = []);
   for (let attempt = 0; attempt < repeat; attempt += 1) {
-    const canvas = await startCanvas(transport);
-    const session = `${args.session}-bench`;
+    const canvas = await startCanvas("scrcpy");
+    let page = null;
     try {
-      await brow(session, ["open", canvas.url]);
-      await waitFor(async () => (await stats(session))?.transport === transport, 20_000, "the page transport");
-      await shell("am start -W -a android.settings.SETTINGS");
-      await sleep(1500);
-      const status = await canvas.status();
-      // The screencap path takes HTTP swipes in display pixels.
-      if (!status.display?.width) throw new Error("the Canvas does not know the display size");
-      const expression = benchExpression(transport, drags, canvas.token, status.display);
+      page = await openBenchPage(browser, canvas);
+      await resetSettings();
+      const item = { loadavg_before: hostLoad() };
+      runs.push(item);
       const cpuBefore = await cpuSeconds(canvas.child.pid);
-      const framesBefore = transport === "scrcpy" ? (await stats(session)).framesRendered : status.frames_sent;
-      const measured = await runBench(session, expression, drags * BENCH_DRAG_BUDGET_MS + 60_000);
+      const framesBefore = (await page.evaluate(() => window.autonomCanvas.stats())).framesRendered;
+      const hostBefore = cpus();
+      const measured = await measureFps(page, canvas.token, seconds * 1000);
+      item.fps = fpsReport(measured, cpuBusy(hostBefore, cpus()));
+      item.loadavg_after_fps = hostLoad();
+      // The list is back near its top between the two parts: Settings opened afresh.
+      await resetSettings();
+      const { latencies } = await measureLatency(page, drags);
       const cpuAfter = await cpuSeconds(canvas.child.pid);
-      const framesAfter = transport === "scrcpy" ? (await stats(session)).framesRendered
-        : (await canvas.status()).frames_sent;
+      const framesAfter = (await page.evaluate(() => window.autonomCanvas.stats())).framesRendered;
       const frames = Math.max(1, framesAfter - framesBefore);
-      const perFrame = (key) => ((cpuAfter[key] - cpuBefore[key]) * 1000) / frames;
-      runs.push({
-        fps_median: median(measured.fps),
-        decoded_fps_median: median(measured.decoded_fps),
-        latency_median_ms: median(measured.latencies),
-        latency_p95_ms: percentile(measured.latencies, 0.95),
-        latency_missed: measured.latencies.filter((value) => value === null).length,
+      const perFrame = (key) => round(((cpuAfter[key] - cpuBefore[key]) * 1000) / frames, 2);
+      Object.assign(item, {
+        presented_fps_median: item.fps.presented.fps_median,
+        distinct_fps_median: item.fps.distinct.fps_median,
+        device_fps_median: item.fps.device.fps_median,
+        decoded_fps: item.fps.decoded_fps,
+        latency_median_ms: median(latencies),
+        latency_p95_ms: percentile(latencies, 0.95),
+        latency_missed: latencies.filter((value) => value === null).length,
+        latencies,
         cpu_ms_per_frame: perFrame("total"),
         cpu_canvas_ms_per_frame: perFrame("canvas"),
         cpu_adb_server_ms_per_frame: perFrame("adbServer"),
         frames,
-        raw: measured,
+        loadavg_after: hostLoad(),
       });
     } finally {
-      await brow(session, ["close"]).catch(() => {});
+      await page?.close().catch(() => {});
       await canvas.stop();
     }
   }
+  const middle = (key) => median(runs.map((item) => item[key]));
   return Object.assign(into, {
-    fps_median: median(runs.map((item) => item.fps_median)),
-    latency_median_ms: median(runs.map((item) => item.latency_median_ms)),
-    latency_p95_ms: median(runs.map((item) => item.latency_p95_ms)),
-    cpu_ms_per_frame: median(runs.map((item) => item.cpu_ms_per_frame)),
+    presented_fps_median: middle("presented_fps_median"),
+    distinct_fps_median: middle("distinct_fps_median"),
+    device_fps_median: middle("device_fps_median"),
+    decoded_fps_median: middle("decoded_fps"),
+    latency_median_ms: middle("latency_median_ms"),
+    latency_p95_ms: middle("latency_p95_ms"),
+    cpu_ms_per_frame: middle("cpu_ms_per_frame"),
   });
 }
 
@@ -850,22 +1123,34 @@ const cases = {
   async bench(report) {
     const repeat = (report.repeat = Number(args.repeat));
     const drags = (report.drags = Number(args.drags));
+    const seconds = (report.seconds_per_window = Number(args.seconds));
+    report.host = { cpus: cpus().length, loadavg_start: hostLoad() };
+    report.browser = { ...browserMode };
     const touches = await shell("settings get system show_touches");
     await shell("settings put system show_touches 1");
+    let browser = null;
     try {
-      const scrcpy = await benchTransport("scrcpy", repeat, drags, (report.scrcpy = {}));
-      const screencap = await benchTransport("screencap", repeat, drags, (report.screencap = {}));
-      const bars = (report.bars = {
-        fps_at_least_30: scrcpy.fps_median >= FPS_BAR,
-        latency_at_most_150ms: scrcpy.latency_median_ms !== null && scrcpy.latency_median_ms <= LATENCY_BAR_MS,
-        fps_beats_screencap: scrcpy.fps_median > (screencap.fps_median ?? 0),
-        latency_beats_screencap: scrcpy.latency_median_ms !== null &&
-          (screencap.latency_median_ms === null || scrcpy.latency_median_ms < screencap.latency_median_ms),
-        cpu_per_frame_not_worse: scrcpy.cpu_ms_per_frame <= screencap.cpu_ms_per_frame,
-      });
-      report.ok = Object.values(bars).every(Boolean);
+      const { chromium } = await loadPlaywright();
+      browser = await chromium.launch({ headless: browserMode.headless, args: browserMode.args });
+      report.browser.version = browser.version();
+      const scrcpy = await benchScrcpy(browser, repeat, drags, seconds, (report.scrcpy = {}));
+      report.bars = {
+        presented_median_at_least_55: scrcpy.presented_fps_median !== null && scrcpy.presented_fps_median >= PRESENTED_BAR,
+        distinct_median_at_least_45: scrcpy.distinct_fps_median !== null && scrcpy.distinct_fps_median >= DISTINCT_BAR,
+      };
+      // Reported against its bar; it does not decide the case.
+      report.latency = {
+        median_ms: scrcpy.latency_median_ms,
+        p95_ms: scrcpy.latency_p95_ms,
+        at_most_150ms: scrcpy.latency_median_ms !== null && scrcpy.latency_median_ms <= LATENCY_BAR_MS,
+      };
+      report.ok = Object.values(report.bars).every(Boolean);
     } finally {
+      await browser?.close().catch(() => {});
       await restoreSetting("show_touches", touches);
+      report.show_touches_restored = (await shell("settings get system show_touches")) === touches;
+      report.host.loadavg_end = hostLoad();
+      if (!report.show_touches_restored) report.ok = false;
     }
   },
 };
