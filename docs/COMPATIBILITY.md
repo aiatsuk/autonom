@@ -272,7 +272,7 @@ A Canvas killed with SIGKILL leaves the preset on the device until
 on the same device takes the first one's preset as its original. Both are
 documented in the `android-emulator-browser` skill.
 
-### Mobile Canvas iOS idb transport (Unreleased)
+### Mobile Canvas iOS idb transport (0.33.0)
 
 Additive. No `error_code` is added. `canvas serve` gains `--transport idb`
 and `--idb-companion PATH` and refuses with existing codes, checked before
@@ -297,7 +297,7 @@ with the same JSON object on stderr and exit code 2.
 | `AUTONOM_IDB_COMPANION` | `host:port` of a remote companion | unchanged; the Canvas never reads it |
 | `AUTONOM_IDB_COMPANION_BIN` | — | new: the Canvas's idb_companion binary, after `--idb-companion` and before `PATH` |
 
-### Mobile Canvas Android 60 fps (Unreleased)
+### Mobile Canvas Android 60 fps (0.33.0)
 
 No flag, code or field is added or removed.
 

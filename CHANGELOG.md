@@ -7,6 +7,8 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
 
 ## [Unreleased]
 
+## [0.33.0] - 2026-10-05
+
 ### Added
 - **iOS Canvas at 60 fps (idb transport).** On an iOS Simulator `canvas serve
   --transport auto` now streams the Simulator's own H.264 at up to 60 fps and
