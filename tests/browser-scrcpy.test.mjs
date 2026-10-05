@@ -888,9 +888,9 @@ async function status(canvas) {
   return await response.json();
 }
 
-async function pageSocket(canvas, auth, path) {
+async function pageSocket(canvas, auth, path, headers = {}) {
   const opened = await openSocket(canvas.port, `${path}?csrf=${encodeURIComponent(auth.csrf)}`, {
-    headers: { Cookie: auth.cookie, Origin: canvas.origin },
+    headers: { Cookie: auth.cookie, Origin: canvas.origin, ...headers },
   });
   assert.equal(opened.status, 101, opened.body);
   return opened.ws;
@@ -1029,12 +1029,43 @@ async function floodSetup(t, options = {}) {
   return setup;
 }
 
-/** Messages on one connection are handled in order, so this pong means all before it were. */
-async function allHandled(ws, timeoutMs = 20_000) {
+/**
+ * Messages on one connection are handled in order, so this pong means all before it were.
+ * A slow machine can take a long time over a flood, so the wait goes on while the client
+ * still receives something (the states a flood of handoff changes sends it), and fails
+ * after `stillMs` without anything new, or after `limitMs` in all.
+ */
+async function allHandled(ws, stillMs = 20_000, limitMs = 90_000) {
   const ts = -Date.now();
-  const pong = ws.until((message) => message.t === "pong" && message.ts === ts, timeoutMs);
+  const started = Date.now();
+  let listener;
+  const pong = new Promise((resolvePromise) => {
+    listener = (message) => {
+      if (message.json?.t === "pong" && message.json.ts === ts) resolvePromise(true);
+    };
+    ws.on("message", listener);
+  });
   ws.send({ t: "ping", ts });
-  await pong;
+  let seen = ws.received;
+  let movedAt = started;
+  try {
+    for (;;) {
+      const timer = sleep(100).then(() => false);
+      if (await Promise.race([pong, timer])) return;
+      if (ws.received !== seen) {
+        seen = ws.received;
+        movedAt = Date.now();
+      }
+      const now = Date.now();
+      if (now - movedAt > stillMs || now - started > limitMs) {
+        const states = ws.counts.has("state") ? `, ${ws.count("state")} states among them` : "";
+        throw new Error(`timed out waiting for the pong after the messages before it: ${now - started} ms, ` +
+          `the client read ${ws.received} bytes${states}, the last ${now - movedAt} ms ago`);
+      }
+    }
+  } finally {
+    ws.off("message", listener);
+  }
 }
 
 async function warmUp(ws, messageAt) {
@@ -3364,7 +3395,9 @@ test("journal flood: 100k control messages against a journal that stops answerin
   assert.equal(control.count("error"), 0, "control messages were refused");
   // States are snapshots: clients that fell behind skipped most, and catch up with the last.
   await waitFor(() => lastState?.paused === false, 5000, "the flooding client's current state");
-  for (const ws of [deaf, blind]) {
+  for (const [name, ws] of [["the /ws/control client that never read", deaf], ["the /ws/video client that never read", blind]]) {
+    const before = { states: ws.json("state").length, bytes: ws.received };
+    const resumed = Date.now();
     ws.socket.resume();
     // The current state follows once the backlog has drained, and on a busy machine Canvas
     // may still be working through the flood then: a client that went quiet on an old
@@ -3374,7 +3407,16 @@ test("journal flood: 100k control messages against a journal that stops answerin
       return ws.json("state").at(-1).paused === false;
     };
     await waitFor(caughtUp, 10_000, "the current state").catch(() => {});
-    assert.equal(ws.json("state").at(-1).paused, false, "a client that fell behind missed the current state");
+    const states = ws.json("state");
+    if (states.at(-1).paused !== false) {
+      const last = { ...states.at(-1) };
+      delete last.presets;
+      const now = await status(canvas);
+      assert.fail(`${name} missed the current state: ${Date.now() - resumed} ms after it read again it had ` +
+        `${states.length} states (${states.length - before.states} since) and ${ws.received} bytes ` +
+        `(${ws.received - before.bytes} since); its last state was ${JSON.stringify(last)}; ` +
+        `the Canvas has input_paused ${now.input_paused} and clients ${JSON.stringify(now.scrcpy)}`);
+    }
   }
   t.diagnostic(`clients got ${control.count("state")}, ${deaf.json("state").length} and ` +
     `${blind.json("state").length} of ${total} state messages`);
@@ -3388,6 +3430,148 @@ test("journal flood: 100k control messages against a journal that stops answerin
     assert.equal(records.filter((record) => record.payload.mode === mode).length, total / 2, `control ${mode}`);
   }
   assert.equal((await status(canvas)).input_paused, false);
+  await stopCanvas(canvas);
+});
+
+// Holds what the Canvas writes to a WebSocket opened with "X-Test-Link: held", from the
+// first message after its 101 answer on: a peer that reads nothing, but without the
+// kernel socket buffers, so all the Canvas sent it waits in the Canvas socket. SIGUSR2
+// lets every held link go, and they stay open from then on.
+const HELD_LINK = `data:text/javascript,${encodeURIComponent(`
+import { Server } from "node:http";
+const releases = [];
+const emit = Server.prototype.emit;
+Server.prototype.emit = function (event, request, socket, ...rest) {
+  if (event === "upgrade" && request.headers["x-test-link"] === "held") hold(socket);
+  return emit.call(this, event, request, socket, ...rest);
+};
+function hold(socket) {
+  const write = socket._write;
+  const writev = socket._writev;
+  // The 101 answer goes out; the link holds from the next write until SIGUSR2.
+  let answered = false;
+  let open = true;
+  let held = null;
+  const pass = (send) => {
+    if (open) send();
+    else held = send;
+    if (!answered) {
+      answered = true;
+      open = false;
+    }
+  };
+  socket._write = function (chunk, encoding, callback) {
+    pass(() => write.call(this, chunk, encoding, callback));
+  };
+  socket._writev = function (chunks, callback) {
+    pass(() => writev.call(this, chunks, callback));
+  };
+  releases.push(() => {
+    open = true;
+    const send = held;
+    held = null;
+    send?.();
+  });
+}
+process.on("SIGUSR2", () => {
+  for (const release of releases.splice(0)) release();
+  process.stderr.write("held links open\\n");
+});
+`)}`;
+
+// A larger high-water mark than Node's default for every stream of the Canvas.
+const LARGE_HIGH_WATER = `data:text/javascript,${encodeURIComponent(`
+import { setDefaultHighWaterMark } from "node:stream";
+setDefaultHighWaterMark(false, 256 * 1024);
+`)}`;
+
+/** A video and a control client of the page whose links hold everything after the upgrade. */
+async function heldClients(canvas, auth) {
+  const headers = { "X-Test-Link": "held" };
+  const video = await pageSocket(canvas, auth, "/ws/video", headers);
+  const control = await pageSocket(canvas, auth, "/ws/control", headers);
+  await waitFor(async () => {
+    const { scrcpy } = await status(canvas);
+    return scrcpy.video_clients === 1 && scrcpy.control_clients === 2 && scrcpy.key_frames >= 1;
+  }, 5000, "both held clients and the key frame the video client asked for");
+  return { video, control };
+}
+
+async function openHeldLinks(canvas) {
+  canvas.child.kill("SIGUSR2");
+  await waitFor(() => canvas.output().includes("held links open"), 5000, "the held links to open");
+}
+
+/** A state message without the constant presets, for messages. */
+function stateText(state) {
+  const shown = { ...state };
+  delete shown.presets;
+  return JSON.stringify(shown);
+}
+
+test("state catch-up: a client that fell behind gets the current state once its socket drains, whatever the socket's high-water mark", async (t) => {
+  // With a high-water mark above the state bound, a client can be behind by more than the
+  // bound while its socket owes no "drain" event, so that event alone never catches it up.
+  const { canvas, auth, control } = await connectedControl(t, {
+    nodeArgs: ["--import", HELD_LINK, "--import", LARGE_HIGH_WATER],
+  });
+  const behind = await heldClients(canvas, auth);
+  // About 550 KB of states that all say paused, past the state bound and the high-water
+  // mark, then the current one, which does not.
+  const pauses = 1000;
+  for (let i = 0; i < pauses; i += 1) control.send({ t: "control", mode: "pause" });
+  control.send({ t: "control", mode: "resume" });
+  await allHandled(control);
+  assert.equal(control.json("state").at(-1).paused, false);
+  await openHeldLinks(canvas);
+  for (const [name, ws] of Object.entries(behind)) {
+    await waitFor(() => ws.json("state").at(-1)?.paused === false, 5000, `the current state on the ${name} client`)
+      .catch(() => assert.fail(`the ${name} client that fell behind missed the current state: it got ` +
+        `${ws.json("state").length} states, the last ${stateText(ws.json("state").at(-1))}`));
+    // Skipped states stay skipped: a client behind keeps at most a bound of them.
+    assert.ok(ws.json("state").length < pauses, `the ${name} client got every state`);
+  }
+  t.diagnostic(`the held clients got ${behind.video.json("state").length} and ` +
+    `${behind.control.json("state").length} of ${pauses + 1} states`);
+  await stopCanvas(canvas);
+});
+
+test("state catch-up: a client whose backlog never drains gets the current state ahead of the next packet or reply it is sent", async (t) => {
+  // A client behind on a slow link whose backlog never empties gets no "drain" event: the
+  // video packets or replies it is sent anyway are its only chance of the current state.
+  const { canvas, auth, device, control } = await connectedControl(t, { nodeArgs: ["--import", HELD_LINK] });
+  const behind = await heldClients(canvas, auth);
+  // More than the state bound of states that all say paused, then the current one.
+  const pauses = 200;
+  for (let i = 0; i < pauses; i += 1) control.send({ t: "control", mode: "pause" });
+  control.send({ t: "control", mode: "resume" });
+  await allHandled(control);
+  const { packets } = (await status(canvas)).scrcpy;
+  // The next packet for the video client; an error reply, then a key press it can watch on
+  // the device, for the control client (its messages are handled in order).
+  const next = device.sendPacket({ size: 200 }).readUInt32BE(5);
+  const keys = device.count("key");
+  behind.control.send("not json");
+  behind.control.send({ t: "key", a: "down", code: 29 });
+  behind.control.send({ t: "key", a: "up", code: 29 });
+  await waitFor(async () => (await status(canvas)).scrcpy.packets > packets && device.count("key") === keys + 2,
+    5000, "the packet and the key press handled");
+  await openHeldLinks(canvas);
+  await waitFor(() => behind.video.packets().some((packet) => packet.seq === next), 5000, "the next packet");
+  await waitFor(() => behind.control.json("error").length === 1, 5000, "the error reply");
+  const before = (ws, isNext) => {
+    const at = ws.messages.findIndex(isNext);
+    return ws.messages.slice(0, at).filter((message) => message.json?.t === "state").map((message) => message.json);
+  };
+  const cases = [
+    ["video", "packet", before(behind.video, (message) => message.binary?.[0] === 3 && message.binary.readUInt32BE(15) === next)],
+    ["control", "reply", before(behind.control, (message) => message.json?.t === "error")],
+  ];
+  for (const [name, what, states] of cases) {
+    assert.ok(states.length < pauses, `the ${name} client got every state`);
+    assert.equal(states.at(-1)?.paused, false, `the ${name} client that fell behind got the next ${what} ` +
+      `before the current state; the last of its ${states.length} states before it: ${stateText(states.at(-1))}`);
+  }
   await stopCanvas(canvas);
 });
 

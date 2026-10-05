@@ -7,6 +7,18 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
 
 ## [Unreleased]
 
+### Fixed
+- **A Canvas page that fell behind always gets the current pause and owner
+  state.** A page more than 64 KiB behind skips state messages and was caught
+  up only when its socket emptied, or before a video packet if it was by then
+  under 64 KiB again. A page on a slow link whose backlog never emptied could
+  keep showing an old state (for example "paused" after input resumed). It
+  now gets the current state ahead of the next video packet or control reply
+  it is sent, whatever its backlog, and states are skipped only while the
+  socket owes a drain event, so a socket with a higher high-water mark than
+  Node's default still catches up. The journal flood test's waits now run on
+  while the Canvas makes progress and report which client fell behind.
+
 ## [0.33.0] - 2026-10-05
 
 ### Added
