@@ -307,7 +307,7 @@ No flag, code or field is added or removed.
 | scrcpy page presentation | only the newest decoded frame waits for a screen refresh; an earlier one is closed and counted in `framesDropped` | decoded frames are shown in order, at most two waiting, one per refresh; only a third waiting frame is dropped. `framesRendered` rises and `framesDropped` falls for the same stream; latency grows by about 6-13 ms on average |
 | `tests/live/canvas_scrcpy_live.mjs --case bench` | brow, input moves tied to animation frames, scrcpy compared with screencap | Playwright Chromium (headed off screen, `--headless` optional), input from a 16 ms timer; reports device, received, decoded, presented and distinct fps, latency and host load; passes on presented median >= 55 with distinct median >= 45 |
 
-### Mobile Canvas iOS volume, clipboard and pinch (Unreleased)
+### Mobile Canvas iOS volume, clipboard and pinch (0.34.0)
 
 Additive: messages that were refused on the iOS idb transport now act. The
 message shapes are unchanged; replies and the `state` field are additive.
@@ -321,7 +321,7 @@ message shapes are unchanged; replies and the `state` field are additive.
 | iOS `state` message | `orientation`, `rotation` | adds `clipboard` (true when paste and clipboard-get reach the Simulator clipboard) |
 | HTTP `POST /key` | `KEYCODE_VOLUME_UP`/`KEYCODE_VOLUME_DOWN` refused (`400 Unsupported key code`) | accepted on both platforms and passed to the action bridge: the device's volume key on Android, the Simulator's volume button on iOS |
 
-### Mobile Canvas Android stream size (Unreleased)
+### Mobile Canvas Android stream size (0.34.0)
 
 No `error_code` is added. The scrcpy default size changes and `0` becomes a
 valid `--max-size`; `/status` and `state` fields are additive.
