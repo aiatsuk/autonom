@@ -443,13 +443,31 @@ function buttonCode(button) {
 }
 
 /**
+ * HIDEvent { pinch: HIDPinch { center: Point, scale, duration, radius } } (HIDEvent field 4).
+ * The companion puts two fingers on a horizontal line `radius` points either side of
+ * `center`, moves them to `radius * scale` over `duration` seconds and lifts them.
+ */
+function encodeHidPinch(pinch) {
+  const x = requireNumber(pinch.center?.x, "pinch.center.x", { min: 0 });
+  const y = requireNumber(pinch.center?.y, "pinch.center.y", { min: 0 });
+  const scale = requireNumber(pinch.scale, "pinch.scale", { min: 0, exclusiveMin: true });
+  const duration = requireNumber(pinch.duration, "pinch.duration", { min: 0 });
+  const radius = requireNumber(pinch.radius, "pinch.radius", { min: 0, exclusiveMin: true });
+  const center = new ProtoWriter().double(1, x).double(2, y).finish();
+  const body = new ProtoWriter().message(1, center).double(2, scale).double(3, duration).double(4, radius).finish();
+  return new ProtoWriter().message(4, body).finish();
+}
+
+/**
  * HIDEvent { press: HIDPress { action: HIDPressAction { touch | button | key }, direction } }.
  * `event` is `{ touch: { x, y } }`, `{ button: "HOME" }` or `{ key: keycode }`, plus
  * `direction` ("down" or "up"). Touch points are logical points in the current
- * orientation.
+ * orientation. `{ pinch: { center: { x, y }, scale, duration, radius } }` is one canned
+ * two-finger pinch instead (no direction).
  */
 export function encodeHidEvent(event) {
   if (!event || typeof event !== "object") throw new TypeError("HID event must be an object.");
+  if (event.pinch) return encodeHidPinch(event.pinch);
   const direction = directionCode(event.direction);
   let action;
   if (event.touch) {
@@ -471,9 +489,21 @@ export function encodeHidEvent(event) {
   return new ProtoWriter().message(1, press).finish();
 }
 
-/** Inverse of encodeHidEvent for press events; null for any other HID event. */
+/** Inverse of encodeHidEvent for press and pinch events; null for any other HID event. */
 export function decodeHidEvent(buf) {
-  const press = fieldBytes(lastFields(buf), 1);
+  const event = lastFields(buf);
+  const pinch = fieldBytes(event, 4);
+  if (pinch && !event.has(1)) {
+    const p = lastFields(pinch);
+    const center = lastFields(fieldBytes(p, 1) ?? Buffer.alloc(0));
+    return {
+      pinch: {
+        center: { x: fieldDouble(center, 1), y: fieldDouble(center, 2) },
+        scale: fieldDouble(p, 2), duration: fieldDouble(p, 3), radius: fieldDouble(p, 4),
+      },
+    };
+  }
+  const press = fieldBytes(event, 1);
   if (!press) return null;
   const p = lastFields(press);
   const direction = fieldUint(p, 2) === HID_DIRECTION.UP ? "up" : "down";
@@ -1477,6 +1507,11 @@ export class IdbHidStream {
 
   keyDown(keycode) {
     return this.send({ key: keycode, direction: "down" });
+  }
+
+  /** One canned two-finger pinch: `{ center: { x, y }, scale, duration, radius }` in points and seconds. */
+  pinch(pinch) {
+    return this.send({ pinch });
   }
 
   keyUp(keycode) {

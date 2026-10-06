@@ -15,12 +15,14 @@
  *
  *   node tests/live/canvas_scrcpy_live.mjs --serial <adb-serial> --case <name> \
  *     [--evidence-dir DIR] [--scrcpy-server <scrcpy-server-v4.1> [--scrcpy-version X.Y]] \
- *     [--adb PATH] [--brow PATH] [--keep-home] \
+ *     [--adb PATH] [--brow PATH] [--keep-home] [--max-size PX] \
  *     [--repeat 3] [--drags 20] [--seconds 10] [--playwright DIR] [--headless]
  *
  * Without --scrcpy-server the Canvas finds the server itself (AUTONOM_SCRCPY_SERVER,
  * SCRCPY_SERVER_PATH, then an installed scrcpy), and the report records which source
- * it used. Cases: picture, bench, tabs, restart, input, journal, display. Each writes
+ * it used. --max-size is handed to every Canvas (0 is native size); without it the Canvas
+ * picks the scrcpy size from the device's H.264 encoder, and the bench report records the
+ * size and encoder it chose. Cases: picture, bench, tabs, restart, input, journal, display. Each writes
  * <evidence-dir>/<case>.json (--out is another name for --evidence-dir), with the steps
  * done so far also when the case fails midway, and exits non-zero when its oracle fails.
  *
@@ -164,6 +166,7 @@ const { values: args } = parseCliArgs({
     playwright: { type: "string" },
     headless: { type: "boolean", default: false },
     "keep-home": { type: "boolean", default: false },
+    "max-size": { type: "string" },
   },
 });
 
@@ -171,7 +174,7 @@ function usage(message) {
   console.error(`canvas_scrcpy_live: ${message}`);
   console.error(`usage: canvas_scrcpy_live.mjs --serial SERIAL --case ${CASES.join("|")} ` +
     "[--evidence-dir DIR] [--scrcpy-server PATH [--scrcpy-version X.Y]] [--adb PATH] [--brow PATH] " +
-    "[--repeat N] [--drags N] [--seconds N] [--playwright DIR] [--headless] [--keep-home]");
+    "[--max-size PX] [--repeat N] [--drags N] [--seconds N] [--playwright DIR] [--headless] [--keep-home]");
   process.exit(2);
 }
 
@@ -182,6 +185,9 @@ if (args["scrcpy-version"] && !args["scrcpy-server"]) {
 }
 for (const name of ["repeat", "drags", "seconds"]) {
   if (!/^[1-9]\d*$/.test(args[name])) usage(`--${name} must be a positive whole number`);
+}
+if (args["max-size"] !== undefined && !/^(0|[1-9]\d*)$/.test(args["max-size"])) {
+  usage("--max-size must be 0 (native size) or a whole number of pixels");
 }
 if (args["evidence-dir"] && args.out && resolve(args["evidence-dir"]) !== resolve(args.out)) {
   usage("--out is another name for --evidence-dir; give one directory");
@@ -325,6 +331,7 @@ async function startCanvas(transport, extraEnv = {}, { unsetEnv = [] } = {}) {
     argv.push("--scrcpy-server", serverPath);
     if (args["scrcpy-version"]) argv.push("--scrcpy-version", args["scrcpy-version"]);
   }
+  if (args["max-size"] !== undefined) argv.push("--max-size", args["max-size"]);
   const env = { ...liveEnv, ...extraEnv };
   for (const name of unsetEnv) delete env[name];
   const child = spawn(process.execPath, argv, {
@@ -779,6 +786,24 @@ function fpsReport(measured, cpuBusyPct) {
   };
 }
 
+/**
+ * The scrcpy stream size the Canvas chose (0 is native) and why, from its /status:
+ * --max-size, the device's H.264 encoder, or the 1280 default when the encoders could not
+ * be read; the video size it got is in each run's fps.video.
+ */
+function streamReport(body) {
+  const scrcpy = body?.scrcpy ?? null;
+  return {
+    max_size_flag: args["max-size"] === undefined ? null : Number(args["max-size"]),
+    max_size: scrcpy?.max_size ?? null,
+    max_size_source: scrcpy?.max_size_source ?? null,
+    encoder: scrcpy?.encoder ?? null,
+    encoder_name: scrcpy?.encoder_name ?? null,
+    width: scrcpy?.width ?? null,
+    height: scrcpy?.height ?? null,
+  };
+}
+
 /** Runs land in `into.runs` as they finish, so a failing run leaves the earlier ones in the report. */
 async function benchScrcpy(browser, repeat, drags, seconds, into) {
   const runs = (into.runs = []);
@@ -799,6 +824,7 @@ async function benchScrcpy(browser, repeat, drags, seconds, into) {
       // The list is back near its top between the two parts: Settings opened afresh.
       await resetSettings();
       const { latencies } = await measureLatency(page, drags);
+      item.stream = streamReport(await canvas.status());
       const cpuAfter = await cpuSeconds(canvas.child.pid);
       const framesAfter = (await page.evaluate(() => window.autonomCanvas.stats())).framesRendered;
       const frames = Math.max(1, framesAfter - framesBefore);
@@ -825,6 +851,8 @@ async function benchScrcpy(browser, repeat, drags, seconds, into) {
   }
   const middle = (key) => median(runs.map((item) => item[key]));
   return Object.assign(into, {
+    // What the first run streamed at; every run of a bench asks the same device.
+    stream: runs[0]?.stream ?? null,
     presented_fps_median: middle("presented_fps_median"),
     distinct_fps_median: middle("distinct_fps_median"),
     device_fps_median: middle("device_fps_median"),
@@ -1134,6 +1162,7 @@ const cases = {
       browser = await chromium.launch({ headless: browserMode.headless, args: browserMode.args });
       report.browser.version = browser.version();
       const scrcpy = await benchScrcpy(browser, repeat, drags, seconds, (report.scrcpy = {}));
+      report.stream = scrcpy.stream;
       report.bars = {
         presented_median_at_least_55: scrcpy.presented_fps_median !== null && scrcpy.presented_fps_median >= PRESENTED_BAR,
         distinct_median_at_least_45: scrcpy.distinct_fps_median !== null && scrcpy.distinct_fps_median >= DISTINCT_BAR,

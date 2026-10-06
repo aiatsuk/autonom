@@ -4,6 +4,8 @@ import test from "node:test";
 import {
   DEFAULT_BIT_RATE,
   DEFAULT_FPS,
+  DEFAULT_MAX_SIZE,
+  SOFTWARE_ENCODER_MAX_SIZE,
   STREAM_KEYCODES,
   encodeAdbText,
   extractJpegFrames,
@@ -16,6 +18,8 @@ import {
   parseControlMessage,
   parseCookies,
   parseWmSize,
+  screenrecordMaxSize,
+  streamMaxSize,
 } from "../plugins/autonom/skills/android-emulator-browser/scripts/browser-lib.mjs";
 
 test("parseArgs returns secure defaults and explicit overrides", () => {
@@ -65,6 +69,50 @@ test("parseArgs accepts the scrcpy transport and its server options", () => {
   assert.equal(parseArgs(["--fps", "15"]).fpsExplicit, true);
   assert.throws(() => parseArgs(["--scrcpy-version", "4.1"]), /--scrcpy-server/);
   assert.throws(() => parseArgs(["--scrcpy-server", "x", "--scrcpy-version", "four"]), /look like 4\.1/);
+});
+
+test("parseArgs marks an explicit --max-size and accepts 0 as native size", () => {
+  const defaults = parseArgs([]);
+  assert.equal(defaults.maxSize, DEFAULT_MAX_SIZE);
+  assert.equal(DEFAULT_MAX_SIZE, 1280);
+  assert.equal(defaults.maxSizeExplicit, undefined);
+  assert.deepEqual([parseArgs(["--max-size", "1280"]).maxSize, parseArgs(["--max-size", "1280"]).maxSizeExplicit],
+    [1280, true]);
+  assert.deepEqual([parseArgs(["--max-size", "0"]).maxSize, parseArgs(["--max-size", "0"]).maxSizeExplicit], [0, true]);
+  assert.equal(parseArgs(["--max-size", "320"]).maxSize, 320);
+  assert.equal(parseArgs(["--max-size", "4096"]).maxSize, 4096);
+  for (const value of ["319", "4097", "-1", "1.5", "native", ""]) {
+    assert.throws(() => parseArgs(["--max-size", value]), /--max-size/, value);
+  }
+  assert.throws(() => parseArgs(["--max-size", "100"]), /0 \(native size\) or an integer from 320 to 4096/);
+});
+
+test("streamMaxSize follows the encoder only without --max-size", () => {
+  const software = { encoder: "software", name: "c2.android.avc.encoder" };
+  const hardware = { encoder: "hardware", name: "c2.qti.avc.encoder" };
+  const defaults = parseArgs([]);
+  assert.equal(SOFTWARE_ENCODER_MAX_SIZE, 2048);
+  assert.deepEqual(streamMaxSize(defaults, software),
+    { maxSize: 2048, source: "encoder", encoder: "software", encoderName: "c2.android.avc.encoder" });
+  assert.deepEqual(streamMaxSize(defaults, hardware),
+    { maxSize: 0, source: "encoder", encoder: "hardware", encoderName: "c2.qti.avc.encoder" });
+  // A failed probe, or one whose answer says nothing usable, keeps the old default.
+  for (const probe of [null, undefined, {}, { encoder: "unknown", name: "x" }]) {
+    assert.deepEqual(streamMaxSize(defaults, probe),
+      { maxSize: 1280, source: "default", encoder: null, encoderName: null });
+  }
+  // An explicit size wins over any encoder, 0 included.
+  assert.deepEqual(streamMaxSize(parseArgs(["--max-size", "1024"]), hardware),
+    { maxSize: 1024, source: "explicit", encoder: "hardware", encoderName: "c2.qti.avc.encoder" });
+  assert.deepEqual(streamMaxSize(parseArgs(["--max-size", "0"])),
+    { maxSize: 0, source: "explicit", encoder: null, encoderName: null });
+  assert.deepEqual(streamMaxSize(parseArgs(["--max-size", "2048"]), software).maxSize, 2048);
+});
+
+test("screenrecordMaxSize never passes 0 to the screenrecord path", () => {
+  assert.equal(screenrecordMaxSize(parseArgs([])), 1280);
+  assert.equal(screenrecordMaxSize(parseArgs(["--max-size", "720"])), 720);
+  assert.equal(screenrecordMaxSize(parseArgs(["--max-size", "0"])), 4096);
 });
 
 test("tokens, keycodes, and conservative text encoding", () => {

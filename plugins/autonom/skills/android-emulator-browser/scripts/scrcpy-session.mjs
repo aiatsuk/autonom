@@ -22,6 +22,8 @@ import {
   VIDEO_CODEC_ID_H264,
   VIDEO_HEADER_LENGTH,
   encodeEmpty,
+  h264EncoderKind,
+  parseH264Encoders,
   parseScrcpyVersion,
   parseVideoHeader,
 } from "./scrcpy-lib.mjs";
@@ -46,6 +48,9 @@ const CONNECT_ATTEMPT_MS = 2000;
 const CHILD_EXIT_GRACE_MS = 1000;
 const ADB_COMMAND_TIMEOUT_MS = 2000;
 const PUSH_TIMEOUT_MS = 30_000;
+// The encoder list takes about 0.3 s on an emulator; past this bound the Canvas streams
+// without it (the size it uses when it cannot tell).
+export const ENCODER_PROBE_TIMEOUT_MS = 3000;
 // A media packet larger than this is a broken stream, not a frame.
 const MAX_PACKET_BYTES = 64 * 1024 * 1024;
 const LOG_TAIL_CHARS = 4000;
@@ -149,6 +154,41 @@ export async function resolveScrcpyServer({
   return { ok: true, source, serverPath: path, version: found };
 }
 
+// serial -> the promise of its encoder probe: a device is asked once per Canvas, also
+// when the probe failed, so a restart never waits for it again.
+const encoderProbes = new Map();
+
+/**
+ * Which H.264 encoders the device offers, from the scrcpy-server already pushed to
+ * REMOTE_SERVER_PATH run with `list_encoders=true`: {encoder: "hardware"|"software",
+ * name, encoders} (see h264EncoderKind), or null when the run fails, takes longer than
+ * `timeoutMs` or lists nothing that says. Never rejects. `cleanup=false` keeps the
+ * server file, which the server otherwise deletes as it starts, for the stream after it.
+ * Asked once per serial; later calls get the first answer.
+ */
+export function probeVideoEncoders({
+  adbPath,
+  serial,
+  version = SCRCPY_PROTOCOL_VERSION,
+  exec = defaultExec,
+  timeoutMs = ENCODER_PROBE_TIMEOUT_MS,
+}) {
+  let probe = encoderProbes.get(serial);
+  if (!probe) {
+    const command = [`CLASSPATH=${REMOTE_SERVER_PATH}`, "app_process", "/", SERVER_CLASS, version,
+      "log_level=info", "cleanup=false", "list_encoders=true"].join(" ");
+    probe = Promise.resolve()
+      .then(() => exec(adbPath, ["-s", serial, "shell", command], { timeout: timeoutMs }))
+      .then(({ stdout }) => {
+        const encoders = parseH264Encoders(stdout);
+        const kind = h264EncoderKind(encoders);
+        return kind && { ...kind, encoders };
+      }, () => null);
+    encoderProbes.set(serial, probe);
+  }
+  return probe;
+}
+
 /**
  * Restart policy after an unexpected exit: 1 s doubling up to 10 s, back to 1 s once
  * the server had streamed for 30 s. Returns this delay and the backoff after it.
@@ -216,6 +256,8 @@ function codecProblem(codec) {
 
 /**
  * States: idle → starting → streaming ↔ restarting → stopped.
+ * With `chooseMaxSize`, each attempt asks probeVideoEncoders (once per serial) after the
+ * push and streams at chooseMaxSize(result), instead of at `maxSize`.
  * Events: state(name), session({width, height}), config(Buffer),
  * packet({keyFrame, pts, data}), device-message(message), control-drain(),
  * error(Error), exit({code, signal}).
@@ -241,6 +283,7 @@ export class ScrcpySession extends EventEmitter {
   #stats = { packets: 0, bytes: 0, keyFrames: 0, restarts: 0 };
   #size = null;
   #deviceName = null;
+  #maxSize = null;
 
   constructor({
     adbPath,
@@ -248,6 +291,7 @@ export class ScrcpySession extends EventEmitter {
     serverPath,
     version = SCRCPY_PROTOCOL_VERSION,
     maxSize,
+    chooseMaxSize = null,
     bitRate,
     maxFps,
     exec = defaultExec,
@@ -255,7 +299,7 @@ export class ScrcpySession extends EventEmitter {
     connect = nodeConnect,
   }) {
     super();
-    this.#options = { adbPath, serial, serverPath, version, maxSize, bitRate, maxFps };
+    this.#options = { adbPath, serial, serverPath, version, maxSize, chooseMaxSize, bitRate, maxFps };
     this.#exec = exec;
     this.#spawn = spawn;
     this.#connect = connect;
@@ -277,6 +321,7 @@ export class ScrcpySession extends EventEmitter {
   get stats() {
     return {
       state: this.#state,
+      maxSize: this.#maxSize,
       width: this.#size?.width ?? null,
       height: this.#size?.height ?? null,
       deviceName: this.#deviceName,
@@ -390,9 +435,17 @@ export class ScrcpySession extends EventEmitter {
   }
 
   async #open(attempt) {
-    const { serverPath, version, maxSize, bitRate, maxFps } = this.#options;
+    const { serverPath, version, chooseMaxSize, bitRate, maxFps } = this.#options;
     await this.#adb(["push", serverPath, REMOTE_SERVER_PATH], PUSH_TIMEOUT_MS);
     this.#checkAttempt(attempt);
+    let { maxSize } = this.#options;
+    if (chooseMaxSize) {
+      const { adbPath, serial } = this.#options;
+      const encoders = await probeVideoEncoders({ adbPath, serial, version, exec: this.#exec });
+      this.#checkAttempt(attempt);
+      maxSize = chooseMaxSize(encoders);
+    }
+    this.#maxSize = maxSize;
     // A teardown that starts while adb is still answering waits for this to remove the forward.
     attempt.forwarding = this.#forward(attempt);
     await attempt.forwarding;

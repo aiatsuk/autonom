@@ -4198,8 +4198,11 @@ CANVAS_IDB_CAPABILITY = "canvas.idb"
 CANVAS_IDB_BIN_ENV = "AUTONOM_IDB_COMPANION_BIN"
 CANVAS_IDB_HINT = ("Install it with `brew install facebook/fb/idb-companion`, set "
                    "AUTONOM_IDB_COMPANION_BIN to its path, or pass --idb-companion PATH.")
-# The same bounds as parseArgs in browser-lib.mjs.
+# The same bounds as parseArgs in browser-lib.mjs, which also takes 0 (native size).
 CANVAS_MAX_SIZE = (320, 4096)
+CANVAS_MAX_SIZE_HINT = ("Without --max-size scrcpy follows the device's H.264 encoder (2048 when "
+                        "software only, native with a hardware one, 1280 when it cannot tell); "
+                        "screenrecord uses 1280.")
 CANVAS_BIT_RATE = (100_000, 100_000_000)
 SCRCPY_VERSION_TEXT = re.compile(doctor_mod.SCRCPY_VERSION_TOKEN)
 
@@ -4282,7 +4285,12 @@ def cmd_canvas_serve(args: argparse.Namespace) -> int:
         raise errors.AutonomError(
             errors.INVALID_VALUE, f"--fps must be 1..60, got {args.fps}",
             "The default is 15, and 60 on the scrcpy and idb transports.")
-    _canvas_bounded("--max-size", args.max_size, CANVAS_MAX_SIZE, "1280")
+    if args.max_size not in (None, 0) and not (
+            CANVAS_MAX_SIZE[0] <= args.max_size <= CANVAS_MAX_SIZE[1]):
+        raise errors.AutonomError(
+            errors.INVALID_VALUE,
+            f"--max-size must be 0 (native size) or {CANVAS_MAX_SIZE[0]}..{CANVAS_MAX_SIZE[1]}, "
+            f"got {args.max_size}", CANVAS_MAX_SIZE_HINT)
     _canvas_bounded("--bit-rate", args.bit_rate, CANVAS_BIT_RATE, "12000000")
     scrcpy_server = _canvas_scrcpy_server(args)
     idb = _canvas_idb_lookup(args)
@@ -4777,7 +4785,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--fps", type=int,
                    help="frame rate cap (default 15; 60 on the scrcpy and idb transports)")
     p.add_argument("--max-size", type=int, metavar="PX",
-                   help="maximum video width in pixels (default 1280)")
+                   help="longest video side in pixels on scrcpy (video width on screenrecord), "
+                        "0 for native size; default on scrcpy: 2048 with a software-only "
+                        "H.264 encoder, native with a hardware one, 1280 when the encoders "
+                        "cannot be read; 1280 otherwise")
     p.add_argument("--bit-rate", type=int, metavar="BPS",
                    help="H.264 bit rate in bits per second (default 12000000)")
     p.add_argument("--scrcpy-server", metavar="PATH",

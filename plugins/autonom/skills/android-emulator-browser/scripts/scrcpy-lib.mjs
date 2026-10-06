@@ -372,6 +372,45 @@ export function parseScrcpyVersion(text) {
   return file ? file[1] : null;
 }
 
+// One video encoder line of scrcpy's `list_encoders=true` output, for example
+// "    --video-codec=h264 --video-encoder=c2.android.avc.encoder   (sw)". Android 10 and
+// later add "(hw)" or "(sw)", then "[vendor]" and "(alias for NAME)" where they apply.
+const ENCODER_LINE = /^\s*--video-codec=(\S+)\s+--video-encoder=(\S+)(.*)$/;
+
+/**
+ * The H.264 video encoders scrcpy-server lists with `list_encoders=true`, in its order:
+ * [{name, hardware, alias}]. `hardware` is true for "(hw)", false for "(sw)" and null
+ * when the line says neither (Android 9 and older); `alias` is true for an alias line.
+ */
+export function parseH264Encoders(text) {
+  const encoders = [];
+  for (const line of String(text ?? "").split(/\r?\n/)) {
+    const match = ENCODER_LINE.exec(line);
+    if (!match || match[1] !== "h264") continue;
+    const details = match[3];
+    const hardware = /\(hw\)/.test(details) ? true : /\(sw\)/.test(details) ? false : null;
+    encoders.push({ name: match[2], hardware, alias: /\(alias for /.test(details) });
+  }
+  return encoders;
+}
+
+/**
+ * What a list of H.264 encoders offers: {encoder: "hardware", name} when one of them is
+ * "(hw)", {encoder: "software", name} when every one is "(sw)", null when there is none
+ * or a line says neither (the Canvas then cannot tell). `name` is the first encoder of
+ * that kind that is not an alias.
+ */
+export function h264EncoderKind(encoders) {
+  if (!Array.isArray(encoders) || !encoders.length) return null;
+  const first = (hardware) => {
+    const matching = encoders.filter((encoder) => encoder.hardware === hardware);
+    return (matching.find((encoder) => !encoder.alias) ?? matching[0]).name;
+  };
+  if (encoders.some((encoder) => encoder.hardware === true)) return { encoder: "hardware", name: first(true) };
+  if (encoders.every((encoder) => encoder.hardware === false)) return { encoder: "software", name: first(false) };
+  return null;
+}
+
 function letterKeys() {
   const keys = {};
   for (let i = 0; i < 26; i += 1) keys[`Key${String.fromCharCode(65 + i)}`] = 29 + i;

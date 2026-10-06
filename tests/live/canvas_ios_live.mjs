@@ -20,7 +20,7 @@
  * --keep-home is given.
  *
  *   node tests/live/canvas_ios_live.mjs --udid 3760A5A8-E59D-4AE6-B1AF-A626908D7B61 \
- *     --case video|input [--evidence-dir DIR] [--idb-companion PATH] [--playwright DIR] \
+ *     --case video|input|controls [--evidence-dir DIR] [--idb-companion PATH] [--playwright DIR] \
  *     [--seconds 10] [--python python3] [--xcrun xcrun] [--idb idb] [--headless] [--keep-home]
  *
  * Playwright comes from --playwright, AUTONOM_PLAYWRIGHT, ~/pr/platform/node_modules/playwright,
@@ -46,6 +46,21 @@
  *          action is one journal record naming idb. Writes input.json. It reads the
  *          screen with `autonom ui tree`, which needs the companion the idb CLI uses; when
  *          none runs for the test Simulator, `idb connect` starts it and the case stops it.
+ *   controls through the Canvas control socket (as an agent, with the token): Volume up then
+ *          Volume down, read back as `sim_volume` in the Simulator's audiosettings.plist, which
+ *          must rise and then return (the Mac's output volume is read before and after, and
+ *          must not change), then the same through HTTP POST /key KEYCODE_VOLUME_UP/DOWN (the
+ *          action bridge presses the buttons with `idb ui button`). A freshly booted Simulator keeps a placeholder there until its audio
+ *          service writes the level, so the case waits 30 s after a boot it made, and while the
+ *          value is still a placeholder pairs of Volume up and Volume down (no net change) go
+ *          first (in the report as `priming`); a paste of the test string, read back with clipboard-get (the
+ *          report keeps only whether it matched); a mirrored two-finger pinch, which must be
+ *          one HID event sent at release, then a one-finger tap at the status bar (two HID
+ *          events); the journal must hold the pinch as a gesture with pointers 2, the tap as a
+ *          gesture with pointers 1, two system records (after any priming ones), two key records
+ *          (VOLUME_UP, VOLUME_DOWN) and one paste record. The Simulator
+ *          pasteboard is put back as found. Writes controls.json. Like input, it starts a
+ *          session and, when none runs, the idb CLI's companion, which types the paste.
  *
  * Each report has `ok` and the steps done so far also when the case fails midway; the
  * script exits non-zero when its oracle fails.
@@ -62,7 +77,7 @@ import { parseArgs as parseCliArgs } from "node:util";
 const ROOT = resolve(import.meta.dirname, "../..");
 const CANVAS = join(ROOT, "plugins/autonom/skills/android-emulator-browser/scripts/android-emulator-browser.mjs");
 const AUTONOM = join(ROOT, "scripts/autonom.py");
-const CASES = ["video", "input"];
+const CASES = ["video", "input", "controls"];
 // The only Simulator these cases may touch (C-4).
 const TEST_UDID = "3760A5A8-E59D-4AE6-B1AF-A626908D7B61";
 const TEST_NAME = "Autonom-Fast-Test";
@@ -114,6 +129,11 @@ const OFF_SCREEN_WINDOW = "--window-position=3000,3000";
 const SEARCH_TEXT = "bluetooth";
 // After the scrolling stops: a key frame comes every 2 s and settled frames sharpen.
 const SETTLE_MS = 2500;
+// The controls case: the only text it pastes, and where the Simulator keeps its volume.
+const CLIP_TEXT = "autonom-clip-test";
+const VOLUME_SETTLE_MS = 30_000;
+const AUDIO_SETTINGS = join(homedir(), "Library/Developer/CoreSimulator/Devices", TEST_UDID,
+  "data/var/run/simulatoraudio/audiosettings.plist");
 
 const { values: args } = parseCliArgs({
   options: {
@@ -194,6 +214,9 @@ async function simulator() {
   return device;
 }
 
+// When this run booted the Simulator (Date.now() at the end of bootstatus), else null.
+let bootedAt = null;
+
 /** Boot the Simulator only when it is shut down; returns how to put it back. */
 async function prepareSimulator(report) {
   const device = await simulator();
@@ -204,6 +227,7 @@ async function prepareSimulator(report) {
     report.simulator.booted_by_case = true;
     const status = await simctl(["bootstatus", udid, "-b"], { timeout: 300_000 });
     if (status.code !== 0) throw new Error(`simctl bootstatus failed: ${status.stderr}`);
+    bootedAt = Date.now();
   } else if (device.state !== "Booted") {
     throw new Error(`${TEST_NAME} is ${device.state}; it must be Booted or Shutdown`);
   }
@@ -342,7 +366,7 @@ async function startCanvas() {
   const origin = new URL(url).origin;
   const headers = { Authorization: `Bearer ${token}` };
   return {
-    child, url, origin, exited, output: () => output,
+    child, url, origin, token, exited, output: () => output,
     async status() {
       return await (await fetch(`${origin}/status`, { headers })).json();
     },
@@ -896,6 +920,106 @@ async function heldDrag(page) {
   });
 }
 
+/** `sim_volume` of the test Simulator (read only), or null when it cannot be read. */
+async function simVolume() {
+  const read = await run("plutil", ["-extract", "sim_volume", "raw", "-o", "-", AUDIO_SETTINGS]);
+  const value = Number(read.stdout.trim());
+  return read.code === 0 && read.stdout.trim() !== "" && Number.isFinite(value) ? value : null;
+}
+
+/** Whether `value` is a level the Simulator writes (floor(k * 6.25)), not its boot placeholder. */
+function volumeOnGrid(value) {
+  return value !== null && Array.from({ length: 17 }, (_, k) => Math.floor(k * 6.25)).includes(value);
+}
+
+/** The Mac's output volume (read only), to show the Simulator buttons leave it alone. */
+async function hostVolume() {
+  const read = await run("osascript", ["-e", "output volume of (get volume settings)"]);
+  return read.code === 0 ? read.stdout.trim() : null;
+}
+
+/** `xcrun simctl <argv>` with `input` on stdin; resolves with its exit code only. */
+function simctlWithInput(argv, input) {
+  return new Promise((resolvePromise) => {
+    const child = spawn(args.xcrun, ["simctl", ...argv], { env: liveEnv, stdio: ["pipe", "ignore", "ignore"] });
+    child.on("error", () => resolvePromise(1));
+    child.on("close", (code) => resolvePromise(code ?? 1));
+    child.stdin.on("error", () => {});
+    child.stdin.end(input);
+  });
+}
+
+/**
+ * The Canvas control socket opened with the token as an agent. `next` resolves with the first
+ * message (seen so far or later) that matches; replies are kept only in memory.
+ */
+async function controlSocket(canvas) {
+  const url = `${canvas.origin.replace(/^http/, "ws")}/ws/control?token=${encodeURIComponent(canvas.token)}&origin=agent`;
+  const ws = new WebSocket(url);
+  const messages = [];
+  const waiters = new Set();
+  ws.onmessage = (event) => {
+    let message;
+    try {
+      message = JSON.parse(event.data);
+    } catch {
+      return;
+    }
+    messages.push(message);
+    for (const waiter of [...waiters]) {
+      if (!waiter.predicate(message)) continue;
+      waiters.delete(waiter);
+      clearTimeout(waiter.timer);
+      waiter.resolve(message);
+    }
+  };
+  await new Promise((resolvePromise, reject) => {
+    ws.onopen = resolvePromise;
+    ws.onerror = () => reject(new Error("the control socket did not open"));
+  });
+  let pings = 0;
+  const socket = {
+    send: (message) => ws.send(JSON.stringify(message)),
+    next(predicate, timeoutMs = 10_000, what = "a control message", { since = 0 } = {}) {
+      const found = messages.slice(since).find(predicate);
+      if (found) return Promise.resolve(found);
+      return new Promise((resolvePromise, reject) => {
+        const waiter = { predicate, resolve: resolvePromise };
+        waiter.timer = setTimeout(() => {
+          waiters.delete(waiter);
+          reject(new Error(`timed out waiting for ${what}`));
+        }, timeoutMs);
+        waiters.add(waiter);
+      });
+    },
+    /** Resolves once every message sent before it was handled (messages run in order). */
+    async handled(timeoutMs = 30_000) {
+      const ts = -(++pings);
+      const since = messages.length;
+      socket.send({ t: "ping", ts });
+      await socket.next((message) => message.t === "pong" && message.ts === ts, timeoutMs, "the pong", { since });
+    },
+    mark: () => messages.length,
+    // Error replies only: they name what failed, never clipboard text.
+    errors: () => messages.filter((message) => message.t === "error").map((message) => ({ for: message.for, message: message.message })),
+    close: () => ws.close(),
+  };
+  return socket;
+}
+
+/** Canvas journal entries (verbs and details) of the run's session; only lengths of text. */
+async function canvasJournal() {
+  const listed = await autonom(["journal", "--max", "200"]);
+  const journal = JSON.parse(listed.stdout || "{}");
+  const all = (journal.entries ?? []).filter((entry) => entry.verb?.startsWith("ui "));
+  const allDetails = await Promise.all(all.map(async (entry) => entry.result?.detail
+    ? JSON.parse(await readFile(join(dirname(journal.journal), entry.result.detail), "utf8").catch(() => "null"))
+    : null));
+  const entries = all.filter((_, index) => allDetails[index]?.canvas === true);
+  const details = allDetails.filter((detail) => detail?.canvas === true);
+  return { entries, details };
+}
+
 /** Mark `report.ok` from its checks: every check passes and the case threw nothing. */
 function settle(report) {
   report.ok = !report.error && Boolean(report.checks) && Object.values(report.checks).every(Boolean);
@@ -1130,6 +1254,210 @@ const cases = {
   },
 };
 
+cases.controls = async function controls(report) {
+  report.host = { cpus: cpus().length, loadavg_start: hostLoad(), output_volume_before: await hostVolume() };
+  await prepareSimulator(report);
+  await ensureCliCompanion(report);
+  const started = await autonom(["session", "start"]);
+  if (started.code !== 0) throw new Error(`autonom session start failed: ${started.stderr || started.stdout}`);
+  report.session_id = JSON.parse(started.stdout).session?.session_id ?? null;
+  // The pasteboard as found, kept in memory only and put back at the end.
+  const original = await simctl(["pbpaste", udid]);
+  const companionsBefore = await canvasCompanions();
+  let canvas = null;
+  let control = null;
+  let companionPid = null;
+  try {
+    canvas = await startCanvas();
+    report.transport = (await canvas.status()).transport ?? null;
+    await freshSettings();
+    control = await controlSocket(canvas);
+    const state = await control.next((message) => message.t === "state" && message.session === "streaming", 30_000,
+      "a streaming session");
+    report.clipboard_available = state.clipboard === true;
+    companionPid = (await canvas.status()).idb?.companion_pid ?? null;
+
+    // The Simulator writes sim_volume as floor(k * 6.25), k = 0..16, once its audio service
+    // runs; until then (some seconds after boot) the file holds a placeholder (60) and button
+    // presses change the level without writing it. So while the value is off that grid,
+    // Volume up then Volume down (no net change) go first until the file shows the level.
+    // Its audio service starts some time after boot, so a Simulator this run booted gets
+    // VOLUME_SETTLE_MS from the end of boot before any press.
+    if (bootedAt !== null) await sleep(Math.max(0, bootedAt + VOLUME_SETTLE_MS - Date.now()));
+    const priming = [];
+    for (let attempt = 0; attempt < 8 && !volumeOnGrid(await simVolume()); attempt += 1) {
+      if (attempt) await sleep(3000);
+      for (const op of ["volume-up", "volume-down"]) {
+        control.send({ t: "system", op });
+        priming.push(op);
+        await sleep(600);
+      }
+      await waitFor(async () => (volumeOnGrid(await simVolume()) ? true : null), 2500, "sim_volume").catch(() => null);
+    }
+    // The start counts once the value has held still for a moment (a late write would move it).
+    for (let previous = null, value = await simVolume(), checks = 0; previous !== value && checks < 10; checks += 1) {
+      await sleep(1500);
+      previous = value;
+      value = await simVolume();
+    }
+    // Volume up, then down: the Simulator's own volume rises and comes back.
+    const start = await simVolume();
+    control.send({ t: "system", op: "volume-up" });
+    const afterUp = await waitFor(async () => {
+      const value = await simVolume();
+      return value !== null && start !== null && value > start ? { value } : null;
+    }, 5000, "sim_volume to rise").catch(() => null);
+    control.send({ t: "system", op: "volume-down" });
+    const afterDown = await waitFor(async () => {
+      const value = await simVolume();
+      return value !== null && value === start ? { value } : null;
+    }, 5000, "sim_volume to return").catch(() => null);
+    report.volume = {
+      plist: AUDIO_SETTINGS, priming, start, after_up: afterUp?.value ?? await simVolume(), after_down: afterDown?.value ?? await simVolume(),
+    };
+    report.volume.rose = afterUp !== null;
+    report.volume.returned = afterDown !== null;
+
+    // The same through HTTP POST /key with the Android names: the action bridge presses the
+    // Simulator's volume buttons with `idb ui button`.
+    const bridgeStart = await simVolume();
+    const pressKey = async (key) => {
+      const response = await fetch(`${canvas.origin}/key`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${canvas.token}`, "Content-Type": "application/json", "X-Autonom-Origin": "agent" },
+        body: JSON.stringify({ key }),
+      });
+      return { status: response.status, body: await response.json().catch(() => null) };
+    };
+    const keyUp = await pressKey("KEYCODE_VOLUME_UP");
+    const bridgeUp = await waitFor(async () => {
+      const value = await simVolume();
+      return value !== null && bridgeStart !== null && value > bridgeStart ? { value } : null;
+    }, 5000, "sim_volume to rise through the bridge").catch(() => null);
+    const keyDown = await pressKey("KEYCODE_VOLUME_DOWN");
+    const bridgeDown = await waitFor(async () => {
+      const value = await simVolume();
+      return value !== null && value === bridgeStart ? { value } : null;
+    }, 5000, "sim_volume to return through the bridge").catch(() => null);
+    report.bridge_volume = {
+      start: bridgeStart, up: { status: keyUp.status, key: keyUp.body?.key ?? null, error: keyUp.body?.error },
+      down: { status: keyDown.status, key: keyDown.body?.key ?? null, error: keyDown.body?.error },
+      after_up: bridgeUp?.value ?? null, after_down: bridgeDown?.value ?? await simVolume(),
+    };
+    report.bridge_volume.ok = keyUp.status === 200 && keyDown.status === 200 && bridgeUp !== null && bridgeDown !== null;
+
+    // Paste the test string, then read the clipboard back; only the match is reported.
+    const pasteMark = control.mark();
+    control.send({ t: "paste", text: CLIP_TEXT });
+    const pasted = await control.next((message) => message.t === "paste" || (message.t === "error" && message.for === "paste"),
+      30_000, "the paste reply", { since: pasteMark });
+    const readMark = control.mark();
+    control.send({ t: "clipboard-get" });
+    const read = await control.next((message) => message.t === "clipboard" ||
+      (message.t === "error" && message.for === "clipboard-get"), 15_000, "the clipboard reply", { since: readMark });
+    report.clipboard = {
+      text_len: CLIP_TEXT.length, paste_reply: pasted.t, typed: pasted.typed ?? null,
+      paste_error: pasted.t === "error" ? pasted.message : undefined,
+      read_reply: read.t, read_error: read.t === "error" ? read.message : undefined,
+      read_back_matches: read.t === "clipboard" && read.text === CLIP_TEXT,
+    };
+
+    // A mirrored pinch, as the page sends a Ctrl-drag (the mirror first), then a tap.
+    await control.handled();
+    await sleep(500);
+    const hidBefore = (await canvas.status()).idb?.hid_events;
+    control.send({ t: "touch", a: "down", id: -1001, x: 0.6, y: 0.55 });
+    control.send({ t: "touch", a: "down", id: 1, x: 0.4, y: 0.45 });
+    for (let step = 1; step <= 20; step += 1) {
+      const d = 0.1 + step * 0.006;
+      control.send({ t: "touch", a: "move", id: -1001, x: 0.5 + d, y: 0.5 + d / 2 });
+      control.send({ t: "touch", a: "move", id: 1, x: 0.5 - d, y: 0.5 - d / 2 });
+      await sleep(16);
+    }
+    await control.handled();
+    const hidBeforeRelease = (await canvas.status()).idb?.hid_events;
+    control.send({ t: "touch", a: "up", id: -1001, x: 0.62, y: 0.56 });
+    control.send({ t: "touch", a: "up", id: 1, x: 0.38, y: 0.44 });
+    await control.handled();
+    await sleep(2500);
+    const hidAfterPinch = (await canvas.status()).idb?.hid_events;
+    // The status bar: a tap there only scrolls a list to its top.
+    control.send({ t: "touch", a: "down", id: 2, x: 0.5, y: 0.03 });
+    await sleep(80);
+    control.send({ t: "touch", a: "up", id: 2, x: 0.5, y: 0.03 });
+    await control.handled();
+    await sleep(800);
+    const after = await canvas.status();
+    report.pinch = {
+      hid_events_before: hidBefore, hid_events_before_release: hidBeforeRelease, hid_events_after_pinch: hidAfterPinch,
+      hid_events_after_tap: after.idb?.hid_events, last_error: after.last_error ?? null,
+    };
+    report.pinch.nothing_before_release = Number.isInteger(hidBefore) && hidBeforeRelease === hidBefore;
+    report.pinch.one_event_at_release = Number.isInteger(hidBefore) && hidAfterPinch === hidBefore + 1;
+    report.pinch.tap_after = Number.isInteger(hidAfterPinch) && after.idb?.hid_events === hidAfterPinch + 2 &&
+      !/idb hid/.test(after.last_error ?? "");
+    report.control_errors = control.errors();
+
+    await sleep(1500);
+    const { entries, details } = await canvasJournal();
+    const verbs = {};
+    for (const entry of entries) verbs[entry.verb] = (verbs[entry.verb] ?? 0) + 1;
+    const gestures = details.filter((detail) => detail?.kind === "gesture");
+    report.journal = {
+      verbs,
+      origins: [...new Set(entries.map((entry) => entry.origin))],
+      gestures: gestures.map((detail) => ({ pointers: detail.pointers, moves: detail.moves, transport: detail.transport })),
+      // Only lengths: a paste record never holds its text.
+      pastes: details.filter((detail) => detail?.kind === "paste").map((detail) => ({ text_len: detail.text_len, has_text: "text" in detail })),
+      systems: details.filter((detail) => detail?.kind === "system").map((detail) => detail.op),
+      // The bridge's own key records (POST /key) name the iOS button they pressed.
+      keys: details.filter((detail) => detail?.kind === "key").map((detail) => detail.key),
+    };
+    report.journal.ok = gestures.length === 2 && gestures[0].pointers === 2 && gestures[1].pointers === 1 &&
+      report.journal.systems.join() === [...(report.volume?.priming ?? []), "volume-up", "volume-down"].join() &&
+      report.journal.pastes.length === 1 && report.journal.pastes[0].text_len === CLIP_TEXT.length &&
+      !report.journal.pastes[0].has_text && report.journal.origins.every((origin) => origin === "agent") &&
+      report.journal.keys.join() === "VOLUME_UP,VOLUME_DOWN" &&
+      details.every((detail) => detail?.kind === "key" || detail?.transport === "idb");
+  } finally {
+    control?.close();
+    report.canvas_exit = canvas ? await canvas.stop() : null;
+    const stopped = await autonom(["session", "stop"]);
+    report.session_stopped = stopped.code === 0;
+    await stopCliCompanion(report);
+    const empty = original.code !== 0 || /There are no items on the device's pasteboard/.test(original.stdout) ? "" : original.stdout;
+    report.pasteboard_restored = (await simctlWithInput(["pbcopy", udid], empty)) === 0;
+  }
+  await sleep(1000);
+  const left = await canvasCompanions();
+  report.after_stop = {
+    companion_alive: companionPid !== null && left.includes(companionPid),
+    companions_left: left.filter((pid) => !companionsBefore.includes(pid)).length,
+  };
+  await stopLeftCompanions(report, companionsBefore);
+  report.host.loadavg_end = hostLoad();
+  report.host.output_volume_after = await hostVolume();
+  report.checks = {
+    transport_idb: report.transport === "idb",
+    clipboard_available: report.clipboard_available === true,
+    volume_rose: report.volume?.rose === true,
+    volume_returned: report.volume?.returned === true,
+    bridge_volume: report.bridge_volume?.ok === true,
+    host_volume_unchanged: report.host.output_volume_before !== null &&
+      report.host.output_volume_after === report.host.output_volume_before,
+    paste_set_and_typed: report.clipboard?.paste_reply === "paste" && report.clipboard.typed === true,
+    clipboard_read_back: report.clipboard?.read_back_matches === true,
+    pinch_nothing_before_release: report.pinch?.nothing_before_release === true,
+    pinch_one_event_at_release: report.pinch?.one_event_at_release === true,
+    tap_after_pinch: report.pinch?.tap_after === true,
+    no_control_errors: Array.isArray(report.control_errors) && report.control_errors.length === 0,
+    journal: report.journal?.ok === true,
+    pasteboard_restored: report.pasteboard_restored === true,
+    nothing_left: report.canvas_exit === 0 && !report.after_stop.companion_alive && report.after_stop.companions_left === 0 &&
+      (!report.cli_companion?.started || report.cli_companion.stopped === true),
+  };
+};
+
 const startedAt = Date.now();
 const report = { case: args.case, udid, ok: false };
 try {
@@ -1150,7 +1478,7 @@ try {
 // The case passes only when the Simulator is back as it was (and, for input, the session
 // it started is stopped), whatever the other checks say.
 report.checks = { ...report.checks, restored: !report.restore_error && restored(report.simulator) };
-if (args.case === "input") report.checks.session_stopped = report.session_stopped === true;
+if (args.case === "input" || args.case === "controls") report.checks.session_stopped = report.session_stopped === true;
 settle(report);
 report.seconds = (Date.now() - startedAt) / 1000;
 report.autonom_home = { path: autonomHome, kept: args["keep-home"] };

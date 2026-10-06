@@ -16,7 +16,13 @@ import { promisify } from "node:util";
 import { Script, createContext } from "node:vm";
 
 import {
+  h264EncoderKind,
+  parseH264Encoders,
+} from "../plugins/autonom/skills/android-emulator-browser/scripts/scrcpy-lib.mjs";
+import {
+  ENCODER_PROBE_TIMEOUT_MS,
   HEALTHY_STREAM_MS,
+  probeVideoEncoders,
   restartDelay,
 } from "../plugins/autonom/skills/android-emulator-browser/scripts/scrcpy-session.mjs";
 
@@ -122,6 +128,18 @@ if (command === "get-state") {
   setTimeout(() => {}, Number(process.env.FAKE_REMOVE_DELAY_MS ?? 0));
 } else if (command === "forward" && tail[0] === "--list") {
   // nothing is listed
+} else if (command === "shell" && tail.length === 1 && tail[0].includes("list_encoders=true")) {
+  // scrcpy-server listing its encoders: FAKE_ENCODERS is what it prints (nothing by
+  // default, so the Canvas cannot tell), "fail" makes it exit 1, "hang" never answers.
+  const listed = process.env.FAKE_ENCODERS ?? "";
+  if (listed === "fail") {
+    console.error("[server] ERROR: Could not list encoders");
+    process.exitCode = 1;
+  } else if (listed === "hang") {
+    setInterval(() => {}, 1000);
+  } else {
+    process.stdout.write(listed);
+  }
 } else if (command === "shell" && tail.length === 1 && tail[0].includes("app_process")) {
   const socket = connect(Number(process.env.FAKE_SCRCPY_LAUNCHER_PORT), "127.0.0.1");
   socket.on("connect", () => socket.write(JSON.stringify({ command: tail[0] }) + "\n"));
@@ -896,6 +914,16 @@ async function pageSocket(canvas, auth, path, headers = {}) {
   return opened.ws;
 }
 
+/** An adb call that starts the streaming scrcpy-server (not the encoder listing). */
+function isServerStart(args) {
+  return args[2] === "shell" && Boolean(args[3]?.includes("app_process")) && !args[3].includes("list_encoders=true");
+}
+
+/** An adb call that runs scrcpy-server to list the device's encoders. */
+function isEncoderProbe(args) {
+  return args[2] === "shell" && Boolean(args[3]?.includes("list_encoders=true"));
+}
+
 async function adbCalls(world) {
   return (await readFile(world.adbLog, "utf8")).trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
 }
@@ -1604,6 +1632,231 @@ test("auth: the page cannot be framed by another local origin, so a framed page 
   await stopCanvas(canvas);
 });
 
+// scrcpy-server 4.1 `list_encoders=true` as the API 36 emulator prints it: every encoder is software.
+const SOFTWARE_ENCODERS = [
+  "[server] INFO: Device: [Google] google sdk_gphone64_arm64 (Android 16)",
+  "[server] INFO: List of video encoders:",
+  "    --video-codec=h264 --video-encoder=c2.android.avc.encoder        (sw)",
+  "    --video-codec=h264 --video-encoder=OMX.google.h264.encoder       (sw) (alias for c2.android.avc.encoder)",
+  "    --video-codec=h265 --video-encoder=c2.android.hevc.encoder       (sw)",
+  "    --video-codec=av1 --video-encoder=c2.android.av1.encoder         (sw)",
+  "",
+].join("\n");
+// A phone: a vendor hardware H.264 encoder (and its alias) ahead of the software one.
+const HARDWARE_ENCODERS = [
+  "[server] INFO: List of video encoders:",
+  "    --video-codec=h264 --video-encoder=OMX.qcom.video.encoder.avc    (hw) [vendor] (alias for c2.qti.avc.encoder)",
+  "    --video-codec=h264 --video-encoder=c2.qti.avc.encoder            (hw) [vendor]",
+  "    --video-codec=h264 --video-encoder=c2.android.avc.encoder        (sw)",
+  "    --video-codec=h265 --video-encoder=c2.qti.hevc.encoder           (hw) [vendor]",
+  "",
+].join("\n");
+
+test("encoders: the H.264 lines of list_encoders say hardware or software", () => {
+  assert.deepEqual(parseH264Encoders(SOFTWARE_ENCODERS), [
+    { name: "c2.android.avc.encoder", hardware: false, alias: false },
+    { name: "OMX.google.h264.encoder", hardware: false, alias: true },
+  ]);
+  assert.deepEqual(h264EncoderKind(parseH264Encoders(SOFTWARE_ENCODERS)),
+    { encoder: "software", name: "c2.android.avc.encoder" });
+  // The first hardware encoder that is not an alias names the kind.
+  assert.deepEqual(h264EncoderKind(parseH264Encoders(HARDWARE_ENCODERS)),
+    { encoder: "hardware", name: "c2.qti.avc.encoder" });
+  // A hardware encoder of another codec does not count.
+  const hevcOnly = "    --video-codec=h265 --video-encoder=c2.qti.hevc.encoder (hw) [vendor]\n" +
+    "    --video-codec=h264 --video-encoder=c2.android.avc.encoder (sw)\r\n";
+  assert.deepEqual(h264EncoderKind(parseH264Encoders(hevcOnly)),
+    { encoder: "software", name: "c2.android.avc.encoder" });
+  // Nothing listed, no H.264 encoder, or a line that says neither (Android 9): cannot tell.
+  assert.equal(h264EncoderKind(parseH264Encoders("")), null);
+  assert.equal(h264EncoderKind(parseH264Encoders(undefined)), null);
+  assert.equal(h264EncoderKind(parseH264Encoders("[server] ERROR: Could not list encoders\n")), null);
+  assert.equal(h264EncoderKind(parseH264Encoders("    --video-codec=h265 --video-encoder=x (sw)\n")), null);
+  assert.equal(h264EncoderKind(parseH264Encoders(
+    "    --video-codec=h264 --video-encoder=OMX.google.h264.encoder\n" +
+    "    --video-codec=h264 --video-encoder=c2.android.avc.encoder (sw)\n")), null);
+  assert.equal(h264EncoderKind([]), null);
+  assert.equal(h264EncoderKind(null), null);
+});
+
+test("encoders: the probe runs the pushed server once per serial, bounded, and a failure is null", async () => {
+  const calls = [];
+  const answers = {
+    "probe-sw": async () => ({ stdout: SOFTWARE_ENCODERS, stderr: "" }),
+    "probe-hw": async () => ({ stdout: HARDWARE_ENCODERS, stderr: "" }),
+    "probe-fail": async () => { throw Object.assign(new Error("Command failed"), { code: 1 }); },
+    "probe-timeout": async () => { throw Object.assign(new Error("killed"), { killed: true, signal: "SIGTERM" }); },
+    "probe-empty": async () => ({ stdout: "", stderr: "" }),
+    "probe-throws": () => { throw new Error("spawn failed"); },
+  };
+  const exec = (file, args, options) => {
+    calls.push({ file, args, options });
+    return answers[args[1]]();
+  };
+  const software = await probeVideoEncoders({ adbPath: "/fake/adb", serial: "probe-sw", exec });
+  assert.equal(software.encoder, "software");
+  assert.equal(software.name, "c2.android.avc.encoder");
+  assert.equal(software.encoders.length, 2);
+  assert.deepEqual(calls[0].args.slice(0, 3), ["-s", "probe-sw", "shell"]);
+  assert.equal(calls[0].args[3], "CLASSPATH=/data/local/tmp/autonom-scrcpy-4.1.jar app_process / " +
+    "com.genymobile.scrcpy.Server 4.1 log_level=info cleanup=false list_encoders=true");
+  assert.equal(calls[0].options.timeout, ENCODER_PROBE_TIMEOUT_MS);
+  assert.ok(ENCODER_PROBE_TIMEOUT_MS <= 5000, "the probe may hold the stream back too long");
+  // Asked once per serial: a second session gets the first answer.
+  assert.equal(await probeVideoEncoders({ adbPath: "/fake/adb", serial: "probe-sw", exec }), software);
+  assert.equal(calls.length, 1);
+  assert.equal((await probeVideoEncoders({ adbPath: "/fake/adb", serial: "probe-hw", exec })).encoder, "hardware");
+  for (const serial of ["probe-fail", "probe-timeout", "probe-empty", "probe-throws"]) {
+    assert.equal(await probeVideoEncoders({ adbPath: "/fake/adb", serial, exec }), null, serial);
+    // A failed probe is not repeated either.
+    assert.equal(await probeVideoEncoders({ adbPath: "/fake/adb", serial, exec }), null, serial);
+  }
+  assert.equal(calls.length, 6);
+});
+
+/** A scrcpy Canvas streaming to one video client; resolves once the device server connected. */
+async function sizedCanvas(t, { env = {}, args = [] } = {}) {
+  const setup = await streamingCanvas(t, { env, args });
+  const control = await pageSocket(setup.canvas, setup.auth, "/ws/control");
+  const viewer = await pageSocket(setup.canvas, setup.auth, "/ws/video");
+  await waitFor(() => setup.device.connected, 8000, "the fake device connection");
+  const calls = await adbCalls(setup.world);
+  const start = calls.find(isServerStart);
+  const options = Object.fromEntries(start[3].split(" ").filter((word) => word.includes("="))
+    .map((word) => word.split("=", 2)));
+  return { ...setup, control, viewer, calls, start, options };
+}
+
+test("encoders: without --max-size a software-only device streams 2048 on the long side", async (t) => {
+  const { canvas, control, calls, options } = await sizedCanvas(t, { env: { FAKE_ENCODERS: SOFTWARE_ENCODERS } });
+  assert.equal(options.max_size, "2048");
+  // The probe ran after the push and before the server.
+  const order = calls.map((args) => isEncoderProbe(args) ? "probe" : isServerStart(args) ? "server"
+    : args[2] === "push" ? "push" : null).filter(Boolean);
+  assert.deepEqual(order, ["push", "probe", "server"]);
+  const body = await status(canvas);
+  assert.equal(body.scrcpy.max_size, 2048);
+  assert.equal(body.scrcpy.max_size_source, "encoder");
+  assert.equal(body.scrcpy.encoder, "software");
+  assert.equal(body.scrcpy.encoder_name, "c2.android.avc.encoder");
+  const state = await control.next((message) => message.json?.t === "state" && message.json.max_size !== null);
+  assert.equal(state.json.max_size, 2048);
+  assert.equal(state.json.encoder, "software");
+  assert.match(canvas.output(), /Stream size: 2048 on the long side \(software H\.264 encoder c2\.android\.avc\.encoder\)/);
+  await stopCanvas(canvas);
+});
+
+test("encoders: without --max-size a hardware H.264 encoder streams native size", async (t) => {
+  const { canvas, options } = await sizedCanvas(t, { env: { FAKE_ENCODERS: HARDWARE_ENCODERS } });
+  assert.equal(options.max_size, "0");
+  const body = await status(canvas);
+  assert.deepEqual([body.scrcpy.max_size, body.scrcpy.max_size_source, body.scrcpy.encoder, body.scrcpy.encoder_name],
+    [0, "encoder", "hardware", "c2.qti.avc.encoder"]);
+  assert.match(canvas.output(), /Stream size: native \(hardware H\.264 encoder c2\.qti\.avc\.encoder\)/);
+  await stopCanvas(canvas);
+});
+
+test("encoders: a failed or empty encoder list keeps 1280", async (t) => {
+  for (const listed of ["fail", ""]) {
+    const { canvas, calls, options } = await sizedCanvas(t, { env: { FAKE_ENCODERS: listed } });
+    assert.equal(options.max_size, "1280", listed);
+    assert.equal(calls.filter(isEncoderProbe).length, 1);
+    const body = await status(canvas);
+    assert.deepEqual([body.scrcpy.max_size, body.scrcpy.max_size_source, body.scrcpy.encoder],
+      [1280, "default", null]);
+    assert.match(canvas.output(), /Stream size: 1280 on the long side \(the device's encoders could not be read\)/);
+    await stopCanvas(canvas);
+  }
+});
+
+test("encoders: an explicit --max-size wins without a probe, and 0 is native", async (t) => {
+  for (const [value, word] of [["1024", "1024 on the long side"], ["0", "native"]]) {
+    const { canvas, calls, options } = await sizedCanvas(t, {
+      env: { FAKE_ENCODERS: HARDWARE_ENCODERS }, args: ["--max-size", value],
+    });
+    assert.equal(options.max_size, value);
+    assert.equal(calls.filter(isEncoderProbe).length, 0, "a probe ran despite --max-size");
+    const body = await status(canvas);
+    assert.deepEqual([body.scrcpy.max_size, body.scrcpy.max_size_source, body.scrcpy.encoder],
+      [Number(value), "explicit", null]);
+    assert.match(canvas.output(), new RegExp(`Stream size: ${word} \\(--max-size\\)`));
+    await stopCanvas(canvas);
+  }
+});
+
+test("encoders: before any session the status names no size", async (t) => {
+  const world = await makeWorld(t, { env: { FAKE_ENCODERS: SOFTWARE_ENCODERS } });
+  const canvas = await startCanvas(world, ["--transport", "scrcpy", "--scrcpy-server", world.serverFile]);
+  const body = await status(canvas);
+  assert.deepEqual([body.scrcpy.max_size, body.scrcpy.max_size_source, body.scrcpy.encoder], [null, null, null]);
+  assert.ok(!(await adbCalls(world)).some(isEncoderProbe), "the encoders were probed without a client");
+  await stopCanvas(canvas);
+});
+
+test("encoders: once auto falls back from scrcpy, state and /status report the size of the transport in use, not the size chosen for scrcpy", async (t) => {
+  for (const withFfmpeg of [true, false]) {
+    // A software-only device whose scrcpy-server cannot stream H.264: scrcpy chooses 2048, then fails.
+    const world = await makeWorld(t, {
+      env: { FAKE_ENCODERS: SOFTWARE_ENCODERS, FAKE_SCREENRECORD: "h264" }, device: { codec: 0x68323635 },
+    });
+    const args = ["--scrcpy-server", world.serverFile];
+    if (withFfmpeg) {
+      const ffmpeg = join(world.directory, "fake-ffmpeg.mjs");
+      await writeFile(ffmpeg, `#!${process.execPath}\n${FAKE_FFMPEG}`);
+      await chmod(ffmpeg, 0o755);
+      args.push("--ffmpeg", ffmpeg);
+    }
+    const canvas = await startCanvas(world, args);
+    assert.equal((await status(canvas)).transport, "scrcpy");
+    const auth = await login(canvas);
+    const control = await pageSocket(canvas, auth, "/ws/control");
+    await pageSocket(canvas, auth, "/ws/video");
+    const fallen = await control.next((message) => message.json?.t === "state" && message.json.transport !== "scrcpy",
+      10_000);
+    assert.match(canvas.output(), /Stream size: 2048 on the long side/, "scrcpy did not choose its own size first");
+    const body = await status(canvas);
+    assert.deepEqual([body.scrcpy.max_size, body.scrcpy.max_size_source, body.scrcpy.encoder, body.scrcpy.encoder_name],
+      [null, null, null, null], "the status names a scrcpy size that is not streaming");
+    if (withFfmpeg) {
+      assert.equal(fallen.json.transport, "screenrecord");
+      assert.deepEqual([fallen.json.max_size, fallen.json.encoder], [1280, null]);
+      assert.deepEqual([body.transport, body.screenrecord_max_size], ["screenrecord", 1280]);
+    } else {
+      assert.equal(fallen.json.transport, "screencap");
+      assert.deepEqual([fallen.json.max_size, fallen.json.encoder], [null, null]);
+      assert.deepEqual([body.transport, body.screenrecord_max_size], ["screencap", null]);
+    }
+    await stopCanvas(canvas);
+  }
+});
+
+test("encoders: while scrcpy streams, /status names no screenrecord size", async (t) => {
+  const { canvas } = await sizedCanvas(t, { env: { FAKE_ENCODERS: SOFTWARE_ENCODERS } });
+  const body = await status(canvas);
+  assert.deepEqual([body.transport, body.scrcpy.max_size, body.screenrecord_max_size], ["scrcpy", 2048, null]);
+  await stopCanvas(canvas);
+});
+
+waitingTest("encoders: a probe that never answers holds the stream back no longer than its bound, once", async (t) => {
+  const started = Date.now();
+  const { canvas, viewer, device, world, options } = await sizedCanvas(t, { env: { FAKE_ENCODERS: "hang" } });
+  const waited = Date.now() - started;
+  assert.equal(options.max_size, "1280");
+  assert.ok(waited >= ENCODER_PROBE_TIMEOUT_MS - 200, `the stream started after ${waited} ms, before the probe bound`);
+  assert.ok(waited < ENCODER_PROBE_TIMEOUT_MS + 5000, `the stream started only after ${waited} ms`);
+  // A restart reuses the answer: no second probe, no second wait.
+  device.sendConfig();
+  device.sendPacket({ key: true });
+  await waitFor(() => viewer.packets().length === 1, 5000, "the first packet");
+  device.crash();
+  await waitFor(() => device.spawns.length === 2 && device.connected, 8000, "the restart");
+  const calls = await adbCalls(world);
+  assert.equal(calls.filter(isEncoderProbe).length, 1);
+  assert.equal(calls.filter(isServerStart).length, 2);
+  assert.equal((await status(canvas)).scrcpy.max_size, 1280);
+  await stopCanvas(canvas);
+});
+
 test("fanout: one device server feeds every client, late joiners start at a key frame", async (t) => {
   const { world, canvas, auth, device } = await streamingCanvas(t);
   const a = await pageSocket(canvas, auth, "/ws/video");
@@ -1667,7 +1920,7 @@ test("fanout: one device server feeds every client, late joiners start at a key 
     .reduce((sum, packet) => sum + packet.data.length, 0);
   assert.ok(burstBytes < burst * 40 * 1024, "nothing of the burst was dropped");
 
-  const spawns = (await adbCalls(world)).filter((args) => args[2] === "shell" && args[3]?.includes("app_process"));
+  const spawns = (await adbCalls(world)).filter(isServerStart);
   assert.equal(spawns.length, 1, "more than one scrcpy-server was started");
   assert.equal(device.spawns.length, 1);
   assert.match(spawns[0][3], /^CLASSPATH=\/data\/local\/tmp\/autonom-scrcpy-4\.1\.jar app_process \/ com\.genymobile\.scrcpy\.Server 4\.1 scid=[0-9a-f]{8} /);
@@ -1756,7 +2009,7 @@ test("fanout: a Canvas stopped while adb creates the forward still removes it", 
   const calls = await adbCalls(world);
   assert.ok(calls.some((args) => args[2] === "forward" && args[3] === "--remove" &&
     args[4] === `tcp:${world.env.FAKE_SCRCPY_PORT}`), "the forward created during the stop outlived the Canvas");
-  assert.ok(!calls.some((args) => args[3]?.includes("app_process")), "a server was started after the stop");
+  assert.ok(!calls.some(isServerStart), "a server was started after the stop");
   assert.equal(device.spawns.length, 0);
 });
 
@@ -1779,7 +2032,7 @@ test("fanout: a stopping Canvas refuses new clients and starts no second server"
   const calls = await adbCalls(world);
   const count = (match) => calls.filter(match).length;
   assert.equal(count((args) => args[2] === "forward" && args[3] === "tcp:0"), 1);
-  assert.equal(count((args) => args[3]?.includes("app_process")), 1);
+  assert.equal(count(isServerStart), 1);
   assert.equal(count((args) => args[2] === "forward" && args[3] === "--remove"), 1);
   assert.equal(device.spawns.length, 1);
 });
@@ -5465,6 +5718,31 @@ if (args[0] === "simctl" && args[1] === "list") {
   console.log(JSON.stringify({ devices: { "iOS 27.0": [{ udid: process.env.FAKE_UDID, state, isAvailable: true }] } }));
 } else if (args[0] === "simctl" && args[1] === "io") {
   writeFileSync(args.at(-1), Buffer.from(process.env.FAKE_PNG, "base64"));
+} else if (args[0] === "simctl" && (args[1] === "pbcopy" || args[1] === "pbpaste")) {
+  // The Simulator pasteboard is the file FAKE_PASTEBOARD; <it>.mode makes the command fail
+  // ("fail"), or pbpaste print what a fresh Simulator prints ("no-items"); while <it>.hold
+  // exists pbcopy waits. Each pbcopy is counted in <it>.copies, never logged with its text.
+  const board = process.env.FAKE_PASTEBOARD;
+  const mode = existsSync(board + ".mode") ? readFileSync(board + ".mode", "utf8").trim() : "";
+  if (mode === "fail") {
+    console.error("Unable to access the pasteboard");
+    process.exit(4);
+  }
+  if (args[1] === "pbpaste") {
+    if (mode === "no-items") process.stdout.write("There are no items on the device's pasteboard.\n");
+    else if (existsSync(board)) process.stdout.write(readFileSync(board));
+  } else {
+    const chunks = [];
+    process.stdin.on("data", (chunk) => chunks.push(chunk));
+    process.stdin.on("end", () => {
+      const wait = () => {
+        if (existsSync(board + ".hold")) { setTimeout(wait, 20); return; }
+        writeFileSync(board, Buffer.concat(chunks));
+        appendFileSync(board + ".copies", "1\n");
+      };
+      wait();
+    });
+  }
 } else {
   console.error("unsupported fake xcrun command: " + args.join(" "));
   process.exitCode = 2;
@@ -5486,7 +5764,11 @@ async function iosWorld(t, { env = {}, companion = true } = {}) {
   await writeFile(world.idbEvents, "");
   world.idbControl = join(world.directory, "idb-control");
   world.simState = join(world.directory, "sim-state");
-  Object.assign(world.env, { FAKE_IDB_EVENTS: world.idbEvents, FAKE_IDB_CONTROL: world.idbControl, FAKE_SIM_STATE: world.simState });
+  world.pasteboard = join(world.directory, "pasteboard");
+  Object.assign(world.env, {
+    FAKE_IDB_EVENTS: world.idbEvents, FAKE_IDB_CONTROL: world.idbControl, FAKE_SIM_STATE: world.simState,
+    FAKE_PASTEBOARD: world.pasteboard,
+  });
   // A companion a failed test left behind goes too, with the Canvas, before the folder is removed.
   world.children.push({
     exitCode: null, signalCode: null,
@@ -5887,23 +6169,27 @@ test("ios: a companion that cannot start falls back to screencap once, closes th
   await stopCanvas(canvas);
 });
 
-test("ios: a held finger moves live with repeated DOWN then UP in logical points; a second pointer is refused while the first keeps working; one gesture record names idb", async (t) => {
-  const { world, canvas, control } = await iosControl(t);
+test("ios: a held finger moves live with repeated DOWN then UP in logical points; another connection's pointer is refused while the first keeps working; one gesture record names idb", async (t) => {
+  const { world, canvas, auth, control } = await iosControl(t);
+  const other = await pageSocket(canvas, auth, "/ws/control");
   control.send({ t: "touch", a: "down", id: 1, x: 0.5, y: 0.5 });
   control.send({ t: "touch", a: "move", id: 1, x: 0.5, y: 0.4 });
-  const refusal = control.reply((message) => message.t === "error" && message.for === "touch");
-  control.send({ t: "touch", a: "down", id: 2, x: 0.1, y: 0.1 });
+  await allHandled(control);
+  const refusal = other.reply((message) => message.t === "error" && message.for === "touch");
+  other.send({ t: "touch", a: "down", id: 2, x: 0.1, y: 0.1 });
   assert.match((await refusal).message, /one finger at a time/);
   // Its moves and up are ignored without more errors.
-  control.send({ t: "touch", a: "move", id: 2, x: 0.2, y: 0.2 });
-  control.send({ t: "touch", a: "up", id: 2, x: 0.2, y: 0.2 });
+  other.send({ t: "touch", a: "move", id: 2, x: 0.2, y: 0.2 });
+  other.send({ t: "touch", a: "up", id: 2, x: 0.2, y: 0.2 });
+  await allHandled(other);
   control.send({ t: "touch", a: "move", id: 1, x: 0.5, y: 0.3 });
   control.send({ t: "touch", a: "up", id: 1, x: 0.5, y: 0.25 });
   await allHandled(control);
   assert.deepEqual(await hidAtLeast(world, 4), [
     touchAt("down", 201, 437), touchAt("down", 201, 349.6), touchAt("down", 201, 262.2), touchAt("up", 201, 218.5),
   ]);
-  assert.equal(control.json("error").length, 1, "the refused pointer's moves were answered");
+  assert.equal(other.json("error").length, 1, "the refused pointer's moves were answered");
+  assert.equal(control.json("error").length, 0);
   await waitFor(async () => (await journaled(world, "gesture")).length === 1, 5000, "the gesture record");
   const [record] = await journaled(world, "gesture");
   assert.equal(record.origin, "human");
@@ -5944,10 +6230,8 @@ test("ios: the wheel is a short synthetic drag lifted once the wheel is still, H
   assert.deepEqual(texts.map((call) => call.origin), ["human", "human"]);
   for (const [message, pattern] of [
     [{ t: "key", a: "down", code: 66 }, /Android keycodes have no iOS Simulator equivalent/],
-    [{ t: "paste", text: "x" }, /no clipboard paste/],
-    [{ t: "clipboard-get" }, /clipboard is not available/],
     [{ t: "system", op: "back" }, /back is not available on the iOS Simulator/],
-    [{ t: "system", op: "volume-up" }, /volume-up is not available/],
+    [{ t: "system", op: "notifications" }, /notifications is not available/],
     [{ t: "display", preset: "tablet" }, /Display presets are Android-only/],
   ]) {
     const answer = control.reply((reply) => reply.t === "error");
@@ -6285,7 +6569,353 @@ test("ios: once a takeover refuses a gesture's DOWN, its queued move and UP are 
   await stopCanvas(canvas);
 });
 
-test("ios: the page uses WebCodecs and the control socket on idb, turns the canvas for landscape, sends Home and Power, one finger only, and typed characters as text", async (t) => {
+test("ios: volume-up and volume-down press VOLUME_UP and VOLUME_DOWN down then up on the HID stream, with one system record each", async (t) => {
+  const { world, canvas, control } = await iosControl(t);
+  control.send({ t: "system", op: "volume-up" });
+  control.send({ t: "system", op: "volume-down" });
+  await allHandled(control);
+  assert.deepEqual(await hidAtLeast(world, 4), [
+    { button: "VOLUME_UP", direction: "down" }, { button: "VOLUME_UP", direction: "up" },
+    { button: "VOLUME_DOWN", direction: "down" }, { button: "VOLUME_DOWN", direction: "up" },
+  ]);
+  assert.equal(control.json("error").length, 0);
+  await waitFor(async () => (await journaled(world, "system")).length === 2, 5000, "the system records");
+  assert.deepEqual((await journaled(world, "system")).map((record) => [record.payload.op, record.payload.transport]),
+    [["volume-up", "idb"], ["volume-down", "idb"]]);
+  // POST /key with the Android volume names reaches the action bridge, which presses the
+  // Simulator's volume buttons (tests/test_canvas_scrcpy.py BridgeIosButtonTests).
+  for (const key of ["KEYCODE_VOLUME_UP", "KEYCODE_VOLUME_DOWN"]) {
+    const answer = await rawHttp(canvas.port, { method: "POST", path: "/key", headers: agentHeaders(), body: JSON.stringify({ key }) });
+    assert.equal(answer.status, 200, answer.body);
+  }
+  assert.deepEqual((await bridgeCalls(world, "key")).map((call) => [call.payload.key, call.origin]),
+    [["KEYCODE_VOLUME_UP", "agent"], ["KEYCODE_VOLUME_DOWN", "agent"]]);
+  await stopCanvas(canvas);
+});
+
+/** simctl clipboard calls the fake xcrun saw, as [command, udid]. */
+async function simctlClipboardCalls(world) {
+  return (await adbCalls(world)).filter((args) => args[0] === "simctl" && /^pb(copy|paste)$/.test(args[1]))
+    .map((args) => args.slice(1));
+}
+
+function pasteboardCopies(world) {
+  return existsSync(`${world.pasteboard}.copies`) ? readFileSync(`${world.pasteboard}.copies`, "utf8").split("\n").filter(Boolean).length : 0;
+}
+
+test("ios: clipboard-get reads the Simulator clipboard with simctl pbpaste for the Canvas UDID; empty and the no-items message read as no text, a failure is an error for clipboard-get, and the text reaches no log, journal or status", async (t) => {
+  const { world, canvas, control } = await iosControl(t);
+  const state = await control.next((message) => message.json?.t === "state" && "clipboard" in message.json);
+  assert.equal(state.json.clipboard, true);
+  const marker = "autonom-clip-test \u00fc\u65e5\u672c";
+  writeFileSync(world.pasteboard, marker);
+  let answer = control.reply((message) => message.t === "clipboard");
+  control.send({ t: "clipboard-get" });
+  assert.deepEqual(await answer, { t: "clipboard", text: marker });
+  writeFileSync(world.pasteboard, "");
+  answer = control.reply((message) => message.t === "clipboard");
+  control.send({ t: "clipboard-get" });
+  assert.deepEqual(await answer, { t: "clipboard", text: null });
+  writeFileSync(`${world.pasteboard}.mode`, "no-items");
+  answer = control.reply((message) => message.t === "clipboard");
+  control.send({ t: "clipboard-get" });
+  assert.deepEqual(await answer, { t: "clipboard", text: null });
+  writeFileSync(`${world.pasteboard}.mode`, "fail");
+  answer = control.reply((message) => message.t === "error");
+  control.send({ t: "clipboard-get" });
+  const failure = await answer;
+  assert.equal(failure.for, "clipboard-get");
+  assert.match(failure.message, /could not be read: simctl pbpaste exited with 4: Unable to access the pasteboard/);
+  // Reading the clipboard is not input: it works under an agent's takeover, like on Android.
+  rmSync(`${world.pasteboard}.mode`);
+  writeFileSync(world.pasteboard, marker);
+  await agentTakeover(canvas);
+  answer = control.reply((message) => message.t === "clipboard");
+  control.send({ t: "clipboard-get" });
+  assert.equal((await answer).text, marker);
+  assert.deepEqual(await simctlClipboardCalls(world), Array(5).fill(["pbpaste", IOS_UDID]));
+  assert.equal(hidEvents(world).length, 0);
+  const body = await status(canvas);
+  await stopCanvas(canvas);
+  assert.doesNotMatch(JSON.stringify(body) + canvas.output() + (await readFile(world.bridgeLog, "utf8")), /autonom-clip-test/);
+});
+
+test("ios: a paste sets the Simulator clipboard once with simctl pbcopy and, as plain ASCII up to 300 bytes, is typed once through the bridge, journaled as a paste; input sent after it waits until it is done", async (t) => {
+  const { world, canvas, control } = await iosControl(t);
+  writeFileSync(`${world.pasteboard}.hold`, "");
+  const text = "autonom-clip-test\n~!";
+  const done = control.reply((message) => message.t === "paste");
+  control.send({ t: "paste", text });
+  control.send({ t: "system", op: "home" });
+  await waitFor(async () => (await simctlClipboardCalls(world)).length === 1, 5000, "the pbcopy");
+  await sleep(200);
+  assert.equal(hidEvents(world).length, 0, "Home went ahead of the paste");
+  assert.equal((await bridgeCalls(world, "text")).length, 0, "typed before the clipboard was set");
+  rmSync(`${world.pasteboard}.hold`);
+  assert.deepEqual(await done, { t: "paste", typed: true });
+  assert.equal(readFileSync(world.pasteboard, "utf8"), text);
+  assert.equal(pasteboardCopies(world), 1);
+  const typed = await bridgeCalls(world, "text");
+  assert.deepEqual(typed.map((call) => [call.payload, call.origin]),
+    [[{ text, sensitive: true, transport: "idb", paste: true }, "human"]]);
+  assert.deepEqual(await hidAtLeast(world, 2), [{ button: "HOME", direction: "down" }, { button: "HOME", direction: "up" }]);
+  // The bridge journals the typed paste itself; the Canvas sends no second record for it.
+  await waitFor(async () => (await journaled(world, "system")).length === 1, 5000, "the Home record");
+  assert.equal((await journaled(world, "paste")).length, 0);
+  assert.deepEqual(await simctlClipboardCalls(world), [["pbcopy", IOS_UDID]]);
+  await stopCanvas(canvas);
+  assert.doesNotMatch(canvas.output(), /autonom-clip-test/);
+});
+
+test("ios: a paste longer than 300 bytes is only set on the Simulator clipboard, the reply says long-press Paste inserts it, and one paste record has its length only", async (t) => {
+  const { world, canvas, control } = await iosControl(t);
+  const text = "autonom-clip-test ".repeat(20);
+  const done = control.reply((message) => message.t === "paste");
+  control.send({ t: "paste", text });
+  const answer = await done;
+  assert.equal(answer.typed, false);
+  assert.match(answer.message, /clipboard was set .* not typed: touch and hold a text field and choose Paste/);
+  assert.equal(readFileSync(world.pasteboard, "utf8"), text);
+  assert.equal(pasteboardCopies(world), 1);
+  assert.equal((await bridgeCalls(world, "text")).length, 0, "long text was typed");
+  await waitFor(async () => (await journaled(world, "paste")).length === 1, 5000, "the paste record");
+  const [record] = await journaled(world, "paste");
+  assert.deepEqual([record.payload.kind, record.payload.transport, record.payload.text_len, record.payload.text],
+    ["paste", "idb", text.length, undefined]);
+  await stopCanvas(canvas);
+  assert.doesNotMatch(canvas.output(), /autonom-clip-test/);
+});
+
+test("ios: a short paste with characters idb cannot type is only set on the Simulator clipboard, never sent to the bridge, and the reply says long-press Paste inserts it", async (t) => {
+  // idb's `ui text` has keys for printable ASCII and newline only ("No keycode found" for any
+  // other character), so typing this text would fail after the clipboard was already set.
+  const { world, canvas, control } = await iosControl(t);
+  for (const text of ["autonom-clip-test \u00fc", "autonom-clip-test\t", "\u0430\u0431", "autonom \u{1f600}"]) {
+    const done = control.reply((message) => message.t === "paste");
+    control.send({ t: "paste", text });
+    const answer = await done;
+    assert.equal(answer.typed, false, JSON.stringify(text));
+    assert.match(answer.message, /clipboard was set .* other than plain ASCII.* not typed: touch and hold a text field and choose Paste/);
+    assert.equal(readFileSync(world.pasteboard, "utf8"), text);
+  }
+  assert.equal(pasteboardCopies(world), 4);
+  assert.equal((await bridgeCalls(world, "text")).length, 0, "text idb cannot type was sent to the bridge");
+  await waitFor(async () => (await journaled(world, "paste")).length === 4, 5000, "the paste records");
+  const records = await journaled(world, "paste");
+  assert.deepEqual(records.map((record) => [record.payload.text_len, record.payload.text]),
+    [[19, undefined], [18, undefined], [2, undefined], [9, undefined]]);
+  await stopCanvas(canvas);
+  assert.doesNotMatch(canvas.output(), /autonom-clip-test/);
+});
+
+test("ios: a paste whose pbcopy fails, or that a takeover refuses by its turn, is answered with an error for paste and types nothing", async (t) => {
+  const { world, canvas, control } = await iosControl(t);
+  writeFileSync(`${world.pasteboard}.mode`, "fail");
+  let answer = control.reply((message) => message.t === "error");
+  control.send({ t: "paste", text: "autonom-clip-test" });
+  const failure = await answer;
+  assert.equal(failure.for, "paste");
+  assert.match(failure.message, /could not be set: simctl pbcopy exited with 4/);
+  rmSync(`${world.pasteboard}.mode`);
+  // Queued behind held text, the paste's turn comes after an agent took control.
+  holdBridgeText(world, "first", true);
+  control.send({ t: "text", text: "first" });
+  answer = control.reply((message) => message.t === "error" && message.for === "paste");
+  control.send({ t: "paste", text: "autonom-clip-test" });
+  await waitFor(async () => (await bridgeCalls(world, "text")).length === 1, 5000, "the held text");
+  await agentTakeover(canvas);
+  holdBridgeText(world, "first", false);
+  assert.match((await answer).message, /owned by agent/);
+  await allHandled(control);
+  assert.equal(pasteboardCopies(world), 0);
+  assert.deepEqual((await bridgeCalls(world, "text")).map((call) => call.payload.text), ["first"]);
+  assert.equal((await journaled(world, "paste")).length, 0);
+  await stopCanvas(canvas);
+});
+
+test("ios: an xcrun that cannot be started answers clipboard-get and paste with an error, and the Canvas keeps running", async (t) => {
+  const { world, canvas, control } = await iosControl(t);
+  const { rename } = await import("node:fs/promises");
+  await rename(world.xcrun, `${world.xcrun}.gone`);
+  t.after(() => rename(`${world.xcrun}.gone`, world.xcrun).catch(() => {}));
+  for (const [message, pattern] of [
+    [{ t: "clipboard-get" }, /could not be read: .*ENOENT/],
+    [{ t: "paste", text: "autonom-clip-test" }, /could not be set: .*ENOENT/],
+  ]) {
+    const answer = control.reply((reply) => reply.t === "error" && reply.for === message.t);
+    control.send(message);
+    assert.match((await answer).message, pattern);
+  }
+  await allHandled(control);
+  assert.equal((await bridgeCalls(world, "text")).length, 0);
+  assert.equal(typeof (await status(canvas)).transport, "string");
+  await rename(`${world.xcrun}.gone`, world.xcrun);
+  await stopCanvas(canvas);
+});
+
+// The Canvas as if it ran on Linux: its Simulator (behind a remote companion) is on another Mac.
+const NOT_MACOS = `data:text/javascript,${encodeURIComponent(`
+import { syncBuiltinESMExports } from "node:module";
+Object.defineProperty(process, "platform", { value: "linux" });
+syncBuiltinESMExports();
+`)}`;
+
+test("ios: a Canvas that does not run on macOS refuses paste and clipboard-get naming why, runs no simctl clipboard command, and its state says the clipboard is unavailable", async (t) => {
+  const world = await iosWorld(t);
+  const canvas = await startCanvas(world, ["--platform", "ios", "--target", IOS_UDID, "--simctl", world.xcrun],
+    { nodeArgs: ["--import", NOT_MACOS] });
+  const auth = await login(canvas);
+  const control = await pageSocket(canvas, auth, "/ws/control");
+  const state = await control.next((message) => message.json?.t === "state" && message.json.session === "streaming", 10_000);
+  assert.equal(state.json.clipboard, false);
+  for (const message of [{ t: "paste", text: "autonom-clip-test" }, { t: "clipboard-get" }]) {
+    const answer = control.reply((reply) => reply.t === "error");
+    control.send(message);
+    const refusal = await answer;
+    assert.equal(refusal.for, message.t);
+    assert.match(refusal.message, /needs xcrun simctl on the Mac that runs the Simulator; this Canvas does not run on macOS/);
+  }
+  await allHandled(control);
+  assert.deepEqual(await simctlClipboardCalls(world), []);
+  assert.equal((await bridgeCalls(world, "text")).length, 0);
+  await stopCanvas(canvas);
+});
+
+/** The HIDPinch the Canvas computes for two pointers given as 0..1 points on the 402x874 screen. */
+function expectedPinch(start, end) {
+  const point = ([x, y]) => ({ x: Math.round(x * IOS_POINTS.width * 100) / 100, y: Math.round(y * IOS_POINTS.height * 100) / 100 });
+  const [a, b, c, d] = [...start, ...end].map(point);
+  const half = (p, q) => Math.hypot(p.x - q.x, p.y - q.y) / 2;
+  const center = { x: Math.round(((a.x + b.x) / 2) * 100) / 100, y: Math.round(((a.y + b.y) / 2) * 100) / 100 };
+  const radius = Math.round(half(a, b) * 100) / 100;
+  return { center, radius, scale: Math.round((half(c, d) / radius) * 10_000) / 10_000 };
+}
+
+test("ios: a mirrored pinch sends nothing before release, then one HIDPinch of center, radius, scale and the time it took; one gesture record with pointers 2; a tap after it goes over the HID stream as before", async (t) => {
+  const { world, canvas, control } = await iosControl(t);
+  // As the page sends it: the mirror (-1000 - id) first, then the pointer.
+  control.send({ t: "touch", a: "down", id: -1001, x: 0.6, y: 0.6 });
+  control.send({ t: "touch", a: "down", id: 1, x: 0.4, y: 0.4 });
+  for (const step of [0.35, 0.3]) {
+    control.send({ t: "touch", a: "move", id: -1001, x: 1 - step, y: 1 - step });
+    control.send({ t: "touch", a: "move", id: 1, x: step, y: step });
+  }
+  await allHandled(control);
+  await sleep(150);
+  assert.deepEqual(hidEvents(world), [], "a touch went out before the release");
+  control.send({ t: "touch", a: "up", id: -1001, x: 0.7, y: 0.7 });
+  control.send({ t: "touch", a: "up", id: 1, x: 0.3, y: 0.3 });
+  await allHandled(control);
+  const [event] = await hidAtLeast(world, 1);
+  const { duration, ...shape } = event.pinch;
+  assert.deepEqual(shape, expectedPinch([[0.4, 0.4], [0.6, 0.6]], [[0.3, 0.3], [0.7, 0.7]]));
+  assert.equal(shape.scale, 2);
+  assert.ok(duration > 0 && duration <= 2, `duration ${duration}`);
+  assert.equal(control.json("error").length, 0, "the second up was answered");
+  // A tap afterwards is one finger, live, as before.
+  control.send({ t: "touch", a: "down", id: 2, x: 0.5, y: 0.5 });
+  control.send({ t: "touch", a: "up", id: 2, x: 0.5, y: 0.5 });
+  await allHandled(control);
+  assert.deepEqual((await hidAtLeast(world, 3)).slice(1), [touchAt("down", 201, 437), touchAt("up", 201, 437)]);
+  await waitFor(async () => (await journaled(world, "gesture")).length === 2, 5000, "the gesture records");
+  const records = await journaled(world, "gesture");
+  assert.deepEqual(records.map((record) => [record.payload.pointers, record.payload.transport]), [[2, "idb"], [1, "idb"]]);
+  assert.equal(records[0].payload.moves, 4);
+  await stopCanvas(canvas);
+});
+
+test("ios: a second pointer of the same connection lifts the live finger and makes a pinch; a third pointer and another connection's pointer are refused with one finger at a time and leave the pinch as it was", async (t) => {
+  const { world, canvas, auth, control } = await iosControl(t);
+  const other = await pageSocket(canvas, auth, "/ws/control");
+  control.send({ t: "touch", a: "down", id: 1, x: 0.5, y: 0.4 });
+  control.send({ t: "touch", a: "down", id: 2, x: 0.5, y: 0.6 });
+  await allHandled(control);
+  assert.deepEqual(await hidAtLeast(world, 2), [touchAt("down", 201, 349.6), touchAt("up", 201, 349.6)]);
+  let refusal = control.reply((message) => message.t === "error" && message.for === "touch");
+  control.send({ t: "touch", a: "down", id: 3, x: 0.1, y: 0.1 });
+  assert.match((await refusal).message, /one finger at a time/);
+  refusal = other.reply((message) => message.t === "error" && message.for === "touch");
+  other.send({ t: "touch", a: "down", id: 7, x: 0.9, y: 0.9 });
+  assert.match((await refusal).message, /one finger at a time/);
+  other.send({ t: "touch", a: "move", id: 7, x: 0.8, y: 0.8 });
+  other.send({ t: "touch", a: "up", id: 7, x: 0.8, y: 0.8 });
+  other.send({ t: "scroll", x: 0.5, y: 0.5, dx: 0, dy: -1 });
+  control.send({ t: "touch", a: "move", id: 3, x: 0.2, y: 0.2 });
+  control.send({ t: "touch", a: "up", id: 3, x: 0.2, y: 0.2 });
+  await allHandled(other);
+  control.send({ t: "touch", a: "move", id: 2, x: 0.5, y: 0.7 });
+  control.send({ t: "touch", a: "up", id: 1, x: 0.5, y: 0.4 });
+  control.send({ t: "touch", a: "up", id: 2, x: 0.5, y: 0.7 });
+  await allHandled(control);
+  const events = await hidAtLeast(world, 3);
+  assert.equal(events.length, 3);
+  const { duration, ...shape } = events[2].pinch;
+  // Pointer 1 started where the live finger was when pointer 2 came.
+  assert.deepEqual(shape, expectedPinch([[0.5, 0.4], [0.5, 0.6]], [[0.5, 0.4], [0.5, 0.7]]));
+  assert.ok(duration >= 0 && duration <= 2);
+  assert.equal(control.json("error").length, 1);
+  assert.equal(other.json("error").filter((message) => message.for === "touch").length, 1);
+  await stopCanvas(canvas);
+});
+
+test("ios: a pending pinch is dropped without a HID event or record when a takeover lifts it", async (t) => {
+  const { world, canvas, control } = await iosControl(t);
+  control.send({ t: "touch", a: "down", id: -1001, x: 0.6, y: 0.6 });
+  control.send({ t: "touch", a: "down", id: 1, x: 0.4, y: 0.4 });
+  control.send({ t: "touch", a: "move", id: 1, x: 0.3, y: 0.3 });
+  await allHandled(control);
+  await agentTakeover(canvas);
+  control.send({ t: "touch", a: "up", id: 1, x: 0.3, y: 0.3 });
+  await allHandled(control);
+  await sleep(200);
+  assert.deepEqual(hidEvents(world), []);
+  assert.equal((await journaled(world, "gesture")).length, 0);
+  await stopCanvas(canvas);
+});
+
+test("ios: a mirrored pinch puts no touch down or up on the HID stream, only one HIDPinch, while an ordinary tap still goes down live before its up is sent", async (t) => {
+  const { world, canvas, control } = await iosControl(t);
+  // The page's Ctrl/Alt-drag: the mirrored finger (-1000 - id) comes first and marks the pair as a pinch.
+  control.send({ t: "touch", a: "down", id: -1001, x: 0.6, y: 0.6 });
+  await allHandled(control);
+  await sleep(150);
+  assert.deepEqual(hidEvents(world), [], "the mirrored finger went down on its own");
+  control.send({ t: "touch", a: "down", id: 1, x: 0.4, y: 0.4 });
+  control.send({ t: "touch", a: "move", id: -1001, x: 0.7, y: 0.7 });
+  control.send({ t: "touch", a: "move", id: 1, x: 0.3, y: 0.3 });
+  control.send({ t: "touch", a: "up", id: -1001, x: 0.7, y: 0.7 });
+  control.send({ t: "touch", a: "up", id: 1, x: 0.3, y: 0.3 });
+  await allHandled(control);
+  await hidAtLeast(world, 1);
+  await sleep(150);
+  const events = hidEvents(world);
+  assert.deepEqual(events.filter((event) => event.touch), [], "a touch down or up went out for the pinch");
+  assert.equal(events.length, 1, JSON.stringify(events));
+  assert.ok(events[0].pinch, "the one event is not a HIDPinch");
+  assert.equal(control.json("error").length, 0);
+  // An ordinary tap is live: its down reaches the HID stream while the finger is still held.
+  control.send({ t: "touch", a: "down", id: 2, x: 0.5, y: 0.5 });
+  assert.deepEqual((await hidAtLeast(world, 2)).slice(1), [touchAt("down", 201, 437)]);
+  control.send({ t: "touch", a: "up", id: 2, x: 0.5, y: 0.5 });
+  assert.deepEqual((await hidAtLeast(world, 3)).slice(1), [touchAt("down", 201, 437), touchAt("up", 201, 437)]);
+  await stopCanvas(canvas);
+});
+
+waitingTest("ios: a pinch held longer than 2 s replays in 2 s, so a long hold cannot stall the HID stream", async (t) => {
+  const { world, canvas, control } = await iosControl(t);
+  control.send({ t: "touch", a: "down", id: -1001, x: 0.6, y: 0.5 });
+  control.send({ t: "touch", a: "down", id: 1, x: 0.4, y: 0.5 });
+  await allHandled(control);
+  await sleep(2300);
+  control.send({ t: "touch", a: "up", id: 1, x: 0.45, y: 0.5 });
+  await allHandled(control);
+  const [event] = await hidAtLeast(world, 1);
+  assert.equal(event.pinch.duration, 2);
+  assert.deepEqual(event.pinch.center, { x: 201, y: 437 });
+  await stopCanvas(canvas);
+});
+
+test("ios: the page uses WebCodecs and the control socket on idb, turns the canvas for landscape, sends Home, Power and the volume buttons, a mirrored pinch with the mirror first and at most two fingers, typed characters as text, and long text or a paste as a paste once the clipboard is available", async (t) => {
   const world = await iosWorld(t);
   const canvas = await startCanvas(world, ["--platform", "ios", "--target", IOS_UDID, "--simctl", world.xcrun]);
   const html = await (await fetch(`${canvas.origin}/`)).text();
@@ -6298,11 +6928,20 @@ test("ios: the page uses WebCodecs and the control socket on idb, turns the canv
   // Home and Power go over the control socket as system actions.
   const dock = document.elements.filter((element) => element.parent?.tagName === "NAV" && element.tagName === "BUTTON");
   const byLabel = (label) => dock.find((element) => element.getAttribute("aria-label") === label);
-  for (const label of ["Home", "Power"]) assert.equal(byLabel(label).hidden, false, `${label} is hidden`);
-  for (const label of ["Back", "Recent apps", "Rotate", "Volume down", "Volume up"]) assert.equal(byLabel(label).hidden, true, `${label} shows`);
+  for (const label of ["Home", "Power", "Volume down", "Volume up"]) assert.equal(byLabel(label).hidden, false, `${label} is hidden`);
+  for (const label of ["Back", "Recent apps", "Rotate"]) assert.equal(byLabel(label).hidden, true, `${label} shows`);
   byLabel("Home").click();
   byLabel("Power").click();
-  assert.deepEqual(sent, [{ t: "system", op: "home" }, { t: "system", op: "power" }]);
+  byLabel("Volume up").click();
+  byLabel("Volume down").click();
+  assert.deepEqual(sent, [{ t: "system", op: "home" }, { t: "system", op: "power" },
+    { t: "system", op: "volume-up" }, { t: "system", op: "volume-down" }]);
+  // Off idb (screencap) the volume buttons go out of sight again.
+  run("const socket=controlSocket;socket.close=()=>{};view.transport=\"screencap\";applyTransport();" +
+    "view.transport=\"idb\";view.mode=\"webcodecs\";controlSocket=socket");
+  assert.equal(byLabel("Volume up").hidden, true);
+  run("applyTransport()");
+  assert.equal(byLabel("Volume up").hidden, false);
   // A landscape Simulator: the canvas holds the portrait picture turned upright.
   run("setVideoSize(1206,2622)");
   assert.deepEqual(JSON.parse(run("JSON.stringify([video.width,video.height])")), [1206, 2622]);
@@ -6310,17 +6949,28 @@ test("ios: the page uses WebCodecs and the control socket on idb, turns the canv
   assert.deepEqual(JSON.parse(run("JSON.stringify([video.width,video.height,rotation])")), [2622, 1206, 270]);
   run("setRotation(0)");
   assert.deepEqual(JSON.parse(run("JSON.stringify([video.width,video.height])")), [1206, 2622]);
-  // One finger at a time, and no mirrored pinch finger.
+  // Ctrl-drag is a mirrored pinch whose mirror finger goes first; a third finger is refused here.
   sent.length = 0;
   const surfaceRect = { left: 0, top: 0, width: 1206, height: 2622 };
   run("video.getBoundingClientRect=()=>(" + JSON.stringify(surfaceRect) + ");video.setPointerCapture=()=>{};");
-  const pointer = (pointerId, extra = {}) => ({ pointerId, pointerType: "mouse", button: 0, clientX: 603, clientY: 1311,
+  const pointer = (pointerId, extra = {}) => ({ pointerId, pointerType: "mouse", button: 0, clientX: 300, clientY: 1311,
     pressure: 0.5, ctrlKey: true, preventDefault() {}, ...extra });
   sandbox.onPointerDown(pointer(1));
   sandbox.onPointerDown(pointer(2, { pointerType: "touch" }));
   sandbox.onPointerEnd(pointer(1), "up");
-  assert.deepEqual(sent.map((message) => `${message.t} ${message.a} ${message.id}`), ["touch down 1", "touch up 1"]);
-  assert.match(run("view.note"), /one finger at a time/);
+  const labels = () => sent.map((message) => `${message.t} ${message.a} ${message.id}`);
+  assert.deepEqual(labels(), ["touch down -1001", "touch down 1", "touch up -1001", "touch up 1"]);
+  const [mirror, first] = sent;
+  assert.ok(Math.abs(mirror.x - (1 - first.x)) < 1e-9 && Math.abs(mirror.y - (1 - first.y)) < 1e-9, "the mirror is around the centre");
+  assert.match(run("view.note"), /two fingers at most/);
+  // Two plain fingers go out as two pointers; a third is refused.
+  sent.length = 0;
+  sandbox.onPointerDown(pointer(3, { pointerType: "touch", ctrlKey: false }));
+  sandbox.onPointerDown(pointer(4, { pointerType: "touch", ctrlKey: false }));
+  sandbox.onPointerDown(pointer(5, { pointerType: "touch", ctrlKey: false }));
+  sandbox.onPointerEnd(pointer(3, { ctrlKey: false }), "up");
+  sandbox.onPointerEnd(pointer(4, { ctrlKey: false }), "up");
+  assert.deepEqual(labels(), ["touch down 3", "touch down 4", "touch up 3", "touch up 4"]);
   // Typed characters on the screen become text; shortcuts and keys without a character do not.
   sent.length = 0;
   const key = (code, value, extra = {}) => ({ code, key: value, repeat: false, shiftKey: false, ctrlKey: false,
@@ -6340,6 +6990,22 @@ test("ios: the page uses WebCodecs and the control socket on idb, turns the canv
   assert.equal(run("textInput.value.length"), 301, "the text box lost text it did not send");
   sandbox.onPaste({ clipboardData: { getData: () => "pasted" }, preventDefault() {} });
   assert.deepEqual(sent.at(-1), { t: "text", text: "pasted" });
+  // Once the state says the Simulator clipboard is reachable, long text and a paste are pastes.
+  run("applyState({t:\"state\",owner:\"shared\",paused:false,session:\"streaming\",clients:{video:1,control:1},transport:\"idb\",orientation:\"PORTRAIT\",rotation:0,clipboard:true})");
+  assert.match(document.getElementById("text-hint").textContent, /Plain ASCII up to 300 bytes is typed .* other text is set on its clipboard/);
+  sent.length = 0;
+  await run("sendText()");
+  run("textInput.value=\"short\"");
+  await run("sendText()");
+  // Text idb cannot type (anything but printable ASCII and newline) goes as a paste too.
+  run("textInput.value=\"caf\\u00e9\"");
+  await run("sendText()");
+  sandbox.onPaste({ clipboardData: { getData: () => "pasted" }, preventDefault() {} });
+  assert.deepEqual(sent, [{ t: "paste", text: "x".repeat(301) }, { t: "text", text: "short" },
+    { t: "paste", text: "caf\u00e9" }, { t: "paste", text: "pasted" }]);
+  assert.equal(run("textInput.value"), "");
+  run("onControlMessage({t:\"paste\",typed:false,message:\"The Simulator clipboard was set\"})");
+  assert.equal(run("view.note"), "The Simulator clipboard was set");
   run("render()");
   assert.equal(document.getElementById("stream-transport").textContent, "idb · WebCodecs");
   assert.equal(run("transportLabel()"), "idb (webcodecs)");
