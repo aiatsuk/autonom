@@ -7,6 +7,8 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
 
 ## [Unreleased]
 
+## [0.34.0] - 2026-10-06
+
 ### Added
 - **iOS Canvas volume buttons.** On the idb transport the dock's Volume down
   and Volume up (and `{"t":"system","op":"volume-up"|"volume-down"}`) press
