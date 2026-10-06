@@ -5804,9 +5804,10 @@ function alive(pid) {
   }
 }
 
-async function iosCanvas(t, { args = [], env = {}, companion = true } = {}) {
+async function iosCanvas(t, { args = [], env = {}, companion = true, nodeArgs = [] } = {}) {
   const world = await iosWorld(t, { env, companion });
-  const canvas = await startCanvas(world, ["--platform", "ios", "--target", IOS_UDID, "--simctl", world.xcrun, ...args]);
+  const canvas = await startCanvas(world, ["--platform", "ios", "--target", IOS_UDID, "--simctl", world.xcrun, ...args],
+    { nodeArgs });
   const auth = await login(canvas);
   return { world, canvas, auth };
 }
@@ -6593,6 +6594,21 @@ test("ios: volume-up and volume-down press VOLUME_UP and VOLUME_DOWN down then u
   await stopCanvas(canvas);
 });
 
+/** A preload that makes the Canvas process see `process.platform` as `name`. */
+function platformPreload(name) {
+  return `data:text/javascript,${encodeURIComponent(`
+import { syncBuiltinESMExports } from "node:module";
+Object.defineProperty(process, "platform", { value: ${JSON.stringify(name)} });
+syncBuiltinESMExports();
+`)}`;
+}
+
+// The Simulator clipboard needs the Canvas on the Mac that runs the Simulator. The clipboard
+// tests start the Canvas as if it ran on macOS, so they behave the same on a Linux test host.
+const ON_MACOS = { nodeArgs: ["--import", platformPreload("darwin")] };
+// The Canvas as if it ran on Linux: its Simulator (behind a remote companion) is on another Mac.
+const NOT_MACOS = platformPreload("linux");
+
 /** simctl clipboard calls the fake xcrun saw, as [command, udid]. */
 async function simctlClipboardCalls(world) {
   return (await adbCalls(world)).filter((args) => args[0] === "simctl" && /^pb(copy|paste)$/.test(args[1]))
@@ -6604,7 +6620,7 @@ function pasteboardCopies(world) {
 }
 
 test("ios: clipboard-get reads the Simulator clipboard with simctl pbpaste for the Canvas UDID; empty and the no-items message read as no text, a failure is an error for clipboard-get, and the text reaches no log, journal or status", async (t) => {
-  const { world, canvas, control } = await iosControl(t);
+  const { world, canvas, control } = await iosControl(t, ON_MACOS);
   const state = await control.next((message) => message.json?.t === "state" && "clipboard" in message.json);
   assert.equal(state.json.clipboard, true);
   const marker = "autonom-clip-test \u00fc\u65e5\u672c";
@@ -6641,7 +6657,7 @@ test("ios: clipboard-get reads the Simulator clipboard with simctl pbpaste for t
 });
 
 test("ios: a paste sets the Simulator clipboard once with simctl pbcopy and, as plain ASCII up to 300 bytes, is typed once through the bridge, journaled as a paste; input sent after it waits until it is done", async (t) => {
-  const { world, canvas, control } = await iosControl(t);
+  const { world, canvas, control } = await iosControl(t, ON_MACOS);
   writeFileSync(`${world.pasteboard}.hold`, "");
   const text = "autonom-clip-test\n~!";
   const done = control.reply((message) => message.t === "paste");
@@ -6668,7 +6684,7 @@ test("ios: a paste sets the Simulator clipboard once with simctl pbcopy and, as 
 });
 
 test("ios: a paste longer than 300 bytes is only set on the Simulator clipboard, the reply says long-press Paste inserts it, and one paste record has its length only", async (t) => {
-  const { world, canvas, control } = await iosControl(t);
+  const { world, canvas, control } = await iosControl(t, ON_MACOS);
   const text = "autonom-clip-test ".repeat(20);
   const done = control.reply((message) => message.t === "paste");
   control.send({ t: "paste", text });
@@ -6689,7 +6705,7 @@ test("ios: a paste longer than 300 bytes is only set on the Simulator clipboard,
 test("ios: a short paste with characters idb cannot type is only set on the Simulator clipboard, never sent to the bridge, and the reply says long-press Paste inserts it", async (t) => {
   // idb's `ui text` has keys for printable ASCII and newline only ("No keycode found" for any
   // other character), so typing this text would fail after the clipboard was already set.
-  const { world, canvas, control } = await iosControl(t);
+  const { world, canvas, control } = await iosControl(t, ON_MACOS);
   for (const text of ["autonom-clip-test \u00fc", "autonom-clip-test\t", "\u0430\u0431", "autonom \u{1f600}"]) {
     const done = control.reply((message) => message.t === "paste");
     control.send({ t: "paste", text });
@@ -6709,7 +6725,7 @@ test("ios: a short paste with characters idb cannot type is only set on the Simu
 });
 
 test("ios: a paste whose pbcopy fails, or that a takeover refuses by its turn, is answered with an error for paste and types nothing", async (t) => {
-  const { world, canvas, control } = await iosControl(t);
+  const { world, canvas, control } = await iosControl(t, ON_MACOS);
   writeFileSync(`${world.pasteboard}.mode`, "fail");
   let answer = control.reply((message) => message.t === "error");
   control.send({ t: "paste", text: "autonom-clip-test" });
@@ -6734,7 +6750,7 @@ test("ios: a paste whose pbcopy fails, or that a takeover refuses by its turn, i
 });
 
 test("ios: an xcrun that cannot be started answers clipboard-get and paste with an error, and the Canvas keeps running", async (t) => {
-  const { world, canvas, control } = await iosControl(t);
+  const { world, canvas, control } = await iosControl(t, ON_MACOS);
   const { rename } = await import("node:fs/promises");
   await rename(world.xcrun, `${world.xcrun}.gone`);
   t.after(() => rename(`${world.xcrun}.gone`, world.xcrun).catch(() => {}));
@@ -6752,13 +6768,6 @@ test("ios: an xcrun that cannot be started answers clipboard-get and paste with 
   await rename(`${world.xcrun}.gone`, world.xcrun);
   await stopCanvas(canvas);
 });
-
-// The Canvas as if it ran on Linux: its Simulator (behind a remote companion) is on another Mac.
-const NOT_MACOS = `data:text/javascript,${encodeURIComponent(`
-import { syncBuiltinESMExports } from "node:module";
-Object.defineProperty(process, "platform", { value: "linux" });
-syncBuiltinESMExports();
-`)}`;
 
 test("ios: a Canvas that does not run on macOS refuses paste and clipboard-get naming why, runs no simctl clipboard command, and its state says the clipboard is unavailable", async (t) => {
   const world = await iosWorld(t);
