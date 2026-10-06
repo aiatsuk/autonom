@@ -26,6 +26,8 @@ import {
   parseArgs,
   parseControlMessage,
   parseCookies,
+  screenrecordMaxSize,
+  streamMaxSize,
 } from "./browser-lib.mjs";
 import {
   ANDROID_KEYCODES,
@@ -203,7 +205,9 @@ const IDB_RETRY_MAX_MS = 5000;
 // A stream that ran this long resets the restart backoff.
 const IDB_STABLE_MS = 10_000;
 // The page's system buttons the Simulator has a hardware button for.
-const IOS_BUTTONS = Object.freeze({ home: "HOME", power: "LOCK" });
+const IOS_BUTTONS = Object.freeze({
+  home: "HOME", power: "LOCK", "volume-up": "VOLUME_UP", "volume-down": "VOLUME_DOWN",
+});
 // Clockwise degrees that turn the Simulator's portrait picture upright for each
 // orientation; the picture itself stays portrait when the Simulator rotates.
 const IOS_ROTATION = Object.freeze({ LANDSCAPE_LEFT: 270, LANDSCAPE_RIGHT: 90, PORTRAIT_UPSIDE_DOWN: 180 });
@@ -221,6 +225,29 @@ const IOS_WHEEL_IDLE_MS = 150;
 // the HID stream still keeps its order, and the companion is restarted when it is gone.
 const IOS_HID_WRITE_MS = 5000;
 const IOS_ONE_FINGER = "The iOS Simulator takes one finger at a time: this pointer was refused while another is down";
+// Two pointers of one connection are one pinch: idb has no live second finger, only a canned
+// HIDPinch sent when either pointer lifts. The page's mirrored pinch finger has the id
+// -1000 - id and comes before its partner, so nothing goes down before the pair is complete.
+const IOS_MIRROR_ID_MAX = -1000;
+// A pinch replays at most this long on the Simulator, so a long hold cannot stall the HID
+// stream; its fingers stay at least IOS_PINCH_MIN_RADIUS points from its center.
+const IOS_PINCH_MAX_S = 2;
+const IOS_PINCH_MIN_RADIUS = 8;
+// The Simulator clipboard is read and set with `xcrun simctl pbpaste|pbcopy UDID`. A paste
+// that fits the HID text path is also typed: at most IOS_TEXT_MAX_BYTES and only characters
+// idb's `ui text` has a key for (IOS_TYPEABLE_TEXT: printable ASCII and newline; any other
+// character fails with "No keycode found"). Other text is only set, and long-press Paste
+// inserts it (idb Cmd+V does not paste text set on the Mac).
+const IOS_TEXT_MAX_BYTES = 300;
+const IOS_TYPEABLE_TEXT = /^[\n\x20-\x7e]*$/;
+const IOS_SIMCTL_MS = 5000;
+const IOS_CLIPBOARD_MAX_BYTES = 256 * 1024;
+const IOS_EMPTY_PASTEBOARD = "There are no items on the device's pasteboard.";
+const IOS_PASTE_INSERT = "touch and hold a text field and choose Paste to insert it";
+const IOS_PASTE_TOO_LONG = "The Simulator clipboard was set but the text is longer than " +
+  `${IOS_TEXT_MAX_BYTES} bytes, so it was not typed: ${IOS_PASTE_INSERT}`;
+const IOS_PASTE_NOT_TYPEABLE = "The Simulator clipboard was set but the text has characters " +
+  `other than plain ASCII, which the Simulator cannot type, so it was not typed: ${IOS_PASTE_INSERT}`;
 
 main().catch((error) => {
   // A refusal with a code is the CLI's JSON error object on stderr and exit code 2, as
@@ -280,6 +307,10 @@ async function main() {
     acceleratedFailed: false,
     scrcpyFailed: null,
     idbFailed: null,
+    // The scrcpy stream size and how it was chosen (streamMaxSize): known once a session
+    // has probed the encoders, or from the start with --max-size.
+    streamSize: options.maxSizeExplicit ? streamMaxSize(options) : null,
+    streamSizeLogged: null,
     lastError: null,
     controlOwner: "shared",
     inputPaused: false,
@@ -483,7 +514,10 @@ Options:
                               auto prefers scrcpy on Android when a ${SCRCPY_PROTOCOL_VERSION} server is found,
                               and idb on the iOS Simulator when idb_companion is found.
   --fps FPS                   Frame rate cap (default: 15; ${DEFAULT_SCRCPY_MAX_FPS} on scrcpy and idb).
-  --max-size PX               Maximum video width (default: 1280).
+  --max-size PX               Longest video side on scrcpy, video width on screenrecord;
+                              0 is native size. Default on scrcpy: follows the device's
+                              H.264 encoder (2048 when software only, native with a
+                              hardware one, 1280 when it cannot tell); otherwise 1280.
   --bit-rate BPS              H.264 bitrate (default: 12000000).
   --scrcpy-server PATH        scrcpy-server file to push (default: AUTONOM_SCRCPY_SERVER,
                               SCRCPY_SERVER_PATH, then the server of scrcpy on PATH).
@@ -860,6 +894,8 @@ async function sendStatus(context, response) {
     fallback_reason: fallbackReason(context),
     ffmpeg: Boolean(context.ffmpegPath),
     screenrecord_h264: context.screenrecordSupported,
+    // The width the multipart screenrecord stream is scaled to, while it is the transport.
+    screenrecord_max_size: transport === "screenrecord" ? screenrecordMaxSize(context.options) : null,
     direct_h264_url: context.screenrecordSupported ? "/stream.h264" : null,
     frames_sent: context.state.framesSent,
     last_frame_at: context.state.lastFrameAt,
@@ -871,6 +907,19 @@ async function sendStatus(context, response) {
     scrcpy: scrcpyStatus(context),
     idb: idbStatus(context),
   });
+}
+
+/**
+ * The stream size of the transport in use, as `state` and `/status` report it: what scrcpy
+ * was asked for (null until a session chose), the width screenrecord is scaled to, or null
+ * on screencap and idb. A size chosen for scrcpy is not reported once the Canvas fell back.
+ */
+function streamSizeInUse(context) {
+  const transport = chooseTransport(context);
+  if (transport === "scrcpy") return context.state.streamSize;
+  if (transport !== "screenrecord") return null;
+  const source = context.options.maxSizeExplicit ? "explicit" : "default";
+  return { maxSize: screenrecordMaxSize(context.options), source, encoder: null, encoderName: null };
 }
 
 /** The iOS fast transport in /status: where the companion came from and what the stream did. */
@@ -907,11 +956,19 @@ function idbStatus(context) {
 function scrcpyStatus(context) {
   if (!context.scrcpy.available) return null;
   const stats = context.session?.stats;
+  const scrcpySize = chooseTransport(context) === "scrcpy" ? context.state.streamSize : null;
   return {
     version: context.scrcpy.version,
     server_path: context.scrcpy.serverPath,
     source: context.scrcpy.source,
     session_state: context.session?.state ?? "idle",
+    // The size asked of scrcpy-server (0 is native) and why: "explicit" (--max-size),
+    // "encoder" (the encoder named) or "default" (the encoders could not be read); all
+    // null until the first session has chosen, and while scrcpy is not the transport.
+    max_size: scrcpySize?.maxSize ?? null,
+    max_size_source: scrcpySize?.source ?? null,
+    encoder: scrcpySize?.encoder ?? null,
+    encoder_name: scrcpySize?.encoderName ?? null,
     width: context.video.size?.width ?? null,
     height: context.video.size?.height ?? null,
     packets: stats?.packets ?? 0,
@@ -1110,7 +1167,7 @@ class FrameBroadcaster {
       "--bit-rate", String(options.bitRate),
       "-",
     ], { stdio: ["ignore", "pipe", "pipe"] });
-    const filter = `fps=${options.fps},scale=min(${options.maxSize}\\,iw):-2`;
+    const filter = `fps=${options.fps},scale=min(${screenrecordMaxSize(options)}\\,iw):-2`;
     const ffmpeg = spawn(ffmpegPath, [
       "-hide_banner", "-loglevel", "error",
       "-f", "h264", "-i", "pipe:0",
@@ -1655,8 +1712,17 @@ function stateMessage(context) {
     session: context.session?.state ?? "idle",
     // iOS: the Simulator orientation, and how far the page turns the portrait picture.
     ...(isIosCanvas(context)
-      ? { orientation: context.session?.orientation ?? null, rotation: iosRotation(context) }
-      : {}),
+      ? {
+        orientation: context.session?.orientation ?? null, rotation: iosRotation(context),
+        // Whether paste and clipboard-get reach the Simulator clipboard (simctl on this Mac).
+        clipboard: iosClipboardRefusal(context) === null,
+      }
+      // Android: the stream size of the transport in use (scrcpy's, 0 is native, with the
+      // encoder behind it; screenrecord's width; null on screencap).
+      : {
+        max_size: streamSizeInUse(context)?.maxSize ?? null,
+        encoder: streamSizeInUse(context)?.encoder ?? null,
+      }),
     // Only Android has this transport, so state messages show the display preset.
     ...stateDisplay(context),
   });
@@ -1733,9 +1799,16 @@ function ensureSession(context) {
       serverPath: scrcpy.serverPath,
       version: scrcpy.version,
       maxSize: options.maxSize,
+      // Without --max-size the size follows the device's encoder (DEC-005).
+      chooseMaxSize: options.maxSizeExplicit ? null : (probe) => {
+        context.state.streamSize = streamMaxSize(options, probe);
+        logStreamSize(context);
+        return context.state.streamSize.maxSize;
+      },
       bitRate: options.bitRate,
       maxFps,
     });
+  if (transport === "scrcpy") logStreamSize(context);
   context.session = session;
   session.on("orientation", () => {
     // A rotation ends a finger or wheel drag: its points belong to the old orientation.
@@ -1793,6 +1866,20 @@ function ensureSession(context) {
       }
     });
   });
+}
+
+/** Print the scrcpy stream size once it is known, and again only when it changes. */
+function logStreamSize(context) {
+  const chosen = context.state.streamSize;
+  if (!chosen) return;
+  const size = chosen.maxSize === 0 ? "native" : `${chosen.maxSize} on the long side`;
+  const why = chosen.source === "explicit" ? "--max-size"
+    : chosen.source === "encoder" ? `${chosen.encoder} H.264 encoder ${chosen.encoderName}`
+      : "the device's encoders could not be read";
+  const line = `Stream size: ${size} (${why})`;
+  if (context.state.streamSizeLogged === line) return;
+  context.state.streamSizeLogged = line;
+  console.log(line);
 }
 
 /** The display size puts journaled gestures in device pixels, like HTTP input. */
@@ -2247,7 +2334,10 @@ function dispatchControl(context, client, message) {
       });
       return;
     case "clipboard-get":
-      if (isIosCanvas(context)) throw new InputError("The iOS Simulator clipboard is not available on this Canvas");
+      if (isIosCanvas(context)) {
+        iosClipboardGet(context, client);
+        return;
+      }
       requestClipboard(context, client);
       return;
     case "system":
@@ -2839,6 +2929,8 @@ function iosResumeReading(context) {
 function runIosItem(context, item) {
   if (item.kind === "hid") return runIosHid(context, item);
   if (item.kind === "text") return runIosText(context, item);
+  if (item.kind === "pbpaste") return runIosClipboardGet(context, item);
+  if (item.kind === "paste") return runIosPaste(context, item);
   runIosRecord(context, item);
   return undefined;
 }
@@ -2871,6 +2963,14 @@ function hidHeld(context) {
 
 async function runIosHid(context, item) {
   const { session, event, client, action } = item;
+  if (event.pinch) {
+    // A pinch holds nothing down: it is sent, by its turn, only for a live companion and a
+    // connection still allowed to send input.
+    const current = context.session === session && context.iosEpoch === item.epoch;
+    if (!current || !session.connected || (client && refusal(context, client.origin))) return;
+    await iosHidWrite(context, session, event, action);
+    return;
+  }
   const contact = Boolean(action && !event.button);
   // A new contact of the action starts clean; the rest of a contact whose DOWN was refused
   // or dropped is dropped with it.
@@ -2908,6 +3008,11 @@ async function runIosHid(context, item) {
   } else {
     held.touch = down ? event.touch : null;
   }
+  await iosHidWrite(context, session, sent, action);
+}
+
+/** Write one event to the session's HID stream; a write not taken in time stops holding the queue. */
+async function iosHidWrite(context, session, sent, action) {
   let timer = null;
   const timeout = new Promise((resolvePromise) => {
     timer = setTimeout(() => resolvePromise("timeout"), IOS_HID_WRITE_MS);
@@ -3005,7 +3110,8 @@ function dispatchIosInput(context, client, message) {
     case "key":
       throw new InputError("Android keycodes have no iOS Simulator equivalent; send text instead");
     case "paste":
-      throw new InputError("The iOS Simulator has no clipboard paste on this Canvas; send text instead");
+      iosPaste(context, client, message);
+      break;
     default:
       throw new InputError("Unsupported control message.");
   }
@@ -3013,7 +3119,8 @@ function dispatchIosInput(context, client, message) {
 
 /**
  * Touch down/move/up live: a held finger moves by repeating DOWN at its new point, then UP.
- * The HID touch has no finger id, so a second pointer, from any connection, is refused.
+ * The HID touch has no finger id, so a pointer from another connection, or a third one, is
+ * refused; a second pointer of the same connection makes the pair a pinch (iosStartPinch).
  */
 function iosTouch(context, client, message) {
   const { id } = message;
@@ -3022,22 +3129,27 @@ function iosTouch(context, client, message) {
     client.refused.delete(id);
     const finger = context.iosFinger;
     if (finger) {
-      if (finger.client === client && finger.id === id) throw new InputError(`Pointer ${id} is already down`);
-      client.refused.add(id);
-      if (client.refused.size > LIFTED_POINTERS_MAX) client.refused.delete(client.refused.values().next().value);
+      if (finger.client === client && iosFingerIds(finger).includes(id)) throw new InputError(`Pointer ${id} is already down`);
+      if (finger.client === client && !finger.wheel && !finger.pinch) {
+        iosStartPinch(context, client, finger, message);
+        return;
+      }
+      iosRefusePointer(client, id);
       throw new InputError(IOS_ONE_FINGER);
     }
     const point = iosPoint(context, message.x, message.y);
-    context.iosFinger = { client, id, x: message.x, y: message.y, point, wheel: false };
+    // A mirrored pinch finger waits for its partner; alone, it goes down at its first move.
+    const deferred = id <= IOS_MIRROR_ID_MAX;
+    context.iosFinger = { client, id, x: message.x, y: message.y, point, wheel: false, deferred, pinch: null };
     client.gesture = {
       startedAt: performance.now(), pointers: 1, moves: 0,
       start: iosGesturePoint(context, message.x, message.y), end: null, action: { sent: 0, written: 0, broken: false },
     };
-    hidSend(context, { touch: point, direction: "down" }, client, client.gesture.action, true);
+    if (!deferred) hidSend(context, { touch: point, direction: "down" }, client, client.gesture.action, true);
     return;
   }
   const finger = context.iosFinger;
-  if (!finger || finger.client !== client || finger.id !== id || finger.wheel) {
+  if (!finger || finger.client !== client || finger.wheel || !iosFingerIds(finger).includes(id)) {
     // The refusal went with the down; its moves and up need no answer.
     if (client.refused.has(id)) {
       if (message.a !== "move") client.refused.delete(id);
@@ -3051,10 +3163,19 @@ function iosTouch(context, client, message) {
     client.lifted.delete(id);
     return;
   }
+  if (finger.pinch) {
+    iosPinchPointer(context, client, finger, message);
+    return;
+  }
+  const action = client.gesture?.action ?? null;
+  if (finger.deferred) {
+    // A mirrored finger whose partner never came is one finger after all.
+    finger.deferred = false;
+    hidSend(context, { touch: finger.point, direction: "down" }, client, action, true);
+  }
   finger.x = message.x;
   finger.y = message.y;
   finger.point = iosPoint(context, message.x, message.y);
-  const action = client.gesture?.action ?? null;
   if (message.a === "move") {
     if (client.gesture) client.gesture.moves += 1;
     hidSend(context, { touch: finger.point, direction: "down" }, client, action);
@@ -3065,6 +3186,106 @@ function iosTouch(context, client, message) {
   context.iosFinger = null;
   if (client.gesture) client.gesture.end = iosGesturePoint(context, message.x, message.y);
   finishGesture(context, client);
+}
+
+/** The pointer ids of the finger state: one, or the two of a pinch. */
+function iosFingerIds(finger) {
+  return finger.pinch ? [...finger.pinch.pointers.keys()] : [finger.id];
+}
+
+/** A refused pointer: its moves and up are ignored without an answer. */
+function iosRefusePointer(client, id) {
+  client.refused.add(id);
+  if (client.refused.size > LIFTED_POINTERS_MAX) client.refused.delete(client.refused.values().next().value);
+}
+
+/**
+ * A second pointer of the finger's connection: the pair becomes a pending pinch. A live
+ * finger lifts where it is first, so the HID stream holds nothing down; the pinch itself
+ * is sent when either pointer lifts (iosPinchPointer), and nothing moves before that.
+ */
+function iosStartPinch(context, client, finger, message) {
+  const point = iosPoint(context, message.x, message.y);
+  if (!finger.deferred) {
+    hidSend(context, { touch: finger.point, direction: "up" }, client, client.gesture?.action ?? null);
+  }
+  finger.deferred = false;
+  finger.pinch = {
+    startedAt: performance.now(),
+    pointers: new Map([
+      [finger.id, { start: finger.point, now: finger.point }],
+      [message.id, { start: point, now: point }],
+    ]),
+  };
+}
+
+/** A move updates its pointer; the first up (or cancel) sends the pair as one HIDPinch. */
+function iosPinchPointer(context, client, finger, message) {
+  const pointer = finger.pinch.pointers.get(message.id);
+  pointer.now = iosPoint(context, message.x, message.y);
+  if (message.id === finger.id) {
+    finger.x = message.x;
+    finger.y = message.y;
+    finger.point = pointer.now;
+  }
+  if (message.a === "move") {
+    if (client.gesture) client.gesture.moves += 1;
+    return;
+  }
+  context.iosFinger = null;
+  // The other pointer is done with the pinch: its moves and up need no answer.
+  for (const other of finger.pinch.pointers.keys()) if (other !== message.id) iosRefusePointer(client, other);
+  let pinch;
+  try {
+    pinch = iosPinchEvent(context, finger.pinch);
+  } catch (error) {
+    iosLetGoUnsent(client, finger, null);
+    finishGesture(context, client);
+    throw error;
+  }
+  hidSend(context, { pinch }, client, client.gesture?.action ?? null);
+  if (client.gesture) {
+    client.gesture.pointers = 2;
+    client.gesture.end = iosGesturePoint(context, finger.x, finger.y);
+  }
+  finishGesture(context, client);
+}
+
+/**
+ * The HIDPinch for two pointers in points: center is the midpoint where they started, radius
+ * half the start distance and scale end distance / start distance, with the duration they
+ * took (at most IOS_PINCH_MAX_S). The companion moves both fingers on a horizontal line
+ * through the center, so center and radii are kept where those fingers stay on the screen.
+ */
+function iosPinchEvent(context, pinch) {
+  const size = iosLogicalSize(context);
+  const [a, b] = [...pinch.pointers.values()];
+  const clamp = (value, low, high) => Math.min(high, Math.max(low, value));
+  const half = (p, q) => Math.hypot(p.x - q.x, p.y - q.y) / 2;
+  const minRadius = Math.min(IOS_PINCH_MIN_RADIUS, size.width / 4);
+  const center = {
+    x: roundPoints(clamp((a.start.x + b.start.x) / 2, minRadius + 1, size.width - minRadius - 1)),
+    y: roundPoints(clamp((a.start.y + b.start.y) / 2, 0, size.height)),
+  };
+  const maxRadius = Math.max(minRadius, Math.min(center.x, size.width - center.x) - 1);
+  const radius = roundPoints(clamp(half(a.start, b.start), minRadius, maxRadius));
+  const end = clamp(half(a.now, b.now), minRadius, maxRadius);
+  const seconds = clamp((performance.now() - pinch.startedAt) / 1000, 0, IOS_PINCH_MAX_S);
+  return {
+    center, radius,
+    scale: Math.round((end / radius) * 10_000) / 10_000,
+    duration: Math.round(seconds * 1000) / 1000,
+  };
+}
+
+/**
+ * A finger that never reached the HID stream (a mirrored finger without its partner, or a
+ * pinch not sent yet) is let go without sending anything; a gesture that sent nothing at all
+ * did not happen and is not journaled.
+ */
+function iosLetGoUnsent(client, finger, reason) {
+  if (reason) for (const id of iosFingerIds(finger)) liftedByCanvas(client, id, reason);
+  if (client.gesture && !client.gesture.action?.sent) client.gesture = null;
 }
 
 const roundPoints = (value) => Math.round(value * 100) / 100;
@@ -3171,6 +3392,152 @@ function iosText(context, client, message) {
 }
 
 /**
+ * Why paste and clipboard-get cannot reach the Simulator clipboard, or null when they can.
+ * `simctl pbcopy`/`pbpaste` act on the Simulators of the Mac they run on, so a Canvas that
+ * does not run on macOS (its Simulator, behind a remote companion, is on another Mac) has
+ * none and runs no simctl command for them.
+ */
+function iosClipboardRefusal(context) {
+  if (platform !== "darwin") {
+    return "The iOS Simulator clipboard needs xcrun simctl on the Mac that runs the Simulator; " +
+      "this Canvas does not run on macOS";
+  }
+  return null;
+}
+
+/**
+ * `xcrun simctl <command> <udid>` with `input` on stdin, no shell; resolves with stdout as
+ * text. Neither stdin nor stdout is ever logged: they are clipboard text.
+ */
+function runSimctlClipboard(context, command, input = null) {
+  return new Promise((resolvePromise, reject) => {
+    let child;
+    try {
+      child = spawn(context.adbPath, ["simctl", command, context.serial], { stdio: ["pipe", "pipe", "pipe"] });
+    } catch (error) {
+      reject(error);
+      return;
+    }
+    const out = [];
+    let outBytes = 0;
+    let errText = "";
+    let failure = null;
+    let settled = false;
+    const finish = (error, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (error) reject(error);
+      else resolvePromise(value);
+    };
+    const timer = setTimeout(() => {
+      failure = new Error(`simctl ${command} took more than ${IOS_SIMCTL_MS} ms`);
+      child.kill("SIGKILL");
+    }, IOS_SIMCTL_MS);
+    timer.unref?.();
+    child.stdout.on("data", (chunk) => {
+      outBytes += chunk.length;
+      if (outBytes > IOS_CLIPBOARD_MAX_BYTES) {
+        failure ??= new Error(`the Simulator clipboard holds more than ${IOS_CLIPBOARD_MAX_BYTES / 1024} KiB of text`);
+        child.kill("SIGKILL");
+        return;
+      }
+      out.push(chunk);
+    });
+    // simctl's own error message, never clipboard text: a short line for the reply.
+    child.stderr.on("data", (chunk) => {
+      if (errText.length < 400) errText += chunk.toString("utf8");
+    });
+    child.stdin.on("error", () => {});
+    child.on("error", (error) => {
+      failure ??= error;
+      // A child that never started has no close to wait for.
+      if (child.pid === undefined) finish(failure);
+    });
+    child.on("close", (code, signal) => {
+      if (!failure && code !== 0) {
+        const detail = errText.trim().split("\n")[0].slice(0, 200);
+        failure = new Error(`simctl ${command} exited with ${code ?? signal}${detail ? `: ${detail}` : ""}`);
+      }
+      finish(failure, failure ? undefined : Buffer.concat(out).toString("utf8"));
+    });
+    child.stdin.end(input ?? undefined);
+  });
+}
+
+/**
+ * clipboard-get on iOS reads the Simulator clipboard with simctl pbpaste at its place in the
+ * input queue, so it sees a paste sent before it. Like Android it acts for anyone; empty
+ * reads as no text. The text is never logged or journaled.
+ */
+function iosClipboardGet(context, client) {
+  const refused = iosClipboardRefusal(context);
+  if (refused) throw new InputError(refused);
+  iosEnqueue(context, { kind: "pbpaste", client });
+}
+
+async function runIosClipboardGet(context, item) {
+  const { client } = item;
+  if (!context.controlClients.has(client)) return;
+  let text;
+  try {
+    text = await runSimctlClipboard(context, "pbpaste");
+  } catch (error) {
+    context.state.lastError = `clipboard: ${error.message}`;
+    reply(context, client, { t: "error", message: `The Simulator clipboard could not be read: ${error.message}`, for: "clipboard-get" });
+    return;
+  }
+  // A fresh Simulator says it has no items, with exit code 0.
+  const empty = text === "" || text.replace(/\r?\n$/, "") === IOS_EMPTY_PASTEBOARD;
+  if (context.controlClients.has(client)) reply(context, client, { t: "clipboard", text: empty ? null : text });
+}
+
+/**
+ * paste on iOS sets the Simulator clipboard with simctl pbcopy at its place in the input
+ * queue, behind HTTP input too, and types the text when it fits the HID text path; longer
+ * text is only set, and the reply says how to insert it. Pause and takeover are checked when
+ * its turn comes. One `paste` record with the text length only; the text is never logged.
+ */
+function iosPaste(context, client, message) {
+  const refused = iosClipboardRefusal(context);
+  if (refused) throw new InputError(refused);
+  iosEnqueue(context, { kind: "paste", client, text: message.text, setOnly: iosPasteSetOnly(message.text) });
+}
+
+/** Why a paste is only set and not typed (null when it fits the HID text path). */
+function iosPasteSetOnly(text) {
+  if (Buffer.byteLength(text, "utf8") > IOS_TEXT_MAX_BYTES) return IOS_PASTE_TOO_LONG;
+  if (!IOS_TYPEABLE_TEXT.test(text)) return IOS_PASTE_NOT_TYPEABLE;
+  return null;
+}
+
+async function runIosPaste(context, item) {
+  const { client, text, setOnly } = item;
+  const typed = !setOnly;
+  try {
+    const refused = refusal(context, client.origin);
+    if (refused) throw new InputError(refused);
+    await context.enqueueInput(async () => {
+      const late = refusal(context, client.origin);
+      if (late) throw new InputError(late);
+      await runSimctlClipboard(context, "pbcopy", text).catch((error) => {
+        context.state.lastError = `clipboard: ${error.message}`;
+        throw new InputError(`The Simulator clipboard could not be set: ${error.message}`);
+      });
+      if (!typed) return;
+      const lateType = refusal(context, client.origin);
+      if (lateType) throw new InputError(`The Simulator clipboard was set, but the text was not typed: ${lateType}`);
+      // The bridge types it and journals it as this paste, with its length only.
+      await context.actionBridge.call("text", { text, sensitive: true, transport: "idb", paste: true }, client.origin);
+    });
+    if (!typed) journalNow(context, client, { kind: "paste", text_len: codePoints(text) });
+    reply(context, client, typed ? { t: "paste", typed: true } : { t: "paste", typed: false, message: setOnly });
+  } catch (error) {
+    reply(context, client, { t: "error", message: error.message, for: "paste" });
+  }
+}
+
+/**
  * Lift this connection's finger or wheel on the Simulator and journal what it did (pause,
  * takeover, disconnect, rotation). With a reason, later moves of the finger are refused.
  */
@@ -3178,7 +3545,11 @@ function iosReleaseInput(context, client, reason = null) {
   if (!isIosCanvas(context)) return;
   finishScroll(context, client);
   const finger = context.iosFinger;
-  if (finger && finger.client === client && !finger.wheel) {
+  if (finger && finger.client === client && !finger.wheel && (finger.pinch || finger.deferred)) {
+    // A pending pinch is dropped, not sent: nothing of it is down on the HID stream.
+    context.iosFinger = null;
+    iosLetGoUnsent(client, finger, reason);
+  } else if (finger && finger.client === client && !finger.wheel) {
     context.iosFinger = null;
     // Queued behind the finger's DOWN, the UP lifts it even when the connection is refused;
     // it is not sent when that DOWN was dropped.
@@ -3193,6 +3564,7 @@ function iosReleaseInput(context, client, reason = null) {
 function iosForgetInput(context, client) {
   const finger = context.iosFinger;
   if (finger?.client === client) context.iosFinger = null;
+  if (finger?.client === client && (finger.pinch || finger.deferred)) iosLetGoUnsent(client, finger, null);
   finishScroll(context, client);
   if (finger?.client === client && !finger.wheel && client.gesture) {
     client.gesture.end = iosGesturePoint(context, finger.x, finger.y);
@@ -3209,7 +3581,9 @@ function iosOrphanInput(context, client) {
   const finger = context.iosFinger;
   if (finger?.client === client) {
     context.iosFinger = null;
-    if (!finger.wheel) {
+    if (finger.pinch || finger.deferred) {
+      iosLetGoUnsent(client, finger, "the idb companion restarted");
+    } else if (!finger.wheel) {
       liftedByCanvas(client, finger.id, "the idb companion restarted");
       if (client.gesture) client.gesture.end = iosGesturePoint(context, finger.x, finger.y);
     }
@@ -4091,6 +4465,9 @@ function renderPage(context) {
   // iOS refuses the Android key buttons, so its page keeps them out of sight (PAGE-003);
   // Home and Power stay, as the bridge presses the Simulator's Home and Lock for them.
   const androidOnly = android ? "" : " hidden";
+  // Volume buttons: scrcpy on Android; on iOS only the idb transport presses them, so they
+  // show there (data-idb) and stay out of sight on screencap.
+  const volume = android ? " data-scrcpy" : " data-idb hidden";
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -4279,8 +4656,8 @@ dd code{font:12px var(--mono)}
     ${iconButton("recent", "Recent apps", `data-key="KEYCODE_APP_SWITCH" data-system="app-switch"${androidOnly}`)}
     <span class="div" aria-hidden="true"${androidOnly}></span>
     ${iconButton("rotate", "Rotate", `data-system="rotate" data-scrcpy${androidOnly}`)}
-    ${iconButton("volumeDown", "Volume down", `data-system="volume-down" data-scrcpy${androidOnly}`)}
-    ${iconButton("volumeUp", "Volume up", `data-system="volume-up" data-scrcpy${androidOnly}`)}
+    ${iconButton("volumeDown", "Volume down", `data-system="volume-down"${volume}`)}
+    ${iconButton("volumeUp", "Volume up", `data-system="volume-up"${volume}`)}
     ${iconButton("power", "Power", 'data-key="KEYCODE_POWER" data-system="power"')}
   </nav>
 </main>
@@ -4362,7 +4739,7 @@ const sizeOptions=[...document.querySelectorAll("[data-preset]")];
 const inputControls=[...document.querySelectorAll("[data-system],[data-code],[data-key]"),textInput,sendButton];
 const ctx=video.getContext("2d");
 let csrf=null,logicalDisplay=null,reconnectTimer=null,pointer=null,displayBusy=false,refocusPicker=false,menuOpen=false,noteAt=0,frameRatio=0,rotation=0;
-const view={transport:null,mode:null,reason:"",status:null,owner:"shared",paused:false,session:"idle",clients:null,width:0,height:0,note:"",rtt:null,preset:null,density:null};
+const view={transport:null,mode:null,reason:"",status:null,owner:"shared",paused:false,session:"idle",clients:null,width:0,height:0,note:"",rtt:null,preset:null,density:null,clipboard:false};
 const stats={decoder:"none",codec:null,framesDecoded:0,framesRendered:0,framesDropped:0,packets:0,bytes:0,errors:0,renderTimes:[],lastFrameAt:0};
 let videoSocket=null,controlSocket=null,decoder=null,config=null,waitingKey=true,drawScheduled=false,configuring=false,pendingChunks=[];
 const MAX_QUEUED_FRAMES=2,frameQueue=[];
@@ -4420,10 +4797,11 @@ function onDecoderError(error){stats.errors+=1;note("decoder: "+(error&&error.me
 // scrcpy control: one WebSocket carrying touch, wheel, keys, text and system actions.
 function connectControl(){if(controlSocket||!fastActive())return;const socket=new WebSocket(wsUrl("/ws/control"));controlSocket=socket;socket.onopen=()=>{controlRetry=500};socket.onmessage=event=>{let message;try{message=JSON.parse(event.data)}catch{return}onControlMessage(message)};socket.onclose=()=>{if(controlSocket!==socket)return;controlSocket=null;activePointers.clear();displayBusy=false;if(fastActive()){setTimeout(connectControl,controlRetry);controlRetry=Math.min(5000,controlRetry*2)}}}
 function closeControlSocket(){const socket=controlSocket;controlSocket=null;if(socket)socket.close()}
-function onControlMessage(message){if(message.t==="state")applyState(message);else if(message.t==="display")onDisplay(message.display);else if(message.t==="error"){stats.errors+=1;note(message.message);if(message.for==="display"){displayBusy=false;syncPicker()}}else if(message.t==="clipboard"){if(typeof message.text!=="string"){note("the device clipboard has no text");return}textInput.value=message.text;if(navigator.clipboard&&navigator.clipboard.writeText)navigator.clipboard.writeText(message.text).catch(()=>{});note("device clipboard copied")}else if(message.t==="pong"){view.rtt=Math.round(performance.now()-message.ts)}}
+function onControlMessage(message){if(message.t==="state")applyState(message);else if(message.t==="display")onDisplay(message.display);else if(message.t==="error"){stats.errors+=1;note(message.message);if(message.for==="display"){displayBusy=false;syncPicker()}}else if(message.t==="clipboard"){if(typeof message.text!=="string"){note("the device clipboard has no text");return}textInput.value=message.text;if(navigator.clipboard&&navigator.clipboard.writeText)navigator.clipboard.writeText(message.text).catch(()=>{});note("device clipboard copied")}else if(message.t==="paste"){if(message.message)note(message.message)}else if(message.t==="pong"){view.rtt=Math.round(performance.now()-message.ts)}}
 function sendControl(message){if(!controlSocket||controlSocket.readyState!==1)return false;controlSocket.send(JSON.stringify(message));return true}
-function applyState(message){view.owner=message.owner;view.paused=message.paused;view.session=message.session;view.clients=message.clients;if("preset" in message){view.preset=message.preset;view.density=message.density}syncPicker();if("rotation" in message)setRotation(message.rotation);if(view.mode==="webcodecs"&&message.width&&message.height)setVideoSize(message.width,message.height);if(message.transport&&message.transport!==view.transport){view.transport=message.transport;applyTransport()}}
-function applyTransport(){textInput.placeholder=fastActive()?"Text to type":"ASCII text to type";setText(ui.hint,iosFast()?"Typed into the Simulator, up to 300 bytes at a time.":scrcpyActive()?"Any language. Longer text is pasted through the device clipboard.":"Letters, digits and punctuation of plain ASCII on this transport.");for(const button of document.querySelectorAll("[data-scrcpy]"))button.hidden=!scrcpyActive();if(fastActive()){connectControl();if(!view.mode){if(typeof VideoDecoder==="function"&&typeof EncodedVideoChunk==="function")startWebCodecs();else startMultipart("VideoDecoder is not available in this browser")}}else{closeControlSocket();if(view.mode!=="multipart")startMultipart("")}}
+function applyState(message){view.owner=message.owner;view.paused=message.paused;view.session=message.session;view.clients=message.clients;if("clipboard" in message){view.clipboard=message.clipboard===true;if(iosFast())applyHint()}if("preset" in message){view.preset=message.preset;view.density=message.density}syncPicker();if("rotation" in message)setRotation(message.rotation);if(view.mode==="webcodecs"&&message.width&&message.height)setVideoSize(message.width,message.height);if(message.transport&&message.transport!==view.transport){view.transport=message.transport;applyTransport()}}
+function applyHint(){setText(ui.hint,iosFast()?(view.clipboard?"Plain ASCII up to 300 bytes is typed into the Simulator; longer or other text is set on its clipboard: touch and hold, then Paste.":"Typed into the Simulator, up to 300 bytes at a time."):scrcpyActive()?"Any language. Longer text is pasted through the device clipboard.":"Letters, digits and punctuation of plain ASCII on this transport.")}
+function applyTransport(){textInput.placeholder=fastActive()?"Text to type":"ASCII text to type";applyHint();for(const button of document.querySelectorAll("[data-scrcpy]"))button.hidden=!scrcpyActive();for(const button of document.querySelectorAll("[data-idb]"))button.hidden=!iosFast();if(fastActive()){connectControl();if(!view.mode){if(typeof VideoDecoder==="function"&&typeof EncodedVideoChunk==="function")startWebCodecs();else startMultipart("VideoDecoder is not available in this browser")}}else{closeControlSocket();if(view.mode!=="multipart")startMultipart("")}}
 // Size picker (Android): the preset in effect is selected; a choice goes the way other input goes.
 function canSendInput(){return !view.paused&&(view.owner==="shared"||view.owner==="human")}
 // Called every render too: nothing already shown is set again, so an open menu stays as it is.
@@ -4464,10 +4842,13 @@ document.addEventListener("touchstart",()=>{},{passive:true});
 function clamp01(value){return Math.min(1,Math.max(0,value))}
 function normalized(event,clampInside){const element=surface(),rect=element.getBoundingClientRect(),width=view.mode==="webcodecs"?video.width:image.naturalWidth,height=view.mode==="webcodecs"?video.height:image.naturalHeight;if(!width||!height||!rect.width||!rect.height)return null;const ratio=Math.min(rect.width/width,rect.height/height),rw=width*ratio,rh=height*ratio,x=(event.clientX-rect.left-(rect.width-rw)/2)/rw,y=(event.clientY-rect.top-(rect.height-rh)/2)/rh;if(clampInside)return{x:clamp01(x),y:clamp01(y)};if(x<0||y<0||x>1||y>1)return null;return{x,y}}
 function pressure(event){return event.pointerType==="mouse"||!event.pressure?1:Math.min(1,event.pressure)}
-// Ctrl- or Alt-drag adds a second finger mirrored around the centre: a pinch.
+// Ctrl- or Alt-drag adds a second finger mirrored around the centre: a pinch. On iOS the
+// mirrored finger goes first, so the Canvas holds the pair back and sends one pinch at release.
 function mirrorId(id){return -1000-id}
-function sendTouch(action,id,at,pinch,p){sendControl({t:"touch",a:action,id,x:at.x,y:at.y,p});if(pinch)sendControl({t:"touch",a:action,id:mirrorId(id),x:1-at.x,y:1-at.y,p})}
-function onPointerDown(event){if(!fastActive()){legacyPointerDown(event);return}if(event.pointerType==="mouse"&&event.button!==0)return;const at=normalized(event,false);if(!at)return;event.preventDefault();if(iosFast()&&activePointers.size){note("the iOS Simulator takes one finger at a time");return}surface().focus();surface().setPointerCapture(event.pointerId);const pinch=!iosFast()&&event.pointerType==="mouse"&&(event.ctrlKey||event.altKey);activePointers.set(event.pointerId,{pinch});sendTouch("down",event.pointerId,at,pinch,pressure(event))}
+function sendTouch(action,id,at,pinch,p){const mirror=()=>sendControl({t:"touch",a:action,id:mirrorId(id),x:1-at.x,y:1-at.y,p});if(pinch&&iosFast())mirror();sendControl({t:"touch",a:action,id,x:at.x,y:at.y,p});if(pinch&&!iosFast())mirror()}
+// iOS takes two fingers at most, sent as one pinch when either lifts.
+function iosFingers(){let count=0;for(const active of activePointers.values())count+=active.pinch?2:1;return count}
+function onPointerDown(event){if(!fastActive()){legacyPointerDown(event);return}if(event.pointerType==="mouse"&&event.button!==0)return;const at=normalized(event,false);if(!at)return;event.preventDefault();const pinch=event.pointerType==="mouse"&&(event.ctrlKey||event.altKey);if(iosFast()&&iosFingers()+(pinch?2:1)>2){note("the iOS Simulator takes two fingers at most, sent as one pinch when one lifts");return}surface().focus();surface().setPointerCapture(event.pointerId);activePointers.set(event.pointerId,{pinch});sendTouch("down",event.pointerId,at,pinch,pressure(event))}
 function onPointerMove(event){const active=activePointers.get(event.pointerId);if(!active)return;const at=normalized(event,true);if(at)sendTouch("move",event.pointerId,at,active.pinch,pressure(event))}
 function onPointerEnd(event,action){const active=activePointers.get(event.pointerId);if(!active)return;activePointers.delete(event.pointerId);const at=normalized(event,true)||{x:0.5,y:0.5};sendTouch(action,event.pointerId,at,active.pinch,0)}
 function legacyPointerDown(event){const p=point(event);if(!p)return;image.setPointerCapture(event.pointerId);pointer={...p,time:performance.now(),id:event.pointerId}}
@@ -4492,13 +4873,14 @@ function onIosKey(event){if(event.ctrlKey||event.metaKey||event.isComposing||typ
 function onKeyDown(event){if(iosFast()){onIosKey(event);return}if(!scrcpyActive())return;const input=keyInputFor(event,KEYCODES,US_KEY_CHARS);if(!input)return;event.preventDefault();if(input.text!==undefined){sendControl({t:"text",text:input.text});return}const repeat=event.repeat?(heldKeys.get(event.code)||0)+1:0;heldKeys.set(event.code,repeat);sendControl({t:"key",a:"down",code:input.code,meta:metaFor(event),repeat})}
 function onKeyUp(event){if(!scrcpyActive()||!heldKeys.has(event.code))return;event.preventDefault();heldKeys.delete(event.code);sendControl({t:"key",a:"up",code:KEYCODES[event.code],meta:metaFor(event),repeat:0})}
 function releaseKeys(){for(const name of heldKeys.keys()){const code=KEYCODES[name];if(code!==undefined)sendControl({t:"key",a:"up",code,meta:0,repeat:0})}heldKeys.clear()}
-function onPaste(event){if(!fastActive())return;const text=event.clipboardData&&event.clipboardData.getData("text/plain");if(!text)return;event.preventDefault();if(iosFast()){if(utf8Length(text)>300){note("the iOS Simulator takes at most 300 bytes of text at a time; nothing was sent");return}sendControl({t:"text",text});return}const message={t:"paste",text};if(!fitsControl(message,"clipboard text"))return;sendControl(message)}
+function onPaste(event){if(!fastActive())return;const text=event.clipboardData&&event.clipboardData.getData("text/plain");if(!text)return;event.preventDefault();if(iosFast()&&!view.clipboard){if(utf8Length(text)>300){note("the iOS Simulator takes at most 300 bytes of text at a time; nothing was sent");return}sendControl({t:"text",text});return}const message={t:"paste",text};if(!fitsControl(message,"clipboard text"))return;sendControl(message)}
 function utf8Length(text){return new TextEncoder().encode(text).length}
+function iosTypeable(text){return /^[\\n\\x20-\\x7e]*$/.test(text)}
 function fitsControl(message,what){const size=utf8Length(JSON.stringify(message));if(size<=MAX_CONTROL_BYTES)return true;note(what+" is too large: "+size+" bytes as a control message after JSON escaping, at most "+MAX_CONTROL_BYTES+"; nothing was sent");return false}
 for(const button of document.querySelectorAll("[data-system],[data-code],[data-key]")){button.addEventListener("click",()=>{if(fastActive()){if(button.dataset.system)sendControl({t:"system",op:button.dataset.system});else if(button.dataset.code){const code=Number(button.dataset.code);sendControl({t:"key",a:"down",code,meta:0,repeat:0});sendControl({t:"key",a:"up",code,meta:0,repeat:0})}return}if(button.dataset.key)post("/key",{key:button.dataset.key}).catch(error=>note(error.message))})}
 $("clipboard").onclick=()=>sendControl({t:"clipboard-get"});
 $("refresh").onclick=()=>{if(view.mode==="webcodecs"){closeVideoSocket();waitingKey=true;videoRetry=500;connectVideo()}else restart()};
-async function sendText(){const value=textInput.value;if(!value)return;if(iosFast()){if(utf8Length(value)>300){note("the iOS Simulator takes at most 300 bytes of text at a time; nothing was sent");return}if(sendControl({t:"text",text:value}))textInput.value="";return}if(scrcpyActive()){const message=utf8Length(value)<=300?{t:"text",text:value}:{t:"paste",text:value};if(!fitsControl(message,"the text"))return;const ok=sendControl(message);if(ok)textInput.value="";return}try{await post("/text",{text:value});textInput.value=""}catch(error){note(error.message)}}
+async function sendText(){const value=textInput.value;if(!value)return;if(iosFast()&&!view.clipboard){if(utf8Length(value)>300){note("the iOS Simulator takes at most 300 bytes of text at a time; nothing was sent");return}if(sendControl({t:"text",text:value}))textInput.value="";return}if(fastActive()){const message=utf8Length(value)<=300&&(!iosFast()||iosTypeable(value))?{t:"text",text:value}:{t:"paste",text:value};if(!fitsControl(message,"the text"))return;const ok=sendControl(message);if(ok)textInput.value="";return}try{await post("/text",{text:value});textInput.value=""}catch(error){note(error.message)}}
 $("sendText").onclick=sendText;textInput.addEventListener("keydown",event=>{if(event.key==="Enter")sendText()});
 function transportLabel(){if(!view.transport)return"connecting";if(!fastActive())return view.transport;if(view.mode==="webcodecs")return scrcpyActive()?"scrcpy (webcodecs)":view.transport+" (webcodecs)";return view.transport+" (multipart"+(view.reason?": "+view.reason:"")+")"}
 function render(){const data=view.status||{},lines=["platform: "+(data.platform||"unknown"),"transport: "+transportLabel()];if(data.fallback_reason)lines.push("fallback: "+data.fallback_reason);if(view.mode==="webcodecs"){lines.push("decoder: "+(stats.codec||"waiting for config"));lines.push("fps: "+stats.renderTimes.length+" rendered, "+stats.framesDecoded+" decoded, "+stats.framesDropped+" dropped, queue "+(decoder?decoder.decodeQueueSize:0));lines.push("video: "+(view.width?view.width+"x"+view.height:"waiting")+", session "+view.session)}else{lines.push("frames: "+(data.frames_sent??0)+"\\nstream clients: "+(data.stream_clients??0))}if(view.clients)lines.push("clients: video "+view.clients.video+", control "+view.clients.control);lines.push("display: "+(data.display&&data.display.width?data.display.width+"x"+data.display.height+(view.density?" @ "+view.density:"")+(sizePicker?" ("+(view.preset||"other")+")":""):"unknown"));lines.push("control: "+view.owner+(view.paused?" (paused)":""));if(data.last_error)lines.push("last error: "+data.last_error);if(view.note)lines.push("note: "+view.note);setStatus(lines.join("\\n"));syncPicker();renderChrome()}

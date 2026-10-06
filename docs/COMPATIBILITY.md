@@ -307,6 +307,51 @@ No flag, code or field is added or removed.
 | scrcpy page presentation | only the newest decoded frame waits for a screen refresh; an earlier one is closed and counted in `framesDropped` | decoded frames are shown in order, at most two waiting, one per refresh; only a third waiting frame is dropped. `framesRendered` rises and `framesDropped` falls for the same stream; latency grows by about 6-13 ms on average |
 | `tests/live/canvas_scrcpy_live.mjs --case bench` | brow, input moves tied to animation frames, scrcpy compared with screencap | Playwright Chromium (headed off screen, `--headless` optional), input from a 16 ms timer; reports device, received, decoded, presented and distinct fps, latency and host load; passes on presented median >= 55 with distinct median >= 45 |
 
+### Mobile Canvas iOS volume, clipboard and pinch (Unreleased)
+
+Additive: messages that were refused on the iOS idb transport now act. The
+message shapes are unchanged; replies and the `state` field are additive.
+
+| Surface | Before | Now |
+| --- | --- | --- |
+| iOS `/ws/control`: a second pointer of the same connection | `error` (one finger at a time) | the pair is one pinch, sent when either pointer lifts as one idb HIDPinch (center, radius, scale, duration of at most 2 s) and journaled as one `gesture` with `pointers: 2`; nothing moves before the release; a pointer from another connection or a third pointer is still refused (`one finger at a time`). A pair that starts with a mirrored finger (id `-1000 - id`, as the page's Ctrl/Alt-drag sends it first) sends no touch down or up at all, only the HIDPinch. Limitation: when two real fingers come one after the other, the first is live like any single finger, so it has already touched down and lifts where it is when the second lands: the Simulator sees a tap or short drag there before the pinch (holding every first finger back would delay every ordinary tap) |
+| iOS `/ws/control` `{"t":"system","op":"volume-up"\|"volume-down"}` and the bridge's `KEYCODE_VOLUME_UP`/`KEYCODE_VOLUME_DOWN` | `error` / passed through as Android key names | the Simulator's VOLUME_UP/VOLUME_DOWN buttons, one `system` record each (the bridge presses them with `idb ui button`); the page shows Volume down and up on the idb transport |
+| iOS `/ws/control` `{"t":"clipboard-get"}` | `error` (clipboard not available) | `{"t":"clipboard","text":...}` from `xcrun simctl pbpaste <udid>` (`null` for an empty clipboard), an `error` for `clipboard-get` when simctl fails; on a Canvas not running on macOS an `error` naming why, with no simctl command run |
+| iOS `/ws/control` `{"t":"paste","text":...}` | `error` (no clipboard paste) | the Simulator clipboard is set with `xcrun simctl pbcopy <udid>` in input order, then the text is typed when it is plain ASCII (printable characters and newline, the only ones idb's text path types) of at most 300 bytes (`{"t":"paste","typed":true}`, journaled by the bridge as one `ui paste` with the length only) or otherwise only set (`{"t":"paste","typed":false,"message":...}` saying why it was not typed and to touch and hold, then Paste, and one `paste` record); errors for `paste` when simctl fails or control was taken; refused off macOS like `clipboard-get` |
+| iOS `state` message | `orientation`, `rotation` | adds `clipboard` (true when paste and clipboard-get reach the Simulator clipboard) |
+| HTTP `POST /key` | `KEYCODE_VOLUME_UP`/`KEYCODE_VOLUME_DOWN` refused (`400 Unsupported key code`) | accepted on both platforms and passed to the action bridge: the device's volume key on Android, the Simulator's volume button on iOS |
+
+### Mobile Canvas Android stream size (Unreleased)
+
+No `error_code` is added. The scrcpy default size changes and `0` becomes a
+valid `--max-size`; `/status` and `state` fields are additive.
+
+| Surface | Before | Now |
+| --- | --- | --- |
+| scrcpy stream size without `--max-size` | 1280 on the longer side | follows the device's H.264 encoder, read once per device with scrcpy-server `list_encoders=true` (at most 3 s, kept for restarts): 2048 when every H.264 encoder is software (every emulator), native size with a hardware one (phones), 1280 when the list fails or says neither |
+| `--max-size` (canvas server and `canvas serve`) | 320..4096 | `0` (native size) or 320..4096; an explicit value is used as given and no encoder probe runs; the screenrecord stream reads 0 as 4096 wide and keeps 1280 by default; out of range is still `invalid_value`, now naming 0 and the encoder default; an empty value is refused instead of read as 0 |
+| `/status` `scrcpy` | — | adds `max_size` (0 is native), `max_size_source` (`explicit`, `encoder`, `default`), `encoder` (`software`, `hardware` or null) and `encoder_name`; all null until the first session chose, and null while scrcpy is not the transport in use (after an `auto` fallback) |
+| `/status` | — | adds `screenrecord_max_size`: the width the screenrecord stream is scaled to while screenrecord is the transport (0 reads as 4096), else null |
+| Android `state` message | — | adds `max_size` and `encoder` of the transport in use: scrcpy's size and encoder, screenrecord's width with `encoder` null, or both null on screencap |
+| Canvas stdout | — | one `Stream size: ...` line when the size is chosen, and again only when it changes |
+| `tests/live/canvas_scrcpy_live.mjs` | — | `--max-size PX` is handed to every Canvas; the bench report's `stream` (and each run's) records `max_size`, `max_size_source`, `encoder`, `encoder_name` and the video size |
+
+Measured on the API 36 emulator (`-gpu host -cores 8 -memory 4096`,
+1080x2424; every encoder software), ranges over several runs on a quiet host.
+This replaces the earlier note that native size reaches only about 52-54 fps,
+which came from 4 vCPUs and a loaded host:
+
+| `--max-size` | Video | Device fps (median) | Presented fps (median) | Host CPU busy | SSIM vs native |
+| --- | --- | --- | --- | --- | --- |
+| 0 (native) | 1080x2424 | 55.8-58.5 | 55.5-58 | 39-53% | 0.9993 |
+| 2048 (software default) | 912x2048 | 57.9-58.0 | 57.5-58 | 33-34% | 0.981 |
+| 1920 | 854x1920 | 56-59 | 56-59 | 32-34% | 0.959 |
+| 1600 | 712x1600 | 58.7-59.5 | 58.5-59 | 32-33% | 0.973 |
+| 1280 (probe-failure default) | 570x1280 | 57.6-58.8 | 57.5-58 | 28-30% | 0.977 |
+
+At the new default on a host at load average 4-5 the live bench presented a
+median of 57 fps (runs 52, 59, 57) with 84.5 ms median latency.
+
 ### iOS UI recovery and `--session-id` (0.32.0)
 
 Additive, with two behaviour changes listed at the end. A host that passes

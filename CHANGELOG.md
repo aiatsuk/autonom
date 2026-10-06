@@ -7,7 +7,66 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
 
 ## [Unreleased]
 
+### Added
+- **iOS Canvas volume buttons.** On the idb transport the dock's Volume down
+  and Volume up (and `{"t":"system","op":"volume-up"|"volume-down"}`) press
+  the Simulator's own VOLUME_DOWN and VOLUME_UP buttons; the Mac's volume is
+  untouched. The journal bridge maps `KEYCODE_VOLUME_UP`/`KEYCODE_VOLUME_DOWN`
+  to them for iOS and presses them with `idb ui button` (the `ui` key path
+  takes only the buttons every iOS input backend has), and HTTP `POST /key`
+  now accepts both names on either platform.
+- **iOS Canvas clipboard.** On the Simulator's own Mac, `clipboard-get` reads
+  the Simulator clipboard (`xcrun simctl pbpaste <udid>`; empty answers no
+  text) and `paste` sets it (`xcrun simctl pbcopy <udid>`) at its place in the
+  input order, then types the text when it fits idb's text path: plain ASCII
+  (printable characters and newline) of at most 300 bytes. Other text is only
+  set, and the reply says to touch and hold a text field and choose Paste,
+  since Cmd+V through idb does not paste text set from the Mac. The page
+  sends a paste, and text longer than 300 bytes or not plain ASCII, as a paste
+  when the `state` message says `clipboard: true`. Clipboard text is never
+  logged or journaled (one `paste` record with its length). A Canvas not
+  running on macOS refuses both with a message and runs no simctl command.
+- **iOS Canvas pinch.** A second pointer of the same connection, or the
+  page's Ctrl/Alt-drag (now also on iOS), makes a pinch that is sent once,
+  when either pointer lifts, as idb's canned HIDPinch: center at the midpoint
+  where the pointers started, radius half their start distance, scale end
+  distance / start distance, and the time they took, at most 2 s. idb 1.6.4
+  has no live second finger, so nothing moves until the release and there is
+  no two-finger pan or rotate. The page's mirrored finger comes first, so a
+  Ctrl/Alt pinch sends no touch down or up at all; two real fingers that land
+  one after the other tap at the first one's spot before the pinch, since
+  every single finger is live. One `gesture` record with `pointers: 2`. A
+  pointer from another connection, or a third one, is still refused. The idb
+  client gains `encodeHidEvent({ pinch })` (HIDEvent field 4) and
+  `IdbHidStream.pinch()`.
+- **Live check `controls`.** `tests/live/canvas_ios_live.mjs --case controls`
+  presses Volume up and down through the control socket and reads the
+  Simulator's `sim_volume` rise and return, pastes `autonom-clip-test` and
+  reads it back, and sends a mirrored pinch then a tap, checking the journal.
+- **Android Canvas stream size follows the encoder.** Without `--max-size`,
+  the scrcpy transport runs the pushed scrcpy-server once per device with
+  `list_encoders=true` (at most 3 s, the answer kept for restarts) before its
+  first stream: a device with only software H.264 encoders (every emulator)
+  streams at most 2048 on the longer side, one with a hardware H.264 encoder
+  (phones) streams native size, and a list that fails or says neither keeps
+  1280. `--max-size N` still wins and no probe runs; `--max-size 0` (also in
+  `autonom canvas serve`) is native size, and the screenrecord stream reads
+  it as 4096 wide. The Canvas prints the chosen size, `/status` `scrcpy`
+  reports `max_size`, `max_size_source`, `encoder` and `encoder_name`, and
+  the Android `state` message carries `max_size` and `encoder` of the
+  transport in use (after a fallback to screenrecord its width, with the new
+  `/status` `screenrecord_max_size`; `scrcpy` then names no size). On the API 36
+  emulator (`-gpu host -cores 8`) 2048 (912x2048) gives about 58 fps, 0.981
+  SSIM against a native screenshot and about 30% less host CPU than native;
+  the live bench presented a median of 57 fps at the new default. The live
+  check `tests/live/canvas_scrcpy_live.mjs` gains `--max-size` and records
+  the chosen size and encoder in its bench report. The performance notes
+  replace the 52-54 fps native figure with the measured table.
+
 ### Fixed
+- **An empty Canvas number flag is refused.** `--max-size ""` (and any other
+  integer flag of the canvas server given an empty value) was read as 0; it
+  is now an error, since 0 means native size.
 - **A Canvas page that fell behind always gets the current pause and owner
   state.** A page more than 64 KiB behind skips state messages and was caught
   up only when its socket emptied, or before a video packet if it was by then

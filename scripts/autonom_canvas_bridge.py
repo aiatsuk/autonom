@@ -30,12 +30,16 @@ ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from autonom_lib import actions, errors, journal, session, ui  # noqa: E402
+from autonom_lib import actions, errors, ios_idb, journal, session, ui  # noqa: E402
 from autonom_lib.platform import ANDROID, IOS, Target  # noqa: E402
 
 ORIGINS = ("human", "agent", "replay", "system")
 # The page's buttons that iOS has a hardware button for.
-IOS_BUTTON_FOR_KEY = {"KEYCODE_HOME": "HOME", "KEYCODE_POWER": "LOCK"}
+IOS_BUTTON_FOR_KEY = {"KEYCODE_HOME": "HOME", "KEYCODE_POWER": "LOCK",
+                      "KEYCODE_VOLUME_UP": "VOLUME_UP", "KEYCODE_VOLUME_DOWN": "VOLUME_DOWN"}
+# The iOS buttons only idb presses: `ui.press_key` takes the buttons every iOS input
+# backend has, so the bridge presses these through idb (`idb ui button`) itself.
+IOS_IDB_ONLY_BUTTONS = ("VOLUME_UP", "VOLUME_DOWN")
 RECORD_KINDS = ("gesture", "scroll", "key", "text", "paste", "system", "control", "display")
 # The transports whose input Canvas streams itself: scrcpy on Android, idb on
 # the iOS Simulator. A record without a transport names scrcpy, as before idb.
@@ -271,13 +275,21 @@ def dispatch(target: Target, message: dict[str, Any]) -> dict[str, Any]:
         if target.platform == IOS:
             # The page's Home and Power buttons send Android names; iOS has buttons.
             key = IOS_BUTTON_FOR_KEY.get(key, key)
-        ui.press_key(target, key)
+        if target.platform == IOS and key in IOS_IDB_ONLY_BUTTONS:
+            ios_idb.button(target, key)
+        else:
+            ui.press_key(target, key)
         detail_payload["key"] = key
         result = {"ok": True, "key": key}
     elif operation == "text":
         text = str(payload.get("text", ""))
         sensitive = bool(payload.get("sensitive", False))
         ui.type_text(target, text)
+        if payload.get("paste") is True and payload.get("transport") in RECORD_TRANSPORTS:
+            # An iOS paste Canvas also typed: journaled as the paste it is, with its
+            # length only, never the clipboard text.
+            return record_completed(record, origin, {
+                "kind": "paste", "transport": payload["transport"], "text_len": len(text)})
         detail_payload.update({"sensitive": sensitive,
                                "text": None if sensitive else text,
                                "text_len": len(text)})

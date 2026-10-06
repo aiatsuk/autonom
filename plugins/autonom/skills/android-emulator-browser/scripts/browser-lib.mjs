@@ -12,7 +12,16 @@ export const DEFAULT_FPS = 15;
 // scrcpy only sends frames when the screen changes, so its cap can be higher than
 // the multipart default; an explicit --fps still applies to it.
 export const DEFAULT_SCRCPY_MAX_FPS = 60;
+// The stream size without --max-size (DEC-005): scrcpy follows the device's H.264
+// encoder, SOFTWARE_ENCODER_MAX_SIZE on the long side for a software-only one (60 fps on
+// the emulator at a third less host CPU than native), native size (0) for a hardware one,
+// and DEFAULT_MAX_SIZE when the encoders cannot be read. screenrecord always uses
+// DEFAULT_MAX_SIZE unless --max-size says otherwise.
 export const DEFAULT_MAX_SIZE = 1280;
+export const SOFTWARE_ENCODER_MAX_SIZE = 2048;
+export const NATIVE_MAX_SIZE = 0;
+export const MIN_MAX_SIZE = 320;
+export const MAX_MAX_SIZE = 4096;
 // 12 Mbit/s: at 60 fps each frame gets about 90% of the bits it had at about 36 fps and 8 Mbit/s.
 export const DEFAULT_BIT_RATE = 12_000_000;
 export const MAX_BODY_BYTES = 64 * 1024;
@@ -36,9 +45,14 @@ const ALLOWED_KEYCODES = new Set([
   "KEYCODE_ESCAPE",
   "KEYCODE_MOVE_HOME",
   "KEYCODE_MOVE_END",
+  // POST /key goes through the action bridge: adb on Android, the Simulator's volume
+  // buttons on iOS. On the streamed transports the page sends the volume system ops.
+  "KEYCODE_VOLUME_UP",
+  "KEYCODE_VOLUME_DOWN",
 ]);
 
-// Android keycodes of the KEYCODE_* names above, for the scrcpy control channel.
+// Android keycodes of the KEYCODE_* names above but the volume keys, for the scrcpy
+// control channel.
 const SYSTEM_KEYCODES = Object.freeze({
   KEYCODE_HOME: 3,
   KEYCODE_BACK: 4,
@@ -101,7 +115,8 @@ function requireFlagValue(argv, index, flag) {
 }
 
 function asInt(flag, raw) {
-  const n = Number(raw);
+  // Number("") is 0, which --max-size reads as native size: an empty value is no integer.
+  const n = String(raw).trim() === "" ? Number.NaN : Number(raw);
   if (!Number.isInteger(n)) {
     throw new Error(`${flag} must be an integer.`);
   }
@@ -161,6 +176,7 @@ export function parseArgs(argv) {
         break;
       case "--max-size":
         options.maxSize = asInt(flag, requireFlagValue(argv, ++i, flag));
+        options.maxSizeExplicit = true;
         break;
       case "--bit-rate":
         options.bitRate = asInt(flag, requireFlagValue(argv, ++i, flag));
@@ -200,8 +216,11 @@ export function parseArgs(argv) {
   if (!Number.isFinite(options.fps) || options.fps < 1 || options.fps > 60) {
     throw new Error("--fps must be between 1 and 60.");
   }
-  if (!Number.isInteger(options.maxSize) || options.maxSize < 320 || options.maxSize > 4096) {
-    throw new Error("--max-size must be an integer from 320 to 4096.");
+  if (
+    !Number.isInteger(options.maxSize) ||
+    (options.maxSize !== NATIVE_MAX_SIZE && (options.maxSize < MIN_MAX_SIZE || options.maxSize > MAX_MAX_SIZE))
+  ) {
+    throw new Error(`--max-size must be 0 (native size) or an integer from ${MIN_MAX_SIZE} to ${MAX_MAX_SIZE}.`);
   }
   if (
     !Number.isInteger(options.bitRate) ||
@@ -222,6 +241,27 @@ export function parseArgs(argv) {
     }
   }
   return options;
+}
+
+/**
+ * The scrcpy stream size (DEC-005) from the options and the encoder probe
+ * (probeVideoEncoders: {encoder, name} or null): {maxSize, source, encoder, encoderName}.
+ * An explicit --max-size wins (0 is native) and needs no probe; otherwise a hardware
+ * H.264 encoder streams native size, a software-only one SOFTWARE_ENCODER_MAX_SIZE, and
+ * a failed probe DEFAULT_MAX_SIZE. `source` is "explicit", "encoder" or "default".
+ */
+export function streamMaxSize(options, probe = null) {
+  const encoder = probe?.encoder === "hardware" || probe?.encoder === "software" ? probe.encoder : null;
+  const found = { encoder, encoderName: encoder ? probe.name ?? null : null };
+  if (options.maxSizeExplicit) return { maxSize: options.maxSize, source: "explicit", ...found };
+  if (encoder === "hardware") return { maxSize: NATIVE_MAX_SIZE, source: "encoder", ...found };
+  if (encoder === "software") return { maxSize: SOFTWARE_ENCODER_MAX_SIZE, source: "encoder", ...found };
+  return { maxSize: DEFAULT_MAX_SIZE, source: "default", ...found };
+}
+
+/** The width cap of the screenrecord/ffmpeg picture: --max-size, where 0 (native) is MAX_MAX_SIZE. */
+export function screenrecordMaxSize(options) {
+  return options.maxSize > 0 ? options.maxSize : MAX_MAX_SIZE;
 }
 
 export function isSafeKeyCode(value) {

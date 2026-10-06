@@ -532,6 +532,26 @@ class BridgeIosTextTests(EnvSandboxMixin, unittest.TestCase):
                           journal.read_text(encoding="utf-8").splitlines()], ["ui text", "ui text"])
         self.assertNotIn(SECRET, journal.read_text(encoding="utf-8"))
 
+    def test_an_idb_paste_that_is_typed_is_journaled_as_one_paste_with_its_length_only(self) -> None:
+        result = self.type({"text": SECRET, "sensitive": True, "transport": "idb", "paste": True})
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["recorded"], "paste")
+        self.assertEqual(self.typed, [SECRET])
+        (detail,) = self.details()
+        self.assertEqual((detail["kind"], detail["transport"], detail["text_len"]),
+                         ("paste", "idb", len(SECRET)))
+        self.assertNotIn("text", detail)
+        journal = Path(self.record["artifacts_dir"]) / "journal.ndjson"
+        self.assertEqual([json.loads(line)["verb"] for line in
+                          journal.read_text(encoding="utf-8").splitlines()], ["ui paste"])
+        self.assertNotIn(SECRET, journal.read_text(encoding="utf-8"))
+        self.assertNotIn(SECRET, json.dumps(result))
+
+    def test_a_paste_flag_without_a_streamed_transport_stays_plain_text(self) -> None:
+        for payload in ({"text": "a", "paste": True}, {"text": "b", "paste": "yes", "transport": "idb"}):
+            self.assertEqual(self.type(payload)["typed"], "<1 chars>")
+        self.assertEqual([detail["kind"] for detail in self.details()], ["text", "text"])
+
     def test_text_without_a_known_transport_names_none(self) -> None:
         for payload in ({"text": "a"}, {"text": "b", "transport": "webrtc"},
                         {"text": "c", "transport": ["idb"]}):
@@ -560,11 +580,37 @@ class BridgeIosButtonTests(EnvSandboxMixin, unittest.TestCase):
             self.assertTrue(self.press(ios, key)["ok"])
         self.assertEqual(self.pressed, [(IOS, "HOME"), (IOS, "LOCK"), (IOS, "KEYCODE_BACK"), (IOS, "HOME")])
 
+    def test_ios_volume_keys_press_the_idb_volume_buttons(self) -> None:
+        # Through a real idb client process, not a mocked press: `ui.press_key` takes only
+        # the buttons every iOS backend has, so before this the mapped VOLUME_UP raised.
+        trace = self.home / "idb.log"
+        idb = write_script(self.home / "bin" / "idb",
+                           f'#!/bin/sh\necho "$*" >> "{trace}"\nexit 0\n')
+        self.set_env(AUTONOM_IDB=str(idb), AUTONOM_IDB_COMPANION=None)
+        ios = Target(IOS, "FAKE-UDID", "/nonexistent/xcrun", {"udid": "FAKE-UDID"})
+        for key in ("KEYCODE_VOLUME_UP", "KEYCODE_VOLUME_DOWN"):
+            result = self.press(ios, key)
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["key"], key.removeprefix("KEYCODE_"))
+        self.assertEqual(trace.read_text(encoding="utf-8").splitlines(),
+                         ["ui button VOLUME_UP --udid FAKE-UDID",
+                          "ui button VOLUME_DOWN --udid FAKE-UDID"])
+        self.assertEqual(self.pressed, [])
+
+    def test_ios_volume_key_reports_a_failed_idb_press(self) -> None:
+        idb = write_script(self.home / "bin" / "idb", '#!/bin/sh\necho "no such button" >&2\nexit 1\n')
+        self.set_env(AUTONOM_IDB=str(idb), AUTONOM_IDB_COMPANION=None)
+        ios = Target(IOS, "FAKE-UDID", "/nonexistent/xcrun", {"udid": "FAKE-UDID"})
+        with self.assertRaises(errors.AutonomError) as caught:
+            self.press(ios, "KEYCODE_VOLUME_UP")
+        self.assertIn("no such button", caught.exception.message)
+
     def test_android_keys_are_unchanged(self) -> None:
         android = Target(ANDROID, SERIAL, "/nonexistent/adb", {"serial": SERIAL})
-        for key in ("KEYCODE_HOME", "KEYCODE_POWER"):
+        for key in ("KEYCODE_HOME", "KEYCODE_POWER", "KEYCODE_VOLUME_UP"):
             self.assertTrue(self.press(android, key)["ok"])
-        self.assertEqual(self.pressed, [(ANDROID, "KEYCODE_HOME"), (ANDROID, "KEYCODE_POWER")])
+        self.assertEqual(self.pressed, [(ANDROID, "KEYCODE_HOME"), (ANDROID, "KEYCODE_POWER"),
+                                        (ANDROID, "KEYCODE_VOLUME_UP")])
 
 
 class BridgeProcessTests(EnvSandboxMixin, unittest.TestCase):
@@ -728,9 +774,26 @@ class CanvasServeFlagsTests(EnvSandboxMixin, unittest.TestCase):
                     self.serve("--transport", transport, "--fps", "30")))
                 self.assertEqual((values["--transport"], values["--fps"]), (transport, "30"))
 
+    def test_max_size_zero_is_native_and_is_forwarded(self) -> None:
+        """lo-005-S04: 0 asks the Canvas for native size; it is not refused as out of bounds."""
+        self.env["AUTONOM_SCRCPY_SERVER"] = str(self.server)
+        for transport in ("auto", "scrcpy", "screenrecord"):
+            with self.subTest(transport=transport):
+                argv = self.node_argv(self.serve("--transport", transport, "--max-size", "0"))
+                self.assertEqual(flag_values(argv)["--max-size"], "0")
+                self.node_out.unlink()
+
+    def test_a_bad_max_size_names_native_size_and_the_encoder_default(self) -> None:
+        payload = self.refused(self.serve("--max-size", "100"))
+        self.assertEqual(payload["error_code"], errors.INVALID_VALUE)
+        self.assertIn("0 (native size) or 320..4096", payload["error"])
+        self.assertIn("2048", payload["hint"])
+        self.assertIn("1280", payload["hint"])
+
     def test_bad_values_fail_before_node_starts(self) -> None:
         cases = [
-            ("--max-size", "100"), ("--max-size", "5000"),
+            ("--max-size", "100"), ("--max-size", "5000"), ("--max-size", "-1"),
+            ("--max-size", "319"),
             ("--bit-rate", "10"), ("--bit-rate", "200000000"),
             ("--fps", "0"), ("--fps", "61"),
             ("--scrcpy-server", str(self.server), "--scrcpy-version", "latest"),

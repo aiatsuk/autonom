@@ -193,6 +193,44 @@ test("requests and HID events round-trip through encode and decode", () => {
   assert.deepEqual(decodeVideoStreamResponse(encodeVideoStreamResponse({ log: "x" })).log, Buffer.from("x"));
 });
 
+// Golden bytes from the reference protobuf library (fb-idb idb_pb2): HIDEvent(pinch=HIDPinch(...)).
+const PINCH_GOLDEN = [
+  [{ center: { x: 201, y: 437 }, scale: 2, duration: 0.6, radius: 60 },
+    "222f0a12090000000000206940110000000000507b4011000000000000004019333333333333e33f210000000000004e40"],
+  // Zero center.x and duration are proto3 defaults and left out, as the reference library does.
+  [{ center: { x: 0, y: 437.5 }, scale: 0.5, duration: 0, radius: 12.25 },
+    "221d0a09110000000000587b4011000000000000e03f210000000000802840"],
+];
+
+test("a pinch is HIDEvent field 4 with center, scale, duration and radius, byte for byte as the reference library writes it", () => {
+  for (const [pinch, golden] of PINCH_GOLDEN) {
+    const bytes = encodeHidEvent({ pinch });
+    assert.equal(hex(bytes), golden);
+    // Field by field: HIDEvent.pinch = 4 (length-delimited), HIDPinch center = 1 (Point x = 1,
+    // y = 2), scale = 2, duration = 3, radius = 4 (doubles).
+    const [event] = decodeProtoFields(bytes);
+    assert.deepEqual([event.field, event.wire], [4, 2]);
+    const fields = new Map(decodeProtoFields(event.value).map((record) => [record.field, record]));
+    const center = new Map(decodeProtoFields(fields.get(1).value).map((record) => [record.field, record.value.readDoubleLE(0)]));
+    assert.equal(center.get(1) ?? 0, pinch.center.x);
+    assert.equal(center.get(2), pinch.center.y);
+    assert.equal(fields.get(2).value.readDoubleLE(0), pinch.scale);
+    assert.equal(fields.get(3)?.value.readDoubleLE(0) ?? 0, pinch.duration);
+    assert.equal(fields.get(4).value.readDoubleLE(0), pinch.radius);
+    assert.deepEqual(decodeHidEvent(bytes), { pinch });
+  }
+  for (const pinch of [
+    { center: { x: -1, y: 1 }, scale: 1, duration: 0.2, radius: 10 },
+    { center: { x: 1, y: Number.NaN }, scale: 1, duration: 0.2, radius: 10 },
+    { center: { x: 1, y: 1 }, scale: 0, duration: 0.2, radius: 10 },
+    { center: { x: 1, y: 1 }, scale: 1, duration: -0.1, radius: 10 },
+    { center: { x: 1, y: 1 }, scale: 1, duration: 0.2, radius: 0 },
+    { scale: 1, duration: 0.2, radius: 10 },
+  ]) {
+    assert.throws(() => encodeHidEvent({ pinch }), /pinch/, JSON.stringify(pinch));
+  }
+});
+
 test("the protobuf decoder skips unknown fields and rejects broken input", () => {
   const extra = Buffer.concat([
     Buffer.from(GOLDEN.orientation, "hex"),
@@ -942,7 +980,8 @@ test("HID events go out in order on one open call, and a new call opens after it
   await hid.buttonUp("LOCK");
   await hid.keyDown(4);
   await hid.keyUp(4);
-  await waitFor(() => state.hidEvents.length === 11, { message: "11 HID events" });
+  await hid.pinch({ center: { x: 201, y: 437 }, scale: 1.5, duration: 0.4, radius: 40 });
+  await waitFor(() => state.hidEvents.length === 12, { message: "12 HID events" });
   assert.equal(state.hidCalls, 1);
   assert.deepEqual(state.hidEvents, [
     { touch: { x: 200, y: 650 }, direction: "down" },
@@ -956,8 +995,9 @@ test("HID events go out in order on one open call, and a new call opens after it
     { button: "LOCK", direction: "up" },
     { key: 4, direction: "down" },
     { key: 4, direction: "up" },
+    { pinch: { center: { x: 201, y: 437 }, scale: 1.5, duration: 0.4, radius: 40 } },
   ]);
-  assert.equal(hid.sent, 11);
+  assert.equal(hid.sent, 12);
   await assert.rejects(hid.touchDown(-5, 0), RangeError);
   await hid.close();
   await waitFor(() => state.hidEnds === 1, { message: "hid end" });

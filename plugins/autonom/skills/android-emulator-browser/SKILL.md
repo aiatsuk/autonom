@@ -62,8 +62,25 @@ one capture loop.
 
 `--fps` caps the multipart stream (default 15) and, only when given, scrcpy
 and idb (otherwise up to 60; scrcpy sends frames only when the screen
-changes). `--max-size` (default 1280) is the longer side of the scrcpy video
-and the width of the MJPEG stream; idb always streams at full resolution.
+changes). `--max-size` is the longer side of the scrcpy video and the width
+of the MJPEG stream, and `--max-size 0` is native size; idb always streams at
+full resolution. Without `--max-size`, scrcpy follows the device's H.264
+encoder: before its first stream the Canvas runs the pushed scrcpy-server once
+per device with `list_encoders=true` (at most 3 s, the answer kept for
+restarts); only software encoders (`(sw)`, as on every emulator) cap the
+longer side at 2048, a hardware encoder (`(hw)`, as on phones) streams native
+size, and a list that fails or says neither keeps 1280. The screenrecord
+stream keeps 1280 unless `--max-size` says otherwise (0 there is 4096 wide).
+The Canvas prints the choice (`Stream size: 2048 on the long side (software
+H.264 encoder c2.android.avc.encoder)`), `/status` `scrcpy` reports
+`max_size` (0 is native), `max_size_source` (`explicit`, `encoder` or
+`default`), `encoder` and `encoder_name`, and the Android `state` message
+carries `max_size` and `encoder`; all are null until the first session chose.
+They describe the transport in use: once `auto` has fallen back, `/status`
+`scrcpy` names no size, `screenrecord_max_size` gives the width the
+screenrecord stream is scaled to (null on any other transport), and the
+`state` message carries that width with `encoder` null, or nulls on
+screencap.
 `--bit-rate` defaults to 12 Mbit/s (8 Mbit/s before), on idb and screenrecord
 too: at 60 fps each frame gets about 90% of the bits it had at about 36 fps
 and 8 Mbit/s (8 Mbit/s would leave 60%).
@@ -130,36 +147,73 @@ refused.
   picture upright. A finger down during a rotation is lifted.
 - **Input.** One finger: down, move and up reach the Simulator live over the
   companion's HID stream (a held finger moves by repeated touch-down at the
-  new point), in logical points of the current orientation. A second pointer
-  is refused with a message while the first keeps working. A wheel burst is
+  new point), in logical points of the current orientation. A pointer from
+  another connection, or a third one, is refused with a message while the first
+  keeps working.
+- **Pinch.** idb 1.6.4 has no live second finger, only a canned two-finger
+  pinch, so a second pointer of the same connection makes the pair a pinch
+  that is sent once, when either pointer lifts: one HIDPinch whose center is
+  the midpoint where the two started, radius half their start distance, scale
+  end distance / start distance and duration the time they took (at most
+  2 s). Nothing moves on the Simulator until the release, and there is no
+  two-finger pan or rotate. The page's Ctrl- or Alt-drag works on iOS too:
+  its mirrored finger (`-1000 - id`, sent first) marks the pair as a pinch
+  from its first message and holds it back, so no touch down or up reaches
+  the Simulator, only the one HIDPinch at the release. Limitation: for two
+  real fingers (a touch screen, or two pointers sent by a client) the first
+  finger is live, as every single finger is, so when the second lands later
+  the first has already touched down and lifts where it is: the Simulator
+  sees a tap (or a short drag) at the first finger's spot before the pinch.
+  Avoiding that would mean holding back every first finger, which would delay
+  every ordinary tap; a client that knows it starts a pinch sends a mirrored
+  (`-1000 - id`) finger first. A rotation, pause, takeover or
+  disconnect drops a pinch not sent yet. One `gesture` record with
+  `pointers: 2`. A wheel burst is
   one short synthetic drag that lifts once the wheel is still (so no fling)
   and never taps: it goes down at an anchor at least 32 points inside every
   edge (where the pointer is, moved inward when it is near an edge), its
   first move goes at least 16 points in the wheel's direction (past the iOS
   tap slop, even for a tiny trackpad delta), and at the screen edge it lifts
-  and starts over from the anchor. Home and Power press the Simulator's Home
-  and Lock buttons, and text (up to 300 bytes per entry, also characters typed
-  on the screen and a paste) is typed through the action bridge, like HTTP
-  text. All iOS input goes through one queue in message order: each touch,
-  wheel or button event is written to the HID stream, and each text typed,
-  before the next one runs, so input sent after text waits until it is
-  typed. Pause and takeover are checked again when each queued item runs:
+  and starts over from the anchor. Home, Power, Volume up and Volume down press
+  the Simulator's Home, Lock, Volume up and Volume down buttons (its own volume;
+  the Mac's stays as it is), and text (up to 300 bytes per entry, also
+  characters typed on the screen) is typed through the action bridge, like HTTP
+  text.
+- **Clipboard.** On a Canvas that runs on the Simulator's Mac, `clipboard-get`
+  reads the Simulator clipboard with `xcrun simctl pbpaste <udid>` (empty, or
+  a fresh Simulator's "no items", answers no text), and `paste` sets it with
+  `xcrun simctl pbcopy <udid>`, then types the text through the action bridge
+  when it is plain ASCII (printable characters and newline, the only ones
+  idb's text path has keys for) of at most 300 bytes. Other text is only set:
+  the reply says why, and touching and holding a text field, then Paste,
+  inserts it (Cmd+V through idb does not paste text set from the Mac). One
+  `paste` record with the text length only; clipboard text is never logged or journaled. The `state`
+  message says `clipboard: true` when this works; a Canvas not running on
+  macOS (its Simulator is on another Mac) refuses both with a message and runs
+  no simctl command. The page's paste, and text longer than 300 bytes or not
+  plain ASCII, go as a paste then; the page has no Copy device clipboard
+  button on iOS.
+- **Order.** All iOS input goes through one queue in message order: each touch,
+  wheel, button or pinch event is written to the HID stream, and each text
+  typed or clipboard set or read, before the next one runs, so input sent
+  after text or a paste waits until it is done. Pause and takeover are checked again when each queued item runs:
   input refused by then is dropped (each dropped text gets an error), except
   an UP that lets go of what the Simulator holds down. When the companion or
   its stream is lost, whatever it held down is lifted through the next
   companion, even when its UP was still queued. Android
-  keycodes, clipboard, paste, Back, volume, rotate, notifications and display
-  presets have no iOS equivalent and are refused with a message; the page
-  hides them.
+  keycodes, Back, rotate, notifications and display presets have no iOS
+  equivalent and are refused with a message; the page hides them.
 - **Fallback.** Without idb_companion, or when the first stream fails to
   start, `auto` serves screenshots and `/status` `fallback_reason` says why;
   a browser without WebCodecs gets the multipart picture with input still on
   the control socket.
 
-Not equal to Android: one finger only (the HID touch has no finger id), no
-key frame on demand, a portrait picture the page turns, no clipboard, Back,
-volume, notifications or display presets, and Home takes about 0.5 s because
-iOS waits for a possible double press.
+Not equal to Android: one live finger only (the HID touch has no finger id),
+and two pointers are one pinch sent at release (no live motion, no pan or
+rotate); a paste is typed only when it is plain ASCII of at most 300 bytes;
+the clipboard works only on the Simulator's own Mac; no key frame on demand,
+a portrait picture the page turns, no Back, notifications or display presets, and Home takes about 0.5 s
+because iOS waits for a possible double press.
 
 ## The page
 
@@ -169,8 +223,9 @@ size and density beside it, the control status, and the inspector toggle.
 Below it the device picture sits in a frame whose aspect ratio follows the
 video, with a caption under it (fps, round trip and decoder on scrcpy; the
 transport otherwise) and a floating pill of device buttons: Back, Home,
-Recent apps | Rotate, Volume down, Volume up, Power (on iOS only Home and
-Power, which press the Simulator's Home and Lock buttons). The inspector beside it
+Recent apps | Rotate, Volume down, Volume up, Power (on iOS Home, Volume down,
+Volume up and Power, which press the Simulator's buttons; Volume down and up
+only on the idb transport). The inspector beside it
 has Type (text box and Send), Keys (Up, Down, Left, Right, Enter, Delete),
 Device (Wake screen, Notifications, Quick settings, Collapse panels, Copy
 device clipboard), Control (Take control or Release, Pause input or Resume
@@ -184,7 +239,8 @@ the safe area, and every tap target is at least 44 px. Controls that cannot
 act (paused, another owner) are disabled; the scrcpy-only ones (Rotate,
 Volume down, Volume up, Notifications, Quick settings, Collapse panels, Copy
 device clipboard) are hidden on the other transports. The iOS page has no Size
-menu, Keys or Device section, and its pill shows only Home and Power. The element ids `video`, `screen`,
+menu, Keys or Device section, and its pill shows Home and Power, plus Volume
+down and Volume up on the idb transport. The element ids `video`, `screen`,
 `status`, `text`, `clipboard`, `device` and `refresh` and
 `window.autonomCanvas` are stable for scripts.
 
@@ -477,14 +533,37 @@ touch to picture, and the device produced about 44 frames/s at 1024 and 56 at
 720. With frames shown in order and 12 Mbit/s, the live bench
 (`tests/live/canvas_scrcpy_live.mjs --case bench`, a finger dragging the
 Settings list every 16 ms, headed Chromium) measured on the API 36 emulator
-started with `-gpu host -cores 8 -memory 4096` at the default `--max-size
-1280` (570x1280 video): 59.4 frames/s produced by the device, 58.9 decoded,
+started with `-gpu host -cores 8 -memory 4096` at `--max-size 1280`
+(570x1280 video; the default before the encoder-chosen size, now used only
+when the encoders cannot be read): 59.4 frames/s produced by the device, 58.9 decoded,
 59 presented and 59 distinct (median of 3 runs of 10 s), none dropped, about
 99 ms median and 117 ms p95 from touch to picture, 0.67 ms of Canvas and adb
-CPU per frame, host load average about 3.4 on 10 cores. At the native
-1080x2424 the emulator's software encoder reaches only about 52-54 fps. Use
-scrcpy itself for high-fidelity manual review and Macrobenchmark / Perfetto /
-Flutter profile mode for claims.
+CPU per frame, host load average about 3.4 on 10 cores.
+
+Every video encoder of the API 36 emulator is software (`c2.android.avc`, no
+host-accelerated one in any `-gpu` mode), which is why the default there is
+2048. Measured on that emulator (`-gpu host -cores 8 -memory 4096`, 1080x2424,
+live bench and the encoder's own rate, ranges over several runs on a quiet
+host, SSIM of the decoded picture against a native screenshot):
+
+| `--max-size` | Video | Device fps (median) | Presented fps (median) | Host CPU busy | SSIM |
+|---|---|---|---|---|---|
+| 0 (native) | 1080x2424 | 55.8-58.5 | 55.5-58 | 39-53% | 0.9993 |
+| 2048 (default with a software encoder) | 912x2048 | 57.9-58.0 | 57.5-58 | 33-34% | 0.981 |
+| 1920 | 854x1920 | 56-59 | 56-59 | 32-34% | 0.959 |
+| 1600 | 712x1600 | 58.7-59.5 | 58.5-59 | 32-33% | 0.973 |
+| 1280 (default when the encoders cannot be read) | 570x1280 | 57.6-58.8 | 57.5-58 | 28-30% | 0.977 |
+
+Touch-to-picture latency was 83-101 ms median at every size. Native is the
+first size to drop frames when the Mac is busy and costs 40-50% more host CPU
+than 2048; the earlier 52-54 fps at native came from 4 vCPUs and a loaded
+host. With the encoder-chosen default (2048, 912x2048 video) on a host at load
+average 4-5, the bench presented a median of 57 fps (runs 52, 59, 57), 84.5 ms
+median and 117 ms p95 latency. 1920 scales unevenly on the device (lowest
+SSIM); 1600 leaves the most headroom. Phones encode in hardware and stream
+native size by default; that was not measured here. Use scrcpy itself for
+high-fidelity manual review and Macrobenchmark / Perfetto / Flutter profile
+mode for claims.
 
 On an emulator with auto-rotate on, the sensor turns the screen back to
 portrait right after Rotate; turn auto-rotate off on the device for a
@@ -493,7 +572,8 @@ rotation that sticks.
 ## Evidence to record
 
 Side-panel screenshot, platform and target id, the Diagnostics panel's
-transport and decoder lines, `fallback_reason`, `scrcpy.version`/`scrcpy.source`
+transport and decoder lines, `fallback_reason`, `scrcpy.version`/`scrcpy.source`,
+`scrcpy.max_size`/`scrcpy.encoder` (the stream size and the encoder behind it)
 (`idb.companion_path`/`idb.source` and `idb.streams_opened` on iOS)
 and the display preset, size and density from `/status`, package/activity,
 variant, control owner, and the exact flow replayed.

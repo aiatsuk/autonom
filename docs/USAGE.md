@@ -175,6 +175,19 @@ report `/status` `fallback_reason`. Drag a list with the mouse, press Home, then
 stop the Canvas with SIGTERM and check that no idb_companion is left running.
 ```
 
+## Mirror an Android device at a chosen size
+
+```text
+Start `autonom canvas serve --platform android --serial <serial>` and read the
+`Stream size:` line it prints, or `/status` `scrcpy.max_size` and
+`scrcpy.encoder`: an emulator (software H.264 encoder only) streams 2048 on
+the long side, a phone with a hardware encoder streams native size, and 1280
+means the encoders could not be read. For a pixel-exact picture on the
+emulator start it again with `--max-size 0` (native, more host CPU); for a
+busy Mac try `--max-size 1600`. Report the size and encoder with any fps
+numbers.
+```
+
 ## Tap one of several identical controls
 
 ```text
