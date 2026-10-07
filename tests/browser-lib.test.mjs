@@ -71,6 +71,17 @@ test("parseArgs accepts the scrcpy transport and its server options", () => {
   assert.throws(() => parseArgs(["--scrcpy-server", "x", "--scrcpy-version", "four"]), /look like 4\.1/);
 });
 
+test("parseArgs takes --tools and --autonom overrides for the panel tools and the log feed", () => {
+  const defaults = parseArgs([]);
+  assert.equal(defaults.tools, undefined);
+  assert.equal(defaults.autonom, undefined);
+  const values = parseArgs(["--tools", "/tmp/fake-tools.mjs", "--autonom", "/tmp/fake-autonom.mjs"]);
+  assert.equal(values.tools, "/tmp/fake-tools.mjs");
+  assert.equal(values.autonom, "/tmp/fake-autonom.mjs");
+  assert.throws(() => parseArgs(["--tools"]), /Pass a value after --tools/);
+  assert.throws(() => parseArgs(["--autonom", "--no-auth"]), /Pass a value after --autonom/);
+});
+
 test("parseArgs marks an explicit --max-size and accepts 0 as native size", () => {
   const defaults = parseArgs([]);
   assert.equal(defaults.maxSize, DEFAULT_MAX_SIZE);

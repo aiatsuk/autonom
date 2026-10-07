@@ -56,6 +56,8 @@ import {
   resolveScrcpyServer,
 } from "./scrcpy-session.mjs";
 import { CLOSE_CODE, READY_STATE, acceptWebSocket, rejectUpgrade } from "./ws.mjs";
+import { createCanvasTools, handleToolsRoute } from "./canvas-tools-server.mjs";
+import { toolsButton, toolsMarkup, toolsScript, toolsStyles } from "./canvas-tools-page.mjs";
 import {
   DEFAULT_VIDEO_OPTIONS,
   ERROR_CODE,
@@ -317,6 +319,8 @@ async function main() {
   };
   let inputQueue = Promise.resolve();
   const actionBridge = createActionBridge(options, adbPath, serial);
+  // The panel tools: their own process and the device log feed, apart from input.
+  const tools = createToolsFor(options, adbPath, serial);
 
   const context = {
     options,
@@ -331,6 +335,7 @@ async function main() {
     port: null,
     sessions: new Map(),
     actionBridge,
+    tools,
     session: null,
     sessionStopping: null,
     idleTimer: null,
@@ -475,8 +480,9 @@ async function main() {
     clearTimeout(context.displayWatch);
     // The device server and the adb forward must be gone before the process is, and the
     // display back as it was, within the 5 s the supervisor allows after SIGTERM.
+    // The tools process and the log feed go with it: no orphans.
     await Promise.race([
-      Promise.all([stopSession(context), restoreDisplay(context)]),
+      Promise.all([stopSession(context), restoreDisplay(context), tools.close()]),
       sleep(SHUTDOWN_STOP_MS),
     ]);
     actionBridge.close();
@@ -525,6 +531,8 @@ Options:
   --token TOKEN               Use a supplied access token.
   --python PATH               Python executable for the persistent action bridge.
   --bridge PATH               Override autonom_canvas_bridge.py.
+  --tools PATH                Override autonom_canvas_tools.py (the panel tools process).
+  --autonom PATH              Override scripts/autonom.py for the device log feed.
   --no-auth                   Disable token protection (isolated local use only).
 `);
 }
@@ -633,6 +641,13 @@ async function handleRequest(context, request, response) {
     await control(context, response, await readJsonBody(request), origin);
   } else if (request.method === "POST" && url.pathname === "/display") {
     await setDisplay(context, response, await readJsonBody(request), origin);
+  } else if (url.pathname.startsWith("/tools/")) {
+    const answer = await handleToolsRoute(context.tools, {
+      method: request.method, url, origin,
+      readBody: () => readJsonBody(request),
+      refusal: (from) => refusal(context, from),
+    });
+    sendJson(response, answer.status, answer.body);
   } else {
     sendJson(response, 404, { error: "Not found" });
   }
@@ -906,6 +921,7 @@ async function sendStatus(context, response) {
     input_paused: context.state.inputPaused,
     scrcpy: scrcpyStatus(context),
     idb: idbStatus(context),
+    tools: context.tools.status(),
   });
 }
 
@@ -4203,6 +4219,21 @@ async function setDisplay(context, response, body, origin) {
   sendJson(response, 200, { ok: true, display });
 }
 
+/** The panel tools of this Canvas (canvas-tools-server.mjs), started with the Canvas. */
+function createToolsFor(options, adbPath, serial) {
+  const childEnv = { ...env };
+  if (options.idb) childEnv.AUTONOM_IDB = options.idb;
+  return createCanvasTools({
+    python: options.python ?? env.PYTHON ?? "python3",
+    toolsPath: options.tools ?? null,
+    autonomPath: options.autonom ?? null,
+    platform: options.platform,
+    target: serial,
+    tool: adbPath,
+    env: childEnv,
+  });
+}
+
 function createActionBridge(options, adbPath, serial) {
   const python = options.python ?? env.PYTHON ?? "python3";
   const bridgePath = options.bridge ?? resolve(
@@ -4455,7 +4486,8 @@ function displayPicker(context) {
 
 /**
  * The Canvas page (PAGE-001..004): toolbar, the device in a frame that follows the video's
- * aspect, a floating pill of device buttons and an inspector. Styles, icons and code are
+ * aspect, a floating pill of device buttons, an inspector and the Tools drawer
+ * (canvas-tools-page.mjs), which takes the inspector's column while it is open. Styles, icons and code are
  * inline (the CSP loads nothing else); device and status strings reach the DOM as text only.
  */
 function renderPage(context) {
@@ -4628,6 +4660,7 @@ dd code{font:12px var(--mono)}
 }
 @media (max-width:360px){.dock{gap:0;padding:2px}.dock .div{display:none}}
 @media (prefers-reduced-motion:reduce){*,*::before,*::after{transition:none!important;animation:none!important}button:active{transform:none!important}}
+${toolsStyles()}
 </style>
 </head>
 <body>
@@ -4643,6 +4676,7 @@ dd code{font:12px var(--mono)}
   </div>
   <div class="actions">
     <span class="chip" title="Who controls the device">${icon("people")}<span id="control-chip">Shared</span></span>
+    ${toolsButton()}
     ${iconButton("inspector", "Inspector", 'id="inspector-toggle" aria-pressed="true" aria-controls="inspector"', "icon")}
   </div>
 </header>
@@ -4704,8 +4738,10 @@ dd code{font:12px var(--mono)}
     <details class="diag"><summary>Diagnostics</summary><pre class="status" id="status">Connecting…</pre></details>
   </section>
 </aside>
+${toolsMarkup({ platform: context.options.platform })}
 <script>
 ${pageScript()}
+${toolsScript()}
 </script>
 </body>
 </html>`;

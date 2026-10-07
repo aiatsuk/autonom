@@ -7,6 +7,46 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
 
 ## [Unreleased]
 
+### Added
+- **Mobile Canvas Tools drawer.** A Tools button in the Canvas toolbar opens
+  a drawer with five tabs for the Canvas's own target. It takes the
+  inspector's column on a desktop-width page (the two are never open
+  together) and is a full-width sheet at phone width; keyboard tabs, light
+  and dark. App: the app id (from the session on this target or the
+  best-known app, editable); Android lists the app's requested runtime
+  permissions with their granted state and grants, revokes or resets one,
+  iOS grants, revokes or resets a privacy service and says it cannot read the
+  state back; location by latitude and longitude or a preset, with an honest
+  Android read-back (delivered, or requested only until an app subscribes),
+  Clear on iOS only (the emulator has no reset). Simulate: push (iOS),
+  biometrics, battery, network online/offline (Android) and appearance, only
+  what the platform supports. Network: status, start after a confirmation
+  that names the MITM effect, attach, detach, stop, a live request list with
+  host, method, status and mocked filters, redacted previews only, and Mock
+  this; it needs an Autonom session on this target and never starts one.
+  Mocks: list with hit counts, add, edit, enable, disable, remove and clear
+  after a confirmation, with the note that mocks apply to every Autonom
+  session on this Mac. Logs: the live device log, optionally for one
+  package, with level and text filters, pause, clear and at most 2000 rows
+  (on iOS only when the session on this Simulator has `--log-stream`).
+- **Canvas tools routes.** `POST /tools/call`, `GET /tools/logs` and
+  `POST /tools/logs` behind the Canvas authorization and CSRF, served by a
+  separate NDJSON tools process (`scripts/autonom_canvas_tools.py`) and one
+  `logs follow --source device` child per Canvas (2000 lines / 1 MiB ring,
+  stopped 60 s after the last read, on close and at Canvas stop; an optional
+  `match` text keeps only the lines holding it, at the source). Device
+  changes follow the handoff rule (403 `control_refused`), a call waits at
+  most 60 s (504 `timeout`), a gone tools process answers 502
+  `tools_unavailable` and is restarted at most once per 10 s, and input and
+  the stream never wait for it. Every change is journaled as `canvas <op>`
+  with its origin, without mock bodies, push payloads or log text. `/status`
+  adds `tools`.
+- **Live check** `tests/live/canvas_tools_live.mjs` drives the real Canvas
+  `/tools` routes on emulator-5580 or the Autonom-Fast-Test Simulator with a
+  temporary `AUTONOM_HOME`, checks each panel's device effect, restores what
+  it changed, and with `--ui` checks the drawer in headless Chromium at
+  1440x900 and 390x844, light and dark.
+
 ## [0.34.0] - 2026-10-06
 
 ### Added

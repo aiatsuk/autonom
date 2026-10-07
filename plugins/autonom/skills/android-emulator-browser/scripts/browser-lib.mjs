@@ -193,6 +193,12 @@ export function parseArgs(argv) {
       case "--bridge":
         options.bridge = requireFlagValue(argv, ++i, flag);
         break;
+      case "--tools":
+        options.tools = requireFlagValue(argv, ++i, flag);
+        break;
+      case "--autonom":
+        options.autonom = requireFlagValue(argv, ++i, flag);
+        break;
       case "--scrcpy-server":
         options.scrcpyServer = requireFlagValue(argv, ++i, flag);
         break;

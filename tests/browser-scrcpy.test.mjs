@@ -16,6 +16,13 @@ import { promisify } from "node:util";
 import { Script, createContext } from "node:vm";
 
 import {
+  toolsButton,
+  toolsMarkup,
+  toolsScript,
+  toolsStyles,
+} from "../plugins/autonom/skills/android-emulator-browser/scripts/canvas-tools-page.mjs";
+
+import {
   h264EncoderKind,
   parseH264Encoders,
 } from "../plugins/autonom/skills/android-emulator-browser/scripts/scrcpy-lib.mjs";
@@ -2963,6 +2970,9 @@ function fakeDocument(html) {
       addEventListener: (type, listener) => listen(element, type, listener),
       dispatch: (type, init) => dispatch(element, type, init),
       click: () => { if (!element.disabled) dispatch(element, "click", { detail: 0 }); },
+      // The Tools drawer queries inside itself with the same attribute selectors.
+      querySelectorAll: (selector) => elements.filter((other) => other !== element && element.contains(other) &&
+        attributeMatcher(selector)(other)),
     };
     let disabled = "disabled" in attributes;
     Object.defineProperty(element, "disabled", {
@@ -2995,12 +3005,16 @@ function fakeDocument(html) {
   document.elements = elements;
   document.body = elements.find((element) => element.tagName === "BODY");
   document.getElementById = (id) => elements.find((element) => element.id === id) ?? null;
-  document.querySelectorAll = (selector) => {
-    const names = selector.split(",").map((part) => part.trim().match(/^\[([\w-]+)\]$/)?.[1]);
-    if (names.some((name) => !name)) throw new Error(`the fake document cannot query ${selector}`);
-    return elements.filter((element) => names.some((name) => element.attributes.has(name)));
-  };
+  document.querySelectorAll = (selector) => elements.filter(attributeMatcher(selector));
   return document;
+}
+
+/** A matcher for the attribute selectors the page scripts use: `[name]`, `[name=value]`, comma lists. */
+function attributeMatcher(selector) {
+  const parts = selector.split(",").map((part) => part.trim().match(/^\[([\w-]+)(?:=(?:"([^"]*)"|([^\]"]*)))?\]$/));
+  if (parts.some((part) => !part)) throw new Error(`the fake document cannot query ${selector}`);
+  return (element) => parts.some(([, name, quoted, bare]) => element.attributes.has(name) &&
+    (quoted === undefined && bare === undefined || element.attributes.get(name) === (quoted ?? bare)));
 }
 
 /**
@@ -5253,7 +5267,8 @@ test("page: the Android page keeps its element ids, window.autonomCanvas and eve
   // Every button has a name; one without text is named by aria-label and shows it as its tooltip.
   for (const button of buttons) {
     assert.ok(button.name, JSON.stringify(button.attributes));
-    assert.equal(button.attributes.type, "button", button.name);
+    // The one submit button is the Tools drawer's mock form (Enter in its fields submits it too).
+    assert.equal(button.attributes.type, button.attributes.id === "tools-mock-save" ? "submit" : "button", button.name);
     if (!button.text) assert.equal(button.attributes.title, button.attributes["aria-label"], button.name);
   }
   assert.deepEqual(buttons.filter((button) => "data-scrcpy" in button.attributes).map((button) => button.name),
@@ -5590,6 +5605,54 @@ test("page: the iOS page runs without the Size menu, keeps every element id, sho
   assert.equal(document.getElementById("target-detail").textContent, "iOS · screencap");
   assert.equal(document.getElementById("display-dims").textContent, "1179 × 2556");
   assert.equal(document.getElementById("sendText").disabled, false);
+  // The Tools drawer is the iOS one: push, Clear and the permissions note, no read-back.
+  assert.equal(html.split('<aside class="tools" id="tools" hidden aria-label="Tools" data-platform="ios">').length - 1, 1);
+  assert.ok(document.getElementById("tools-loc-clear"));
+  assert.ok(document.getElementById("tools-perms-note"));
+  assert.equal(document.getElementById("tools-loc-get"), null);
+  assert.equal(document.querySelectorAll("[data-sim]").filter((element) => element.getAttribute("data-sim") === "push").length, 1);
+});
+
+test("page: the served page carries the Tools drawer after the inspector, its toggle in the toolbar, its styles and its script, which parses and runs with the page", async (t) => {
+  const { html, run, document } = await loadPage(t);
+  // Markup: the toggle sits in the toolbar actions next to the inspector toggle; the drawer
+  // follows the inspector and starts hidden; every id on the page is unique.
+  const actions = html.match(/<div class="actions">([\s\S]*?)<\/div>/)[1];
+  assert.ok(actions.includes(toolsButton()), "the Tools toggle is in the toolbar");
+  assert.ok(actions.indexOf('id="tools-toggle"') < actions.indexOf('id="inspector-toggle"'));
+  const inspectorEnd = html.indexOf("</aside>", html.indexOf('<aside class="side" id="inspector"'));
+  const drawerAt = html.indexOf('<aside class="tools" id="tools" hidden aria-label="Tools" data-platform="android">');
+  assert.ok(inspectorEnd > 0 && drawerAt > inspectorEnd, "the drawer comes right after the inspector");
+  assert.ok(html.includes(toolsMarkup({ platform: "android" })));
+  const markup = html.replace(/<script>[\s\S]*?<\/script>|<style>[\s\S]*?<\/style>/g, "");
+  const ids = [...markup.matchAll(/\sid="([^"]+)"/g)].map((match) => match[1]);
+  assert.deepEqual(ids.filter((id, index) => ids.indexOf(id) !== index), [], "no id is used twice");
+  assert.deepEqual([...markup.matchAll(/role="tab"[^>]*>([^<]+)</g)].map((match) => match[1]), ["App", "Simulate", "Network", "Mocks", "Logs"]);
+  assert.equal((markup.match(/role="tabpanel"/g) || []).length, 5);
+  // The location presets do not join the page's display-size options.
+  assert.equal(run("sizeOptions.length"), 5);
+  // Styles and script: inlined whole, after the page's own; the script parses as one.
+  const css = html.match(/<style>([\s\S]*)<\/style>/)[1];
+  assert.ok(css.includes(toolsStyles().trim()), "the drawer styles are inlined");
+  assert.ok(css.indexOf("/* tools drawer */") > css.indexOf("@media (max-width:760px)"), "after the page's own phone rules");
+  const script = html.match(/<script>([\s\S]*)<\/script>/)[1];
+  assert.doesNotThrow(() => new Script(script));
+  assert.ok(script.includes(toolsScript()), "the drawer script is inlined");
+  assert.ok(script.indexOf(toolsScript()) > script.indexOf("window.autonomCanvas="), "after the page script");
+  // It runs with the page's globals: open, then the inspector toggle closes it (mutually exclusive).
+  const byId = (id) => document.getElementById(id);
+  assert.equal(run("typeof window.autonomTools.open"), "function");
+  byId("tools-toggle").click();
+  assert.equal(byId("tools").hidden, false);
+  assert.equal(document.body.classList.contains("tools-open"), true);
+  assert.equal(byId("tools-toggle").getAttribute("aria-pressed"), "true");
+  assert.equal(byId("inspector-toggle").getAttribute("aria-pressed"), "false");
+  byId("inspector-toggle").click();
+  assert.equal(byId("tools").hidden, true);
+  assert.equal(document.body.classList.contains("tools-open"), false);
+  assert.equal(document.body.classList.contains("no-inspector"), false, "the inspector is back");
+  assert.equal(byId("inspector-toggle").getAttribute("aria-pressed"), "true");
+  assert.equal(byId("tools-toggle").getAttribute("aria-pressed"), "false");
 });
 
 // ---------------------------------------------------------------------------

@@ -2208,21 +2208,39 @@ def cmd_record_stop(args: argparse.Namespace) -> int:
 
 def cmd_network_start(args: argparse.Namespace) -> int:
     record = session_mod.require_current()
+    return emit(network_start_payload(
+        record, port=args.port, capture_bodies=args.capture_bodies,
+        acknowledged=args.i_understand_mitm,
+        mitmdump=getattr(args, "mitmdump", None),
+        ignore_hosts=getattr(args, "ignore_hosts", None),
+        intercept_connectivity_checks=getattr(args, "intercept_connectivity_checks", False),
+    ), as_json=True)
+
+
+def network_start_payload(record: dict[str, Any], *, port: int | None,
+                          capture_bodies: bool, acknowledged: bool,
+                          mitmdump: str | None = None, ignore_hosts: str | None = None,
+                          intercept_connectivity_checks: bool = False) -> dict[str, Any]:
+    """`network start` for `record`: consent, proxy, session update, payload.
+
+    Shared by the CLI verb and the Canvas tools process, so both start the
+    proxy, record consent and warn exactly the same way.
+    """
     entry = consent_mod.require(
         consent_mod.Operation(
             kind="mitm_proxy",
-            target=f"127.0.0.1:{args.port or 'auto'}",
+            target=f"127.0.0.1:{port or 'auto'}",
             effect=("start a man-in-the-middle proxy that decrypts and records this "
                     "session's HTTP(S) traffic to disk"),
             flags=("--i-understand-mitm",),
         ),
-        acknowledged=args.i_understand_mitm,
+        acknowledged=acknowledged,
     )
     state = proxy_mod.start(
-        record, port=args.port, capture_bodies=args.capture_bodies,
-        mitmdump=getattr(args, "mitmdump", None),
-        ignore_hosts=getattr(args, "ignore_hosts", None),
-        intercept_connectivity_checks=getattr(args, "intercept_connectivity_checks", False),
+        record, port=port, capture_bodies=capture_bodies,
+        mitmdump=mitmdump,
+        ignore_hosts=ignore_hosts,
+        intercept_connectivity_checks=intercept_connectivity_checks,
     )
     consent_mod.record(record, entry)
     network = record.setdefault("network", {})
@@ -2243,7 +2261,7 @@ def cmd_network_start(args: argparse.Namespace) -> int:
     warnings: list[dict[str, str]] = list(state.get("warnings") or [])
     # What is actually being captured decides the warning, not what was asked:
     # an already-running proxy keeps its own --capture-bodies setting.
-    if state.get("capture_bodies", args.capture_bodies):
+    if state.get("capture_bodies", capture_bodies):
         warnings.append({
             "code": "full_body_capture_enabled",
             "error": "full request and response bodies are being written to disk",
@@ -2259,7 +2277,7 @@ def cmd_network_start(args: argparse.Namespace) -> int:
         warnings.append(persistent)
     if warnings:
         payload["warnings"] = warnings
-    return emit(payload, as_json=True)
+    return payload
 
 
 def cmd_cleanup(args: argparse.Namespace) -> int:
@@ -2303,16 +2321,32 @@ def cmd_processes(_: argparse.Namespace) -> int:
 
 def cmd_network_stop(_: argparse.Namespace) -> int:
     record = session_mod.require_current()
+    return emit(network_stop_payload(record), as_json=True)
+
+
+def network_stop_payload(record: dict[str, Any]) -> dict[str, Any]:
+    """`network stop` for `record` (shared with the Canvas tools process)."""
     detail = proxy_mod.stop(record)
     record.setdefault("network", {})["enabled"] = False
     session_mod.save(record)
-    return emit({"ok": True, **detail}, as_json=True)
+    return {"ok": True, **detail}
 
 
 def cmd_network_status(args: argparse.Namespace) -> int:
+    record = session_mod.require_current()
+    return emit(network_status_payload(record, lambda: _target(args), _mock_hit_counts),
+                as_json=True)
+
+
+def network_status_payload(record: dict[str, Any], target: Any,
+                           hit_counts: Any) -> dict[str, Any]:
+    """`network status` for `record` (shared with the Canvas tools process).
+
+    `target` is called only when the Android proxy setting must be read back;
+    `hit_counts` returns the mock hit counts the idle-rule warning is judged by.
+    """
     from autonom_lib.network import attachment as attachment_mod
 
-    record = session_mod.require_current()
     state = proxy_mod.status(record)
     network = record.get("network") or {}
     payload: dict[str, Any] = {"ok": True, "proxy": state}
@@ -2322,7 +2356,7 @@ def cmd_network_status(args: argparse.Namespace) -> int:
     # is read back when no flow decides, and an unreadable device is
     # `setting_unreadable`, never "cleared externally".
     platform = record.get("platform") or ANDROID
-    observe = ((lambda: device_proxy_android.read_setting(_target(args)))
+    observe = ((lambda: device_proxy_android.read_setting(target()))
                if platform == ANDROID else None)
     evidence = attachment_mod.attachment_evidence(record, platform=platform,
                                                   observe_setting=observe)
@@ -2347,7 +2381,7 @@ def cmd_network_status(args: argparse.Namespace) -> int:
     if network.get("capture_mode") == "transparent" and network.get("http_proxy_routed"):
         payload["http_proxy_routed"] = network.get("http_proxy_routed")
     mocks_state = mocks_mod.summary()
-    idle = _annotate_hits(mocks_mod.active())
+    idle = mocks_mod.annotate_hits(mocks_mod.active(), hit_counts())
     payload["mocks"] = mocks_state
     if idle:
         payload.setdefault("warnings", []).extend(idle)
@@ -2357,11 +2391,25 @@ def cmd_network_status(args: argparse.Namespace) -> int:
         payload.setdefault("warnings", []).append(persistent)
     if payload["attached"] == "unknown":
         payload["next_action"] = "exercise the app, then re-run 'autonom network status'"
-    return emit(payload, as_json=True)
+    return payload
 
 
 def cmd_network_attach(args: argparse.Namespace) -> int:
     record = session_mod.require_current()
+    return emit(network_attach_payload(
+        record, lambda: _target(args), acknowledged=args.i_understand_mitm,
+        system_ca=getattr(args, "system_ca", False), install_ca=args.install_ca,
+        network_cycle=not getattr(args, "no_network_cycle", False),
+    ), as_json=True)
+
+
+def network_attach_payload(record: dict[str, Any], target_of: Any, *, acknowledged: bool,
+                           system_ca: bool = False, install_ca: bool = False,
+                           network_cycle: bool = True) -> dict[str, Any]:
+    """`network attach` for `record` (shared with the Canvas tools process).
+
+    `target_of` is called once the proxy is known to run, as the verb always did.
+    """
     state = proxy_mod.status(record)
     if not state["running"]:
         raise errors.AutonomError(
@@ -2369,46 +2417,48 @@ def cmd_network_attach(args: argparse.Namespace) -> int:
             "no proxy is running for this session",
             "Start one first: 'autonom network start --i-understand-mitm'.",
         )
-    target = _target(args)
+    target = target_of()
     if target.platform == ANDROID:
-        if getattr(args, "system_ca", False):
+        if system_ca:
             # Transparent capture: the emulator is already routed through the
             # proxy at launch (`devices boot --http-proxy`); this only installs
             # the system CA so the proxy can decrypt. Refuses when not routed.
             detail = device_proxy_android.attach_transparent(
-                target, record, port=state["port"], acknowledged=args.i_understand_mitm
+                target, record, port=state["port"], acknowledged=acknowledged
             )
             session_mod.save(record)
-            return emit({"ok": True, "mode": "transparent", **detail, **target.identity()},
-                        as_json=True)
+            return {"ok": True, "mode": "transparent", **detail, **target.identity()}
         ca_detail = None
-        if args.install_ca:
+        if install_ca:
             ca_detail = device_proxy_android.install_ca_certificate(
-                target, record, acknowledged=args.i_understand_mitm
+                target, record, acknowledged=acknowledged
             )
         detail = device_proxy_android.attach(
-            target, record, port=state["port"], acknowledged=args.i_understand_mitm,
-            network_cycle=not getattr(args, "no_network_cycle", False),
+            target, record, port=state["port"], acknowledged=acknowledged,
+            network_cycle=network_cycle,
         )
         if ca_detail:
             detail["ca_installed"] = ca_detail
         session_mod.save(record)
-        return emit({"ok": True, "mode": "automated", **detail, **target.identity()},
-                    as_json=True)
+        return {"ok": True, "mode": "automated", **detail, **target.identity()}
 
     from autonom_lib.network import device_proxy_ios
 
     detail = device_proxy_ios.attach(
         target, record, port=state["port"],
-        acknowledged=args.i_understand_mitm, install_ca=args.install_ca,
+        acknowledged=acknowledged, install_ca=install_ca,
     )
     session_mod.save(record)
-    return emit({"ok": True, **detail, **target.identity()}, as_json=True)
+    return {"ok": True, **detail, **target.identity()}
 
 
 def cmd_network_detach(args: argparse.Namespace) -> int:
     record = session_mod.require_current()
-    target = _target(args)
+    return emit(network_detach_payload(record, _target(args)), as_json=True)
+
+
+def network_detach_payload(record: dict[str, Any], target: Target) -> dict[str, Any]:
+    """`network detach` for `record` (shared with the Canvas tools process)."""
     if target.platform == ANDROID:
         detail = device_proxy_android.detach(target, record)
     else:
@@ -2416,7 +2466,7 @@ def cmd_network_detach(args: argparse.Namespace) -> int:
 
         detail = device_proxy_ios.detach(target, record)
     session_mod.save(record)
-    return emit({"ok": True, **detail, **target.identity()}, as_json=True)
+    return {"ok": True, **detail, **target.identity()}
 
 
 def cmd_network_requests_list(args: argparse.Namespace) -> int:
@@ -2594,22 +2644,7 @@ def _mock_hit_counts() -> dict[str, int]:
 
 
 def _annotate_hits(rules: list[dict[str, Any]]) -> list[dict[str, str]]:
-    counts = _mock_hit_counts()
-    for rule in rules:
-        rule["hits"] = counts.get(rule.get("id"), 0)
-    idle = [r["id"] for r in rules if r.get("enabled", True) and not r["hits"]]
-    if idle and counts:
-        # Only worth saying once some rule HAS fired: otherwise the proxy simply
-        # has not seen traffic yet, which is a different problem.
-        return [{
-            "code": "mock_never_matched",
-            "error": "enabled rule(s) that have not matched a single request: "
-                     + ", ".join(idle),
-            "hint": "Check the glob against a real URL — 'network requests list' "
-                    "shows the full URL, and a query string defeats a glob that "
-                    "ends at the path.",
-        }]
-    return []
+    return mocks_mod.annotate_hits(rules, _mock_hit_counts())
 
 
 def cmd_network_mock_add(args: argparse.Namespace) -> int:

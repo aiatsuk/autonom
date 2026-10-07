@@ -188,6 +188,22 @@ busy Mac try `--max-size 1600`. Report the size and encoder with any fps
 numbers.
 ```
 
+## Change device state from the Canvas Tools drawer
+
+```text
+Start `autonom session start --serial <serial> --app-id <app id>` (on iOS
+`--platform ios --udid <udid> --log-stream`), then `autonom canvas serve` on
+the same target and open the URL. Press Tools in the toolbar. On App, revoke
+the camera permission and set the location to a preset; on Android press
+Read back and say whether the fix was delivered or only requested. On
+Network, press Start capture, read the confirmation, confirm, Attach device,
+use the app, open one request, press Mock this, set status 503 and add the
+mock; check the app's error state, then remove the mock, Detach and Stop
+capture. On Logs, filter to the app package and Warning level. Report each
+step's result line and any error code and hint; never paste request bodies
+or log text into the report.
+```
+
 ## Tap one of several identical controls
 
 ```text
