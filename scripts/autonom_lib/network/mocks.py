@@ -149,6 +149,29 @@ def hit_counts(flows: Iterable[dict[str, Any]]) -> dict[str, int]:
     return counts
 
 
+def annotate_hits(rules: list[dict[str, Any]],
+                  counts: dict[str, int]) -> list[dict[str, str]]:
+    """Set each rule's `hits` from `counts`; return the `mock_never_matched`
+    warning (or nothing) for enabled rules that never fired.
+
+    The warning is only worth giving once some rule HAS fired: otherwise the
+    proxy simply has not seen traffic yet, which is a different problem.
+    """
+    for rule in rules:
+        rule["hits"] = counts.get(rule.get("id"), 0)
+    idle = [r["id"] for r in rules if r.get("enabled", True) and not r["hits"]]
+    if idle and counts:
+        return [{
+            "code": "mock_never_matched",
+            "error": "enabled rule(s) that have not matched a single request: "
+                     + ", ".join(idle),
+            "hint": "Check the glob against a real URL — 'network requests list' "
+                    "shows the full URL, and a query string defeats a glob that "
+                    "ends at the path.",
+        }]
+    return []
+
+
 def session_hit_counts(record: dict[str, Any] | None = None) -> dict[str, int]:
     """`hit_counts` over a session's flow store — the current session's when
     `record` is None; empty when there is no session or no store."""

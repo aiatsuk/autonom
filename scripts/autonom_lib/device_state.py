@@ -159,6 +159,84 @@ def granted_runtime_permissions(dumpsys_text: str) -> list[str]:
     return granted
 
 
+# A permission line under `requested permissions:` is the bare name, sometimes
+# followed by attributes (`android.permission.X: restricted=true`).
+_REQUESTED_PERMISSION = re.compile(r"^\s*([A-Za-z0-9_.]+)\s*(?::.*)?$")
+
+
+def runtime_permission_states(dumpsys_text: str) -> list[dict[str, Any]]:
+    """The app's requested runtime permissions with their granted state.
+
+    Read from `dumpsys package <pkg>`: every `runtime permissions:` section
+    (one per user; the first mention of a name wins) gives `granted` true or
+    false, in the order of the `requested permissions:` list where the name is
+    there. A requested permission that is one of the short-name aliases
+    (`ANDROID_PERMISSION_ALIASES`) but missing from every runtime section has
+    `granted: None` (not known), never a guess. Install-time permissions are
+    left out: they are granted at install and cannot be changed.
+    """
+    requested: list[str] = []
+    states: dict[str, bool] = {}
+    section: str | None = None
+    for line in (dumpsys_text or "").splitlines():
+        stripped = line.strip()
+        if stripped.endswith(":") and "permissions" in stripped:
+            section = stripped[:-1]
+            continue
+        if section == "runtime permissions":
+            match = _RUNTIME_PERMISSION.match(line)
+            if match is None:
+                section = None
+                continue
+            states.setdefault(match.group(1), match.group(2) == "true")
+        elif section == "requested permissions":
+            match = _REQUESTED_PERMISSION.match(line)
+            if match is None or "." not in match.group(1):
+                section = None
+                continue
+            if match.group(1) not in requested:
+                requested.append(match.group(1))
+    known_runtime = {name for names in ANDROID_PERMISSION_ALIASES.values() for name in names}
+    ordered = [name for name in requested if name in states or name in known_runtime]
+    ordered += [name for name in states if name not in ordered]
+    return [{"name": name, "alias": android_permission_alias(name),
+             "granted": states.get(name)} for name in ordered]
+
+
+def android_permission_alias(permission: str) -> str | None:
+    """The short name a single Android permission belongs to, if any."""
+    for alias, names in ANDROID_PERMISSION_ALIASES.items():
+        if permission in names:
+            return alias
+    return None
+
+
+def app_runtime_permissions(target: Target, app_id: str) -> list[dict[str, Any]]:
+    """`runtime_permission_states` for one installed package (Android only)."""
+    if target.platform != ANDROID:
+        raise _unsupported(target, "permissions list",
+                           "simctl cannot read the privacy state back on iOS.")
+    completed = adb_mod.run_adb(
+        target.tool, ["shell", "dumpsys", "package", app_id],
+        serial=target.target_id, timeout=30, check=False,
+    )
+    text = completed.stdout if isinstance(completed.stdout, str) else ""
+    if completed.returncode != 0:
+        # An offline or unauthorized device, or any adb failure, is a device
+        # problem: never report it as a missing app.
+        detail = text.strip().splitlines()[-1][:400] if text.strip() else ""
+        raise adb_mod.AdbError(
+            detail or f"dumpsys package {app_id} failed (exit {completed.returncode})",
+            hint="Check the device with 'adb devices'; it must be online and authorized.",
+        )
+    if "Unable to find package" in text or f"Package [{app_id}]" not in text:
+        raise errors.AutonomError(
+            errors.APP_NOT_INSTALLED, f"{app_id} is not installed on the device",
+            "Check the package id with 'adb shell pm list packages'.",
+        )
+    return runtime_permission_states(text)
+
+
 def _raise_for_pm_output(output: str, app_id: str, permission: str) -> None:
     """`pm grant|revoke` failures are Java exceptions on stdout; name them."""
     text = (output or "").strip()

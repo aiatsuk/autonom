@@ -219,7 +219,8 @@ because iOS waits for a possible double press.
 
 A slim toolbar holds the Autonom wordmark, the target with a live dot and the
 transport, the Size menu (Android only, see Display size) with the current
-size and density beside it, the control status, and the inspector toggle.
+size and density beside it, the control status, the Tools toggle (see Tools
+drawer) and the inspector toggle.
 Below it the device picture sits in a frame whose aspect ratio follows the
 video, with a caption under it (fps, round trip and decoder on scrcpy; the
 transport otherwise) and a floating pill of device buttons: Back, Home,
@@ -243,6 +244,68 @@ menu, Keys or Device section, and its pill shows Home and Power, plus Volume
 down and Volume up on the idb transport. The element ids `video`, `screen`,
 `status`, `text`, `clipboard`, `device` and `refresh` and
 `window.autonomCanvas` are stable for scripts.
+
+## Tools drawer
+
+The Tools toggle in the toolbar opens a drawer with five tabs for the
+Canvas's own target. On a desktop-width page it takes the inspector's column
+(wider, about 440-520 px) and never covers the device; the inspector and the
+drawer are never open together, and the inspector toggle closes the drawer.
+At 760 px and narrower it is a full-width sheet. The tabs are a keyboard tab
+list (arrow keys, Home, End; Escape closes the drawer), light and dark follow
+the system, and every device or network string is shown as text.
+
+| Tab | What it does | Limits |
+| --- | --- | --- |
+| App | App id (pre-filled from the session on this target or the best-known app, editable); permissions: Android lists the app's requested runtime permissions with granted or denied and grants, revokes or resets one; iOS lists the privacy services with Grant, Revoke and Reset. Location: latitude and longitude (checked: -90..90, -180..180) or a preset; Android reads the position back | iOS cannot read a permission or the location back, so the drawer says so and shows the last value set. The Android emulator has no location reset, so Clear is iOS only; its position moves only once an app subscribes to location updates, and Read back says "delivered" or "requested only" |
+| Simulate | Push (iOS, JSON payload of at most 4 KB), biometrics (iOS enroll, unenroll, match, non-match; Android a matching fingerprint), battery level and reset (iOS also its state), network online/offline (Android), appearance light/dark | Only these controls, and only on an emulator or Simulator; the result says whether the device confirmed the change |
+| Network | Capture status (proxy, device attached yes/no/unknown, recent requests), Start capture after a confirmation that names the effect (it decrypts and records this session's HTTP(S) traffic), Attach device, Detach, Stop capture; a live request list (polled once a second while the tab is visible) with host, method, status and mocked filters; details from the redacted previews; Mock this fills the Mocks form | Needs an Autonom session on this target (`autonom session start` with the Canvas's `--serial`/`--udid`); without one the tab shows that hint and never starts a session. Never `--capture-bodies`, never the system CA: previews only, at most 2 KB, already redacted |
+| Mocks | The mock list with hit counts, add, edit, enable, disable, remove, and Clear all after a confirmation; validation errors are shown with their code | Mocks apply to every Autonom session on this Mac (the drawer says so). Hit counts count only the session on this target (0 without one). Status 100-599, body at most 32 KB |
+| Logs | The live device log, optionally for one app package (iOS: process or bundle), with a level filter, a text filter, Pause (keeps polling, stops drawing), Clear and auto-scroll unless you scrolled up | At most 2000 rows in the page; the Canvas keeps the last 2000 lines (at most 1 MiB) and counts the lines it evicted before the page read them. On iOS the feed follows the current session's log stream, so it starts only when that session is on this Simulator and was started with `--log-stream`; otherwise it says how to start one |
+
+Device changes (permissions, location, simulations, capture, mocks) follow
+the handoff rules of input: while input is paused or another origin holds
+control they are disabled with the reason, and the Canvas refuses them with
+403 `control_refused`. Reads and the log feed are never refused for control.
+A change that gets no answer within 60 s is reported as an unknown outcome,
+never retried, and the panel reads its state again where the device can
+report it.
+
+Behind the drawer, the Canvas runs one tools process
+(`scripts/autonom_canvas_tools.py`, NDJSON over stdio, separate from the
+input bridge, so slow panel work never delays input or the stream) and, while
+the Logs tab is open, one `autonom logs follow --source device` child. Both
+use the same `autonom_lib` functions as the CLI and stop with the Canvas; the
+log child also stops 60 s after the last read and when the drawer closes.
+Routes, behind the same authorization and CSRF as every other route:
+
+- `POST /tools/call` `{"op","payload"}`: the ops `context`, `permissions.list`,
+  `permissions.set`, `location.get`, `location.set`, `location.clear`,
+  `simulate`, `network.status`, `network.start`, `network.attach`,
+  `network.detach`, `network.stop`, `network.requests`, `network.request`,
+  `mocks.list`, `mocks.add`, `mocks.update`, `mocks.enable`,
+  `mocks.disable`, `mocks.remove`, `mocks.clear`. 200 `{"ok":true,"result"}`;
+  a refusal keeps the library's `error_code`, `error`, `hint` and `capability`
+  with 400 (invalid input, consent), 404 (unknown mock, flow or app), 409
+  (unsupported here, no session on this target) or 502; 403
+  `control_refused`, 504 `timeout` after 60 s, 502 `tools_unavailable` when
+  the tools process is gone (the next call starts it again, at most once per
+  10 s).
+- `GET /tools/logs?after=<seq>&limit=<1-500>`: `running`, `package`, `lines`
+  (each with its `seq`), `next`, `dropped` (the lost lines between `after`
+  and `next`, each counted once when `next` is passed back as `after`) and
+  `error`.
+- `POST /tools/logs` `{"active": true|false, "package": null|"<id>",
+  "match": null|"<text>"}`: starts, restarts for another package or match, or
+  stops the feed. `match` (1-200 printable ASCII characters) keeps only the
+  lines holding that text, case-insensitively, at the source (`logs follow
+  --grep`), so a device that logs faster than a reader reads (a booted iOS
+  Simulator) cannot push those lines out of the ring.
+
+`/status` `tools` reports `available` and `logs.running`/`logs.package`.
+Every device change is journaled into the session on this target as
+`canvas <op>` with its origin; mock bodies, push payloads and log text are
+never journaled (lengths only), and the Canvas writes no log text to disk.
 
 ## The scrcpy page
 
@@ -576,4 +639,6 @@ transport and decoder lines, `fallback_reason`, `scrcpy.version`/`scrcpy.source`
 `scrcpy.max_size`/`scrcpy.encoder` (the stream size and the encoder behind it)
 (`idb.companion_path`/`idb.source` and `idb.streams_opened` on iOS)
 and the display preset, size and density from `/status`, package/activity,
-variant, control owner, and the exact flow replayed.
+variant, control owner, and the exact flow replayed. For Tools drawer work,
+the ops called and their results (never mock bodies, push payloads or log
+text).

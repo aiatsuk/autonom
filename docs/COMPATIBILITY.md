@@ -352,6 +352,30 @@ which came from 4 vCPUs and a loaded host:
 At the new default on a host at load average 4-5 the live bench presented a
 median of 57 fps (runs 52, 59, 57) with 84.5 ms median latency.
 
+### Mobile Canvas web controls (Unreleased)
+
+Additive. No CLI verb, flag, `error_code` or output field changes: the CLI
+handlers for `network start`, `network stop`, `network attach` and
+`network status` and the mock registry now share small helpers with the
+Canvas tools process, with the same output. The Canvas page gains a Tools drawer; the Canvas server gains these
+routes and fields (all behind the existing authorization, POST behind CSRF):
+
+| Surface | Before | Now |
+| --- | --- | --- |
+| `POST /tools/call` `{"op","payload"}` | 404 | the drawer's operations (`context`, `permissions.list`/`set`, `location.get`/`set`/`clear`, `simulate` with the controls `push`, `biometric`, `battery`, `network`, `appearance` only, `network.status`/`start`/`attach`/`detach`/`stop`/`requests`/`request`, `mocks.list`/`add`/`update`/`enable`/`disable`/`remove`/`clear`); 200 `{"ok":true,"result":{...}}`. Unknown op: 400 `flow_command_invalid`. A device change while input is paused or another origin holds control: 403 `control_refused` (reads are never refused). A library refusal keeps its `error_code`, `error`, `hint` and `capability`: 400 for invalid input and consent codes, 404 for `mock_not_found`, `flow_not_found`, `app_not_installed`, 409 for `unsupported_on_platform`, `unsupported_capability`, `no_active_session`, `session_target_mismatch`, `emulator_only`, `proxy_not_running`, `physical_device_attach_unsupported`, 502 otherwise. 504 `timeout` after 60 s (the late reply is dropped, nothing is retried); 502 `tools_unavailable` when the tools process is gone, restarted by the next call at most once per 10 s |
+| `GET /tools/logs?after=&limit=` | 404 | `{"ok","running","package","lines":[{"seq",...}],"next","dropped","error"}`; `limit` 1-500; `dropped` counts the seqs in (`after`, `next`] that are not in the buffer (evicted by its bound, or a line too long to keep; never the lines a feed restart cleared), so each lost line is counted once by a reader that passes `next` back as `after`, and that reader adds the reads up. `next` is the last returned seq when `limit` cut the page short, else the newest seq, so lost lines at the end are passed too |
+| `POST /tools/logs` `{"active","package","match"}` | 404 | starts, restarts (another package or match) or stops the one `autonom logs follow --source device` child of the Canvas; `package` matches `^[A-Za-z0-9_.]{1,255}$` or is null; `match` is 1-200 printable ASCII characters or null, and keeps only the lines holding that text (case-insensitive, passed as an escaped `--grep`); the answer echoes `match`; never refused for control. On iOS it starts only when the current session is on this Simulator, else `running: false` with an `error` naming `autonom session start --platform ios --udid <udid> --log-stream` |
+| `/status` | — | adds `tools`: `{"available": bool, "logs": {"running": bool, "package": str\|null}}` |
+| Journal of the session on the Canvas target | — | one `canvas <op>` action per device change with its origin; mock bodies and push payloads appear only as lengths, log text never |
+| Canvas server options | — | `--tools PATH` (the tools process script) and `--autonom PATH` (the CLI the log feed runs), for tests |
+
+Limits: network capture and request lists need an Autonom session on this
+target (the drawer never starts one); request details are the redacted
+previews only (never full bodies); mocks are machine-wide and their hit counts
+count only this target's session; iOS cannot read permissions or the location
+back; the Android emulator has no location reset (Clear is iOS only, and a
+direct Android `location.clear` is 409 `unsupported_on_platform`).
+
 ### iOS UI recovery and `--session-id` (0.32.0)
 
 Additive, with two behaviour changes listed at the end. A host that passes
