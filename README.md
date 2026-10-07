@@ -36,6 +36,10 @@ Kotlin/Jetpack Compose, and iOS.
 **Roadmap:** Flutter VM Service, React Native skills, optional MCP wrapper,
 hosted device providers.
 
+**Proposed ChatGPT desktop workspace:** [architecture and implementation plan](docs/plans/CHATGPT_DEVICE_WORKSPACE.md)
+for local and remote Canvas connections, concurrent device sessions, and shared
+human/agent control. This is a plan, not an available feature.
+
 ## Why Autonom
 
 - **Agent-portable** — one skill pack for Codex, Claude, Grok, or any skill host.
