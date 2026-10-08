@@ -654,13 +654,24 @@ def _session_stop_marked(args: argparse.Namespace, record: dict[str, Any]) -> in
         ("log_stream", _log_stream),
         ("recorder", _recorder),
         ("network_detach", _detach),
-        ("network_stop", lambda: proxy_mod.stop(record)),
-        # last: every registry row this session owns (the log-stream writer,
-        # a canvas pair, an idb_companion its idb calls started), each one
-        # signature-checked before it is signalled
-        ("session_processes", lambda: session_mod.reap_owned_processes(record)),
     ]
     teardown = session_mod.run_teardown(actions)
+    failed_detach = next((step for step in teardown
+                          if step["action"] == "network_detach" and not step["ok"]), None)
+    session_mod.save(record)
+    if failed_detach:
+        raise errors.AutonomError(
+            errors.BACKEND_FAILED, "Could not restore the device proxy; session kept open.",
+            "Resolve the detach error and retry session stop; the proxy was left running.",
+            teardown=teardown)
+    # Use the same route guard as CLI/Canvas Stop. No generic process reaping
+    # may kill a proxy still needed by the target.
+    stopped_network = (proxy_mod.stop(record) if gone else
+                       network_stop_payload(record, lambda: _target(args)))
+    teardown.append({"action": "network_stop", "ok": True, "detail": stopped_network})
+    teardown.extend(session_mod.run_teardown([
+        ("session_processes", lambda: session_mod.reap_owned_processes(record)),
+    ]))
     if accessibility_teardown is not None:
         teardown.insert(0, {"action": "accessibility_restore", "ok": True,
                             "detail": accessibility_teardown})
@@ -2398,17 +2409,35 @@ def cmd_processes(_: argparse.Namespace) -> int:
     return emit({"ok": True, **processes_mod.scan()}, as_json=True)
 
 
-def cmd_network_stop(_: argparse.Namespace) -> int:
+def cmd_network_stop(args: argparse.Namespace) -> int:
     record = session_mod.require_current()
-    return emit(network_stop_payload(record), as_json=True)
+    return emit(network_stop_payload(record, lambda: _target(args)), as_json=True)
 
 
-def network_stop_payload(record: dict[str, Any]) -> dict[str, Any]:
-    """`network stop` for `record` (shared with the Canvas tools process)."""
+def network_stop_payload(record: dict[str, Any], target_of: Any = None) -> dict[str, Any]:
+    """Restore the target before stopping its proxy; keep both on failure."""
+    from autonom_lib.network import attachment as attachment_mod
+
+    if attachment_mod.transparent_route_live(record):
+        raise errors.AutonomError(
+            errors.UNSUPPORTED_CAPABILITY,
+            "The emulator is still routed through this proxy at launch time.",
+            "Shut down the routed emulator before stopping capture; detach cannot "
+            "remove its launch-time proxy route.", capability="network.transparent_capture")
+    detached = {"was_attached": False}
+    if (record.get("network") or {}).get("attached"):
+        target = target_of() if target_of else _target(argparse.Namespace())
+        if (target.target_id != record.get("target_id")
+                or target.platform != record.get("platform")):
+            raise errors.AutonomError(
+                errors.SESSION_TARGET_MISMATCH, "The proxy belongs to another target.",
+                "Select the session that owns this target before stopping capture.")
+        detached = network_detach_payload(record, target)
+        detached.pop("ok", None)
     detail = proxy_mod.stop(record)
     record.setdefault("network", {})["enabled"] = False
     session_mod.save(record)
-    return {"ok": True, **detail}
+    return {"ok": True, **detail, "detach": detached}
 
 
 def cmd_network_status(args: argparse.Namespace) -> int:
@@ -2512,10 +2541,14 @@ def network_attach_payload(record: dict[str, Any], target_of: Any, *, acknowledg
             ca_detail = device_proxy_android.install_ca_certificate(
                 target, record, acknowledged=acknowledged
             )
-        detail = device_proxy_android.attach(
-            target, record, port=state["port"], acknowledged=acknowledged,
-            network_cycle=network_cycle,
-        )
+        try:
+            detail = device_proxy_android.attach(
+                target, record, port=state["port"], acknowledged=acknowledged,
+                network_cycle=network_cycle,
+            )
+        finally:
+            # A written proxy must stay recoverable even if refreshing Wi-Fi fails.
+            session_mod.save(record)
         if ca_detail:
             detail["ca_installed"] = ca_detail
         session_mod.save(record)
@@ -2538,13 +2571,15 @@ def cmd_network_detach(args: argparse.Namespace) -> int:
 
 def network_detach_payload(record: dict[str, Any], target: Target) -> dict[str, Any]:
     """`network detach` for `record` (shared with the Canvas tools process)."""
-    if target.platform == ANDROID:
-        detail = device_proxy_android.detach(target, record)
-    else:
-        from autonom_lib.network import device_proxy_ios
+    try:
+        if target.platform == ANDROID:
+            detail = device_proxy_android.detach(target, record)
+        else:
+            from autonom_lib.network import device_proxy_ios
 
-        detail = device_proxy_ios.detach(target, record)
-    session_mod.save(record)
+            detail = device_proxy_ios.detach(target, record)
+    finally:
+        session_mod.save(record)
     return {"ok": True, **detail, **target.identity()}
 
 

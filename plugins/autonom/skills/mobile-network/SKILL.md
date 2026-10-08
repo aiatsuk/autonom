@@ -63,8 +63,17 @@ python3 <autonom-root>/scripts/autonom.py network stop
 Step 6 uses `disable --all`, not `clear`: the registry is persistent, so `clear`
 throws away rules you may want tomorrow. Use `clear` only to actually delete them.
 
-`session stop` performs detach and stop best-effort anyway, in that order, so the
-device is never left pointing at a dead proxy.
+`network stop` also detaches first. If restoration or its read-back fails, it
+keeps the proxy running and the restore snapshot for retry. `session stop`
+keeps the session open on a network cleanup failure, rather than reaping a
+proxy the device still needs. Repeated attach preserves the first snapshot.
+Android detach refreshes Wi-Fi, briefly interrupting connectivity.
+
+Inspect a saved local proxy before restoring it: an unreachable prior proxy or
+an external settings change makes cleanup refuse with a repair hint. Resolve
+it with the operator instead of blindly clearing their settings. Transparent
+emulator routing requires shutting down that emulator before stopping capture.
+Abrupt proxy/host crashes still need `doctor` and device-state inspection.
 
 ## Transparent capture on Android (no app change)
 
