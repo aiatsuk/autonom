@@ -113,6 +113,24 @@ in full, and export a HAR into the session. Report the request the app never
 made separately from the ones that failed.
 ```
 
+## Finish network capture safely
+
+`autonom network stop` and Canvas Stop first detach the target, then stop the
+proxy. Android detach restores the original legacy and canonical proxy settings,
+refreshes Wi-Fi (briefly interrupting connectivity), and reads the settings back.
+Repeated attach preserves the original restore snapshot, including when the
+capture port changes.
+
+If restoration or verification fails, the proxy stays running and the snapshot
+is retained for retry. `session stop` also keeps the session open rather than
+killing that proxy during process cleanup. A saved local proxy that is no longer
+reachable, or settings changed outside Autonom, require explicit operator repair;
+cleanup never blindly overwrites them. A transparently routed emulator must be
+shut down before its proxy can be stopped. Certificates are left unchanged.
+
+These guarantees apply to orderly cleanup. An abruptly killed proxy or host crash
+still requires inspecting the device proxy with `autonom doctor` before using it.
+
 ## Force a backend failure and check the UI
 
 ```text

@@ -83,6 +83,7 @@ class _AdbStub:
                  root_out: str = "restarting adbd as root", ls_rc: int = 0,
                  qemu: str = "1") -> None:
         self.calls: list[list[str]] = []
+        self.settings: dict[str, str] = {}
         self.uid = uid
         self.api = api
         self.root_out = root_out
@@ -106,6 +107,14 @@ class _AdbStub:
                 out = self.api
             elif rest[:1] == ["getprop"] and rest[1:2] == ["ro.kernel.qemu"]:
                 out = self.qemu
+            elif rest[:1] == ["settings"] and len(rest) >= 4:
+                action, key = rest[1], rest[3]
+                if action == "get":
+                    out = self.settings.get(key, "null")
+                elif action == "put":
+                    self.settings[key] = rest[4]
+                elif action == "delete":
+                    self.settings.pop(key, None)
             else:
                 script = rest[0] if rest else ""
                 if "mount -t tmpfs" in script:
@@ -340,7 +349,11 @@ class AttachTransparentTests(TransparentBase):
         stub = self._stub_adb(api="37")
         self._route()
         record = self._app_proxy_attached()
-        device_proxy_android.detach(self.target, record)
+        stub.settings["http_proxy"] = "10.0.2.2:8080"
+        with mock.patch.object(device_proxy_android.time, "sleep"):
+            device_proxy_android.detach(self.target, record)
+        self.assertEqual(stub.settings["http_proxy"], "proxy.corp:3128")
+        self.assertEqual(stub.settings["global_http_proxy_host"], "proxy.corp")
         # detach wrote back exactly the value the app-proxy attach had saved
         self.assertIn("shell settings put global http_proxy proxy.corp:3128", stub.flat())
         detail = device_proxy_android.attach_transparent(

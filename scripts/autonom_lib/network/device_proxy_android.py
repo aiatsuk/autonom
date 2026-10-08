@@ -11,7 +11,9 @@ Blindly clearing would silently destroy a developer's corporate proxy setting.
 """
 from __future__ import annotations
 
+import shlex
 import shutil
+import socket
 import subprocess
 import time
 from pathlib import Path
@@ -25,6 +27,9 @@ from . import proxy as proxy_mod
 EMULATOR_HOST = "10.0.2.2"
 SETTING = "http_proxy"
 UNSET = ":0"
+# Android also persists a canonical proxy separate from the legacy http_proxy row.
+PROXY_SETTINGS = ("global_http_proxy_host", "global_http_proxy_port",
+                  "global_http_proxy_exclusion_list", "global_proxy_pac_url")
 
 # Android's user CA store keys certificates by the OpenSSL "old" subject hash.
 USER_CA_STORE = "/data/misc/user/0/cacerts-added"
@@ -441,7 +446,7 @@ def _get_setting(target: Target) -> str | None:
 
 def _put_setting(target: Target, value: str) -> None:
     adb_mod.run_adb(
-        target.tool, ["shell", "settings", "put", "global", SETTING, value],
+        target.tool, ["shell", "settings", "put", "global", SETTING, shlex.quote(value)],
         serial=target.target_id, timeout=15, check=True,
     )
 
@@ -462,16 +467,22 @@ def apply_proxy_setting(target: Target) -> dict[str, Any]:
     who has already arranged the re-read another way.
     """
     result: dict[str, Any] = {"method": "wifi_cycle", "applied": False}
-    for action in ("disable", "enable"):
+    try:
         completed = adb_mod.run_adb(
-            target.tool, ["shell", "svc", "wifi", action],
-            serial=target.target_id, timeout=20, check=False,
-        )
+            target.tool, ["shell", "svc", "wifi", "disable"],
+            serial=target.target_id, timeout=20, check=False)
         if getattr(completed, "returncode", 0) not in (0, None):
-            result["error"] = f"svc wifi {action} failed"
-            return result
-        if action == "disable":
+            result["error"] = "svc wifi disable failed"
+        else:
             time.sleep(2)
+    finally:
+        enabled = adb_mod.run_adb(
+            target.tool, ["shell", "svc", "wifi", "enable"],
+            serial=target.target_id, timeout=20, check=False)
+    if getattr(enabled, "returncode", 0) not in (0, None):
+        result["error"] = "svc wifi enable failed"
+    if result.get("error"):
+        return result
     time.sleep(6)
     result["applied"] = True
     return result
@@ -520,14 +531,24 @@ def attach(
     )
     entry = consent.require(operation, acknowledged=acknowledged)
 
-    previous = _get_setting(target)
+    current = _get_setting(target)
+    network = record.setdefault("network", {})
+    if network.get("attached"):
+        if (network.get("capture_mode") == "transparent"
+                or current != network.get("device_proxy")):
+            raise errors.AutonomError(
+                errors.BACKEND_FAILED, "The proxy changed outside this attachment.",
+                "Resolve the existing attachment before attaching again.")
+        previous = network.get("previous_http_proxy")
+        saved_settings = network.get("previous_proxy_settings")
+    else:
+        if current == device_proxy:
+            raise errors.AutonomError(
+                errors.BACKEND_FAILED, "The device already uses this proxy without a restore snapshot.",
+                "Inspect the device proxy and explicitly restore it before attaching.")
+        previous = current
+        saved_settings = {key: _read_proxy_setting(target, key) for key in PROXY_SETTINGS}
     _put_setting(target, device_proxy)
-    applied = apply_proxy_setting(target) if network_cycle else {
-        "method": "none", "applied": False,
-        "hint": "The framework adopts a proxy written this way only after the "
-                "network is re-evaluated; without that, nothing reaches the proxy.",
-    }
-
     network = record.setdefault("network", {})
     network.update({
         "enabled": True,
@@ -536,11 +557,17 @@ def attach(
         "device_proxy": device_proxy,
         "attached": True,
         "previous_http_proxy": previous,
+        "previous_proxy_settings": saved_settings,
         # The device-proxy + user-CA path: honest fallback for non-rootable
         # devices, but Flutter/`dart:io` and pinned traffic are not captured.
         "capture_mode": "app_proxy",
     })
     consent.record(record, entry)
+    applied = apply_proxy_setting(target) if network_cycle else {
+        "method": "none", "applied": False,
+        "hint": "The framework adopts a proxy written this way only after the "
+                "network is re-evaluated; without that, nothing reaches the proxy.",
+    }
     # `attach_state` mirrors the iOS attach: "automated" here means the device
     # setting was written by Autonom itself.
     result = {"attached": True, "attach_state": "automated", "device_proxy": device_proxy,
@@ -577,11 +604,92 @@ def detach(target: Target, record: dict[str, Any]) -> dict[str, Any]:
 
     previous = network.get("previous_http_proxy")
     restore = previous if previous else UNSET
+    current = _get_setting(target)
+    if current not in (network.get("device_proxy"), restore, None if restore == UNSET else restore):
+        raise errors.AutonomError(
+            errors.BACKEND_FAILED, "The device proxy changed outside this attachment.",
+            "Inspect the current proxy; detach will not overwrite another proxy.")
+    if previous and previous == network.get("device_proxy"):
+        raise errors.AutonomError(
+            errors.BACKEND_FAILED, "The saved proxy points back to the proxy being stopped.",
+            "Explicitly repair the device proxy; the original setting is unknown.")
+    if isinstance(previous, str) and previous.startswith(EMULATOR_HOST + ":"):
+        try:
+            port = int(previous.rsplit(":", 1)[1])
+            with socket.create_connection(("127.0.0.1", port), timeout=1):
+                pass
+        except (OSError, ValueError, OverflowError) as exc:
+            raise errors.AutonomError(
+                errors.BACKEND_FAILED, "The saved local proxy is not reachable.",
+                "Restore that proxy or explicitly repair the device settings before stopping.") from exc
+    saved = network.get("previous_proxy_settings")
+    expected = _canonical_proxy(network.get("device_proxy"))
+    restored = saved if isinstance(saved, dict) else _canonical_proxy(restore)
+    for key in PROXY_SETTINGS:
+        current_value = _read_proxy_setting(target, key)
+        if current_value not in (None, expected[key], restored.get(key)):
+            raise errors.AutonomError(
+                errors.BACKEND_FAILED, "The canonical device proxy changed outside this attachment.",
+                "Inspect the current proxy; detach will not overwrite another proxy.")
+    if restored.get("global_http_proxy_host") == EMULATOR_HOST:
+        canonical = f"{EMULATOR_HOST}:{restored.get('global_http_proxy_port')}"
+        if canonical == network.get("device_proxy"):
+            raise errors.AutonomError(
+                errors.BACKEND_FAILED, "The saved canonical proxy points back to this capture.",
+                "Explicitly repair the device proxy; the original setting is unknown.")
+        if canonical != previous:
+            try:
+                with socket.create_connection(("127.0.0.1", int(restored["global_http_proxy_port"])),
+                                              timeout=1):
+                    pass
+            except (OSError, TypeError, ValueError, OverflowError) as exc:
+                raise errors.AutonomError(
+                    errors.BACKEND_FAILED, "The saved canonical local proxy is not reachable.",
+                    "Restore that proxy or explicitly repair the device settings before stopping.") from exc
     _put_setting(target, restore)
-
+    # Legacy sessions saved only host:port; restored then contains its
+    # canonical route, after refusing any unrelated PAC/exclusion edit.
+    for key in PROXY_SETTINGS:
+        value = restored.get(key)
+        argv = (["shell", "settings", "delete", "global", key] if value is None else
+                ["shell", "settings", "put", "global", key, shlex.quote(str(value))])
+        adb_mod.run_adb(target.tool, argv, serial=target.target_id, timeout=15, check=True)
+    applied = apply_proxy_setting(target)
+    if (not applied.get("applied") or _get_setting(target) != restore
+            or any(_read_proxy_setting(target, key) != restored.get(key)
+                   for key in PROXY_SETTINGS)):
+        raise errors.AutonomError(
+            errors.BACKEND_FAILED, "The restored proxy could not be verified.",
+            "Retry detach; the restore snapshot and proxy have been kept.")
     network.update({"attached": False, "device_proxy": None, "previous_http_proxy": None,
-                    "capture_mode": None})
-    return {"was_attached": True, "restored_http_proxy": previous, "wrote": restore}
+                    "previous_proxy_settings": None, "capture_mode": None})
+    return {"was_attached": True, "restored_http_proxy": previous, "wrote": restore,
+            "setting_applied": applied}
+
+
+def _canonical_proxy(value: str | None) -> dict[str, str | None]:
+    settings = dict.fromkeys(PROXY_SETTINGS)
+    if value and value != UNSET:
+        try:
+            host, port = value.rsplit(":", 1)
+            if not host or not 0 < int(port) < 65536:
+                raise ValueError(value)
+        except ValueError as exc:
+            raise errors.AutonomError(
+                errors.BACKEND_FAILED, "The saved proxy address is invalid.",
+                "Inspect and explicitly repair the device proxy before stopping capture.") from exc
+        settings["global_http_proxy_host"] = host.removeprefix("[").removesuffix("]")
+        settings["global_http_proxy_port"] = port
+    return settings
+
+
+def _read_proxy_setting(target: Target, key: str) -> str | None:
+    completed = adb_mod.run_adb(
+        target.tool, ["shell", "settings", "get", "global", key],
+        serial=target.target_id, timeout=15, check=True)
+    value = (completed.stdout or "").strip()
+    return None if (not value or value == "null"
+                    or key == "global_http_proxy_port" and value == "0") else value
 
 
 def observed_setting(target: Target) -> str | None:

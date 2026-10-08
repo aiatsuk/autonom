@@ -540,7 +540,7 @@ class Tools:
 
     def network_stop(self, payload: dict[str, Any], record: dict[str, Any] | None):
         record = self.require_session(record)
-        result = cli.network_stop_payload(record)
+        result = cli.network_stop_payload(record, lambda: self.target)
         result.pop("ok", None)
         return result, [], {}
 
