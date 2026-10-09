@@ -187,7 +187,10 @@ function canvasArgs(world, args) {
   ];
 }
 
-/** Start the Canvas; resolves once it prints its URL, or with its exit when `expectExit`. */
+/** The final line the Canvas prints on start-up, after `Preview at`. */
+const STARTED_LINE = /^Open this exact URL in the visible \S+ side-panel browser: \S+\n/m;
+
+/** Start the Canvas; resolves once it prints its last start-up line, or with its exit when `expectExit`. */
 function startCanvas(world, args, { expectExit = false } = {}) {
   const child = spawn(process.execPath, canvasArgs(world, args),
     { cwd: ROOT, env: world.env, stdio: ["ignore", "pipe", "pipe"] });
@@ -204,7 +207,8 @@ function startCanvas(world, args, { expectExit = false } = {}) {
     const timer = setTimeout(() => reject(new Error(`Canvas did not start: ${stdout}${stderr}`)), 15_000);
     child.stdout.on("data", () => {
       const match = stdout.match(/Preview at (http:\/\/127\.0\.0\.1:(\d+)\/)/);
-      if (!match) return;
+      // The side-panel line is the last start-up line; wait for it whole, so callers can assert on all of them.
+      if (!match || !STARTED_LINE.test(stdout)) return;
       clearTimeout(timer);
       resolvePromise({ child, origin: match[1].slice(0, -1), port: Number(match[2]), exited,
         stdout: () => stdout, stderr: () => stderr });
