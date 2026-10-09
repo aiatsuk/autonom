@@ -607,9 +607,22 @@ class CanvasJournalTests(MultiSessionCase):
         self.assertEqual(self.current_id(), self.primary["session_id"])
 
 
+# The fake is spawned with the real proxy argv, which names the addon
+# (`processes.ADDON_MARKER`). `processes.discover_proxies` scans every process
+# on the machine for that marker plus "mitmdump", so a fake left visible is
+# an orphan proxy to any test that scans in parallel (test_processes). The
+# fake is therefore not named mitmdump, and a fake that stays up re-execs
+# into a plain sleeper: same pid and process group, the listening socket
+# kept, a command line without either mark.
 FAKE_MITMDUMP = textwrap.dedent("""\
     #!{python}
     import os, socket, sys, time
+
+    def linger(server=None):
+        if server is not None:
+            server.set_inheritable(True)
+        os.execv(sys.executable, [sys.executable, "-c", "import time; time.sleep(60)"])
+
     counter = os.environ["FAKE_MITM_COUNTER"]
     with open(counter, "a", encoding="utf-8") as handle:
         handle.write("x")
@@ -626,16 +639,16 @@ FAKE_MITMDUMP = textwrap.dedent("""\
     except OSError as exc:
         sys.stderr.write("Error starting proxy server: " + str(exc) + "\\n")
         if os.environ.get("FAKE_MITM_STAY"):
-            time.sleep(60)  # a mitmdump that keeps running without its port
+            linger()  # a mitmdump that keeps running without its port
         sys.exit(1)
-    time.sleep(60)
+    linger(server)
 """)
 
 
 class ProxyRetryTests(MultiSessionCase):
     def setUp(self) -> None:
         super().setUp()
-        self.fake = self.root / "mitmdump"
+        self.fake = self.root / "fake-proxy"  # never "mitmdump": see FAKE_MITMDUMP
         self.fake.write_text(FAKE_MITMDUMP.format(python=sys.executable), encoding="utf-8")
         self.fake.chmod(0o755)
         self.counter = self.root / "mitm-calls"
@@ -661,6 +674,11 @@ class ProxyRetryTests(MultiSessionCase):
             child.kill()
         child.wait(timeout=10)
 
+    def assert_invisible_to_discovery(self) -> None:
+        """No fake this test spawned looks like a proxy to the machine-wide scan."""
+        mine = {child.pid for child in self.spawned}
+        self.assertEqual([row for row in processes.discover_proxies() if row["pid"] in mine], [])
+
     def calls(self) -> int:
         return len(self.counter.read_text(encoding="utf-8")) if self.counter.exists() else 0
 
@@ -675,6 +693,7 @@ class ProxyRetryTests(MultiSessionCase):
         [row] = [e for e in processes.entries() if e["kind"] == "proxy"]
         self.assertEqual(row["pid"], self.spawned[-1].pid)
         self.assertEqual(row["session_id"], self.record["session_id"])
+        self.assert_invisible_to_discovery()
 
     def test_three_failures_are_backend_failed(self) -> None:
         self.set_env(FAKE_MITM_COUNTER=str(self.counter), FAKE_MITM_FAILS="9")
@@ -726,6 +745,7 @@ class ProxyRetryTests(MultiSessionCase):
         self.assertEqual((stored["pid"], stored["port"]), (state["pid"], state["port"]))
         [row] = [e for e in processes.entries() if e["kind"] == "proxy"]
         self.assertEqual((row["pid"], row["port"]), (state["pid"], state["port"]))
+        self.assert_invisible_to_discovery()
 
     def test_a_picked_port_another_process_listens_on_is_retried(self) -> None:
         self.set_env(FAKE_MITM_COUNTER=str(self.counter), FAKE_MITM_FAILS="0")
