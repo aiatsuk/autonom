@@ -25,6 +25,8 @@ from .. import errors, processes as processes_mod, session as session_mod
 from . import mocks as mocks_mod
 
 LISTEN_HOST = "127.0.0.1"
+# Spawns tried for a picked (not explicit) port before `backend_failed`.
+PROXY_START_ATTEMPTS = 3
 ADDON = Path(__file__).resolve().parent / "mitm_addon.py"
 
 # Files mitmproxy writes into its confdir that contain ONLY the certificate.
@@ -255,36 +257,41 @@ def start(
     directory = network_dir(record)
     confdir = ca_store()
 
-    chosen = _pick_port(port)
     # Enforcement reads the live registry, so a rule added mid-run takes effect
     # without a restart; the snapshot beside it records what was in force when
     # this run started.
     mocks_file = mocks_mod.registry_file()
     mocks_mod.snapshot(directory / "mocks-snapshot.json")
-    argv = build_argv(binary, port=chosen, directory=directory,
-                      confdir=confdir, capture_bodies=capture_bodies,
-                      mocks_file=mocks_file, ignore_hosts=ignore_hosts,
-                      intercept_connectivity_checks=intercept_connectivity_checks)
     log = directory / "mitmdump.log"
-    # The child gets its own copy of the descriptor; this process's copy was
-    # never closed, leaking one open file per `network start`.
-    with open(log, "ab") as handle:
-        process = subprocess.Popen(  # noqa: S603 - argv is constructed, never shell
-            argv, stdout=handle, stderr=handle, start_new_session=True
-        )
-
-    deadline = time.time() + 15
-    while time.time() < deadline:
-        if not _port_free(chosen):
+    # A free port is picked by binding and releasing it, so another proxy
+    # starting at the same moment (two Canvas devices) can take it before
+    # mitmdump does: mitmdump then exits before binding, and a picked port is
+    # tried again (up to PROXY_START_ATTEMPTS). An explicit port is tried once.
+    attempts = 1 if port else PROXY_START_ATTEMPTS
+    process = None
+    chosen = 0
+    detail = ""
+    for _attempt in range(attempts):
+        chosen = _pick_port(port)
+        argv = build_argv(binary, port=chosen, directory=directory,
+                          confdir=confdir, capture_bodies=capture_bodies,
+                          mocks_file=mocks_file, ignore_hosts=ignore_hosts,
+                          intercept_connectivity_checks=intercept_connectivity_checks)
+        process, detail = _spawn_and_wait(argv, chosen, log)
+        if process is not None:
             break
-        if process.poll() is not None:
-            detail = log.read_text(encoding="utf-8", errors="replace")[-600:]
+    if process is None:
+        if port and not _port_free(chosen):
             raise errors.AutonomError(
-                errors.BACKEND_FAILED,
-                f"mitmdump exited immediately: {detail.strip()}",
-                "Check the mitmproxy install with 'autonom doctor'.",
+                errors.PORT_UNAVAILABLE,
+                f"port {chosen} is already in use on {LISTEN_HOST}",
+                "Pick another --port, or stop whatever is listening there.",
             )
-        time.sleep(0.2)
+        raise errors.AutonomError(
+            errors.BACKEND_FAILED,
+            f"mitmdump exited immediately: {detail.strip()}",
+            "Check the mitmproxy install with 'autonom doctor'.",
+        )
 
     payload = {
         "pid": process.pid,
@@ -307,6 +314,156 @@ def start(
                            port=chosen, session_id=record.get("session_id"),
                            signature=processes_mod.ADDON_MARKER)
     return {"running": True, **payload}
+
+
+def _spawn_and_wait(argv: list[str], port: int,
+                    log: Path) -> tuple[subprocess.Popen | None, str]:
+    """Start mitmdump and wait (up to 15 s) until it listens on `port`.
+
+    "The port is no longer free" is not proof: another process (a second
+    proxy started at the same moment) may have taken the picked port, and our
+    mitmdump is then about to exit with "address in use". So the listener
+    must belong to the spawned process group (`_listener_owned_by`; mitmdump
+    runs in its own session, so its pid is the group id). Where no tool can
+    say who listens, the child must still be running `OWNER_SETTLE_SECONDS`
+    after the port was taken.
+
+    Returns the process, or None and a reason when it exited first or the
+    port is held by someone else (the child is then stopped and reaped;
+    nothing is left behind)."""
+    # The child gets its own copy of the descriptor; this process's copy was
+    # never closed, leaking one open file per `network start`.
+    with open(log, "ab") as handle:
+        process = subprocess.Popen(  # noqa: S603 - argv is constructed, never shell
+            argv, stdout=handle, stderr=handle, start_new_session=True
+        )
+
+    def tail() -> str:
+        return log.read_text(encoding="utf-8", errors="replace")[-600:]
+
+    deadline = time.time() + 15
+    foreign_seen = 0
+    unknown_since: float | None = None
+    while time.time() < deadline:
+        exited = process.poll() is not None
+        if not _port_free(port):
+            owner = _listener_owned_by(port, process.pid)
+            if owner:
+                return process, ""
+            if owner is None:
+                if exited:
+                    return None, tail()
+                unknown_since = unknown_since or time.time()
+                if time.time() - unknown_since >= OWNER_SETTLE_SECONDS:
+                    return process, ""
+            else:
+                # Seen twice, so a listener caught between bind and listen
+                # is not mistaken for a stranger.
+                foreign_seen += 1
+                if exited or foreign_seen >= 2:
+                    _discard(process)
+                    return None, (f"port {port} was taken by another process "
+                                  f"before mitmdump could listen on it. {tail()}")
+        else:
+            foreign_seen = 0
+            if exited:
+                return None, tail()
+        time.sleep(0.2)
+    if foreign_seen:
+        _discard(process)
+        return None, f"port {port} was taken by another process"
+    return process, ""
+
+
+# How long a spawned mitmdump must stay up after its port was taken, when
+# neither lsof nor /proc can say which process listens there.
+OWNER_SETTLE_SECONDS = 1.5
+_LSOF_CANDIDATES = ("/usr/sbin/lsof", "/usr/bin/lsof")
+
+
+def _in_group(pid: int, pgid: int) -> bool:
+    if pid == pgid:
+        return True
+    try:
+        return os.getpgid(pid) == pgid
+    except OSError:
+        return False
+
+
+def _listener_owned_by(port: int, pgid: int) -> bool | None:
+    """Whether the TCP listener on `port` belongs to process group `pgid`.
+
+    True or False when lsof (or Linux's /proc) could tell, None when nothing
+    could. A listener lsof cannot see (another user's) counts as foreign."""
+    lsof = shutil.which("lsof") or next(
+        (path for path in _LSOF_CANDIDATES if os.access(path, os.X_OK)), None)
+    if lsof:
+        try:
+            completed = subprocess.run(
+                [lsof, "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                timeout=10, check=False)
+        except (OSError, subprocess.SubprocessError, ValueError):
+            completed = None
+        if completed is not None:
+            pids = [int(item) for item in (completed.stdout or "").split() if item.isdigit()]
+            if pids:
+                return any(_in_group(pid, pgid) for pid in pids)
+            # Exit 1 with nothing on stderr: no listener lsof may see.
+            if completed.returncode == 1 and not (completed.stderr or "").strip():
+                return False
+    return _proc_listener_owned_by(port, pgid)
+
+
+def _proc_listener_owned_by(port: int, pgid: int) -> bool | None:
+    """The /proc answer (Linux without lsof): the listening sockets on `port`
+    from /proc/net/tcp*, matched against the open files of the group."""
+    inodes: set[str] = set()
+    readable = False
+    for table in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            lines = Path(table).read_text(encoding="ascii", errors="replace").splitlines()[1:]
+        except OSError:
+            continue
+        readable = True
+        for line in lines:
+            fields = line.split()
+            if len(fields) < 10 or fields[3] != "0A":  # 0A: LISTEN
+                continue
+            try:
+                if int(fields[1].rsplit(":", 1)[1], 16) == port:
+                    inodes.add(fields[9])
+            except (IndexError, ValueError):
+                continue
+    if not readable:
+        return None
+    if not inodes:
+        return False
+    wanted = {f"socket:[{inode}]" for inode in inodes}
+    members = set(processes_mod.group_members(pgid)) | {pgid}
+    for pid in members:
+        try:
+            names = os.listdir(f"/proc/{pid}/fd")
+        except OSError:
+            continue
+        for name in names:
+            try:
+                if os.readlink(f"/proc/{pid}/fd/{name}") in wanted:
+                    return True
+            except OSError:
+                continue
+    return False
+
+
+def _discard(process: subprocess.Popen) -> None:
+    """Stop a spawned mitmdump that lost its port, and reap it."""
+    if process.poll() is None:
+        processes_mod.terminate_group(process.pid, timeout=5.0)
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=5)
 
 
 def stop(record: dict[str, Any]) -> dict[str, Any]:

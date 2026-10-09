@@ -1221,7 +1221,7 @@ class InputValidationTests(CliCase):
         self.assertFalse(any("screenrecord" in " ".join(argv) for argv in self.calls("adb")))
 
     def test_canvas_values_are_validated_in_python(self) -> None:
-        for argv in (("--port", "0"), ("--port", "70000"), ("--fps", "0"), ("--fps", "500")):
+        for argv in (("--port", "70000"), ("--fps", "0"), ("--fps", "500")):
             with self.subTest(argv=argv):
                 code, payload = self.android("canvas", "serve", *argv)
                 self.assertEqual((code, payload["error_code"]), (2, "invalid_value"))

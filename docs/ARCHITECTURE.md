@@ -251,6 +251,11 @@ serialization tests.
 | `scrcpy-session.mjs` | one scrcpy-server on the device (push, `adb forward`, start, sockets, restart, stop) and server discovery |
 | `ws.mjs` | the server side of RFC 6455 |
 | `scripts/autonom_canvas_bridge.py` | the persistent Python bridge: HTTP input through `ui.*`, and the `record` operation, which only journals |
+| `canvas-devices.mjs` | device ids, `/d/<id>/` paths, the registry of attached devices and their states, focus profiles |
+| `canvas-workspace.mjs` | tabs (1-4 tiles each), placement, the saved workspace file and its lock |
+| `canvas-sessions.mjs` | the automatic Autonom session per attached device (start `--alongside`, reuse, release) |
+| `canvas-workspace-page.mjs` | the workspace page: tab bar, tiles (each an embedded device page), picker |
+| `canvas-actions-page.mjs`, `canvas-activity.mjs` | the Actions drawer of a device page; the command log and `/api/activity`, `/api/health` |
 
 ```text
 browser page
@@ -396,6 +401,34 @@ a flood) is dropped and counted in `scrcpy.journal_dropped`. Bounded memory
 is the promise, not throughput: a client that already holds the token or the
 cookie can still make input slow, delay journaling, or get itself closed.
 That risk is accepted, because such a client can drive the device anyway.
+
+### Canvas workspace
+
+`autonom canvas` (or `canvas serve` with no target or device flag) starts a
+**workspace Canvas**: one Node server with no device, registered with no
+session owner, open until Ctrl+C or `autonom canvas stop`. Its main()
+starts `startCanvas(options, hooks)` with the workspace page, the Actions
+drawer as a page extension of every device page, the activity and health API
+routes and one command log; the server itself works without them (tests use
+its built-in page).
+
+```text
+workspace page /c/<tab>  ──▶ /api/workspace, /api/devices, /api/targets, /api/boot (polling, POST)
+  └─ tile iframe ─▶ /d/<device id>/?embed=1  ──▶ that device's context: transport, bridge, tools, session
+autonom canvas stop|attach|detach|list ──▶ <state>/canvas/<port>.json ──▶ /api/* with the Bearer token
+```
+
+Each attached device gets its own context (the single-device Canvas's state,
+bridge and tools process), its own `/d/<id>/` routes and its own Autonom
+session: the server runs `session start --alongside --started-by
+canvas:<port>:<pid>` for it, or reuses the live session already on that
+target, and never writes `current.json`. Commands with `--serial X` bind to
+the session on X, so an agent's commands journal next to the Canvas's. A
+device lives in one tab; tabs persist in `<state>/canvas/workspaces/<name>.json`
+and one lock file keeps a workspace to one Canvas. Only the focused tile
+streams at full rate; a crash inside one device's scope restores that device
+alone. With `--serial`, `--udid`, `--target` or one `--device` the Canvas is
+the single-device Canvas of before, byte for byte.
 
 ### Canvas security
 

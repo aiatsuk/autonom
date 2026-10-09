@@ -8,6 +8,31 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
 ## [Unreleased]
 
 ### Added
+- **Canvas workspace with several devices.** `autonom canvas` (or
+  `canvas serve` with no target) starts a workspace Canvas with no device and
+  no session that keeps running until Ctrl+C or `autonom canvas stop`. The
+  page has in-page tabs (at most 8), each a split of 1-4 tiles with its own
+  `/c/<tab id>` URL; a device lives in one tab, and other tabs offer "Move
+  here". Attaching a device starts its own Autonom session (`session start
+  --alongside`, never touching `current.json`) or reuses the live one on that
+  target; detaching ends only sessions the Canvas started. The focused tile
+  streams at full rate and the others at a background profile (device
+  summaries and `/status` report the planned profile and, as
+  `profile_applied`, the one the stream runs after a restart that worked); one device's
+  crash restores that device only. Tabs and the devices attached at stop are
+  saved per workspace (`--workspace NAME`, `--ephemeral`). New `canvas serve`
+  flags: `--device PLATFORM:ID`, `--split`, `--workspace`, `--ephemeral`,
+  `--bootable avd:NAME[@PORT]|simulator:UDID`, `--shutdown-booted`,
+  `--install-root DIR`, `--captures-dir DIR`; `--port 0` picks a free port.
+  New verbs `canvas stop`, `canvas attach`, `canvas detach` and `canvas
+  list`, and the codes `canvas_not_found`, `canvas_ambiguous` and
+  `workspace_in_use`. A second `autonom canvas` for a running workspace
+  prints its URL instead of starting another.
+- **Canvas Actions drawer.** Per device: screenshot, recording (up to
+  180 s), install from `--install-root` folders only, launch, open link, app
+  language, a captures gallery in `~/Downloads/Autonom/<device>/` (200 files
+  or 2 GB per device, oldest deleted with a notice), the command log and
+  tool health.
 - **Mobile Canvas Tools drawer.** A Tools button in the Canvas toolbar opens
   a drawer with five tabs for the Canvas's own target. It takes the
   inspector's column on a desktop-width page (the two are never open
@@ -46,6 +71,13 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
   temporary `AUTONOM_HOME`, checks each panel's device effect, restores what
   it changed, and with `--ui` checks the drawer in headless Chromium at
   1440x900 and 390x844, light and dark.
+
+### Changed
+- `autonom canvas serve` with no target or device flag now starts a workspace
+  Canvas instead of picking the session's target or the only ready device.
+  Pass `--serial`, `--udid`, `--target` or one `--device` for the
+  single-device Canvas, which is unchanged (same node command line, page,
+  routes and process owner).
 
 ## [0.34.0] - 2026-10-06
 

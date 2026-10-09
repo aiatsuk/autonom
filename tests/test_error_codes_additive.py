@@ -29,6 +29,23 @@ NEW_CODES = {
     "STALE_REF": "stale_ref",
 }
 
+# Canvas actions (run canvas-multi-device, contract 5.3).
+NEW_CODES.update({
+    "RECORDING_NOT_ACTIVE": "recording_not_active",
+    "CAPTURE_NOT_FOUND": "capture_not_found",
+    "CAPTURE_TOO_LARGE": "capture_too_large",
+    "INSTALL_NOT_CONFIGURED": "install_not_configured",
+    "INSTALL_PATH_NOT_ALLOWED": "install_path_not_allowed",
+    "INSTALL_FAILED": "install_failed",
+})
+
+# Canvas workspace CLI (run canvas-multi-device, contract 6.1).
+NEW_CODES.update({
+    "CANVAS_NOT_FOUND": "canvas_not_found",
+    "CANVAS_AMBIGUOUS": "canvas_ambiguous",
+    "WORKSPACE_IN_USE": "workspace_in_use",
+})
+
 EXISTING_CODES = {
     "FLOW_NOT_FOUND": "flow_not_found",
     "FLOW_FILE_NOT_FOUND": "flow_file_not_found",

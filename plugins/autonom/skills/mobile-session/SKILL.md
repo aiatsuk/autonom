@@ -181,6 +181,7 @@ export AUTONOM_IDB_COMPANION=mac-farm-01:10882
 | --- | --- |
 | `ambiguous_target` | more than one ready target; pass `--target` |
 | `session_already_active` | a session is current; `session stop` it before starting another |
+| `canvas_not_found` / `canvas_ambiguous` | `canvas stop/attach/detach` found no live Canvas, or several; pass `--port` or `--workspace` (`autonom canvas list`) |
 | `idb_required` | iOS `ui` verbs need idb; `screenshot`/`logs`/`open` still work |
 | `ios_boot_failed` | simulator never reached `Booted`; try `xcrun simctl erase <udid>` |
 | `no_active_session` | start one with `session start` |
@@ -196,7 +197,14 @@ Keep device actions inside the Autonom CLI, including screenshots and recovery.
 without changing the current session. A stopped session stays readable (`journal`,
 `shots`, `logs`, `report` but not `report serve`, `session show|outputs`) and refuses
 everything else with `session_stopped`; another target's flags are refused with `session_target_mismatch`.
-One session per machine store still applies: `session start` refuses a second one.
+`session start` without `--alongside` still refuses a second one while the current
+session is live. A Canvas workspace (`autonom canvas`) starts one session per device
+it attaches with `session start --alongside --started-by canvas:<port>:<pid>`, or
+reuses the live session already on that target; those sessions never become current,
+and a command with `--serial X` / `--udid U` binds to the live session on that target,
+so its journal lands next to the Canvas's. `session stop --serial X` stops the session
+on X; detaching the device in the Canvas stops only sessions the Canvas started, and
+`session stop` never stops a workspace Canvas (it has no session owner).
 A stopped session's journal never grows: a command that names it is journaled in the
 current session, if there is one.
 

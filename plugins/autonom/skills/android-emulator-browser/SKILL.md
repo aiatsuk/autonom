@@ -36,11 +36,59 @@ successful.
 
 Stop the Canvas with Ctrl+C in its terminal. For a background run, send
 SIGTERM to the `autonom canvas serve` process; a job started in the
-background from a script ignores SIGINT. There is no separate stop command.
+background from a script ignores SIGINT, or run `autonom canvas stop` (it finds
+the Canvas from its discovery file and asks it to stop).
 Stopping ends the scrcpy device server, removes its `adb forward`, and puts
 back the display size and density if the Canvas changed them (see Display
 size); on iOS it sends Stop on the video stream and ends the Canvas's
 idb_companion.
+
+## Workspace: several devices, tabs, automatic sessions
+
+```bash
+autonom canvas                                   # a workspace with no device, port 3277
+autonom canvas serve --port 0 --workspace qa     # another workspace on a free port
+autonom canvas serve --device android:emulator-5580 --device ios:<udid>
+autonom canvas serve --bootable avd:Pixel_9@5586 --shutdown-booted --install-root ~/src/app/build
+autonom canvas list
+autonom canvas attach --serial <adb-serial> [--tab <tab id or name>]
+autonom canvas detach --serial <adb-serial>      # or --device-id android~<serial>
+autonom canvas stop [--port N | --workspace NAME | --all]
+```
+
+Without `--serial`, `--udid`, `--target` or exactly one `--device`, `canvas serve`
+starts a **workspace Canvas**: it holds no device at first, keeps running when the
+last device or tab goes away, and stops only with Ctrl+C or `autonom canvas stop`.
+A second `autonom canvas` for the same workspace prints the running one's URL
+(`already_running: true`). The page has in-page tabs (at most 8), each a split of
+1-4 tiles with its own URL `/c/<tab id>`, so a tab can also be opened in its own
+browser window. An empty tile is a picker: running targets with Attach, devices
+already in another tab with "Move here" (a device lives in one tab), and the
+`--bootable` entries with Boot. At most 8 devices per Canvas.
+
+- **Sessions are automatic.** Attaching starts an Autonom session for that device
+  (`session start --alongside`, never written to `current.json`) or reuses the live
+  session on that target; detaching ends only the sessions the Canvas started. An
+  agent's `--serial X` commands bind to the session on X, so both journal together.
+  A tile shows "No Autonom session: …" with Reconnect when the start failed.
+- **Focus.** One tile is focused (click it, or Ctrl+Alt+1..4; Ctrl+Alt+Left/Right
+  switch tabs). It streams at full rate; the others drop to at most 30 fps and
+  1024 px (Android) or half scale (iOS), and tiles of tabs no window shows stop
+  streaming.
+- **Isolation.** A crash or a dead action bridge in one device restores that device
+  only; an offline target turns its tile amber and comes back by itself.
+- **Persistence.** Tabs and the devices attached at stop are saved per workspace;
+  a restart restores the tabs and attaches the devices that are running.
+  `--ephemeral` neither reads nor saves the file.
+- **Actions drawer** (per tile, next to Tools): screenshot, recording (up to 180 s),
+  install a build from an `--install-root` folder (no upload; without a root it
+  explains the flag), launch, open link, app language, a gallery of the captures in
+  `~/Downloads/Autonom/<device>/` (`--captures-dir`, `AUTONOM_CAPTURES_DIR`; at 200
+  files or 2 GB the oldest are deleted and the gallery says so), the command log
+  (Activity) and tool health.
+- `canvas attach`/`detach` answer with the API's own `error_code` and `hint`
+  (`tab_full`, `device_in_other_tab`, `target_not_found`, `device_limit`, …);
+  `canvas_not_found` and `canvas_ambiguous` mean no Canvas or several matched.
 
 ## Transport modes
 
