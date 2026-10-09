@@ -1340,9 +1340,14 @@ export class IdbVideoStream {
    * the call in time, may leave the old encoder running. No new Start goes out on that
    * companion then: the stream ends at once as abnormal (restart() rejects), so its
    * owner replaces the companion before it opens the next stream, never two encoders.
+   *
+   * With `options`, the new Start uses them (normalized like the constructor's) instead of
+   * the ones given before: how a Canvas changes the frame rate or scale of a running stream.
    */
-  async restart({ timeoutMs = STREAM_STOP_TIMEOUT_MS } = {}) {
+  async restart({ timeoutMs = STREAM_STOP_TIMEOUT_MS, options } = {}) {
     if (this.#done || this.#stopping || this.#restarting) throw new Error("Video stream is closed or restarting.");
+    // Validated before anything stops: bad options leave the running stream alone.
+    const nextOptions = options === undefined ? null : normalizeVideoOptions(options);
     // Events of the old call are stale from here on.
     this.#generation += 1;
     this.#restarting = (async () => {
@@ -1352,6 +1357,7 @@ export class IdbVideoStream {
           "its encoder may still run, so the companion must be restarted.");
       }
       this.#paused = false;
+      if (nextOptions) this.#options = nextOptions;
       this.#openCall();
     })();
     try {

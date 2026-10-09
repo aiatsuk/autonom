@@ -293,6 +293,10 @@ def cmd_devices(args: argparse.Namespace) -> int:
 
 def cmd_devices_boot(args: argparse.Namespace) -> int:
     avd = getattr(args, "avd", None)
+    if getattr(args, "port", None) is not None and not avd:
+        raise errors.AutonomError(
+            errors.INVALID_VALUE, "--port picks the console port of a new emulator; it needs --avd",
+            "Pass --avd <name> --port <even port 5554-5682>.")
     explicit = any(getattr(args, flag, None) for flag in ("target", "serial", "udid"))
     if avd and explicit:
         raise errors.AutonomError(
@@ -309,6 +313,7 @@ def cmd_devices_boot(args: argparse.Namespace) -> int:
             emulator_bin, adb_path, avd,
             wait=not args.no_wait, timeout=args.timeout,
             http_proxy=getattr(args, "http_proxy", None),
+            port=getattr(args, "port", None),
         )
         return emit({"ok": True, "platform": ANDROID, **detail}, as_json=True)
     if not explicit:
@@ -372,25 +377,72 @@ def _session_target_gone(args: argparse.Namespace) -> bool:
         return False
 
 
-def cmd_session_start(args: argparse.Namespace) -> int:
-    # One session per machine store: starting a second one silently replaced
-    # the current pointer and orphaned the first one's proxy and log stream.
-    current = session_mod.load_current()
-    if current:
-        target_id = current.get("target_id") or current.get("serial")
-        gone = _session_target_gone(args)
-        extra: dict[str, Any] = {"stale_target": True} if gone else {}
+_STARTED_BY = re.compile(r"^canvas:([0-9]{1,5}):([0-9]{1,10})$")
+
+
+def _started_by(args: argparse.Namespace) -> dict[str, Any] | None:
+    """`--started-by canvas:<port>:<pid>` as the record's `started_by`."""
+    raw = getattr(args, "started_by", None)
+    if raw is None:
+        return None
+    if not getattr(args, "alongside", False):
         raise errors.AutonomError(
-            errors.SESSION_ALREADY_ACTIVE,
-            f"session {current.get('session_id')} is still active on "
-            f"{target_id}" + (" (no longer present)" if gone else ""),
-            f"Stop it first with 'autonom session stop' (it clears the session on "
-            f"{target_id} even if that target is gone), then start the new one.",
-            session_id=current.get("session_id"),
-            target_id=target_id,
-            **extra,
-        )
+            errors.USAGE_ERROR, "--started-by is only accepted with --alongside",
+            "A Canvas starts its sessions with 'session start --alongside "
+            "--started-by canvas:<port>:<pid>'.")
+    match = _STARTED_BY.fullmatch(raw)
+    if not match or not 0 <= int(match.group(1)) <= 65535 or int(match.group(2)) < 1:
+        raise errors.AutonomError(
+            errors.USAGE_ERROR, f"--started-by must look like canvas:<port>:<pid>, not {raw!r}",
+            "For example --started-by canvas:3277:12345 (port 0-65535, pid above 0).")
+    return {"kind": "canvas", "port": int(match.group(1)), "pid": int(match.group(2))}
+
+
+def _explicit_target_flags(args: argparse.Namespace) -> bool:
+    return any(getattr(args, flag, None) for flag in ("target", "serial", "udid"))
+
+
+def _already_active(record: dict[str, Any], *, gone: bool = False,
+                    with_started_by: bool = False) -> errors.AutonomError:
+    target_id = record.get("target_id") or record.get("serial")
+    extra: dict[str, Any] = {"stale_target": True} if gone else {}
+    if with_started_by:
+        extra["started_by"] = record.get("started_by")
+    return errors.AutonomError(
+        errors.SESSION_ALREADY_ACTIVE,
+        f"session {record.get('session_id')} is still active on "
+        f"{target_id}" + (" (no longer present)" if gone else ""),
+        f"Stop it first with 'autonom session stop' (it clears the session on "
+        f"{target_id} even if that target is gone), then start the new one.",
+        session_id=record.get("session_id"),
+        target_id=target_id,
+        **extra,
+    )
+
+
+def cmd_session_start(args: argparse.Namespace) -> int:
+    started_by = _started_by(args)
+    alongside_flag = bool(getattr(args, "alongside", False))
+    explicit = _explicit_target_flags(args)
+    # One session per target. `current.json` keeps naming the machine's
+    # primary session; a start on another target named explicitly (or with
+    # --alongside) runs beside it and never replaces that pointer.
+    current = session_mod.load_current()
+    if current and not alongside_flag:
+        if not explicit:
+            # Starting a second one used to silently replace the current
+            # pointer and orphan the first one's proxy and log stream.
+            raise _already_active(current)
+        if _session_target_gone(args):
+            raise _already_active(current, gone=True)
+    alongside = alongside_flag or bool(current)
     target = platform_mod.resolve(args)
+    live = session_mod.live_for_target(target.target_id, target.platform)
+    if live is not None:
+        # The refused attempt is journaled where it belongs: in the session
+        # that holds this target, not in the primary on another device.
+        session_mod.select(live["session_id"])
+        raise _already_active(live, with_started_by=True)
     # Everything that can be refused is refused before the session exists.
     install_path = Path(args.install).expanduser() if args.install else None
     if install_path is not None and not install_path.exists():
@@ -420,14 +472,32 @@ def cmd_session_start(args: argparse.Namespace) -> int:
     else:
         tooling["adb"] = target.tool
 
-    record = session_mod.start_session(
-        target.tool,
-        serial=target.serial,
-        app_id=args.app_id,
-        platform=target.platform,
-        target_id=target.target_id,
-        tooling=tooling,
-    )
+    try:
+        record = session_mod.start_session(
+            target.tool,
+            serial=target.serial,
+            app_id=args.app_id,
+            platform=target.platform,
+            target_id=target.target_id,
+            tooling=tooling,
+            alongside=alongside,
+            started_by=started_by,
+            exclusive=True,
+        )
+    except errors.AutonomError as exc:
+        # Lost a race on this target under the store lock: like the refusal
+        # above, the attempt is journaled in the session that holds it.
+        holder = exc.extra.get("session_id")
+        if exc.code == errors.SESSION_ALREADY_ACTIVE and isinstance(holder, str):
+            session_mod.select(holder)
+        raise
+    if alongside:
+        # The rest of this command (its saves and its journal entry) belongs
+        # to the new session, never to the one `current.json` names. If the
+        # start is rolled back, the entry goes nowhere (as a rolled-back
+        # primary start's always did), never to that other session.
+        session_mod.select(record["session_id"])
+        session_mod.keep_journal_in(record["session_id"])
 
     record["ui_backend_preference"] = getattr(args, "ui_backend", None) or "auto"
     warnings: list[dict[str, Any]] = []
@@ -482,13 +552,17 @@ def cmd_session_start(args: argparse.Namespace) -> int:
         # "current": the next verb would silently drive it.
         session_mod.terminate_pid((record.get("background") or {}).get("log_stream_pid"))
         session_mod.save(record)
-        session_mod.stop_session()
+        # Only the new session: a primary running beside it is never touched.
+        session_mod.stop_session(session_id=record["session_id"])
         if isinstance(exc, errors.AutonomError):
             exc.extra.setdefault("session_rolled_back", record.get("session_id"))
         raise
 
     session_mod.save(record)
-    payload: dict[str, Any] = {"ok": True, "session": record,
+    primary = session_mod._current_id(None) == record.get("session_id")
+    payload: dict[str, Any] = {"ok": True,
+                               "session": {**record, "primary": primary,
+                                           "started_by": record.get("started_by")},
                                "installed": installed, "launched": launched}
     if target.platform == IOS:
         payload["booted"] = booted
@@ -601,9 +675,12 @@ def _session_stop_marked(args: argparse.Namespace, record: dict[str, Any]) -> in
             current["process_teardown"] = reaped
             session_mod.save(current)
 
-    # the list above already reaped the session's processes
-    stopped = session_mod.stop_session(reap=False)
-    payload: dict[str, Any] = {"ok": True, "session": stopped, "teardown": teardown}
+    # the list above already reaped the session's processes; the session
+    # stopped is the one this command is bound to (--session-id, a target
+    # flag naming a live session, else current.json)
+    stopped = session_mod.stop_session(reap=False, session_id=record.get("session_id"))
+    payload: dict[str, Any] = {"ok": True, "session": stopped, "teardown": teardown,
+                               "started_by": (stopped or record).get("started_by")}
     warnings: list[dict[str, Any]] = []
     if gone:
         target_id = record.get("target_id") or record.get("serial")
@@ -673,7 +750,9 @@ def cmd_session_launch(args: argparse.Namespace) -> int:
                 "launches by bundle id."))
         env = dict(pair.split("=", 1) for pair in (args.setenv or []) if "=" in pair)
         # When the session is attached to a proxy, launching without the proxy
-        # environment would silently produce an uncaptured run.
+        # environment would silently produce an uncaptured run. The session is
+        # the one this command is bound to (`_select_session`): with --udid X
+        # that is the live session on X, not necessarily current.json's.
         from autonom_lib.network import device_proxy_ios as _ios_proxy
 
         current = session_mod.load_current()
@@ -4310,12 +4389,231 @@ def _canvas_idb_lookup(args: argparse.Namespace) -> dict[str, Any]:
             "reason": f"{source} is not an executable file: {path}"}
 
 
-def cmd_canvas_serve(args: argparse.Namespace) -> int:
-    # validated here: the node bridge answered a bad value with a stack trace
-    if not 1 <= args.port <= 65535:
+import contextlib  # noqa: E402
+import signal  # noqa: E402
+import urllib.parse  # noqa: E402
+
+CANVAS_SCRIPT = (ROOT.parent / "plugins/autonom/skills/android-emulator-browser/scripts/"
+                 "android-emulator-browser.mjs")
+# A pid the CLI may signal runs this file; a reused pid running anything else never is.
+CANVAS_MARKER = "android-emulator-browser.mjs"
+CANVAS_DISCOVERY_SCHEMA = "autonom-canvas/v1"
+CANVAS_DEFAULT_WORKSPACE = "default"
+CANVAS_MAX_DEVICES = 8
+CANVAS_MAX_BOOTABLE = 8
+CANVAS_DEVICE_SPEC = re.compile(r"^(android|ios):([A-Za-z0-9._:-]{1,128})$")
+CANVAS_WORKSPACE_NAME = re.compile(r"^[A-Za-z0-9._-]{1,40}$")
+CANVAS_BOOTABLE_AVD = re.compile(r"^avd:([A-Za-z0-9._-]{1,100})(?:@([0-9]{4}))?$")
+CANVAS_BOOTABLE_SIMULATOR = re.compile(r"^simulator:[0-9A-Fa-f-]{36}$")
+CANVAS_STOP_WAIT_S = 10.0
+CANVAS_WORKSPACE_FLAGS_HINT = ("Run `autonom canvas` (or `canvas serve --split`) for a workspace, "
+                               "or drop the workspace flags.")
+
+
+def _canvas_device_specs(values: list[str] | None) -> list[tuple[str, str]]:
+    """`--device PLATFORM:ID` entries as (platform, target), checked as node checks them."""
+    specs: list[tuple[str, str]] = []
+    for raw in values or []:
+        match = CANVAS_DEVICE_SPEC.fullmatch(raw)
+        if not match:
+            raise errors.AutonomError(
+                errors.INVALID_VALUE, f"--device must be android:<serial> or ios:<udid>, got {raw!r}",
+                "For example --device android:emulator-5580 (letters, digits, . _ : - up to 128).")
+        spec = (match.group(1), match.group(2))
+        if spec in specs:
+            raise errors.AutonomError(
+                errors.INVALID_VALUE, f"--device names {raw} twice", "Name each device once.")
+        specs.append(spec)
+    if len(specs) > CANVAS_MAX_DEVICES:
         raise errors.AutonomError(
-            errors.INVALID_VALUE, f"--port must be 1..65535, got {args.port}",
-            "The default is 3277.")
+            errors.INVALID_VALUE, f"--device may be given at most {CANVAS_MAX_DEVICES} times",
+            "A Canvas shows at most 8 devices (4 per tab).")
+    return specs
+
+
+def _canvas_bootable(values: list[str] | None) -> list[str]:
+    entries = list(values or [])
+    if len(entries) > CANVAS_MAX_BOOTABLE:
+        raise errors.AutonomError(
+            errors.INVALID_VALUE, f"--bootable may be given at most {CANVAS_MAX_BOOTABLE} times",
+            "List the AVDs and Simulators the page may boot, at most 8.")
+    for raw in entries:
+        avd = CANVAS_BOOTABLE_AVD.fullmatch(raw)
+        if avd:
+            port = avd.group(2)
+            if port is not None and not (5554 <= int(port) <= 5682 and int(port) % 2 == 0):
+                raise errors.AutonomError(
+                    errors.INVALID_VALUE, f"--bootable {raw}: the port must be even, 5554..5682",
+                    "For example --bootable avd:Pixel_9@5586.")
+            continue
+        if CANVAS_BOOTABLE_SIMULATOR.fullmatch(raw):
+            continue
+        raise errors.AutonomError(
+            errors.INVALID_VALUE, f"--bootable must be avd:NAME[@PORT] or simulator:UDID, got {raw!r}",
+            "For example --bootable avd:Pixel_9@5586 or --bootable simulator:<36-character UDID>.")
+    return entries
+
+
+def _canvas_install_roots(values: list[str] | None) -> list[str]:
+    roots: list[str] = []
+    for raw in values or []:
+        path = Path(raw).expanduser()
+        if not path.is_dir():
+            raise errors.AutonomError(
+                errors.INVALID_VALUE, f"--install-root is not a directory: {path}",
+                "Name a folder that holds the builds the page may install, for example ~/src/app/build.",
+                path=str(path))
+        roots.append(str(path.absolute()))
+    return roots
+
+
+def _canvas_state_base() -> Path:
+    """The Canvas files' base (contract 0): the process registry's base, not the sessions'."""
+    explicit = os.environ.get("AUTONOM_HOME")
+    if explicit:
+        return Path(explicit)
+    state = os.environ.get("XDG_STATE_HOME")
+    return Path(state) / "autonom" if state else Path.home() / ".local/state/autonom"
+
+
+def _canvas_pid_is_canvas(pid: int) -> bool:
+    """A live pid that runs the Canvas server (ps cannot answer: trust the pid)."""
+    if not session_mod.pid_alive(pid):
+        return False
+    command = processes_mod.command_of(pid)
+    return command is None or CANVAS_MARKER in command
+
+
+def _canvas_discovery() -> list[dict[str, Any]]:
+    """Every live Canvas from its discovery file, port order; files of dead ones are removed."""
+    directory = _canvas_state_base() / "canvas"
+    live: list[dict[str, Any]] = []
+    try:
+        files = sorted(directory.glob("*.json"))
+    except OSError:
+        return live
+    for path in files:
+        try:
+            document = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(document, dict) or document.get("schema") != CANVAS_DISCOVERY_SCHEMA:
+            continue
+        pid, port = document.get("pid"), document.get("port")
+        if not isinstance(pid, int) or not isinstance(port, int) or isinstance(pid, bool):
+            continue
+        if not _canvas_pid_is_canvas(pid):
+            with contextlib.suppress(OSError):
+                path.unlink()
+            continue
+        live.append(document)
+    live.sort(key=lambda item: item["port"])
+    return live
+
+
+def _canvas_url(document: dict[str, Any]) -> str:
+    url = document.get("url") or f"http://127.0.0.1:{document['port']}/"
+    token = document.get("token")
+    return f"{url}#token={urllib.parse.quote(token, safe='')}" if token else url
+
+
+def _canvas_select(args: argparse.Namespace, live: list[dict[str, Any]]) -> dict[str, Any]:
+    """`--port`, else `--workspace`, else the only live Canvas (contract 6.1)."""
+    port = getattr(args, "canvas_port", None)
+    workspace = getattr(args, "canvas_workspace", None)
+    if port is not None:
+        matches = [item for item in live if item["port"] == port]
+        wanted = f"on port {port}"
+    elif workspace is not None:
+        matches = [item for item in live if item.get("workspace") == workspace]
+        wanted = f"for workspace {workspace}"
+    else:
+        matches, wanted = live, "running"
+    if not matches:
+        raise errors.AutonomError(
+            errors.CANVAS_NOT_FOUND, f"no Canvas is {wanted}" if wanted != "running" else "no Canvas is running",
+            "Start one with `autonom canvas`, or run `autonom canvas list`.")
+    if len(matches) > 1:
+        raise errors.AutonomError(
+            errors.CANVAS_AMBIGUOUS, f"{len(matches)} Canvases are running",
+            "Pass --port N or --workspace NAME; `autonom canvas list` shows them.",
+            canvases=[{"port": item["port"], "workspace": item.get("workspace")} for item in matches])
+    return matches[0]
+
+
+def _canvas_api(document: dict[str, Any], method: str, path: str,
+                body: dict[str, Any] | None = None, *, timeout: float = 30.0) -> dict[str, Any]:
+    """One authenticated call to a Canvas API; its error answers are raised with their code."""
+    import urllib.error
+    import urllib.request
+
+    headers = {"Accept": "application/json", "X-Autonom-Origin": "agent"}
+    token = document.get("token")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    data = None
+    if method == "POST":
+        data = json.dumps(body or {}).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{document['port']}{path}", data=data, headers=headers, method=method)
+    # A configured HTTP proxy (http_proxy, system settings) must never see the Bearer token:
+    # the Canvas is loopback only, so this opener skips every proxy.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(request, timeout=timeout) as response:  # noqa: S310 - loopback
+            raw = response.read()
+    except urllib.error.HTTPError as exc:
+        raw = exc.read()
+        try:
+            payload = json.loads(raw.decode("utf-8") or "{}")
+        except ValueError:
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        # The API's extras ride along; names the error object itself uses never do.
+        extra = {key: value for key, value in payload.items()
+                 if key not in ("ok", "error", "error_code", "hint", "code", "message")}
+        extra.update(status=exc.code, port=document["port"])
+        code = payload.get("error_code")
+        raise errors.AutonomError(
+            code if isinstance(code, str) and code else errors.BACKEND_FAILED,
+            str(payload.get("error") or f"the Canvas answered HTTP {exc.code}"),
+            payload.get("hint") if isinstance(payload.get("hint"), str) else None, **extra) from exc
+    except (urllib.error.URLError, OSError) as exc:
+        reason = getattr(exc, "reason", exc)
+        raise errors.AutonomError(
+            errors.BACKEND_FAILED, f"the Canvas on port {document['port']} did not answer: {reason}",
+            "Check it with `autonom canvas list`; stop a stuck one with `autonom canvas stop`.",
+            port=document["port"]) from exc
+    try:
+        payload = json.loads(raw.decode("utf-8") or "{}")
+    except ValueError as exc:
+        raise errors.AutonomError(
+            errors.BACKEND_FAILED, f"the Canvas on port {document['port']} answered no JSON",
+            port=document["port"]) from exc
+    return payload if isinstance(payload, dict) else {}
+
+
+def _canvas_workspace_lock(name: str) -> dict[str, Any] | None:
+    """The live owner {pid, port} of a workspace lock (contract 3.3), or None."""
+    path = _canvas_state_base() / "canvas" / "workspaces" / f"{name}.lock"
+    try:
+        holder = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    pid = holder.get("pid") if isinstance(holder, dict) else None
+    if not isinstance(pid, int) or isinstance(pid, bool) or not _canvas_pid_is_canvas(pid):
+        return None
+    return {"pid": pid, "port": holder.get("port")}
+
+
+def _canvas_check_values(args: argparse.Namespace) -> None:
+    # validated here: the node bridge answered a bad value with a stack trace
+    if not 0 <= args.port <= 65535:
+        raise errors.AutonomError(
+            errors.INVALID_VALUE, f"--port must be 0..65535, got {args.port}",
+            "The default is 3277; 0 picks a free port.")
     if args.fps is not None and not 1 <= args.fps <= 60:
         raise errors.AutonomError(
             errors.INVALID_VALUE, f"--fps must be 1..60, got {args.fps}",
@@ -4327,6 +4625,93 @@ def cmd_canvas_serve(args: argparse.Namespace) -> int:
             f"--max-size must be 0 (native size) or {CANVAS_MAX_SIZE[0]}..{CANVAS_MAX_SIZE[1]}, "
             f"got {args.max_size}", CANVAS_MAX_SIZE_HINT)
     _canvas_bounded("--bit-rate", args.bit_rate, CANVAS_BIT_RATE, "12000000")
+
+
+def _canvas_shared_args(args: argparse.Namespace, scrcpy_server: str | None) -> list[str]:
+    """Video and auth flags of both modes, in the order of the single-device command."""
+    command: list[str] = []
+    # Only explicit values are forwarded: an explicit --fps also caps scrcpy,
+    # which otherwise streams at up to 60 fps while multipart keeps 15.
+    for flag, value in (("--fps", args.fps), ("--max-size", args.max_size),
+                        ("--bit-rate", args.bit_rate)):
+        if value is not None:
+            command += [flag, str(value)]
+    if scrcpy_server:
+        command += ["--scrcpy-server", scrcpy_server]
+        if args.scrcpy_version:
+            command += ["--scrcpy-version", args.scrcpy_version]
+    return command
+
+
+def _canvas_action_args(args: argparse.Namespace, install_roots: list[str]) -> list[str]:
+    command: list[str] = []
+    for root in install_roots:
+        command += ["--install-root", root]
+    if args.captures_dir:
+        command += ["--captures-dir", str(Path(args.captures_dir).expanduser().absolute())]
+    return command
+
+
+def _canvas_node() -> str:
+    node = shutil.which("node")
+    if not node:
+        raise errors.AutonomError(
+            errors.TOOL_MISSING, "node is required to serve Mobile Canvas",
+            hint="Install Node.js or run the browser bridge on a host that has it.",
+            tool="node")
+    return node
+
+
+def cmd_canvas(args: argparse.Namespace) -> int:
+    """`autonom canvas` alone: `canvas serve` with its defaults (a workspace Canvas)."""
+    defaults = (_ROOT_PARSER or build_parser()).parse_args(["canvas", "serve"])
+    for key, value in vars(args).items():
+        if key not in ("func", "canvas_command"):
+            setattr(defaults, key, value)
+    return cmd_canvas_serve(defaults)
+
+
+def cmd_canvas_serve(args: argparse.Namespace) -> int:
+    _canvas_check_values(args)
+    devices = _canvas_device_specs(args.device)
+    bootable = _canvas_bootable(args.bootable)
+    if args.workspace is not None and not CANVAS_WORKSPACE_NAME.fullmatch(args.workspace):
+        raise errors.AutonomError(
+            errors.INVALID_VALUE, f"--workspace must be 1-40 letters, digits, . _ or -, got {args.workspace!r}",
+            "The default workspace is `default`.")
+    explicit = _explicit_target_flags(args)
+    if devices and explicit:
+        raise errors.AutonomError(
+            errors.USAGE_ERROR, "--device cannot be combined with --target, --serial or --udid",
+            "Name every device with --device PLATFORM:ID, or one target with the target flags.")
+    workspace_mode = bool(args.split or args.workspace is not None or len(devices) >= 2
+                          or (not explicit and not devices))
+    install_roots = _canvas_install_roots(args.install_root)
+    if not workspace_mode:
+        for flag, given in (("--ephemeral", args.ephemeral), ("--bootable", bool(bootable)),
+                            ("--shutdown-booted", args.shutdown_booted)):
+            if given:
+                raise errors.AutonomError(
+                    errors.INVALID_VALUE, f"{flag} needs a workspace Canvas",
+                    CANVAS_WORKSPACE_FLAGS_HINT)
+        if devices:
+            platform, target_id = devices[0]
+            given_platform = getattr(args, "platform", None)
+            if given_platform and given_platform != platform:
+                raise errors.AutonomError(
+                    errors.USAGE_ERROR, f"--platform {given_platform} does not match --device {platform}:{target_id}",
+                    "Drop --platform; --device names the platform.")
+            args.platform, args.target = platform, target_id
+        return _canvas_serve_single(args, install_roots)
+    if explicit:
+        # `--serial X canvas serve --split`: the named target is the workspace's first device.
+        target = _target(args)
+        devices = [(target.platform, target.target_id)]
+    return _canvas_serve_workspace(args, devices, bootable, install_roots)
+
+
+def _canvas_serve_single(args: argparse.Namespace, install_roots: list[str]) -> int:
+    """The single-device Canvas of before: same node command, same process owner."""
     scrcpy_server = _canvas_scrcpy_server(args)
     idb = _canvas_idb_lookup(args)
     target = _target(args)
@@ -4353,37 +4738,12 @@ def cmd_canvas_serve(args: argparse.Namespace) -> int:
             "the scrcpy transport mirrors Android targets only",
             "On the iOS Simulator use --transport auto.",
             capability=doctor_mod.SCRCPY_CAPABILITY)
-    if args.transport == "scrcpy" and not scrcpy_server and doctor_mod.scrcpy_source() is None:
-        # Nothing at all could provide a server, so the node server would
-        # refuse as well; refusing here keeps the JSON error contract. A
-        # configured server's version is still checked by the node server.
-        raise errors.AutonomError(
-            errors.TOOL_MISSING,
-            f"--transport scrcpy needs scrcpy-server {doctor_mod.SCRCPY_PROTOCOL_VERSION} "
-            "and none is configured",
-            doctor_mod.SCRCPY_INSTALL_HINT, tool="scrcpy",
-            capability=doctor_mod.SCRCPY_CAPABILITY)
-    node = shutil.which("node")
-    if not node:
-        raise errors.AutonomError(
-            errors.TOOL_MISSING, "node is required to serve Mobile Canvas",
-            hint="Install Node.js or run the browser bridge on a host that has it.",
-            tool="node")
-    script = (ROOT.parent / "plugins/autonom/skills/android-emulator-browser/scripts/"
-              "android-emulator-browser.mjs")
-    command = [node, str(script), "--platform", target.platform,
+    _canvas_require_scrcpy(args, scrcpy_server)
+    node = _canvas_node()
+    command = [node, str(CANVAS_SCRIPT), "--platform", target.platform,
                "--target", target.target_id, "--port", str(args.port),
                "--transport", args.transport]
-    # Only explicit values are forwarded: an explicit --fps also caps scrcpy,
-    # which otherwise streams at up to 60 fps while multipart keeps 15.
-    for flag, value in (("--fps", args.fps), ("--max-size", args.max_size),
-                        ("--bit-rate", args.bit_rate)):
-        if value is not None:
-            command += [flag, str(value)]
-    if scrcpy_server:
-        command += ["--scrcpy-server", scrcpy_server]
-        if args.scrcpy_version:
-            command += ["--scrcpy-version", args.scrcpy_version]
+    command += _canvas_shared_args(args, scrcpy_server)
     if target.platform == ANDROID:
         command += ["--adb", target.tool]
     else:
@@ -4395,7 +4755,9 @@ def cmd_canvas_serve(args: argparse.Namespace) -> int:
     if args.no_auth:
         command.append("--no-auth")
     if args.token:
-        command += ["--token", args.token]
+        command += _canvas_token_args(args.token)
+    # Additive: without these flags the command is the one of before, byte for byte.
+    command += _canvas_action_args(args, install_roots)
     # Supervised in its own process group and registered (supervisor and
     # node child) for its whole life, so `processes` lists the pair, `cleanup
     # --all` and `session stop` can stop it, and killing this CLI takes node
@@ -4408,6 +4770,237 @@ def cmd_canvas_serve(args: argparse.Namespace) -> int:
         command, kind="canvas", owner=owner,
         artifacts_dir=current.get("artifacts_dir") if owner and current else None,
         target_id=target.target_id, port=args.port)
+
+
+def _canvas_require_scrcpy(args: argparse.Namespace, scrcpy_server: str | None) -> None:
+    if args.transport == "scrcpy" and not scrcpy_server and doctor_mod.scrcpy_source() is None:
+        # Nothing at all could provide a server, so the node server would
+        # refuse as well; refusing here keeps the JSON error contract. A
+        # configured server's version is still checked by the node server.
+        raise errors.AutonomError(
+            errors.TOOL_MISSING,
+            f"--transport scrcpy needs scrcpy-server {doctor_mod.SCRCPY_PROTOCOL_VERSION} "
+            "and none is configured",
+            doctor_mod.SCRCPY_INSTALL_HINT, tool="scrcpy",
+            capability=doctor_mod.SCRCPY_CAPABILITY)
+
+
+def _canvas_serve_workspace(args: argparse.Namespace, devices: list[tuple[str, str]],
+                            bootable: list[str], install_roots: list[str]) -> int:
+    """A workspace Canvas (contract 6.1): no device needed, no session owner, open until stopped."""
+    name = args.workspace or CANVAS_DEFAULT_WORKSPACE
+    scrcpy_server = _canvas_scrcpy_server(args)
+    idb = _canvas_idb_lookup(args)
+    platforms = {platform for platform, _target_id in devices}
+    if len(platforms) > 1 and args.transport != "auto":
+        raise errors.AutonomError(
+            errors.INVALID_VALUE, f"--transport {args.transport} cannot serve Android and iOS devices together",
+            "Use --transport auto with mixed platforms.")
+    if ANDROID in platforms and (args.transport == "idb" or args.idb_companion is not None):
+        raise errors.AutonomError(
+            errors.UNSUPPORTED_ON_PLATFORM, "the idb transport mirrors iOS Simulators only",
+            "On Android use --transport auto or scrcpy.", capability=CANVAS_IDB_CAPABILITY)
+    if IOS in platforms and (args.transport == "scrcpy" or scrcpy_server):
+        raise errors.AutonomError(
+            errors.UNSUPPORTED_ON_PLATFORM, "the scrcpy transport mirrors Android targets only",
+            "On the iOS Simulator use --transport auto.", capability=doctor_mod.SCRCPY_CAPABILITY)
+    if args.transport == "idb" and not idb["available"]:
+        raise errors.AutonomError(
+            errors.TOOL_MISSING, f"--transport idb is unavailable: {idb['reason']}",
+            CANVAS_IDB_HINT, tool="idb_companion", capability=CANVAS_IDB_CAPABILITY)
+    if args.idb_companion is not None and not idb["available"]:
+        raise errors.AutonomError(
+            errors.INVALID_VALUE, f"--idb-companion is not an executable file: {idb['path']}",
+            CANVAS_IDB_HINT, path=idb["path"])
+    _canvas_require_scrcpy(args, scrcpy_server)
+    # One Canvas per workspace: a second `autonom canvas` prints the running one's URL.
+    for document in _canvas_discovery():
+        if document.get("mode") == "workspace" and document.get("workspace") == name:
+            return emit({"ok": True, "already_running": True, "port": document["port"],
+                         "pid": document["pid"], "workspace": name, "url": _canvas_url(document)},
+                        as_json=True)
+    holder = _canvas_workspace_lock(name)
+    if holder:
+        raise errors.AutonomError(
+            errors.WORKSPACE_IN_USE, f"workspace {name} is in use by Canvas pid {holder['pid']}",
+            "It is still starting or stopping; retry in a moment, or stop it with "
+            "`autonom canvas stop --workspace " + name + "`.",
+            pid=holder["pid"], port=holder["port"], workspace=name)
+    node = _canvas_node()
+    command = [node, str(CANVAS_SCRIPT), "--workspace", name, "--port", str(args.port),
+               "--transport", args.transport]
+    for platform, target_id in devices:
+        command += ["--device", f"{platform}:{target_id}"]
+    if args.ephemeral:
+        command.append("--ephemeral")
+    for entry in bootable:
+        command += ["--bootable", entry]
+    if args.shutdown_booted:
+        command.append("--shutdown-booted")
+    command += _canvas_shared_args(args, scrcpy_server)
+    # Both tools when found: the page attaches Android and iOS devices alike.
+    adb_flag = getattr(args, "adb", None)
+    with contextlib.suppress(errors.AutonomError):
+        command += ["--adb", adb_mod.find_adb(adb_flag)]
+    simctl_flag = getattr(args, "simctl", None)
+    if simctl_flag or sys.platform == "darwin" or os.environ.get("AUTONOM_SIMCTL"):
+        with contextlib.suppress(errors.AutonomError):
+            command += ["--simctl", ios_simctl.find_simctl(simctl_flag)]
+    if getattr(args, "idb", None):
+        command += ["--idb", args.idb]
+    if args.idb_companion is not None:
+        command += ["--idb-companion", idb["path"]]
+    # The automatic sessions run this CLI with this interpreter.
+    command += ["--python", sys.executable, "--autonom", str(Path(__file__).resolve())]
+    if args.no_auth:
+        command.append("--no-auth")
+    if args.token:
+        command += _canvas_token_args(args.token)
+    command += _canvas_action_args(args, install_roots)
+    # No session owner: a session stop never reaps a workspace Canvas (contract 3.4).
+    return processes_mod.run_supervised(
+        command, kind="canvas", owner=None, artifacts_dir=None, port=args.port, workspace=name)
+
+
+def _canvas_token_args(token: str) -> list[str]:
+    """The node argv items that pass the Canvas token.
+
+    A token starting with "-" goes as one `--token=VALUE` item: as a separate item the
+    node parser (and argparse) would read it as an option. Any other token keeps the
+    `--token VALUE` pair of before.
+    """
+    return [f"--token={token}"] if token.startswith("-") else ["--token", token]
+
+
+def cmd_canvas_list(args: argparse.Namespace) -> int:
+    canvases = [{
+        "port": item["port"], "pid": item["pid"], "url": item.get("url"),
+        "mode": item.get("mode"), "workspace": item.get("workspace"),
+        "tabs": [{"id": tab.get("id"), "name": tab.get("name"), "devices": tab.get("devices") or []}
+                 for tab in item.get("tabs") or [] if isinstance(tab, dict)],
+    } for item in _canvas_discovery()]
+    return emit({"ok": True, "canvases": canvases}, as_json=True)
+
+
+def _canvas_wait_exit(pid: int, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not session_mod.pid_alive(pid):
+            return True
+        time.sleep(0.1)
+    return not session_mod.pid_alive(pid)
+
+
+def cmd_canvas_stop(args: argparse.Namespace) -> int:
+    live = _canvas_discovery()
+    if args.all:
+        chosen = live
+    else:
+        chosen = [_canvas_select(args, live)]
+    stopped: list[dict[str, Any]] = []
+    for document in chosen:
+        pid = document["pid"]
+        with contextlib.suppress(errors.AutonomError):
+            _canvas_api(document, "POST", "/api/stop", {}, timeout=5)
+        exited = _canvas_wait_exit(pid, CANVAS_STOP_WAIT_S)
+        forced = False
+        if not exited:
+            command = processes_mod.command_of(pid) or ""
+            if CANVAS_MARKER in command:
+                with contextlib.suppress(OSError):
+                    os.kill(pid, signal.SIGTERM)
+                    forced = True
+                exited = _canvas_wait_exit(pid, 5.0)
+        item = {"port": document["port"], "pid": pid, "workspace": document.get("workspace")}
+        if forced:
+            item["terminated"] = True
+        if not exited:
+            item["still_running"] = True
+        stopped.append(item)
+    return emit({"ok": True, "stopped": stopped}, as_json=True)
+
+
+def _canvas_target_spec(args: argparse.Namespace, document: dict[str, Any]) -> tuple[str, str]:
+    """(platform, target) from the target flags; a bare --target is looked up in the Canvas."""
+    platform = getattr(args, "platform", None)
+    serial, udid, target = (getattr(args, "serial", None), getattr(args, "udid", None),
+                            getattr(args, "target", None))
+    value = serial or udid or target
+    if not value:
+        raise errors.AutonomError(
+            errors.USAGE_ERROR, "name the device with --serial, --udid or --target",
+            "For example `autonom canvas attach --serial emulator-5580`.")
+    if serial:
+        platform = platform or ANDROID
+    elif udid:
+        platform = platform or IOS
+    if platform:
+        return platform, value
+    running = _canvas_api(document, "GET", "/api/targets").get("running") or []
+    found = sorted({item.get("platform") for item in running
+                    if isinstance(item, dict) and item.get("target") == value} - {None})
+    if len(found) == 1:
+        return found[0], value
+    if len(found) > 1:
+        raise errors.AutonomError(
+            errors.AMBIGUOUS_TARGET, f"{value} names targets on both platforms",
+            "Pass --platform android or --platform ios.")
+    raise errors.AutonomError(
+        errors.NO_TARGET, f"{value} is not a running target",
+        "Boot it first, or pass --platform with --target; `autonom devices` lists the running ones.",
+        target_id=value)
+
+
+def cmd_canvas_attach(args: argparse.Namespace) -> int:
+    document = _canvas_select(args, _canvas_discovery())
+    platform, target = _canvas_target_spec(args, document)
+    body: dict[str, Any] = {"platform": platform, "target": target}
+    if args.tab:
+        tabs = _canvas_api(document, "GET", "/api/workspace").get("tabs") or []
+        by_id = [tab for tab in tabs if isinstance(tab, dict) and tab.get("id") == args.tab]
+        by_name = [tab for tab in tabs if isinstance(tab, dict) and tab.get("name") == args.tab]
+        if len(by_name) > 1 and not by_id:
+            raise errors.AutonomError(
+                errors.INVALID_VALUE, f"{len(by_name)} tabs are named {args.tab!r}",
+                "Pass the tab id (t_…) instead; `autonom canvas list` shows them.")
+        chosen = (by_id or by_name or [{"id": args.tab}])[0]
+        body["tab"] = chosen["id"]
+    answer = _canvas_api(document, "POST", "/api/devices", body, timeout=150)
+    device = answer.get("device") or {}
+    return emit({"ok": True, "port": document["port"], "device": device,
+                 "attached": bool(answer.get("attached")), "tab": device.get("tab")}, as_json=True)
+
+
+def cmd_canvas_detach(args: argparse.Namespace) -> int:
+    document = _canvas_select(args, _canvas_discovery())
+    if args.device_id:
+        device_id = args.device_id
+        if _explicit_target_flags(args):
+            raise errors.AutonomError(
+                errors.USAGE_ERROR, "--device-id cannot be combined with the target flags",
+                "Name the device one way only.")
+    else:
+        value = (getattr(args, "serial", None) or getattr(args, "udid", None)
+                 or getattr(args, "target", None))
+        if not value:
+            raise errors.AutonomError(
+                errors.USAGE_ERROR, "name the device with --device-id or the target flags",
+                "For example `autonom canvas detach --serial emulator-5580`.")
+        platform = getattr(args, "platform", None) or (
+            ANDROID if getattr(args, "serial", None) else IOS if getattr(args, "udid", None) else None)
+        attached = _canvas_api(document, "GET", "/api/devices").get("devices") or []
+        matches = [item.get("id") for item in attached if isinstance(item, dict)
+                   and item.get("target") == value and (platform is None or item.get("platform") == platform)]
+        if len(matches) > 1:
+            raise errors.AutonomError(
+                errors.AMBIGUOUS_TARGET, f"{value} names devices on both platforms",
+                "Pass --platform, or --device-id.")
+        device_id = matches[0] if matches else f"{platform or ANDROID}~{value}"
+    answer = _canvas_api(document, "POST",
+                         f"/api/devices/{urllib.parse.quote(device_id, safe='')}/detach", {},
+                         timeout=120)
+    return emit({"ok": True, "port": document["port"], "detached": answer.get("detached", device_id),
+                 "session_stopped": bool(answer.get("session_stopped"))}, as_json=True)
 
 
 # --- parser ------------------------------------------------------------------
@@ -4562,6 +5155,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="seconds to wait for the boot to complete")
     p.add_argument("--no-wait", action="store_true",
                    help="return right after spawning instead of waiting for boot (Android)")
+    p.add_argument("--port", type=int,
+                   help="console port of the new emulator (even, 5554-5682; serial "
+                        "emulator-<port>). Android, with --avd only")
     p.set_defaults(func=cmd_devices_boot)
 
     p = devices_sub.add_parser(
@@ -4579,6 +5175,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--launch", nargs="?", const="", help="launch app id (defaults to --app-id)")
     p.add_argument("--activity", help="optional activity component (Android)")
     p.add_argument("--log-stream", action="store_true", help="start a background log stream (iOS)")
+    p.add_argument("--alongside", action="store_true",
+                   help="start beside the current session without becoming current "
+                        "(current.json is left as it is)")
+    p.add_argument("--started-by", metavar="canvas:PORT:PID",
+                   help="record who started the session (with --alongside only)")
     p.set_defaults(func=cmd_session_start)
 
     p = session_sub.add_parser("stop", help="stop current session metadata", parents=[target_flags])
@@ -4810,10 +5411,13 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--json", help="JSON object of control values")
         p.set_defaults(func=cmd_simulator, control=control)
 
-    canvas = sub.add_parser("canvas", help="shared human/agent mobile control surface")
-    canvas_sub = canvas.add_subparsers(dest="canvas_command", required=True)
+    canvas = sub.add_parser("canvas", help="shared human/agent mobile control surface "
+                                           "(alone: a workspace Canvas, as `canvas serve`)")
+    # `autonom canvas` alone serves the workspace with the defaults (contract 6.1).
+    canvas.set_defaults(func=cmd_canvas)
+    canvas_sub = canvas.add_subparsers(dest="canvas_command", required=False)
     p = canvas_sub.add_parser("serve", parents=[target_flags])
-    p.add_argument("--port", type=int, default=3277)
+    p.add_argument("--port", type=int, default=3277, help="0 picks a free port")
     p.add_argument("--transport", choices=CANVAS_TRANSPORTS, default="auto",
                    help="auto prefers scrcpy on Android when a 4.1 server is found, "
                         "and idb on the iOS Simulator when idb_companion is found")
@@ -4835,7 +5439,51 @@ def build_parser() -> argparse.ArgumentParser:
                         "(default: AUTONOM_IDB_COMPANION_BIN, then PATH)")
     p.add_argument("--token")
     p.add_argument("--no-auth", action="store_true")
+    # Workspace and multi-device flags. None may start with --to: the abbreviations
+    # --to and --tok must keep reaching --token (journal redaction relies on it).
+    p.add_argument("--device", action="append", metavar="PLATFORM:ID",
+                   help="a device to show, android:<serial> or ios:<udid> (repeatable, at most 8); "
+                        "one alone is the single-device Canvas")
+    p.add_argument("--split", action="store_true",
+                   help="a workspace Canvas even with one --device or a target flag")
+    p.add_argument("--workspace", metavar="NAME",
+                   help="workspace name (default: default); its tabs persist across restarts")
+    p.add_argument("--ephemeral", action="store_true",
+                   help="a workspace that neither reads nor saves its tabs")
+    p.add_argument("--bootable", action="append", metavar="SPEC",
+                   help="avd:NAME[@PORT] or simulator:UDID the page may boot (repeatable, at most 8)")
+    p.add_argument("--shutdown-booted", action="store_true",
+                   help="shut down the devices this Canvas booted when it stops")
+    p.add_argument("--install-root", action="append", metavar="DIR",
+                   help="a folder the page may install builds from (repeatable; default none)")
+    p.add_argument("--captures-dir", metavar="DIR",
+                   help="screenshots and recordings (default: AUTONOM_CAPTURES_DIR, "
+                        "else ~/Downloads/Autonom)")
     p.set_defaults(func=cmd_canvas_serve)
+
+    def canvas_selector(parser: argparse.ArgumentParser) -> None:
+        group = parser.add_mutually_exclusive_group()
+        group.add_argument("--port", dest="canvas_port", type=int, metavar="N",
+                           help="the Canvas on this port")
+        group.add_argument("--workspace", dest="canvas_workspace", metavar="NAME",
+                           help="the Canvas of this workspace")
+        return group
+
+    p = canvas_sub.add_parser("stop", help="stop a running Canvas")
+    canvas_selector(p).add_argument("--all", action="store_true", help="every running Canvas")
+    p.set_defaults(func=cmd_canvas_stop)
+    p = canvas_sub.add_parser("attach", parents=[target_flags],
+                              help="attach a device to a running workspace Canvas")
+    canvas_selector(p)
+    p.add_argument("--tab", metavar="ID|NAME", help="the tab to place it in (default: the active tab)")
+    p.set_defaults(func=cmd_canvas_attach)
+    p = canvas_sub.add_parser("detach", parents=[target_flags],
+                              help="detach a device; a session the Canvas started ends with it")
+    canvas_selector(p)
+    p.add_argument("--device-id", metavar="ID", help="the Canvas device id, e.g. android~emulator-5580")
+    p.set_defaults(func=cmd_canvas_detach)
+    p = canvas_sub.add_parser("list", help="the running Canvases, their tabs and devices")
+    p.set_defaults(func=cmd_canvas_list)
 
     media = sub.add_parser("media", help="device media library")
     media_sub = media.add_subparsers(dest="media_command", required=True)
@@ -5566,14 +6214,43 @@ _READONLY_SESSION_COMMANDS = {"show", "outputs"}
 _DRIVING_REPORT_COMMANDS = {"serve"}
 
 
-def _select_session(args: argparse.Namespace) -> None:
-    """Bind this invocation to the session `--session-id` names.
+def _bind_to_target_session(args: argparse.Namespace) -> None:
+    """With explicit target flags, bind to the live session on that target
+    when it is not the current one: an agent's `--serial X` commands journal
+    into the session a Canvas started on X. `session start` creates sessions
+    and is never bound. Never fails: a broken store binds nothing."""
+    if args.command == "session" and getattr(args, "session_command", None) == "start":
+        return
+    value = next((getattr(args, flag, None) for flag in ("target", "serial", "udid")
+                  if getattr(args, flag, None)), None)
+    if not value:
+        return
+    try:
+        record = session_mod.live_for_target(str(value), getattr(args, "platform", None))
+        current_id = session_mod._current_id(None)
+    except Exception:  # noqa: BLE001 - binding is a convenience, never a failure
+        return
+    if record and record.get("session_id") != current_id:
+        session_mod.select(record["session_id"])
 
-    `current` (or no flag) keeps the machine's current session. Any other id
-    must exist; a stopped one is accepted only by the read-only verbs, and
-    `session start` never takes one (it creates a session)."""
+
+def _select_session(args: argparse.Namespace) -> None:
+    """Bind this invocation to a session. First match wins:
+
+    1. `--session-id X` (X other than `current`): that session. X must
+       exist; a stopped one is accepted only by the read-only verbs, and
+       `session start` never takes one (it creates a session).
+    2. Explicit target flags (any verb but `session start`): the live session
+       on that target, when it is not the current one.
+    3. Otherwise (and always with `--session-id current`) the machine's
+       current session (`current.json`)."""
+    # A new invocation: no earlier one's journal restriction carries over.
+    session_mod.keep_journal_in(None)
     selected = getattr(args, "session_id", None)
-    if not selected or selected == "current":
+    if not selected:
+        _bind_to_target_session(args)
+        return
+    if selected == "current":
         return
     if args.command == "session" and getattr(args, "session_command", None) == "start":
         raise errors.AutonomError(

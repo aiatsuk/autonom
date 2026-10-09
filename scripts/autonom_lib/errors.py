@@ -157,6 +157,19 @@ XCUITEST_FAILED = "xcuitest_failed"  # the runner reported an unexpected failure
 STALE_UI_ELEMENT = "stale_ui_element"  # the observed element changed; refresh the tree
 NO_FOCUSED_FIELD = "no_focused_field"  # text typed through the runner with no focused field
 
+# --- Canvas actions (captures, recording, install roots) ----------------------
+RECORDING_NOT_ACTIVE = "recording_not_active"  # record.stop with no recording on this device
+CAPTURE_NOT_FOUND = "capture_not_found"  # a capture name the captures index does not hold
+CAPTURE_TOO_LARGE = "capture_too_large"  # a screenshot or video above its size cap; nothing saved
+INSTALL_NOT_CONFIGURED = "install_not_configured"  # the Canvas was started with no --install-root
+INSTALL_PATH_NOT_ALLOWED = "install_path_not_allowed"  # the path resolves outside every install root
+INSTALL_FAILED = "install_failed"  # the device refused the install (reason in the `reason` extra)
+
+# --- Canvas workspace (autonom canvas stop|attach|detach|list) ------------------
+CANVAS_NOT_FOUND = "canvas_not_found"  # no live Canvas matches --port/--workspace (or none runs)
+CANVAS_AMBIGUOUS = "canvas_ambiguous"  # several live Canvases and no --port or --workspace
+WORKSPACE_IN_USE = "workspace_in_use"  # another live Canvas already serves this workspace
+
 class AutonomError(RuntimeError):
     """An expected failure with a stable code and an actionable hint."""
 

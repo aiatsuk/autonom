@@ -13,12 +13,26 @@
  * text narrows the feed at its source (`logs follow --grep`), so a device that logs faster
  * than a reader can read (a booted iOS Simulator logs thousands of lines a second) cannot
  * push the lines asked for out of the ring.
+ *
+ * The Actions drawer's ops (contract section 5.4) travel the same way: `ACTION_*_OPS` are
+ * accepted by /tools/call next to the Tools ops, and GET /tools/captures/<name> streams one
+ * capture file (located by the internal `captures.file` op) with Range support. Every call
+ * through createCanvasTools is written to the Canvas command log when one is given.
  */
 import { spawn } from "node:child_process";
+import { createReadStream, constants as fsConstants } from "node:fs";
+import { open } from "node:fs/promises";
 import { createInterface } from "node:readline";
-import { resolve } from "node:path";
+import { basename, resolve } from "node:path";
 
 export const TOOLS_CALL_TIMEOUT_MS = 60_000;
+// Ops that may take longer than the default: an install, the pull of a recording, tool checks.
+// record.start and record.status may first save a recording that ended at its limit
+// (settle, pull, device cleanup), so they get the same room as record.stop.
+export const OP_TIMEOUT_MS = Object.freeze({ "app.install": 300_000, "record.start": 180_000, "record.status": 180_000,
+  "record.stop": 180_000, "health": 30_000 });
+// A tools process that is told to stop gets this long to remove a recording's device file.
+export const TOOLS_CLOSE_GRACE_MS = 6000;
 export const TOOLS_RESTART_INTERVAL_MS = 10_000;
 export const LOG_IDLE_STOP_MS = 60_000;
 export const LOG_MAX_ENTRIES = 2000;
@@ -60,20 +74,33 @@ export const TOOLS_MUTATING_OPS = Object.freeze([
   "mocks.clear",
 ]);
 export const TOOLS_OPS = Object.freeze([...TOOLS_READ_OPS, ...TOOLS_MUTATING_OPS]);
+// The Actions drawer (same values as ACTION_*_OPS in scripts/autonom_canvas_tools.py).
+export const ACTION_READ_OPS = Object.freeze(["captures.list", "record.status", "apps.candidates", "health"]);
+export const ACTION_DEVICE_OPS = Object.freeze(["capture.screenshot", "record.start", "record.stop", "app.install",
+  "app.launch", "app.open_url", "app.locale"]);
+export const ACTION_LOCAL_OPS = Object.freeze(["captures.delete"]);
+// `captures.file` is internal: only the file route asks it, /tools/call refuses it.
+const CALLABLE_OPS = Object.freeze([...TOOLS_OPS, ...ACTION_READ_OPS, ...ACTION_DEVICE_OPS, ...ACTION_LOCAL_OPS]);
 
 const READ_OPS = new Set(TOOLS_READ_OPS);
 const ALL_OPS = new Set(TOOLS_OPS);
+const CALLABLE = new Set(CALLABLE_OPS);
+const CONTROLLED = new Set([...TOOLS_MUTATING_OPS, ...ACTION_DEVICE_OPS]);
 
 const STATUS_400 = new Set([
   "flow_command_invalid", "invalid_value", "invalid_coordinates", "unknown_privacy_service",
   "invalid_simulator_action", "consent_required", "consent_declined", "selector_required",
 ]);
-const STATUS_404 = new Set(["mock_not_found", "flow_not_found", "app_not_installed"]);
+const STATUS_403 = new Set(["install_path_not_allowed"]);
+const STATUS_404 = new Set(["mock_not_found", "flow_not_found", "app_not_installed", "capture_not_found",
+  "install_path_not_found"]);
 const STATUS_409 = new Set([
   "unsupported_on_platform", "unsupported_capability", "no_active_session",
   "session_target_mismatch", "emulator_only", "proxy_not_running",
-  "physical_device_attach_unsupported",
+  "physical_device_attach_unsupported", "install_not_configured", "recording_already_active",
+  "recording_not_active",
 ]);
+const STATUS_413 = new Set(["capture_too_large"]);
 
 const PACKAGE_NAME = /^[A-Za-z0-9_.]{1,255}$/;
 // The feed's `match`: plain printable ASCII text, found case-insensitively in a line.
@@ -90,8 +117,10 @@ export function literalPattern(text) {
 /** The HTTP status of a failed tools call, by its lowercase error code. */
 export function toolsErrorStatus(code) {
   if (STATUS_400.has(code)) return 400;
+  if (STATUS_403.has(code)) return 403;
   if (STATUS_404.has(code)) return 404;
   if (STATUS_409.has(code)) return 409;
+  if (STATUS_413.has(code)) return 413;
   return 502;
 }
 
@@ -103,9 +132,22 @@ export function isMutatingToolsOp(op) {
   return isToolsOp(op) && !READ_OPS.has(op);
 }
 
+/** An op /tools/call accepts: the Tools ops and the Actions ops (never `captures.file`). */
+export function isCallableOp(op) {
+  return typeof op === "string" && CALLABLE.has(op);
+}
+
+/** An op the Canvas control rule applies to: Tools mutations and Actions device ops. */
+export function isControlledOp(op) {
+  return typeof op === "string" && CONTROLLED.has(op);
+}
+
 function failure(status, errorCode, error, hint = null, capability = null) {
   return { status, body: { ok: false, error, error_code: errorCode, hint, capability } };
 }
+
+// Reply fields that are not part of the error envelope but say more about it (install reason...).
+const REPLY_EXTRAS = ["reason", "roots", "size", "limit"];
 
 const optionalText = (value) => (typeof value === "string" && value !== "" ? value : null);
 
@@ -116,9 +158,13 @@ export function toolsReplyResponse(message) {
     return { status: 200, body: { ok: true, result } };
   }
   const code = optionalText(message.error_code) ?? "backend_failed";
-  return failure(toolsErrorStatus(code), code,
+  const answer = failure(toolsErrorStatus(code), code,
     optionalText(message.error) ?? "The Canvas tools call failed",
     optionalText(message.hint), optionalText(message.capability));
+  for (const key of REPLY_EXTRAS) {
+    if (key in message && !(key in answer.body)) answer.body[key] = message[key];
+  }
+  return answer;
 }
 
 /** Calls `onGone` once, when the child's stdout has closed after its exit (or soon after it). */
@@ -183,9 +229,13 @@ export class ToolsClient {
     timeoutMs = TOOLS_CALL_TIMEOUT_MS,
     restartIntervalMs = TOOLS_RESTART_INTERVAL_MS,
     now = () => performance.now(),
+    opTimeoutsMs = OP_TIMEOUT_MS,
+    closeGraceMs = TOOLS_CLOSE_GRACE_MS,
   }) {
     this.spawnTools = spawnTools;
     this.timeoutMs = timeoutMs;
+    this.opTimeoutsMs = opTimeoutsMs ?? {};
+    this.closeGraceMs = closeGraceMs;
     this.restartIntervalMs = restartIntervalMs;
     this.now = now;
     this.child = null;
@@ -265,18 +315,25 @@ export class ToolsClient {
     return alive(this.child);
   }
 
+  /** How long a call of `op` may wait: its own limit (OP_TIMEOUT_MS) or the client's default. */
+  timeoutFor(op) {
+    const own = Object.hasOwn(this.opTimeoutsMs, op) ? this.opTimeoutsMs[op] : null;
+    return Number.isFinite(own) && own > 0 ? own : this.timeoutMs;
+  }
+
   call(op, payload, origin) {
     if (!this.ensureRunning()) return Promise.resolve(this.unavailable());
     const child = this.child;
     const id = ++this.nextId;
+    const timeoutMs = this.timeoutFor(op);
     return new Promise((resolvePromise) => {
       const timer = setTimeout(() => {
         // The process is not killed for one slow call; its late reply is dropped.
         if (this.pending.get(id)?.child !== child) return;
         this.pending.delete(id);
         resolvePromise(failure(504, "timeout",
-          `The Canvas tools call ${op} did not answer within ${Math.round(this.timeoutMs / 1000)} s`));
-      }, this.timeoutMs);
+          `The Canvas tools call ${op} did not answer within ${Math.round(timeoutMs / 1000)} s`));
+      }, timeoutMs);
       this.pending.set(id, { child, resolve: resolvePromise, timer });
       try {
         child.stdin.write(`${JSON.stringify({ id, op, payload, origin })}\n`);
@@ -294,7 +351,7 @@ export class ToolsClient {
       clearTimeout(waiter.timer);
       waiter.resolve(this.unavailable());
     }
-    await terminate(child);
+    await terminate(child, { graceMs: this.closeGraceMs });
   }
 }
 
@@ -566,15 +623,28 @@ export function createCanvasTools({
   idleMs,
   maxEntries,
   maxBytes,
+  installRoots = [],
+  capturesDir = null,
+  deviceId = null,
+  deviceName = null,
+  commandLog = null,
+  opTimeoutsMs,
 }) {
   const repoScripts = resolve(import.meta.dirname, "../../../../../scripts");
   const toolsScript = toolsPath ?? resolve(repoScripts, "autonom_canvas_tools.py");
   const autonomScript = autonomPath ?? resolve(repoScripts, "autonom.py");
+  // Only options that were given reach the process, so today's argv stays as it was.
+  const actionArgs = [
+    ...(installRoots ?? []).filter((root) => typeof root === "string" && root).flatMap((root) => ["--install-root", root]),
+    ...(capturesDir ? ["--captures-dir", capturesDir] : []),
+    ...(deviceName ? ["--device-name", deviceName] : []),
+  ];
   const client = new ToolsClient({
     spawnTools: () => spawn(python, [toolsScript, "--platform", platform, "--target", target,
-      "--tool", tool], { stdio: ["pipe", "pipe", "pipe"], env }),
+      "--tool", tool, ...actionArgs], { stdio: ["pipe", "pipe", "pipe"], env }),
     timeoutMs,
     restartIntervalMs,
+    opTimeoutsMs,
   });
   const targetFlag = platform === "ios" ? "--udid" : "--serial";
   const toolFlag = platform === "ios" ? "--simctl" : "--adb";
@@ -602,7 +672,7 @@ export function createCanvasTools({
   return {
     client,
     feed,
-    call: (op, payload, origin) => client.call(op, payload, origin),
+    call: (op, payload, origin) => loggedCall(client, commandLog, deviceId, op, payload, origin),
     status: () => ({ available: client.available(), logs: feed.status() }),
     async close() {
       await Promise.all([client.close(), feed.close()]);
@@ -610,8 +680,168 @@ export function createCanvasTools({
   };
 }
 
+/** The command-log summary of a tools call: names only, never contents; URLs as scheme+host. */
+export function callSummary(op, payload) {
+  const value = payload && typeof payload === "object" ? payload : {};
+  const text = (item) => (typeof item === "string" ? item.slice(0, 300) : null);
+  switch (op) {
+    case "app.open_url": {
+      const url = text(value.url);
+      if (!url) return null;
+      try {
+        const parsed = new URL(url);
+        const scheme = parsed.protocol.replace(/:$/, "");
+        return parsed.hostname ? `${scheme}://${parsed.hostname}` : `${scheme}:`;
+      } catch {
+        const scheme = /^([A-Za-z][A-Za-z0-9+.-]*):/.exec(url);
+        return scheme ? `${scheme[1]}:` : null;
+      }
+    }
+    case "app.launch": return text(value.app_id) ? `${text(value.app_id)}${value.fresh === true ? " (fresh)" : ""}` : null;
+    case "app.locale": return text(value.app_id) && text(value.locale) ? `${text(value.app_id)} ${text(value.locale)}` : null;
+    case "app.install": return text(value.path) ? basename(text(value.path)) : null;
+    case "captures.delete":
+    case "captures.file": return text(value.name);
+    default: return null;
+  }
+}
+
+function loggedCall(client, commandLog, deviceId, op, payload, origin) {
+  if (!commandLog || typeof commandLog.begin !== "function") return client.call(op, payload, origin);
+  let handle = null;
+  try {
+    handle = commandLog.begin({ device: deviceId, kind: "tools", name: op, origin, summary: callSummary(op, payload) });
+  } catch { /* the log never blocks a call */ }
+  return client.call(op, payload, origin).then((answer) => {
+    try {
+      const ok = answer.status < 400 && answer.body?.ok !== false;
+      handle?.end({ ok, errorCode: ok ? null : answer.body?.error_code ?? null, error: ok ? null : answer.body?.error ?? null });
+    } catch { /* idem */ }
+    return answer;
+  });
+}
+
 function badRequest(errorCode, error) {
   return failure(400, errorCode, error);
+}
+
+const RANGE = /^bytes=(\d*)-(\d*)$/;
+
+/** The byte range a single `Range: bytes=a-b` asks for: {start, end}, "unsatisfiable", or null for the whole file. */
+export function parseRange(header, size) {
+  if (typeof header !== "string" || !header) return null;
+  const match = RANGE.exec(header.trim());
+  if (!match) return null; // several ranges, or another unit: the whole file
+  const [, first, last] = match;
+  if (first === "" && last === "") return null;
+  let start;
+  let end;
+  if (first === "") {
+    const suffix = Number(last);
+    if (suffix === 0) return "unsatisfiable";
+    start = Math.max(0, size - suffix);
+    end = size - 1;
+  } else {
+    start = Number(first);
+    end = last === "" ? size - 1 : Math.min(Number(last), size - 1);
+    if (last !== "" && Number(last) < start) return null;
+  }
+  if (start >= size || size === 0) return "unsatisfiable";
+  return { start, end };
+}
+
+/** `Content-Disposition` for a capture: inline, its name, RFC 5987 `filename*` when not ASCII. */
+export function contentDisposition(name) {
+  const value = String(name);
+  const ascii = value.replace(/[^\x20-\x7e]/g, "_").replace(/["\\]/g, "_");
+  const plain = `inline; filename="${ascii}"`;
+  if (/^[\x20-\x7e]*$/.test(value)) return plain;
+  const encoded = encodeURIComponent(value).replace(/['()*]/g, (character) => `%${character.charCodeAt(0).toString(16).toUpperCase()}`);
+  return `${plain}; filename*=UTF-8''${encoded}`;
+}
+
+const CAPTURE_PREFIX = "/tools/captures/";
+
+async function sendCapture(tools, { url, origin, request, response }) {
+  if (!response) {
+    return failure(501, "unsupported_capability", "This Canvas cannot stream capture files here");
+  }
+  let name;
+  try {
+    name = decodeURIComponent(url.pathname.slice(CAPTURE_PREFIX.length));
+  } catch {
+    return badRequest("invalid_value", "The capture name is not valid");
+  }
+  if (!name || name.length > 255 || name.includes("/") || name.includes("\\") || name.startsWith(".")) {
+    return failure(404, "capture_not_found", "No capture with that name");
+  }
+  const answer = await tools.call("captures.file", { name }, origin);
+  if (answer.status !== 200) return answer;
+  const found = answer.body.result ?? {};
+  if (typeof found.path !== "string" || !["image/png", "video/mp4"].includes(found.content_type)) {
+    return failure(502, "backend_failed", "The capture lookup gave no file");
+  }
+  let handle;
+  try {
+    handle = await open(found.path, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+  } catch {
+    return failure(404, "capture_not_found", "The capture file is gone");
+  }
+  let size;
+  try {
+    const info = await handle.stat();
+    if (!info.isFile()) throw new Error("not a file");
+    size = info.size;
+  } catch {
+    await handle.close().catch(() => {});
+    return failure(404, "capture_not_found", "The capture file is gone");
+  }
+  const headers = {
+    "Content-Type": found.content_type,
+    "Cache-Control": "no-store",
+    "X-Content-Type-Options": "nosniff",
+    "Content-Disposition": contentDisposition(found.name ?? name),
+    "Content-Security-Policy": "default-src 'none'; sandbox",
+    "Accept-Ranges": "bytes",
+  };
+  const range = parseRange(request?.headers?.range, size);
+  if (range === "unsatisfiable") {
+    await handle.close().catch(() => {});
+    response.writeHead(416, { ...headers, "Content-Range": `bytes */${size}`, "Content-Length": "0" });
+    response.end();
+    return { handled: true };
+  }
+  const start = range ? range.start : 0;
+  const end = range ? range.end : size - 1;
+  const length = size === 0 ? 0 : end - start + 1;
+  response.writeHead(range ? 206 : 200, {
+    ...headers,
+    "Content-Length": String(length),
+    ...(range ? { "Content-Range": `bytes ${start}-${end}/${size}` } : {}),
+  });
+  if (length === 0 || request?.method === "HEAD") {
+    await handle.close().catch(() => {});
+    response.end();
+    return { handled: true };
+  }
+  await new Promise((resolvePromise) => {
+    const stream = createReadStream(null, { fd: handle.fd, start, end, autoClose: false });
+    const finish = () => {
+      handle.close().catch(() => {});
+      resolvePromise();
+    };
+    stream.on("error", () => {
+      response.destroy();
+      finish();
+    });
+    response.on("close", () => {
+      stream.destroy();
+      finish();
+    });
+    stream.on("end", () => response.end());
+    stream.pipe(response, { end: false });
+  });
+  return { handled: true };
 }
 
 function readInteger(raw, name, minimum, maximum, fallback) {
@@ -629,22 +859,22 @@ function readInteger(raw, name, minimum, maximum, fallback) {
  * authorization and CSRF. `readBody()` reads the JSON body (with the Canvas body limit);
  * `refusal(origin)` is the Canvas control rule, a message when input is refused.
  */
-export async function handleToolsRoute(tools, { method, url, origin, readBody, refusal }) {
+export async function handleToolsRoute(tools, { method, url, origin, readBody, refusal, request = null, response = null }) {
   try {
     if (method === "POST" && url.pathname === "/tools/call") {
       const body = await readBody();
       if (!body || typeof body !== "object" || Array.isArray(body)) {
         return badRequest("invalid_value", "The body must be a JSON object");
       }
-      if (!isToolsOp(body.op)) {
+      if (!isCallableOp(body.op)) {
         return badRequest("flow_command_invalid",
-          `Unknown tools op ${JSON.stringify(String(body.op ?? ""))}; valid ops: ${TOOLS_OPS.join(", ")}`);
+          `Unknown tools op ${JSON.stringify(String(body.op ?? ""))}; valid ops: ${CALLABLE_OPS.join(", ")}`);
       }
       const payload = body.payload ?? {};
       if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
         return badRequest("invalid_value", "payload must be a JSON object");
       }
-      if (isMutatingToolsOp(body.op)) {
+      if (isControlledOp(body.op)) {
         const refused = refusal(origin);
         if (refused) return failure(403, "control_refused", refused);
       }
@@ -670,6 +900,9 @@ export async function handleToolsRoute(tools, { method, url, origin, readBody, r
       }
       // Starting or stopping the feed is not a device mutation: no control check.
       return { status: 200, body: await tools.feed.set(body.active, packageName, match) };
+    }
+    if ((method === "GET" || method === "HEAD") && url.pathname.startsWith(CAPTURE_PREFIX)) {
+      return await sendCapture(tools, { url, origin, request, response });
     }
     return { status: 404, body: { error: "Not found" } };
   } catch (error) {

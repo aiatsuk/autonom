@@ -192,8 +192,9 @@ numbers.
 
 ```text
 Start `autonom session start --serial <serial> --app-id <app id>` (on iOS
-`--platform ios --udid <udid> --log-stream`), then `autonom canvas serve` on
-the same target and open the URL. Press Tools in the toolbar. On App, revoke
+`--platform ios --udid <udid> --log-stream`), then `autonom canvas serve
+--serial <serial>` (on iOS `--platform ios --udid <udid>`) for that same target
+and open the URL. Press Tools in the toolbar. On App, revoke
 the camera permission and set the location to a preset; on Android press
 Read back and say whether the fix was delivered or only requested. On
 Network, press Start capture, read the confirmation, confirm, Attach device,
@@ -203,6 +204,42 @@ capture. On Logs, filter to the app package and Warning level. Report each
 step's result line and any error code and hint; never paste request bodies
 or log text into the report.
 ```
+
+## Work on several devices in one Canvas workspace
+
+```text
+Run `autonom canvas` (no target: a workspace Canvas that starts with no device
+and keeps running until Ctrl+C or `autonom canvas stop`) and open the printed
+URL. In the empty tile press Attach on `emulator-5580`, choose layout 2 and
+attach the Simulator into the second tile. Each attached device gets its own
+Autonom session automatically, or reuses the live session already running on
+that target; `current.json` is never changed by the Canvas. Press + for a new
+tab, and in its picker press "Move here" on the Simulator (a device lives in
+one tab only). Use Ctrl+Alt+1..4 to focus a tile and Ctrl+Alt+Left/Right to
+switch tabs; only the focused tile streams at full rate. From a terminal,
+`autonom canvas list` shows the running Canvases and their tabs,
+`autonom canvas attach --serial <serial> [--tab <id or name>]` and
+`autonom canvas detach --serial <serial>` change the devices, and detaching
+ends only the sessions the Canvas started. Report each device's session id and
+whether it was reused.
+```
+
+Notes:
+- A second `autonom canvas` for the same workspace prints the running one's URL
+  (`already_running: true`) instead of starting another; `--workspace NAME`
+  keeps several apart, and `--ephemeral` keeps a workspace's tabs out of the
+  saved file.
+- Tabs and the devices attached at stop are saved per workspace, so a restart
+  brings the tabs back (`/c/<tab id>` links keep working) and attaches the
+  devices that are running again.
+- Screenshots and recordings from the Actions drawer go to
+  `~/Downloads/Autonom/<device>/` (`--captures-dir DIR` or
+  `AUTONOM_CAPTURES_DIR`); at 200 files or 2 GB per device the oldest are
+  deleted and the gallery says so. Installing a build works only from folders
+  named with `--install-root DIR` (repeatable); there is no upload.
+- `--bootable avd:NAME[@PORT]` or `--bootable simulator:UDID` lets the picker
+  boot a device; with `--shutdown-booted` the Canvas shuts down what it booted
+  when it stops. Pass `--port 0` for a free port.
 
 ## Tap one of several identical controls
 

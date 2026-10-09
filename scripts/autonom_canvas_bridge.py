@@ -4,8 +4,9 @@
 Canvas never actuates adb/idb directly.  Every input crosses this process,
 uses the same platform-neutral action functions as the CLI, and is journaled
 with an explicit human/agent/replay/system origin.  Journaling goes into the
-current Autonom session only when that session is on this Canvas's own
-target; a session on another device never receives this Canvas's actions.
+live Autonom session on this Canvas's own target (found by the target's
+session pointer, or `current.json` when that session is on this target); a
+session on another device never receives this Canvas's actions.
 
 The exceptions are the streamed transports: on scrcpy (Android) Canvas
 writes streamed input to the scrcpy control socket itself, and on idb (the iOS
@@ -225,18 +226,29 @@ def record_completed(record: dict[str, Any] | None, origin: str,
 
 
 def journal_session(target: Target) -> dict[str, Any] | None:
-    """The current session when it is on this Canvas's target, else None.
+    """The live session on this Canvas's own target, else None.
 
-    Canvas serves one target while the current session may be on another
-    device; journaling there would put this Canvas's actions into that other
-    device's record.  With None the action still runs and nothing is journaled.
+    Each Canvas device journals into its own session: the one whose target
+    pointer names this target (a session a workspace Canvas started beside the
+    primary), or `current.json`'s when it is on this target. A session on
+    another device never receives this Canvas's actions; with None the action
+    still runs and nothing is journaled.
+
+    A session that is not the current one is also selected for the rest of
+    this operation, so whatever the operation saves into it (a location fix,
+    a proxy) stays in that session and never replaces `current.json`.
     """
-    record = session.load_current()
-    if not record or record.get("target_id") != target.target_id:
-        return None
-    platform = record.get("platform")
-    if platform and platform != target.platform:
-        return None
+    record = session.live_for_target(target.target_id, target.platform)
+    current_id = None
+    if record is not None:
+        try:
+            current_id = session._current_id(None)
+        except Exception:  # noqa: BLE001 - an unreadable current.json names nothing
+            current_id = None
+    if record is not None and record.get("session_id") != current_id:
+        session.select(record.get("session_id"))
+    else:
+        session.select(None)
     return record
 
 

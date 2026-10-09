@@ -9,11 +9,13 @@ not create, because a user may be mid-investigation when they update (INV-02).
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import os
 import re
 import subprocess
 import tempfile
+import threading
 import time
 import uuid
 from contextvars import ContextVar
@@ -34,9 +36,22 @@ _SELECTED: ContextVar[str | None] = ContextVar("autonom_session", default=None)
 _SESSION_ID = re.compile(r"s_[A-Za-z0-9]+")
 
 
+# A session whose journal entries must never fall back to `current.json`
+# once it is stopped (see `journal_session`).
+_JOURNAL_ONLY: ContextVar[str | None] = ContextVar("autonom_journal_only", default=None)
+
+
 def select(session_id: str | None):
     """Bind the rest of this invocation to `session_id`; returns the reset token."""
     return _SELECTED.set(session_id)
+
+
+def keep_journal_in(session_id: str | None):
+    """This invocation's journal entry belongs to `session_id` alone: when
+    that session is stopped by the time the entry is written (a rolled-back
+    `session start --alongside`), the entry is dropped rather than written to
+    the machine's current session on another target. Returns the reset token."""
+    return _JOURNAL_ONLY.set(session_id)
 
 
 def load_by_id(session_id: str, cwd: Path | None = None) -> dict[str, Any]:
@@ -99,6 +114,7 @@ def new_record(
     artifacts_dir: Path,
     session_id: str,
     tooling: dict[str, Any] | None = None,
+    started_by: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     record: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
@@ -123,6 +139,9 @@ def new_record(
         "background": {"log_stream_pid": None, "recorder_pid": None},
         "streams": [],
         "consent_log": [],
+        # Who started the session: null for a person or an agent at the CLI,
+        # {"kind": "canvas", "port", "pid"} for a Canvas workspace.
+        "started_by": dict(started_by) if started_by else None,
     }
     if platform == "android":
         # DEC-004: `serial` and `adb` are permanent for Android callers.
@@ -196,37 +215,321 @@ def start_session(
     platform: str = "android",
     target_id: str | None = None,
     tooling: dict[str, Any] | None = None,
+    alongside: bool = False,
+    started_by: dict[str, Any] | None = None,
+    exclusive: bool = False,
 ) -> dict[str, Any]:
     """Create the artifact tree and the session record.
 
     `tool` and `serial` keep their 0.4.0 positions so existing callers and tests
     (which pass `start_session("adb", serial=...)`) are unaffected.
+
+    The creation and the new session's target pointer hold the target store
+    lock. With `exclusive` or `alongside` (the CLI passes `exclusive`) a live
+    session on the target is checked under that same lock, so two starts
+    racing on one target cannot both win: the loser is refused with
+    `session_already_active` (extras `session_id`, `target_id`, `started_by`).
+    Without either, a library caller keeps the old behaviour (no check; the
+    pointer names the newest session). With `alongside` the session never
+    becomes the machine's current one (`current.json` is left as it is).
     """
     resolved_id = target_id or serial
     if not resolved_id:
         raise errors.AutonomError(errors.NO_TARGET, "a target id is required to start a session")
-    session_id = f"s_{uuid.uuid4().hex[:10]}"
-    root = artifacts_root(cwd) / session_id
-    for name in ("shots", "trees", "logs", "network", "recordings", "crashes",
-                 "files", "output"):
-        (root / name).mkdir(parents=True, exist_ok=True)
+    with _targets_lock(cwd):
+        live = live_for_target(resolved_id, platform, cwd) if (exclusive or alongside) else None
+        if live is not None:
+            live_target = live.get("target_id") or live.get("serial")
+            raise errors.AutonomError(
+                errors.SESSION_ALREADY_ACTIVE,
+                f"session {live.get('session_id')} is still active on {live_target}",
+                f"Stop it first with 'autonom session stop' (it clears the session on "
+                f"{live_target} even if that target is gone), then start the new one.",
+                session_id=live.get("session_id"),
+                target_id=live_target,
+                started_by=live.get("started_by"),
+            )
+        session_id = f"s_{uuid.uuid4().hex[:10]}"
+        root = artifacts_root(cwd) / session_id
+        for name in ("shots", "trees", "logs", "network", "recordings", "crashes",
+                     "files", "output"):
+            (root / name).mkdir(parents=True, exist_ok=True)
 
-    resolved_tooling = dict(tooling or {})
-    if platform == "android":
-        resolved_tooling.setdefault("adb", tool)
-    else:
-        resolved_tooling.setdefault("simctl", tool)
+        resolved_tooling = dict(tooling or {})
+        if platform == "android":
+            resolved_tooling.setdefault("adb", tool)
+        else:
+            resolved_tooling.setdefault("simctl", tool)
 
-    record = new_record(
-        platform=platform,
-        target_id=resolved_id,
-        app_id=app_id,
-        artifacts_dir=root,
-        session_id=session_id,
-        tooling=resolved_tooling,
-    )
-    save(record, cwd)
+        record = new_record(
+            platform=platform,
+            target_id=resolved_id,
+            app_id=app_id,
+            artifacts_dir=root,
+            session_id=session_id,
+            tooling=resolved_tooling,
+            started_by=started_by,
+        )
+        if alongside:
+            # Bound to the new session for its own save: `save` then leaves
+            # `current.json` alone. The caller's selection is restored after.
+            token = select(session_id)
+            try:
+                save(record, cwd)
+            finally:
+                _SELECTED.reset(token)
+        else:
+            save(record, cwd)
+        _write_target_pointer(record, cwd)
     return record
+
+
+# --- target pointers -----------------------------------------------------------
+#
+# One small file per target names the live session on it, so a command given
+# `--serial X` (or a Canvas tile on X) finds the session X belongs to even
+# when `current.json` names a session on another device. The pointer is never
+# a copy of the record: the record in the session directory stays the truth.
+#
+# The pointers are plain files directly in the session store, next to
+# `current.json`, never a subdirectory: the store's subdirectories are the
+# sessions themselves, and tools (and tests) count them as such.
+
+TARGET_POINTER_PREFIX = "target-"
+TARGETS_LOCK = ".target-pointers.lock"
+TARGET_POINTER_SCHEMA = 1
+_UNSAFE_TARGET_CHARS = re.compile(r"[^A-Za-z0-9._-]")
+
+
+def _safe_target(target_id: str) -> str:
+    """The target id as a file name part. An id that had to be changed
+    (`127.0.0.1:5555`, or one longer than 128 characters) also carries a
+    short hash of the exact id, so two different targets never share a
+    pointer file (`127.0.0.1:5555` and `127.0.0.1_5555`)."""
+    raw = str(target_id)
+    safe = _UNSAFE_TARGET_CHARS.sub("_", raw)[:128]
+    if safe == raw:
+        return safe
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
+    return f"{safe[:115]}-{digest}"
+
+
+def target_pointer_path(platform: str, target_id: str, cwd: Path | None = None) -> Path:
+    """`<store>/target-<platform>__<safe target>.json`; nothing is created."""
+    platform_part = _UNSAFE_TARGET_CHARS.sub("_", platform or "android")[:16]
+    return artifacts_root(cwd) / (
+        f"{TARGET_POINTER_PREFIX}{platform_part}__{_safe_target(target_id)}.json")
+
+
+# The target lock is re-entrant within one thread: `start_session` holds it
+# while `live_for_target` (which takes it to drop a stale pointer) runs. A
+# second flock on a new descriptor of the same file would wait for itself.
+_TARGETS_LOCK_HELD = threading.local()
+
+
+@contextlib.contextmanager
+def _targets_lock(cwd: Path | None = None):
+    """The store-wide lock around "is a session live on this target", the
+    creation of one and every change of a pointer file: an exclusive flock on
+    a lock file beside the pointers."""
+    if fcntl is None:  # pragma: no cover - Windows
+        yield
+        return
+    path = str(artifacts_root(cwd) / TARGETS_LOCK)
+    held: dict[str, int] = getattr(_TARGETS_LOCK_HELD, "paths", None) or {}
+    _TARGETS_LOCK_HELD.paths = held
+    if held.get(path):
+        held[path] += 1
+        try:
+            yield
+        finally:
+            held[path] -= 1
+        return
+    descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        held[path] = 1
+        try:
+            yield
+        finally:
+            held.pop(path, None)
+    finally:
+        os.close(descriptor)  # releases the lock
+
+
+def _write_target_pointer(record: dict[str, Any], cwd: Path | None = None) -> None:
+    platform = record.get("platform") or "android"
+    target_id = record.get("target_id") or record.get("serial") or ""
+    if not target_id:
+        return
+    path = target_pointer_path(platform, target_id, cwd)
+    payload = {"schema": TARGET_POINTER_SCHEMA, "session_id": record.get("session_id"),
+               "platform": platform, "target_id": target_id,
+               "started_at": record.get("started_at")}
+    with contextlib.suppress(OSError):
+        os.chmod(path.parent, 0o700)
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp",
+                                             dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(temporary)
+        raise
+
+
+def _read_target_pointer(path: Path) -> dict[str, Any] | None:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _forget_target_pointer(record: dict[str, Any], cwd: Path | None = None) -> None:
+    """Delete the pointer of `record`'s target, but only while it names this
+    session: a newer session on the same target keeps its own pointer."""
+    target_id = record.get("target_id") or record.get("serial")
+    if not target_id:
+        return
+    path = target_pointer_path(record.get("platform") or "android", target_id, cwd)
+    # Read and delete under the target lock: a start on the same target that
+    # writes its own pointer in between is never undone by this stop.
+    with _targets_lock(cwd):
+        pointer = _read_target_pointer(path)
+        if pointer is not None and pointer.get("session_id") == record.get("session_id"):
+            with contextlib.suppress(OSError):
+                path.unlink()
+
+
+def _drop_stale_pointer(path: Path, seen: dict[str, Any], target_id: str,
+                        platform: str, cwd: Path | None) -> None:
+    """Delete the pointer at `path` (best effort) when, under the target lock,
+    it is still the stale one that was read: the same session id, on
+    `target_id`. A pointer rewritten meanwhile (a new session on the target)
+    is kept."""
+    try:
+        with _targets_lock(cwd):
+            again = _read_target_pointer(path)
+            if again is None or again != seen:
+                return
+            if again and (again.get("target_id") != target_id
+                          or (again.get("platform") or platform) != platform):
+                return
+            if again:
+                session_id = again.get("session_id")
+                record = None
+                if isinstance(session_id, str):
+                    try:
+                        record = load_by_id(session_id, cwd)
+                    except (errors.AutonomError, OSError, ValueError):
+                        record = None
+                if _is_live_on(record, target_id, platform):
+                    return
+            path.unlink()
+    except OSError:
+        pass
+
+
+def _is_live_on(record: dict[str, Any] | None, target_id: str,
+                platform: str | None) -> bool:
+    if not record or record.get("stopped_at"):
+        return False
+    if (record.get("target_id") or record.get("serial")) != target_id:
+        return False
+    return platform is None or (record.get("platform") or "android") == platform
+
+
+def live_for_target(target_id: str, platform: str | None = None,
+                    cwd: Path | None = None) -> dict[str, Any] | None:
+    """The live session on `target_id` (and `platform` when given), or None.
+
+    Read from the target's pointer. A pointer that names another target is
+    not this target's (it is left alone). A pointer of this target whose
+    session is gone, stopped or on another target is stale and deleted (best
+    effort, under the target lock, and only while it still names that
+    session). A session started before pointers existed is still found
+    through `current.json`. When `current.json` names the same session, a
+    stop recorded in either copy counts: that session is not live."""
+    if not target_id:
+        return None
+    try:
+        current = _load_pointer(cwd)
+    except Exception:  # noqa: BLE001 - an unreadable current.json names nothing
+        current = None
+    if not isinstance(current, dict):
+        current = None
+    platforms = [platform] if platform else ["android", "ios"]
+    for candidate in platforms:
+        path = target_pointer_path(candidate, target_id, cwd)
+        pointer = _read_target_pointer(path)
+        if pointer is None:
+            continue
+        if pointer and (pointer.get("target_id") != target_id
+                        or (pointer.get("platform") or candidate) != candidate):
+            # Another target's file (or a hand-made one): not ours to judge.
+            continue
+        record = None
+        session_id = pointer.get("session_id")
+        if isinstance(session_id, str):
+            try:
+                record = load_by_id(session_id, cwd)
+            except (errors.AutonomError, OSError, ValueError):
+                record = None
+        if _is_live_on(record, target_id, candidate):
+            if (current is not None and current.get("session_id") == session_id
+                    and current.get("stopped_at")):
+                return None
+            return record
+        _drop_stale_pointer(path, pointer, target_id, candidate, cwd)
+    if _is_live_on(current, target_id, platform):
+        return current
+    return None
+
+
+def live_sessions(cwd: Path | None = None) -> list[dict[str, Any]]:
+    """Every live session the store points at (the target pointers and
+    `current.json`), oldest first, each with `primary`: True for the one
+    `current.json` names. Old records nobody points at are not listed."""
+    root = artifacts_root(cwd)
+    try:
+        current_id = _current_id(cwd)
+    except Exception:  # noqa: BLE001 - an unreadable pointer names nothing
+        current_id = None
+    found: dict[str, dict[str, Any]] = {}
+    # `started_at` has whole seconds; the pointer's own write time (written
+    # once, at the start) orders sessions started within the same second.
+    written: dict[str, int] = {}
+    for path in sorted(root.glob(f"{TARGET_POINTER_PREFIX}*.json")):
+        pointer = _read_target_pointer(path) or {}
+        session_id = pointer.get("session_id")
+        target_id = pointer.get("target_id")
+        if not isinstance(session_id, str) or not isinstance(target_id, str):
+            continue
+        record = live_for_target(target_id, pointer.get("platform"), cwd)
+        if record and record.get("session_id") == session_id:
+            found[session_id] = record
+            with contextlib.suppress(OSError):
+                written[session_id] = path.stat().st_mtime_ns
+    if current_id and current_id not in found:
+        try:
+            current = _load_pointer(cwd)
+        except Exception:  # noqa: BLE001 - an unreadable current.json names nothing
+            current = None
+        if current and not current.get("stopped_at"):
+            found[current_id] = current
+    listed = []
+    for session_id, record in found.items():
+        listed.append({**record, "primary": session_id == current_id})
+    listed.sort(key=lambda item: (str(item.get("started_at") or ""),
+                                  written.get(str(item.get("session_id")), 0),
+                                  str(item.get("session_id") or "")))
+    return listed
 
 
 def _write_atomic(path: Path, payload: str) -> None:
@@ -408,8 +711,14 @@ def clear_stopping(record: dict[str, Any], token: str,
     _set_stopping(record, remove=token, cwd=cwd)
 
 
-def stop_session(cwd: Path | None = None, *, reap: bool = True) -> dict[str, Any] | None:
-    """Mark the current session stopped and clear the pointer.
+def stop_session(cwd: Path | None = None, *, reap: bool = True,
+                 session_id: str | None = None) -> dict[str, Any] | None:
+    """Mark a session stopped and clear its pointers.
+
+    The session is `session_id` when given, else the selected or current one
+    as before. Its target pointer is deleted; `current.json` is unlinked only
+    when it names this session. Nothing is promoted: when the current session
+    stops, `current.json` is gone even if sessions on other targets stay live.
 
     With `reap` (the default), every process the machine registry records as
     this session's — the iOS log-stream writer, a `canvas serve` pair, an
@@ -420,9 +729,18 @@ def stop_session(cwd: Path | None = None, *, reap: bool = True) -> dict[str, Any
     must not outlive the session it served.
     """
     current = artifacts_root(cwd) / "current.json"
-    record = load_current(cwd)
+    record = load_by_id(session_id, cwd) if session_id else load_current(cwd)
     if not record:
         return None
+    if record.get("stopped_at"):
+        # Already stopped: only its pointers are left to clear.
+        directory = Path(record["artifacts_dir"])
+        directory.mkdir(parents=True, exist_ok=True)
+        with _record_lock(directory):
+            if _current_id(cwd) == record.get("session_id"):
+                current.unlink(missing_ok=True)
+        _forget_target_pointer(record, cwd)
+        return record
     record["stopped_at"] = _now()
     if reap:
         teardown = reap_owned_processes(record)
@@ -436,6 +754,7 @@ def stop_session(cwd: Path | None = None, *, reap: bool = True) -> dict[str, Any
                       json.dumps(record, indent=2, ensure_ascii=False) + "\n")
         if _current_id(cwd) == record.get("session_id"):
             current.unlink(missing_ok=True)
+    _forget_target_pointer(record, cwd)
     return record
 
 
@@ -460,9 +779,12 @@ def journal_session(cwd: Path | None = None) -> dict[str, Any] | None:
     A session that has stopped is read-only: `--session-id` may name one for
     reading, but nothing is ever appended to its timeline after the stop. The
     entry then goes where it always went, the machine's current session (or
-    nowhere when there is none)."""
+    nowhere when there is none), unless the invocation keeps its journal in
+    that stopped session alone (`keep_journal_in`): then it goes nowhere."""
     record = load_current(cwd)
     if record and record.get("stopped_at"):
+        if record.get("session_id") == _JOURNAL_ONLY.get():
+            return None
         return _load_pointer(cwd)
     return record
 

@@ -128,6 +128,7 @@ test("screenrecordMaxSize never passes 0 to the screenrecord path", () => {
 
 test("tokens, keycodes, and conservative text encoding", () => {
   assert.ok(generateToken().length >= 24);
+  for (let i = 0; i < 500; i += 1) assert.ok(!generateToken(3).startsWith("-"));
   assert.equal(isSafeKeyCode("KEYCODE_BACK"), true);
   assert.equal(isSafeKeyCode("KEYCODE_UNKNOWN_INJECTION"), false);
   assert.equal(encodeAdbText("hello world"), "hello%sworld");
@@ -207,4 +208,90 @@ test("control messages are validated strictly and keep only known fields", () =>
   for (const [raw, type] of rejects) {
     assert.throws(() => parseControlMessage(raw), (error) => error.for === type, raw.slice(0, 60));
   }
+});
+
+// Workspace and multi-device options (contract 3.5); appended, the tests above are unchanged.
+test("parseArgs: no device flags is the single-device Canvas, as before", () => {
+  const options = parseArgs([]);
+  assert.equal(options.mode, "single");
+  assert.deepEqual(options.devices, []);
+  assert.equal(options.workspace, undefined);
+  assert.equal(parseArgs(["--serial", "emulator-5580"]).mode, "single");
+});
+
+test("parseArgs: one --device stands for --platform and --target", () => {
+  const android = parseArgs(["--device", "android:127.0.0.1:5555"]);
+  assert.equal(android.mode, "single");
+  assert.equal(android.platform, "android");
+  assert.equal(android.target, "127.0.0.1:5555");
+  const ios = parseArgs(["--device", "ios:45A342A1-AA2F-4F40-8EFD-F0D0C590ECE5"]);
+  assert.equal(ios.platform, "ios");
+  assert.equal(ios.target, "45A342A1-AA2F-4F40-8EFD-F0D0C590ECE5");
+  assert.throws(() => parseArgs(["--platform", "ios", "--device", "android:x"]), /does not match/);
+});
+
+test("parseArgs: --workspace, --split or two --device select the workspace", () => {
+  const two = parseArgs(["--device", "android:emulator-5580", "--device", "ios:45A342A1-AA2F-4F40-8EFD-F0D0C590ECE5"]);
+  assert.equal(two.mode, "workspace");
+  assert.equal(two.workspace, "default");
+  assert.deepEqual(two.devices, [{ platform: "android", target: "emulator-5580" },
+    { platform: "ios", target: "45A342A1-AA2F-4F40-8EFD-F0D0C590ECE5" }]);
+  assert.equal(parseArgs(["--split"]).workspace, "default");
+  const named = parseArgs(["--workspace", "qa.run-1", "--ephemeral", "--device", "android:emulator-5580"]);
+  assert.equal(named.mode, "workspace");
+  assert.equal(named.workspace, "qa.run-1");
+  assert.equal(named.ephemeral, true);
+  assert.deepEqual(named.devices, [{ platform: "android", target: "emulator-5580" }]);
+  assert.equal(named.target, undefined, "a workspace --device is not the single target");
+});
+
+test("parseArgs: device flags are validated", () => {
+  for (const value of ["emulator-5580", "windows:x", "android:", "android:a b", `android:${"x".repeat(129)}`]) {
+    assert.throws(() => parseArgs(["--device", value]), /--device must be/, value);
+  }
+  assert.throws(() => parseArgs(["--device", "android:a", "--device", "android:a"]), /same device twice/);
+  const nine = Array.from({ length: 9 }, (_, i) => ["--device", `android:emulator-${5554 + 2 * i}`]).flat();
+  assert.throws(() => parseArgs(nine), /at most 8/);
+  assert.throws(() => parseArgs(["--serial", "x", "--device", "android:y"]), /cannot be combined/);
+  assert.throws(() => parseArgs(["--target", "x", "--device", "android:y"]), /cannot be combined/);
+  assert.throws(() => parseArgs(["--serial", "x", "--split"]), /single-device Canvas/);
+  for (const name of ["", "a/b", "x".repeat(41), "a b"]) {
+    assert.throws(() => parseArgs(["--workspace", name]), name === "" ? /Pass a value|--workspace/ : /--workspace must be/);
+  }
+  assert.throws(() => parseArgs(["--device"]), /Pass a value after --device/);
+});
+
+test("parseArgs: --bootable, --shutdown-booted, --install-root and --captures-dir", () => {
+  const options = parseArgs(["--split", "--bootable", "avd:Autonom_Split2_API36@5586", "--bootable", "avd:Pixel",
+    "--bootable", "simulator:45A342A1-AA2F-4F40-8EFD-F0D0C590ECE5", "--shutdown-booted",
+    "--install-root", "/src/app/build", "--install-root", "/src/other", "--captures-dir", "/tmp/captures"]);
+  assert.deepEqual(options.bootable, [
+    { kind: "avd", name: "Autonom_Split2_API36", port: 5586, udid: null },
+    { kind: "avd", name: "Pixel", port: null, udid: null },
+    { kind: "simulator", name: null, port: null, udid: "45A342A1-AA2F-4F40-8EFD-F0D0C590ECE5" },
+  ]);
+  assert.equal(options.shutdownBooted, true);
+  assert.deepEqual(options.installRoots, ["/src/app/build", "/src/other"]);
+  assert.equal(options.capturesDir, "/tmp/captures");
+  assert.deepEqual(parseArgs([]).installRoots, []);
+  // The single-device Canvas takes install roots and the captures folder too.
+  assert.deepEqual(parseArgs(["--serial", "x", "--install-root", "/a"]).installRoots, ["/a"]);
+  for (const value of ["avd:", "avd:a@5555", "avd:a@5684", "avd:a@55860", "avd:a b", "avd:a@5586@1",
+    "simulator:nope", "floppy:x"]) {
+    assert.throws(() => parseArgs(["--split", "--bootable", value]), /--bootable/, value);
+  }
+  const nine = Array.from({ length: 9 }, (_, i) => ["--bootable", `avd:A${i}`]).flat();
+  assert.throws(() => parseArgs(["--split", ...nine]), /at most 8/);
+  assert.throws(() => parseArgs(["--bootable", "avd:Pixel"]), /needs a workspace/);
+  assert.throws(() => parseArgs(["--shutdown-booted"]), /needs a workspace/);
+  assert.throws(() => parseArgs(["--ephemeral"]), /needs a workspace/);
+});
+
+test("a token starting with a dash passes as --token=VALUE", () => {
+  // Before: "--token=..." was an unknown flag, and "--token" "--x" was refused as missing.
+  assert.equal(parseArgs(["--token=--dash-token_1"]).token, "--dash-token_1");
+  assert.equal(parseArgs(["--token=-d"]).token, "-d");
+  assert.equal(parseArgs(["--token=a=b"]).token, "a=b");
+  assert.equal(parseArgs(["--token", "plain"]).token, "plain");
+  assert.throws(() => parseArgs(["--token="]), /Pass a value after --token/);
 });

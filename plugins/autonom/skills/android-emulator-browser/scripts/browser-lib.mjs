@@ -6,6 +6,7 @@
 import { randomBytes } from "node:crypto";
 
 import { ANDROID_KEYCODES } from "./scrcpy-lib.mjs";
+import { DEVICE_ID_PATTERN, MAX_DEVICES } from "./canvas-devices.mjs";
 
 export const DEFAULT_PORT = 3277;
 export const DEFAULT_FPS = 15;
@@ -96,8 +97,15 @@ const ASCII_TEXT = /^[A-Za-z0-9 ._@:/,+\-=!?]*$/;
 const SOI = Buffer.from([0xff, 0xd8]);
 const EOI = Buffer.from([0xff, 0xd9]);
 
+/**
+ * A random base64url token that never starts with "-": a token is passed on command
+ * lines, where a leading "-" reads as an option to argparse and to parseArgs below.
+ */
 export function generateToken(bytes = 24) {
-  return randomBytes(bytes).toString("base64url");
+  for (;;) {
+    const token = randomBytes(bytes).toString("base64url");
+    if (!token.startsWith("-")) return token;
+  }
 }
 
 export function clamp(value, minimum, maximum) {
@@ -123,6 +131,50 @@ function asInt(flag, raw) {
   return n;
 }
 
+// Workspace and multi-device options (contract 3.5).
+export const MAX_BOOTABLE = 8;
+export const WORKSPACE_NAME = /^[A-Za-z0-9._-]{1,40}$/;
+const AVD_NAME = /^[A-Za-z0-9._-]{1,100}$/;
+const SIMULATOR_UDID = /^[0-9A-Fa-f-]{36}$/;
+const EMULATOR_PORT_MIN = 5554;
+const EMULATOR_PORT_MAX = 5682;
+
+/** `--device PLATFORM:ID`: {platform, target}; the id rule is the Canvas device id's. */
+export function parseDeviceSpec(value) {
+  const text = String(value);
+  const colon = text.indexOf(":");
+  const platform = colon < 0 ? "" : text.slice(0, colon);
+  const target = colon < 0 ? "" : text.slice(colon + 1);
+  if (!DEVICE_ID_PATTERN.test(`${platform}~${target}`)) {
+    throw new Error("--device must be android:<adb serial> or ios:<Simulator UDID> " +
+      "(letters, digits, . _ : - up to 128 characters).");
+  }
+  return { platform, target };
+}
+
+/** `--bootable avd:NAME[@PORT]` or `--bootable simulator:UDID`. */
+export function parseBootableSpec(value) {
+  const text = String(value);
+  if (text.startsWith("avd:")) {
+    const [name, port, extra] = text.slice(4).split("@");
+    if (extra !== undefined || !AVD_NAME.test(name)) {
+      throw new Error("--bootable avd:NAME needs an AVD name of 1-100 letters, digits, . _ -, optionally @PORT.");
+    }
+    if (port === undefined) return { kind: "avd", name, port: null, udid: null };
+    const number = /^\d{4}$/.test(port) ? Number(port) : Number.NaN;
+    if (!Number.isInteger(number) || number < EMULATOR_PORT_MIN || number > EMULATOR_PORT_MAX || number % 2) {
+      throw new Error(`--bootable avd:NAME@PORT needs an even port from ${EMULATOR_PORT_MIN} to ${EMULATOR_PORT_MAX}.`);
+    }
+    return { kind: "avd", name, port: number, udid: null };
+  }
+  if (text.startsWith("simulator:")) {
+    const udid = text.slice(10);
+    if (!SIMULATOR_UDID.test(udid)) throw new Error("--bootable simulator:UDID needs a 36-character Simulator UDID.");
+    return { kind: "simulator", name: null, port: null, udid };
+  }
+  throw new Error("--bootable must be avd:NAME[@PORT] or simulator:UDID.");
+}
+
 export function parseArgs(argv) {
   const options = {
     platform: "android",
@@ -132,10 +184,19 @@ export function parseArgs(argv) {
     bitRate: DEFAULT_BIT_RATE,
     transport: "auto",
     noAuth: false,
+    devices: [],
+    bootable: [],
+    installRoots: [],
   };
 
   for (let i = 0; i < argv.length; i += 1) {
     const flag = argv[i];
+    // `--token=VALUE` carries any value, one starting with "-" too (the CLI passes it so).
+    if (typeof flag === "string" && flag.startsWith("--token=")) {
+      options.token = flag.slice("--token=".length);
+      if (options.token === "") throw new Error("Pass a value after --token.");
+      continue;
+    }
     switch (flag) {
       case "--help":
       case "-h":
@@ -150,6 +211,7 @@ export function parseArgs(argv) {
         break;
       case "--platform":
         options.platform = requireFlagValue(argv, ++i, flag);
+        options.platformExplicit = true;
         break;
       case "--adb":
         options.adb = requireFlagValue(argv, ++i, flag);
@@ -208,6 +270,30 @@ export function parseArgs(argv) {
       case "--no-auth":
         options.noAuth = true;
         break;
+      case "--device":
+        options.devices.push(parseDeviceSpec(requireFlagValue(argv, ++i, flag)));
+        break;
+      case "--split":
+        options.split = true;
+        break;
+      case "--workspace":
+        options.workspace = requireFlagValue(argv, ++i, flag);
+        break;
+      case "--ephemeral":
+        options.ephemeral = true;
+        break;
+      case "--bootable":
+        options.bootable.push(parseBootableSpec(requireFlagValue(argv, ++i, flag)));
+        break;
+      case "--shutdown-booted":
+        options.shutdownBooted = true;
+        break;
+      case "--install-root":
+        options.installRoots.push(requireFlagValue(argv, ++i, flag));
+        break;
+      case "--captures-dir":
+        options.capturesDir = requireFlagValue(argv, ++i, flag);
+        break;
       default:
         throw new Error(`Unknown argument: ${flag}`);
     }
@@ -238,6 +324,7 @@ export function parseArgs(argv) {
   if (!TRANSPORTS.has(options.transport)) {
     throw new Error("--transport must be auto, scrcpy, screenrecord, or screencap (or idb on the iOS Simulator).");
   }
+  checkCanvasMode(options);
   if (options.scrcpyVersion !== undefined) {
     if (!VERSION_TEXT.test(options.scrcpyVersion)) {
       throw new Error("--scrcpy-version must look like 4.1.");
@@ -247,6 +334,49 @@ export function parseArgs(argv) {
     }
   }
   return options;
+}
+
+/**
+ * Mode selection (contract 3.1): a workspace with --workspace, --split or two or more
+ * --device; otherwise the single-device Canvas of before, where one --device stands for
+ * --platform and --target. Sets `mode` and, in workspace mode, `workspace`.
+ */
+function checkCanvasMode(options) {
+  const { devices } = options;
+  if (devices.length > MAX_DEVICES) throw new Error(`--device may be given at most ${MAX_DEVICES} times.`);
+  const ids = new Set(devices.map(({ platform, target }) => `${platform}~${target}`));
+  if (ids.size !== devices.length) throw new Error("--device names the same device twice.");
+  if (devices.length && (options.serial !== undefined || options.target !== undefined)) {
+    throw new Error("--device cannot be combined with --serial or --target.");
+  }
+  if (options.workspace !== undefined && !WORKSPACE_NAME.test(options.workspace)) {
+    throw new Error("--workspace must be 1-40 letters, digits, . _ or -.");
+  }
+  if (options.bootable.length > MAX_BOOTABLE) throw new Error(`--bootable may be given at most ${MAX_BOOTABLE} times.`);
+  const workspace = options.workspace !== undefined || options.split === true || devices.length >= 2;
+  if (workspace && (options.serial !== undefined || options.target !== undefined)) {
+    throw new Error("--serial and --target select the single-device Canvas; use --device in a workspace.");
+  }
+  if (!workspace) {
+    for (const flag of ["ephemeral", "shutdownBooted"]) {
+      if (options[flag]) throw new Error(`--${flag === "ephemeral" ? "ephemeral" : "shutdown-booted"} needs a workspace Canvas (--workspace, --split or two --device).`);
+    }
+    if (options.bootable.length) throw new Error("--bootable needs a workspace Canvas (--workspace, --split or two --device).");
+  }
+  if (workspace) {
+    options.mode = "workspace";
+    options.workspace ??= "default";
+    return;
+  }
+  options.mode = "single";
+  if (devices.length === 1) {
+    const [only] = devices;
+    if (options.platformExplicit && options.platform !== only.platform) {
+      throw new Error("--platform does not match the platform of --device.");
+    }
+    options.platform = only.platform;
+    options.target = only.target;
+  }
 }
 
 /**

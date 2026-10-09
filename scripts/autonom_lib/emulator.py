@@ -12,20 +12,32 @@ the wrong kind of surprise anyway.
 """
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 import shutil
+import socket
 import subprocess
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Iterator
 
 from . import adb as adb_mod
 from . import errors
 from . import processes
 
+try:  # POSIX (macOS, Linux: every platform Autonom runs on); absent on Windows
+    import fcntl
+except ImportError:  # pragma: no cover
+    fcntl = None  # type: ignore[assignment]
+
 AVD_NAME = re.compile(r"^[A-Za-z0-9._-]+$")
 EMULATOR_SERIAL = re.compile(r"^emulator-\d+$")
+# The even console ports an emulator may take (adb port = console port + 1).
+EMULATOR_PORTS = range(5554, 5683, 2)
+# One boot at a time picks its serial: `<state base>/locks/emulator-boot.lock`.
+BOOT_LOCK = "emulator-boot.lock"
+BOOT_LOCK_POLL = 0.1
 
 
 def find_emulator(explicit: str | None = None, *, adb_path: str | None = None) -> str:
@@ -204,6 +216,166 @@ def proxy_routing(serial: str) -> str | None:
     return None
 
 
+def boot_lock_path() -> Path:
+    """`<state base>/locks/emulator-boot.lock`, its directory private (0700).
+    The state base is the process registry's (`processes.registry_dir()`)."""
+    directory = processes.registry_dir().parent / "locks"
+    directory.mkdir(parents=True, exist_ok=True)
+    with contextlib.suppress(OSError):
+        os.chmod(directory, 0o700)
+    return directory / BOOT_LOCK
+
+
+def _acquire_boot_lock(timeout: float) -> Callable[[], None]:
+    """Take the machine's boot lock within `timeout` seconds; returns the
+    release function (idempotent). Timing out is `boot_timeout` with
+    `waiting_for: "boot_lock"`: another boot is still picking its serial."""
+    if fcntl is None:  # pragma: no cover - Windows
+        return lambda: None
+    path = boot_lock_path()
+    descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    while True:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                os.close(descriptor)
+                raise errors.AutonomError(
+                    errors.BOOT_TIMEOUT,
+                    f"another emulator boot held the boot lock for more than {timeout:g}s",
+                    "Another 'devices boot' is still choosing its serial; wait for it, "
+                    "or re-run with a larger --timeout.",
+                    waiting_for="boot_lock",
+                ) from None
+            time.sleep(BOOT_LOCK_POLL)
+    released = False
+
+    def release() -> None:
+        nonlocal released
+        if not released:
+            released = True
+            os.close(descriptor)  # releases the lock
+
+    return release
+
+
+@contextlib.contextmanager
+def boot_lock(timeout: float) -> Iterator[None]:
+    """Hold the machine's emulator boot lock (flock) for the block.
+
+    Raises `boot_timeout` (extra `waiting_for: "boot_lock"`) when it cannot be
+    taken within `timeout` seconds."""
+    release = _acquire_boot_lock(timeout)
+    try:
+        yield
+    finally:
+        release()
+
+
+def running_avds(adb_path: str) -> dict[str, str]:
+    """AVD name -> serial of every running emulator (`emulator-*` in state
+    `device`) whose console names its AVD. Best-effort per emulator."""
+    found: dict[str, str] = {}
+    for device in adb_mod.list_devices(adb_path):
+        if device.state != "device" or not EMULATOR_SERIAL.match(device.serial):
+            continue
+        name = running_avd_name(adb_path, device.serial)
+        if name and name not in found:
+            found[name] = device.serial
+    return found
+
+
+def _port_of(serial: str | None) -> int | None:
+    if serial and EMULATOR_SERIAL.match(serial):
+        return int(serial.rsplit("-", 1)[1])
+    return None
+
+
+def _loopback_port_free(port: int) -> bool:
+    """Whether an emulator could take `port` on loopback: nothing listens
+    there (a connect is refused) and it can be bound. SO_REUSEADDR as the
+    emulator binds: a port left in TIME_WAIT by an emulator that just
+    stopped is free, a port something listens on is not."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.settimeout(0.5)
+        try:
+            probe.connect(("127.0.0.1", port))
+        except OSError:
+            pass
+        else:
+            return False
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            probe.bind(("127.0.0.1", port))
+        except OSError:
+            return False
+    return True
+
+
+def _launching_on(port: int) -> int | None:
+    """The pid of an emulator this harness launched on `port` that is still
+    running, though adb may not list it yet (a `--port` boot releases the
+    boot lock right after its launch): its registry row names
+    `emulator-<port>`. A row whose pid is gone or now runs something else
+    does not count."""
+    wanted = f"emulator-{port}"
+    for entry in processes.entries():
+        if entry.get("kind") != "emulator" or entry.get("serial") != wanted:
+            continue
+        try:
+            pid = int(entry.get("pid") or 0)
+        except (TypeError, ValueError):
+            continue
+        if pid <= 0:
+            continue
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            continue
+        except OSError:
+            pass  # exists, owned by someone else
+        command = processes.command_of(pid)
+        if command is not None and "-avd" not in command:
+            continue
+        return pid
+    return None
+
+
+def _discard_child(child: subprocess.Popen) -> None:
+    """Stop and reap an emulator this boot launched that cannot be its own."""
+    if child.poll() is None:
+        processes.terminate_group(child.pid, timeout=5.0)
+    with contextlib.suppress(subprocess.TimeoutExpired, OSError):
+        child.wait(timeout=5)
+    processes.deregister(child.pid)
+
+
+def _check_port(port: int | None) -> None:
+    if port is None:
+        return
+    if isinstance(port, bool) or not isinstance(port, int) or port not in EMULATOR_PORTS:
+        raise errors.AutonomError(
+            errors.INVALID_VALUE,
+            f"--port {port!r} is not an emulator console port",
+            f"Pick an even port from {EMULATOR_PORTS.start} to {EMULATOR_PORTS.stop - 2}; "
+            "the emulator's serial becomes emulator-<port>.",
+            port=port,
+        )
+
+
+def _port_unavailable(port: int, reason: str) -> errors.AutonomError:
+    return errors.AutonomError(
+        errors.PORT_UNAVAILABLE,
+        f"emulator port {port} is not available: {reason}",
+        "Pick another even --port (5554-5682), or leave --port out to let the "
+        "emulator choose.",
+        port=port, serial=f"emulator-{port}",
+    )
+
+
 def boot_avd(
     emulator_bin: str,
     adb_path: str,
@@ -212,7 +384,16 @@ def boot_avd(
     wait: bool = True,
     timeout: float = 180.0,
     http_proxy: str | None = None,
+    port: int | None = None,
 ) -> dict[str, Any]:
+    """Start AVD `name` and (with `wait`) return once it has booted.
+
+    Safe to run several at once: under the machine's boot lock an AVD that is
+    already running is returned as it is (`already_running`), and a new
+    emulator's serial is claimed only by this boot — `emulator-<port>` with
+    `port`, otherwise a new serial whose console names this AVD. The lock is
+    held until the serial is settled (right after the launch with `port`)."""
+    _check_port(port)
     known = list_avds(emulator_bin)
     if name not in known:
         raise errors.AutonomError(
@@ -220,8 +401,43 @@ def boot_avd(
             f"AVD '{name}' does not exist",
             f"Available: {', '.join(known) if known else 'none — create one in Android Studio'}.",
         )
-    before = {device.serial for device in adb_mod.list_devices(adb_path)}
+    started = time.monotonic()
+    deadline = started + timeout
+    release = _acquire_boot_lock(timeout)
+    try:
+        return _boot_locked(emulator_bin, adb_path, name, wait=wait, timeout=timeout,
+                            http_proxy=http_proxy, port=port, release=release,
+                            started=started, deadline=deadline)
+    finally:
+        release()
+
+
+def _boot_locked(emulator_bin: str, adb_path: str, name: str, *, wait: bool,
+                 timeout: float, http_proxy: str | None, port: int | None,
+                 release: Callable[[], None], started: float,
+                 deadline: float) -> dict[str, Any]:
+    running = running_avds(adb_path)
+    if name in running:
+        serial = running[name]
+        return {"avd": name, "pid": None, "booted": False, "waited": False,
+                "already_running": True, "serial": serial, "target_id": serial,
+                "port": _port_of(serial)}
+    listed = adb_mod.list_devices(adb_path)
+    before = {device.serial for device in listed}
+    if port is not None:
+        wanted = f"emulator-{port}"
+        if wanted in before:
+            raise _port_unavailable(port, f"{wanted} is already running another AVD")
+        launching = _launching_on(port)
+        if launching is not None:
+            raise _port_unavailable(
+                port, f"emulator pid {launching} was launched on it and is still starting")
+        for candidate in (port, port + 1):
+            if not _loopback_port_free(candidate):
+                raise _port_unavailable(port, f"127.0.0.1:{candidate} is in use")
     argv = [emulator_bin, "-avd", name]
+    if port is not None:
+        argv += ["-port", str(port)]
     routed_hostport = None
     if http_proxy:
         # A launch-time flag that routes ALL of the emulator's TCP through the
@@ -243,24 +459,49 @@ def boot_avd(
     # routed through is recorded here so `network attach --system-ca` can prove
     # the transparent path is available before touching the device.
     processes.register("emulator", child.pid, avd=name, owner=processes.HARNESS_OWNER,
-                       http_proxy=routed_hostport)
+                       http_proxy=routed_hostport,
+                       serial=f"emulator-{port}" if port is not None else None)
+    if port is not None:
+        # The serial is fixed by the port: nothing is left to pick.
+        release()
     detail: dict[str, Any] = {"avd": name, "pid": child.pid}
     if routed_hostport:
         detail["http_proxy"] = routed_hostport
     if not wait:
-        return {**detail, "booted": False, "waited": False}
+        return {**detail, "booted": False, "waited": False, "already_running": False,
+                "port": port}
 
-    started = time.monotonic()
-    deadline = started + timeout
+    claimed: str | None = f"emulator-{port}" if port is not None else None
+    confirmed = False
     while time.monotonic() < deadline:
-        serial = next(
-            (
-                device.serial
-                for device in adb_mod.list_devices(adb_path)
-                if device.serial not in before and device.state == "device"
-            ),
-            None,
-        )
+        ready = {device.serial for device in adb_mod.list_devices(adb_path)
+                 if device.state == "device"}
+        serial = None
+        if claimed is not None:
+            serial = claimed if claimed in ready else None
+            if serial and not confirmed:
+                # `emulator-<port>` is this boot's only when its console names
+                # this AVD: an emulator that took the port first (and made this
+                # one fail to bind) must never be reported as this boot's.
+                running = running_avd_name(adb_path, serial)
+                if running is None:
+                    serial = None  # the console does not answer yet
+                elif running != name:
+                    _discard_child(child)
+                    raise _port_unavailable(
+                        port or 0, f"{serial} runs AVD '{running}', not '{name}'")
+                else:
+                    confirmed = True
+        else:
+            # A new serial is this boot's only when its console names this
+            # AVD: a parallel boot's emulator may appear first. A console
+            # that does not answer yet is asked again on the next round.
+            for candidate in sorted(ready - before):
+                if running_avd_name(adb_path, candidate) == name:
+                    claimed = serial = candidate
+                    processes.update(child.pid, serial=serial)
+                    release()
+                    break
         if serial:
             completed = adb_mod.run_adb(
                 adb_path, ["shell", "getprop", "sys.boot_completed"], serial=serial, check=False
@@ -272,7 +513,8 @@ def boot_avd(
                 dropped = _forget_device_state(serial)
                 return {**detail, "booted": True, "waited": True,
                         "serial": serial, "target_id": serial,
-                        "stale_pin_dropped": dropped}
+                        "stale_pin_dropped": dropped, "already_running": False,
+                        "port": _port_of(serial)}
         if child.poll() is not None and serial is None and time.monotonic() - started > 3:
             raise errors.AutonomError(
                 errors.BACKEND_FAILED,

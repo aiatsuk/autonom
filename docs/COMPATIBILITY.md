@@ -376,6 +376,33 @@ count only this target's session; iOS cannot read permissions or the location
 back; the Android emulator has no location reset (Clear is iOS only, and a
 direct Android `location.clear` is 409 `unsupported_on_platform`).
 
+### Canvas workspace and several devices (Unreleased)
+
+Mostly additive; one intentional change. Codes added (pinned by
+`tests/test_error_codes_additive.py`): `canvas_not_found` (no live Canvas
+matches `--port` or `--workspace`, or none runs), `canvas_ambiguous` (several
+run and neither was given; extra `canvases`), `workspace_in_use` (another
+Canvas holds the workspace lock; extras `pid`, `port`), and for the Actions
+drawer `recording_not_active`, `capture_not_found`, `capture_too_large`,
+`install_not_configured`, `install_path_not_allowed`, `install_failed`.
+
+| Surface | Before | Now |
+| --- | --- | --- |
+| `autonom canvas` | usage error (a subcommand was required) | a workspace Canvas, as `canvas serve` with no target or device flag |
+| `canvas serve` with no target or device flag | the session's target or the only ready device | **intentional change:** a workspace Canvas (no device, no session, open until Ctrl+C or `canvas stop`); pass `--serial`, `--udid`, `--target` or one `--device` for the single-device Canvas |
+| `canvas serve --serial X` / `--platform ios --udid U` / one `--device PLATFORM:ID` | — | unchanged: the same node command line byte for byte, stdout, page, routes, headers, `/status`, state messages and process owner (the session on that target). `--install-root` and `--captures-dir` are appended only when given |
+| `canvas serve --port` | 1..65535 | 0..65535; 0 picks a free port (the printed URL names it) |
+| `canvas serve` new flags | — | `--device PLATFORM:ID` (repeatable, at most 8), `--split`, `--workspace NAME` (`^[A-Za-z0-9._-]{1,40}$`), `--ephemeral`, `--bootable avd:NAME[@PORT]` / `simulator:UDID` (at most 8), `--shutdown-booted`, `--install-root DIR` (repeatable), `--captures-dir DIR`. `--ephemeral`, `--bootable` and `--shutdown-booted` need a workspace (`invalid_value` otherwise); `--device` with a target flag is `usage_error`; mixed platforms need `--transport auto`. No flag starts with `--to`, so `--to` and `--tok` still mean `--token` |
+| A workspace Canvas already running | — | `autonom canvas` for the same workspace prints `{"ok": true, "already_running": true, "port", "pid", "workspace", "url"}` (the URL with its `#token=`) and starts nothing |
+| Workspace Canvas process | — | registered with no session owner (`session stop` never reaps it) and with `workspace` detail |
+| `canvas stop [--port N \| --workspace NAME \| --all]` | — | `POST /api/stop` with the Bearer token, waits up to 10 s, then SIGTERM only when the pid still runs `android-emulator-browser.mjs`; `{"ok", "stopped": [{"port", "pid", "workspace"}]}` (`terminated`, `still_running` when they apply) |
+| `canvas attach [--port \| --workspace] <target flags> [--tab ID\|NAME]` | — | `{"ok", "port", "device", "attached", "tab"}`; API refusals keep their `error_code`, `hint` and extras, plus `status` and `port` |
+| `canvas detach [--port \| --workspace] (--device-id ID \| <target flags>)` | — | `{"ok", "port", "detached", "session_stopped"}` |
+| `canvas list` | — | `{"ok", "canvases": [{"port", "pid", "url", "mode", "workspace", "tabs": [{"id", "name", "devices"}]}]}`, never a token; discovery files whose pid is gone are removed |
+| Canvas files | — | `<state>/canvas/<port>.json` (discovery, 0600, removed at stop), `<state>/canvas/workspaces/<name>.json` (tabs, 0600) and `<name>.lock`; `<state>` is `AUTONOM_HOME`, else `$XDG_STATE_HOME/autonom`, else `~/.local/state/autonom` |
+| Sessions | — | the workspace Canvas starts `session start --alongside --started-by canvas:<port>:<pid>` per attached device or reuses the live one on that target; `current.json` is never written by it; detach and stop end only the sessions it started |
+| Captures | — | the Actions drawer saves to `~/Downloads/Autonom/<device>/` (`--captures-dir`, `AUTONOM_CAPTURES_DIR`); at 200 files or 2 GB per device folder the oldest indexed captures are deleted |
+
 ### iOS UI recovery and `--session-id` (0.32.0)
 
 Additive, with two behaviour changes listed at the end. A host that passes
