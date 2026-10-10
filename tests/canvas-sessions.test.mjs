@@ -116,21 +116,28 @@ test("an ensure meeting this Canvas's own release still running waits for it", a
   let finishStop;
   const stopDone = new Promise((resolve) => { finishStop = resolve; });
   let stopped = false;
+  let refusedOnce;
+  const refused = new Promise((resolve) => { refusedOnce = resolve; });
   const { run, calls } = fakeRun({
-    "session start": () => (stopped
-      ? { code: 0, json: { ok: true, session: { session_id: "s_next" } } }
-      : { code: 2, json: { ok: false, error_code: "session_already_active", session_id: "s_mine",
-        started_by: { kind: "canvas", port: 4321, pid: 999 } } }),
+    "session start": () => {
+      if (stopped) return { code: 0, json: { ok: true, session: { session_id: "s_next" } } };
+      refusedOnce();
+      return { code: 2, json: { ok: false, error_code: "session_already_active", session_id: "s_mine",
+        started_by: { kind: "canvas", port: 4321, pid: 999 } } };
+    },
     "session stop": async () => { await stopDone; stopped = true; return { code: 0, json: { ok: true } }; },
   });
   const sessions = manager(run);
   const releasing = sessions.release({ session_id: "s_mine", started_by_canvas: true, reused: false });
   const ensuring = sessions.ensure({ platform: "android", target: "emulator-5580", tool: "adb" });
-  await new Promise((r) => setTimeout(r, 20));
+  // The stop ends only once the ensure has met it (its start refused as this Canvas's own),
+  // so the waiting path runs every time instead of depending on a short sleep.
+  await refused;
   finishStop();
   assert.deepEqual(await releasing, { stopped: true, error: null });
   assert.deepEqual(await ensuring, { session_id: "s_next", started_by_canvas: true, reused: false, error: null });
   assert.equal(calls.filter((call) => call.argv.includes("stop")).length, 1);
+  assert.equal(calls.filter((call) => call.argv.includes("start")).length, 2, "refused once, then started");
 });
 
 test("ensure never rejects: a failure keeps the device and says why", async () => {
