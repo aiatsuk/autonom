@@ -26,6 +26,11 @@ try:
 except ImportError:  # direct `python3 -m unittest tests.test_...` runs
     from tests.env_isolation import EnvSandboxMixin  # noqa: E402
 
+try:
+    from process_isolation import own_entries  # noqa: E402  (discover -s tests)
+except ImportError:  # direct `python3 -m unittest tests.test_...` runs
+    from tests.process_isolation import own_entries  # noqa: E402
+
 COMPANION_2022 = '{"build_time":"08:41:50","build_date":"Aug 12 2022"}'
 COMPANION_FIXED = '{"version":"1.6.2","build_date":"Jun 20 2026"}'
 
@@ -158,13 +163,18 @@ class DoctorTests(unittest.TestCase):
                 json.dumps({"pid": os.getpid(), "port": 8080}), encoding="utf-8"
             )
             report = json.loads(self._run(bare=True, home=home).stdout)
-            self.assertEqual(len(report["orphans"]), 1)
-            self.assertEqual(report["orphans"][0]["port"], 8080)
-            self.assertIn("network stop", report["orphans"][0]["hint"])
+            # discovery is machine-wide: another test's proxy is not this one's
+            orphans = own_entries(report["orphans"], home)
+            self.assertEqual(len(orphans), 1)
+            self.assertEqual(orphans[0]["port"], 8080)
+            self.assertIn("network stop", orphans[0]["hint"])
 
     def test_clean_host_reports_no_orphans(self) -> None:
-        report = json.loads(self._run(bare=True).stdout)
-        self.assertEqual(report["orphans"], [])
+        with tempfile.TemporaryDirectory() as home:
+            report = json.loads(self._run(bare=True, home=home).stdout)
+            # a proxy another test (or the developer) runs is not this host's
+            # clean-store answer: only what this home owns or holds counts
+            self.assertEqual(own_entries(report["orphans"], home), [])
         self.assertIsNone(report["session"])
 
     def test_dangling_attachment_is_surfaced(self) -> None:

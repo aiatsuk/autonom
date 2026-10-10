@@ -22,9 +22,9 @@ sys.path.insert(0, str(ROOT / "scripts"))
 from autonom_lib import processes  # noqa: E402
 
 try:
-    from process_isolation import scope_proxy_discovery  # noqa: E402  (discover -s tests)
+    from process_isolation import own_entries, scope_proxy_discovery  # noqa: E402
 except ImportError:  # direct `python3 -m unittest tests.test_...` runs
-    from tests.process_isolation import scope_proxy_discovery  # noqa: E402
+    from tests.process_isolation import own_entries, scope_proxy_discovery  # noqa: E402
 
 
 class ProcessRegistryTests(unittest.TestCase):
@@ -152,6 +152,24 @@ class ProcessRegistryTests(unittest.TestCase):
             result = processes.cleanup()
         self.assertEqual([item["pid"] for item in result["actions"]], [insider.pid])
         self.assertIsNone(outsider.poll(), "cleanup terminated another test's proxy")
+
+    def test_a_subprocess_report_keeps_only_this_homes_entries(self) -> None:
+        """`own_entries`: what a test reads from `doctor` run in a subprocess."""
+        elsewhere = tempfile.TemporaryDirectory()
+        self.addCleanup(elsewhere.cleanup)
+        entries = [
+            {"pid": 1, "kind": "proxy", "hint": "autonom network stop"},  # proxy.json
+            {"pid": 2, "kind": "proxy", "source": "registry+signature",
+             "artifacts_dir": str(Path(elsewhere.name) / "network")},  # our registry
+            {"pid": 3, "kind": "proxy", "source": "signature",
+             "artifacts_dir": str(self.artifacts)},
+            {"pid": 4, "kind": "proxy", "source": "signature",
+             "artifacts_dir": str(Path(elsewhere.name) / "network")},
+            {"pid": 5, "kind": "proxy", "source": "signature", "artifacts_dir": None},
+        ]
+        self.assertEqual([item["pid"] for item in own_entries(entries, self.tmp.name)],
+                         [1, 2, 3])
+        self.assertEqual(own_entries([], self.tmp.name), [])
 
     def test_signature_discovery_needs_our_own_addon_in_the_command_line(self) -> None:
         """Matching bare 'mitmdump' would sweep up someone else's proxy."""

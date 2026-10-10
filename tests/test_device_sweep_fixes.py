@@ -37,6 +37,11 @@ try:
 except ImportError:  # direct `python3 -m unittest tests.test_...` runs
     from tests.env_isolation import EnvSandboxMixin  # noqa: E402
 
+try:
+    from process_isolation import own_entries  # noqa: E402  (discover -s tests)
+except ImportError:  # direct `python3 -m unittest tests.test_...` runs
+    from tests.process_isolation import own_entries  # noqa: E402
+
 
 class SweepBase(EnvSandboxMixin, unittest.TestCase):
     def setUp(self) -> None:
@@ -386,7 +391,9 @@ class DoctorForeignProxyTests(SweepBase):
         self.set_state(devices=[], settings={"http_proxy": ":0"})
         code, report = self.run_cli("doctor", "--adb", str(FAKE_ADB))
         self.assertEqual(code, 0)
-        self.assertEqual([o for o in report["orphans"] if o["kind"] == "proxy"], [])
+        # discovery is machine-wide: another test's proxy is not an orphan here
+        self.assertEqual([o for o in own_entries(report["orphans"], self.home)
+                          if o["kind"] == "proxy"], [])
         self.assertIn("foreign_proxy_running", [w["code"] for w in report["warnings"]])
 
     def test_no_proxy_setting_means_no_warning(self) -> None:
