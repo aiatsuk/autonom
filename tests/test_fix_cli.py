@@ -455,6 +455,44 @@ class FlowSuitePlatformTests(_Cli):
 
 
 class LogStreamRestartTests(_Cli):
+    # How long a test's teardown waits for the log-stream writers it started.
+    WRITER_EXIT_SECONDS = 20.0
+
+    def setUp(self) -> None:
+        super().setUp()
+        # Runs before the temporary directory is removed (cleanups are LIFO):
+        # a writer the CLI restarted can still be writing into the home, and
+        # removing the directory under it failed with "Directory not empty"
+        # (issue #39).
+        self.addCleanup(self.wait_for_log_writers)
+
+    def log_writer_pids(self) -> set[int]:
+        pids = {int(row["pid"]) for row in processes.entries()
+                if row.get("kind") == "log_stream" and row.get("pid")}
+        try:
+            current = session.load_current()
+        except Exception:  # noqa: BLE001 - no session, or one already gone
+            current = None
+        recorded = ((current or {}).get("background") or {}).get("log_stream_pid")
+        if recorded:
+            pids.add(int(recorded))
+        return pids
+
+    def wait_for_log_writers(self) -> None:
+        """Wait, bounded, until every log-stream writer this test started has
+        exited. A writer still alive after that is stopped only when its
+        command line points into this test's directory: a recorded pid can
+        belong to a stranger by then."""
+        pids = self.log_writer_pids()
+        if _wait_until(lambda: all(_gone(pid) for pid in pids),
+                       timeout=self.WRITER_EXIT_SECONDS):
+            return
+        for pid in pids:
+            command = processes.command_of(pid)
+            if command and str(self.root) in command:
+                _kill_quietly(pid)
+        _wait_until(lambda: all(_gone(pid) for pid in pids), timeout=5.0)
+
     def start_streaming_session(self) -> dict:
         self.prefs_dir()
         self.write_state(**self.ios_app_state(), ios_log=[self.mine])
