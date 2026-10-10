@@ -614,7 +614,8 @@ def _session_stop_marked(args: argparse.Namespace, record: dict[str, Any]) -> in
         if gone and target.platform == ANDROID:
             # The proxy setting lived on the device, which is gone with it.
             record.setdefault("network", {}).update(
-                {"attached": False, "device_proxy": None, "previous_http_proxy": None})
+                {"attached": False, "device_proxy": None, "previous_http_proxy": None,
+                 "previous_proxy_settings": None, "capture_mode": None})
             return {"was_attached": True, "skipped": "stale_target"}
         if target.platform == ANDROID:
             return device_proxy_android.detach(target, record)
@@ -2430,9 +2431,18 @@ def network_stop_payload(record: dict[str, Any], target_of: Any = None) -> dict[
         if (target.target_id != record.get("target_id")
                 or target.platform != record.get("platform")):
             raise errors.AutonomError(
-                errors.SESSION_TARGET_MISMATCH, "The proxy belongs to another target.",
-                "Select the session that owns this target before stopping capture.")
-        detached = network_detach_payload(record, target)
+                errors.SESSION_TARGET_MISMATCH,
+                f"the proxy of session {record.get('session_id')} is attached to "
+                f"{record.get('target_id')}, not {target.target_id}",
+                "Select the session that owns this target (--session-id, or that "
+                "target's flags) before stopping capture.",
+                session_id=record.get("session_id"), target_id=record.get("target_id"))
+        try:
+            detached = network_detach_payload(record, target)
+        except errors.AutonomError as exc:
+            # The device may still point at the proxy: it is never stopped here.
+            exc.extra.setdefault("proxy_kept_running", True)
+            raise
         detached.pop("ok", None)
     detail = proxy_mod.stop(record)
     record.setdefault("network", {})["enabled"] = False

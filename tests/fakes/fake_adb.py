@@ -535,7 +535,11 @@ def main(argv: list[str]) -> int:
             sys.stdout.write(f"{value}\n")
             return 0
         if args[2] == "put" and len(args) > 5:
-            state.setdefault(table, {})[args[4]] = args[5]
+            value = args[5]
+            # a value quoted for the device shell, as `adb shell` would unquote it
+            if len(value) >= 2 and value[0] == value[-1] == "'":
+                value = shlex.split(value)[0]
+            state.setdefault(table, {})[args[4]] = value
             write_state(state)
             return 0
         if args[2] == "delete":
