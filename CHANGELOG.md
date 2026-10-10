@@ -7,6 +7,8 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
 
 ## [Unreleased]
 
+## [0.35.0] - 2026-10-10
+
 ### Added
 - **Canvas workspace with several devices.** `autonom canvas` (or
   `canvas serve` with no target) starts a workspace Canvas with no device and

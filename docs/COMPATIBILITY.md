@@ -352,7 +352,7 @@ which came from 4 vCPUs and a loaded host:
 At the new default on a host at load average 4-5 the live bench presented a
 median of 57 fps (runs 52, 59, 57) with 84.5 ms median latency.
 
-### Mobile Canvas web controls (Unreleased)
+### Mobile Canvas web controls (0.35.0)
 
 Additive. No CLI verb, flag, `error_code` or output field changes: the CLI
 handlers for `network start`, `network stop`, `network attach` and
@@ -376,7 +376,7 @@ count only this target's session; iOS cannot read permissions or the location
 back; the Android emulator has no location reset (Clear is iOS only, and a
 direct Android `location.clear` is 409 `unsupported_on_platform`).
 
-### Canvas workspace and several devices (Unreleased)
+### Canvas workspace and several devices (0.35.0)
 
 Mostly additive; one intentional change. Codes added (pinned by
 `tests/test_error_codes_additive.py`): `canvas_not_found` (no live Canvas
