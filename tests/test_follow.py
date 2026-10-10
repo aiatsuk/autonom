@@ -6,7 +6,6 @@ import os
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 import unittest
 from pathlib import Path
@@ -55,16 +54,13 @@ class FollowFileTests(unittest.TestCase):
     def test_starts_at_eof_and_reads_only_appended_lines(self) -> None:
         self.path.write_text("old line\n", encoding="utf-8")
 
-        def writer() -> None:
-            time.sleep(0.05)
+        def append() -> None:
             with self.path.open("a", encoding="utf-8") as handle:
                 handle.write("first\nsecond\n")
 
-        thread = threading.Thread(target=writer)
-        thread.start()
         eof = follow.follow_file(self.path, source="t", emit=self._emit,
-                                 max_lines=2, max_seconds=5, poll_ms=20)
-        thread.join()
+                                 max_lines=2, max_seconds=5, poll_ms=20,
+                                 sleep=self.on_first_poll(append))
         self.assertEqual(self.lines(), ["first", "second"])
         self.assertEqual(eof["reason"], "max_lines")
         self.assertNotIn("old line", self.lines())
@@ -91,31 +87,40 @@ class FollowFileTests(unittest.TestCase):
         self.assertEqual(eof["reason"], "max_seconds")
         self.assertEqual(eof["lines"], 0)
 
-    def test_missing_file_is_polled_for_until_it_appears(self) -> None:
-        def writer() -> None:
-            time.sleep(0.05)
-            self.path.write_text("born\n", encoding="utf-8")
+    @staticmethod
+    def on_first_poll(action):
+        """A `sleep` for `follow_file` that runs `action` at its first poll:
+        the change lands only after the follow has begun. A writer thread
+        that slept 50 ms instead raced a follow that started late on a
+        loaded host (it then found the file already there)."""
+        done = []
 
-        thread = threading.Thread(target=writer)
-        thread.start()
+        def sleep(seconds: float) -> None:
+            if not done:
+                done.append(True)
+                action()
+            time.sleep(seconds)
+
+        return sleep
+
+    def test_missing_file_is_polled_for_until_it_appears(self) -> None:
+        self.assertFalse(self.path.exists())
         follow.follow_file(self.path, source="t", emit=self._emit,
-                           max_lines=1, max_seconds=5, poll_ms=20)
-        thread.join()
+                           max_lines=1, max_seconds=5, poll_ms=20,
+                           sleep=self.on_first_poll(
+                               lambda: self.path.write_text("born\n", encoding="utf-8")))
         self.assertEqual(self.lines(), ["born"])
 
     def test_rotation_reopens_and_reads_the_new_file(self) -> None:
         self.path.write_text("one long original line\n", encoding="utf-8")
 
-        def rotate() -> None:
-            time.sleep(0.05)
-            self.path.write_text("rotated\n", encoding="utf-8")  # shrinks
-
-        thread = threading.Thread(target=rotate)
-        thread.start()
+        # rotated at the first poll, after the original line was read
         follow.follow_file(self.path, source="t", emit=self._emit,
                            from_start=True, max_lines=2, max_seconds=5,
-                           poll_ms=20)
-        thread.join()
+                           poll_ms=20,
+                           sleep=self.on_first_poll(
+                               lambda: self.path.write_text("rotated\n",
+                                                            encoding="utf-8")))  # shrinks
         self.assertEqual(self.lines(), ["one long original line", "rotated"])
 
     def test_raw_mode_passes_lines_through_verbatim(self) -> None:
