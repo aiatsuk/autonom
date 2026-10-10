@@ -898,6 +898,41 @@ test("stop() waiting on an unresponsive companion is bounded", async (t) => {
   assert.ok(Date.now() - started < 1000);
   assert.equal(result.stopSent, true);
   assert.equal(state.stops, 1);
+  // A Stop written but never answered may leave the encoder running, as for restart():
+  // the stream ends as abnormal, so its owner replaces the companion.
+  assert.equal(result.abnormal, true);
+  assert.equal(stream.abnormal, true);
+  assert.equal((await stream.closed).abnormal, true);
+});
+
+test("an awaited unary call is rejected at its deadline even when nothing else keeps the event loop alive", async (t) => {
+  // The child's only handles are an unref'd server and the client's unref'd session: with an
+  // unref'd deadline the loop drains, the await is dropped and Node exits with code 13.
+  const dir = tempDir(t);
+  const script = join(dir, "unary-deadline.mjs");
+  writeFileSync(script, `
+import * as http2 from "node:http2";
+import { IdbCompanionClient } from ${JSON.stringify(MODULE_URL)};
+const server = http2.createServer();
+server.on("session", (session) => session.unref());
+server.on("stream", () => {}); // never answers
+server.listen(0, "127.0.0.1", async () => {
+  server.unref();
+  const client = new IdbCompanionClient({ host: "127.0.0.1", port: server.address().port });
+  try {
+    await client.unary("describe", Buffer.alloc(0), { timeoutMs: 300 });
+    console.log("resolved");
+  } catch (error) {
+    console.log("rejected " + error.code);
+  }
+});
+`);
+  const child = spawn(process.execPath, [script], { stdio: ["ignore", "pipe", "pipe"] });
+  let stdout = "";
+  child.stdout.on("data", (chunk) => { stdout += chunk; });
+  const code = await new Promise((resolve) => child.on("close", resolve));
+  assert.equal(stdout.trim(), "rejected 4", "the awaited call was dropped instead of rejected at its deadline");
+  assert.equal(code, 0);
 });
 
 test("a slow consumer gets every frame in order (flow control, no drops)", async (t) => {

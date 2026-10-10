@@ -6657,6 +6657,97 @@ test("ios: volume-up and volume-down press VOLUME_UP and VOLUME_DOWN down then u
   await stopCanvas(canvas);
 });
 
+// Steers the Canvas's HID writes from the test: while <FAKE_IDB_CONTROL>.hid-fail exists a
+// write fails without reaching the companion; while <it>.hid-hold exists a write reaches the
+// companion but is confirmed only once the file is removed, as a write the Simulator takes late.
+const HID_GATE = `data:text/javascript,${encodeURIComponent(`
+import { existsSync } from "node:fs";
+import { IdbHidStream } from ${JSON.stringify(IDB_MODULE_URL)};
+const base = process.env.FAKE_IDB_CONTROL;
+const send = IdbHidStream.prototype.send;
+IdbHidStream.prototype.send = function (event) {
+  if (existsSync(base + ".hid-fail")) return Promise.reject(new Error("fake HID write failure"));
+  const written = send.call(this, event);
+  if (!existsSync(base + ".hid-hold")) return written;
+  return written.then(() => new Promise((resolve) => {
+    const poll = () => (existsSync(base + ".hid-hold") ? setTimeout(poll, 20) : resolve());
+    poll();
+  }));
+};
+`)}`;
+
+test("ios: action.written counts only writes the companion confirmed: an action whose every write failed is not journaled, one with a confirmed write is", async (t) => {
+  const { world, canvas, control } = await iosControl(t, { nodeArgs: ["--import", HID_GATE] });
+  idbControl(world, "hid-fail", "1");
+  control.send({ t: "system", op: "home" });
+  await allHandled(control);
+  await waitFor(async () => /fake HID write failure/.test((await status(canvas)).last_error ?? ""), 5000,
+    "the failed writes");
+  idbControl(world, "hid-fail", null);
+  // Input after the failed Home runs once it is done: its record had its turn by then.
+  control.send({ t: "system", op: "power" });
+  await allHandled(control);
+  assert.deepEqual(await hidAtLeast(world, 2), [{ button: "LOCK", direction: "down" }, { button: "LOCK", direction: "up" }]);
+  await waitFor(async () => (await journaled(world, "system")).length >= 1, 5000, "the power record");
+  await sleep(300);
+  assert.equal(hidEvents(world).length, 2, "a failed write reached the companion");
+  assert.deepEqual((await journaled(world, "system")).map((record) => record.payload.op), ["power"],
+    "an action none of whose writes the companion confirmed was journaled");
+  await stopCanvas(canvas);
+});
+
+waitingTest("ios: a HID write that outlives 5 s but is then taken is journaled, after the queue moved on without it", async (t) => {
+  const { world, canvas, control } = await iosControl(t, { nodeArgs: ["--import", HID_GATE] });
+  idbControl(world, "hid-hold", "1");
+  control.send({ t: "system", op: "home" });
+  await allHandled(control);
+  // The DOWN and the UP each stop holding the queue after 5 s: the record's turn comes at
+  // about 10 s, while neither is confirmed yet.
+  assert.deepEqual(await hidAtLeast(world, 2), [{ button: "HOME", direction: "down" }, { button: "HOME", direction: "up" }]);
+  await sleep(10_600);
+  assert.match((await status(canvas)).last_error ?? "", /a write took more than 5000 ms/);
+  assert.equal((await journaled(world, "system")).length, 0, "journaled before any write was confirmed");
+  idbControl(world, "hid-hold", null);
+  await waitFor(async () => (await journaled(world, "system")).length === 1, 5000,
+    "the record of the action the Simulator took late");
+  assert.equal((await journaled(world, "system"))[0].payload.op, "home");
+  assert.match((await status(canvas)).last_error ?? "", /then the companion took it/);
+  // Input after it goes out and is journaled as before.
+  control.send({ t: "system", op: "power" });
+  await allHandled(control);
+  await waitFor(async () => (await journaled(world, "system")).length === 2, 5000, "the power record");
+  assert.deepEqual((await journaled(world, "system")).map((record) => record.payload.op), ["home", "power"]);
+  await stopCanvas(canvas);
+});
+
+waitingTest("ios: a stream restarted by a forced key frame that then sends no frame is ended after 10 s and opened again", async (t) => {
+  const { world, canvas, auth } = await iosCanvas(t, { env: { FAKE_IDB_KEY_EVERY: "10000", FAKE_IDB_INTERVAL_MS: "10" } });
+  const tab = await pageSocket(canvas, auth, "/ws/video");
+  await waitFor(() => tab.packets().length >= 10, 10_000, "packets");
+  const pid = (await status(canvas)).idb.companion_pid;
+  // The companion stops sending frames; the forced restart's new call stays silent.
+  idbControl(world, "freeze", "1");
+  const control = await pageSocket(canvas, auth, "/ws/control");
+  control.send({ t: "system", op: "keyframe" });
+  await waitFor(() => idbEventsNow(world).filter((event) => event.type === "start").length === 2, 6000, "the forced restart");
+  const restartedAt = Date.now();
+  await waitFor(() => idbEventsNow(world).filter((event) => event.type === "start").length === 3, 15_000,
+    "a new stream after the silent restarted one");
+  assert.ok(Date.now() - restartedAt >= 9000, "the silent stream was ended before its 10 s");
+  idbControl(world, "freeze", null);
+  const events = idbEventsNow(world);
+  // The silent call was ended with a Stop the companion answered, so the same companion streams.
+  assert.deepEqual(events.filter((event) => ["start", "stop"].includes(event.type)).map((event) => `${event.type} ${event.call}`),
+    ["start 1", "stop 1", "start 2", "stop 2", "start 3"]);
+  assert.equal(events.filter((event) => event.type === "spawn").length, 1);
+  const count = tab.packets().length;
+  await waitFor(() => tab.packets().length >= count + 3, 10_000, "packets on the new stream");
+  const body = await status(canvas);
+  assert.equal(body.idb.session_state, "streaming");
+  assert.equal(body.idb.companion_pid, pid);
+  await stopCanvas(canvas);
+});
+
 /** A preload that makes the Canvas process see `process.platform` as `name`. */
 function platformPreload(name) {
   return `data:text/javascript,${encodeURIComponent(`

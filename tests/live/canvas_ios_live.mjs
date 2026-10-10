@@ -74,6 +74,8 @@ import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { parseArgs as parseCliArgs } from "node:util";
 
+import { withoutTypedText } from "./live-report.mjs";
+
 const ROOT = resolve(import.meta.dirname, "../..");
 const CANVAS = join(ROOT, "plugins/autonom/skills/android-emulator-browser/scripts/android-emulator-browser.mjs");
 const AUTONOM = join(ROOT, "scripts/autonom.py");
@@ -813,14 +815,17 @@ async function settledSsim(page) {
     masked_share: Math.round(result.masked_share * 10000) / 10000, screenshot: shot };
 }
 
-/** The compact UI tree nodes from the Autonom CLI; null when it failed. */
-// Why `ui tree` calls failed, for the report (the last few, cut short).
+// Why `ui tree` calls failed, for the report (the last few, cut short). A call made after
+// typing can echo the screen, so the typed words are taken out of what is kept.
 const uiTreeErrors = [];
 
+/** The compact UI tree nodes from the Autonom CLI; null when it failed. */
 async function uiNodes() {
   const tree = await autonom(["ui", "tree", "--max-nodes", "400"]);
   const failed = (why) => {
-    uiTreeErrors.push(`${why}: ${(tree.stderr || tree.stdout).trim().slice(0, 300)}`);
+    // Taken out before the cut, so a word cut in half at the end cannot slip through.
+    const output = withoutTypedText((tree.stderr || tree.stdout).trim(), [SEARCH_TEXT, CLIP_TEXT]);
+    uiTreeErrors.push(`${why}: ${output.slice(0, 300)}`);
     if (uiTreeErrors.length > 5) uiTreeErrors.shift();
     return null;
   };
@@ -1187,7 +1192,8 @@ const cases = {
       const field = findNode(searchNodes, isField) ??
         findNode(searchNodes, (node) => node.role !== "button" && /^search$/i.test(label(node)));
       report.text = { field_found: Boolean(field), text_len: SEARCH_TEXT.length };
-      report.ui_tree_errors = uiTreeErrors;
+      // A copy taken before typing: errors of the reads that follow stay out of the report.
+      report.ui_tree_errors = [...uiTreeErrors];
       if (field) {
         await tapAt(page, centre(field, points));
         await sleep(1200);

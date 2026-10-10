@@ -7,6 +7,18 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
 
 ## [Unreleased]
 
+### Fixed
+- **iOS fast Canvas follow-ups (#38).** A stream restarted on the same call
+  (a forced key frame, a profile change, the Simulator booting again) that
+  then sends no frame is ended after 10 s and opened again. A HID write that
+  takes longer than 5 s but is then taken by the companion now journals its
+  action. A video `stop()` whose Stop was written but never answered ends the
+  stream as abnormal, so the companion is replaced, as `restart()` does. The
+  deadline of a unary companion call keeps the event loop alive, so an
+  awaited call is rejected instead of dropped. `doctor` lists
+  `AUTONOM_IDB_COMPANION_BIN` among the active overrides. The iOS live script
+  keeps typed test words out of the `ui tree` errors it reports.
+
 ## [0.35.0] - 2026-10-10
 
 ### Added

@@ -976,8 +976,9 @@ export class IdbCompanionClient {
       };
       const onAbort = () => finish(abortError(signal));
       signal?.addEventListener("abort", onAbort, { once: true });
+      // Referenced, as in withTimeout(): the session is unref'd, so an unref'd deadline could
+      // let the event loop drain and drop the caller's await instead of rejecting it.
       const timer = setTimeout(() => finish(new GrpcError(4, "Deadline exceeded.", { method })), timeoutMs);
-      timer.unref?.();
       call.on("response", (headers) => {
         status = grpcStatusFrom(headers) ?? status;
       });
@@ -1061,8 +1062,8 @@ export class IdbCompanionClient {
  * this message carried them; `pts` is the arrival time in µs since the stream began.
  * Stop is sent on stop(), on return() from a for-await loop, on abort, and on errors
  * while the call can still carry it. `abnormal` is true when the stream ended without
- * Stop reaching the companion, which leaves its encoder running: restart the
- * companion then.
+ * Stop reaching the companion, or with a Stop the companion did not answer in time,
+ * either of which may leave its encoder running: restart the companion then.
  */
 export class IdbVideoStream {
   #client;
@@ -1324,8 +1325,10 @@ export class IdbVideoStream {
       return { stopSent: this.#stopSent, abnormal: this.abnormal, error: this.#error };
     }
     this.#stopping = (async () => {
-      const { stopSent } = await this.#stopCall(timeoutMs);
-      this.#finish(null, { abnormal: !stopSent });
+      // A Stop written but not answered by ending the call in time may leave the encoder
+      // running, as in restart(): abnormal, so the owner replaces the companion.
+      const { stopSent, acknowledged } = await this.#stopCall(timeoutMs);
+      this.#finish(null, { abnormal: !stopSent || !acknowledged });
       return { stopSent, abnormal: this.abnormal, error: this.#error };
     })();
     return this.#stopping;
