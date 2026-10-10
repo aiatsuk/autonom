@@ -18,6 +18,14 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
   awaited call is rejected instead of dropped. `doctor` lists
   `AUTONOM_IDB_COMPANION_BIN` among the active overrides. The iOS live script
   keeps typed test words out of the `ui tree` errors it reports.
+- **Canvas Rotate on Android sticks.** On Android 12+ Rotate now switches the
+  default display with a temporary WindowManager manual rotation
+  (`wm user-rotation lock` and `wm fixed-to-user-rotation enabled`), so
+  auto-rotation and an orientation-locked launcher no longer turn it back.
+  The page waits for the rotation to read back, shows a failure and puts the
+  original settings back. The original rotation mode, stored rotation and
+  app-orientation policy are kept per device and restored on detach,
+  reconnect and Canvas stop. Android 11 and older keep the scrcpy request.
 
 ## [0.35.0] - 2026-10-10
 

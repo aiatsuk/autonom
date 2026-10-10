@@ -676,9 +676,17 @@ native size by default; that was not measured here. Use scrcpy itself for
 high-fidelity manual review and Macrobenchmark / Perfetto / Flutter profile
 mode for claims.
 
-On an emulator with auto-rotate on, the sensor turns the screen back to
-portrait right after Rotate; turn auto-rotate off on the device for a
-rotation that sticks.
+Rotate on the Android scrcpy transport switches the default display between
+portrait and landscape with WindowManager. On Android 12+, which supports
+wm fixed-to-user-rotation, it temporarily locks manual rotation and overrides
+app-requested orientation so the sensor or launcher cannot undo the click.
+The button waits for rotation read-back; a failure is shown and the settings found
+before the first Rotate are put back. The original user rotation mode, stored
+rotation and app-orientation policy are kept per device and restored when that
+device is detached from a workspace Canvas, when it is reconnected, and when the
+Canvas stops, as display presets are. Older Android without that WM command keeps
+the scrcpy rotation request, which can still be undone by auto-rotate. A Canvas
+killed with SIGKILL cannot restore them.
 
 ## Evidence to record
 

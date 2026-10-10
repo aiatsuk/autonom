@@ -209,6 +209,8 @@ const DISPLAY_PRESET_IDS = Object.freeze(DISPLAY_PRESETS.map((preset) => preset.
 const DISPLAY_PRESETS_JSON = JSON.stringify(DISPLAY_PRESETS);
 // Each `wm` call; the stop-time restore runs inside SHUTDOWN_STOP_MS as a whole.
 const WM_TIMEOUT_MS = 5000;
+// How long a Canvas stop waits for a running Rotate before it restores the rotation.
+const ROTATION_STOP_WAIT_MS = 1000;
 // /status and the state message show a `wm` reading at most this old (DISPLAY-001). Pages
 // poll /status about every second, so readings are shared instead of made per request.
 const DISPLAY_READ_MAX_AGE_MS = 2000;
@@ -2063,6 +2065,13 @@ export function createDeviceContext(server, device) {
     // running, which are all the restore at stop waits for.
     displayWaiting: null,
     displayRunning: null,
+    // Manual rotation is opt-in on the first Rotate; restored when this Canvas stops.
+    rotationOriginal: null,
+    rotationWritten: false,
+    rotationPending: false,
+    rotationRunning: null,
+    // Cancels the adb children of the Rotate's own `wm` writes, so none lands after a restore.
+    rotationAbort: null,
     // The bridge of its own that writes the restore record while the shared one is busy.
     restoreBridge: null,
     // Tasks ever queued: a waiting change with nothing queued after it is the last one.
@@ -2117,7 +2126,7 @@ async function closeDevice(context) {
   // display back as it was, within the 5 s the supervisor allows after SIGTERM.
   // The tools process and the log feed go with it: no orphans.
   await Promise.race([
-    Promise.all([stopSession(context), restoreDisplay(context), context.tools.close()]),
+    Promise.all([stopSession(context), restoreDisplay(context), restoreDeviceRotation(context), context.tools.close()]),
     sleep(SHUTDOWN_STOP_MS),
   ]);
   context.actionBridge.close();
@@ -3915,7 +3924,7 @@ function receive(context, client, data, isBinary) {
  * waits for its clipboard ack, which holds the input of every connection.
  */
 function inputPressure(context, client, share) {
-  return context.clipboardHold !== null || pastBounds(context, client, share);
+  return context.rotationPending || context.clipboardHold !== null || pastBounds(context, client, share);
 }
 
 function pastBounds(context, client, share) {
@@ -4067,7 +4076,9 @@ function handleControlMessage(context, client, raw) {
   } catch (error) {
     // Every refusal is answered on the connection; none may take the Canvas down.
     if (!(error instanceof InputError)) context.state.lastError = error.message;
-    reply(context, client, { t: "error", message: error.message, for: message.t });
+    // A refused Rotate answers as one, so the page's Rotate button is enabled again.
+    const answersFor = message.t === "system" && message.op === "rotate" ? "rotate" : message.t;
+    reply(context, client, { t: "error", message: error.message, for: answersFor });
   }
 }
 
@@ -4112,6 +4123,17 @@ function dispatchControl(context, client, message) {
     return;
   }
   requireSession(context);
+  if (!isIosCanvas(context) && message.t === "system" && message.op === "rotate") {
+    finishScroll(context, client);
+    requestDeviceRotation(context, client).then(
+      (result) => reply(context, client, { t: "rotation", ...result }),
+      (error) => {
+        // A refusal is answered on the connection only, as the synchronous ones are.
+        if (!(error instanceof InputError)) context.state.lastError = error.message;
+        reply(context, client, { t: "error", message: error.message, for: "rotate" });
+      });
+    return;
+  }
   // Any other input ends a wheel burst, so the journal keeps the order of actions.
   if (message.t !== "scroll") finishScroll(context, client);
   if (isIosCanvas(context)) {
@@ -4416,6 +4438,183 @@ function systemAction(context, client, op) {
     throw new InputError(`Unsupported system action ${op}`);
   }
   journal(context, client, { kind: "system", op });
+}
+
+/**
+ * One manual rotation at a time, behind HTTP input/display changes. While it waits or
+ * runs, inputPressure stops reading input, so a later Rotate runs after it; one already
+ * read in the same burst is answered as busy, so no flood can grow the queue.
+ */
+function requestDeviceRotation(context, client) {
+  if (context.rotationPending) return Promise.reject(inputError(409, "A device rotation is already in progress"));
+  context.rotationPending = true;
+  return context.enqueueInput(() => {
+    const running = changeDeviceRotation(context, client);
+    context.rotationRunning = running;
+    return running.finally(() => {
+      if (context.rotationRunning === running) context.rotationRunning = null;
+    });
+  }).finally(() => { context.rotationPending = false; resumeAllReading(context); });
+}
+
+/** Only the default display counts; dumpsys can list scrcpy's virtual display first. */
+async function currentDeviceRotation(context) {
+  const { stdout } = await runAdb(context, ["shell", "dumpsys", "window", "displays"], { timeout: WM_TIMEOUT_MS });
+  const block = stdout.match(/(?:^|\n)\s*Display: mDisplayId=0\b([\s\S]*?)(?=\n\s*Display: mDisplayId=|$)/);
+  const found = block?.[1].match(/^\s*mRotation=(?:ROTATION_)?(270|180|90|[0-3])\b/m);
+  if (!found) throw new Error("WindowManager did not report the default display's rotation");
+  const value = Number(found[1]);
+  return value > 3 ? value / 90 : value;
+}
+
+/**
+ * `wm user-rotation` and `wm fixed-to-user-rotation` exist from Android 12. An older `wm`
+ * reports an unknown command: exit 255 with "Unknown command" on Android 10 and 11, exit 0
+ * with only stderr on Android 9. enabled_if_no_auto_rotation exists on newer releases only.
+ */
+const UNKNOWN_WM_COMMAND = /\bunknown command\b/i;
+const FIXED_TO_USER_ROTATION = Object.freeze(["default", "enabled", "disabled", "enabled_if_no_auto_rotation"]);
+
+async function originalDeviceRotation(context) {
+  let fixed;
+  try {
+    const answer = await runAdb(context, ["shell", "wm", "fixed-to-user-rotation"], { timeout: WM_TIMEOUT_MS });
+    // Older Android has no per-display override; preserve its scrcpy control path.
+    if (UNKNOWN_WM_COMMAND.test(String(answer.stderr) + String(answer.stdout))) return null;
+    fixed = answer.stdout.trim();
+  } catch (error) {
+    if (UNKNOWN_WM_COMMAND.test(String(error.stderr) + String(error.stdout))) return null;
+    throw error;
+  }
+  if (!FIXED_TO_USER_ROTATION.includes(fixed)) throw new Error("WindowManager returned an unknown rotation policy");
+  const mode = (await runAdb(context, ["shell", "wm", "user-rotation"], { timeout: WM_TIMEOUT_MS })).stdout.trim();
+  const locked = mode.match(/^lock ([0-3])$/);
+  if (!locked && mode !== "free") throw new Error("WindowManager returned an unknown user rotation mode");
+  const stored = (await runAdb(context,
+    ["shell", "settings", "get", "system", "user_rotation"], { timeout: WM_TIMEOUT_MS })).stdout.trim();
+  if (stored !== "null" && !/^[0-3]$/.test(stored)) throw new Error("Android did not report the stored user rotation");
+  // A fresh Android uses rotation 0 when this setting has never been stored.
+  const rotation = locked ? locked[1] : stored === "null" ? "0" : stored;
+  return { fixed, mode: locked ? "lock" : "free", rotation, unset: stored === "null" };
+}
+
+/**
+ * Keep manual rotation instead of scrcpy's freeze-then-thaw, which lets the sensor
+ * snap it back. fixed-to-user-rotation also rotates displays held by a launcher/app.
+ * Success is reported and journaled only when the default display reads back changed.
+ */
+async function changeDeviceRotation(context, client) {
+  assertDisplayGoesOn(context, client.origin, client);
+  liftForDisplayChange(context);
+  await heldWritesSent(context);
+  assertDisplayGoesOn(context, client.origin, client);
+  // Only an attempt that wrote rolls back: a refused Rotate never changes the device.
+  let wrote = false;
+  try {
+    if (!context.rotationWritten) {
+      const original = await originalDeviceRotation(context);
+      assertDisplayGoesOn(context, client.origin, client);
+      if (!original) {
+        systemAction(context, client, "rotate");
+        return { legacy: true };
+      }
+      context.rotationOriginal = original;
+    }
+    const rotation = ((await currentDeviceRotation(context)) & 1) ^ 1;
+    assertDisplayGoesOn(context, client.origin, client);
+    context.rotationWritten = true;
+    wrote = true;
+    const abort = new AbortController();
+    context.rotationAbort = abort;
+    let failure;
+    try {
+      [failure] = await runWm(context, [
+        ["user-rotation", "lock", String(rotation)],
+        ["fixed-to-user-rotation", "enabled"],
+      ], { change: true, signal: abort.signal });
+    } finally {
+      if (context.rotationAbort === abort) context.rotationAbort = null;
+    }
+    if (failure) throw new Error(failure);
+    const deadline = performance.now() + WM_TIMEOUT_MS;
+    do {
+      if (context.shuttingDown) throw inputError(503, "Canvas is stopping");
+      if (await currentDeviceRotation(context) === rotation) {
+        if (context.shuttingDown) throw inputError(503, "Canvas is stopping");
+        journal(context, client, { kind: "system", op: "rotate" });
+        return { rotation };
+      }
+      await sleep(100);
+    } while (performance.now() < deadline);
+    throw new Error("WindowManager accepted Rotate, but the default display did not rotate");
+  } catch (error) {
+    // A partial change cannot leave a failed Rotate's overrides behind; the original
+    // settings found before the first Rotate are put back.
+    if (wrote && !context.shuttingDown) await restoreRotationSettings(context);
+    throw error;
+  }
+}
+
+function rotationRestoreCommands(original) {
+  return [
+    ["user-rotation", "lock", original.rotation],
+    ["fixed-to-user-rotation", original.fixed],
+    ...(original.mode === "free" ? [["user-rotation", "free"]] : []),
+  ];
+}
+
+/** Returns the settings it restored, or null when nothing was written or a command failed. */
+async function restoreRotationSettings(context) {
+  const original = context.rotationOriginal;
+  if (!context.rotationWritten || !original) return null;
+  const failures = await runWm(context, rotationRestoreCommands(original), { change: false });
+  if (original.unset) {
+    try {
+      await runAdb(context, ["shell", "settings", "delete", "system", "user_rotation"], { timeout: WM_TIMEOUT_MS });
+    } catch (error) { failures.push("restoring unset user_rotation failed: " + adbFailure(error)); }
+  }
+  if (failures.length) {
+    context.state.lastError = "Rotation restore failed: " + failures.join("; ");
+    console.log(context.state.lastError);
+  } else {
+    console.log(`Rotation restored: ${original.mode === "free" ? "free" : "lock " + original.rotation}, ` +
+      `user_rotation ${original.unset ? "unset" : original.rotation}, fixed-to-user-rotation ${original.fixed}`);
+    context.rotationWritten = false;
+    context.rotationOriginal = null;
+    return original;
+  }
+  return null;
+}
+
+/**
+ * The running Rotate sees the stop at its next step and its pending `wm` write is killed;
+ * the wait for it is bounded so the restore still fits the stop budget behind an adb call
+ * that hangs. Remaining window: a killed write that the device applies only after the
+ * read-back below is not put back.
+ */
+async function restoreDeviceRotation(context) {
+  // A Rotate write still waiting on adb is killed first: it must not land after the restore.
+  context.rotationAbort?.abort();
+  const running = context.rotationRunning;
+  if (running) await Promise.race([running.catch(() => {}), sleep(ROTATION_STOP_WAIT_MS)]);
+  const original = await restoreRotationSettings(context);
+  if (!original) return;
+  // A killed adb client whose `wm` had already reached the device can still apply it: read
+  // the settings back once and put them back again if they differ.
+  try {
+    const mode = (await runAdb(context, ["shell", "wm", "user-rotation"], { timeout: WM_TIMEOUT_MS })).stdout.trim();
+    const fixed = (await runAdb(context, ["shell", "wm", "fixed-to-user-rotation"], { timeout: WM_TIMEOUT_MS })).stdout.trim();
+    const expected = original.mode === "free" ? "free" : `lock ${original.rotation}`;
+    if (mode === expected && fixed === original.fixed) return;
+    console.log(`Rotation changed after its restore (${mode}, ${fixed}); restoring again`);
+    const failures = await runWm(context, rotationRestoreCommands(original), { change: false });
+    if (failures.length) {
+      context.state.lastError = "Rotation restore failed: " + failures.join("; ");
+      console.log(context.state.lastError);
+    }
+  } catch (error) {
+    console.log(`Rotation restore read-back failed: ${adbFailure(error)}`);
+  }
 }
 
 /** Lift every pointer and key of one connection on the device and journal what it did. */
@@ -5553,12 +5752,12 @@ function restoreCommands(original) {
  * stops at its first failure, and before its next command once the Canvas stops, since
  * the restore puts back both values; the restore runs every command.
  */
-async function runWm(context, commands, { change }) {
+async function runWm(context, commands, { change, signal }) {
   const failures = [];
   for (const command of commands) {
     if (change && context.shuttingDown) break;
     try {
-      await runAdb(context, ["shell", "wm", ...command], { timeout: WM_TIMEOUT_MS });
+      await runAdb(context, ["shell", "wm", ...command], { timeout: WM_TIMEOUT_MS, signal });
     } catch (error) {
       failures.push(`wm ${command.join(" ")} failed: ${adbFailure(error)}`);
       if (change) break;
@@ -6134,6 +6333,7 @@ async function runAdb(context, args, options = {}) {
     timeout: options.timeout ?? 10_000,
     maxBuffer: 32 * 1024 * 1024,
     encoding: encoding === "buffer" ? null : "utf8",
+    ...(options.signal ? { signal: options.signal } : {}),
   });
   return { stdout: result.stdout, stderr: result.stderr };
 }
@@ -6609,7 +6809,7 @@ const sizeOptions=[...document.querySelectorAll("[data-preset]")];
 const inputControls=[...document.querySelectorAll("[data-system],[data-code],[data-key]"),textInput,sendButton];
 const ctx=video.getContext("2d");
 let csrf=null,logicalDisplay=null,reconnectTimer=null,pointer=null,displayBusy=false,refocusPicker=false,menuOpen=false,noteAt=0,frameRatio=0,rotation=0;
-const view={transport:null,mode:null,reason:"",status:null,owner:"shared",paused:false,session:"idle",clients:null,width:0,height:0,note:"",rtt:null,preset:null,density:null,clipboard:false};
+const view={transport:null,mode:null,reason:"",status:null,owner:"shared",paused:false,session:"idle",clients:null,width:0,height:0,note:"",rtt:null,preset:null,density:null,clipboard:false,rotateBusy:false};
 const stats={decoder:"none",codec:null,framesDecoded:0,framesRendered:0,framesDropped:0,packets:0,bytes:0,errors:0,renderTimes:[],lastFrameAt:0};
 let videoSocket=null,controlSocket=null,decoder=null,config=null,waitingKey=true,drawScheduled=false,configuring=false,pendingChunks=[];
 const MAX_QUEUED_FRAMES=2,frameQueue=[];
@@ -6665,9 +6865,9 @@ function draw(){drawScheduled=false;const frame=frameQueue.shift();if(!frame)ret
 function onDecoderError(error){stats.errors+=1;note("decoder: "+(error&&error.message||error));try{if(decoder&&decoder.state!=="closed")decoder.close()}catch{}decoder=null;waitingKey=true;if(stats.codec&&supportedCodecs.get(stats.codec))applyDecoderConfig(stats.codec);sendControl({t:"system",op:"keyframe"})}
 
 // scrcpy control: one WebSocket carrying touch, wheel, keys, text and system actions.
-function connectControl(){if(controlSocket||!fastActive())return;const socket=new WebSocket(wsUrl("/ws/control"));controlSocket=socket;socket.onopen=()=>{controlRetry=500};socket.onmessage=event=>{let message;try{message=JSON.parse(event.data)}catch{return}onControlMessage(message)};socket.onclose=()=>{if(controlSocket!==socket)return;controlSocket=null;activePointers.clear();displayBusy=false;if(fastActive()){setTimeout(connectControl,controlRetry);controlRetry=Math.min(5000,controlRetry*2)}}}
+function connectControl(){if(controlSocket||!fastActive())return;const socket=new WebSocket(wsUrl("/ws/control"));controlSocket=socket;socket.onopen=()=>{controlRetry=500};socket.onmessage=event=>{let message;try{message=JSON.parse(event.data)}catch{return}onControlMessage(message)};socket.onclose=()=>{if(controlSocket!==socket)return;controlSocket=null;activePointers.clear();displayBusy=false;view.rotateBusy=false;syncControls();if(fastActive()){setTimeout(connectControl,controlRetry);controlRetry=Math.min(5000,controlRetry*2)}}}
 function closeControlSocket(){const socket=controlSocket;controlSocket=null;if(socket)socket.close()}
-function onControlMessage(message){if(message.t==="state")applyState(message);else if(message.t==="display")onDisplay(message.display);else if(message.t==="error"){stats.errors+=1;note(message.message);if(message.for==="display"){displayBusy=false;syncPicker()}}else if(message.t==="clipboard"){if(typeof message.text!=="string"){note("the device clipboard has no text");return}textInput.value=message.text;if(navigator.clipboard&&navigator.clipboard.writeText)navigator.clipboard.writeText(message.text).catch(()=>{});note("device clipboard copied")}else if(message.t==="paste"){if(message.message)note(message.message)}else if(message.t==="pong"){view.rtt=Math.round(performance.now()-message.ts)}}
+function onControlMessage(message){if(message.t==="state")applyState(message);else if(message.t==="display")onDisplay(message.display);else if(message.t==="rotation"){view.rotateBusy=false;syncControls();note(message.legacy?"Rotation requested through scrcpy":"Device rotated")}else if(message.t==="error"){stats.errors+=1;note(message.message);if(message.for==="rotate"){view.rotateBusy=false;syncControls()}if(message.for==="display"){displayBusy=false;syncPicker()}}else if(message.t==="clipboard"){if(typeof message.text!=="string"){note("the device clipboard has no text");return}textInput.value=message.text;if(navigator.clipboard&&navigator.clipboard.writeText)navigator.clipboard.writeText(message.text).catch(()=>{});note("device clipboard copied")}else if(message.t==="paste"){if(message.message)note(message.message)}else if(message.t==="pong"){view.rtt=Math.round(performance.now()-message.ts)}}
 function sendControl(message){if(!controlSocket||controlSocket.readyState!==1)return false;controlSocket.send(JSON.stringify(message));return true}
 function applyState(message){view.owner=message.owner;view.paused=message.paused;view.session=message.session;view.clients=message.clients;if("clipboard" in message){view.clipboard=message.clipboard===true;if(iosFast())applyHint()}if("preset" in message){view.preset=message.preset;view.density=message.density}syncPicker();if("rotation" in message)setRotation(message.rotation);if(view.mode==="webcodecs"&&message.width&&message.height)setVideoSize(message.width,message.height);if(message.transport&&message.transport!==view.transport){view.transport=message.transport;applyTransport()}}
 function applyHint(){setText(ui.hint,iosFast()?(view.clipboard?"Plain ASCII up to 300 bytes is typed into the Simulator; longer or other text is set on its clipboard: touch and hold, then Paste.":"Typed into the Simulator, up to 300 bytes at a time."):scrcpyActive()?"Any language. Longer text is pasted through the device clipboard.":"Letters, digits and punctuation of plain ASCII on this transport.")}
@@ -6702,7 +6902,7 @@ if(sizePicker){
   document.addEventListener("pointerdown",event=>{if(menuOpen&&!sizeMenu.contains(event.target)&&!sizePicker.contains(event.target))closeMenu(false)});
 }
 // Controls that cannot act look and are disabled (PAGE-004); handoff goes the way input goes.
-function syncControls(){const ready=Boolean(view.status)&&canSendInput(),owner=OWNERS[view.owner]||[String(view.owner),"holds control"];for(const control of inputControls)if(control.disabled===ready)control.disabled=!ready;setText(ui.ownerName,owner[0]);setText(ui.ownerDetail,"· "+(view.paused?"input is paused":owner[1]));setText(ui.chip,owner[0]+(view.paused?" · Paused":""));setState(ui.ownerDot,ready?"live":"warn");setText(ui.take,view.owner==="human"?"Release":"Take control");setText(ui.pause,view.paused?"Resume input":"Pause input");for(const button of [ui.take,ui.pause])if(button.disabled===Boolean(view.status))button.disabled=!view.status}
+function syncControls(){const ready=Boolean(view.status)&&canSendInput(),owner=OWNERS[view.owner]||[String(view.owner),"holds control"];for(const control of inputControls){const disabled=!ready||(control.dataset.system==="rotate"&&view.rotateBusy);if(control.disabled!==disabled)control.disabled=disabled}setText(ui.ownerName,owner[0]);setText(ui.ownerDetail,"· "+(view.paused?"input is paused":owner[1]));setText(ui.chip,owner[0]+(view.paused?" · Paused":""));setState(ui.ownerDot,ready?"live":"warn");setText(ui.take,view.owner==="human"?"Release":"Take control");setText(ui.pause,view.paused?"Resume input":"Pause input");for(const button of [ui.take,ui.pause])if(button.disabled===Boolean(view.status))button.disabled=!view.status}
 function setControl(mode){if(fastActive()&&sendControl({t:"control",mode}))return;post("/control",{mode}).then(result=>{view.owner=result.control_owner;view.paused=result.input_paused;syncPicker()}).catch(error=>note(error.message))}
 ui.take.addEventListener("click",()=>setControl(view.owner==="human"?"release":"takeover"));
 ui.pause.addEventListener("click",()=>setControl(view.paused?"resume":"pause"));
@@ -6747,7 +6947,7 @@ function onPaste(event){if(!fastActive())return;const text=event.clipboardData&&
 function utf8Length(text){return new TextEncoder().encode(text).length}
 function iosTypeable(text){return /^[\\n\\x20-\\x7e]*$/.test(text)}
 function fitsControl(message,what){const size=utf8Length(JSON.stringify(message));if(size<=MAX_CONTROL_BYTES)return true;note(what+" is too large: "+size+" bytes as a control message after JSON escaping, at most "+MAX_CONTROL_BYTES+"; nothing was sent");return false}
-for(const button of document.querySelectorAll("[data-system],[data-code],[data-key]")){button.addEventListener("click",()=>{if(fastActive()){if(button.dataset.system)sendControl({t:"system",op:button.dataset.system});else if(button.dataset.code){const code=Number(button.dataset.code);sendControl({t:"key",a:"down",code,meta:0,repeat:0});sendControl({t:"key",a:"up",code,meta:0,repeat:0})}return}if(button.dataset.key)post("/key",{key:button.dataset.key}).catch(error=>note(error.message))})}
+for(const button of document.querySelectorAll("[data-system],[data-code],[data-key]")){button.addEventListener("click",()=>{if(fastActive()){if(button.dataset.system){const sent=sendControl({t:"system",op:button.dataset.system});if(button.dataset.system==="rotate"&&sent){view.rotateBusy=true;syncControls();note("Rotating device…")}}else if(button.dataset.code){const code=Number(button.dataset.code);sendControl({t:"key",a:"down",code,meta:0,repeat:0});sendControl({t:"key",a:"up",code,meta:0,repeat:0})}return}if(button.dataset.key)post("/key",{key:button.dataset.key}).catch(error=>note(error.message))})}
 $("clipboard").onclick=()=>sendControl({t:"clipboard-get"});
 $("refresh").onclick=()=>{if(view.mode==="webcodecs"){closeVideoSocket();waitingKey=true;videoRetry=500;connectVideo()}else restart()};
 async function sendText(){const value=textInput.value;if(!value)return;if(iosFast()&&!view.clipboard){if(utf8Length(value)>300){note("the iOS Simulator takes at most 300 bytes of text at a time; nothing was sent");return}if(sendControl({t:"text",text:value}))textInput.value="";return}if(fastActive()){const message=utf8Length(value)<=300&&(!iosFast()||iosTypeable(value))?{t:"text",text:value}:{t:"paste",text:value};if(!fitsControl(message,"the text"))return;const ok=sendControl(message);if(ok)textInput.value="";return}try{await post("/text",{text:value});textInput.value=""}catch(error){note(error.message)}}
