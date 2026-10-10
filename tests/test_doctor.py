@@ -39,7 +39,7 @@ COMPANION_FIXED = '{"version":"1.6.2","build_date":"Jun 20 2026"}'
 # companion / idb state file) on the machine running the suite.
 TOOL_ENV = ("AUTONOM_ADB", "AUTONOM_SIMCTL", "AUTONOM_IDB", "AUTONOM_MITMDUMP",
             "AUTONOM_AXE", "AUTONOM_IOS_HID", "AUTONOM_IDB_COMPANION",
-            "AUTONOM_IDB_STATE_FILE", "AUTONOM_FAKE_STATE", "AUTONOM_FAKE_LOG",
+            "AUTONOM_IDB_COMPANION_BIN", "AUTONOM_IDB_STATE_FILE", "AUTONOM_FAKE_STATE", "AUTONOM_FAKE_LOG",
             "DEVELOPER_DIR")
 
 
@@ -215,6 +215,25 @@ class DoctorTests(unittest.TestCase):
             self.assertEqual(warning["variable"], "AUTONOM_ADB")
             self.assertIn("unset AUTONOM_ADB", warning["hint"])
             self.assertNotEqual(report["tools"]["adb"]["state"], "ok")
+
+    def test_canvas_companion_binary_override_is_named(self) -> None:
+        """AUTONOM_IDB_COMPANION_BIN picks the Canvas's idb_companion: doctor names it
+        and warns when it points at nothing, as for every other binary override."""
+        with tempfile.TemporaryDirectory() as home:
+            env = hermetic_env(home, fakes_path(home))
+            for value, exists in ((str(FAKE_ADB), True), (str(Path(home) / "no-companion"), False)):
+                env["AUTONOM_IDB_COMPANION_BIN"] = value
+                result = subprocess.run(
+                    [sys.executable, str(CLI), "doctor"],
+                    cwd=ROOT, env=env, text=True,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, timeout=120,
+                )
+                report = json.loads(result.stdout)
+                self.assertEqual(report["overrides"]["AUTONOM_IDB_COMPANION_BIN"],
+                                 {"value": value, "exists": exists})
+                missing = [w for w in report["warnings"] if w["code"] == "override_path_missing"
+                           and w["variable"] == "AUTONOM_IDB_COMPANION_BIN"]
+                self.assertEqual(len(missing), 0 if exists else 1)
 
     def test_installed_tools_are_reported_ok(self) -> None:
         env_result = self._run("--adb", str(FAKE_ADB), "--simctl", str(FAKE_SIMCTL))

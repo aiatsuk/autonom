@@ -221,7 +221,9 @@ const MAX_SENT_DISPLAY_SIDE = 10_000;
 // Transports whose video and input go over /ws/video and /ws/control: scrcpy on Android,
 // idb (one idb_companion H.264 stream and its HID stream) on the iOS Simulator.
 const FAST_TRANSPORTS = new Set(["scrcpy", "idb"]);
-// A fast stream that sends no frame this long after it opened is ended and opened again.
+// A fast stream that sends no frame this long after it opened, or after a restart on the
+// same call (a forced key frame, a profile change, the Simulator booting again), is ended
+// and opened again.
 const IDB_FIRST_FRAME_MS = 10_000;
 // The companion has no key frame on demand; it sends one every DEFAULT_VIDEO_OPTIONS
 // .keyFrameRate seconds (DEC-004). A key frame asked for and not seen within this wait is
@@ -2925,6 +2927,10 @@ class IosFastSession extends EventEmitter {
   #keyFrameTimer = null;
   #forcedKeyFrameAt = -Infinity;
   #streamRestarting = false;
+  // The first-frame watchdog of the current stream: { stream, timer, since }, and how the stream
+  // that runs reports the watchdog's error to its run loop.
+  #frameWatch = null;
+  #streamFail = null;
   #stats = {
     packets: 0, bytes: 0, keyFrames: 0, restarts: 0, companionStarts: 0, streamsOpened: 0,
     streamRestarts: 0, forcedKeyFrames: 0, hidEvents: 0,
@@ -3022,6 +3028,7 @@ class IosFastSession extends EventEmitter {
     this.#stats.streamRestarts += 1;
     return stream.restart({ options: this.#video }).then(() => {
       this.#stats.streamsOpened += 1;
+      if (this.#stream === stream && !stream.done && !this.#stopped) this.#watchFirstFrame(stream);
       return true;
     }, (error) => {
       if (!stream.abnormal && this.listenerCount("error")) {
@@ -3040,6 +3047,7 @@ class IosFastSession extends EventEmitter {
     clearTimeout(this.#watchTimer);
     clearTimeout(this.#orientationTimer);
     clearTimeout(this.#keyFrameTimer);
+    this.#clearFrameWatch();
     this.#wake?.();
     this.#setState("stopped");
     this.#settleFirst(new Error("the idb session stopped"));
@@ -3124,27 +3132,46 @@ class IosFastSession extends EventEmitter {
     this.#stream = stream;
     this.#stats.streamsOpened += 1;
     const openedAt = performance.now();
-    let framed = false;
     let error = null;
-    const timer = setTimeout(() => {
-      if (framed) return;
-      error = new Error(`the idb video stream sent no frame within ${IDB_FIRST_FRAME_MS / 1000} s`);
-      stream.stop().catch(() => {});
-    }, IDB_FIRST_FRAME_MS);
-    timer.unref?.();
+    this.#streamFail = (watchdog) => { error ??= watchdog; };
+    this.#watchFirstFrame(stream);
     try {
-      for await (const frame of stream) {
-        framed = true;
-        this.#onFrame(frame);
-      }
+      for await (const frame of stream) this.#onFrame(frame);
     } catch (thrown) {
       error ??= thrown;
     } finally {
-      clearTimeout(timer);
+      this.#clearFrameWatch();
+      this.#streamFail = null;
       if (this.#stream === stream) this.#stream = null;
     }
     const closed = await stream.closed;
     return { abnormal: closed.abnormal, error: error ?? closed.error ?? null, ranMs: performance.now() - openedAt };
+  }
+
+  /**
+   * Ends `stream` when it sends no frame within IDB_FIRST_FRAME_MS: armed when it opens and
+   * again after each restart, so a call reopened by Stop and Start that stays silent is
+   * ended too and the run loop opens a new stream (replacing the companion when the Stop
+   * goes unanswered).
+   */
+  #watchFirstFrame(stream) {
+    this.#clearFrameWatch();
+    // Frames the old call queued before a restart arrived before this: they do not count.
+    const watch = { stream, timer: null, since: performance.now() };
+    watch.timer = setTimeout(() => {
+      if (this.#frameWatch !== watch) return;
+      this.#frameWatch = null;
+      if (this.#stopped || stream.done || this.#stream !== stream) return;
+      this.#streamFail?.(new Error(`the idb video stream sent no frame within ${IDB_FIRST_FRAME_MS / 1000} s`));
+      stream.stop().catch(() => {});
+    }, IDB_FIRST_FRAME_MS);
+    watch.timer.unref?.();
+    this.#frameWatch = watch;
+  }
+
+  #clearFrameWatch() {
+    clearTimeout(this.#frameWatch?.timer);
+    this.#frameWatch = null;
   }
 
   /** The screen size in points, for HID coordinates; the last known one is kept on failure. */
@@ -3176,6 +3203,7 @@ class IosFastSession extends EventEmitter {
   }
 
   #onFrame(frame) {
+    if (this.#frameWatch && !(frame.receivedAt < this.#frameWatch.since)) this.#clearFrameWatch();
     if (frame.config && (!this.#config || !frame.config.equals(this.#config))) {
       this.#config = Buffer.from(frame.config);
       if (frame.width && frame.height &&
@@ -3235,6 +3263,7 @@ class IosFastSession extends EventEmitter {
     this.#stats.streamRestarts += 1;
     stream.restart().then(() => {
       this.#stats.streamsOpened += 1;
+      if (this.#stream === stream && !stream.done && !this.#stopped) this.#watchFirstFrame(stream);
     }, (error) => {
       // An abnormal end is reported by the run loop, with this same error.
       if (stream.abnormal || !this.listenerCount("error")) return;
@@ -3602,7 +3631,6 @@ function logStreamSize(context) {
   console.log(line);
 }
 
-/** The display size puts journaled gestures in device pixels, like HTTP input. */
 /**
  * On the idb transport the companion already reported the screen in points, as the bridge
  * would read it from the accessibility tree; asking the bridge on every /status would run an
@@ -3613,6 +3641,7 @@ function iosStreamDisplay(context) {
   return { display: iosLogicalSize(context) };
 }
 
+/** The display size puts journaled gestures in device pixels, like HTTP input. */
 function refreshDisplay(context) {
   const streamed = iosStreamDisplay(context);
   if (streamed) {
@@ -4731,9 +4760,15 @@ async function runIosHid(context, item) {
   await iosHidWrite(context, session, sent, action);
 }
 
-/** Write one event to the session's HID stream; a write not taken in time stops holding the queue. */
+/**
+ * Write one event to the session's HID stream; a write not taken in time stops holding the
+ * queue. Such a late write still counts once the companion takes it: it happened on the
+ * Simulator, so its action is journaled then (iosLateWrite), even after its record's turn.
+ */
 async function iosHidWrite(context, session, sent, action) {
   let timer = null;
+  let late = false;
+  const startedAt = performance.now();
   const timeout = new Promise((resolvePromise) => {
     timer = setTimeout(() => resolvePromise("timeout"), IOS_HID_WRITE_MS);
     timer.unref?.();
@@ -4741,15 +4776,42 @@ async function iosHidWrite(context, session, sent, action) {
   // Only an event the companion took counts for its action's record.
   const written = session.hid(sent).then(() => {
     if (action) action.written += 1;
+    if (!late) return;
+    context.state.lastError = `idb hid: a write took ${Math.round(performance.now() - startedAt)} ms ` +
+      `(more than ${IOS_HID_WRITE_MS} ms), then the companion took it`;
+    iosLateWrite(context, action, true);
+  }, (error) => {
+    if (!late) throw error;
+    context.state.lastError = `idb hid: ${error.message}`;
+    iosLateWrite(context, action, false);
   });
   try {
     const result = await Promise.race([written, timeout]);
-    if (result === "timeout") context.state.lastError = `idb hid: a write took more than ${IOS_HID_WRITE_MS} ms`;
+    if (result === "timeout") {
+      late = true;
+      if (action) action.late = (action.late ?? 0) + 1;
+      context.state.lastError = `idb hid: a write took more than ${IOS_HID_WRITE_MS} ms`;
+    }
   } catch (error) {
     context.state.lastError = `idb hid: ${error.message}`;
   } finally {
     clearTimeout(timer);
   }
+}
+
+/**
+ * A write that outlived IOS_HID_WRITE_MS settled. Its action's record, held back because no
+ * event of the action was taken by its turn (runIosRecord), is journaled once one is taken,
+ * and dropped once every late write failed.
+ */
+function iosLateWrite(context, action, taken) {
+  if (!action) return;
+  action.late -= 1;
+  const deferred = action.deferred;
+  if (!deferred || (!taken && action.late > 0)) return;
+  action.deferred = null;
+  if (taken) journalNow(context, deferred.client, deferred.record, deferred.onAnswered);
+  else deferred.onAnswered?.();
 }
 
 /**
@@ -4802,10 +4864,16 @@ async function runIosText(context, item) {
  * A record waits behind the input before it. An action none of whose events a live
  * companion took (refused by their turn, or dropped with a lost companion or a stopped
  * session) did not happen: its record is dropped. An action without events (a wheel burst
- * that did not move) is journaled unless refused by its turn.
+ * that did not move) is journaled unless refused by its turn. One whose writes are still
+ * pending past IOS_HID_WRITE_MS waits for them (iosLateWrite).
  */
 function runIosRecord(context, item) {
   const { client, record, onAnswered, action } = item;
+  if (action && !action.written && action.late > 0) {
+    // A write still pending past IOS_HID_WRITE_MS may yet reach the Simulator.
+    action.deferred = { client, record, onAnswered };
+    return;
+  }
   if (action && !action.written && (action.sent || refusal(context, client.origin))) {
     onAnswered?.();
     return;
