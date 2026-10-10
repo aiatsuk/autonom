@@ -7,6 +7,8 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
 
 ## [Unreleased]
 
+## [0.35.1] - 2026-10-10
+
 ### Fixed
 - **iOS fast Canvas follow-ups (#38).** A stream restarted on the same call
   (a forced key frame, a profile change, the Simulator booting again) that
@@ -26,6 +28,15 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
   original settings back. The original rotation mode, stored rotation and
   app-orientation policy are kept per device and restored on detach,
   reconnect and Canvas stop. Android 11 and older keep the scrcpy request.
+- **Network stop restores the device first.** `network stop`, `network detach`,
+  `session stop` and the Canvas Tools Stop now put the Android emulator's
+  proxy settings back and verify them before the capture proxy is stopped, so
+  the device is never left pointing at a dead local proxy. A failed restore
+  keeps the proxy running with an actionable hint and the snapshot for a
+  retry; a device whose proxy was changed outside Autonom is left alone and
+  the stop finishes with a `device_proxy_changed_externally` warning. Stop and
+  detach are bound to the session of the device they name and refuse
+  another target (`session_target_mismatch`).
 
 ## [0.35.0] - 2026-10-10
 
