@@ -146,14 +146,75 @@ class ProxyCleanupTests(EnvSandboxMixin, unittest.TestCase):
         device.detach(self.target, self.record)
         self.assertEqual(self.settings(), {"http_proxy": ":0"})
 
-    def test_external_proxy_change_is_not_overwritten(self):
+    def test_external_proxy_change_is_left_and_capture_finishes(self):
+        # The device no longer depends on this capture: its new proxy stays,
+        # and stopping the capture proxy cannot strand it.
         self.attach()
         self.set_settings(http_proxy="other.corp:8080")
+        with mock.patch.object(cli.proxy_mod, "stop", return_value={"was_running": True}) as stop:
+            result = self.stop()
+        stop.assert_called_once()
+        self.assertEqual(self.settings(), {"http_proxy": "other.corp:8080"})
+        self.assertEqual(result["detach"]["left_unchanged"], "other.corp:8080")
+        self.assertEqual(result["detach"]["warnings"][0]["code"],
+                         "device_proxy_changed_externally")
+        saved = session.require_current()["network"]
+        self.assertFalse(saved["attached"])
+        self.assertIsNone(saved["previous_proxy_settings"])
+
+    def test_external_legacy_change_with_canonical_still_on_capture_is_refused(self):
+        # Deleting http_proxy does not clear Android's canonical proxy: the
+        # device still uses the capture, so the proxy must keep running.
+        self.attach("proxy.corp:3128")
+        self.set_settings(global_http_proxy_host="10.0.2.2", global_http_proxy_port="8899")
         with mock.patch.object(cli.proxy_mod, "stop") as stop:
-            with self.assertRaises(errors.AutonomError):
+            with self.assertRaises(errors.AutonomError) as caught:
                 self.stop()
         stop.assert_not_called()
-        self.assertEqual(self.settings()["http_proxy"], "other.corp:8080")
+        self.assertIn("settings put global http_proxy :0", caught.exception.hint)
+        self.assertTrue(session.require_current()["network"]["attached"])
+
+    def test_dead_prior_proxy_hint_leads_to_a_finished_stop(self):
+        self.attach("10.0.2.2:58514")
+        with mock.patch.object(device.socket, "create_connection", side_effect=OSError("dead")), \
+                mock.patch.object(cli.proxy_mod, "stop") as stop:
+            with self.assertRaises(errors.AutonomError) as caught:
+                self.stop()
+        stop.assert_not_called()
+        hint = caught.exception.hint
+        self.assertIn("adb -s emulator-5580 shell settings put global http_proxy :0", hint)
+        # The operator follows the hint (Android then clears the canonical rows).
+        self.set_settings(http_proxy=":0")
+        with mock.patch.object(cli.proxy_mod, "stop", return_value={"was_running": True}) as stop:
+            result = self.stop()
+        stop.assert_called_once()
+        self.assertEqual(self.settings(), {"http_proxy": ":0"})
+        self.assertEqual(result["detach"]["left_unchanged"], ":0")
+
+    def test_empty_canonical_rows_are_put_back_empty_not_deleted(self):
+        # A fresh emulator keeps the rows empty ("" and port 0) after ":0".
+        self.set_settings(http_proxy=":0", global_http_proxy_host="", global_http_proxy_port="0",
+                          global_http_proxy_exclusion_list="", global_proxy_pac_url="")
+        device.attach(self.target, self.record, port=8899, acknowledged=True)
+        self.set_settings(http_proxy="10.0.2.2:8899", global_http_proxy_host="10.0.2.2",
+                          global_http_proxy_port="8899", global_http_proxy_exclusion_list="",
+                          global_proxy_pac_url="")
+        device.detach(self.target, self.record)
+        self.assertEqual(self.settings(), {
+            "http_proxy": ":0", "global_http_proxy_host": "", "global_http_proxy_port": "0",
+            "global_http_proxy_exclusion_list": "", "global_proxy_pac_url": ""})
+
+    def test_restore_failure_error_names_the_retry(self):
+        self.attach("proxy.corp:3128")
+        with mock.patch.object(device, "apply_proxy_setting",
+                               return_value={"applied": False, "error": "svc wifi enable failed"}), \
+                mock.patch.object(cli.proxy_mod, "stop") as stop:
+            with self.assertRaises(errors.AutonomError) as caught:
+                self.stop()
+        stop.assert_not_called()
+        self.assertEqual(caught.exception.code, errors.BACKEND_FAILED)
+        self.assertIn("network stop", caught.exception.hint)
+        self.assertTrue(session.require_current()["network"]["attached"])
 
     def test_external_pac_change_is_not_overwritten(self):
         self.attach()

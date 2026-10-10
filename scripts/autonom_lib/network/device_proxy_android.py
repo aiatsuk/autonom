@@ -538,16 +538,21 @@ def attach(
                 or current != network.get("device_proxy")):
             raise errors.AutonomError(
                 errors.BACKEND_FAILED, "The proxy changed outside this attachment.",
-                "Resolve the existing attachment before attaching again.")
+                "Run 'autonom network detach' to finish the existing attachment, "
+                "then attach again.")
         previous = network.get("previous_http_proxy")
         saved_settings = network.get("previous_proxy_settings")
     else:
         if current == device_proxy:
             raise errors.AutonomError(
                 errors.BACKEND_FAILED, "The device already uses this proxy without a restore snapshot.",
-                "Inspect the device proxy and explicitly restore it before attaching.")
+                "A stopped capture left it behind, so the original setting is unknown. "
+                f"Set the proxy the device should use (no proxy: 'adb -s {target.target_id} "
+                f"shell settings put global {SETTING} {UNSET}'), then attach again.")
         previous = current
-        saved_settings = {key: _read_proxy_setting(target, key) for key in PROXY_SETTINGS}
+        # Raw values, so detach puts back an empty row as empty, not deleted.
+        saved_settings = {key: _read_proxy_setting(target, key, raw=True)
+                          for key in PROXY_SETTINGS}
     _put_setting(target, device_proxy)
     network = record.setdefault("network", {})
     network.update({
@@ -605,14 +610,33 @@ def detach(target: Target, record: dict[str, Any]) -> dict[str, Any]:
     previous = network.get("previous_http_proxy")
     restore = previous if previous else UNSET
     current = _get_setting(target)
-    if current not in (network.get("device_proxy"), restore, None if restore == UNSET else restore):
+    device_proxy = network.get("device_proxy")
+    repair = (f"adb -s {target.target_id} shell settings put global {SETTING} {UNSET}")
+    if current not in (device_proxy, restore, None if restore == UNSET else restore):
+        if not _points_at(target, device_proxy):
+            # Someone else replaced the proxy: the device no longer depends on
+            # this capture, so finishing never strands it. Their setting stays.
+            network.update({"attached": False, "device_proxy": None,
+                            "previous_http_proxy": None, "previous_proxy_settings": None,
+                            "capture_mode": None})
+            return {"was_attached": True, "restored_http_proxy": None, "wrote": None,
+                    "left_unchanged": current,
+                    "warnings": [{
+                        "code": "device_proxy_changed_externally",
+                        "error": f"the device proxy was changed to {current!r} outside "
+                                 "this attachment and was left as it is",
+                        "hint": "Check that this is the proxy the device should use.",
+                    }]}
         raise errors.AutonomError(
             errors.BACKEND_FAILED, "The device proxy changed outside this attachment.",
-            "Inspect the current proxy; detach will not overwrite another proxy.")
-    if previous and previous == network.get("device_proxy"):
+            "Inspect the current proxy; detach will not overwrite another proxy. "
+            f"To clear it by hand: '{repair}', then retry.")
+    if previous and previous == device_proxy:
         raise errors.AutonomError(
             errors.BACKEND_FAILED, "The saved proxy points back to the proxy being stopped.",
-            "Explicitly repair the device proxy; the original setting is unknown.")
+            f"The original setting is unknown. Clear the device proxy with '{repair}' "
+            "(or set the proxy the device should use), then retry; the capture proxy "
+            "keeps running until then.")
     if isinstance(previous, str) and previous.startswith(EMULATOR_HOST + ":"):
         try:
             port = int(previous.rsplit(":", 1)[1])
@@ -620,11 +644,14 @@ def detach(target: Target, record: dict[str, Any]) -> dict[str, Any]:
                 pass
         except (OSError, ValueError, OverflowError) as exc:
             raise errors.AutonomError(
-                errors.BACKEND_FAILED, "The saved local proxy is not reachable.",
-                "Restore that proxy or explicitly repair the device settings before stopping.") from exc
+                errors.BACKEND_FAILED, f"The saved local proxy {previous} is not reachable.",
+                "Restoring it would leave the device offline. Start that proxy again, or "
+                f"clear the device proxy with '{repair}', then retry; the capture proxy "
+                "keeps running until then.") from exc
     saved = network.get("previous_proxy_settings")
     expected = _canonical_proxy(network.get("device_proxy"))
-    restored = saved if isinstance(saved, dict) else _canonical_proxy(restore)
+    raw_restore = saved if isinstance(saved, dict) else _canonical_proxy(restore)
+    restored = {key: _normalise_setting(key, raw_restore.get(key)) for key in PROXY_SETTINGS}
     for key in PROXY_SETTINGS:
         current_value = _read_proxy_setting(target, key)
         if current_value not in (None, expected[key], restored.get(key)):
@@ -636,7 +663,8 @@ def detach(target: Target, record: dict[str, Any]) -> dict[str, Any]:
         if canonical == network.get("device_proxy"):
             raise errors.AutonomError(
                 errors.BACKEND_FAILED, "The saved canonical proxy points back to this capture.",
-                "Explicitly repair the device proxy; the original setting is unknown.")
+                f"The original setting is unknown. Clear the device proxy with '{repair}', "
+                "then retry; the capture proxy keeps running until then.")
         if canonical != previous:
             try:
                 with socket.create_connection(("127.0.0.1", int(restored["global_http_proxy_port"])),
@@ -644,27 +672,48 @@ def detach(target: Target, record: dict[str, Any]) -> dict[str, Any]:
                     pass
             except (OSError, TypeError, ValueError, OverflowError) as exc:
                 raise errors.AutonomError(
-                    errors.BACKEND_FAILED, "The saved canonical local proxy is not reachable.",
-                    "Restore that proxy or explicitly repair the device settings before stopping.") from exc
-    _put_setting(target, restore)
-    # Legacy sessions saved only host:port; restored then contains its
-    # canonical route, after refusing any unrelated PAC/exclusion edit.
-    for key in PROXY_SETTINGS:
-        value = restored.get(key)
-        argv = (["shell", "settings", "delete", "global", key] if value is None else
-                ["shell", "settings", "put", "global", key, shlex.quote(str(value))])
-        adb_mod.run_adb(target.tool, argv, serial=target.target_id, timeout=15, check=True)
-    applied = apply_proxy_setting(target)
+                    errors.BACKEND_FAILED, f"The saved canonical local proxy {canonical} is not reachable.",
+                    "Restoring it would leave the device offline. Start that proxy again, or "
+                    f"clear the device proxy with '{repair}', then retry; the capture proxy "
+                    "keeps running until then.") from exc
+    retry = ("Retry 'autonom network detach' or 'network stop'; the restore snapshot "
+             "and the capture proxy have been kept.")
+    try:
+        _put_setting(target, restore)
+        # Legacy sessions saved only host:port; restored then contains its
+        # canonical route, after refusing any unrelated PAC/exclusion edit.
+        for key in PROXY_SETTINGS:
+            value = raw_restore.get(key)
+            argv = (["shell", "settings", "delete", "global", key] if value is None else
+                    ["shell", "settings", "put", "global", key, shlex.quote(str(value))])
+            adb_mod.run_adb(target.tool, argv, serial=target.target_id, timeout=15, check=True)
+        applied = apply_proxy_setting(target)
+    except errors.AutonomError as exc:
+        # A half-written restore is retried from the same snapshot.
+        raise errors.AutonomError(
+            exc.code, f"Restoring the device proxy failed: {exc.message}", retry,
+            **exc.extra) from exc
     if (not applied.get("applied") or _get_setting(target) != restore
             or any(_read_proxy_setting(target, key) != restored.get(key)
                    for key in PROXY_SETTINGS)):
         raise errors.AutonomError(
-            errors.BACKEND_FAILED, "The restored proxy could not be verified.",
-            "Retry detach; the restore snapshot and proxy have been kept.")
+            errors.BACKEND_FAILED, "The restored proxy could not be verified"
+            + (f" ({applied['error']})" if applied.get("error") else "") + ".", retry)
     network.update({"attached": False, "device_proxy": None, "previous_http_proxy": None,
                     "previous_proxy_settings": None, "capture_mode": None})
     return {"was_attached": True, "restored_http_proxy": previous, "wrote": restore,
             "setting_applied": applied}
+
+
+def _points_at(target: Target, device_proxy: str | None) -> bool:
+    """Does the legacy or the canonical device proxy still name `device_proxy`?"""
+    if not device_proxy:
+        return False
+    if _get_setting(target) == device_proxy:
+        return True
+    host = _read_proxy_setting(target, "global_http_proxy_host")
+    port = _read_proxy_setting(target, "global_http_proxy_port")
+    return f"{host}:{port}" == device_proxy
 
 
 def _canonical_proxy(value: str | None) -> dict[str, str | None]:
@@ -683,13 +732,23 @@ def _canonical_proxy(value: str | None) -> dict[str, str | None]:
     return settings
 
 
-def _read_proxy_setting(target: Target, key: str) -> str | None:
+def _read_proxy_setting(target: Target, key: str, *, raw: bool = False) -> str | None:
+    """One canonical proxy row. `raw` keeps an empty row ("") apart from a
+    missing one (None); otherwise both, and port 0, read as None (no proxy)."""
     completed = adb_mod.run_adb(
         target.tool, ["shell", "settings", "get", "global", key],
         serial=target.target_id, timeout=15, check=True)
     value = (completed.stdout or "").strip()
-    return None if (not value or value == "null"
-                    or key == "global_http_proxy_port" and value == "0") else value
+    if value == "null":
+        return None
+    return value if raw else _normalise_setting(key, value)
+
+
+def _normalise_setting(key: str, value: str | None) -> str | None:
+    if value is None:
+        return None
+    value = str(value)
+    return None if (not value or key == "global_http_proxy_port" and value == "0") else value
 
 
 def observed_setting(target: Target) -> str | None:

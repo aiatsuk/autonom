@@ -118,6 +118,62 @@ class MultiSessionCase(EnvSandboxMixin, unittest.TestCase):
                 path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
+class NetworkStopBindingTests(MultiSessionCase):
+    """`network stop` restores the device of the session it is bound to."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.primary = self.start(PRIMARY)
+        self.canvas = self.start(CANVAS, "--alongside", "--started-by", "canvas:3277:4242")
+        path = self.home / "sessions" / self.canvas["session_id"] / "session.json"
+        record = json.loads(path.read_text(encoding="utf-8"))
+        record.setdefault("network", {}).update({
+            "enabled": True, "attached": True, "capture_mode": "app_proxy",
+            "device_proxy": "10.0.2.2:8899", "previous_http_proxy": "proxy.corp:3128",
+            "previous_proxy_settings": {"global_http_proxy_host": "proxy.corp",
+                                        "global_http_proxy_port": "3128",
+                                        "global_http_proxy_exclusion_list": None,
+                                        "global_proxy_pac_url": None}})
+        path.write_text(json.dumps(record), encoding="utf-8")
+        self.write_state(settings={"http_proxy": "10.0.2.2:8899",
+                                   "global_http_proxy_host": "10.0.2.2",
+                                   "global_http_proxy_port": "8899"})
+
+    def settings_writes(self) -> list[list[str]]:
+        if not self.log.exists():
+            return []
+        calls = [json.loads(line)["argv"] for line in
+                 self.log.read_text(encoding="utf-8").splitlines() if line.strip()]
+        return [argv for argv in calls if argv[2:5] == ["shell", "settings", "put"]]
+
+    def test_stop_by_target_restores_that_targets_device(self) -> None:
+        code, payload = self.cli("--serial", CANVAS, "network", "stop")
+        self.assertEqual(code, 0, payload)
+        self.assertEqual(payload["detach"]["restored_http_proxy"], "proxy.corp:3128")
+        self.assertEqual(payload["detach"]["target_id"], CANVAS)
+        writes = self.settings_writes()
+        self.assertTrue(writes)
+        self.assertTrue(all(argv[:2] == ["-s", CANVAS] for argv in writes), writes)
+        self.assertFalse(self.record(self.canvas["session_id"])["network"]["attached"])
+        self.assertEqual(self.current_id(), self.primary["session_id"])
+        state = json.loads(self.state.read_text(encoding="utf-8"))["settings"]
+        self.assertEqual(state["http_proxy"], "proxy.corp:3128")
+
+    def test_the_primary_session_never_detaches_the_canvas_device(self) -> None:
+        code, payload = self.cli("network", "stop")
+        self.assertEqual(code, 0, payload)
+        self.assertFalse(payload["detach"]["was_attached"])
+        self.assertEqual(self.settings_writes(), [])
+        self.assertTrue(self.record(self.canvas["session_id"])["network"]["attached"])
+
+    def test_session_id_against_another_target_refuses_before_any_write(self) -> None:
+        code, payload = self.cli("--session-id", self.canvas["session_id"],
+                                 "--serial", PRIMARY, "network", "stop")
+        self.assertEqual((code, payload["error_code"]), (2, "session_target_mismatch"))
+        self.assertEqual(self.settings_writes(), [])
+        self.assertTrue(self.record(self.canvas["session_id"])["network"]["attached"])
+
+
 class AlongsideStartTests(MultiSessionCase):
     def test_alongside_with_nothing_live_never_writes_current(self) -> None:
         started = self.start(CANVAS, "--alongside")
