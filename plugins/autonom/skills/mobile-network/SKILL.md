@@ -69,9 +69,10 @@ keeps the session open on a network cleanup failure, rather than reaping a
 proxy the device still needs. Repeated attach preserves the first snapshot.
 Android detach refreshes Wi-Fi, briefly interrupting connectivity.
 
-An unreachable saved local proxy makes cleanup refuse with a hint naming the
-exact `adb` repair; agree it with the operator instead of blindly clearing their
-settings, then retry. A proxy changed outside Autonom that no longer points at
+While the device still points at the capture, an unreachable or
+self-referential saved proxy makes cleanup refuse with a hint naming the exact
+`adb` repair; agree it with the operator instead of blindly clearing their
+settings, then retry (the retry then finishes). A proxy changed outside Autonom that no longer points at
 the capture is left as it is (warning `device_proxy_changed_externally`). Transparent
 emulator routing requires shutting down that emulator before stopping capture.
 Abrupt proxy/host crashes still need `doctor` and device-state inspection.

@@ -204,6 +204,81 @@ class ProxyCleanupTests(EnvSandboxMixin, unittest.TestCase):
             "http_proxy": ":0", "global_http_proxy_host": "", "global_http_proxy_port": "0",
             "global_http_proxy_exclusion_list": "", "global_proxy_pac_url": ""})
 
+    STALE_ROWS = {"http_proxy": ":0", "global_http_proxy_host": "",
+                  "global_http_proxy_port": "0", "global_http_proxy_exclusion_list": "",
+                  "global_proxy_pac_url": ""}
+
+    def test_stale_dead_canonical_rows_finish_after_the_hinted_repair(self):
+        # `settings delete global http_proxy` left the canonical rows on an old
+        # local port; Android re-syncs them only on a put.
+        self.set_settings(global_http_proxy_host="10.0.2.2", global_http_proxy_port="58514")
+        device.attach(self.target, self.record, port=8899, acknowledged=True)
+        self.set_settings(http_proxy="10.0.2.2:8899", global_http_proxy_host="10.0.2.2",
+                          global_http_proxy_port="8899")
+        dead = mock.patch.object(device.socket, "create_connection", side_effect=OSError("dead"))
+        with dead, mock.patch.object(cli.proxy_mod, "stop") as stop:
+            with self.assertRaises(errors.AutonomError) as caught:
+                self.stop()
+        stop.assert_not_called()
+        self.assertIn("settings put global http_proxy :0", caught.exception.hint)
+        self.set_settings(**self.STALE_ROWS)  # the repair, as Android applies it
+        with dead, mock.patch.object(cli.proxy_mod, "stop",
+                                     return_value={"was_running": True}) as stop:
+            result = self.stop()
+        stop.assert_called_once()
+        self.assertEqual(self.settings(), self.STALE_ROWS)
+        self.assertEqual(result["detach"]["warnings"][0]["code"],
+                         "device_proxy_changed_externally")
+        self.assertFalse(session.require_current()["network"]["attached"])
+
+    def test_snapshot_naming_the_capture_finishes_after_the_hinted_repair(self):
+        # An older attach saved canonical rows that name the capture itself.
+        self.attach()
+        self.record["network"]["previous_proxy_settings"] = {
+            "global_http_proxy_host": "10.0.2.2", "global_http_proxy_port": "8899",
+            "global_http_proxy_exclusion_list": None, "global_proxy_pac_url": None}
+        session.save(self.record)
+        self.set_settings(global_http_proxy_host="10.0.2.2", global_http_proxy_port="8899")
+        with mock.patch.object(cli.proxy_mod, "stop") as stop:
+            with self.assertRaises(errors.AutonomError) as caught:
+                self.stop()
+        stop.assert_not_called()
+        self.assertIn("settings put global http_proxy :0", caught.exception.hint)
+        self.set_settings(**self.STALE_ROWS)
+        with mock.patch.object(cli.proxy_mod, "stop", return_value={"was_running": True}) as stop:
+            result = self.stop()
+        stop.assert_called_once()
+        self.assertEqual(self.settings(), self.STALE_ROWS)
+        self.assertEqual(result["detach"]["left_unchanged"], ":0")
+
+    def test_attach_refuses_canonical_rows_already_naming_the_capture(self):
+        self.set_settings(global_http_proxy_host="10.0.2.2", global_http_proxy_port="8899")
+        with self.assertRaises(errors.AutonomError) as caught:
+            device.attach(self.target, self.record, port=8899, acknowledged=True)
+        self.assertIn("settings put global http_proxy :0", caught.exception.hint)
+        self.assertFalse(self.record["network"].get("attached"))
+        self.assertNotIn("http_proxy", self.settings())
+
+    def test_session_stop_reaps_even_when_the_proxy_fails_to_stop(self):
+        self.attach("proxy.corp:3128")
+        with mock.patch.object(cli, "_target", return_value=self.target), \
+                mock.patch.object(cli, "_session_target_gone", return_value=False), \
+                mock.patch.object(cli.proxy_mod, "stop", side_effect=RuntimeError("kill failed")), \
+                mock.patch.object(session, "reap_owned_processes", return_value={}) as reap, \
+                mock.patch("sys.stdout"):
+            cli.cmd_session_stop(argparse.Namespace())
+        reap.assert_called_once()
+        self.assertEqual(self.settings()["http_proxy"], "proxy.corp:3128")
+
+    def test_detach_refuses_another_target(self):
+        self.attach("proxy.corp:3128")
+        other = Target("android", "emulator-5582", self.target.tool, {})
+        with self.assertRaises(errors.AutonomError) as caught:
+            cli.network_detach_payload(self.record, other)
+        self.assertEqual(caught.exception.code, errors.SESSION_TARGET_MISMATCH)
+        self.assertEqual(self.settings()["http_proxy"], "10.0.2.2:8899")
+        self.assertTrue(self.record["network"]["attached"])
+
     def test_restore_failure_error_names_the_retry(self):
         self.attach("proxy.corp:3128")
         with mock.patch.object(device, "apply_proxy_setting",
