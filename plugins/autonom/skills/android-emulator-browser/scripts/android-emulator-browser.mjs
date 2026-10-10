@@ -4769,8 +4769,15 @@ async function iosHidWrite(context, session, sent, action) {
   let timer = null;
   let late = false;
   const startedAt = performance.now();
+  // Marked late in the timer itself, not after the race returns: a write that fails in the
+  // same turn the timer fires must still see it, or its action would be held for good.
   const timeout = new Promise((resolvePromise) => {
-    timer = setTimeout(() => resolvePromise("timeout"), IOS_HID_WRITE_MS);
+    timer = setTimeout(() => {
+      late = true;
+      if (action) action.late = (action.late ?? 0) + 1;
+      context.state.lastError = `idb hid: a write took more than ${IOS_HID_WRITE_MS} ms`;
+      resolvePromise("timeout");
+    }, IOS_HID_WRITE_MS);
     timer.unref?.();
   });
   // Only an event the companion took counts for its action's record.
@@ -4786,12 +4793,7 @@ async function iosHidWrite(context, session, sent, action) {
     iosLateWrite(context, action, false);
   });
   try {
-    const result = await Promise.race([written, timeout]);
-    if (result === "timeout") {
-      late = true;
-      if (action) action.late = (action.late ?? 0) + 1;
-      context.state.lastError = `idb hid: a write took more than ${IOS_HID_WRITE_MS} ms`;
-    }
+    await Promise.race([written, timeout]);
   } catch (error) {
     context.state.lastError = `idb hid: ${error.message}`;
   } finally {
@@ -6849,7 +6851,7 @@ function sleep(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
-export { handleRequest, handleUpgrade, renderPage, pageScript, IosFastSession };
+export { handleRequest, handleUpgrade, renderPage, pageScript, IosFastSession, iosHidWrite };
 
 // Last, so every module-level constant above is initialized before main() reads it.
 if (isMainModule()) {
