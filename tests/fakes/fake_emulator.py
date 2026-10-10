@@ -18,6 +18,11 @@ State keys (all optional):
 ``boot_delay``   seconds the boot waits before the device appears (default 0)
 ``boot_no_name`` when true, the booted AVD is not entered in ``avd_names``
                  (a console that does not answer ``emu avd name`` yet)
+``boot_linger``  seconds the process stays alive after its device appears
+                 (default 0: it exits at once). A real emulator keeps running;
+                 ``boot_avd`` reads an exited one as a failed launch
+                 (``backend_failed``), so a test about what happens while the
+                 emulator still runs sets this and stops the process itself
 
 A boot appends the device row and records the AVD under its serial in the
 fake adb's ``avd_names`` (what ``adb emu avd name`` answers). Boots running
@@ -180,6 +185,9 @@ def main(argv: list[str]) -> int:
             if not state.get("boot_no_name"):
                 state.setdefault("avd_names", {})[serial] = avd
             write_state(state)
+        linger = float(state.get("boot_linger") or 0)
+        if linger > 0:
+            time.sleep(linger)
         return 0
 
     return 0

@@ -13,12 +13,18 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 CLI = ROOT / "scripts/autonom.py"
 
 sys.path.insert(0, str(ROOT / "scripts"))
 from autonom_lib import processes  # noqa: E402
+
+try:
+    from process_isolation import scope_proxy_discovery  # noqa: E402  (discover -s tests)
+except ImportError:  # direct `python3 -m unittest tests.test_...` runs
+    from tests.process_isolation import scope_proxy_discovery  # noqa: E402
 
 
 class ProcessRegistryTests(unittest.TestCase):
@@ -28,6 +34,11 @@ class ProcessRegistryTests(unittest.TestCase):
         os.environ["AUTONOM_HOME"] = self.tmp.name
         self.artifacts = Path(self.tmp.name) / "session" / "network"
         self.artifacts.mkdir(parents=True)
+        # Signature discovery is machine-wide by design. In a parallel run it
+        # found other modules' fake proxies: they turned up as orphans here,
+        # and `cleanup()` here terminated them under their own tests. Only
+        # proxies whose artifacts dir is under this test's home count.
+        scope_proxy_discovery(self, processes, self.tmp.name)
 
     def tearDown(self) -> None:
         if self.previous is None:
@@ -124,6 +135,23 @@ class ProcessRegistryTests(unittest.TestCase):
 
         explicit = processes.cleanup(dry_run=True, include_live=True)
         self.assertIn(child.pid, [item["pid"] for item in explicit["actions"]])
+
+    def test_cleanup_here_never_touches_a_proxy_outside_this_home(self) -> None:
+        """The guard itself: another test's proxy (artifacts dir elsewhere)
+        is neither listed nor terminated; this home's proxy still is."""
+        outsider, insider = self._spawn_child(), self._spawn_child()
+        elsewhere = tempfile.TemporaryDirectory()
+        self.addCleanup(elsewhere.cleanup)
+        command = ("/opt/homebrew/bin/mitmdump --listen-port 18400 "
+                   f"-s /x/{processes.ADDON_MARKER} --set {processes.PROXY_MARKER}{{}} -q")
+        rows = [(outsider.pid, command.format(Path(elsewhere.name) / "network")),
+                (insider.pid, command.format(self.artifacts))]
+        with mock.patch.object(processes, "_running_processes", return_value=rows):
+            self.assertEqual([item["pid"] for item in processes.discover_proxies()],
+                             [insider.pid])
+            result = processes.cleanup()
+        self.assertEqual([item["pid"] for item in result["actions"]], [insider.pid])
+        self.assertIsNone(outsider.poll(), "cleanup terminated another test's proxy")
 
     def test_signature_discovery_needs_our_own_addon_in_the_command_line(self) -> None:
         """Matching bare 'mitmdump' would sweep up someone else's proxy."""

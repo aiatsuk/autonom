@@ -26,6 +26,7 @@ FAKE_EMULATOR = ROOT / "tests/fakes/fake_emulator.py"
 
 sys.path.insert(0, str(ROOT / "scripts"))
 from autonom_lib import emulator as emulator_mod, errors, processes  # noqa: E402
+from autonom_lib import session as session_mod  # noqa: E402
 
 try:
     from env_isolation import EnvSandboxMixin  # noqa: E402  (discover -s tests)
@@ -247,6 +248,12 @@ class PortBootTests(BootCase):
 
 
 class ClaimTests(BootCase):
+    @staticmethod
+    def stop_emulator(pid: int) -> None:
+        """Stop a lingering fake emulator: `boot_avd` leaves a timed-out
+        emulator running (it may still be booting)."""
+        processes.terminate_group(pid, timeout=5.0)  # also reaps our child
+
     def test_without_a_port_the_serial_is_claimed_by_avd_name(self) -> None:
         # another boot's emulator appears first; it is not this boot's
         self.set_state(devices=[], boot_first=["emulator-5558", "Other_AVD"],
@@ -272,13 +279,21 @@ class ClaimTests(BootCase):
         self.assertEqual(serials, {"Pixel_9": "emulator-5562", "Pixel_10": "emulator-5564"})
 
     def test_a_console_that_never_names_its_avd_is_never_claimed(self) -> None:
-        self.set_state(devices=[], boot_no_name=True)
+        # The emulator keeps running, as a real one does. A fake that exited
+        # at once raced the boot's own rule — an emulator gone for more than
+        # 3 s before a device is claimed is `backend_failed` — against this
+        # 3 s timeout, and under load the exit rule won.
+        self.set_state(devices=[], boot_no_name=True, boot_linger=60)
         with self.assertRaises(errors.AutonomError) as caught:
             self.boot(timeout=3)
+        [row] = [entry for entry in processes.entries() if entry.get("kind") == "emulator"]
+        self.addCleanup(self.stop_emulator, row["pid"])
         self.assertEqual(caught.exception.code, errors.BOOT_TIMEOUT)
         self.assertNotIn("waiting_for", caught.exception.extra)
-        [row] = [entry for entry in processes.entries() if entry.get("kind") == "emulator"]
         self.assertNotIn("serial", row)
+        # the timeout came while the emulator still ran: the console rule,
+        # not the emulator's exit, kept the serial unclaimed
+        self.assertTrue(session_mod.pid_alive(row["pid"]))
 
 
 class AlreadyRunningTests(BootCase):

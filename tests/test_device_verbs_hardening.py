@@ -30,6 +30,11 @@ try:
 except ImportError:  # direct `python3 -m unittest tests.test_...` runs
     from tests.env_isolation import EnvSandboxMixin  # noqa: E402
 
+try:
+    from process_isolation import scope_proxy_discovery  # noqa: E402  (discover -s tests)
+except ImportError:  # direct `python3 -m unittest tests.test_...` runs
+    from tests.process_isolation import scope_proxy_discovery  # noqa: E402
+
 FAKE_ADB = str(ROOT / "tests/fakes/fake_adb.py")
 FAKE_EMULATOR = str(ROOT / "tests/fakes/fake_emulator.py")
 ANDROID = Target("android", "emulator-5554", "/fake/adb", {"serial": "emulator-5554"})
@@ -522,7 +527,10 @@ class FollowSourceTests(unittest.TestCase):
 
 class EmulatorOwnershipTests(EnvSandboxMixin, unittest.TestCase):
     def setUp(self) -> None:
-        self.sandbox_home()
+        home = self.sandbox_home()
+        # `cleanup(include_live=True)` below must never reach another test's
+        # proxy: machine-wide signature discovery sees only this home's.
+        scope_proxy_discovery(self, processes, home)
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.state = Path(tmp.name) / "state.json"
