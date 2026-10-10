@@ -85,7 +85,7 @@ createInterface({ input: process.stdin }).on("line", (line) => {
 // autonom.py: session start/stop, devices boot/shutdown and logs follow, each logged.
 // FAKE_BUSY names serials that already have a live session (started_by FAKE_BUSY_BY).
 const FAKE_AUTONOM = String.raw`
-import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 const args = process.argv.slice(2);
 appendFileSync(process.env.FAKE_AUTONOM_LOG, JSON.stringify(args) + "\n");
 const flag = (name) => { const at = args.indexOf(name); return at >= 0 ? args[at + 1] : null; };
@@ -93,8 +93,13 @@ const verb = args.filter((arg) => ["session", "devices", "logs"].includes(arg))[
 const action = verb ? args[args.indexOf(verb) + 1] : null;
 const target = flag("--serial") ?? flag("--udid");
 if (verb === "session" && action === "start") {
-  const delay = Number(process.env.FAKE_START_DELAY_MS ?? 0);
-  if (delay > 0) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, delay);
+  // FAKE_START_GATE holds every start until the test creates that file (bounded at 30 s), so a
+  // test sees the start in progress for as long as it needs, however loaded the host is.
+  const gate = process.env.FAKE_START_GATE;
+  const gateDeadline = Date.now() + 30_000;
+  while (gate && !existsSync(gate) && Date.now() < gateDeadline) {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+  }
   const busy = JSON.parse(process.env.FAKE_BUSY ?? "[]");
   if (busy.includes(target)) {
     console.error(JSON.stringify({ ok: false, error_code: "session_already_active", error: "busy",
@@ -588,11 +593,16 @@ test("stop ends the Canvas's own sessions; a restart restores the tabs and re-at
 });
 
 test("a stop while session starts are still running ends those sessions too", async (t) => {
-  const world = await makeWorld(t, { env: { FAKE_START_DELAY_MS: "2500" } });
+  const gate = join(tmpdir(), `autonom-start-gate-${process.pid}-${Date.now()}`);
+  t.after(() => rm(gate, { force: true }));
+  const world = await makeWorld(t, { env: { FAKE_START_GATE: gate } });
   const canvas = await startCanvas(world, ["--ephemeral", "--device", `android:${A}`, "--device", `android:${B}`]);
   await waitFor(async () => (await autonomCalls(world, "session start")).length >= 2, 8000, "two session starts");
   const stop = await api(canvas, "POST", "/api/stop", { body: {} });
   assert.equal(stop.status, 202);
+  // Both starts are still held: the stop has begun while they run. Let them answer now.
+  assert.deepEqual(await autonomCalls(world, "session stop"), [], "no stop before the starts answer");
+  await writeFile(gate, "");
   assert.equal((await canvas.exited).code, 0);
   const stops = await waitFor(async () => {
     const calls = await autonomCalls(world, "session stop");
@@ -624,12 +634,26 @@ test("two detaches of one device at once stop its session once and answer the sa
 test("a detach while the device's session is still starting waits for it and stops it", async (t) => {
   // A restored device turns live before its session start answers (live run 2026-10-07: the
   // detach right after a restart answered session_stopped false and the session ended later).
-  const world = await makeWorld(t, { env: { FAKE_START_DELAY_MS: "2500" } });
+  // The start is held on a gate file rather than a fixed delay: with a 2.5 s delay a loaded host
+  // turned B live only after the start had answered, and the test saw a session already linked.
+  const gate = join(tmpdir(), `autonom-start-gate-${process.pid}-${Date.now()}`);
+  t.after(() => rm(gate, { force: true }));
+  const world = await makeWorld(t, { env: { FAKE_START_GATE: gate } });
   const canvas = await startCanvas(world, ["--ephemeral", "--split", "--device", `android:${B}`]);
+  await waitFor(async () => (await autonomCalls(world, "session start")).length === 1, 8000, "the session start");
   const live = await waitFor(async () => (await api(canvas, "GET", "/api/devices")).json.devices
     .find((device) => device.id === ID_B && device.state === "live") ?? null, 8000, "B live");
   assert.equal(live.session, null, "the session start is still running");
-  const detach = await api(canvas, "POST", `/api/devices/${encodeURIComponent(ID_B)}/detach`, { body: {} });
+  let answered = false;
+  const detaching = api(canvas, "POST", `/api/devices/${encodeURIComponent(ID_B)}/detach`, { body: {} })
+    .finally(() => { answered = true; });
+  // The detach has begun once B is gone from the list; it must then wait for the held start.
+  await waitFor(async () => !(await api(canvas, "GET", "/api/devices")).json.devices
+    .some((device) => device.id === ID_B), 8000, "B detaching");
+  assert.equal(answered, false, "the detach waits for the session start");
+  assert.deepEqual(await autonomCalls(world, "session stop"), [], "nothing to stop before the start answers");
+  await writeFile(gate, "");
+  const detach = await detaching;
   assert.equal(detach.status, 200);
   assert.deepEqual(detach.json, { ok: true, detached: ID_B, session_stopped: true });
   const stops = await autonomCalls(world, "session stop");
