@@ -174,6 +174,34 @@ class NetworkStopBindingTests(MultiSessionCase):
         self.assertTrue(self.record(self.canvas["session_id"])["network"]["attached"])
 
 
+    def test_detach_by_target_restores_that_targets_device(self) -> None:
+        code, payload = self.cli("--serial", CANVAS, "network", "detach")
+        self.assertEqual(code, 0, payload)
+        self.assertEqual(payload["restored_http_proxy"], "proxy.corp:3128")
+        writes = self.settings_writes()
+        self.assertTrue(writes)
+        self.assertTrue(all(argv[:2] == ["-s", CANVAS] for argv in writes), writes)
+        self.assertFalse(self.record(self.canvas["session_id"])["network"]["attached"])
+
+    def test_detach_on_a_device_without_its_own_session_refuses(self) -> None:
+        # emulator-5560 has no live session: the binding falls back to the
+        # current (primary) session, whose snapshot must not land there.
+        self.write_state(devices=[[PRIMARY, "device", "product:sdk_gphone64_arm64"],
+                                  [CANVAS, "device", "product:sdk_gphone64_arm64"],
+                                  ["emulator-5560", "device", "product:sdk_gphone64_arm64"]],
+                         settings={"http_proxy": "10.0.2.2:8899"})
+        code, payload = self.cli("--serial", "emulator-5560", "network", "detach")
+        self.assertEqual((code, payload["error_code"]), (2, "session_target_mismatch"))
+        self.assertEqual(self.settings_writes(), [])
+
+    def test_detach_session_id_against_another_target_refuses(self) -> None:
+        code, payload = self.cli("--session-id", self.canvas["session_id"],
+                                 "--serial", PRIMARY, "network", "detach")
+        self.assertEqual((code, payload["error_code"]), (2, "session_target_mismatch"))
+        self.assertEqual(self.settings_writes(), [])
+        self.assertTrue(self.record(self.canvas["session_id"])["network"]["attached"])
+
+
 class AlongsideStartTests(MultiSessionCase):
     def test_alongside_with_nothing_live_never_writes_current(self) -> None:
         started = self.start(CANVAS, "--alongside")

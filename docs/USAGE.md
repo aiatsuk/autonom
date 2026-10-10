@@ -127,13 +127,20 @@ killing that proxy during process cleanup. Cleanup never blindly overwrites a
 setting it did not write. If the device proxy was changed outside Autonom and no
 longer points at the capture, that setting is left as it is, the attachment is
 finished with a `device_proxy_changed_externally` warning, and the proxy stops.
-If the saved original is a local proxy that is no longer reachable, or the
-device still points at the capture in a way Autonom did not write, stop refuses
-with a hint naming the exact `adb ... settings put global http_proxy :0` repair;
-after that repair a retry finishes. A transparently routed emulator must be
+While the device still points at the capture, stop refuses when the saved
+original (legacy or canonical) is a local proxy that is no longer reachable,
+names the capture itself, or was changed in a way Autonom did not write. The
+refusal names the exact `adb ... settings put global http_proxy :0` repair;
+after that repair the device no longer points at the capture, so a retry
+finishes with the warning above. Attach refuses a device whose legacy or
+canonical proxy already names the capture, since its original is unknown. A transparently routed emulator must be
 shut down before its proxy can be stopped. Certificates are left unchanged.
-`--session-id` or a target flag picks which session's device is restored; the
+`--session-id` or a target flag picks which session's device is restored; a
+`network stop` or `network detach` aimed at a device other than the bound
+session's is refused (`session_target_mismatch`) before any device write. The
 Canvas Tools `network.stop` and `network.detach` act on the Canvas's own target.
+`session stop` still reaps the session's processes when the proxy fails to stop
+after a successful restore.
 
 These guarantees apply to orderly cleanup. An abruptly killed proxy or host crash
 still requires inspecting the device proxy with `autonom doctor` before using it.

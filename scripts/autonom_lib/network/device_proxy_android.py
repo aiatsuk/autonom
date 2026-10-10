@@ -553,6 +553,15 @@ def attach(
         # Raw values, so detach puts back an empty row as empty, not deleted.
         saved_settings = {key: _read_proxy_setting(target, key, raw=True)
                           for key in PROXY_SETTINGS}
+        stale = (f"{_normalise_setting('global_http_proxy_host', saved_settings['global_http_proxy_host'])}:"
+                 f"{_normalise_setting('global_http_proxy_port', saved_settings['global_http_proxy_port'])}")
+        if stale == device_proxy:
+            raise errors.AutonomError(
+                errors.BACKEND_FAILED,
+                "The device's canonical proxy already names this proxy without a restore snapshot.",
+                "A stopped capture left it behind, so the original setting is unknown. "
+                f"Set the proxy the device should use (no proxy: 'adb -s {target.target_id} "
+                f"shell settings put global {SETTING} {UNSET}'), then attach again.")
     _put_setting(target, device_proxy)
     network = record.setdefault("network", {})
     network.update({
@@ -612,26 +621,19 @@ def detach(target: Target, record: dict[str, Any]) -> dict[str, Any]:
     current = _get_setting(target)
     device_proxy = network.get("device_proxy")
     repair = (f"adb -s {target.target_id} shell settings put global {SETTING} {UNSET}")
+    # Every refusal below protects a device that still uses this capture.
+    # Once neither setting points at it (someone changed it, or followed a
+    # repair hint), finishing never strands the device: their setting stays.
     if current not in (device_proxy, restore, None if restore == UNSET else restore):
         if not _points_at(target, device_proxy):
-            # Someone else replaced the proxy: the device no longer depends on
-            # this capture, so finishing never strands it. Their setting stays.
-            network.update({"attached": False, "device_proxy": None,
-                            "previous_http_proxy": None, "previous_proxy_settings": None,
-                            "capture_mode": None})
-            return {"was_attached": True, "restored_http_proxy": None, "wrote": None,
-                    "left_unchanged": current,
-                    "warnings": [{
-                        "code": "device_proxy_changed_externally",
-                        "error": f"the device proxy was changed to {current!r} outside "
-                                 "this attachment and was left as it is",
-                        "hint": "Check that this is the proxy the device should use.",
-                    }]}
+            return _finish_left(network, current)
         raise errors.AutonomError(
             errors.BACKEND_FAILED, "The device proxy changed outside this attachment.",
             "Inspect the current proxy; detach will not overwrite another proxy. "
             f"To clear it by hand: '{repair}', then retry.")
     if previous and previous == device_proxy:
+        if not _points_at(target, device_proxy):
+            return _finish_left(network, current)
         raise errors.AutonomError(
             errors.BACKEND_FAILED, "The saved proxy points back to the proxy being stopped.",
             f"The original setting is unknown. Clear the device proxy with '{repair}' "
@@ -643,6 +645,8 @@ def detach(target: Target, record: dict[str, Any]) -> dict[str, Any]:
             with socket.create_connection(("127.0.0.1", port), timeout=1):
                 pass
         except (OSError, ValueError, OverflowError) as exc:
+            if not _points_at(target, device_proxy):
+                return _finish_left(network, current)
             raise errors.AutonomError(
                 errors.BACKEND_FAILED, f"The saved local proxy {previous} is not reachable.",
                 "Restoring it would leave the device offline. Start that proxy again, or "
@@ -655,12 +659,16 @@ def detach(target: Target, record: dict[str, Any]) -> dict[str, Any]:
     for key in PROXY_SETTINGS:
         current_value = _read_proxy_setting(target, key)
         if current_value not in (None, expected[key], restored.get(key)):
+            if not _points_at(target, device_proxy):
+                return _finish_left(network, current)
             raise errors.AutonomError(
                 errors.BACKEND_FAILED, "The canonical device proxy changed outside this attachment.",
                 "Inspect the current proxy; detach will not overwrite another proxy.")
     if restored.get("global_http_proxy_host") == EMULATOR_HOST:
         canonical = f"{EMULATOR_HOST}:{restored.get('global_http_proxy_port')}"
         if canonical == network.get("device_proxy"):
+            if not _points_at(target, device_proxy):
+                return _finish_left(network, current)
             raise errors.AutonomError(
                 errors.BACKEND_FAILED, "The saved canonical proxy points back to this capture.",
                 f"The original setting is unknown. Clear the device proxy with '{repair}', "
@@ -671,6 +679,8 @@ def detach(target: Target, record: dict[str, Any]) -> dict[str, Any]:
                                               timeout=1):
                     pass
             except (OSError, TypeError, ValueError, OverflowError) as exc:
+                if not _points_at(target, device_proxy):
+                    return _finish_left(network, current)
                 raise errors.AutonomError(
                     errors.BACKEND_FAILED, f"The saved canonical local proxy {canonical} is not reachable.",
                     "Restoring it would leave the device offline. Start that proxy again, or "
@@ -703,6 +713,20 @@ def detach(target: Target, record: dict[str, Any]) -> dict[str, Any]:
                     "previous_proxy_settings": None, "capture_mode": None})
     return {"was_attached": True, "restored_http_proxy": previous, "wrote": restore,
             "setting_applied": applied}
+
+
+def _finish_left(network: dict[str, Any], current: str | None) -> dict[str, Any]:
+    """End an attachment the device no longer uses, leaving its settings alone."""
+    network.update({"attached": False, "device_proxy": None, "previous_http_proxy": None,
+                    "previous_proxy_settings": None, "capture_mode": None})
+    return {"was_attached": True, "restored_http_proxy": None, "wrote": None,
+            "left_unchanged": current,
+            "warnings": [{
+                "code": "device_proxy_changed_externally",
+                "error": f"the device proxy is {current!r} and no longer points at this "
+                         "capture; it was left as it is",
+                "hint": "Check that this is the proxy the device should use.",
+            }]}
 
 
 def _points_at(target: Target, device_proxy: str | None) -> bool:

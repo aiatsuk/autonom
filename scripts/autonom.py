@@ -667,9 +667,16 @@ def _session_stop_marked(args: argparse.Namespace, record: dict[str, Any]) -> in
             teardown=teardown)
     # Use the same route guard as CLI/Canvas Stop. No generic process reaping
     # may kill a proxy still needed by the target.
-    stopped_network = (proxy_mod.stop(record) if gone else
-                       network_stop_payload(record, lambda: _target(args)))
-    teardown.append({"action": "network_stop", "ok": True, "detail": stopped_network})
+    from autonom_lib.network import attachment as attachment_mod
+
+    if not gone and attachment_mod.transparent_route_live(record):
+        network_stop_payload(record)  # raises the transparent-route refusal
+    # The device is restored by now: a proxy that fails to stop is reported,
+    # and the reaping below stays its best-effort backstop.
+    teardown.extend(session_mod.run_teardown([
+        ("network_stop", lambda: (proxy_mod.stop(record) if gone else
+                                  network_stop_payload(record, lambda: _target(args)))),
+    ]))
     teardown.extend(session_mod.run_teardown([
         ("session_processes", lambda: session_mod.reap_owned_processes(record)),
     ]))
@@ -2428,15 +2435,6 @@ def network_stop_payload(record: dict[str, Any], target_of: Any = None) -> dict[
     detached = {"was_attached": False}
     if (record.get("network") or {}).get("attached"):
         target = target_of() if target_of else _target(argparse.Namespace())
-        if (target.target_id != record.get("target_id")
-                or target.platform != record.get("platform")):
-            raise errors.AutonomError(
-                errors.SESSION_TARGET_MISMATCH,
-                f"the proxy of session {record.get('session_id')} is attached to "
-                f"{record.get('target_id')}, not {target.target_id}",
-                "Select the session that owns this target (--session-id, or that "
-                "target's flags) before stopping capture.",
-                session_id=record.get("session_id"), target_id=record.get("target_id"))
         try:
             detached = network_detach_payload(record, target)
         except errors.AutonomError as exc:
@@ -2581,6 +2579,16 @@ def cmd_network_detach(args: argparse.Namespace) -> int:
 
 def network_detach_payload(record: dict[str, Any], target: Target) -> dict[str, Any]:
     """`network detach` for `record` (shared with the Canvas tools process)."""
+    # Never write one session's snapshot onto another device, or clear it there.
+    if (target.target_id != record.get("target_id")
+            or target.platform != record.get("platform")):
+        raise errors.AutonomError(
+            errors.SESSION_TARGET_MISMATCH,
+            f"the proxy of session {record.get('session_id')} is attached to "
+            f"{record.get('target_id')}, not {target.target_id}",
+            "Select the session that owns this target (--session-id, or that "
+            "target's flags) before detaching or stopping capture.",
+            session_id=record.get("session_id"), target_id=record.get("target_id"))
     try:
         if target.platform == ANDROID:
             detail = device_proxy_android.detach(target, record)
