@@ -97,6 +97,58 @@ if (command === "get-state") {
 } else if (command === "shell" && tail.join(" ") === "screenrecord --help") {
   // Android 16 (API 36) help text: the hidden --output-format option is not listed.
   console.log("Usage: screenrecord [options] <filename>\n--size WIDTHxHEIGHT\n--bit-rate RATE\n--time-limit TIME");
+} else if (command === "shell" && tail[0] === "wm" && ["fixed-to-user-rotation", "user-rotation"].includes(tail[1])) {
+  if (process.env.FAKE_ROTATION_ANDROID9) {
+    // Android 9's wm prints its usage and the error on stderr and still exits 0.
+    console.error("usage: wm [subcommand] [options]\n\nError: unknown command '" + tail[1] + "'");
+  } else if (!process.env.FAKE_ROTATION_SUPPORTED) {
+    console.error("Unknown command: " + tail[1]);
+    process.exitCode = 1;
+  } else {
+    const state = { rotation: 0, userRotation: process.env.FAKE_ROTATION_UNSET ? null : 3,
+      mode: "free", fixed: process.env.FAKE_ROTATION_FIXED ?? "default", ...wmState() };
+    const [, what, value, rotation] = tail;
+    if (value === undefined) {
+      setTimeout(() => console.log(what === "fixed-to-user-rotation" ? state.fixed :
+        state.mode === "free" ? "free" : "lock " + state.userRotation),
+        Number(process.env.FAKE_ROTATION_READ_MS ?? 0));
+    } else if (process.env.FAKE_ROTATION_FAIL && what === "fixed-to-user-rotation" && value === "enabled") {
+      console.error("Error: rotation policy denied");
+      process.exitCode = 1;
+    } else {
+      // A Rotate's own lock to landscape stuck in adb; a SIGTERM ends it before it lands.
+      if (process.env.FAKE_ROTATION_WRITE_MS && what === "user-rotation" && value === "lock" && rotation === "1") {
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Number(process.env.FAKE_ROTATION_WRITE_MS));
+        Object.assign(state, wmState());
+      }
+      if (what === "fixed-to-user-rotation") state.fixed = value;
+      else {
+        state.mode = value;
+        if (value === "lock") state.userRotation = Number(rotation);
+      }
+      // The sensor snaps back to 0 in free mode, and the launcher ignores locked
+      // user rotation until the display is fixed to it.
+      if (!process.env.FAKE_ROTATION_STUCK) {
+        if (state.fixed === "enabled") state.rotation = state.userRotation;
+        else if (state.mode === "free") state.rotation = 0;
+      }
+      // A Rotate write that reached the device before its adb client was killed lands right
+      // after the first restore.
+      if (process.env.FAKE_ROTATION_RELAND && what === "user-rotation" && value === "free" && !state.relanded) {
+        Object.assign(state, { mode: "lock", userRotation: 1, fixed: "enabled", rotation: 1, relanded: true });
+      }
+      writeFileSync(process.env.FAKE_WM_STATE, JSON.stringify(state));
+    }
+  }
+} else if (command === "shell" && tail.join(" ") === "settings get system user_rotation") {
+  const state = wmState();
+  console.log("userRotation" in state ? state.userRotation : process.env.FAKE_ROTATION_UNSET ? "null" : 3);
+} else if (command === "shell" && tail.join(" ") === "settings delete system user_rotation") {
+  writeFileSync(process.env.FAKE_WM_STATE, JSON.stringify({ ...wmState(), userRotation: null }));
+} else if (command === "shell" && tail.join(" ") === "dumpsys window displays") {
+  if (process.env.FAKE_ROTATION_DUMPSYS_MS) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Number(process.env.FAKE_ROTATION_DUMPSYS_MS));
+  console.log("  Display: mDisplayId=9\n    mRotation=3\n  Display: mDisplayId=0 (organized)\n    mRotation=" +
+    (process.env.FAKE_ROTATION_BAD_READ ? "unknown" : wmState().rotation ?? 0));
 } else if (command === "shell" && tail[0] === "wm" && ["size", "density"].includes(tail[1])) {
   const [, what, value] = tail;
   const state = wmState();
@@ -2372,6 +2424,205 @@ test("input: touches map to the current video size and every interruption lifts 
   const clipboard = control.reply((message) => message.t === "clipboard");
   device.sendClipboard("from the device");
   assert.equal((await clipboard).text, "from the device");
+  await stopCanvas(canvas);
+});
+
+/** WM rotation settings, including writes that roll back a failed command. */
+async function rotationWrites(world) {
+  return (await adbCalls(world)).map((args) => args.slice(2))
+    .filter((args) => args[0] === "shell" && args[1] === "wm" &&
+      ["user-rotation", "fixed-to-user-rotation"].includes(args[2]) && args.length > 3)
+    .map((args) => args.slice(2).join(" "));
+}
+
+test("rotate: auto-rotation and an orientation-locked launcher cannot undo either click; stop restores free mode, stored rotation and policy", async (t) => {
+  const { world, canvas, device, control } = await connectedControl(t, { env: { FAKE_ROTATION_SUPPORTED: "1" } });
+  assert.deepEqual(await rotationWrites(world), [], "Canvas changed rotation before any Rotate");
+  for (const rotation of [1, 0]) {
+    const answer = control.reply((message) => message.t === "rotation", 10000);
+    control.send({ t: "system", op: "rotate" });
+    assert.deepEqual(await answer, { t: "rotation", rotation });
+    const state = JSON.parse(await readFile(world.wmState, "utf8"));
+    assert.deepEqual([state.mode, state.fixed, state.rotation], ["lock", "enabled", rotation]);
+  }
+  assert.equal(device.count("rotate"), 0, "scrcpy thawed the manual rotation");
+  await waitFor(async () => (await bridgeCalls(world, "record"))
+    .filter((record) => record.payload.kind === "system" && record.payload.op === "rotate").length === 2,
+    5000, "one record per verified rotation");
+  await stopCanvas(canvas);
+  const restored = JSON.parse(await readFile(world.wmState, "utf8"));
+  assert.deepEqual([restored.mode, restored.fixed, restored.userRotation], ["free", "default", 3]);
+});
+
+test("rotate: an unset user_rotation uses Android's default and its missing setting is restored", async (t) => {
+  const { world, canvas, control } = await connectedControl(t, {
+    env: { FAKE_ROTATION_SUPPORTED: "1", FAKE_ROTATION_UNSET: "1" },
+  });
+  const answer = control.reply((message) => message.t === "rotation", 10000);
+  control.send({ t: "system", op: "rotate" });
+  assert.equal((await answer).rotation, 1);
+  await stopCanvas(canvas);
+  const restored = JSON.parse(await readFile(world.wmState, "utf8"));
+  assert.deepEqual([restored.mode, restored.fixed, restored.userRotation], ["free", "default", null]);
+});
+
+test("rotate: a failing override rolls back the original settings, reports an error and journals no successful rotation", async (t) => {
+  const { world, canvas, control } = await connectedControl(t, {
+    env: { FAKE_ROTATION_SUPPORTED: "1", FAKE_ROTATION_FAIL: "1" },
+  });
+  const answer = control.reply((message) => message.t === "error" && message.for === "rotate", 10000);
+  control.send({ t: "system", op: "rotate" });
+  assert.match((await answer).message, /rotation policy denied/);
+  const restored = JSON.parse(await readFile(world.wmState, "utf8"));
+  assert.deepEqual([restored.mode, restored.fixed, restored.userRotation], ["free", "default", 3]);
+  assert.equal((await bridgeCalls(world, "record")).filter((record) => record.payload.op === "rotate").length, 0);
+  await stopCanvas(canvas);
+});
+
+test("rotate: following input waits, a late takeover prevents writes, and an unreadable default-display rotation never changes settings", async (t) => {
+  // Touch, key and text sent while a Rotate runs are held and reach the device after it.
+  const held = await connectedControl(t, { env: { FAKE_ROTATION_SUPPORTED: "1", FAKE_ROTATION_READ_MS: "400" } });
+  const sentBefore = held.device.messages.length;
+  const rotated = held.control.reply((message) => message.t === "rotation", 10000);
+  held.control.send({ t: "system", op: "rotate" });
+  await waitFor(async () => (await adbCalls(held.world)).some((args) =>
+    args.slice(2).join(" ") === "shell wm fixed-to-user-rotation"), 5000, "rotation read started");
+  held.control.send({ t: "touch", a: "down", id: 1, x: 0.5, y: 0.5 });
+  held.control.send({ t: "touch", a: "up", id: 1, x: 0.5, y: 0.5 });
+  held.control.send({ t: "key", a: "down", code: 29, meta: 0, repeat: 0 });
+  held.control.send({ t: "key", a: "up", code: 29, meta: 0, repeat: 0 });
+  held.control.send({ t: "text", text: "held" });
+  // At the Rotate's first write, after the 400 ms read, none of that input has reached the device.
+  await waitFor(async () => (await rotationWrites(held.world)).length > 0, 5000, "the Rotate's first write");
+  assert.deepEqual(held.device.messages.slice(sentBefore).map((message) => message.type), [],
+    "input sent during the Rotate reached the device before it finished");
+  assert.equal((await rotated).rotation, 1);
+  await waitFor(() => held.device.messages.length >= sentBefore + 5, INPUT_WAIT_MS, "the held input");
+  assert.deepEqual(held.device.messages.slice(sentBefore).map((message) => message.type),
+    ["touch", "touch", "key", "key", "text"]);
+  await stopCanvas(held.canvas);
+
+  const { world, canvas, control } = await connectedControl(t, {
+    env: { FAKE_ROTATION_SUPPORTED: "1", FAKE_ROTATION_READ_MS: "400" },
+  });
+  const denied = control.reply((message) => message.t === "error" && /owned by agent/.test(message.message), 10000);
+  control.send({ t: "system", op: "rotate" });
+  await waitFor(async () => (await adbCalls(world)).some((args) =>
+    args.slice(2).join(" ") === "shell wm fixed-to-user-rotation"), 5000, "rotation read started");
+  // Further input waits behind the read; the takeover must refuse both requests.
+  control.send({ t: "system", op: "rotate" });
+  const taken = await fetch(canvas.origin + "/control", {
+    method: "POST", headers: { Authorization: "Bearer " + TOKEN, "Content-Type": "application/json", "X-Autonom-Origin": "agent" },
+    body: JSON.stringify({ mode: "takeover" }),
+  });
+  assert.equal(taken.status, 200);
+  await denied;
+  assert.deepEqual(await rotationWrites(world), []);
+  await stopCanvas(canvas);
+
+  const bad = await connectedControl(t, { env: { FAKE_ROTATION_SUPPORTED: "1", FAKE_ROTATION_BAD_READ: "1" } });
+  const error = bad.control.reply((message) => message.t === "error" && message.for === "rotate", 10000);
+  bad.control.send({ t: "system", op: "rotate" });
+  assert.match((await error).message, /default display's rotation/);
+  assert.deepEqual(await rotationWrites(bad.world), []);
+  await stopCanvas(bad.canvas);
+});
+
+test("rotate: a Rotate refused before it is queued answers for rotate, so the page enables the button again", async (t) => {
+  const { world, canvas, control } = await connectedControl(t, { env: { FAKE_ROTATION_SUPPORTED: "1" } });
+  await agentTakeover(canvas);
+  const answer = control.reply((message) => message.t === "error", 10000);
+  control.send({ t: "system", op: "rotate" });
+  const refused = await answer;
+  assert.equal(refused.for, "rotate");
+  assert.match(refused.message, /owned by agent/);
+  assert.deepEqual(await rotationWrites(world), []);
+  await stopCanvas(canvas);
+});
+
+test("rotate: after a rotation, a Rotate refused while it reads the display leaves the device as rotated", async (t) => {
+  const { world, canvas, control } = await connectedControl(t, {
+    env: { FAKE_ROTATION_SUPPORTED: "1", FAKE_ROTATION_DUMPSYS_MS: "300" },
+  });
+  const first = control.reply((message) => message.t === "rotation", 10000);
+  control.send({ t: "system", op: "rotate" });
+  assert.deepEqual(await first, { t: "rotation", rotation: 1 });
+  const writes = await rotationWrites(world);
+  const dumps = async () => (await adbCalls(world)).filter((args) => args.slice(2).join(" ") === "shell dumpsys window displays").length;
+  const before = await dumps();
+  const refused = control.reply((message) => message.t === "error" && message.for === "rotate", 10000);
+  control.send({ t: "system", op: "rotate" });
+  await waitFor(async () => await dumps() > before, 5000, "the second Rotate's read");
+  await agentTakeover(canvas);
+  assert.match((await refused).message, /owned by agent/);
+  assert.deepEqual(await rotationWrites(world), writes, "a refused Rotate rolled the first one back");
+  const state = JSON.parse(await readFile(world.wmState, "utf8"));
+  assert.deepEqual([state.mode, state.fixed, state.rotation], ["lock", "enabled", 1]);
+  await stopCanvas(canvas);
+  const restored = JSON.parse(await readFile(world.wmState, "utf8"));
+  assert.deepEqual([restored.mode, restored.fixed, restored.userRotation], ["free", "default", 3]);
+});
+
+test("rotate: a Rotate write still stuck in adb at stop is killed, so it cannot land after the restore", async (t) => {
+  const { world, canvas, control } = await connectedControl(t, {
+    env: { FAKE_ROTATION_SUPPORTED: "1", FAKE_ROTATION_WRITE_MS: "2500" },
+  });
+  control.send({ t: "system", op: "rotate" });
+  await waitFor(async () => (await rotationWrites(world)).includes("user-rotation lock 1"), 5000, "the stuck write");
+  const stopped = performance.now();
+  await stopCanvas(canvas);
+  // Past the moment the stuck write would have landed.
+  await sleep(Math.max(0, 3000 - (performance.now() - stopped)));
+  const state = JSON.parse(await readFile(world.wmState, "utf8"));
+  assert.deepEqual([state.mode, state.fixed, state.userRotation], ["free", "default", 3]);
+});
+
+test("rotate: a Rotate write that lands right after the stop's restore is put back again", async (t) => {
+  const { world, canvas, control } = await connectedControl(t, {
+    env: { FAKE_ROTATION_SUPPORTED: "1", FAKE_ROTATION_RELAND: "1" },
+  });
+  const answer = control.reply((message) => message.t === "rotation", 10000);
+  control.send({ t: "system", op: "rotate" });
+  assert.equal((await answer).rotation, 1);
+  await stopCanvas(canvas);
+  const state = JSON.parse(await readFile(world.wmState, "utf8"));
+  assert.equal(state.relanded, true, "the late write never landed");
+  assert.deepEqual([state.mode, state.fixed, state.userRotation], ["free", "default", 3]);
+});
+
+test("rotate: Android 9, whose wm exits 0 for an unknown command, keeps the scrcpy rotation and writes no WM setting", async (t) => {
+  const { world, canvas, device, control } = await connectedControl(t, { env: { FAKE_ROTATION_ANDROID9: "1" } });
+  const answer = control.reply((message) => message.t === "rotation", 10000);
+  control.send({ t: "system", op: "rotate" });
+  assert.deepEqual(await answer, { t: "rotation", legacy: true });
+  await waitFor(() => device.count("rotate") === 1, INPUT_WAIT_MS, "the scrcpy rotation request");
+  assert.deepEqual(await rotationWrites(world), []);
+  await stopCanvas(canvas);
+  assert.deepEqual(await rotationWrites(world), [], "the stop wrote rotation settings it never changed");
+});
+
+test("rotate: an enabled_if_no_auto_rotation policy (newer Android releases) is accepted and put back at stop", async (t) => {
+  const { world, canvas, control } = await connectedControl(t, {
+    env: { FAKE_ROTATION_SUPPORTED: "1", FAKE_ROTATION_FIXED: "enabled_if_no_auto_rotation" },
+  });
+  const answer = control.reply((message) => message.t === "rotation", 10000);
+  control.send({ t: "system", op: "rotate" });
+  assert.deepEqual(await answer, { t: "rotation", rotation: 1 });
+  await stopCanvas(canvas);
+  const restored = JSON.parse(await readFile(world.wmState, "utf8"));
+  assert.deepEqual([restored.mode, restored.fixed, restored.userRotation], ["free", "enabled_if_no_auto_rotation", 3]);
+});
+
+test("rotate: a command that exits successfully without changing the display is refused and rolled back", async (t) => {
+  const { world, canvas, control } = await connectedControl(t, {
+    env: { FAKE_ROTATION_SUPPORTED: "1", FAKE_ROTATION_STUCK: "1" },
+  });
+  const answer = control.reply((message) => message.t === "error" && message.for === "rotate", 15000);
+  control.send({ t: "system", op: "rotate" });
+  assert.match((await answer).message, /did not rotate/);
+  const restored = JSON.parse(await readFile(world.wmState, "utf8"));
+  assert.deepEqual([restored.mode, restored.fixed, restored.userRotation], ["free", "default", 3]);
+  assert.equal((await bridgeCalls(world, "record")).filter((record) => record.payload.op === "rotate").length, 0);
   await stopCanvas(canvas);
 });
 
