@@ -6676,6 +6676,25 @@ IdbHidStream.prototype.send = function (event) {
 };
 `)}`;
 
+test("ios: a HID write that fails in the same turn its 5 s timeout fires is counted down, so its action's record is not held for good", async (t) => {
+  const { pathToFileURL } = await import("node:url");
+  const { iosHidWrite } = await import(pathToFileURL(CANVAS).href);
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  let reject = null;
+  const session = { hid: () => new Promise((_, rejectPromise) => { reject = rejectPromise; }) };
+  const context = { state: { lastError: null } };
+  const action = { sent: 1, written: 0, broken: false };
+  const writing = iosHidWrite(context, session, { button: "HOME", direction: "down" }, action);
+  // The timeout fires and the write fails before any promise callback runs.
+  t.mock.timers.tick(5000);
+  reject(new Error("the HID stream is gone"));
+  await writing;
+  await new Promise((resolvePromise) => setImmediate(resolvePromise));
+  assert.equal(action.late, 0, "the failed late write was never counted down");
+  assert.equal(action.written, 0);
+  assert.equal(context.state.lastError, "idb hid: the HID stream is gone");
+});
+
 test("ios: action.written counts only writes the companion confirmed: an action whose every write failed is not journaled, one with a confirmed write is", async (t) => {
   const { world, canvas, control } = await iosControl(t, { nodeArgs: ["--import", HID_GATE] });
   idbControl(world, "hid-fail", "1");
