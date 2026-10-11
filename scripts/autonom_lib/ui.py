@@ -8,6 +8,7 @@ and `ui_ios.py`; selection lives in `selector.py`. This module only routes.
 from __future__ import annotations
 
 import json
+import threading
 import time
 from typing import Any, Callable, Mapping
 
@@ -348,6 +349,12 @@ def _ios():
     return ui_ios
 
 
+# The last snapshot this thread read, per target: the pre-test guard finds a
+# selector-resolved node's surroundings (its enclosing control, the labels
+# inside it) in the very tree the node came from, without a second read.
+_LAST_SNAPSHOT = threading.local()
+
+
 def snapshot(target: Target) -> list[dict[str, Any]]:
     """Every node the tree lists, unfiltered — the search corpus for find/tap.
 
@@ -355,12 +362,25 @@ def snapshot(target: Target) -> list[dict[str, Any]]:
     ``visible: false`` (see ``selector.mark_visibility``).
     """
     if target.platform == ANDROID:
-        return selector.mark_visibility(annotate_parents(
+        nodes = selector.mark_visibility(annotate_parents(
             ui_android.parse_all(ui_android.dump_hierarchy(target.tool, target.target_id))))
-    if target.platform == IOS:
-        return selector.mark_visibility(
+    elif target.platform == IOS:
+        nodes = selector.mark_visibility(
             annotate_parents(_ios().parse_all(_ios().describe_all(target))))
-    raise errors.AutonomError(errors.UNKNOWN_PLATFORM, f"unknown platform: {target.platform}")
+    else:
+        raise errors.AutonomError(errors.UNKNOWN_PLATFORM,
+                                  f"unknown platform: {target.platform}")
+    _LAST_SNAPSHOT.value = (target.platform, target.target_id, nodes)
+    return nodes
+
+
+def last_snapshot(target: Target) -> list[dict[str, Any]] | None:
+    """The nodes of this thread's last ``snapshot(target)``; None when this
+    thread has not read that target's tree. Never touches the device."""
+    held = getattr(_LAST_SNAPSHOT, "value", None)
+    if not held or (held[0], held[1]) != (target.platform, target.target_id):
+        return None
+    return held[2]
 
 
 def tree(
@@ -634,9 +654,18 @@ def screen_size(target: Target) -> tuple[int, int] | None:
 ANDROID_BACKEND = "adb"
 
 
+def _pretest_guard(verb: str, target: Target, **kwargs: Any) -> None:
+    """The pre-test budget/forbid guard (a no-op without an active pre-test);
+    always after the coordinate guard, so a refused point costs no action."""
+    from .pretest import guard
+
+    guard.before_mutation(verb, target=target, **kwargs)
+
+
 def tap(target: Target, x: int, y: int, *, screen: tuple[int, int] | None = None,
         node: dict | None = None) -> str:
     _guard_point(target, x, y, screen=screen)
+    _pretest_guard("tap", target, node=node, point=(x, y))
     if target.platform == ANDROID:
         ui_android.tap(target.tool, target.target_id, x, y)
         return ANDROID_BACKEND
@@ -645,8 +674,9 @@ def tap(target: Target, x: int, y: int, *, screen: tuple[int, int] | None = None
 
 
 def long_press(target: Target, x: int, y: int, duration_ms: int = 600,
-               *, screen: tuple[int, int] | None = None) -> str:
+               *, screen: tuple[int, int] | None = None, node: dict | None = None) -> str:
     _guard_point(target, x, y, screen=screen)
+    _pretest_guard("long-press", target, node=node, point=(x, y))
     if target.platform == ANDROID:
         ui_android.long_press(target.tool, target.target_id, x, y, duration_ms)
         return ANDROID_BACKEND
@@ -655,8 +685,10 @@ def long_press(target: Target, x: int, y: int, duration_ms: int = 600,
 
 
 def double_tap(target: Target, x: int, y: int,
-               *, screen: tuple[int, int] | None = None) -> str:
+               *, screen: tuple[int, int] | None = None, node: dict | None = None) -> str:
     _guard_point(target, x, y, screen=screen)
+    # one action: the pair is a single gesture to the app
+    _pretest_guard("double-tap", target, node=node, point=(x, y))
     # Guard once, dispatch twice — the platform helpers skip the guard.
     if target.platform == ANDROID:
         ui_android.tap(target.tool, target.target_id, x, y)
@@ -672,6 +704,7 @@ def swipe(target: Target, x1: int, y1: int, x2: int, y2: int, duration: float,
           *, screen: tuple[int, int] | None = None) -> str:
     for point in ((x1, y1), (x2, y2)):
         _guard_point(target, *point, screen=screen)
+    _pretest_guard("swipe", target)
     if target.platform == ANDROID:
         ui_android.swipe(target.tool, target.target_id, x1, y1, x2, y2, duration)
         return ANDROID_BACKEND
@@ -679,6 +712,7 @@ def swipe(target: Target, x1: int, y1: int, x2: int, y2: int, duration: float,
 
 
 def type_text(target: Target, text: str) -> str:
+    _pretest_guard("type", target)
     if target.platform == ANDROID:
         ui_android.type_text(target.tool, target.target_id, text)
         return ANDROID_BACKEND
@@ -686,6 +720,7 @@ def type_text(target: Target, text: str) -> str:
 
 
 def press_key(target: Target, key: str) -> str:
+    _pretest_guard("key", target)
     if target.platform == ANDROID:
         ui_android.press_key(target.tool, target.target_id, key)
         return ANDROID_BACKEND
@@ -700,6 +735,7 @@ def gesture(target: Target, name: str, **kwargs: Any) -> None:
             f"'{name}' is not supported on android",
             "Android input supports tap, swipe, text, and keyevent only.",
         )
+    _pretest_guard("gesture", target)
     _ios().gesture(target, name, **kwargs)
 
 

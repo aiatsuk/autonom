@@ -1018,10 +1018,16 @@ def cmd_ui_tree(args: argparse.Namespace) -> int:
                             accessibility_mod.flutter_shell(whole) and \
                             accessibility_mod.foreground_app(target) == current["app_id"]:
                         accessibility_mod.enable(target, current)
-                        session_mod.force_stop(target.tool, target.target_id,
-                                               current["app_id"])
-                        launch = session_mod.launch_app(target.tool, target.target_id,
-                                                        current["app_id"])
+                        from autonom_lib.pretest import guard as pretest_guard
+
+                        # The relaunch belongs to this read-only verb, not to
+                        # the agent: a pre-test neither counts nor refuses it,
+                        # so the app is never left force-stopped (contract §9).
+                        with pretest_guard.exempt():
+                            session_mod.force_stop(target.tool, target.target_id,
+                                                   current["app_id"])
+                            launch = session_mod.launch_app(target.tool, target.target_id,
+                                                            current["app_id"])
                         for attempt in range(3):
                             nodes, new_warnings, truncated = ui_mod.tree_clipped(
                                 target, meaningful_only=not args.all, max_depth=args.max_depth,
@@ -1090,6 +1096,13 @@ def cmd_ui_tree(args: argparse.Namespace) -> int:
         payload["accessibility_recovery"] = recovery
     current = session_mod.load_current()
     if current and not dump:
+        # While a pre-test is active the saved tree names it, and an open
+        # check doubles as the tree's task (tp-004). Without one: no new keys.
+        attribution = shot_mod.pretest_attribution(current)
+        if attribution:
+            payload.update(attribution)
+            if attribution.get("check_id"):
+                payload["task"] = attribution["check_id"]
         blob = json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
         # Keep the full history, not just the latest: a run's trees are evidence
         # of how the screen changed. `latest.json` stays as a stable pointer.
@@ -1519,7 +1532,21 @@ def cmd_ui_tap(args: argparse.Namespace) -> int:
     return emit({**payload, **target.identity()}, as_json=True)
 
 
+# `ui swipe --duration` is in seconds; a value past this is a millisecond
+# count by mistake (400 would hold the finger for almost seven minutes).
+SWIPE_MAX_SECONDS = 60.0
+
+
 def cmd_ui_swipe(args: argparse.Namespace) -> int:
+    duration = args.duration
+    if duration != duration or duration > SWIPE_MAX_SECONDS:  # NaN or too long
+        raise errors.AutonomError(
+            errors.INVALID_VALUE,
+            f"--duration {duration:g} is not a swipe length: it is in seconds, at most "
+            f"{SWIPE_MAX_SECONDS:g}",
+            "--duration is seconds, e.g. 0.4 (not milliseconds).",
+            duration=duration if duration == duration and abs(duration) != float("inf")
+            else str(duration), max_seconds=SWIPE_MAX_SECONDS)
     x1, y1 = _point(args.start, "--from")
     x2, y2 = _point(args.end, "--to")
     target = _target(args)
@@ -2031,6 +2058,11 @@ def _open_android(target: Target, url: str) -> dict[str, Any]:
     the app used to be reported exactly like one that reached the app."""
     if not device_state._URL.match(url or ""):  # noqa: SLF001 - open_url's own check
         device_state.open_url(target, url)  # raises its invalid_url envelope
+    from autonom_lib.pretest import guard as pretest_guard
+
+    # counted and checked against the allow list like device_state.open_url,
+    # before any device command; a no-op without an active pre-test
+    pretest_guard.before_mutation("open", target=target, url=url)
     completed = adb_mod.run_adb(
         target.tool,
         ["shell", "am", "start", "-W", "-a", _VIEW_ACTION, "-d", shlex.quote(url)],
@@ -3448,6 +3480,643 @@ def cmd_proof(args: argparse.Namespace) -> int:
     return 2  # blocked / inconclusive: verification itself did not happen
 
 
+# --- ticket pre-test ------------------------------------------------------------
+#
+# Thin verbs: every rule (budgets, ids, masking, the pack, reviews) lives in
+# autonom_lib.pretest, imported on demand so no other verb loads it.
+
+PRETEST_TICKET_MAX_BYTES = 1_048_576
+# flow run status -> check verdict (tp-008); `broken` is a run that did not
+# reach the app's behaviour (infrastructure or definition failure).
+_FLOW_VERDICTS = {"passed": "pass", "failed": "fail", "broken": "blocked",
+                  "skipped": "inconclusive"}
+
+
+def _pretest_session() -> dict[str, Any]:
+    """The live session a pre-test verb works in, else `no_active_session`."""
+    record = session_mod.load_current()
+    if not record or record.get("stopped_at"):
+        raise errors.AutonomError(
+            errors.NO_ACTIVE_SESSION, "no active session",
+            "Start one with 'autonom session start --serial <id> --app-id <app>' "
+            "(--udid on iOS), then run the pre-test verb again.")
+    return record
+
+
+def _pretest_newest(session: dict[str, Any]) -> dict[str, Any] | None:
+    """The session's most recently created pre-test record, any status."""
+    from autonom_lib.pretest import store as pretest_store
+
+    records = pretest_store.list_records(session)
+    if not records:
+        return None
+    return max(records, key=lambda item: (str(item.get("created_at") or ""),
+                                          item["pretest_id"]))
+
+
+def _pretest_active(session: dict[str, Any], *, changing: bool = False) -> dict[str, Any]:
+    """The active pre-test (`no_active_pretest`). For a verb that changes it,
+    a session whose newest pre-test is packed answers `pretest_finalized`:
+    a pack is final, and the hint names the way to continue."""
+    from autonom_lib.pretest import store as pretest_store
+
+    try:
+        return pretest_store.require_active(session)
+    except errors.AutonomError as exc:
+        if changing and exc.code == errors.NO_ACTIVE_PRETEST:
+            newest = _pretest_newest(session)
+            if newest is not None and newest.get("status") == "packed":
+                pretest_store.ensure_mutable(newest)  # raises pretest_finalized
+        raise
+
+
+def _read_ticket(raw: str) -> str:
+    """The ticket text from a file or, for `-`, from stdin (at most 1 MiB)."""
+    limit = PRETEST_TICKET_MAX_BYTES
+    if raw == "-":
+        stream = getattr(sys.stdin, "buffer", None)
+        data = (stream.read(limit + 1) if stream is not None
+                else sys.stdin.read(limit + 1).encode("utf-8"))
+    else:
+        path = Path(raw).expanduser()
+        if not path.is_file():
+            raise errors.AutonomError(
+                errors.INVALID_VALUE, f"--ticket {raw}: no such file",
+                "Pass the ticket as a text or Markdown file, or '-' to read it from stdin.",
+                path=raw)
+        try:
+            with path.open("rb") as handle:
+                data = handle.read(limit + 1)
+        except OSError as exc:
+            raise errors.AutonomError(
+                errors.INVALID_VALUE, f"--ticket {raw}: cannot read it ({exc.strerror or exc})",
+                "Check the file's permissions, or pipe the text with --ticket -.",
+                path=raw) from None
+    if len(data) > limit:
+        raise errors.AutonomError(
+            errors.INVALID_VALUE, "the ticket is larger than 1 MiB",
+            "Pass the ticket's description and acceptance criteria only; attach logs "
+            "and screenshots as finding evidence instead.")
+    text = data.decode("utf-8", errors="replace")
+    if not text.strip():
+        raise errors.AutonomError(
+            errors.INVALID_VALUE, "the ticket is empty",
+            "Pass the ticket text: its title, description and acceptance criteria.")
+    return text
+
+
+def _max_actions(value: str | None) -> int | None:
+    """`--max-actions` as given: a whole number >= 1, else invalid_value."""
+    if value is None:
+        return None
+    try:
+        number = int(str(value).strip())
+    except ValueError:
+        number = None
+    if number is None or number < 1:
+        raise errors.AutonomError(
+            errors.INVALID_VALUE, f"--max-actions must be a whole number >= 1, got {value!r}",
+            "For example --max-actions 300.", flag="--max-actions")
+    return number
+
+
+def _whole(value: str | float | None) -> int | float | None:
+    """`--max-minutes` as given: a finite number > 0 (never NaN, infinite, zero
+    or negative, else invalid_value); whole numbers stay whole."""
+    if value is None:
+        return None
+    try:
+        number = float(str(value).strip())
+    except ValueError:
+        number = float("nan")
+    if number != number or number in (float("inf"), float("-inf")) or number <= 0:
+        raise errors.AutonomError(
+            errors.INVALID_VALUE, f"--max-minutes must be a finite number > 0, got {value!r}",
+            "For example --max-minutes 60 (not NaN, inf, 0 or a negative number).",
+            flag="--max-minutes")
+    return int(number) if number.is_integer() else number
+
+
+def _pretest_doc(session: dict[str, Any], record: dict[str, Any], which: str) -> dict[str, Any]:
+    """The pre-test's context.json or baseline.json as an object."""
+    from autonom_lib.pretest import store as pretest_store
+
+    reader = pretest_store.read_context if which == "context" else pretest_store.read_baseline
+    try:
+        doc = reader(session, record["pretest_id"])
+    except (OSError, ValueError):
+        doc = None
+    if not isinstance(doc, dict):
+        raise errors.AutonomError(
+            errors.INVALID_VALUE, f"the pre-test's {which}.json is missing or unreadable",
+            "The pre-test directory was damaged; stop it with 'autonom pretest stop' and "
+            "start a new one.", pretest_id=record["pretest_id"])
+    return doc
+
+
+def cmd_pretest_start(args: argparse.Namespace) -> int:
+    from autonom_lib.pretest import store as pretest_store
+
+    session = _pretest_session()
+    existing = pretest_store.active(session)
+    if existing is not None:
+        raise errors.AutonomError(
+            errors.PRETEST_ALREADY_ACTIVE,
+            f"pre-test {existing.get('pretest_id')} is still active in this session",
+            "Finish it with 'autonom pretest pack' or 'autonom pretest stop' first.",
+            pretest_id=existing.get("pretest_id"))
+    ticket = _read_ticket(args.ticket)
+    target = _target(args)
+    budget = {"max_actions": _max_actions(args.max_actions),
+              "max_minutes": _whole(args.max_minutes),
+              "forbid_text": args.forbid_text, "allow_apps": args.allow_app}
+    record = pretest_store.create(
+        session, target=target, ticket_text=ticket, ticket_ref=args.ticket_ref,
+        title=args.title, repo=Path(args.repo or ".").expanduser(), base=args.base,
+        head=args.head, flows_dir=args.flows, app_id=args.app_id, budget=budget)
+    pretest_id = record["pretest_id"]
+    context = _pretest_doc(session, record, "context")
+    baseline = _pretest_doc(session, record, "baseline")
+    flows = context.get("flows") if isinstance(context.get("flows"), dict) else {}
+    return emit({
+        "ok": True, **record,
+        "dir": str(pretest_store.pretest_dir(session, pretest_id)),
+        "changed_files_count": len(context.get("changed_files") or []),
+        "diff_truncated": bool(context.get("diff_truncated")),
+        "selected_flows": [entry.get("flow") for entry in flows.get("selected") or []
+                           if isinstance(entry, dict)],
+        "baseline": {key: (baseline.get(key) if isinstance(baseline.get(key), dict)
+                           else {}).get("state")
+                     for key in ("crashes", "logs", "network", "metrics")},
+    }, as_json=True)
+
+
+def cmd_pretest_status(args: argparse.Namespace) -> int:
+    from autonom_lib.pretest import checks as pretest_checks
+    from autonom_lib.pretest import findings as pretest_findings
+    from autonom_lib.pretest import guard as pretest_guard
+
+    session = _pretest_session()
+    record = _pretest_active(session)
+    usage = pretest_guard.usage(session, record)
+    states = pretest_checks.fold(session, record)
+    found = pretest_findings.fold(session, record)
+    opened = next((item for item in states if item["state"] == "open"), None)
+    by_state: dict[str, int] = {}
+    for item in states:
+        by_state[item["state"]] = by_state.get(item["state"], 0) + 1
+    return emit({
+        "ok": True,
+        **{key: record.get(key) for key in (
+            "pretest_id", "status", "title", "ticket_ref", "kind", "parent_pack",
+            "created_at", "target", "app_id", "base", "head")},
+        "actions_used": usage.get("actions_used"),
+        "actions_limit": usage.get("max_actions"),
+        "actions_left": usage.get("actions_left"),
+        "minutes_elapsed": usage.get("minutes_elapsed"),
+        "minutes_limit": usage.get("max_minutes"),
+        "minutes_left": usage.get("minutes_left"),
+        "budget": usage,
+        "open_check": None if opened is None else {
+            "check_id": opened["check_id"], "title": opened["title"],
+            "began_at": opened.get("began_at")},
+        "checks": len(states),
+        "checks_by_state": by_state,
+        "findings": len(found),
+        "auto_findings": sum(1 for item in found if item.get("origin") == "auto"),
+    }, as_json=True)
+
+
+def cmd_pretest_context(args: argparse.Namespace) -> int:
+    session = _pretest_session()
+    record = _pretest_active(session)
+    context = _pretest_doc(session, record, "context")
+    return emit({"ok": True, "pretest_id": record["pretest_id"], **context}, as_json=True)
+
+
+def cmd_pretest_stop(args: argparse.Namespace) -> int:
+    from autonom_lib.pretest import store as pretest_store
+
+    record = pretest_store.stop(_pretest_session())
+    return emit({"ok": True, **record}, as_json=True)
+
+
+def cmd_pretest_list(args: argparse.Namespace) -> int:
+    from autonom_lib.pretest import store as pretest_store
+
+    session = _pretest_session()
+    ids = pretest_store.active_ids(session)
+    rows = [{key: record.get(key) for key in (
+        "pretest_id", "status", "kind", "title", "ticket_ref", "created_at", "ended_at",
+        "parent_pack", "pack")} for record in pretest_store.list_records(session)]
+    return emit({"ok": True, "count": len(rows), "pretests": rows,
+                 "active": ids[0] if ids else None}, as_json=True)
+
+
+def cmd_pretest_check_add(args: argparse.Namespace) -> int:
+    from autonom_lib.pretest import checks as pretest_checks
+
+    session = _pretest_session()
+    record = _pretest_active(session, changing=True)
+    state = pretest_checks.add(session, record, title=args.title, kind=args.kind,
+                               case=args.case, why=args.why, flow=args.flow)
+    return emit({"ok": True, "pretest_id": record["pretest_id"], **state}, as_json=True)
+
+
+def cmd_pretest_check_begin(args: argparse.Namespace) -> int:
+    from autonom_lib.pretest import checks as pretest_checks
+
+    session = _pretest_session()
+    record = _pretest_active(session, changing=True)
+    state = pretest_checks.begin(session, record, args.check_id)
+    return emit({"ok": True, "pretest_id": record["pretest_id"], **state}, as_json=True)
+
+
+def cmd_pretest_check_end(args: argparse.Namespace) -> int:
+    from autonom_lib.pretest import checks as pretest_checks
+
+    session = _pretest_session()
+    record = _pretest_active(session, changing=True)
+    state = pretest_checks.end(session, record, args.check_id, verdict=args.verdict,
+                               note=args.note)
+    return emit({"ok": True, "pretest_id": record["pretest_id"], **state}, as_json=True)
+
+
+def cmd_pretest_check_list(args: argparse.Namespace) -> int:
+    from autonom_lib.pretest import checks as pretest_checks
+
+    session = _pretest_session()
+    record = _pretest_active(session)
+    states = pretest_checks.fold(session, record)
+    opened = next((item["check_id"] for item in states if item["state"] == "open"), None)
+    return emit({"ok": True, "pretest_id": record["pretest_id"], "count": len(states),
+                 "open_check": opened, "checks": states}, as_json=True)
+
+
+def cmd_pretest_finding_add(args: argparse.Namespace) -> int:
+    from autonom_lib.pretest import findings as pretest_findings
+
+    session = _pretest_session()
+    record = _pretest_active(session, changing=True)
+    finding = pretest_findings.add(
+        session, record, check_id=args.check, severity=args.severity, title=args.title,
+        actual=args.actual, expected=args.expected, evidence=args.evidence or ())
+    return emit({"ok": True, "pretest_id": record["pretest_id"], **finding}, as_json=True)
+
+
+def cmd_pretest_finding_list(args: argparse.Namespace) -> int:
+    from autonom_lib.pretest import findings as pretest_findings
+
+    session = _pretest_session()
+    record = _pretest_active(session)
+    found = pretest_findings.fold(session, record)
+    return emit({"ok": True, "pretest_id": record["pretest_id"], "count": len(found),
+                 "findings": found}, as_json=True)
+
+
+def _flow_execution(status: str, failure: dict[str, Any] | None, steps: list[Any]) -> str:
+    """passed|failed|broken|skipped for one finished flow run, the key of
+    `_FLOW_VERDICTS` (tp-008): a failure that is not the app's (infrastructure,
+    definition) is broken, and a run whose every step was skipped proved nothing."""
+    if status in ("passed", "replayed"):
+        if steps and all(getattr(step, "status", None) == "skipped" for step in steps):
+            return "skipped"
+        return "passed"
+    if (failure or {}).get("failure_class") in (None, "test_failure"):
+        return "failed"
+    return "broken"
+
+
+def cmd_pretest_flows(args: argparse.Namespace) -> int:
+    from autonom_lib.flow import schema as flow_schema
+    from autonom_lib.pretest import checks as pretest_checks
+
+    session = _pretest_session()
+    record = _pretest_active(session, changing=True)
+    opened = pretest_checks.open_check(session, record)
+    if opened is not None:
+        raise errors.AutonomError(
+            errors.CHECK_ALREADY_OPEN, f"check {opened['check_id']} is still open",
+            f"End it first with 'autonom pretest check end {opened['check_id']} "
+            "--verdict <verdict>'; each selected flow runs as its own check.",
+            open_check_id=opened["check_id"])
+    context = _pretest_doc(session, record, "context")
+    flows = context.get("flows") if isinstance(context.get("flows"), dict) else {}
+    selected = [entry for entry in flows.get("selected") or [] if isinstance(entry, dict)]
+    env_overrides = _flow_env_overrides(args)
+    secrets = _flow_secrets(args)
+    runs: list[dict[str, Any]] = []
+    if selected:
+        target = _target(args)
+        config = flow_executor.RunConfig(env=env_overrides, secrets=secrets)
+    for entry in selected:
+        path = str(entry.get("flow") or "")
+        reasons = [str(item) for item in entry.get("reasons") or []]
+        run: dict[str, Any] = {"flow": path, "reasons": reasons, "run_id": None,
+                               "failure": None}
+        flow = None
+        try:
+            if not path:
+                raise errors.AutonomError(
+                    errors.FLOW_FILE_NOT_FOUND, "a selected flow has no path",
+                    "Start a new pre-test so its context is computed again.")
+            flow = flow_validator.validate_tree(Path(path))
+        except errors.AutonomError as exc:
+            run["failure"] = {"error_code": exc.code,
+                              "failure_class": flow_schema.failure_class(exc.code),
+                              "error": exc.message}
+        name = (flow.name if flow is not None and flow.name else Path(path).name) or "flow"
+        title = f"Regression flow: {name}"
+        state = pretest_checks.add(session, record, title=title, kind="regression",
+                                   why="; ".join(reasons) or None,
+                                   flow=path if path and Path(path).is_file() else None)
+        run["check_id"] = state["check_id"]
+        pretest_checks.begin(session, record, state["check_id"])
+        execution = "broken"
+        if flow is not None:
+            runner = flow_executor.Executor(target, session, config)
+            try:
+                result = runner.run(flow)
+            except errors.AutonomError as exc:
+                # the run aborted (budget, backend, definition): its evidence
+                # is written; the check is blocked, never a test failure
+                run["run_id"] = getattr(runner, "_writer_run_id", None)
+                run["failure"] = {"error_code": exc.code,
+                                  "failure_class": flow_schema.failure_class(exc.code),
+                                  "error": exc.message}
+            except BaseException as exc:
+                # an unexpected stop (a wedged backend, an interrupt) never
+                # leaves the check open; the CLI still reports the error
+                with contextlib.suppress(Exception):  # the original error wins
+                    pretest_checks.end(session, record, state["check_id"],
+                                       verdict="blocked",
+                                       note=f"run stopped: {type(exc).__name__}",
+                                       run_id=getattr(runner, "_writer_run_id", None))
+                raise
+            else:
+                run["run_id"] = result.run_id
+                run["failure"] = result.failure
+                execution = _flow_execution(result.status, result.failure, result.steps)
+        verdict = _FLOW_VERDICTS[execution]
+        failure = run["failure"] or {}
+        note = (f"{failure.get('error_code')}: {failure.get('error')}"
+                if failure.get("error_code") else None)
+        ended = pretest_checks.end(session, record, state["check_id"], verdict=verdict,
+                                   note=note, run_id=run["run_id"])
+        run.update({"status": execution, "verdict": ended["verdict"]})
+        runs.append(run)
+    payload: dict[str, Any] = {
+        "ok": True, "pretest_id": record["pretest_id"], "count": len(runs),
+        # one line per flow: which check it became and how it ended
+        "flows": [{key: run.get(key) for key in
+                   ("flow", "check_id", "run_id", "status", "verdict")} for run in runs],
+        "runs": runs}
+    if not selected:
+        payload["warnings"] = [{
+            "code": "no_flows_selected",
+            "error": "the pre-test's context selected no flow for this diff",
+            "hint": "Add flows whose 'properties.covers' globs match the changed files "
+                    "(see 'autonom pretest context'), or plan the checks by hand."}]
+    return emit(payload, as_json=True)
+
+
+def cmd_pretest_health(args: argparse.Namespace) -> int:
+    from autonom_lib.pretest import health as pretest_health
+
+    session = _pretest_session()
+    record = _pretest_active(session, changing=True)
+    result = pretest_health.run(session, record, _target(args))
+    return emit({"ok": True, "pretest_id": record["pretest_id"], **result}, as_json=True)
+
+
+def cmd_pretest_pack(args: argparse.Namespace) -> int:
+    from autonom_lib.pretest import pack as pretest_pack
+    from autonom_lib.pretest import store as pretest_store
+
+    session = _pretest_session()
+    record = pretest_store.active(session)
+    if record is None:
+        # a stopped pre-test is packed; a packed one returns its pack unchanged
+        record = _pretest_newest(session)
+        if record is None:
+            record = pretest_store.require_active(session)  # raises no_active_pretest
+    target = None
+    if record.get("status") != "packed":
+        try:
+            target = _target(args)
+        except errors.AutonomError:
+            target = None  # the device is gone: health reads what it can
+    result = pretest_pack.build(session, record, out=args.out, target=target)
+    return emit({"ok": True, **result}, as_json=True)
+
+
+def _start_more_checks(session: dict[str, Any], target: Target, pack: Path,
+                       titles: list[str], *, app_id: str | None,
+                       budget: dict[str, Any]) -> dict[str, Any]:
+    """The child pre-test of a `more-checks` review: linked to the pack, with
+    the parent's ticket and diff context, holding the requested checks.
+
+    Its safety rules (app id, budget, forbidden text, allowed apps) come from
+    the reviewer: the review's own flags, else this session and the defaults.
+    The pack's record is never trusted for them, so a pack made with relaxed
+    rules cannot loosen the guard of a pre-test that runs on QA's device."""
+    from autonom_lib.pretest import checks as pretest_checks
+    from autonom_lib.pretest import pack as pretest_pack
+    from autonom_lib.pretest import store as pretest_store
+
+    parent = pretest_store.find_pack_record(pack)
+    try:
+        context = json.loads(pretest_pack.read_regular_bytes(pack / pretest_store.CONTEXT_FILE))
+        ticket = pretest_pack.read_regular_bytes(pack / pretest_store.TICKET_FILE).decode(
+            "utf-8", errors="replace")
+    except (OSError, ValueError) as exc:
+        raise errors.AutonomError(
+            errors.NOT_A_PRETEST_PACK, f"cannot read the pack's ticket or context: {exc}",
+            "Verify the pack with 'autonom report verify <pack>'.", path=str(pack)) from None
+    if not isinstance(context, dict):
+        raise errors.AutonomError(
+            errors.NOT_A_PRETEST_PACK, "the pack's context.json is not an object",
+            "Verify the pack with 'autonom report verify <pack>'.", path=str(pack))
+    child = pretest_store.create(
+        session, target=target, ticket_text=ticket,
+        ticket_ref=parent.get("ticket_ref"), title=parent.get("title"),
+        repo=parent.get("repo"), base=parent.get("base"), head=parent.get("head"),
+        flows_dir=parent.get("flows_dir"), app_id=app_id,
+        budget=budget, parent_pack=pack, kind="more-checks",
+        context=context)
+    added = [pretest_checks.add(session, child, title=title, kind="ticket")
+             for title in titles]
+    return {key: child.get(key) for key in (
+        "pretest_id", "status", "kind", "parent_pack", "title", "app_id",
+        "budget")} | {"checks": added}
+
+
+def cmd_pretest_review(args: argparse.Namespace) -> int:
+    from autonom_lib.pretest import review as pretest_review
+    from autonom_lib.pretest import store as pretest_store
+
+    session, target = None, None
+    child_app_id: str | None = None
+    child_budget: dict[str, Any] = {}
+    rule_flags = [flag for flag, value in (
+        ("--app-id", args.app_id), ("--max-actions", args.max_actions),
+        ("--max-minutes", args.max_minutes), ("--forbid-text", args.forbid_text),
+        ("--allow-app", args.allow_app)) if value is not None]
+    if args.decision != "more-checks" and rule_flags:
+        raise errors.AutonomError(
+            errors.INVALID_VALUE,
+            f"{', '.join(rule_flags)} only applies to more-checks",
+            "Only more-checks starts a child pre-test; drop the flag or use more-checks.",
+            flags=rule_flags)
+    if args.decision == "more-checks":
+        # everything the child needs is checked before the decision is written
+        if not args.check:
+            raise errors.AutonomError(
+                errors.INVALID_VALUE, "more-checks needs at least one --check",
+                'Name each check to add, e.g. --check "Rotate on results".')
+        # the child's rules are the reviewer's, never the pack's (see
+        # _start_more_checks); a bad value is refused before anything is written
+        child_budget = {"max_actions": _max_actions(args.max_actions),
+                        "max_minutes": _whole(args.max_minutes),
+                        "forbid_text": args.forbid_text, "allow_apps": args.allow_app}
+        session = _pretest_session()
+        child_app_id = args.app_id or session.get("app_id")
+        pretest_store._normalize_budget(child_budget, child_app_id)
+        existing = pretest_store.active(session)
+        if existing is not None:
+            raise errors.AutonomError(
+                errors.PRETEST_ALREADY_ACTIVE,
+                f"pre-test {existing.get('pretest_id')} is still active in this session",
+                "The more-checks child starts in this session; pack or stop the active "
+                "pre-test first.", pretest_id=existing.get("pretest_id"))
+        target = _target(args)
+    result = pretest_review.write(
+        args.pack, args.decision, note=args.note, checks=args.check or (),
+        findings=args.finding or (), confirm=args.confirm or (),
+        dismiss=args.dismiss or (), author=args.author)
+    payload: dict[str, Any] = {"ok": True, **result}
+    if session is not None:
+        pack = Path(args.pack).expanduser().resolve()
+        try:
+            payload["child"] = _start_more_checks(session, target, pack,
+                                                  list(result["checks"]),
+                                                  app_id=child_app_id,
+                                                  budget=child_budget)
+        except errors.AutonomError as exc:
+            raise errors.AutonomError(
+                exc.code, f"{exc.message} (the more-checks decision was recorded, but its "
+                          "child pre-test did not start)",
+                (exc.hint + " " if exc.hint else "")
+                + "Fix the cause and run the same review again; it adds a new decision.",
+                **{**exc.extra, "review": result["path"]}) from None
+    return emit(payload, as_json=True)
+
+
+def cmd_pretest_review_status(args: argparse.Namespace) -> int:
+    from autonom_lib.pretest import review as pretest_review
+
+    return emit(pretest_review.status(args.pack), as_json=True)
+
+
+def cmd_pretest_kit(args: argparse.Namespace) -> int:
+    from autonom_lib.pretest import checks as pretest_checks
+    from autonom_lib.pretest import kit as pretest_kit
+    from autonom_lib.pretest import store as pretest_store
+
+    payload: dict[str, Any] = {"ok": True, "count": len(pretest_kit.KIT),
+                               "kit": [dict(case) for case in pretest_kit.KIT]}
+    try:
+        session = session_mod.load_current()
+        record = pretest_store.active(session) if session else None
+        if record is not None:
+            payload["pretest_id"] = record["pretest_id"]
+            payload["coverage"] = pretest_kit.coverage(pretest_checks.fold(session, record))
+    except (errors.AutonomError, OSError, ValueError):
+        pass  # the kit itself never depends on a session
+    return emit(payload, as_json=True)
+
+
+def cmd_pretest_flow_draft(args: argparse.Namespace) -> int:
+    from autonom_lib.pretest import regress as pretest_regress
+
+    if args.pack:
+        # a pack is read (and verified) as it is; nothing is recorded in it
+        session = session_mod.load_current()
+        result = pretest_regress.flow_draft(session, args.pack, args.finding_id, out=args.out)
+    else:
+        session = _pretest_session()
+        record = _pretest_active(session, changing=True)
+        result = pretest_regress.flow_draft(session, record, args.finding_id, out=args.out)
+    return emit({"ok": True, **result}, as_json=True)
+
+
+def _pretest_run_config(args: argparse.Namespace) -> Any:
+    return flow_executor.RunConfig(env=_flow_env_overrides(args), secrets=_flow_secrets(args))
+
+
+def cmd_pretest_repro(args: argparse.Namespace) -> int:
+    from autonom_lib.pretest import pack as pretest_pack
+    from autonom_lib.pretest import regress as pretest_regress
+
+    if args.pack:
+        # child-free design: a pack is final, and repro records on the finding
+        if not pretest_pack.is_pack(args.pack):
+            raise errors.AutonomError(
+                errors.NOT_A_PRETEST_PACK, f"{args.pack} is not a pre-test pack",
+                "Pass the directory 'autonom pretest pack' printed.", path=args.pack)
+        raise errors.AutonomError(
+            errors.PRETEST_FINALIZED,
+            "a packed pre-test cannot record repro results",
+            "Replay the pack's drafts on the current build with 'autonom pretest rerun "
+            "<pack> --check <id>', or run repro in the active pre-test before packing.",
+            pack=args.pack, finding_id=args.finding_id)
+    pretest_regress.check_times(args.times)  # refused before anything else
+    session = _pretest_session()
+    _pretest_active(session, changing=True)
+    config = _pretest_run_config(args)
+    result = pretest_regress.repro(session, args.finding_id, times=args.times,
+                                   target=_target(args), config=config)
+    return emit({"ok": True, **result}, as_json=True)
+
+
+def cmd_pretest_rerun(args: argparse.Namespace) -> int:
+    from autonom_lib.pretest import regress as pretest_regress
+
+    session = _pretest_session()
+    config = _pretest_run_config(args)
+    result = pretest_regress.rerun(session, args.pack, check_ids=args.check or (),
+                                   target=_target(args), config=config)
+    return emit({"ok": True, **result}, as_json=True)
+
+
+def cmd_pretest_warmup(args: argparse.Namespace) -> int:
+    from autonom_lib.pretest import warmup as pretest_warmup
+
+    session = _pretest_session()
+    record = _pretest_active(session, changing=True)
+    result = pretest_warmup.run(session, record, _target(args),
+                                config=_pretest_run_config(args))
+    return emit({"ok": True, "pretest_id": record["pretest_id"], **result}, as_json=True)
+
+
+def cmd_pretest_a11y(args: argparse.Namespace) -> int:
+    from autonom_lib.pretest import a11y as pretest_a11y
+
+    session = _pretest_session()
+    record = _pretest_active(session, changing=True)
+    result = pretest_a11y.run(session, record, _target(args), check_id=args.check)
+    return emit({"ok": True, "pretest_id": record["pretest_id"], **result}, as_json=True)
+
+
+def cmd_pretest_events(args: argparse.Namespace) -> int:
+    from autonom_lib.pretest import events as pretest_events
+
+    session = _pretest_session()
+    record = _pretest_active(session, changing=True)
+    result = pretest_events.run(session, record, check_id=args.check)
+    return emit({"ok": True, "pretest_id": record["pretest_id"], **result}, as_json=True)
+
+
 # --- atlas -------------------------------------------------------------------
 
 
@@ -3612,7 +4281,13 @@ def cmd_report_bundle(args: argparse.Namespace) -> int:
 
 
 def cmd_report_verify(args: argparse.Namespace) -> int:
-    return emit(report_bundle_mod.verify(Path(args.bundle)), as_json=True)
+    from autonom_lib.pretest import pack as pretest_pack
+
+    path = Path(args.bundle)
+    if pretest_pack.is_pack(path):
+        # a pre-test pack: every digest, nested flow bundles included
+        return emit(pretest_pack.verify(path), as_json=True)
+    return emit(report_bundle_mod.verify(path), as_json=True)
 
 
 def cmd_report_annotate(args: argparse.Namespace) -> int:
@@ -5316,7 +5991,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = ui_sub.add_parser("swipe", help="swipe between two points", parents=[target_flags])
     p.add_argument("--from", dest="start", required=True, metavar="X,Y")
     p.add_argument("--to", dest="end", required=True, metavar="X,Y")
-    p.add_argument("--duration", type=float, default=0.3)
+    p.add_argument("--duration", type=float, default=0.3, metavar="SECONDS",
+                   help=f"seconds, e.g. 0.4 (default 0.3, at most {SWIPE_MAX_SECONDS:g})")
     p.set_defaults(func=cmd_ui_swipe)
 
     # Only pinch takes an anchor and a scale; `idb ui rotate|shake` accept
@@ -5695,6 +6371,172 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--env", action="append", metavar="KEY=VALUE")
     p.add_argument("--secret", action="append", metavar="NAME")
     p.set_defaults(func=cmd_proof)
+
+    pretest = sub.add_parser(
+        "pretest", help="pre-test one ticket and its diff on the session's device")
+    pretest_sub = pretest.add_subparsers(dest="pretest_command", required=True)
+    p = pretest_sub.add_parser("start", help="start a pre-test of one ticket and its diff",
+                               parents=[target_flags])
+    p.add_argument("--ticket", required=True, metavar="FILE|-",
+                   help="the ticket text (Markdown or plain text); '-' reads stdin")
+    p.add_argument("--base", required=True, help="git ref the change is compared with")
+    p.add_argument("--head", help="git ref of the change (default: the working tree)")
+    p.add_argument("--repo", help="repository root (default: cwd)")
+    p.add_argument("--flows", help="flow directory (default: <repo>/.autonom/flows)")
+    p.add_argument("--title", help="pre-test title (default: the ticket's first line)")
+    p.add_argument("--ticket-ref", metavar="KEY", help="the ticket's key, e.g. WB-123")
+    p.add_argument("--app-id", help="the app under test (default: the session's)")
+    p.add_argument("--max-actions", metavar="N",
+                   help="mutating device actions allowed (default 300)")
+    p.add_argument("--max-minutes", metavar="N",
+                   help="minutes the pre-test may run (default 60)")
+    p.add_argument("--forbid-text", action="append", metavar="PATTERN",
+                   help="case-insensitive regex; a tap on matching text is refused "
+                        "(repeatable; replaces the default list)")
+    p.add_argument("--allow-app", action="append", metavar="ID",
+                   help="app id open/launch may reach (repeatable; default: the session's app)")
+    p.set_defaults(func=cmd_pretest_start)
+    for verb, func, help_text in (
+        ("status", cmd_pretest_status, "the active pre-test: budget, open check, counts"),
+        ("context", cmd_pretest_context, "the diff context: files, hunks, flows, screen hints"),
+        ("stop", cmd_pretest_stop, "close the active pre-test without a pack"),
+        ("health", cmd_pretest_health, "device-health deltas since the baseline"),
+        ("list", cmd_pretest_list, "this session's pre-tests"),
+    ):
+        p = pretest_sub.add_parser(verb, help=help_text, parents=[target_flags])
+        p.set_defaults(func=func)
+
+    check = pretest_sub.add_parser("check", help="plan, open and close checks")
+    check_sub = check.add_subparsers(dest="pretest_check_command", required=True)
+    p = check_sub.add_parser("add", help="add a check", parents=[target_flags])
+    p.add_argument("title", help="what the check verifies")
+    p.add_argument("--kind", required=True, metavar="KIND",
+                   help="ticket|edge|regression|network|a11y|analytics")
+    p.add_argument("--case", metavar="KIT-ID", help="edge-case kit id ('pretest kit')")
+    p.add_argument("--why", help="why this check matters for the ticket")
+    p.add_argument("--flow", metavar="PATH", help="the flow file that runs this check")
+    p.set_defaults(func=cmd_pretest_check_add)
+    p = check_sub.add_parser("begin", help="open a check (one at a time)",
+                             parents=[target_flags])
+    p.add_argument("check_id")
+    p.set_defaults(func=cmd_pretest_check_begin)
+    p = check_sub.add_parser("end", help="close the open check with a verdict",
+                             parents=[target_flags])
+    p.add_argument("check_id")
+    p.add_argument("--verdict", required=True, metavar="V",
+                   help="pass|fail|blocked|not_covered|inconclusive")
+    p.add_argument("--note", help="what was seen")
+    p.set_defaults(func=cmd_pretest_check_end)
+    p = check_sub.add_parser("list", help="every check with state, verdict and time",
+                             parents=[target_flags])
+    p.set_defaults(func=cmd_pretest_check_list)
+
+    p = pretest_sub.add_parser("flows", help="run the selected flows as regression checks",
+                               parents=[target_flags])
+    p.add_argument("--env", action="append", metavar="KEY=VALUE")
+    p.add_argument("--secret", action="append", metavar="NAME")
+    p.set_defaults(func=cmd_pretest_flows)
+
+    finding = pretest_sub.add_parser("finding", help="record and list findings")
+    finding_sub = finding.add_subparsers(dest="pretest_finding_command", required=True)
+    p = finding_sub.add_parser("add", help="record a finding with evidence",
+                               parents=[target_flags])
+    p.add_argument("--check", required=True, metavar="ID", help="the check it belongs to")
+    p.add_argument("--severity", required=True, metavar="S",
+                   help="blocker|major|minor|info")
+    p.add_argument("--title", required=True)
+    p.add_argument("--actual", required=True, help="what happened")
+    p.add_argument("--expected", help="what should have happened")
+    p.add_argument("--evidence", action="append", metavar="REF",
+                   help="shot:<id>|tree:<file>|action:<id>|request:<id>|log:<from>..<to>"
+                        "|run:<run_id>|crash:<name> (repeatable)")
+    p.set_defaults(func=cmd_pretest_finding_add)
+    p = finding_sub.add_parser("list", help="every finding", parents=[target_flags])
+    p.set_defaults(func=cmd_pretest_finding_list)
+
+    p = pretest_sub.add_parser("pack", help="finish the pre-test and write its pack",
+                               parents=[target_flags])
+    p.add_argument("--out", metavar="DIR",
+                   help="an empty or new directory (default: <pre-test>/pack)")
+    p.set_defaults(func=cmd_pretest_pack)
+
+    p = pretest_sub.add_parser("review", help="record a QA decision beside a pack",
+                               parents=[target_flags])
+    p.add_argument("pack", help="the pack directory")
+    p.add_argument("decision", choices=("approve", "more-checks", "return-to-dev"))
+    p.add_argument("--note", help="the reviewer's note")
+    p.add_argument("--check", action="append", metavar="TITLE",
+                   help="more-checks: a check the child pre-test starts with (repeatable)")
+    p.add_argument("--finding", action="append", metavar="ID",
+                   help="return-to-dev: a finding to fix (repeatable)")
+    p.add_argument("--confirm", action="append", metavar="ID",
+                   help="confirm an automatic finding (repeatable)")
+    p.add_argument("--dismiss", action="append", metavar="ID",
+                   help="dismiss an automatic finding (repeatable)")
+    p.add_argument("--author", default="qa", metavar="NAME", help="who decided (default qa)")
+    p.add_argument("--app-id",
+                   help="more-checks: the child's app (default: this session's, never the pack's)")
+    p.add_argument("--max-actions", metavar="N",
+                   help="more-checks: the child's action budget (default 300)")
+    p.add_argument("--max-minutes", metavar="N",
+                   help="more-checks: the child's time budget (default 60)")
+    p.add_argument("--forbid-text", action="append", metavar="PATTERN",
+                   help="more-checks: replaces the child's default forbidden-text list "
+                        "(repeatable)")
+    p.add_argument("--allow-app", action="append", metavar="ID",
+                   help="more-checks: an app the child may open (repeatable; default: "
+                        "the child's app)")
+    p.set_defaults(func=cmd_pretest_review)
+    p = pretest_sub.add_parser("review-status", help="the review decisions of a pack")
+    p.add_argument("pack", help="the pack directory")
+    p.set_defaults(func=cmd_pretest_review_status)
+    p = pretest_sub.add_parser("kit", help="the edge-case kit (and its coverage)")
+    p.set_defaults(func=cmd_pretest_kit)
+    p = pretest_sub.add_parser("flow-draft", help="compile a finding's check into a draft flow",
+                               parents=[target_flags])
+    p.add_argument("finding_id", help="the finding, e.g. f-1")
+    p.add_argument("--pack", metavar="PATH",
+                   help="read the finding from this pack instead of the active pre-test "
+                        "(nothing is recorded)")
+    p.add_argument("--out", metavar="PATH",
+                   help="the draft file (default: <repo>/.autonom/flows/drafts/"
+                        "<ticket-slug>-<finding-id>.yaml)")
+    p.set_defaults(func=cmd_pretest_flow_draft)
+    p = pretest_sub.add_parser("repro", help="replay a finding's draft N times",
+                               parents=[target_flags])
+    p.add_argument("finding_id", help="the finding, e.g. f-1")
+    p.add_argument("--times", required=True, type=int, metavar="N", help="runs, 1 to 10")
+    p.add_argument("--pack", metavar="PATH",
+                   help="a pack is final: refused with pretest_finalized (use rerun)")
+    p.add_argument("--env", action="append", metavar="KEY=VALUE")
+    p.add_argument("--secret", action="append", metavar="NAME")
+    p.set_defaults(func=cmd_pretest_repro)
+    p = pretest_sub.add_parser("rerun", help="rerun a pack's checks in a linked child pre-test",
+                               parents=[target_flags])
+    p.add_argument("pack", help="the pack directory")
+    p.add_argument("--check", action="append", metavar="ID",
+                   help="a parent check to rerun (repeatable; default: every check with "
+                        "a flow or draft)")
+    p.add_argument("--env", action="append", metavar="KEY=VALUE")
+    p.add_argument("--secret", action="append", metavar="NAME")
+    p.set_defaults(func=cmd_pretest_rerun)
+    p = pretest_sub.add_parser("warmup", help="run the app profile's login and warm-up "
+                               "flows, then walk the Runtime Map to the hinted screens",
+                               parents=[target_flags])
+    p.add_argument("--env", action="append", metavar="KEY=VALUE")
+    p.add_argument("--secret", action="append", metavar="NAME")
+    p.set_defaults(func=cmd_pretest_warmup)
+    p = pretest_sub.add_parser("a11y", help="accessibility rules on the current screen's tree",
+                               parents=[target_flags])
+    p.add_argument("--check", metavar="ID",
+                   help="the check the findings belong to (default: the open check)")
+    p.set_defaults(func=cmd_pretest_a11y)
+    p = pretest_sub.add_parser("events", help="match the profile's analytics events against "
+                               "captured requests", parents=[target_flags])
+    p.add_argument("--check", metavar="ID",
+                   help="the check whose window is searched (default: the open check, "
+                        "else the whole pre-test)")
+    p.set_defaults(func=cmd_pretest_events)
 
     atlas = sub.add_parser("atlas", aliases=["runtime-map"],
                            help="the observed Runtime Map application graph")
@@ -6120,6 +6962,7 @@ _SUBCOMMAND_DESTS = (
     "record_command", "shots_command", "devices_command", "note_command",
     "logs_command", "metrics_command", "teach_command", "app_skill_command",
     "simulator_command", "canvas_command", "ci_command", "agent_command",
+    "pretest_command", "pretest_check_command", "pretest_finding_command",
 )
 
 
@@ -6153,6 +6996,35 @@ def _journal_command(args: argparse.Namespace, argv: list[str], ok: bool,
         payload=_LAST_EMIT, ok=ok, error_code=error_code,
         args=args, parser=_ROOT_PARSER,
     )
+    if ok:
+        _journal_mock_state(session, args)
+
+
+# `network mock` sub-commands that change the registry.
+_MOCK_CHANGES = frozenset({"add", "update", "enable", "disable", "remove", "clear"})
+
+
+def _journal_mock_state(session: dict[str, Any], args: argparse.Namespace) -> None:
+    """While a pre-test is active, journal the mock registry as it stands
+    after a `network mock` change and at `pretest start` (a `mock_state`
+    entry: ids, URL globs, methods, hosts, statuses, enabled flags), so the
+    pack can tell which mocks were active at each step. Nothing is written
+    without an active pre-test; a failure here never fails the command."""
+    command = getattr(args, "command", None)
+    changed = (command == "network" and getattr(args, "network_command", None) == "mock"
+               and getattr(args, "mock_command", None) in _MOCK_CHANGES)
+    started = command == "pretest" and getattr(args, "pretest_command", None) == "start"
+    if not (changed or started):
+        return
+    try:
+        from autonom_lib.pretest import repro as pretest_repro
+        from autonom_lib.pretest import store as pretest_store
+
+        if not pretest_store.attribution(session):
+            return
+        journal_mod.append(session, pretest_repro.mock_state_entry(mocks_mod.load()))
+    except Exception:  # noqa: BLE001 — journaling is best-effort
+        pass
 
 
 _PAIR_FLAGS = ("--env", "--setenv")

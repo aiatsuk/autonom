@@ -227,6 +227,18 @@ def active_mocks() -> dict[str, Any]:
 # --- evidence-grade capture ---------------------------------------------------
 
 
+def pretest_attribution(session: dict[str, Any] | None) -> dict[str, str]:
+    """``pretest_id``/``check_id`` of the session's active pre-test, else ``{}``."""
+    if not session:
+        return {}
+    try:
+        from .pretest import store as pretest_store
+
+        return pretest_store.attribution(session)
+    except Exception:  # noqa: BLE001 - attribution must never break a capture
+        return {}
+
+
 def shots_dir(session: dict[str, Any], task: str | None = None) -> Path:
     path = Path(session["artifacts_dir"]) / "shots"
     if task:
@@ -281,6 +293,11 @@ def capture_evidence(
     contained no pictures of it.
     """
     moment = time.time()
+    # While a pre-test check is open, an unlabelled capture belongs to it
+    # (tp-004). Without an active pre-test this is empty and nothing changes.
+    attribution = pretest_attribution(session)
+    if task is None and attribution.get("check_id"):
+        task = attribution["check_id"]
     if session:
         directory = shots_dir(session, task)
         destination = directory / build_filename(next_index(directory), label, moment)
@@ -299,6 +316,7 @@ def capture_evidence(
         "app_id": (session or {}).get("app_id"),
         "foreground": foreground(target),
     }
+    meta.update(attribution)
     mocks = active_mocks()
     meta["mocks_active"] = mocks["active"]
     if mocks["active"]:

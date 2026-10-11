@@ -29,6 +29,7 @@ def record_detail(session: dict[str, Any] | None, hint: str,
     if not session:
         return None
     try:
+        payload = _with_pretest(session, payload)
         directory = session_mod.artifact_path(session, "actions")
         directory.mkdir(parents=True, exist_ok=True)
         index = sum(1 for entry in directory.iterdir()
@@ -41,6 +42,26 @@ def record_detail(session: dict[str, Any] | None, hint: str,
         return str(path.relative_to(session["artifacts_dir"]))
     except Exception:  # noqa: BLE001 — evidence loss never fails a command
         return None
+
+
+def _with_pretest(session: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+    """While a pre-test is active, the detail names it and its open check
+    (the check id doubles as the ``task`` when none was given). Without one,
+    the payload is written exactly as passed."""
+    try:
+        from .pretest import store as pretest_store
+
+        attribution = pretest_store.attribution(session)
+    except Exception:  # noqa: BLE001
+        return payload
+    if not attribution:
+        return payload
+    extended = dict(payload)
+    for key, value in attribution.items():
+        extended.setdefault(key, value)
+    if attribution.get("check_id") and extended.get("task") is None:
+        extended["task"] = attribution["check_id"]
+    return extended
 
 
 def read_details(session: dict[str, Any]) -> dict[str, dict[str, Any]]:

@@ -54,6 +54,7 @@ _EXACT_NON_SECRET_PREFIXES: dict[tuple[str, ...], frozenset[str]] = {
     ("runtime-map", "paths"): frozenset({"--to"}),
     ("runtime-map", "diff"): frozenset({"--head"}),
     ("proof",): frozenset({"--head"}),
+    ("pretest", "start"): frozenset({"--head"}),
 }
 # Namespace dests whose exact string values are secrets wherever they appear.
 _SENSITIVE_DESTS = ("token", "secret", "password", "header", "value", "json",
@@ -668,6 +669,27 @@ def _lock(handle: Any) -> None:
     fcntl.flock(handle, fcntl.LOCK_EX)
 
 
+def last_seq(session: dict[str, Any] | None) -> int:
+    """The sequence number of the newest entry (0 for an empty journal)."""
+    if not session:
+        return 0
+    try:
+        return _next_seq(journal_path(session)) - 1
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def _pretest_attribution(session: dict[str, Any]) -> dict[str, str]:
+    """``pretest_id`` and the open ``check_id`` while a pre-test is active;
+    nothing otherwise, so entries stay shaped exactly as before (tp-004)."""
+    try:
+        from .pretest import store as pretest_store
+
+        return pretest_store.attribution(session)
+    except Exception:  # noqa: BLE001 — attribution must never cost an entry
+        return {}
+
+
 def append(session: dict[str, Any] | None, entry: dict[str, Any]) -> None:
     """Append one entry. Never raises — journaling is best-effort."""
     if not session:
@@ -675,11 +697,14 @@ def append(session: dict[str, Any] | None, entry: dict[str, Any]) -> None:
     try:
         path = journal_path(session)
         path.parent.mkdir(parents=True, exist_ok=True)
+        attribution = _pretest_attribution(session)
         with path.open("a", encoding="utf-8") as handle:
             # Serialize sequence allocation and append across independent CLI
             # processes (a flow and a hand-run verb on one session).
             _lock(handle)
             full = {"seq": _next_seq(path), "ts": _now(), **entry}
+            for key, value in attribution.items():
+                full.setdefault(key, value)
             handle.write(json.dumps(full, ensure_ascii=False) + "\n")
             handle.flush()
     except Exception:  # noqa: BLE001 — a broken journal must not break a command

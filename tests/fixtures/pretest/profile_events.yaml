@@ -1,0 +1,20 @@
+# The app profile the events tests use (workspace location).
+schema: autonom.pretest-profile/v1
+accounts:
+  qa:
+    user: PRETEST_QA_USER
+    password: PRETEST_QA_PASSWORD
+flaky_screens: [Splash]
+events:
+  - name: screen_view
+    method: POST
+    host: analytics.example.com
+    path: "/v1/events*"
+    body_key: event
+    body_value: screen_view
+  - name: add_to_cart
+    method: post
+    host: "*.example.com"
+    path: /v1/events
+    body_key: event
+    body_value: add_to_cart

@@ -228,5 +228,49 @@ class DocumentedCliSurfaceTests(unittest.TestCase):
         self.assertEqual(gaps, {}, f"documented flags the CLI does not accept: {gaps}")
 
 
+class PretestDocsTests(unittest.TestCase):
+    """tp-027: every `pretest` verb is documented in CAPABILITIES and walked
+    through in USAGE, and every pre-test error code is in the CAPABILITIES table."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.cli = load_cli()
+        cls.verbs = sorted(verb for verb in parser_surface(cls.cli.build_parser())
+                           if verb.startswith("pretest "))
+
+    def test_the_parser_has_the_pretest_verbs(self) -> None:
+        for verb in ("pretest start", "pretest check end", "pretest finding add",
+                     "pretest review", "pretest kit"):
+            self.assertIn(verb, self.verbs)
+
+    def test_every_pretest_verb_is_in_capabilities_and_usage(self) -> None:
+        documented = documented_surface()
+        usage = (ROOT / "docs/USAGE.md").read_text(encoding="utf-8")
+        for verb in self.verbs:
+            self.assertIn(verb, documented, f"'{verb}' is not in the CAPABILITIES CLI block")
+            self.assertTrue(f"autonom {verb}" in usage, f"docs/USAGE.md never shows '{verb}'")
+
+    def test_every_pretest_error_code_is_documented(self) -> None:
+        text = DOC.read_text(encoding="utf-8")
+        section = text.split("### Ticket pre-test (`autonom pretest`)", 1)
+        self.assertEqual(len(section), 2, "CAPABILITIES has no pre-test section")
+        errors = self.cli.errors
+        for name in ("NO_ACTIVE_PRETEST", "PRETEST_ALREADY_ACTIVE", "PRETEST_FINALIZED",
+                     "CHECK_ALREADY_OPEN", "NO_OPEN_CHECK", "UNKNOWN_CHECK",
+                     "INVALID_VERDICT", "UNKNOWN_FINDING", "INVALID_SEVERITY",
+                     "EVIDENCE_REF_UNKNOWN", "BUDGET_EXHAUSTED", "FORBIDDEN_ACTION",
+                     "APP_NOT_ALLOWED", "REVIEW_NEEDS_FINDING", "NOT_AUTOMATIC",
+                     "PROFILE_INVALID", "NOT_A_PRETEST_PACK", "DRAFT_UNAVAILABLE"):
+            code = getattr(errors, name)
+            self.assertIn(f"`{code}`", section[1].split("\n## ", 1)[0], code)
+
+    def test_plan_status_and_changelog(self) -> None:
+        plan = (ROOT / "docs/plans/PHASE_7_TICKET_PRETEST.md").read_text(encoding="utf-8")
+        self.assertIn("**Status:** implemented", plan)
+        changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        unreleased = changelog.split("## [Unreleased]", 1)[1].split("\n## [", 1)[0]
+        self.assertIn("autonom pretest", unreleased)
+
+
 if __name__ == "__main__":
     unittest.main()

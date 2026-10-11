@@ -61,6 +61,19 @@ Legend: ✅ shipped · ⚠️ partial · 🔜 planned · ❌ not planned for nea
 | Flow DSL: runFlow / tags / hooks execution | ✅ | ✅ | subflows inline with inherited appId, isolated `onFlowComplete`, `when:` conditions, tag-filtered directory suites, evidence policy |
 | Flow DSL: Session → Flow compiler | ✅ | ✅ | `flow create --from-session` — proven selectors reused, secrets become `${SECRET_n}`, coordinate taps refuse to compile |
 | PR Proof (local) | ✅ | ✅ | `proof --base` — covers-globs + pull-request tags select the suite; verdicts pass/fail/not_covered/blocked/inconclusive, never upgraded |
+| Ticket pre-test: record, context, baseline | ✅ | ✅ | `pretest start --ticket FILE\|- --base REF` — one active pre-test per session (`pretest_already_active`); the ticket is masked before it is written; `context.json` holds changed files with hunk ranges, renames, binaries, the `proof` flow selection and Runtime Map hints (`hint: true`, never coverage) — hunk `functions` only for code files (not Markdown, text, ARB, JSON, YAML and other data files) and never an import/package line; `baseline.json` records crashes, log cursor, captured-request count and one metrics snapshot, each `unavailable` with a reason when it cannot be read; `pretest status\|context\|stop\|list` |
+| Ticket pre-test: attribution | ✅ | ✅ | while a check is open every journal entry, note, screenshot, saved `ui tree` and action detail carries `pretest_id` and `check_id`, and the check id is the `task` when none was given; network flows and log lines are attributed by the check's time window at pack time; after each `network mock` change (and at `pretest start`) the mock registry is journaled as a `mock_state` entry (ids, URL globs, methods, hosts, statuses, enabled flags; never headers or bodies), so each step lists the mocks active at its time; without a pre-test nothing gains a key or entry |
+| Ticket pre-test: budgets and forbidden actions | ✅ | ⚠️ | `--max-actions` (300; a whole number ≥ 1) and `--max-minutes` (60; a finite number > 0 — NaN, inf, 0 and negatives are `invalid_value`) count `ui tap\|long-press\|double-tap\|swipe\|type\|key\|gesture`, `open`, app launch/stop/clear and each flow input step (`budget_exhausted`); a tap on text matching `--forbid-text` (default `buy\|pay\|purchase\|delete\|remove account\|купить\|оплатить\|удалить`) or at a point whose tree cannot be read is `forbidden_action`; an app outside `--allow-app` is `app_not_allowed` (an Android link no app has verified opens the system app chooser and is refused as such, `chooser: true`) — all before any input reaches the device. Every guarded point tap reads a fresh tree (no reuse between taps), so rapid repeat taps (a flow `tapOn` with `repeat`, a double tap by points) are slow during a pre-test — about one tree read (~2.5 s) per tap — and a race criterion passes only with an observed request count, else `inconclusive`. iOS `open` is counted but not checked against the allow list (iOS cannot say which app takes a URL); a flow `eraseText` counts each key press; the `ui tree` accessibility relaunch is exempt |
+| Ticket pre-test: checks and findings | ✅ | ✅ | `pretest check add\|begin\|end\|list` — one open check at a time, verdicts pass/fail/blocked/not_covered/inconclusive; `pretest finding add` with evidence refs (`shot:`, `tree:`, `action:`, `request:`, `log:`, `run:`, `crash:`) resolved at write time (`evidence_ref_unknown`); `pretest flows` runs the selected flows as `regression` checks (passed→pass, failed→fail, broken→blocked, all skipped→inconclusive) and prints a `flows` list of `{flow, check_id, run_id, status, verdict}`; `check end` of an ended check is always `no_open_check` (its verdict and note never change) |
+| Ticket pre-test: device health | ✅ | ✅ | `pretest health` (and `pack`) — new crashes, grouped app error logs (logcat E/F/A or iOS error/fault lines, plus app lines of any level whose message is a JSON or `key=value` record with `level` error/fatal/severe, and Flutter `FLUTTER_ERROR` / `══╡ EXCEPTION CAUGHT` markers), 5xx / unmocked 4xx / unfinished requests and metrics leads since the baseline, each an automatic finding (`origin: auto`, `severity: info`, `confirmed: false`) attributed to the check whose window holds it; automatic findings never change a verdict |
+| Ticket pre-test: pack and verify | ✅ | ✅ | `pretest pack [--out DIR]` — ends the pre-test (an open check becomes `inconclusive`), computes the ticket verdict, and writes `summary.json`, paste-ready `summary.md`, an offline `index.html`, content-addressed evidence and nested flow Bundles v2 through one atomic rename; re-packing is idempotent; screenshots taken while mocks were active are marked (`mocked: true`, `mocks_active` in `summary.json`, "(mocked data)" in `summary.md`, a "Mocked" tag in `index.html`); each check lists the requests captured in its window (method, host, path without the query, status, mocked, duration; at most 200 with `requests_truncated`; never headers or bodies) in `checks/<id>.json`, `summary.json`, `summary.md` and `index.html`; a finding's steps run from its check start to its latest evidence; `summary.md` gives each not covered, blocked or open check with its note; in `index.html` opened from disk the review commands carry the pack's real directory (shell-quoted; `<pack>` without JavaScript) and the verdict reason names the check title; `report verify <pack>` checks every digest including nested bundles; a packed pre-test refuses changes (`pretest_finalized`) |
+| Ticket pre-test: QA review and kit | ✅ | ✅ | `pretest review <pack> approve\|more-checks\|return-to-dev` writes an annotation outside the integrity set (`report verify` stays ok); `return-to-dev` needs `--finding` (`review_needs_finding`), `--confirm`/`--dismiss` take automatic findings only (`not_automatic`); `more-checks --check TITLE` starts a linked child pre-test with the parent's ticket and diff context, but with the reviewer's own rules: `--app-id`, `--max-actions`, `--max-minutes`, `--forbid-text` and `--allow-app` on the review, else this session's app and the defaults, never the pack's (the child's `app_id` and `budget` are in the output); `pretest review-status <pack>`; `pretest kit` lists the 18 edge cases and, with an active pre-test, their coverage |
+| Ticket pre-test: regression drafts, repro and rerun | ✅ | ✅ | `pretest flow-draft <finding-id> [--pack PATH] [--out PATH]` compiles the journal range of the finding's check (Session→Flow compiler) into `<repo>/.autonom/flows/drafts/<ticket-slug>-<finding-id>.yaml` with the `draft` tag, `properties.covers` set to the changed files and a closing assertion from that check's own last `ui find`; the file must pass `flow check`, is never overwritten with other content, and its path is recorded on the finding (with `--pack` nothing is recorded); `pretest repro <finding-id> --times N` (1–10) replays the draft and records `reproduced: k/N`, `stability` (`stable`/`intermittent`/`not_reproduced`) and the run ids — N is always the `--times` value: a failed run (test failure) reproduces the finding, a passed run does not, and the first run with no verdict (broken, skipped, aborted or refused by a guard) stops repro, records nothing and returns its cause; the finding always stays; on a pack it is refused (`pretest_finalized`); `pretest rerun <pack> [--check ID]...` starts a linked child pre-test (`kind: rerun`) with this session's rules, runs each chosen check's flow or draft, and the child's pack shows `before`/`after` per check while the parent pack is only read |
+| Ticket pre-test: app profile | ✅ | ✅ | one read order: the workspace's `.autonom/apps/<app-id>/profile.yaml`, else `$AUTONOM_HOME/apps/<app-id>/profile.yaml` (`~/.autonom` by default); `pretest context` reports the profile used (`profile.path`, `profile.source`) or `null`; keys `login_flow`, `warmup_flow`, `accounts` (names → environment variable names only, each starting with `AUTONOM_` or `PRETEST_`; warm-up reads no other variable), `fixtures`, `flaky_screens`, `events`; parsed with the flow files' YAML subset; a credential-shaped value or a secret-named field holding a value refuses the profile (`profile_invalid`, naming the key path, never the value), and `pretest start` then creates nothing (schema `schemas/pretest-profile-v1.schema.json`) |
+| Ticket pre-test: warm-up | ✅ | ✅ | `pretest warmup` runs the profile's `login_flow`, then `warmup_flow` (the account variables that are set go to the runs as secrets), updates the Runtime Map from the session like `atlas update`, and reports each Runtime Map screen hint `reached` (replaying recorded selector-tap transitions along the shortest known path), `unreplayable` (a path holds a swipe, key, coordinate tap or relational selector), `known` (in the map, not reached, with a `reason`) or `unknown` (not in the map); no exploration beyond recorded transitions; flow steps and replayed taps count against the budget; refused while a check is open (`check_already_open`) |
+| Ticket pre-test: accessibility check | ✅ | ✅ | `pretest a11y [--check ID]` reads the current tree once, saves it under `trees/`, and writes an automatic finding (`source: a11y`, `severity: minor`, `confirmed: false`, bounds in the text and `data`, the saved tree as `tree:` evidence) per unlabelled control, control smaller than 48×48 dp with a 0.5 dp rounding tolerance (Android, density from `wm density` or `ro.sf.lcd_density`; skipped with `density_unknown` when neither answers) or 44×44 pt (iOS), and group of controls sharing one label; once per check, screen and problem; read-only (never counted) |
+| Ticket pre-test: analytics event check | ✅ | ✅ | `pretest events [--check ID]` matches the profile's `events` rules (method, host or host glob, path glob without the query, optional `body_key` — dotted for nested JSON, or a form field — and `body_value`) against the captured requests in the check's window (the open check's, else the whole pre-test's) and reports `matched` (with request ids), `missing` and `unexpected` (requests to a rule's endpoint that match no rule, with body key names only); each missing rule is an automatic finding (`source: analytics`, `severity: minor`); body values are never copied anywhere; without captured traffic the result is `state: unavailable` and no finding is written |
+| Ticket pre-test: agent skill | ✅ | ✅ | the `ticket-pretest` skill — the agent's playbook (read the ticket and `pretest context`; plan checks before touching the device: acceptance points, then kit edge cases, then regression flows; begin/end each check; findings with expected vs actual and evidence refs; facts apart from guesses; pack; the verdict stated plainly), the QA review, drafts, repro and rerun, profile, warm-up, a11y and events, and the 18-case edge-case kit with setup verbs and platform limits (`references/edge-case-kit.md`, mirroring `pretest/kit.py`); registered in the `autonom` map and `project-router` |
 | Atlas-lite: observed screens/transitions graph | ✅ | ✅ | `atlas update|show|coverage|paths|export|diff`; fingerprints ride in run events; observed-only, unknown stays unknown |
 | Evidence: step debugger + HTML/JUnit reports | ✅ | ✅ | manifest v3; addressable screenshots, hierarchy diff, logs, scrubbed requests; `report build|open|export|suite|serve`; loopback replay controls; JUnit for CI |
 | Flow DSL: Maestro Core Profile import/export | ✅ | ✅ | `flow import`/`flow export --format maestro`; a timed `assertVisible`/`assertNotVisible` exports as `extendedWaitUntil`, a timed tap as `extendedWaitUntil` then the tap, `waitForSettled` as `waitForAnimationToEnd` (and back on import); outside-profile constructs refuse with `unsupported_flow_command` |
@@ -154,7 +167,7 @@ autonom ui wait --settled [--timeout-ms N] [--quiet-ms N]
 autonom ui find [--text|--desc|--resource-id|--class-name|--package|--role] [--mode exact|contains|regex]
                 [--case-sensitive] [--index N] [--clickable B] [--enabled B] [--all] [--dump FILE]
 autonom ui tap [selector flags] | [--x X --y Y] [--duration MS]
-autonom ui swipe --from X,Y --to X,Y [--duration S]
+autonom ui swipe --from X,Y --to X,Y [--duration S]   # seconds (0.3 default), > 60 is invalid_value
 autonom ui pinch --at X,Y [--scale F] | ui rotate | ui shake   # refused on both platforms
 autonom ui type <text> [--sensitive]
 autonom ui key <keycode>
@@ -178,6 +191,30 @@ autonom app-skill promote <app-id> <flow> [--approval FILE] [--workspace DIR]
 
 autonom proof --base <REF> [--head REF] [--repo PATH] [--flows DIR] [--out DIR]
               [--env KEY=VALUE] [--secret NAME]
+
+autonom pretest start --ticket FILE|- --base REF [--head REF] [--repo PATH] [--flows DIR]
+                      [--title TEXT] [--ticket-ref KEY] [--app-id ID] [--max-actions N]
+                      [--max-minutes N] [--forbid-text PATTERN]... [--allow-app ID]...
+autonom pretest status|context|stop|health|list
+autonom pretest check add <title> --kind KIND [--case KIT-ID] [--why TEXT] [--flow PATH]
+autonom pretest check begin <check-id> | end <check-id> --verdict V [--note TEXT] | list
+autonom pretest flows [--env KEY=VALUE]... [--secret NAME]...
+autonom pretest finding add --check ID --severity S --title T --actual T [--expected T]
+                            [--evidence REF]...
+autonom pretest finding list
+autonom pretest pack [--out DIR]
+autonom pretest review <pack> <approve|more-checks|return-to-dev> [--note T] [--check TITLE]...
+                       [--finding ID]... [--confirm ID]... [--dismiss ID]... [--author NAME]
+                       [--app-id ID] [--max-actions N] [--max-minutes N]
+                       [--forbid-text PATTERN]... [--allow-app ID]...
+autonom pretest review-status <pack>
+autonom pretest kit
+autonom pretest flow-draft <finding-id> [--pack PATH] [--out PATH]
+autonom pretest repro <finding-id> --times N [--pack PATH] [--env KEY=VALUE]... [--secret NAME]...
+autonom pretest rerun <pack> [--check ID]... [--env KEY=VALUE]... [--secret NAME]...
+autonom pretest warmup [--env KEY=VALUE]... [--secret NAME]...
+autonom pretest a11y [--check ID]
+autonom pretest events [--check ID]
 
 autonom atlas update [--session ID] [--app-id ID]
 autonom atlas show [--app-id ID]
@@ -301,6 +338,57 @@ A malformed regular expression is `invalid_value` and an output path that
 cannot be written (`--out`, `--har`) is `output_not_writable`, both exit 2 and
 both checked before the device is touched. A usage error's `hint` is the usage
 of the verb that rejected the flag.
+
+### Ticket pre-test (`autonom pretest`)
+
+A pre-test lives inside the current session (`no_active_session` without
+one) under `<session>/pretests/<pretest-id>/`, owner-only. `--kind` is
+`ticket|edge|regression|network|a11y|analytics`; `--verdict` is
+`pass|fail|blocked|not_covered|inconclusive`; `--severity` is
+`blocker|major|minor|info`; `--case` is an id from `pretest kit`.
+`--forbid-text` replaces the default list; `--allow-app` defaults to the
+session's app. `--ticket -` reads the ticket from stdin (at most 1 MiB).
+`pretest pack` without an active pre-test packs the session's newest one
+(a stopped one is packed, a packed one is returned unchanged). The `pretest`
+verbs are journaled but never count against the budget; the flow steps that
+`pretest flows`, `pretest repro` and `pretest rerun` run do. `repro`
+refuses while a check is open (`check_already_open`), `rerun` while another
+pre-test is active (`pretest_already_active`), and `flow-draft` refuses to
+overwrite a file with other content (`output_not_writable`). `warmup` runs
+only with no check open (`check_already_open`) and refuses a profile flow
+that does not exist (`flow_file_not_found`) before touching the device;
+`a11y` and `events` take `--check` for any check of the pre-test
+(`unknown_check`), and `events` needs the check to have begun and a profile
+with `events` rules (`invalid_value` otherwise). Error codes:
+
+| `error_code` | When |
+| --- | --- |
+| `no_active_pretest` | a pre-test verb with no active pre-test in the session |
+| `pretest_already_active` | `start` (or `review … more-checks`) while another pre-test is active |
+| `pretest_finalized` | a change to a packed pre-test, `pack --out` to a second place, or `repro --pack` (a pack is final; use `rerun`) |
+| `check_already_open` | `check begin` (or `flows`) while another check is open (`open_check_id`) |
+| `no_open_check` | `check end` for a check that is not open, including one already ended (same verdict or not; record more in a finding) |
+| `unknown_check` | a check id the pre-test does not hold |
+| `invalid_verdict` | a `--verdict` outside the five verdicts |
+| `invalid_severity` | a `--severity` outside the four severities |
+| `unknown_finding` | a finding id the pack does not hold |
+| `evidence_ref_unknown` | an `--evidence` ref that names no artifact of the session (nothing written) |
+| `budget_exhausted` | the action or minute budget is used up; no input was sent |
+| `forbidden_action` | the tap target matches `--forbid-text`, or the screen cannot be read; no input was sent |
+| `app_not_allowed` | `open`, launch, stop or clear of an app outside the allow list, or an Android `open` that would show the system app chooser (`chooser: true`) |
+| `review_needs_finding` | `review … return-to-dev` without `--finding` |
+| `not_automatic` | `--confirm`/`--dismiss` of a finding an agent wrote |
+| `not_a_pretest_pack` | `review`/`review-status` on a directory that is not a pre-test pack |
+| `report_integrity_failed` | `report verify` (or a review) of a pack with a changed, missing or unlisted file |
+| `draft_unavailable` | `flow-draft` of a finding without a check, of a check that never began or has no replayable action, or whose session journal is not on this machine; `repro` of a finding without a draft; `rerun` of a check (or a pack) with no flow or draft on this machine — nothing is written |
+| `profile_invalid` | an app profile that cannot be read, does not parse, has unknown keys, an `accounts` value that is not a variable name starting with `AUTONOM_` or `PRETEST_`, or a credential-shaped value (`failures` lists key paths, never values); refuses `start`, `warmup` and `events` |
+
+Also used: `invalid_value` (an empty or missing ticket, a bad `--max-actions`,
+`--max-minutes`, `--forbid-text` pattern, `--kind` or `--case`, `more-checks`
+without `--check`, a child-rule flag such as `--max-actions` on `approve` or
+`return-to-dev`, `events` without profile `events` rules, or `events --check`
+of a check that never began) and `flow_file_not_found` (`check add --flow` to
+a missing file, or a profile's `login_flow`/`warmup_flow` that does not exist).
 
 ## Environment overrides
 

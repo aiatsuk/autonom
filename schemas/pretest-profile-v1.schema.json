@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autonom.dev/schemas/pretest-profile-v1.schema.json",
+  "title": "Autonom App Profile v1",
+  "description": "The document in .autonom/apps/<app-id>/profile.yaml (workspace, read first) or $AUTONOM_HOME/apps/<app-id>/profile.yaml (home), written in the flow files' YAML subset, so every value is a string. A profile never holds a secret: secret-named fields and accounts hold environment variable NAMES only, and any credential-shaped value is refused with profile_invalid. Flow paths are relative to the profile's folder.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema": {"const": "autonom.pretest-profile/v1"},
+    "login_flow": {"type": "string", "minLength": 1,
+                   "description": "Flow v1 file run first by 'pretest warmup'."},
+    "warmup_flow": {"type": "string", "minLength": 1,
+                    "description": "Flow v1 file run after login_flow passed."},
+    "accounts": {
+      "type": "object",
+      "description": "Account name -> one environment variable name, or field -> variable name. 'pretest warmup' hands the variables that are set to the flows as secrets.",
+      "additionalProperties": {
+        "oneOf": [
+          {"$ref": "#/$defs/env_name"},
+          {"type": "object", "minProperties": 1,
+           "additionalProperties": {"$ref": "#/$defs/env_name"}}
+        ]
+      }
+    },
+    "fixtures": {
+      "description": "Free-form test data (no secrets): a mapping or a list of strings, lists and mappings.",
+      "type": ["object", "array"]
+    },
+    "flaky_screens": {
+      "type": "array", "maxItems": 200,
+      "items": {"type": "string", "minLength": 1},
+      "description": "Screen ids or labels known to be flaky."
+    },
+    "events": {
+      "type": "array", "maxItems": 100,
+      "items": {"$ref": "#/$defs/event_rule"},
+      "description": "Analytics rules matched by 'pretest events'; names are unique."
+    }
+  },
+  "$defs": {
+    "env_name": {"type": "string", "pattern": "^(?:AUTONOM|PRETEST)_[A-Z0-9_]+$",
+                 "description": "An environment variable name starting with AUTONOM_ or PRETEST_; warm-up reads no other variable."},
+    "event_rule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name"],
+      "anyOf": [{"required": ["method"]}, {"required": ["host"]}, {"required": ["path"]}],
+      "dependentRequired": {"body_value": ["body_key"]},
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "method": {"type": "string", "pattern": "^[A-Za-z]{1,16}$",
+                   "description": "HTTP method, any letter case."},
+        "host": {"type": "string", "minLength": 1,
+                 "description": "Exact host or a glob such as *.example.com, any letter case."},
+        "path": {"type": "string", "minLength": 1,
+                 "description": "Glob over the request path without its query."},
+        "body_key": {"type": "string", "pattern": "^[^.\\s]+(\\.[^.\\s]+)*$",
+                     "description": "Top-level JSON key, dotted path into nested JSON, or a form field."},
+        "body_value": {"type": "string",
+                       "description": "The value at body_key, compared as text (JSON true is \"true\")."}
+      }
+    }
+  }
+}

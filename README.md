@@ -25,7 +25,11 @@ Teach recording and approved App Skills, addressable per-step evidence reports
 (HTML/JUnit/Allure/agent/CSV/metrics), portable integrity-checked Report Bundle
 v2, baseline replay/checkpoints, supervised CI campaigns, Mobile Canvas, an
 observed Runtime Map, local PR proof
-(`autonom proof --base`), live session watch (`session outputs`,
+(`autonom proof --base`), a **ticket pre-test** (`autonom pretest`: one ticket
+and its diff checked on the device under an action budget and forbidden-tap
+rules, with checks, findings, device-health deltas, an integrity-checked pack
+with `summary.md` and an offline `index.html`, and a local QA review loop),
+live session watch (`session outputs`,
 `logs follow`, `network requests follow`), and an `autonom metrics` family
 (memory, CPU, frames, traces), and deterministic capture state — a pinned
 status bar on both platforms, a pinned keyboard/locale on iOS, and system
@@ -78,6 +82,15 @@ autonom location get                        # current position (Android)
 autonom crash list
 autonom open "myapp://order/42"
 
+# Pre-test one ticket and its diff, then hand QA a verified pack
+autonom pretest start --ticket ticket.md --base main --ticket-ref WB-7
+autonom pretest check add "Results appear after a search" --kind ticket
+autonom pretest check begin chk-1           # evidence from here on is filed under chk-1
+autonom pretest check end chk-1 --verdict pass
+autonom pretest flows                       # the selected regression flows, one check each
+autonom pretest pack                        # summary.md + index.html; `report verify` checks it
+autonom pretest review <pack> approve       # QA: approve | more-checks | return-to-dev
+
 # Everything above is journaled; add a note, read the run back, then stop
 autonom note add "login works; the 500 retry path is missing"
 autonom journal
@@ -112,6 +125,7 @@ See `docs/CAPABILITIES.md` for the full shipped vs planned matrix.
 - `mobile-network` — consent-gated HTTP(S) capture, mocking, HAR export
 - `mobile-flow` — repeatable Flow v1 files: strict YAML, exact selectors, polling assertions, failure classes
 - `mobile-memory` — per-app knowledge and flow runbooks under `~/.autonom/apps/`
+- `ticket-pretest` — pre-test one ticket and its diff on a device before QA: plan checks, the 18-case edge-case kit, findings with evidence, pack, honest verdict
 
 ### Flutter
 
@@ -239,6 +253,7 @@ benchmark. Use a physical device plus native profilers for frame-rate review.
 - `docs/FLOW.md` — Flow v1: the strict flow language, runner, recording, reports, atlas, proof
 - `docs/plans/PHASE_0_RELEASE_ENGINEERING.md` — shipped: test isolation, CI, tagged releases
 - `docs/plans/PHASE_4_METRICS.md` — shipped as 0.27.x: live session watch + metrics/memory/CPU/traces
+- `docs/plans/PHASE_7_TICKET_PRETEST.md` — implemented, unreleased: the ticket pre-test (`autonom pretest`)
 - `docs/USAGE.md` — ready-to-use prompts and workflows
 - `CHANGELOG.md` — release history
 - `SECURITY.md` — the enforced security model (MITM, consent, redaction)

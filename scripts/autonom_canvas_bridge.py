@@ -16,16 +16,25 @@ It then sends one `record` per completed action, which only journals and
 never actuates.  Text on idb still comes here as a `text` operation.  Display
 size changes (`wm size`/`wm density`) follow the record path on every Android
 transport: Canvas runs them on its own serial, then sends one `display` record.
+
+While a pre-test is active on this target, input with the `human` origin runs
+inside `pretest.guard.exempt()`: a QA person's own taps are journaled (with the
+pre-test and open check ids) but never counted against the budget or refused.
+Input of every other origin goes through the same guard as the CLI's verbs and
+can be refused (`budget_exhausted`, `forbidden_action`); a refusal is journaled
+with its code and nothing reaches the device. A `record` only journals input
+Canvas already streamed, so it is never counted or refused.
 """
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import math
 import re
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, ContextManager
 
 ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
@@ -33,6 +42,7 @@ if str(ROOT) not in sys.path:
 
 from autonom_lib import actions, errors, ios_idb, journal, session, ui  # noqa: E402
 from autonom_lib.platform import ANDROID, IOS, Target  # noqa: E402
+from autonom_lib.pretest import guard  # noqa: E402
 
 ORIGINS = ("human", "agent", "replay", "system")
 # The page's buttons that iOS has a hardware button for.
@@ -63,6 +73,10 @@ MAX_PIXEL = 100_000
 MAX_SCROLL = 1_000_000.0
 # Control messages are at most 64 KiB, so no single text entry can be longer.
 MAX_TEXT = 64 * 1024
+# The operations that send input to the device.
+INPUT_OPS = ("tap", "swipe", "key", "text")
+# The pre-test guard's refusals: journaled with their code (tp-006).
+GUARD_REFUSALS = (errors.BUDGET_EXHAUSTED, errors.FORBIDDEN_ACTION, errors.APP_NOT_ALLOWED)
 
 
 def parser() -> argparse.ArgumentParser:
@@ -252,6 +266,65 @@ def journal_session(target: Target) -> dict[str, Any] | None:
     return record
 
 
+def input_scope(origin: str) -> ContextManager[Any]:
+    """Human input is the QA person's own: exempt from the pre-test guard (never
+    counted, never refused). Every other origin goes through the guard that the
+    shared `ui` functions run, exactly like the CLI's verbs."""
+    return guard.exempt() if origin == "human" else contextlib.nullcontext()
+
+
+def _actuate(target: Target, record: dict[str, Any] | None, operation: str,
+             payload: dict[str, Any], origin: str,
+             detail_payload: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    """Send one input to the device. Returns the result and whether it is
+    final (already journaled, as an iOS paste is)."""
+    if operation == "tap":
+        x, y = int(payload["x"]), int(payload["y"])
+        ui.tap(target, x, y)
+        detail_payload.update({"coordinate": True, "x": x, "y": y})
+        return {"ok": True, "x": x, "y": y}, False
+    if operation == "swipe":
+        x1, y1 = int(payload["x1"]), int(payload["y1"])
+        x2, y2 = int(payload["x2"]), int(payload["y2"])
+        duration_ms = max(1, min(5000, int(payload.get("duration", 250))))
+        ui.swipe(target, x1, y1, x2, y2, duration_ms / 1000)
+        detail_payload.update({"from": [x1, y1], "to": [x2, y2],
+                               "duration_ms": duration_ms})
+        return {"ok": True, "x1": x1, "y1": y1,
+                "x2": x2, "y2": y2, "duration": duration_ms}, False
+    if operation == "key":
+        key = str(payload["key"])
+        if target.platform == IOS:
+            # The page's Home and Power buttons send Android names; iOS has buttons.
+            key = IOS_BUTTON_FOR_KEY.get(key, key)
+        if target.platform == IOS and key in IOS_IDB_ONLY_BUTTONS:
+            # `ui.press_key` (which guards itself) does not take these buttons:
+            # the same guard runs here before idb is asked.
+            guard.before_mutation("key", target=target)
+            ios_idb.button(target, key)
+        else:
+            ui.press_key(target, key)
+        detail_payload["key"] = key
+        return {"ok": True, "key": key}, False
+    # text
+    text = str(payload.get("text", ""))
+    sensitive = bool(payload.get("sensitive", False))
+    ui.type_text(target, text)
+    if payload.get("paste") is True and payload.get("transport") in RECORD_TRANSPORTS:
+        # An iOS paste Canvas also typed: journaled as the paste it is, with its
+        # length only, never the clipboard text.
+        return record_completed(record, origin, {
+            "kind": "paste", "transport": payload["transport"], "text_len": len(text)}), True
+    detail_payload.update({"sensitive": sensitive,
+                           "text": None if sensitive else text,
+                           "text_len": len(text)})
+    # Text typed from the idb transport's control socket says so; any other
+    # value is dropped rather than copied into the journal.
+    if payload.get("transport") in RECORD_TRANSPORTS:
+        detail_payload["transport"] = payload["transport"]
+    return {"ok": True, "typed": f"<{len(text)} chars>"}, False
+
+
 def dispatch(target: Target, message: dict[str, Any]) -> dict[str, Any]:
     operation = message.get("op")
     payload = message.get("payload") or {}
@@ -262,57 +335,30 @@ def dispatch(target: Target, message: dict[str, Any]) -> dict[str, Any]:
     record = journal_session(target)
     if operation == "record":
         return record_completed(record, origin, payload)
-    detail_payload = {"kind": operation, "origin": origin,
-                      "canvas": True}
     if operation == "screen-size":
         size = ui.screen_size(target)
         return {"ok": True, "display": (
             {"width": size[0], "height": size[1]} if size else None)}
-    if operation == "tap":
-        x, y = int(payload["x"]), int(payload["y"])
-        ui.tap(target, x, y)
-        detail_payload.update({"coordinate": True, "x": x, "y": y})
-        result = {"ok": True, "x": x, "y": y}
-    elif operation == "swipe":
-        x1, y1 = int(payload["x1"]), int(payload["y1"])
-        x2, y2 = int(payload["x2"]), int(payload["y2"])
-        duration_ms = max(1, min(5000, int(payload.get("duration", 250))))
-        ui.swipe(target, x1, y1, x2, y2, duration_ms / 1000)
-        detail_payload.update({"from": [x1, y1], "to": [x2, y2],
-                               "duration_ms": duration_ms})
-        result = {"ok": True, "x1": x1, "y1": y1,
-                  "x2": x2, "y2": y2, "duration": duration_ms}
-    elif operation == "key":
-        key = str(payload["key"])
-        if target.platform == IOS:
-            # The page's Home and Power buttons send Android names; iOS has buttons.
-            key = IOS_BUTTON_FOR_KEY.get(key, key)
-        if target.platform == IOS and key in IOS_IDB_ONLY_BUTTONS:
-            ios_idb.button(target, key)
-        else:
-            ui.press_key(target, key)
-        detail_payload["key"] = key
-        result = {"ok": True, "key": key}
-    elif operation == "text":
-        text = str(payload.get("text", ""))
-        sensitive = bool(payload.get("sensitive", False))
-        ui.type_text(target, text)
-        if payload.get("paste") is True and payload.get("transport") in RECORD_TRANSPORTS:
-            # An iOS paste Canvas also typed: journaled as the paste it is, with its
-            # length only, never the clipboard text.
-            return record_completed(record, origin, {
-                "kind": "paste", "transport": payload["transport"], "text_len": len(text)})
-        detail_payload.update({"sensitive": sensitive,
-                               "text": None if sensitive else text,
-                               "text_len": len(text)})
-        # Text typed from the idb transport's control socket says so; any other
-        # value is dropped rather than copied into the journal.
-        if payload.get("transport") in RECORD_TRANSPORTS:
-            detail_payload["transport"] = payload["transport"]
-        result = {"ok": True, "typed": f"<{len(text)} chars>"}
-    else:
+    if operation not in INPUT_OPS:
         raise errors.AutonomError(errors.FLOW_COMMAND_INVALID,
                                   f"unsupported Canvas operation {operation!r}")
+    detail_payload = {"kind": operation, "origin": origin,
+                      "canvas": True}
+    try:
+        with input_scope(origin):
+            result, final = _actuate(target, record, operation, payload, origin,
+                                     detail_payload)
+    except errors.AutonomError as exc:
+        if exc.code in GUARD_REFUSALS:
+            # Only an active pre-test refuses with these codes: the refused
+            # input is journaled with its code (tp-006); nothing reached the device.
+            journal.record_action(
+                record, verb=f"ui {operation}", argv=["ui", str(operation), "<canvas>"],
+                payload=None, ok=False, error_code=exc.code, origin=origin,
+            )
+        raise
+    if final:
+        return result
     detail = actions.record_detail(record, f"canvas-{operation}", detail_payload)
     if detail:
         result["detail"] = detail

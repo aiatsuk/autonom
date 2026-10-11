@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autonom.dev/schemas/pretest-check-v1.schema.json",
+  "title": "Autonom Ticket Pre-test Check Event v1",
+  "description": "One line of pretests/<pretest_id>/checks.ndjson. $defs.state is the folded state per check that status, pack and summary read.",
+  "type": "object",
+  "required": ["event", "check_id", "ts", "journal_seq"],
+  "properties": {
+    "event": {"enum": ["add", "begin", "end"]},
+    "check_id": {"type": "string", "pattern": "^chk-[1-9][0-9]*$"},
+    "ts": {"type": "string", "minLength": 1},
+    "journal_seq": {"type": "integer", "minimum": 0}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"event": {"const": "add"}}},
+      "then": {
+        "required": ["title", "kind", "case", "why", "flow"],
+        "properties": {
+          "title": {"type": "string", "minLength": 1},
+          "kind": {"$ref": "#/$defs/kind"},
+          "case": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/kit_id"}]},
+          "why": {"type": ["string", "null"]},
+          "flow": {"type": ["string", "null"]}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"event": {"const": "end"}}},
+      "then": {
+        "required": ["verdict", "note", "run_id"],
+        "properties": {
+          "verdict": {"$ref": "#/$defs/verdict"},
+          "note": {"type": ["string", "null"]},
+          "run_id": {"type": ["string", "null"]}
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "kind": {"enum": ["ticket", "edge", "regression", "network", "a11y", "analytics"]},
+    "verdict": {"enum": ["pass", "fail", "blocked", "not_covered", "inconclusive"]},
+    "kit_id": {"enum": ["offline", "slow", "server-error", "timeout", "background-resume",
+                        "process-death", "rotation", "dark-mode", "large-text", "locale",
+                        "permission-denied", "empty-input", "long-input", "emoji-input",
+                        "rtl-input", "double-tap", "fast-back", "deep-link"]},
+    "state": {
+      "type": "object",
+      "required": ["check_id", "title", "kind", "case", "why", "flow", "state", "verdict",
+                   "note", "run_ids", "began_at", "ended_at", "duration_s", "seq_from", "seq_to"],
+      "properties": {
+        "check_id": {"type": "string", "pattern": "^chk-[1-9][0-9]*$"},
+        "title": {"type": "string"},
+        "kind": {"$ref": "#/$defs/kind"},
+        "case": {"type": ["string", "null"]},
+        "why": {"type": ["string", "null"]},
+        "flow": {"type": ["string", "null"]},
+        "state": {"enum": ["added", "open", "ended"]},
+        "verdict": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/verdict"}]},
+        "note": {"type": ["string", "null"]},
+        "run_ids": {"type": "array", "items": {"type": "string"}},
+        "added_at": {"type": "string"},
+        "began_at": {"type": ["string", "null"]},
+        "ended_at": {"type": ["string", "null"]},
+        "duration_s": {"type": ["number", "null"]},
+        "seq_from": {"type": ["integer", "null"]},
+        "seq_to": {"type": ["integer", "null"]}
+      }
+    }
+  }
+}

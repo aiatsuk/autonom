@@ -7,6 +7,108 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
 
 ## [Unreleased]
 
+### Added
+- **Ticket pre-test (`autonom pretest`, plan `docs/plans/PHASE_7_TICKET_PRETEST.md`).**
+  `pretest start --ticket FILE|- --base REF` starts one pre-test per session
+  with the masked ticket, the diff context (hunk ranges, renames, binaries,
+  the selected flows, Runtime Map hints) and a device baseline;
+  `pretest status|context|stop|list` read and close it. While a check is open
+  (`pretest check add|begin|end|list`) every journal entry, note, screenshot,
+  saved `ui tree` and action detail carries `pretest_id` and `check_id`.
+  `pretest finding add|list` records findings with evidence refs checked at
+  write time; `pretest flows` runs the selected flows as regression checks;
+  `pretest health` reports new crashes, grouped error logs, failed requests
+  and metrics leads as automatic findings; `pretest pack` writes an
+  integrity-checked pack with `summary.json`, a paste-ready `summary.md` and an
+  offline `index.html`, and `report verify` checks it, nested flow bundles
+  included. `pretest review <pack> approve|more-checks|return-to-dev` records a
+  QA decision outside the integrity set (`more-checks` starts a linked child
+  pre-test with the pack's context but the reviewer's own app, budget,
+  forbidden text and allowed apps, never the pack's), `pretest review-status` reads it back, and `pretest kit` lists the
+  18 edge cases. New error codes: `no_active_pretest`,
+  `pretest_already_active`, `pretest_finalized`, `check_already_open`,
+  `no_open_check`, `unknown_check`, `invalid_verdict`, `unknown_finding`,
+  `invalid_severity`, `evidence_ref_unknown`, `budget_exhausted`,
+  `forbidden_action`, `app_not_allowed`, `review_needs_finding`,
+  `not_automatic`, `profile_invalid`, `not_a_pretest_pack`, `draft_unavailable`.
+- **Regression drafts, reproducibility and reruns (`autonom pretest`).**
+  `pretest flow-draft <finding-id>` compiles the finding's check into a draft
+  flow under `.autonom/flows/drafts/` (tag `draft`, `properties.covers` set to
+  the changed files, validated by `flow check`, recorded on the finding;
+  `--pack` drafts from a pack without changing it). `pretest repro <finding-id>
+  --times N` replays the draft 1 to 10 times and records `reproduced: k/N`,
+  `stability` and the run ids on the finding (refused on a pack with
+  `pretest_finalized`); N is always the number asked for, so a run with no
+  verdict (broken, aborted, refused by a guard) stops repro and records
+  nothing. `pretest rerun <pack> [--check ID]...` starts a linked
+  child pre-test that runs the chosen checks' flows and drafts on the current
+  build; its pack shows each check before and after, and the parent pack is
+  never changed. `draft_unavailable` names a finding or check with nothing to
+  replay.
+- **Budgets and forbidden actions while a pre-test is active.** Mutating
+  verbs, the Android `open` included, and each flow input step count against
+  `--max-actions`/`--max-minutes`; taps on text matching `--forbid-text` and
+  apps outside `--allow-app` are refused before any input reaches the device.
+  The `ui tree` accessibility recovery relaunch is never counted or refused.
+  Without an active pre-test nothing changes.
+- **App profile, warm-up, accessibility and analytics checks (`autonom pretest`).**
+  The app profile is read from the workspace's
+  `.autonom/apps/<app-id>/profile.yaml`, else from
+  `~/.autonom/apps/<app-id>/profile.yaml`, and `pretest context` reports the
+  one used; it names a login and a warm-up flow, test accounts by environment
+  variable name only, fixtures, flaky screens and analytics event rules, and a
+  credential-shaped value refuses it (`profile_invalid`, schema
+  `schemas/pretest-profile-v1.schema.json`). `pretest warmup` runs the login and
+  warm-up flows, updates the Runtime Map and reports each screen hint as
+  `reached` (recorded selector taps replayed), `unreplayable`, `known` or
+  `unknown`. `pretest a11y [--check ID]` writes automatic findings for
+  unlabelled controls, tap targets under 48 dp (Android) or 44 pt (iOS) and
+  duplicate labels, with node bounds and the saved tree as evidence.
+  `pretest events [--check ID]` matches the profile's event rules against the
+  captured requests of the check window, reports matched (with request ids),
+  missing and unexpected events, writes a finding per missing event, and never
+  copies a request body value.
+- **Pre-test packs show what the device saw.** Each check lists the requests
+  captured in its window (method, host, path without the query, status,
+  mocked, duration; at most 200, `requests_truncated` counts the rest; never
+  headers or bodies) in `checks/<id>.json`, `summary.json`, `summary.md` and
+  `index.html`. Screenshots taken while mocks were active are marked
+  (`mocked: true`, `mocks_active`; "(mocked data)"; a "Mocked" tag). Each
+  step lists only the mocks active at its time, with their current status:
+  while a pre-test is active every `network mock` change (and `pretest start`)
+  journals the registry as a `mock_state` entry. A finding's steps run from its
+  check start to its latest evidence. `summary.md` gives each not covered,
+  blocked or open check with its note. `index.html` opened from disk shows the
+  review commands with the pack's real, shell-quoted directory, and the
+  verdict reason names the check title. `pretest flows` prints a `flows` list
+  (`flow`, `check_id`, `run_id`, `status`, `verdict`).
+
+### Changed
+
+- `pretest health` also counts app error records logged at any level (JSON or
+  `key=value` `level` error/fatal/severe) and Flutter `FLUTTER_ERROR` /
+  `══╡ EXCEPTION CAUGHT` markers as error log groups.
+- `pretest check end` of an ended check is always refused with
+  `no_open_check`, also with the same verdict (it used to return ok and drop
+  the new note).
+- `pretest context` keeps hunk-header `functions` for code files only, never
+  an import or package line.
+- `pretest a11y` allows 0.5 dp (or pt) for rounding: a 47.6 dp target is not
+  flagged.
+- An Android `open` that would show the system app chooser (a link no app has
+  verified) is refused as such (`chooser: true`), not as app "android".
+- Every guarded point tap during a pre-test reads a fresh UI tree (nothing is
+  reused between taps, so a screen change cannot let a forbidden control
+  through); rapid repeat taps are slow during a pre-test (one tree read each).
+- `pretest start` and `pretest review ... more-checks` refuse `--max-minutes`
+  and `--max-actions` values that are not finite positive numbers (NaN, inf, 0,
+  negatives, text) with `invalid_value` and a hint.
+- An app profile's `accounts` may only name environment variables starting
+  with `AUTONOM_` or `PRETEST_`; any other name is `profile_invalid`, and
+  warm-up never reads other variables.
+- `ui swipe --duration` is documented as seconds and refuses values over 60
+  (`invalid_value`, "seconds, e.g. 0.4").
+
 ## [0.35.1] - 2026-10-10
 
 ### Fixed

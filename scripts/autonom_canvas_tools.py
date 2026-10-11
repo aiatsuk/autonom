@@ -33,6 +33,14 @@ are ops of this process too (`ACTION_*_OPS`). Captures go to the captures store
 At most one recording runs per device; when the process ends (stdin closed or
 SIGTERM) a running recording is stopped, its device file and partial file are
 removed, and nothing is saved.
+
+With a live session on this device, a screenshot is also filed in the
+session's `shots/` (`captures.file_in_session`, tp-017); the reply then has a
+`shot` with its session file, task and `mocks_active`. A failed session copy
+never loses the Downloads capture: the reply carries a `session_copy_failed`
+warning instead. Operations asked with the `human` origin run inside the
+pre-test guard's exemption (a person's own actions are never counted or
+refused); every other origin goes through the guard like the CLI's verbs.
 """
 from __future__ import annotations
 
@@ -217,6 +225,7 @@ class Tools:
         self.captures_dir = captures_dir
         self.device_name = device_name
         self.recording: dict[str, Any] | None = None
+        self.origin = "human"  # the origin of the request being answered
         self.last_recording: dict[str, Any] | None = None
         self.handlers: dict[str, Callable[..., Any]] = {
             "context": self.context,
@@ -713,8 +722,35 @@ class Tools:
             raise
         capture, pruned = captures.commit(temp, directory, "screenshot",
                                           meta=self._meta(created=created, duration_ms=None))
-        return ({"capture": capture, "pruned": pruned}, [capture["name"]],
+        result: dict[str, Any] = {"capture": capture, "pruned": pruned}
+        if record is not None:
+            self._file_in_session(result, directory / capture["name"], record, created)
+        return (result, [capture["name"]],
                 {"size": capture["size"], "pruned": len(pruned) or None})
+
+    def _file_in_session(self, result: dict[str, Any], path: Path, record: dict[str, Any],
+                         created: float) -> None:
+        """With a live session on this device, the capture is also session
+        evidence (tp-017): a copy in `shots/` with the provenance of `autonom
+        screenshot`. The Downloads copy is already saved, so a failure here
+        never loses it: it becomes a `session_copy_failed` warning."""
+        try:
+            shot = captures.file_in_session(path, record, self.target,
+                                            origin=self.origin, created=created)
+        except Exception as exc:  # noqa: BLE001 - the Downloads capture is already saved
+            detail = exc.message if isinstance(exc, errors.AutonomError) else str(exc)
+            result["warnings"] = [{
+                "code": "session_copy_failed",
+                "error": f"the screenshot was saved to Downloads but not to the session: "
+                         f"{detail}",
+                "hint": "Check the session's artifacts folder is writable, or capture with "
+                        "'autonom screenshot'.",
+            }]
+            return
+        warnings = shot.pop("warnings", None)
+        result["shot"] = shot
+        if warnings:
+            result["warnings"] = warnings
 
     # --- actions: recording ----------------------------------------------------------
 
@@ -1172,8 +1208,12 @@ class Tools:
         if op in UNJOURNALED_OPS:
             return handler(payload)
         record = self.session()
+        self.origin = origin
         try:
-            result, words, summary = handler(payload, record)
+            # A person's own Canvas actions are exempt from the pre-test guard;
+            # an agent's go through it exactly like the CLI's verbs.
+            with bridge.input_scope(origin):
+                result, words, summary = handler(payload, record)
         except errors.AutonomError as exc:
             self._journal(record, op, origin, [], {}, False, exc.code)
             raise

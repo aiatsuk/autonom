@@ -118,6 +118,17 @@ scripts/autonom_lib/
     fingerprint.py            volatility-resistant screen identity (structure/state hashes)
     graph.py                  the observed graph: storage, ingestion, coverage, paths, diff
   proof.py                    PR proof: git diff -> covering suite -> honest verdict
+  bundle_writer.py            staged, content-addressed, atomically finalized bundles (Report
+                              Bundle v2 and the pre-test pack)
+  pretest/                    ticket pre-test (see "Ticket pre-test" below)
+    store.py                  layout, record, locks, active pointer, free-text masking
+    context.py / baseline.py  diff hunks + flow selection + Runtime Map hints; device baseline
+    checks.py / findings.py   append-only check and finding events, evidence refs
+    guard.py                  action/minute budget, forbidden taps, allowed apps
+    health.py / repro.py      health deltas and automatic findings; steps to reproduce
+    verdict.py / kit.py       the ticket verdict; the 18-case edge-case kit
+    pack.py / summary.py      the integrity-checked pack, summary.json and summary.md
+    view.py / review.py       offline index.html; QA review annotations
   actions.py                  per-action detail records feeding the Session -> Flow compiler
   network/
     proxy.py                  mitmdump lifecycle, machine-level confdir, CA publication
@@ -165,6 +176,7 @@ Two rules carry the design.
 | `network *` | consent-gated HTTP(S) capture, mock, HAR |
 | `atlas update\|show\|coverage\|paths\|export\|diff` | the observed application graph, evidence-linked |
 | `proof --base` | run the covering flow suite for a diff; pass/fail/not_covered/blocked/inconclusive |
+| `pretest *` | one ticket and its diff pre-tested on the session's device: checks, findings, health, budgets, the pack, the QA review |
 | `report build\|open\|export\|suite` | addressable per-step evidence UI, self-contained HTML, and JUnit |
 | `report serve` | loopback-only, token-protected replay-to-step controls over recorded runs |
 | `flow check\|fmt\|list\|run` | validate, canonicalize, enumerate, and execute Flow v1 files (`docs/FLOW.md`); `run` polls assertions, fires mutations once, and supports prefix replay |
@@ -175,6 +187,66 @@ Two rules carry the design.
 Every verb except `note`, `journal`, and `version` passes through one journal
 choke point in `main()`, so the timeline records the failures too — including
 the ones the agent chose not to mention.
+
+### Ticket pre-test
+
+`autonom pretest` turns one ticket plus its diff into a pack a QA engineer can
+review instead of re-testing (`docs/plans/PHASE_7_TICKET_PRETEST.md`). It
+lives inside a session, under `<session>/pretests/<pretest-id>/` (files
+`0600`, directories `0700`), with one active pre-test per session named by
+`pretests/active.json`:
+
+```text
+pretest start ──► pretest.json  ticket.md (masked)  context.json  baseline.json  budget.json
+check add/begin/end ──► checks.ndjson      finding add ──► findings.ndjson
+pretest flows ──► flow executor runs, one regression check each (run_id on the end event)
+pretest health / pack ──► health.json + automatic findings (origin: auto, confirmed: false)
+pretest pack ──► <pre-test>/pack/  (bundle_writer: staging dir, blobs/sha256, integrity.json,
+                 finalized.json, one atomic rename; nested Bundle v2 per flow run)
+pretest review ──► <pack>/annotations/review-<n>.json  (outside the integrity set)
+review … more-checks ──► a child pre-test: the pack's ticket and context, the reviewer's rules
+```
+
+A pack's integrity check proves only that the pack matches itself, so the
+`more-checks` child never takes its app id, budget, forbidden text or allowed
+apps from the pack's record: they come from the review's own flags, else the
+reviewer's session and the defaults. A pack made with relaxed rules cannot
+loosen the guard on QA's device.
+
+`autonom.py` only parses arguments and calls the `pretest` package, which it
+imports on demand, so no other verb loads it. Three hooks reach the rest of
+the harness, each a no-op without an active pre-test so every existing output
+stays byte for byte as before:
+
+1. **Attribution.** `journal.append`, `screenshot.capture_evidence`,
+   `actions.record_detail` and the `ui tree` save read `active.json` (one small
+   file, never raises) and add `pretest_id` and, while a check is open,
+   `check_id`; an open check is also the `task` when none was given. Network
+   flows and log lines are not rewritten: `health` and `pack` attribute them by
+   each check's begin/end window.
+2. **The guard.** `pretest/guard.py:before_mutation` runs at the start of the
+   shared mutating functions (`ui` input, `device_state.open_url`, app launch,
+   stop and clear in `session.py`, the iOS `simctl` launch/terminate) and in
+   the Android `open` verb, before any device command: it counts the action
+   under the pre-test lock or refuses it (`budget_exhausted`,
+   `forbidden_action`, `app_not_allowed`), appending the refusal to
+   `budget.json`. The CLI's normal error path journals the refusal with its
+   code. `guard.exempt()` covers human Canvas input and the `ui tree`
+   accessibility relaunch, which is read-only from the agent's point of view.
+   Flow steps go through the same functions, so `pretest flows` is counted step
+   by step; a refused step aborts its run as an infrastructure failure and the
+   check is `blocked`.
+3. **Verify.** `report verify` recognizes a pre-test pack by its manifest kind
+   (`autonom.pretest-pack/v1`) and checks every digest, nested flow bundles
+   included; any other directory goes to the Report Bundle v2 verifier as before.
+
+The ticket verdict is `fail` (a failed check or a confirmed blocker/major
+finding), else `blocked`, else `not_covered` (a planned check never began, or
+no checks), else `inconclusive`, else `pass`. Automatic findings never change a
+verdict by themselves. Free text (ticket, titles, notes, findings) is masked by
+a fixed, line-based rule set (credential headers, auth schemes, secret-named
+fields, `.env` lines, values `contracts.redact_value` recognizes) before it is
+written; formats outside that list are a documented limitation.
 
 ### iOS input backends
 
