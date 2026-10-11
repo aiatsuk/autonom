@@ -45,6 +45,9 @@ def open_url(target: Target, url: str) -> None:
             f"not a URL: {url!r}",
             "Pass a full URL with a scheme, e.g. myapp://profile/42 or https://example.com.",
         )
+    from .pretest import guard  # a no-op without an active pre-test
+
+    guard.before_mutation("open", target=target, url=url)
     if target.platform == IOS:
         ios_simctl.openurl(target.tool, target.target_id, url)
         return

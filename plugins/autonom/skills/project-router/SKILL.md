@@ -24,6 +24,11 @@ request, response, mock, HAR, proxy, or "why is this call failing". Load
 `mobile-flow` when the task mentions a repeatable flow, regression check,
 smoke suite, replaying a journey, or a `.yaml` flow file.
 
+Load `ticket-pretest` (with `mobile-session` and `mobile-screen`) when the task
+hands over a ticket, diff, branch, or pull request to **pre-test on a device**
+before QA: "pre-test this ticket", "check this PR on the emulator", "smoke-test
+the change before review", or a request for a verdict, findings, and a pack.
+
 Once the target app is known (a package/bundle id is in play), load
 `mobile-memory` and read `~/.autonom/apps/<package>/app.md` and any matching
 `flows/` runbook **before** driving the device — it carries the backend, network
@@ -65,6 +70,7 @@ python3 <marketplace-root>/scripts/flutter_exec.py --root . -- --version
    - per-app knowledge and flows: `mobile-memory` (read `~/.autonom/apps/<package>/`)
    - deeper debug: `android-debugger-agent` / `ios-debugger-agent` / `flutter-debugger-agent`
    - network inspect or mock: `mobile-network`
+   - a ticket, diff, or PR to pre-test on a device: `ticket-pretest`
    - visual mirror: `android-emulator-browser`
 5. When the machine's capabilities are unclear, run
    `python3 <autonom-root>/scripts/autonom.py doctor` — it reports which platforms

@@ -1,0 +1,8 @@
+schema: autonom.dev/flow/v1
+appId: com.example.app
+name: Login
+---
+- launchApp
+- assertVisible:
+    selector:
+      text: Home

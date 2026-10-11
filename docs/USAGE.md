@@ -338,6 +338,193 @@ failure screenshot and tell me what the app actually showed; do not retry the
 flow.
 ```
 
+## Pre-test a ticket before it goes to QA
+
+```text
+Pre-test ticket WB-7 (ticket.md) against main on emulator-5554. Read the ticket
+and `autonom pretest context`, plan the checks before touching the device
+(acceptance points, then edge cases from `autonom pretest kit`, then the selected
+regression flows), begin and end each check, record findings with expected vs
+actual and evidence refs, then pack and tell me the ticket verdict, what was not
+covered, and the pack path. Do not tap anything that buys, pays or deletes.
+```
+
+The `ticket-pretest` skill carries this playbook for the agent: the order in
+which to plan checks, how to run and end each one, how to write a finding
+(expected vs actual, evidence refs), the verdict rules, the QA review, drafts,
+repro and rerun, and the 18-case edge-case kit with the verbs that set up each
+case and its platform limits (`references/edge-case-kit.md`).
+
+The same pre-test by hand, inside a running session:
+
+```bash
+autonom session start --serial emulator-5554 --app-id com.example.app --launch
+# the app runs before `pretest start`: the start takes the metrics baseline
+autonom pretest start --ticket ticket.md --base main --ticket-ref WB-7 \
+    --max-actions 200 --max-minutes 45        # or: --ticket - < ticket.md
+autonom pretest context                       # changed files, hunks, selected flows, screen hints
+autonom pretest kit                           # the 18 edge-case ids for --case
+
+autonom pretest check add "Results appear after a search" --kind ticket
+autonom pretest check add "Search offline" --kind edge --case offline
+autonom pretest check add "A 500 shows Retry" --kind ticket --case server-error   # an acceptance point that is a kit case
+autonom pretest check begin chk-1
+autonom ui tap --text Search                  # counted against --max-actions
+autonom screenshot                            # filed under the check (task chk-1)
+autonom pretest check end chk-1 --verdict fail --note "500 not handled"
+autonom pretest finding add --check chk-1 --severity major --title "Error swallowed" \
+    --expected "an error message" --actual "an empty list" --evidence shot:1
+
+autonom pretest flows                         # each selected flow becomes a regression check;
+                                              # `flows` lists {flow, check_id, run_id, status, verdict}
+autonom pretest status                        # budget used and left, open check, counts
+autonom pretest health                        # crashes, error logs, failed requests since start
+autonom pretest check list
+autonom pretest finding list
+autonom pretest pack                          # summary.md, index.html, integrity-checked pack
+autonom report verify <pack>
+```
+
+In the pack, each check lists the requests captured in its window (method,
+host, path, status, mocked, duration), each step lists the mocks active at
+that moment, screenshots taken under a mock are marked as mocked data, and a
+finding's steps to reproduce stop at its latest evidence. `index.html` opened
+from disk fills the review commands with the pack's own directory. An ended
+check cannot be ended again (`no_open_check`): add a finding instead.
+`ui swipe --duration` is in seconds (`--duration 0.4`).
+
+Then QA reviews the pack (no session needed except for `more-checks`):
+
+```bash
+autonom pretest review <pack> return-to-dev --finding f-1 --note "500 path missing"
+autonom pretest review <pack> approve --dismiss f-2 --author anna
+autonom pretest review <pack> more-checks --check "Rotate on results"   # starts a linked child pre-test
+autonom pretest review-status <pack>
+```
+
+The `more-checks` child copies the pack's ticket and diff context, never its
+safety rules: its app, budget, forbidden text and allowed apps come from your
+session and the defaults (300 actions, 60 minutes, the default forbidden
+list), or from `--app-id`, `--max-actions`, `--max-minutes`, `--forbid-text`
+and `--allow-app` on the review. The output shows them under
+`child.app_id` and `child.budget`.
+
+Turn a finding into a regression flow, measure how often it reproduces, and
+rerun it after the fix:
+
+```bash
+autonom pretest flow-draft f-1                # .autonom/flows/drafts/wb-7-f-1.yaml, tag draft, covers = changed files
+autonom flow check .autonom/flows/drafts/wb-7-f-1.yaml
+autonom pretest repro f-1 --times 3           # reproduced "1/3", stability intermittent, three run ids
+autonom pretest pack
+# ...the fix lands, the app is rebuilt...
+autonom pretest rerun <pack> --check chk-2    # a linked child pre-test runs chk-2's draft again
+autonom pretest pack                          # the child's summary shows chk-2 before fail, after pass
+```
+
+The draft is compiled from the journal of the finding's check, so drive checks
+with selector-based taps (`ui tap --text ...`) and end them with a `ui find` on
+the state you expect; read the draft's closing assertion before relying on it,
+because a repro run that fails reproduces the finding and a passing run means it
+is gone. `repro` records a result only when all N runs reached a verdict: a
+broken run, a dead device or a spent budget stops it and nothing is recorded.
+`repro` works on the active pre-test only (`--pack` is refused with
+`pretest_finalized`); `autonom pretest flow-draft f-1 --pack <pack>` writes a
+draft from a pack without changing it, and `rerun` without `--check` runs every
+check of the pack that has a flow or draft. The child gets this session's app
+and the default safety rules, never the pack's.
+
+`autonom pretest stop` closes a pre-test without a pack, and
+`autonom pretest list` shows the session's pre-tests. A tap on forbidden text,
+an app outside `--allow-app` or a spent budget is refused before any input
+reaches the device (`forbidden_action`, `app_not_allowed`, `budget_exhausted`);
+the refusal is in the journal. Every journal entry, screenshot and saved tree made while a check
+is open carries `pretest_id` and `check_id`.
+
+### App profile and warm-up
+
+An app profile tells the pre-test how to start the app. It is read from the
+workspace first, `<repo>/.autonom/apps/<app-id>/profile.yaml`, then from the
+home, `~/.autonom/apps/<app-id>/profile.yaml` (`$AUTONOM_HOME/apps/...` when set);
+`autonom pretest context` shows which one was used under `profile` (`null`
+when there is none). It is written in the same YAML subset as flow files:
+
+```yaml
+schema: autonom.pretest-profile/v1
+login_flow: login.yaml                 # relative to this file's folder
+warmup_flow: warmup.yaml
+accounts:                              # environment variable NAMES, never values
+  qa:                                  # names start with AUTONOM_ or PRETEST_
+    user: PRETEST_QA_USER
+    password: PRETEST_QA_PASSWORD
+fixtures:
+  product: Blue mug
+flaky_screens: [Splash]
+events:                                # rules for `autonom pretest events`
+  - name: add_to_cart
+    method: POST
+    host: analytics.example.com        # or a glob: "*.example.com"
+    path: "/v1/events*"                # glob over the path without its query
+    body_key: event                    # dotted for nested JSON, or a form field
+    body_value: add_to_cart
+```
+
+A profile never holds a secret: an inline password, token, bearer header, JWT
+or URL with a password is refused with `profile_invalid` (the key path is
+named, the value never), and `pretest start` then creates nothing. A value
+written like a variable name (`PRETEST_QA_PASSWORD`) is read as a name.
+`accounts` may only name environment variables whose names start with
+`AUTONOM_` or `PRETEST_` (then upper case, digits and `_`); any other name
+(`HOME`, `AWS_SECRET_ACCESS_KEY`, `QA_USER`) makes the profile invalid
+(`profile_invalid`, the hint names the rule), and warm-up never reads any
+other variable.
+
+```bash
+export PRETEST_QA_USER=anna PRETEST_QA_PASSWORD=...   # handed to the flows as secrets
+autonom pretest warmup                        # login_flow, warmup_flow, Runtime Map update, walk
+```
+
+`autonom pretest warmup` runs `login_flow` and then `warmup_flow`, updates the
+Runtime Map from the session (as `autonom atlas update` does), and reports each
+screen hint of the diff as `reached` (the recorded selector taps of a known
+path were replayed and the screen is on display), `unreplayable` (the path
+holds a swipe, a key, a coordinate tap or a relational selector), `known` (in
+the map but not reached; `reason` says why) or `unknown` (not in the map). It
+never explores beyond recorded transitions. Its flow steps and taps count
+against the budget, and it refuses while a check is open.
+
+### Accessibility and analytics checks
+
+```bash
+autonom pretest check add "Cart is accessible" --kind a11y
+autonom pretest check begin chk-3
+autonom pretest a11y                          # unlabelled controls, small targets, duplicate labels
+autonom pretest check end chk-3 --verdict pass
+
+autonom network start && autonom network attach   # analytics needs captured traffic (consent)
+autonom pretest check add "Cart sends add_to_cart" --kind analytics
+autonom pretest check begin chk-4
+autonom ui tap --text "Add to cart"
+autonom pretest events                        # matched (request ids), missing, unexpected
+autonom pretest check end chk-4 --verdict fail --note "add_to_cart not sent"
+```
+
+`autonom pretest a11y [--check ID]` saves the current tree under `trees/` and
+writes one automatic finding (`severity: minor`, `confirmed: false`) per
+control without a label, control smaller than 48×48 dp on Android or 44×44 pt
+on iOS, and group of controls with the same label, each with the node bounds and
+the saved tree as evidence. Without a readable screen density on Android the
+size rule is skipped with a `density_unknown` warning. Contrast and reading
+order are not checked.
+
+`autonom pretest events [--check ID]` matches the profile's `events` rules
+against the requests captured during the check (the open check, else the whole
+pre-test). Each missing rule becomes an automatic finding; `unexpected` lists
+requests to a rule's endpoint that match no rule, with request ids and body key
+names. Body values are never copied into the output, findings or journal.
+Without captured traffic the result says `state: unavailable` and no finding is
+written. Automatic findings never change a verdict until QA confirms them.
+
 ## Watch a session live
 
 ```text

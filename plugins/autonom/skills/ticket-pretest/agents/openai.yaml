@@ -1,0 +1,4 @@
+interface:
+  display_name: "Ticket Pre-test"
+  short_description: "Pre-test one ticket and its diff on an Android emulator or iOS Simulator before QA: plan checks, drive them under a budget, record findings with evidence, pack and report an honest verdict."
+  default_prompt: "Pre-test this ticket against main on the current device: read the ticket and the pre-test context, plan the checks first, run each one, record findings with expected vs actual and evidence, then pack and report the verdict, what was not covered, and the pack path."

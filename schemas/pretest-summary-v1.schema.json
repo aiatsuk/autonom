@@ -1,0 +1,201 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autonom.dev/schemas/pretest-summary-v1.schema.json",
+  "title": "Autonom Ticket Pre-test Summary v1",
+  "description": "summary.json inside a pre-test pack: verdict, checks, findings, kit coverage, health deltas, evidence and timing. Evidence paths are relative to the pack.",
+  "type": "object",
+  "required": ["schema", "pretest_id", "title", "ticket_ref", "verdict", "verdict_reasons",
+               "target", "app_id", "base", "head", "created_at", "ended_at", "parent_pack",
+               "kind", "changed_files", "diff_truncated", "checks", "findings",
+               "not_covered", "blocked", "open", "kit", "health", "evidence", "timing",
+               "review_commands"],
+  "properties": {
+    "schema": {"const": "autonom.pretest-summary/v1"},
+    "pretest_id": {"type": "string", "pattern": "^pt_[0-9]{8}T[0-9]{6}_[0-9a-f]{6}$"},
+    "title": {"type": "string", "minLength": 1},
+    "ticket_ref": {"type": ["string", "null"]},
+    "verdict": {"$ref": "#/$defs/verdict"},
+    "verdict_reasons": {"type": "array", "items": {"type": "string"}},
+    "target": {
+      "type": "object",
+      "required": ["platform", "target_id"],
+      "properties": {
+        "platform": {"enum": ["android", "ios"]},
+        "target_id": {"type": "string"}
+      }
+    },
+    "app_id": {"type": ["string", "null"]},
+    "base": {"type": ["string", "null"]},
+    "head": {"type": ["string", "null"]},
+    "created_at": {"type": ["string", "null"]},
+    "ended_at": {"type": ["string", "null"]},
+    "parent_pack": {"type": ["string", "null"]},
+    "kind": {"enum": ["pretest", "more-checks", "rerun"]},
+    "rerun_of": {"type": ["object", "null"]},
+    "budget": {
+      "type": "object",
+      "properties": {
+        "max_actions": {"type": ["integer", "null"]},
+        "max_minutes": {"type": ["number", "null"]}
+      }
+    },
+    "changed_files": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["path", "status"],
+        "properties": {
+          "path": {"type": "string"},
+          "status": {"enum": ["M", "A", "D", "R"]},
+          "renamed_from": {"type": "string"}
+        }
+      }
+    },
+    "diff_truncated": {"type": "boolean"},
+    "checks": {"type": "array", "items": {"$ref": "#/$defs/check"}},
+    "parent_checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "check_id": {"type": ["string", "null"]},
+          "title": {"type": ["string", "null"]},
+          "verdict": {"type": ["string", "null"]},
+          "state": {"type": ["string", "null"]}
+        }
+      }
+    },
+    "findings": {"type": "array", "items": {"$ref": "#/$defs/finding"}},
+    "not_covered": {"type": "array", "items": {"type": "string"}},
+    "blocked": {"type": "array", "items": {"type": "string"}},
+    "open": {"type": "array", "items": {"type": "string"}},
+    "kit": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "title", "covered", "checks", "verdicts"],
+        "properties": {
+          "id": {"type": "string"},
+          "title": {"type": "string"},
+          "covered": {"type": "boolean"},
+          "checks": {"type": "array", "items": {"type": "string"}},
+          "verdicts": {"type": "array", "items": {"type": ["string", "null"]}}
+        }
+      }
+    },
+    "health": {
+      "description": "health.json without its schema key: crashes, logs, requests and metrics blocks, each available or unavailable with a reason.",
+      "type": "object"
+    },
+    "evidence": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "kind", "path", "label", "check_id"],
+        "properties": {
+          "id": {"type": "string", "pattern": "^e-[1-9][0-9]*$"},
+          "kind": {"enum": ["screenshot", "tree", "action", "request", "log", "run",
+                            "crash", "recording"]},
+          "path": {"type": "string",
+                   "pattern": "^(blobs/sha256/[0-9a-f]{2}/[0-9a-f]{64}|runs/[A-Za-z0-9._-]+/)$"},
+          "label": {"type": ["string", "null"]},
+          "check_id": {"type": ["string", "null"]},
+          "width": {"type": ["number", "null"]},
+          "height": {"type": ["number", "null"]},
+          "mocked": {"type": "boolean", "description": "A screenshot taken while mocks were active."},
+          "mocks_active": {"type": "integer", "minimum": 0}
+        }
+      }
+    },
+    "timing": {
+      "type": "object",
+      "required": ["wall_s", "checks_s", "actions", "checks", "findings", "auto_findings"],
+      "properties": {
+        "wall_s": {"type": ["number", "null"]},
+        "checks_s": {"type": "object", "additionalProperties": {"type": "number"}},
+        "actions": {"type": ["integer", "null"]},
+        "checks": {"type": "integer"},
+        "findings": {"type": "integer"},
+        "auto_findings": {"type": "integer"}
+      }
+    },
+    "review_commands": {
+      "type": "object",
+      "required": ["approve", "more_checks", "return_to_dev"],
+      "properties": {
+        "approve": {"type": "string"},
+        "more_checks": {"type": "string"},
+        "return_to_dev": {"type": "string"}
+      }
+    }
+  },
+  "$defs": {
+    "verdict": {"enum": ["pass", "fail", "blocked", "not_covered", "inconclusive"]},
+    "check": {
+      "type": "object",
+      "required": ["check_id", "title", "kind", "case", "verdict", "state", "note",
+                   "duration_s", "run_ids", "evidence", "repro", "before", "after"],
+      "properties": {
+        "check_id": {"type": "string"},
+        "title": {"type": "string"},
+        "kind": {"enum": ["ticket", "edge", "regression", "network", "a11y", "analytics"]},
+        "case": {"type": ["string", "null"]},
+        "why": {"type": ["string", "null"]},
+        "verdict": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/verdict"}]},
+        "state": {"enum": ["added", "open", "ended"]},
+        "note": {"type": ["string", "null"]},
+        "began_at": {"type": ["string", "null"]},
+        "ended_at": {"type": ["string", "null"]},
+        "duration_s": {"type": ["number", "null"]},
+        "run_ids": {"type": "array", "items": {"type": "string"}},
+        "evidence": {"type": "array", "items": {"type": "string"}},
+        "repro": {"type": "array"},
+        "before": {"type": ["object", "null"]},
+        "after": {"type": ["object", "null"]},
+        "requests": {
+          "description": "Requests captured in the check's time window; never headers or bodies.",
+          "type": "array",
+          "maxItems": 200,
+          "items": {
+            "type": "object",
+            "required": ["method", "host", "path", "status", "mocked"],
+            "properties": {
+              "method": {"type": ["string", "null"]},
+              "host": {"type": ["string", "null"]},
+              "path": {"type": ["string", "null"], "description": "Without the query string."},
+              "status": {"type": ["integer", "null"]},
+              "mocked": {"type": "boolean"},
+              "duration_ms": {"type": "integer", "minimum": 0},
+              "started_at": {"type": "string"}
+            }
+          }
+        },
+        "requests_truncated": {"type": "integer", "minimum": 0}
+      }
+    },
+    "finding": {
+      "type": "object",
+      "required": ["finding_id", "check_id", "origin", "source", "severity", "title",
+                   "expected", "actual", "confirmed", "evidence", "reproduced",
+                   "stability", "draft_flow"],
+      "properties": {
+        "finding_id": {"type": "string", "pattern": "^f-[1-9][0-9]*$"},
+        "check_id": {"type": ["string", "null"]},
+        "origin": {"enum": ["agent", "auto"]},
+        "source": {"enum": [null, "crash", "log", "request", "metrics", "a11y", "analytics"]},
+        "severity": {"enum": ["blocker", "major", "minor", "info"]},
+        "title": {"type": "string"},
+        "expected": {"type": ["string", "null"]},
+        "actual": {"type": "string"},
+        "confirmed": {"type": "boolean"},
+        "evidence": {"type": "array", "items": {"type": "string"}},
+        "refs": {"type": "array", "items": {"type": "string"}},
+        "repro": {"type": "array"},
+        "reproduced": {"type": ["string", "null"], "pattern": "^[0-9]+/[1-9][0-9]*$"},
+        "stability": {"enum": [null, "stable", "intermittent", "not_reproduced"]},
+        "repro_runs": {"type": "array", "items": {"type": "string"}},
+        "draft_flow": {"type": ["string", "null"]}
+      }
+    }
+  }
+}

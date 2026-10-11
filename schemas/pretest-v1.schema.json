@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autonom.dev/schemas/pretest-v1.schema.json",
+  "title": "Autonom Ticket Pre-test Record v1",
+  "description": "pretests/<pretest_id>/pretest.json inside a session, and pretest.json inside a pre-test pack.",
+  "type": "object",
+  "required": ["schema", "pretest_id", "session_id", "status", "title", "ticket_ref",
+               "created_at", "ended_at", "repo", "base", "head", "flows_dir", "target",
+               "app_id", "budget", "parent_pack", "kind", "rerun_of", "pack"],
+  "properties": {
+    "schema": {"const": "autonom.pretest/v1"},
+    "pretest_id": {"type": "string", "pattern": "^pt_[0-9]{8}T[0-9]{6}_[0-9a-f]{6}$"},
+    "session_id": {"type": "string", "minLength": 1},
+    "status": {"enum": ["active", "stopped", "packed"]},
+    "title": {"type": "string", "minLength": 1},
+    "ticket_ref": {"type": ["string", "null"]},
+    "created_at": {"type": "string", "minLength": 1},
+    "ended_at": {"type": ["string", "null"]},
+    "repo": {"type": ["string", "null"]},
+    "base": {"type": ["string", "null"]},
+    "head": {"type": ["string", "null"]},
+    "flows_dir": {"type": ["string", "null"]},
+    "target": {
+      "type": "object",
+      "required": ["platform", "target_id"],
+      "properties": {
+        "platform": {"enum": ["android", "ios"]},
+        "target_id": {"type": "string", "minLength": 1}
+      }
+    },
+    "app_id": {"type": ["string", "null"]},
+    "budget": {
+      "type": "object",
+      "required": ["max_actions", "max_minutes", "forbid_text", "allow_apps"],
+      "properties": {
+        "max_actions": {"type": "integer", "minimum": 1},
+        "max_minutes": {"type": "number", "exclusiveMinimum": 0},
+        "forbid_text": {"type": "array", "items": {"type": "string"}},
+        "allow_apps": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "parent_pack": {"type": ["string", "null"]},
+    "kind": {"enum": ["pretest", "more-checks", "rerun"]},
+    "rerun_of": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "required": ["pack", "checks"],
+          "properties": {
+            "pack": {"type": "string"},
+            "checks": {"type": "array", "items": {"type": "string"}}
+          }
+        }
+      ]
+    },
+    "pack": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "required": ["path", "integrity_sha256"],
+          "properties": {
+            "path": {"type": "string"},
+            "integrity_sha256": {"type": "string"}
+          }
+        }
+      ]
+    }
+  },
+  "if": {"properties": {"status": {"const": "packed"}}},
+  "then": {"properties": {"pack": {"type": "object"}}}
+}

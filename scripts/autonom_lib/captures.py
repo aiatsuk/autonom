@@ -18,6 +18,12 @@ gallery.
 A capture is written to a `.partial-<12 hex>.<ext>` file first and renamed into
 place only once it is complete, so a half-written file never shows under a
 capture name; `sweep` removes partial files a stopped process left behind.
+
+`file_in_session` files a committed screenshot a second time as session
+evidence (tp-017): when a session is live on the Canvas device, a copy goes to
+the session's `shots/` with the provenance `autonom screenshot` records
+(`mocks_active`, the open pre-test check as `task`, `pretest_id`, `check_id`)
+plus the request's `origin`. The Downloads copy and its index are not touched.
 """
 from __future__ import annotations
 
@@ -35,6 +41,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from . import errors
+from . import screenshot as shot_mod
 
 ROOT_ENV = "AUTONOM_CAPTURES_DIR"
 DEFAULT_ROOT = Path.home() / "Downloads" / "Autonom"
@@ -416,3 +423,114 @@ def sweep(directory: Path, older_than_s: float = 60) -> int:
             if exc.errno != errno.ENOENT:
                 continue
     return removed
+
+
+# --- session evidence (tp-017) ------------------------------------------------------
+
+SESSION_LABEL = "canvas"
+SESSION_NAME_TRIES = 50
+
+
+def _owner_dir(path: Path) -> None:
+    """Create `path` (one level) with mode 0700 when it is missing."""
+    if not path.is_dir():
+        path.mkdir(mode=0o700, exist_ok=True)
+        os.chmod(path, 0o700)
+
+
+def _claim_shot(directory: Path, moment: float) -> tuple[Path, int]:
+    """The next free `<NNNN>_<HHMMSS>_canvas.png` in `directory`, created 0600
+    with O_EXCL so a capture running at the same time never overwrites it."""
+    first = shot_mod.next_index(directory)
+    for number in range(first, first + SESSION_NAME_TRIES):
+        path = directory / shot_mod.build_filename(number, SESSION_LABEL, moment)
+        try:
+            descriptor = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            continue
+        return path, descriptor
+    raise errors.AutonomError(
+        errors.BACKEND_FAILED, f"no free screenshot name in {directory}",
+        "Another process is writing screenshots into this session; retry the capture.")
+
+
+def file_in_session(source: Path, session: dict[str, Any], target: Any, *,
+                    origin: str = "human", created: float | None = None) -> dict[str, Any]:
+    """Copy the committed screenshot `source` into the session's `shots/`.
+
+    The copy is named and annotated like `autonom screenshot`'s capture: the
+    open pre-test check is its `task` (a subfolder), the PNG carries the
+    metadata as `iTXt` chunks, and `shots/index.jsonl` gets the same row, with
+    `origin` (who asked for the capture) and `source: "canvas"`. Directories
+    are created 0700 and the file 0600. `source` is only read.
+
+    Refusals (AutonomError with a hint): `backend_failed` when the source is
+    not a regular PNG file or the session has no artifacts folder. On any
+    failure the partial copy is removed and no index row is written.
+    """
+    source = Path(source)
+    info = _regular(source)
+    if info is None:
+        raise errors.AutonomError(
+            errors.BACKEND_FAILED, "the Canvas screenshot to file in the session is missing",
+            "The Downloads copy may have been removed; capture again.")
+    with open(source, "rb") as handle:
+        data = handle.read(SCREENSHOT_MAX + 1)
+    if not data.startswith(PNG_SIGNATURE) or len(data) > SCREENSHOT_MAX:
+        raise errors.AutonomError(
+            errors.BACKEND_FAILED, "the Canvas screenshot is not a PNG image",
+            "Capture again; the session copy was not written.")
+    artifacts = Path(str(session.get("artifacts_dir") or ""))
+    if not session.get("artifacts_dir") or not artifacts.is_dir():
+        raise errors.AutonomError(
+            errors.BACKEND_FAILED, "the session has no artifacts folder for the screenshot",
+            "Check the session with 'autonom session status', or start a new one.")
+    moment = float(created) if created else time.time()
+    attribution = shot_mod.pretest_attribution(session)
+    task = attribution.get("check_id")
+    directory = artifacts / "shots"
+    _owner_dir(directory)
+    if task:
+        directory = directory / shot_mod.slugify(task, limit=32)
+        _owner_dir(directory)
+    path, descriptor = _claim_shot(directory, moment)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(data)
+        meta: dict[str, Any] = {
+            "captured_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(moment)),
+            "label": SESSION_LABEL,
+            "task": task,
+            "session_id": session.get("session_id"),
+            "platform": getattr(target, "platform", None),
+            "target_id": getattr(target, "target_id", None),
+            "app_id": session.get("app_id"),
+            "foreground": shot_mod.foreground(target),
+        }
+        meta.update(attribution)
+        mocks = shot_mod.active_mocks()
+        meta["mocks_active"] = mocks["active"]
+        if mocks["active"]:
+            meta["mocks"] = ",".join(str(item) for item in mocks["ids"])
+        meta["origin"] = origin
+        meta["source"] = "canvas"
+        embedded = shot_mod.embed_metadata(path, meta)
+        width, height = _png_size(path)
+        relative = str(path.resolve().relative_to(artifacts.resolve()))
+        shot_mod.append_index(session, {**meta, "file": relative,
+                                        "width": width, "height": height})
+    except BaseException:
+        _remove(path)
+        raise
+    result: dict[str, Any] = {"path": str(path), "file": relative, "task": task,
+                              "mocks_active": mocks["active"],
+                              "metadata_embedded": embedded}
+    if mocks["active"]:
+        result["warnings"] = [{
+            "code": "screenshot_shows_mocked_data",
+            "error": f"{mocks['active']} mock rule(s) were active — this image may "
+                     f"show fabricated responses",
+            "hint": "The fact is embedded in the session copy and the shots index. Do not "
+                    "present this as evidence of real backend behaviour.",
+        }]
+    return result

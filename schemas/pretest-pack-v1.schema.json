@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autonom.dev/schemas/pretest-pack-v1.schema.json",
+  "title": "Autonom Ticket Pre-test Pack v1",
+  "description": "manifest.json of a pre-test pack. The manifest is listed in integrity.json; finalized.json seals the catalogue. The annotations/ tree (review decisions, autonom.pretest-review/v1) is outside the integrity set.",
+  "type": "object",
+  "required": ["schema", "kind", "pretest_id", "session_id", "title", "verdict", "packed_at",
+               "files", "checks", "findings", "runs", "runs_unavailable", "evidence",
+               "record_digest"],
+  "properties": {
+    "schema": {"const": "autonom.pretest-pack/v1"},
+    "kind": {"const": "autonom.pretest-pack/v1"},
+    "pretest_id": {"type": "string", "pattern": "^pt_[0-9]{8}T[0-9]{6}_[0-9a-f]{6}$"},
+    "session_id": {"type": ["string", "null"]},
+    "title": {"type": ["string", "null"]},
+    "ticket_ref": {"type": ["string", "null"]},
+    "verdict": {"enum": ["pass", "fail", "blocked", "not_covered", "inconclusive"]},
+    "packed_at": {"type": "string"},
+    "parent_pack": {"type": ["string", "null"]},
+    "pack_kind": {"enum": ["pretest", "more-checks", "rerun"]},
+    "files": {
+      "type": "object",
+      "required": ["record", "summary", "summary_md", "index", "integrity", "finalized"],
+      "additionalProperties": {"type": "string"}
+    },
+    "checks": {"type": "array", "items": {"type": "string", "pattern": "^chk-[1-9][0-9]*$"}},
+    "findings": {"type": "array", "items": {"type": "string", "pattern": "^f-[1-9][0-9]*$"}},
+    "runs": {"type": "array", "items": {"type": "string"}},
+    "runs_unavailable": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["run_id", "reason"],
+        "properties": {
+          "run_id": {"type": ["string", "null"]},
+          "reason": {"type": ["string", "null"]}
+        }
+      }
+    },
+    "evidence": {"type": "integer", "minimum": 0},
+    "record_digest": {
+      "description": "Sealed record digest (SHA-256 over canonical JSON): the record without status, pack and ended_at; the folded checks; the folded findings; health.json without computed_at; and sha256 over the four. A crash-recovery re-pack adopts an existing pack only when this matches the pre-test as it is now.",
+      "type": "object",
+      "required": ["sha256", "record", "checks", "findings", "health"],
+      "additionalProperties": false,
+      "properties": {
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "record": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "checks": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "findings": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "health": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    }
+  }
+}

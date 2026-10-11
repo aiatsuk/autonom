@@ -108,6 +108,7 @@ reads it back — the record you use to re-check or hand off a flow.
 | Metrics | `metrics snapshot/series/list-presets`, `metrics memory capture/analyze/warn`, `metrics frames …`, `metrics trace --preset …` |
 | Network | `network start/stop/status/attach/detach`, `network requests list/show`, `network mock …`, `network export --har` |
 | Flows | `flow check/fmt/list/run` — repeatable Flow v1 files with exact selectors and failure classes |
+| Ticket pre-test | `pretest start/context/kit/check/finding/flows/health/pack/review/rerun` — one ticket and its diff checked on the device under an action budget and forbidden-tap rules, packed with an honest verdict (`ticket-pretest`) |
 | Housekeeping | `processes`, `cleanup` |
 
 ## Which skill for what
@@ -120,6 +121,8 @@ reads it back — the record you use to re-check or hand off a flow.
 - **`mobile-network`** — capture, mock, HAR — consent-gated MITM.
 - **`mobile-flow`** — repeatable Flow v1 files: author, validate, run, replay.
 - **`mobile-memory`** — read/write per-app knowledge and flow runbooks.
+- **`ticket-pretest`** — pre-test a ticket, PR or diff on a device before QA:
+  plan checks, run them with evidence, pack, report the verdict.
 - **`android-debugger-agent` / `ios-debugger-agent` / `flutter-debugger-agent`**
   — build-run-inspect for a specific stack.
 - Domain packs — `flutter-*`, native `android-*` / `compose-*` — for testing,

@@ -1042,6 +1042,122 @@ LAUNCHER_CATEGORY = "android.intent.category.LAUNCHER"
 RESUME_TASK_FLAGS = "0x10200000"
 
 
+# Android class and component names (`.Main`, `pkg/.ui.Main$Inner`): nothing a
+# device shell would interpret can reach `adb shell am start -n`.
+_ACTIVITY_PATTERN = re.compile(r"[A-Za-z0-9_.$/]+")
+
+
+def _check_activity(activity: str | None) -> None:
+    """Refuse an `--activity` value that is not a plain class or component
+    name, before any device command."""
+    if activity and not _ACTIVITY_PATTERN.fullmatch(activity):
+        raise errors.AutonomError(
+            errors.INVALID_VALUE,
+            f"not an activity or component name: {activity!r}",
+            hint="Pass an activity class (.MainActivity, com.example.app.MainActivity) "
+                 "or a component (com.example.app/.MainActivity): letters, digits, "
+                 "'_', '.', '$' and '/' only.",
+            activity=activity,
+        )
+
+
+def _launched_package(app_id: str, activity: str | None) -> str:
+    """The package a launch actually starts: a full component in `activity`
+    (`pkg/.Main`) starts that package, whatever `app_id` says."""
+    if activity and "/" in activity:
+        package = activity.split("/", 1)[0].strip()
+        if package:
+            return package
+    return app_id
+
+
+def _guard_app(verb: str, platform: str, tool: str, target_id: str, app_id: str,
+               activity: str | None = None) -> bool:
+    """The pre-test guard for an app launch, stop or clear-data (budget and
+    allowed apps); a no-op without an active pre-test. Runs before any device
+    command. The allow list is checked against the package the launch starts
+    (see `_launched_package`), not only the `app_id` argument. True when the
+    action was counted."""
+    from .platform import Target
+    from .pretest import guard
+
+    return guard.before_mutation(verb, target=Target(platform, target_id, tool),
+                                 app_id=_launched_package(app_id, activity))
+
+
+def _guard_launch(platform: str, tool: str, target_id: str, app_id: str,
+                  activity: str | None = None) -> None:
+    _check_activity(activity)
+    _guard_app("launch", platform, tool, target_id, app_id, activity)
+
+
+def _ios_fresh_key(udid: str, bundle_id: str) -> tuple[str, ...]:
+    return ("ios-launch", str(udid), str(bundle_id))
+
+
+def _install_ios_guards() -> None:
+    """Put the pre-test guard in front of ``ios_simctl.launch`` and
+    ``ios_simctl.terminate``.
+
+    They are the iOS app launch and stop choke points: `session start
+    --launch`, `session launch`, `session stop-app`, the flow executor's
+    ``launchApp``/``stopApp`` steps and Canvas all call them through the
+    module attribute. Every one of those callers imports this module, so the
+    guarded functions are in place before the first call. The guard (budget
+    and allowed apps, tp-006) runs before any simctl command, including the
+    ``listapps`` install check.
+
+    A fresh launch is ``terminate`` then ``launch`` of the same app: one
+    operation. Its single check runs before the terminate and counts one
+    action; the launch that follows at once on the same thread is let through
+    (``guard.take_follow_up``) without a second count or check. Without an
+    active pre-test the guard is a no-op that never touches the device.
+    Installing twice (a module reload) keeps a single guard on each."""
+    import functools
+
+    from . import ios_simctl
+    from .pretest import guard
+
+    def wrap(name: str, verb: str) -> None:
+        unguarded = getattr(ios_simctl, name)
+        if getattr(unguarded, "pretest_guarded", False):
+            return
+
+        @functools.wraps(unguarded)
+        def guarded(xcrun: str, udid: str, bundle_id: str, *args: Any, **kwargs: Any) -> Any:
+            key = _ios_fresh_key(udid, bundle_id)
+            if verb == "launch" and guard.take_follow_up(key):
+                return unguarded(xcrun, udid, bundle_id, *args, **kwargs)
+            counted = _guard_app(verb, "ios", xcrun, udid, bundle_id)
+            result = unguarded(xcrun, udid, bundle_id, *args, **kwargs)
+            if verb == "stop" and counted:
+                guard.expect_follow_up(key)
+            return result
+
+        guarded.pretest_guarded = True  # type: ignore[attr-defined]
+        setattr(ios_simctl, name, guarded)
+
+    wrap("launch", "launch")
+    wrap("terminate", "stop")
+
+
+_install_ios_guards()
+
+
+def launch_ios_app(xcrun: str, udid: str, app_id: str, *, args: Any = (),
+                   env: dict[str, str] | None = None, fresh: bool = False) -> int | None:
+    """`simctl launch` (after `simctl terminate` when ``fresh``) behind the
+    pre-test guard: the iOS counterpart of `launch_app` / `launch_app_fresh`
+    for callers that launch through the session layer. The guard lives on the
+    ``ios_simctl`` functions themselves (see ``_install_ios_guards``), so the
+    launch is counted once, fresh or not."""
+    from . import ios_simctl
+
+    if fresh:
+        ios_simctl.terminate(xcrun, udid, app_id)
+    return ios_simctl.launch(xcrun, udid, app_id, args=args, env=env)
+
+
 def launch_app(adb: str, serial: str, app_id: str,
                activity: str | None = None) -> dict[str, Any]:
     """Start (or bring to the front) the app the way its launcher icon does.
@@ -1054,6 +1170,7 @@ def launch_app(adb: str, serial: str, app_id: str,
     Returns ``{"mode": "resume", "component", "launch"}`` where `launch` is
     the `-W` report (`parse_am_wait`), or None when monkey had to be used.
     """
+    _guard_launch("android", adb, serial, app_id, activity)
     if activity:
         component = _component(app_id, activity)
         output = _am_start(adb, serial, ["-W", "-n", component], component, timeout=60)
@@ -1108,6 +1225,7 @@ def launch_app_fresh(adb: str, serial: str, app_id: str,
     component, so `--fresh --activity` no longer falls back to a resume.
     The `-W` launch report is returned under `launch` when there is one.
     """
+    _guard_launch("android", adb, serial, app_id, activity)
     if activity:
         component = _component(app_id, activity)
         output = _am_start(adb, serial, ["-W", "-n", component, "-f", FRESH_TASK_FLAGS],
@@ -1142,10 +1260,14 @@ def _with_launch(detail: dict[str, Any], output: str) -> dict[str, Any]:
 def force_stop(adb: str, serial: str, app_id: str) -> None:
     from . import adb as adb_mod
 
+    _guard_app("stop", "android", adb, serial, app_id)
+
     adb_mod.run_adb(adb, ["shell", "am", "force-stop", app_id], serial=serial, timeout=20, check=True)
 
 
 def clear_data(adb: str, serial: str, app_id: str) -> None:
     from . import adb as adb_mod
+
+    _guard_app("clear", "android", adb, serial, app_id)
 
     adb_mod.run_adb(adb, ["shell", "pm", "clear", app_id], serial=serial, timeout=30, check=True)

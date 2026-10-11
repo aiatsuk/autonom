@@ -170,6 +170,29 @@ CANVAS_NOT_FOUND = "canvas_not_found"  # no live Canvas matches --port/--workspa
 CANVAS_AMBIGUOUS = "canvas_ambiguous"  # several live Canvases and no --port or --workspace
 WORKSPACE_IN_USE = "workspace_in_use"  # another live Canvas already serves this workspace
 
+# --- Ticket pre-test (autonom pretest) -------------------------------------------
+# A pre-test is one ticket checked on a device inside a session. Report
+# integrity reuses REPORT_INTEGRITY_FAILED; a missing session reuses
+# NO_ACTIVE_SESSION; git or device failures reuse BACKEND_FAILED.
+NO_ACTIVE_PRETEST = "no_active_pretest"  # a pretest verb with no active pre-test in the session
+PRETEST_ALREADY_ACTIVE = "pretest_already_active"  # start while another pre-test is active (extra: pretest_id)
+PRETEST_FINALIZED = "pretest_finalized"  # a change to a packed pre-test; packs are immutable
+CHECK_ALREADY_OPEN = "check_already_open"  # check begin while another check is open (extra: open_check_id)
+NO_OPEN_CHECK = "no_open_check"  # check end for a check that is not the open one
+UNKNOWN_CHECK = "unknown_check"  # a check id the pre-test does not hold (extra: check_id)
+INVALID_VERDICT = "invalid_verdict"  # a check verdict outside pass|fail|blocked|not_covered|inconclusive
+UNKNOWN_FINDING = "unknown_finding"  # a finding id the pre-test or pack does not hold
+INVALID_SEVERITY = "invalid_severity"  # a finding severity outside blocker|major|minor|info
+EVIDENCE_REF_UNKNOWN = "evidence_ref_unknown"  # an evidence ref that names no session artifact (extra: ref)
+BUDGET_EXHAUSTED = "budget_exhausted"  # the pre-test's action or minute budget is used up; no input sent
+FORBIDDEN_ACTION = "forbidden_action"  # the target matches a forbidden text pattern, or cannot be read; no input sent
+APP_NOT_ALLOWED = "app_not_allowed"  # open or launch of an app outside the pre-test's allow list
+REVIEW_NEEDS_FINDING = "review_needs_finding"  # return-to-dev without a finding id
+NOT_AUTOMATIC = "not_automatic"  # confirm or dismiss of a finding that is not automatic
+PROFILE_INVALID = "profile_invalid"  # an app profile that does not parse or holds credential-shaped values
+NOT_A_PRETEST_PACK = "not_a_pretest_pack"  # a path that is not a finalized pre-test pack
+DRAFT_UNAVAILABLE = "draft_unavailable"  # no draft flow can be built or found for the finding
+
 class AutonomError(RuntimeError):
     """An expected failure with a stable code and an actionable hint."""
 

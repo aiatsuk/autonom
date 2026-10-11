@@ -1,0 +1,81 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autonom.dev/schemas/pretest-finding-v1.schema.json",
+  "title": "Autonom Ticket Pre-test Finding Event v1",
+  "description": "One line of pretests/<pretest_id>/findings.ndjson. $defs.state is the folded finding that status, pack, summary and review read.",
+  "type": "object",
+  "required": ["event", "finding_id", "ts", "journal_seq"],
+  "properties": {
+    "event": {"enum": ["add", "update"]},
+    "finding_id": {"type": "string", "pattern": "^f-[1-9][0-9]*$"},
+    "ts": {"type": "string", "minLength": 1},
+    "journal_seq": {"type": "integer", "minimum": 0}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"event": {"const": "add"}}},
+      "then": {
+        "required": ["check_id", "origin", "source", "severity", "title", "expected",
+                     "actual", "evidence", "confirmed", "data"],
+        "properties": {
+          "check_id": {"type": ["string", "null"], "pattern": "^chk-[1-9][0-9]*$"},
+          "origin": {"enum": ["agent", "auto"]},
+          "source": {"enum": [null, "crash", "log", "request", "metrics", "a11y", "analytics"]},
+          "severity": {"$ref": "#/$defs/severity"},
+          "title": {"type": "string", "minLength": 1},
+          "expected": {"type": ["string", "null"]},
+          "actual": {"type": "string", "minLength": 1},
+          "evidence": {"type": "array", "items": {"$ref": "#/$defs/ref"}},
+          "confirmed": {"type": "boolean"},
+          "data": {"type": "object"}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"event": {"const": "update"}}},
+      "then": {
+        "required": ["fields"],
+        "properties": {"fields": {"$ref": "#/$defs/fields"}}
+      }
+    }
+  ],
+  "$defs": {
+    "severity": {"enum": ["blocker", "major", "minor", "info"]},
+    "ref": {"type": "string", "pattern": "^(shot|tree|action|request|log|run|crash):.+$"},
+    "fields": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": false,
+      "properties": {
+        "reproduced": {"type": "string", "pattern": "^[0-9]+/[1-9][0-9]*$"},
+        "stability": {"enum": ["stable", "intermittent", "not_reproduced"]},
+        "repro_runs": {"type": "array", "items": {"type": "string"}},
+        "draft_flow": {"type": ["string", "null"]}
+      }
+    },
+    "state": {
+      "type": "object",
+      "required": ["finding_id", "check_id", "origin", "source", "severity", "title",
+                   "expected", "actual", "evidence", "confirmed", "data", "reproduced",
+                   "stability", "repro_runs", "draft_flow"],
+      "properties": {
+        "finding_id": {"type": "string", "pattern": "^f-[1-9][0-9]*$"},
+        "check_id": {"type": ["string", "null"]},
+        "origin": {"enum": ["agent", "auto"]},
+        "source": {"type": ["string", "null"]},
+        "severity": {"$ref": "#/$defs/severity"},
+        "title": {"type": "string"},
+        "expected": {"type": ["string", "null"]},
+        "actual": {"type": "string"},
+        "evidence": {"type": "array", "items": {"$ref": "#/$defs/ref"}},
+        "confirmed": {"type": "boolean"},
+        "data": {"type": "object"},
+        "created_at": {"type": "string"},
+        "reproduced": {"type": ["string", "null"]},
+        "stability": {"enum": [null, "stable", "intermittent", "not_reproduced"]},
+        "repro_runs": {"type": "array", "items": {"type": "string"}},
+        "draft_flow": {"type": ["string", "null"]}
+      }
+    }
+  }
+}

@@ -3,41 +3,23 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
-import tempfile
 from pathlib import Path
 from typing import Any
 
 from . import errors
+from .bundle_writer import BundleWriter, safe_relative, verify_tree
 from .contracts import (BUNDLE_SCHEMA, REPLAY_SCHEMA, canonical_json, fresh_id,
                         redact_value, sha256_bytes, sha256_file, utc_now)
 from . import report_model
 
-
-def _safe_relative(value: str) -> Path:
-    path = Path(value)
-    if path.is_absolute() or ".." in path.parts:
-        raise errors.AutonomError(
-            errors.PATH_FORBIDDEN,
-            "artifact path escapes the session evidence root", path=value)
-    return path
+# Kept for callers that imported the private name before the writer existed.
+_safe_relative = safe_relative
 
 
 def _write_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(canonical_json(value) + b"\n")
     os.chmod(path, 0o600)
-
-
-def _copy_blob(source: Path, root: Path) -> tuple[str, Path]:
-    digest = sha256_file(source)
-    relative = Path("blobs") / "sha256" / digest[:2] / digest
-    destination = root / relative
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    if not destination.exists():
-        shutil.copyfile(source, destination)
-        os.chmod(destination, 0o600)
-    return digest, relative
 
 
 def replay_manifest(model: dict[str, Any]) -> dict[str, Any]:
@@ -121,53 +103,37 @@ def build(manifest: dict[str, Any], *, artifacts_root: Path, out: Path,
             "output directory is non-empty and not an Autonom finalized bundle",
             hint="Choose an empty output directory.", bundle=str(out))
 
-    out.parent.mkdir(parents=True, exist_ok=True)
-    staging = Path(tempfile.mkdtemp(prefix=f".{out.name}.staging-", dir=out.parent))
-    try:
+    with BundleWriter(out) as writer:
         attachment_catalog: list[dict[str, Any]] = []
-        (staging / "flow/.autonom").mkdir(parents=True, exist_ok=True)
+        writer.ensure_dir("flow/.autonom")
         for source, relative in sources:
-            destination = staging / "flow" / relative
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(source, destination)
-            os.chmod(destination, 0o600)
+            writer.copy_file(source, Path("flow") / relative)
         for attachment in model.get("attachments") or []:
             relative_source = _safe_relative(attachment["path"])
             source = artifacts_root / relative_source
             row = dict(attachment)
             if source.is_file():
-                digest, blob_path = _copy_blob(source, staging)
-                row.update({"sha256": digest, "size": source.stat().st_size,
-                            "blob": blob_path.as_posix()})
+                blob = writer.add_blob(source)
+                row.update({"sha256": blob["sha256"], "size": blob["size"],
+                            "blob": blob["path"]})
             else:
                 row["availability"] = "unavailable"
                 row["reason"] = "artifact was listed but is not present"
             attachment_catalog.append(row)
         model["attachments"] = attachment_catalog
         model_hash = sha256_bytes(canonical_json(model))
-        _write_json(staging / "model/report.json", model)
-        _write_json(staging / "summary.json", report_model.summary(model))
-        _write_json(staging / "catalog.json", {"attachments": attachment_catalog})
-        _write_json(staging / "run.json", safe_manifest)
-        _write_json(staging / "replay.json", replay_manifest(model))
+        writer.write_json("model/report.json", model)
+        writer.write_json("summary.json", report_model.summary(model))
+        writer.write_json("catalog.json", {"attachments": attachment_catalog})
+        writer.write_json("run.json", safe_manifest)
+        writer.write_json("replay.json", replay_manifest(model))
         for step in model.get("steps") or []:
-            _write_json(staging / "steps" / f"{step['step_id']}.json", step)
+            writer.write_json(Path("steps") / f"{step['step_id']}.json", step)
 
         source_events = artifacts_root / "flows" / str(manifest["run_id"]) / "events.ndjson"
         if source_events.is_file():
-            stream = staging / "streams/events.ndjson"
-            stream.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(source_events, stream)
-            os.chmod(stream, 0o600)
+            writer.copy_file(source_events, "streams/events.ndjson")
 
-        files = []
-        for path in sorted(staging.rglob("*")):
-            if path.is_file():
-                files.append({"path": path.relative_to(staging).as_posix(),
-                              "sha256": sha256_file(path),
-                              "size": path.stat().st_size})
-        integrity = {"algorithm": "sha256", "files": files}
-        _write_json(staging / "integrity.json", integrity)
         descriptor = {
             "schema": BUNDLE_SCHEMA,
             "run_id": manifest["run_id"],
@@ -179,18 +145,7 @@ def build(manifest: dict[str, Any], *, artifacts_root: Path, out: Path,
             "integrity": "integrity.json",
             "finalized": True,
         }
-        _write_json(staging / "manifest.json", descriptor)
-        _write_json(staging / "finalized.json", {
-            "schema": "autonom.finalized/v1",
-            "model_sha256": model_hash,
-            "integrity_sha256": sha256_file(staging / "integrity.json"),
-        })
-        if out.exists():
-            out.rmdir()
-        staging.replace(out)
-    except Exception:
-        shutil.rmtree(staging, ignore_errors=True)
-        raise
+        writer.finalize(descriptor, finalized_fields={"model_sha256": model_hash})
     return {"bundle": str(out), "finalized": True, "idempotent": False,
             "model_sha256": model_hash,
             "attachments": len(attachment_catalog)}
@@ -238,14 +193,7 @@ def verify(bundle: Path) -> dict[str, Any]:
             errors.REPORT_INTEGRITY_FAILED,
             "report model digest does not match finalization record")
     integrity = json.loads(integrity_path.read_text(encoding="utf-8"))
-    failures = []
-    for item in integrity.get("files") or []:
-        relative = _safe_relative(item["path"])
-        path = bundle / relative
-        if not path.is_file():
-            failures.append({"path": item["path"], "reason": "missing"})
-        elif sha256_file(path) != item["sha256"]:
-            failures.append({"path": item["path"], "reason": "digest-mismatch"})
+    failures = verify_tree(bundle)
     if failures:
         raise errors.AutonomError(
             errors.REPORT_INTEGRITY_FAILED,
