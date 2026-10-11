@@ -1,0 +1,1 @@
+{"mcpServers": {"autonom-chatgpt-probe": {"command": "sh", "args": ["./bin/launch.sh"], "cwd": "."}}}

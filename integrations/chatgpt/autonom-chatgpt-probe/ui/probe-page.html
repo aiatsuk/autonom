@@ -1,0 +1,1965 @@
+<!doctype html>
+<html lang="en" data-probe-state="loading">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<title>Autonom probe</title>
+<style>
+/* Tokens: copied verbatim from the Canvas workspaceStyles() (light and dark), plus the probe's four. */
+:root{
+  color-scheme:light dark;
+  --bg:#f5f5f7;--surface:#fff;--raised:#fff;--text:#1d1d1f;--text-2:#6e6e73;--line:rgba(0,0,0,.09);--line-2:rgba(0,0,0,.14);
+  --fill:rgba(0,0,0,.045);--fill-2:rgba(0,0,0,.08);--accent:#0071e3;--accent-fill:#0071e3;--on-accent:#fff;--live:#1f9d55;--warn:#b25000;--idle:#8e8e93;--danger:#d70015;
+  --shadow:0 1px 1px rgba(0,0,0,.04),0 10px 30px rgba(0,0,0,.08);--material:rgba(255,255,255,.96);--r-sm:8px;--r-md:12px;
+  --font:-apple-system,BlinkMacSystemFont,"SF Pro Text","Helvetica Neue",system-ui,sans-serif;
+  --mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,monospace;
+  --pass:var(--live);--fail:var(--danger);--skip:var(--idle);--ease-out:cubic-bezier(.23,1,.32,1);
+}
+@media (prefers-color-scheme:dark){:root:not([data-theme=light]){
+  --bg:#0b0b0c;--surface:#161617;--raised:#1f1f21;--text:#f5f5f7;--text-2:#a1a1a6;--line:rgba(255,255,255,.09);--line-2:rgba(255,255,255,.16);
+  --fill:rgba(255,255,255,.06);--fill-2:rgba(255,255,255,.11);--accent:#0a84ff;--accent-fill:#0068d6;--live:#32d74b;--warn:#ff9f0a;--danger:#ff453a;
+  --shadow:0 1px 1px rgba(0,0,0,.4),0 12px 32px rgba(0,0,0,.45);--material:rgba(36,36,38,.95);
+}}
+:root[data-theme=dark]{
+  --bg:#0b0b0c;--surface:#161617;--raised:#1f1f21;--text:#f5f5f7;--text-2:#a1a1a6;--line:rgba(255,255,255,.09);--line-2:rgba(255,255,255,.16);
+  --fill:rgba(255,255,255,.06);--fill-2:rgba(255,255,255,.11);--accent:#0a84ff;--accent-fill:#0068d6;--live:#32d74b;--warn:#ff9f0a;--danger:#ff453a;
+  --shadow:0 1px 1px rgba(0,0,0,.4),0 12px 32px rgba(0,0,0,.45);--material:rgba(36,36,38,.95);
+}
+:root[data-theme=light]{color-scheme:light}
+:root[data-theme=dark]{color-scheme:dark}
+
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;background:var(--bg);color:var(--text);font:13px/1.4 var(--font);-webkit-font-smoothing:antialiased}
+[hidden]{display:none!important}
+button,textarea{font:inherit;color:inherit}
+button{cursor:pointer;-webkit-tap-highlight-color:transparent;touch-action:manipulation}
+button:disabled{cursor:default;opacity:.4}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+h2,h3,p{margin:0}
+.sr{position:absolute;width:1px;height:1px;margin:-1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+.ico{width:14px;height:14px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;flex:none}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;height:30px;padding:0 12px;border-radius:var(--r-sm);border:1px solid var(--line-2);
+  background:var(--raised);font-weight:500;white-space:nowrap;transition:transform .1s var(--ease-out),background-color .12s var(--ease-out)}
+.btn:not(:disabled):active{transform:scale(.97)}
+.btn.primary{background:var(--accent-fill);border-color:transparent;color:var(--on-accent)}
+.btn.primary:focus-visible{outline-color:var(--text)}
+.btn.small{height:28px;padding:0 10px;font-size:12px}
+@media (pointer:coarse){.btn,.btn.small{height:44px}}
+
+/* header and summary strip (DESIGN 3, 4) */
+.pb-bar{display:grid;grid-template-columns:minmax(0,1fr) auto;grid-template-areas:"brand run" "strip strip";align-items:center;column-gap:12px;
+  padding:0 16px;background:var(--surface);border-bottom:1px solid var(--line)}
+.pb-brand{grid-area:brand;display:flex;align-items:center;gap:10px;min-width:0;height:52px}
+.ws-mark{width:22px;height:22px;border-radius:6px;background:var(--text);color:var(--bg);display:grid;place-items:center;flex:none}
+.ws-mark svg{width:14px;height:14px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+.pb-brand b{font-size:14px;font-weight:600;white-space:nowrap}
+.pb-version{color:var(--text-2);font-variant-numeric:tabular-nums}
+.pb-run{grid-area:run;min-width:112px}
+.pb-strip{grid-area:strip;display:flex;flex-wrap:wrap;align-items:center;gap:8px 12px;margin:0 -16px;padding:10px 16px 12px;border-top:1px solid var(--line)}
+.pb-sum{flex:1 1 100%;min-width:0}
+.pb-summary{font-variant-numeric:tabular-nums}
+.pb-summary .danger{color:var(--danger)}
+.pb-saved{margin-top:2px;color:var(--text-2);font-size:11px;overflow-wrap:anywhere}
+.pb-actions{display:flex;flex-wrap:wrap;align-items:center;gap:8px}
+.pb-copy{min-width:156px}
+.pb-copybox{padding:0 16px 12px;background:var(--surface);border-bottom:1px solid var(--line)}
+.pb-copybox textarea{display:block;width:100%;padding:8px;border:1px solid var(--line-2);border-radius:var(--r-sm);background:var(--bg);font:11.5px/1.45 var(--mono);resize:vertical}
+.pb-copybox p{margin-top:6px;color:var(--text-2);font-size:12px}
+.pb-notice{margin:12px 16px 0;padding:10px 12px;border-radius:var(--r-md);background:var(--surface);border:1px solid var(--line-2);overflow-wrap:anywhere}
+.pb-notice[data-kind=error]{border-color:color-mix(in srgb,var(--danger) 45%,transparent)}
+.pb-notice code{font:11.5px var(--mono)}
+
+/* page grid: narrow puts the media card above the matrix; wide puts it in a sticky right column */
+.pb-main{display:grid;gap:16px;max-width:720px;margin:0 auto;padding:16px;grid-template-columns:minmax(0,1fr);grid-template-areas:"side" "col"}
+.pb-col{grid-area:col;display:grid;gap:16px;min-width:0}
+.pb-side{grid-area:side;display:grid;gap:16px;min-width:0;align-content:start}
+.pb-card{background:var(--surface);border:1px solid var(--line);border-radius:var(--r-md)}
+.pb-card-head{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:12px 12px 8px}
+.pb-card h2{font-size:14px;font-weight:600}
+.pb-caption{padding:0 12px 8px;color:var(--text-2);font-size:11px;overflow-wrap:anywhere}
+
+/* rows: one button per row toggles the detail (DESIGN 4, 8) */
+.pb-rows{list-style:none;margin:0;padding:0}
+.pb-item{border-top:1px solid var(--line)}
+.pb-grid{display:grid;grid-template-columns:minmax(0,1fr) 80px 80px 16px;align-items:center;column-gap:8px}
+.pb-mhead-col{color:var(--text-2);font-size:11px}
+.pb-row{width:100%;min-height:40px;padding:0 12px;border:0;border-radius:0;background:none;text-align:left}
+.pb-row:focus-visible{outline-offset:-2px}
+.pb-hrow{display:grid;grid-template-columns:14px minmax(0,1fr) auto 16px;align-items:center;column-gap:8px}
+.pb-label{font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
+.pb-cell{display:flex;align-items:center;gap:6px;min-width:0;color:var(--text-2);font-size:12px;font-variant-numeric:tabular-nums;white-space:nowrap}
+.pb-val{color:var(--text-2);font-size:12px;font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:22ch;justify-self:end}
+.pb-val.mono{font:11.5px var(--mono)}
+.pb-chev{width:12px;height:12px;justify-self:end;color:var(--text-2);fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;transition:transform 160ms var(--ease-out)}
+.pb-row[aria-expanded=true] .pb-chev{transform:rotate(90deg)}
+.pb-glyph{width:14px;height:14px;display:grid;place-items:center;flex:none}
+.pb-glyph svg{width:14px;height:14px;display:block}
+.g-fill-pass{fill:var(--pass)}
+.g-fill-fail{fill:var(--fail)}
+.g-mark{fill:none;stroke:#fff;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
+.g-skip{fill:none;stroke:var(--skip);stroke-width:1.3;stroke-dasharray:2.2 1.9}
+.pb-spin{width:12px;height:12px;border-radius:50%;border:1.5px solid color-mix(in srgb,var(--text-2) 30%,transparent);border-top-color:var(--text-2);animation:pb-spin .8s linear infinite}
+@keyframes pb-spin{to{transform:rotate(360deg)}}
+.pb-detail{padding:2px 12px 12px;animation:pb-fade 160ms var(--ease-out)}
+@keyframes pb-fade{from{opacity:0}to{opacity:1}}
+.pb-desc{color:var(--text-2);max-width:75ch}
+.pb-route-details{display:grid;gap:12px;margin-top:10px}
+.pb-route-detail h3{font-size:12px;font-weight:600}
+.pb-kv{display:grid;grid-template-columns:auto minmax(0,1fr);gap:2px 12px;margin:6px 0 0;font-size:12px}
+.pb-kv dt{color:var(--text-2)}
+.pb-kv dd{margin:0;overflow-wrap:anywhere;font-variant-numeric:tabular-nums}
+.pb-err{margin-top:6px;font:11.5px/1.45 var(--mono);overflow-wrap:anywhere}
+.pb-clue{margin-top:2px;color:var(--text-2);font-size:12px}
+.pb-again{margin-top:8px}
+.pb-manual{padding:0 12px 12px 34px}
+.pb-manual p{margin-bottom:8px;max-width:75ch}
+.pb-manual-actions{display:flex;flex-wrap:wrap;gap:8px}
+.pb-foot{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:10px 12px;border-top:1px solid var(--line);color:var(--text-2);font-size:12px}
+
+/* remote origin picker (.ws-menu style) */
+.pb-picker{position:relative}
+.pb-pick{display:inline-flex;align-items:center;gap:2px;height:24px;padding:0 4px;margin-left:-4px;border:0;border-radius:6px;background:none;color:var(--text-2);font-size:11px}
+.pb-pick svg{width:10px;height:10px}
+.pb-menu{position:absolute;top:calc(100% + 6px);right:0;z-index:6;min-width:220px;padding:6px;border-radius:var(--r-md);background:var(--material);
+  -webkit-backdrop-filter:blur(24px) saturate(1.6);backdrop-filter:blur(24px) saturate(1.6);border:1px solid var(--line-2);box-shadow:var(--shadow)}
+.pb-menu-item{display:grid;grid-template-columns:14px minmax(0,1fr);align-items:center;column-gap:8px;width:100%;min-height:32px;padding:4px 10px;border:0;border-radius:7px;background:none;text-align:left;font-size:13px}
+.pb-menu-item small{grid-column:2;color:var(--text-2);font:11px var(--mono);overflow-wrap:anywhere}
+.pb-menu-item:focus{outline:none}
+.pb-menu-item:focus-visible{background:var(--accent-fill);color:var(--on-accent)}
+.pb-menu-item:focus-visible small{color:inherit}
+@media (pointer:coarse){.pb-menu-item{min-height:44px}}
+@supports not ((backdrop-filter:blur(1px)) or (-webkit-backdrop-filter:blur(1px))){:root{--material:var(--raised)}}
+
+/* media card (DESIGN 4) */
+.pb-media{display:flex;gap:12px;align-items:flex-start;padding:12px}
+.pb-tile{position:relative;flex:none;width:96px;aspect-ratio:9/19.5;background:#000;border:1px solid var(--line);border-radius:var(--r-md);overflow:hidden}
+.pb-tile canvas{display:block;width:100%;height:100%;object-fit:contain}
+.pb-tile[data-state=idle],.pb-tile[data-state=connecting],.pb-tile[data-state=unsupported]{background:var(--fill)}
+.pb-tile[data-state=idle] canvas,.pb-tile[data-state=connecting] canvas,.pb-tile[data-state=unsupported] canvas{visibility:hidden}
+.pb-tile-state{position:absolute;inset:0;display:grid;place-items:center;align-content:center;gap:6px;padding:8px;text-align:center;color:var(--text-2);font-size:11px}
+.pb-tile[data-state=stalled] .pb-tile-state{background:color-mix(in srgb,var(--bg) 50%,transparent);color:var(--text)}
+.pb-media-body{display:grid;gap:10px;min-width:0;flex:1}
+.pb-media-title{font-weight:500;overflow-wrap:anywhere}
+.pb-readouts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px 12px}
+.pb-ro{min-width:0}
+.pb-ro b{display:block;font-size:15px;font-weight:600;font-variant-numeric:tabular-nums;white-space:nowrap}
+.pb-ro span{display:block;color:var(--text-2);font-size:11px}
+.pb-switch{display:none;align-items:center;gap:2px;padding:2px;border-radius:var(--r-sm);background:var(--fill);width:max-content}
+.pb-switch button{height:26px;padding:0 12px;border:0;border-radius:6px;background:none;color:var(--text-2);font-weight:500}
+.pb-switch button[aria-pressed=true]{background:var(--raised);color:var(--text);box-shadow:0 1px 2px rgba(0,0,0,.12)}
+.pb-env{display:none;padding:12px;border-top:1px solid var(--line)}
+.pb-env h2{font-size:14px;font-weight:600}
+
+@media (hover:hover){
+  .btn:not(.primary):not(:disabled):hover,.pb-pick:not(:disabled):hover{background:var(--fill-2)}
+  .pb-row:hover{background:var(--fill)}
+  .pb-menu-item:hover{background:var(--accent-fill);color:var(--on-accent)}
+  .pb-menu-item:hover small{color:inherit}
+  .pb-switch button:not([aria-pressed=true]):hover{color:var(--text)}
+}
+@media (pointer:coarse){.pb-row{min-height:44px}}
+@media (min-width:640px){.pb-grid{grid-template-columns:minmax(0,1fr) 96px 96px 20px}}
+@media (min-width:900px){
+  .pb-bar{position:sticky;top:0;z-index:5;grid-template-columns:auto minmax(0,1fr) auto;grid-template-areas:"brand strip run";min-height:52px}
+  .pb-strip{flex-wrap:nowrap;margin:0;padding:8px 0;border-top:0}
+  .pb-sum{flex:1 1 auto}
+  .pb-main{max-width:none;grid-template-columns:minmax(0,1fr) 340px;grid-template-areas:"col side";align-items:start}
+  .pb-side{position:sticky;top:68px}
+  .pb-media{flex-direction:column;align-items:stretch}
+  .pb-tile{width:max(96px,min(280px,100%,calc((100vh - 330px) * 9 / 19.5)));margin:0 auto}
+  .pb-switch{display:flex}
+  .pb-env{display:block}
+  .pb-route-details{grid-template-columns:repeat(2,minmax(0,1fr))}
+}
+@media (prefers-reduced-motion:reduce){
+  *,*::before,*::after{animation:none!important;transition:none!important}
+  .btn:active{transform:none!important}
+  .pb-spin{width:auto;height:auto;border:0;border-radius:0;color:var(--text-2);font-size:12px;line-height:1}
+  .pb-spin::after{content:"\2026"}
+}
+</style>
+</head>
+<body>
+<header class="pb-bar">
+  <div class="pb-brand"><span class="ws-mark" aria-hidden="true"><svg viewBox="0 0 24 24" focusable="false"><path d="M7 4h10a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2Z"/><path d="M10 17h4"/></svg></span><b>Autonom probe</b><span class="pb-version" id="pb-version">0.1.0</span></div>
+  <div class="pb-strip">
+    <div class="pb-sum">
+      <p class="pb-summary" id="pb-summary" role="status" aria-live="polite">27 checks ready. Run all takes about 30 s.</p>
+      <p class="pb-saved" id="pb-saved" hidden></p>
+    </div>
+    <div class="pb-actions">
+      <button type="button" class="btn pb-copy" id="pb-copy">Copy results JSON</button>
+      <button type="button" class="btn" id="pb-send">Send to chat</button>
+    </div>
+  </div>
+  <button type="button" class="btn primary pb-run" id="pb-run">Run all</button>
+</header>
+<div class="pb-copybox" id="pb-copybox" hidden>
+  <label class="sr" for="pb-json">Results JSON</label>
+  <textarea id="pb-json" rows="8" readonly spellcheck="false"></textarea>
+  <p>Press ⌘C to copy.</p>
+</div>
+<p class="pb-notice" id="pb-notice" hidden></p>
+<main class="pb-main">
+  <div class="pb-col">
+    <section class="pb-card" aria-labelledby="pb-routes-title">
+      <div class="pb-grid pb-card-head">
+        <h2 id="pb-routes-title">Routes</h2>
+        <span class="pb-mhead-col">Local</span>
+        <div class="pb-picker">
+          <button type="button" class="pb-pick" id="pb-pick" aria-haspopup="menu" aria-expanded="false" aria-controls="pb-menu">Remote<svg class="ico" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="m7 10 5 5 5-5"/></svg></button>
+          <div class="pb-menu" id="pb-menu" role="menu" aria-label="Remote origin" hidden></div>
+        </div>
+        <span></span>
+      </div>
+      <p class="pb-caption" id="pb-route-caption"></p>
+      <ul class="pb-rows" id="pb-matrix">
+        <li class="pb-item" data-row="fetch" data-local="net.fetch.local" data-remote="net.fetch.remote"></li>
+        <li class="pb-item" data-row="ws" data-local="net.ws.local" data-remote="net.ws.remote"></li>
+        <li class="pb-item" data-row="input" data-local="input.rtt.local" data-remote="input.rtt.remote"></li>
+        <li class="pb-item" data-row="decode" data-local="media.decode.local" data-remote="media.decode.remote"></li>
+        <li class="pb-item" data-row="reconnect" data-local="net.reconnect.local" data-remote="net.reconnect.remote"></li>
+        <li class="pb-item" data-row="csp" data-local="net.csp.local" data-remote="net.csp.remote"></li>
+      </ul>
+    </section>
+    <section class="pb-card" aria-labelledby="pb-host-title">
+      <div class="pb-card-head"><h2 id="pb-host-title">Host and bridge</h2></div>
+      <ul class="pb-rows" id="pb-host">
+        <li class="pb-item" data-check="host.init"></li>
+        <li class="pb-item" data-check="host.entry"></li>
+        <li class="pb-item" data-check="host.theme"></li>
+        <li class="pb-item" data-check="host.size"></li>
+        <li class="pb-item" data-check="bridge.read"></li>
+        <li class="pb-item" data-check="bridge.write"></li>
+        <li class="pb-item" data-check="bridge.error"></li>
+        <li class="pb-item" data-check="bridge.stale"></li>
+        <li class="pb-item" data-check="bridge.context"></li>
+        <li class="pb-item" data-check="bridge.message"></li>
+        <li class="pb-item" data-check="bridge.media"></li>
+        <li class="pb-item" data-check="model.tool"></li>
+        <li class="pb-item" data-check="media.webcodecs"></li>
+      </ul>
+    </section>
+    <section class="pb-card" aria-labelledby="pb-devices-title">
+      <div class="pb-card-head"><h2 id="pb-devices-title">Fixture devices</h2></div>
+      <ul class="pb-rows" id="pb-devices">
+        <li class="pb-item" data-check="device.android.local"></li>
+        <li class="pb-item" data-check="device.ios.remote"></li>
+      </ul>
+      <div class="pb-foot"><span>Uses the allowed test devices only. Run all never runs these.</span><button type="button" class="btn small" id="pb-run-devices">Run device checks</button></div>
+    </section>
+  </div>
+  <aside class="pb-side" aria-label="Media and environment">
+    <section class="pb-card" aria-labelledby="pb-media-title">
+      <div class="pb-media">
+        <div class="pb-tile" id="pb-tile" data-state="idle">
+          <canvas id="pb-canvas" width="96" height="208" role="img" aria-label="Decoded test pattern"></canvas>
+          <div class="pb-tile-state" id="pb-tile-state">Video starts with the decode check</div>
+        </div>
+        <div class="pb-media-body">
+          <p class="pb-media-title" id="pb-media-title">Video decode · Local</p>
+          <div class="pb-switch" role="group" aria-label="Stream route">
+            <button type="button" id="pb-switch-local" aria-pressed="true">Local</button>
+            <button type="button" id="pb-switch-remote" aria-pressed="false">Remote</button>
+          </div>
+          <div class="pb-readouts">
+            <div class="pb-ro"><b id="pb-ro-fps">–</b><span>fps</span></div>
+            <div class="pb-ro"><b id="pb-ro-decode">–</b><span>decode ms, median</span></div>
+            <div class="pb-ro"><b id="pb-ro-input">–</b><span>input ms, median</span></div>
+            <div class="pb-ro"><b id="pb-ro-p95">–</b><span>input ms, p95</span></div>
+            <div class="pb-ro"><b id="pb-ro-age">–</b><span id="pb-ro-age-label">frame age ms</span></div>
+          </div>
+        </div>
+      </div>
+      <div class="pb-env">
+        <h2 id="pb-env-title">Environment</h2>
+        <dl class="pb-kv" id="pb-env" aria-labelledby="pb-env-title"></dl>
+      </div>
+    </section>
+  </aside>
+</main>
+<script type="application/json" id="probe-config">__PROBE_CONFIG_JSON__</script>
+<!-- PROBE_CORE -->
+<script type="module">
+// Probe page view: bridge, checks, rendering. Pure logic lives in the core module (globalThis.AutonomProbeCore).
+let core = globalThis.AutonomProbeCore;
+if (!core) {
+  try {
+    await import("./probe-core.mjs");
+    core = globalThis.AutonomProbeCore;
+  } catch {
+    core = null;
+  }
+}
+const $ = (id) => document.getElementById(id);
+const html = document.documentElement;
+
+if (!core) {
+  const notice = $("pb-notice");
+  notice.textContent = "The probe core script is missing, so no check can run.";
+  notice.dataset.kind = "error";
+  notice.hidden = false;
+  html.dataset.probeState = "broken";
+} else {
+  startProbe(core);
+}
+
+function startProbe(C) {
+  const now = () => performance.now();
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const DEVICE_IDS = ["device.android.local", "device.ios.remote"];
+  const MANUAL_REASONS = new Set([C.REASONS.contextOperator, C.REASONS.modelOperator, C.REASONS.entryOperator]);
+  const GLYPHS = {
+    pass: '<svg viewBox="0 0 14 14" aria-hidden="true" focusable="false"><circle class="g-fill-pass" cx="7" cy="7" r="7"/><path class="g-mark" d="M4.1 7.3l1.9 1.9 3.9-4.3"/></svg>',
+    fail: '<svg viewBox="0 0 14 14" aria-hidden="true" focusable="false"><circle class="g-fill-fail" cx="7" cy="7" r="7"/><path class="g-mark" d="M4.8 4.8l4.4 4.4M9.2 4.8l-4.4 4.4"/></svg>',
+    skip: '<svg viewBox="0 0 14 14" aria-hidden="true" focusable="false"><circle class="g-skip" cx="7" cy="7" r="6.2"/></svg>',
+    running: '<span class="pb-spin" aria-hidden="true"></span>',
+  };
+  const CHEVRON = '<svg class="pb-chev" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="m9 6 6 6-6 6"/></svg>';
+  const CHECK_ICON = '<svg class="ico" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="m5 12.5 4.5 4.5L19 7.5"/></svg>';
+
+  // ------------------------------------------------------------------------------------------- state
+  const config = readConfig();
+  const S = {
+    inHost: window.parent !== window,
+    bridge: null,
+    toolPath: null,
+    init: { state: "pending", result: null, error: null, ms: null, clue: null },
+    hostContext: {},
+    theme: null,
+    themeChanges: 0,
+    workspace: null,
+    tokenPath: null,
+    token: null,
+    nonce: null,
+    selection: { target_ref: null, revision: 0 },
+    noteRevision: null,
+    lastRead: null,
+    serverInfo: null,
+    remote: null,
+    remoteChosen: false,
+    run: C.createRun(),
+    running: false,
+    progress: { done: 0, total: 0 },
+    attempted: { local: false, remote: false },
+    violations: [],
+    extra: {},
+    entryByOperator: null,
+    rtt: { local: null, remote: null },
+    phase: "loading",
+  };
+  let readyResolve;
+  const ready = new Promise((resolve) => { readyResolve = resolve; });
+  let workspaceWaiter = null;
+
+  function readConfig() {
+    const fallback = { probe_version: C.PROBE_VERSION, local_origin: null, remote_routes: [], allowed_devices: [], media_port: 47811 };
+    try {
+      const parsed = JSON.parse($("probe-config").textContent);
+      return parsed && typeof parsed === "object" ? { ...fallback, ...parsed } : fallback;
+    } catch {
+      return fallback;
+    }
+  }
+
+  function localOrigin() {
+    const fromWorkspace = S.workspace && S.workspace.media.local_origin;
+    const fromConfig = C.originOf(config.local_origin);
+    const port = Number(config.media_port) || 47811;
+    return fromWorkspace || fromConfig || C.originOf(`http://127.0.0.1:${port}`);
+  }
+  function remoteRoutes() {
+    const fromWorkspace = S.workspace ? S.workspace.media.remote_routes : [];
+    return fromWorkspace.length ? fromWorkspace : C.remoteChoices(config.remote_routes);
+  }
+  function allowedDevices() {
+    const fromWorkspace = S.workspace ? S.workspace.media.allowed_devices : [];
+    return fromWorkspace.length ? fromWorkspace : (Array.isArray(config.allowed_devices) ? config.allowed_devices : []);
+  }
+  function routeOrigin(route) {
+    return route === "local" ? localOrigin() : (S.remote ? S.remote.origin : null);
+  }
+
+  // CSP violations are counted from page load (net.csp.<route>).
+  document.addEventListener("securitypolicyviolation", (event) => {
+    if (S.violations.length < 500) {
+      S.violations.push({ blockedURI: String(event.blockedURI || ""), directive: String(event.effectiveDirective || event.violatedDirective || "") });
+    }
+  });
+
+  function cspClue(origin) {
+    return C.cspCountFor(S.violations, origin) > 0 ? "csp:connect-src" : null;
+  }
+
+  // ------------------------------------------------------------------------------------------- theme
+  function applyTheme(theme) {
+    if (theme === "light" || theme === "dark") html.dataset.theme = theme;
+    else delete html.dataset.theme;
+  }
+  function currentTheme() {
+    if (html.dataset.theme) return html.dataset.theme;
+    return window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+  }
+  function applyHostContext(ctx, { change = false } = {}) {
+    if (!ctx || typeof ctx !== "object") return;
+    const before = S.theme;
+    S.hostContext = { ...S.hostContext, ...ctx };
+    if (ctx.theme === "light" || ctx.theme === "dark") {
+      if (change && before && before !== ctx.theme) S.themeChanges += 1;
+      S.theme = ctx.theme;
+      applyTheme(ctx.theme);
+      const record = S.run.checks["host.theme"];
+      if (record.status === "pass") record.value = ctx.theme;
+    }
+    if (change && S.run.checks["host.size"].status === "pass") {
+      const size = sizeValue();
+      if (size.ok) S.run.checks["host.size"].value = size.text;
+    }
+    renderAll();
+  }
+
+  // ------------------------------------------------------------------------------------------- bridge
+  async function boot() {
+    renderAll();
+    if (!S.inHost) {
+      S.init.state = "outside";
+      showNotice("Not running inside ChatGPT. Host and bridge checks are not exercised.", "info");
+      finishBoot();
+      return;
+    }
+    const bridge = new C.BridgeClient({
+      post: (message) => window.parent.postMessage(message, "*"),
+      addListener: (handler) => window.addEventListener("message", handler),
+      parent: window.parent,
+      timeoutMs: 8000,
+    });
+    S.bridge = bridge;
+    bridge.onNotification("ui/notifications/tool-input", () => {});
+    bridge.onNotification("ui/notifications/tool-result", (params) => {
+      if (C.isOpenWorkspaceResult(params)) adoptWorkspace(params, "tool-result");
+    });
+    bridge.onNotification("ui/notifications/host-context-changed", (params) => applyHostContext(params, { change: true }));
+    bridge.onRequest("ui/resource-teardown", () => {
+      teardown();
+      return {};
+    });
+    const started = now();
+    try {
+      const result = await bridge.request("ui/initialize", C.initializeParams(config.probe_version || C.PROBE_VERSION), { timeoutMs: 8000 });
+      S.init = { state: "ok", result: result || {}, error: null, ms: now() - started, clue: null };
+      S.toolPath = "bridge";
+      bridge.notify("ui/notifications/initialized", {});
+      applyHostContext((result && result.hostContext) || {});
+      watchSize();
+      if (!S.workspace) {
+        await new Promise((resolve) => {
+          workspaceWaiter = resolve;
+          setTimeout(resolve, 2000);
+        });
+        workspaceWaiter = null;
+      }
+      if (!S.workspace) await selfCallOpenWorkspace();
+    } catch (error) {
+      S.init = { state: "failed", result: null, error: errorOf(error, "bridge_error"), ms: now() - started, clue: null };
+      const openai = window.openai;
+      if (openai && typeof openai.callTool === "function") {
+        S.toolPath = "openai";
+        S.init.clue = "openai-globals-only";
+        if (openai.theme === "light" || openai.theme === "dark") {
+          S.theme = openai.theme;
+          applyTheme(openai.theme);
+        }
+        if (openai.toolResponseMetadata || openai.toolOutput) {
+          const result = { structuredContent: openai.toolOutput, _meta: openai.toolResponseMetadata };
+          if (C.isOpenWorkspaceResult(result)) adoptWorkspace(result, "openai-globals");
+        }
+        if (!S.workspace) await selfCallOpenWorkspace();
+      } else {
+        showNotice("The host did not answer ui/initialize. Host and bridge checks cannot run.", "error");
+      }
+    }
+    if (S.nonce && S.toolPath === "bridge") sendContext().catch(() => {});
+    finishBoot();
+  }
+
+  function finishBoot() {
+    S.phase = "ready";
+    html.dataset.probeState = "ready";
+    readyResolve();
+    renderAll();
+  }
+
+  async function selfCallOpenWorkspace() {
+    try {
+      const result = await callTool("open_workspace", {});
+      adoptWorkspace(result, "self-call");
+    } catch (error) {
+      S.extra["host.init"] = [["open_workspace", `${error.code || "bridge_error"}: ${error.message || ""}`]];
+    }
+  }
+
+  function adoptWorkspace(result, path) {
+    const ws = C.readOpenWorkspace(result);
+    if (!ws.ok && !ws.media_token && !ws.context_nonce) {
+      S.extra["host.init"] = [["open_workspace", "returned ok:false"]];
+      return;
+    }
+    S.workspace = ws;
+    if (!S.tokenPath || ws.media_token) S.tokenPath = path;
+    if (ws.media_token) S.token = ws.media_token;
+    if (ws.context_nonce) S.nonce = ws.context_nonce;
+    S.selection = ws.selection;
+    if (S.noteRevision === null) S.noteRevision = ws.note.revision;
+    if (!S.remoteChosen) {
+      const routes = remoteRoutes();
+      if (!S.remote || !routes.some((r) => r.label === S.remote.label && r.origin === S.remote.origin)) S.remote = routes.length ? routes[0] : null;
+    }
+    if (ws.media.state === "failed") {
+      const port = ws.media.port || config.media_port;
+      showNotice(`The probe server at 127.0.0.1:${port} did not answer${ws.media.error ? ` (${ws.media.error})` : ""}. ` +
+        `${ws.media.hint || "Start it by opening the probe again (open_workspace)."}`, "error");
+    }
+    if (workspaceWaiter) workspaceWaiter();
+    renderAll();
+  }
+
+  async function callTool(name, args = {}) {
+    if (S.toolPath === "bridge") return S.bridge.request("tools/call", { name, arguments: args }, { timeoutMs: 45000 });
+    if (S.toolPath === "openai") {
+      let timer;
+      try {
+        return await Promise.race([
+          window.openai.callTool(name, args),
+          new Promise((_, reject) => { timer = setTimeout(() => reject(new C.BridgeError("bridge_timeout", `${name}: no answer within 45 s`)), 45000); }),
+        ]);
+      } catch (error) {
+        throw error instanceof C.BridgeError ? error : new C.BridgeError("bridge_error", `${name}: ${error && error.message ? error.message : "callTool failed"}`);
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+    throw new C.BridgeError("bridge_error", "No tool path: ui/initialize failed and window.openai is absent");
+  }
+
+  function sendContext() {
+    if (S.toolPath !== "bridge" || !S.nonce) return Promise.resolve(null);
+    return S.bridge.request("ui/update-model-context", C.contextParams(S.nonce, S.selection), { timeoutMs: 8000 });
+  }
+
+  let sizeTimer = null;
+  function watchSize() {
+    if (typeof ResizeObserver !== "function") return;
+    let last = "";
+    new ResizeObserver(() => {
+      clearTimeout(sizeTimer);
+      sizeTimer = setTimeout(() => {
+        const width = Math.ceil(document.documentElement.scrollWidth);
+        const height = Math.ceil(document.documentElement.scrollHeight);
+        const key = `${width}x${height}`;
+        if (key !== last && S.bridge) {
+          last = key;
+          try { S.bridge.notify("ui/notifications/size-changed", { width, height }); } catch { /* parent gone */ }
+        }
+      }, 200);
+    }).observe(document.body);
+  }
+
+  function teardown() {
+    feed.stop();
+    if (deviceSock) deviceSock.close(1000);
+  }
+
+  // --------------------------------------------------------------------------------------- helpers
+  function errorOf(error, fallbackCode) {
+    if (error && typeof error === "object" && typeof error.code === "string" && C.ERROR_CODE_PATTERN.test(error.code)) {
+      return { code: error.code, message: redactText(error.message || error.code), clue: error.clue || null };
+    }
+    return { code: fallbackCode, message: redactText(error && error.message ? error.message : String(error)), clue: null };
+  }
+  function redactText(text) {
+    return C.redact(String(text || ""), S.token ? [S.token] : []).replace(/bearer\./gi, "bearer_");
+  }
+  const pass = (value = null, unit = null) => ({ status: "pass", value, unit });
+  const fail = (code, message, clue = null, value = null) => ({ status: "fail", error: { code, message: redactText(message), clue }, value });
+  const skip = (reason, value = null) => ({ status: "not_exercised", reason, value });
+
+  function toolFailure(outcome, name) {
+    const sc = outcome.sc || {};
+    const detail = [sc.error_code, sc.error].filter(Boolean).join(": ") || "isError";
+    return fail("tool_error", `${name}: ${detail}`);
+  }
+
+  // A WebSocket with a message backlog, so checks can await specific messages.
+  class Sock {
+    constructor(url, protocols) {
+      this.ws = new WebSocket(url, protocols);
+      this.ws.binaryType = "arraybuffer";
+      this.backlog = [];
+      this.waiters = [];
+      this.onBinary = null;
+      this.onText = null;
+      this.onClose = null;
+      this.closeEvent = null;
+      this.isOpen = false;
+      this.ws.addEventListener("message", (event) => {
+        if (typeof event.data === "string") {
+          let msg;
+          try { msg = JSON.parse(event.data); } catch { return; }
+          if (!msg || typeof msg !== "object") return;
+          if (this.onText) this.onText(msg);
+          const waiter = this.waiters.find((w) => w.pred(msg));
+          if (waiter) {
+            this.waiters.splice(this.waiters.indexOf(waiter), 1);
+            clearTimeout(waiter.timer);
+            waiter.resolve(msg);
+          } else if (this.backlog.length < 200) {
+            this.backlog.push(msg);
+          }
+        } else if (this.onBinary) {
+          this.onBinary(event.data);
+        }
+      });
+      this.ws.addEventListener("open", () => { this.isOpen = true; });
+      this.ws.addEventListener("close", (event) => {
+        this.closeEvent = { code: event.code, reason: event.reason, wasClean: event.wasClean };
+        for (const w of this.waiters.splice(0)) {
+          clearTimeout(w.timer);
+          w.reject(Object.assign(new Error(`socket closed ${event.code}`), { closed: true }));
+        }
+        if (this.onClose) this.onClose(this.closeEvent);
+      });
+    }
+    opened(timeoutMs) {
+      if (this.isOpen) return Promise.resolve(this);
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          try { this.ws.close(); } catch { /* ignore */ }
+          reject({ code: "ws_closed_before_open", message: `no open within ${Math.round(timeoutMs / 1000)} s` });
+        }, timeoutMs);
+        this.ws.addEventListener("open", () => { clearTimeout(timer); resolve(this); }, { once: true });
+        this.ws.addEventListener("close", (event) => {
+          clearTimeout(timer);
+          reject({ code: "ws_closed_before_open", message: `closed ${event.code} before open` });
+        }, { once: true });
+      });
+    }
+    waitText(pred, timeoutMs) {
+      const index = this.backlog.findIndex(pred);
+      if (index >= 0) return Promise.resolve(this.backlog.splice(index, 1)[0]);
+      if (this.closeEvent) return Promise.reject(Object.assign(new Error(`socket closed ${this.closeEvent.code}`), { closed: true }));
+      return new Promise((resolve, reject) => {
+        const waiter = { pred, resolve, reject, timer: null };
+        waiter.timer = setTimeout(() => {
+          const at = this.waiters.indexOf(waiter);
+          if (at >= 0) this.waiters.splice(at, 1);
+          reject(Object.assign(new Error("timeout"), { timeout: true }));
+        }, timeoutMs);
+        this.waiters.push(waiter);
+      });
+    }
+    send(obj) {
+      if (this.ws.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify(obj));
+    }
+    close(code = 1000, timeoutMs = 2000) {
+      if (this.closeEvent) return Promise.resolve(this.closeEvent);
+      return new Promise((resolve) => {
+        const timer = setTimeout(() => resolve(this.closeEvent || { code: null, reason: "close timeout", wasClean: false }), timeoutMs);
+        this.ws.addEventListener("close", () => { clearTimeout(timer); resolve(this.closeEvent); }, { once: true });
+        try { this.ws.close(code); } catch { /* already closing */ }
+      });
+    }
+  }
+
+  // A decoder bound to one canvas draw callback; Annex B chunks, no description (5.5).
+  function makeDecoder(onFrame, onError) {
+    const started = new Map();
+    const decoder = new VideoDecoder({
+      output: (frame) => {
+        const t0 = started.get(frame.timestamp);
+        started.delete(frame.timestamp);
+        try {
+          onFrame(frame, t0 === undefined ? null : now() - t0);
+        } finally {
+          frame.close();
+        }
+      },
+      error: (error) => onError(error),
+    });
+    return {
+      decoder,
+      configure(codec) {
+        decoder.configure({ codec, optimizeForLatency: true });
+      },
+      decode(seq, key, data) {
+        if (decoder.state !== "configured") return false;
+        const timestamp = seq * 33333;
+        started.set(timestamp, now());
+        if (started.size > 120) started.delete(started.keys().next().value);
+        decoder.decode(new EncodedVideoChunk({ type: key ? "key" : "delta", timestamp, data }));
+        return true;
+      },
+      close() {
+        try { if (decoder.state !== "closed") decoder.close(); } catch { /* closed */ }
+      },
+    };
+  }
+
+  // ----------------------------------------------------------------------------------- media card
+  const tile = {
+    el: $("pb-tile"),
+    canvas: $("pb-canvas"),
+    label: $("pb-tile-state"),
+    ctx: null,
+    state: "idle",
+    lastDrawAt: 0,
+    draw(frame) {
+      const w = frame.displayWidth || frame.codedWidth;
+      const h = frame.displayHeight || frame.codedHeight;
+      if (this.canvas.width !== w || this.canvas.height !== h) {
+        this.canvas.width = w;
+        this.canvas.height = h;
+        this.ctx = null;
+      }
+      if (!this.ctx) this.ctx = this.canvas.getContext("2d");
+      this.ctx.drawImage(frame, 0, 0, w, h);
+      this.lastDrawAt = now();
+      if (this.state !== "live") this.set("live");
+    },
+    set(state, text) {
+      this.state = state;
+      this.el.dataset.state = state;
+      const labels = { idle: "Video starts with the decode check", connecting: "", unsupported: "This host has no WebCodecs decoder" };
+      this.label.replaceChildren();
+      if (state === "connecting") {
+        const spin = document.createElement("span");
+        spin.className = "pb-spin";
+        spin.setAttribute("aria-hidden", "true");
+        this.label.append(spin, document.createTextNode("Connecting"));
+      } else if (state === "stalled") {
+        this.label.textContent = text || "Stalled";
+      } else if (labels[state]) {
+        this.label.textContent = labels[state];
+      }
+      this.label.hidden = state === "live";
+    },
+  };
+
+  // The live fixture stream behind the media card; it reconnects after an unplanned close.
+  const feed = {
+    route: null,
+    source: "Local",
+    sock: null,
+    dec: null,
+    wanted: false,
+    fps: 30,
+    generation: 0,
+    genFrames: 0,
+    genFirstFrameAt: 0,
+    frameTimes: [],
+    decodeMs: [],
+    ages: [],
+    lastAge: null,
+    error: null,
+    retry: 0,
+    reconnectTimer: null,
+    async start(route, fps = 30) {
+      this.stop();
+      this.route = route;
+      this.fps = fps;
+      this.wanted = true;
+      this.retry = 0;
+      this.frameTimes = [];
+      this.decodeMs = [];
+      this.ages = [];
+      this.error = null;
+      setMediaTitle(`Video decode · ${route === "local" ? "Local" : "Remote"}`);
+      tile.set("connecting");
+      await this.connect();
+    },
+    // The first connect rejects on failure; reconnects never reject (the close handler retries).
+    async connect({ reconnect = false } = {}) {
+      const gen = ++this.generation;
+      this.genFrames = 0;
+      this.genFirstFrameAt = 0;
+      const origin = routeOrigin(this.route);
+      const sock = new Sock(C.wsUrl(origin, "fixture"), C.wsProtocols(S.token));
+      this.sock = sock;
+      if (this.dec) this.dec.close();
+      const dec = makeDecoder((frame, decodeMs) => {
+        if (gen !== this.generation) return;
+        tile.draw(frame);
+        const t = now();
+        this.genFrames += 1;
+        if (!this.genFirstFrameAt) this.genFirstFrameAt = t;
+        this.frameTimes.push(t);
+        if (this.frameTimes.length > 400) this.frameTimes.shift();
+        if (decodeMs !== null) this.decodeMs.push(decodeMs);
+        if (this.decodeMs.length > 120) this.decodeMs.shift();
+        const meta = this.meta.get(frame.timestamp);
+        if (meta) {
+          this.lastAge = Date.now() - meta;
+          this.ages.push(this.lastAge);
+          if (this.ages.length > 120) this.ages.shift();
+          this.meta.delete(frame.timestamp);
+        }
+      }, (error) => { this.error = error; });
+      this.dec = dec;
+      this.meta = new Map();
+      let needKey = true;
+      sock.onText = (msg) => {
+        if (gen !== this.generation) return;
+        if (msg.type === "hello") sock.send({ type: "start", fps: this.fps });
+        if (msg.type === "config") {
+          try {
+            dec.configure(typeof msg.codec === "string" ? msg.codec : C.FIXTURE_CODEC);
+            needKey = true;
+          } catch (error) {
+            this.error = error;
+          }
+        }
+      };
+      sock.onBinary = (buffer) => {
+        if (gen !== this.generation) return;
+        let frame;
+        try { frame = C.parseFrameHeader(buffer); } catch { return; }
+        if (needKey && !frame.key) return;
+        if (!frame.key && dec.decoder.decodeQueueSize > 8) return;
+        try {
+          if (dec.decode(frame.seq, frame.key, frame.payload)) {
+            needKey = false;
+            this.meta.set(frame.seq * 33333, frame.tServerMs);
+            if (this.meta.size > 120) this.meta.delete(this.meta.keys().next().value);
+          }
+        } catch (error) {
+          this.error = error;
+        }
+      };
+      sock.onClose = (event) => {
+        if (gen !== this.generation || !this.wanted) return;
+        dec.close();
+        this.scheduleReconnect(event);
+      };
+      try {
+        await sock.opened(5000);
+        this.retry = 0;
+      } catch (error) {
+        if (reconnect) return;
+        throw error;
+      }
+    },
+    scheduleReconnect() {
+      clearTimeout(this.reconnectTimer);
+      const delay = Math.min(2000, 100 * 2 ** this.retry);
+      this.retry += 1;
+      this.reconnectTimer = setTimeout(() => {
+        if (this.wanted) this.connect({ reconnect: true });
+      }, delay);
+    },
+    send(obj) {
+      if (this.sock) this.sock.send(obj);
+    },
+    stop() {
+      this.wanted = false;
+      clearTimeout(this.reconnectTimer);
+      this.generation += 1;
+      if (this.sock) this.sock.close(1000);
+      if (this.dec) this.dec.close();
+      this.sock = null;
+      this.dec = null;
+      if (tile.state === "connecting") tile.set("idle");
+    },
+    live() {
+      return Boolean(this.wanted && this.sock && this.sock.isOpen && !this.sock.closeEvent);
+    },
+  };
+
+  function setMediaTitle(text) {
+    $("pb-media-title").textContent = text;
+  }
+
+  // Readouts refresh at most twice a second; stalled after 2 s without a frame.
+  setInterval(() => {
+    const t = now();
+    const recent = feed.frameTimes.filter((x) => t - x <= 1000);
+    const liveish = feed.wanted && (tile.state === "live" || tile.state === "stalled");
+    $("pb-ro-fps").textContent = liveish ? String(recent.length) : "–";
+    const decodeMed = C.median(feed.decodeMs.slice(-30));
+    $("pb-ro-decode").textContent = liveish && decodeMed !== null ? C.formatMs(decodeMed) : "–";
+    const rtt = S.rtt[feed.route || "local"];
+    $("pb-ro-input").textContent = rtt ? C.formatMs(rtt.median) : "–";
+    $("pb-ro-p95").textContent = rtt ? C.formatMs(rtt.p95) : "–";
+    $("pb-ro-age").textContent = liveish && feed.lastAge !== null ? C.formatMs(feed.lastAge) : "–";
+    $("pb-ro-age-label").textContent = feed.route === "remote" ? "frame age ms (clocks unsynced)" : "frame age ms";
+    if (feed.wanted && tile.lastDrawAt && (tile.state === "live" || tile.state === "stalled")) {
+      const idle = t - tile.lastDrawAt;
+      if (idle > 2000) tile.set("stalled", `Stalled ${(idle / 1000).toFixed(1)} s`);
+      else if (tile.state === "stalled") tile.set("live");
+    }
+  }, 500);
+
+  function waitUntil(pred, timeoutMs, stepMs = 25) {
+    return new Promise((resolve) => {
+      const t0 = now();
+      const tick = () => {
+        if (pred()) resolve(true);
+        else if (now() - t0 >= timeoutMs) resolve(false);
+        else setTimeout(tick, stepMs);
+      };
+      tick();
+    });
+  }
+
+  // ----------------------------------------------------------------------------------------- checks
+  function preconditionReason(id) {
+    const check = C.checkById(id);
+    if (!S.inHost) {
+      if (id === "media.webcodecs") return null;
+      return check.group === "host" ? C.REASONS.outsideHost : C.REASONS.noTokenOutside;
+    }
+    if (check.route === "remote" && !S.remote) return C.REASONS.noRemote;
+    return null;
+  }
+
+  function sizeValue() {
+    const size = C.containerSize(S.hostContext.containerDimensions);
+    const mode = typeof S.hostContext.displayMode === "string" ? S.hostContext.displayMode : null;
+    const ok = Boolean(size.width && size.height && mode);
+    const width = size.width || window.innerWidth;
+    const height = size.height || window.innerHeight;
+    return { ok, text: `${width}x${height} ${mode || "unknown"}`, size, mode };
+  }
+
+  async function needTools() {
+    if (!S.toolPath) return skip("No tool path: ui/initialize failed and window.openai is absent");
+    return null;
+  }
+
+  const RUNNERS = {
+    "host.init": async () => {
+      if (S.init.state === "ok") {
+        const info = S.init.result.hostInfo || {};
+        const value = { name: info.name || null, version: info.version || null, protocol: S.init.result.protocolVersion || null };
+        return { status: "pass", value, duration_ms: Math.round(S.init.ms) };
+      }
+      const error = S.init.error || { code: "bridge_error", message: "ui/initialize failed" };
+      return { ...fail(error.code, `ui/initialize: ${error.message}`, S.init.clue), duration_ms: Math.round(S.init.ms || 0) };
+    },
+    "host.entry": async () => {
+      const entry = C.detectEntry(S.hostContext);
+      if (entry !== "unknown") return pass(entry);
+      if (S.entryByOperator) return { status: "pass", value: S.entryByOperator, observed_by: "operator" };
+      return skip(C.REASONS.entryOperator, "unknown");
+    },
+    "host.theme": async () => {
+      const theme = S.hostContext.theme;
+      if (theme === "light" || theme === "dark") {
+        if (html.dataset.theme !== theme) return fail("unexpected_result", `Theme ${theme} was received but not applied`);
+        return pass(theme);
+      }
+      return fail("unexpected_result", "The host context has no theme; the page follows prefers-color-scheme");
+    },
+    "host.size": async () => {
+      const size = sizeValue();
+      if (size.ok) return pass(size.text);
+      return fail("unexpected_result", `The host reported ${size.size.width || "no width"} x ${size.size.height || "no height"}, display mode ${size.mode || "none"}`, null, size.text);
+    },
+    "bridge.read": async () => {
+      const blocked = await needTools();
+      if (blocked) return blocked;
+      const t0 = now();
+      const result = await callTool("probe_read", {});
+      const ms = Math.round(now() - t0);
+      const outcome = C.toolOutcome(result);
+      if (!outcome.ok) return toolFailure(outcome, "probe_read");
+      const missing = C.missingFields(outcome.sc, C.PROBE_READ_FIELDS);
+      adoptRead(outcome.sc);
+      if (missing.length) return fail("unexpected_result", `probe_read is missing ${missing.join(", ")}`);
+      return pass(ms, "ms");
+    },
+    "bridge.write": async () => {
+      const blocked = await needTools();
+      if (blocked) return blocked;
+      const text = `Probe note from ${S.run.run_id}`;
+      let revision = S.noteRevision ?? 0;
+      const t0 = now();
+      let outcome = C.toolOutcome(await callTool("probe_write", { text, expected_revision: revision }));
+      if (!outcome.ok && outcome.errorCode === "stale_revision" && Number.isInteger(outcome.sc.current_revision)) {
+        revision = outcome.sc.current_revision;
+        outcome = C.toolOutcome(await callTool("probe_write", { text, expected_revision: revision }));
+      }
+      const ms = Math.round(now() - t0);
+      if (!outcome.ok) return toolFailure(outcome, "probe_write");
+      const written = outcome.sc.note && outcome.sc.note.revision;
+      if (written !== revision + 1) return fail("unexpected_result", `probe_write returned revision ${written}, expected ${revision + 1}`);
+      S.noteRevision = written;
+      const read = C.toolOutcome(await callTool("probe_read", {}));
+      if (!read.ok) return toolFailure(read, "probe_read");
+      adoptRead(read.sc);
+      const note = read.sc.note || {};
+      if (note.text !== text || note.revision !== written) {
+        return fail("unexpected_result", `Read-back shows revision ${note.revision} and different text`);
+      }
+      return pass(ms, "ms");
+    },
+    "bridge.error": async () => {
+      const blocked = await needTools();
+      if (blocked) return blocked;
+      const result = await callTool("probe_fail", {});
+      const outcome = C.toolOutcome(result);
+      const sc = outcome.sc;
+      S.extra["bridge.error"] = [["error_code", String(sc.error_code ?? "(missing)")], ["error", String(sc.error ?? "(missing)")], ["hint", String(sc.hint ?? "(missing)")]];
+      const complete = ["error_code", "error", "hint"].every((key) => typeof sc[key] === "string" && sc[key]);
+      if (result && result.isError === true && complete) return pass(sc.error_code);
+      return fail("unexpected_result", `probe_fail returned isError ${result && result.isError === true} with ${complete ? "all" : "missing"} error fields`);
+    },
+    "bridge.stale": async () => {
+      const blocked = await needTools();
+      if (blocked) return blocked;
+      const base = S.selection.revision ?? 0;
+      const first = C.toolOutcome(await callTool("probe_select", { target_ref: "fixture~probe-a", expected_revision: base }));
+      if (!first.ok) return toolFailure(first, "probe_select");
+      const rev1 = first.sc.selection && first.sc.selection.revision;
+      if (rev1 !== base + 1) return fail("unexpected_result", `probe_select returned revision ${rev1}, expected ${base + 1}`);
+      const second = C.toolOutcome(await callTool("probe_select", { target_ref: "fixture~probe-b", expected_revision: rev1 }));
+      if (!second.ok) return toolFailure(second, "probe_select");
+      const rev2 = second.sc.selection && second.sc.selection.revision;
+      if (rev2 !== rev1 + 1) return fail("unexpected_result", `probe_select returned revision ${rev2}, expected ${rev1 + 1}`);
+      S.selection = { target_ref: second.sc.selection.target_ref ?? "fixture~probe-b", revision: rev2 };
+      sendContext().catch(() => {});
+      const noteRev = S.noteRevision ?? 0;
+      const write = C.toolOutcome(await callTool("probe_write", { text: "stale write", expected_revision: noteRev, selection_revision: rev1 }));
+      S.extra["bridge.stale"] = [["selection revisions", `${base} → ${rev1} → ${rev2}`], ["write with", `selection_revision ${rev1}`],
+        ["answer", write.ok ? "ok" : `${write.errorCode} (current ${write.sc.current_selection_revision ?? "?"})`]];
+      if (write.ok) {
+        S.noteRevision = write.sc.note && write.sc.note.revision;
+        return fail("unexpected_result", "probe_write with an old selection_revision was accepted");
+      }
+      if (write.errorCode !== "stale_selection") return fail("unexpected_result", `probe_write answered ${write.errorCode}, expected stale_selection`);
+      const read = C.toolOutcome(await callTool("probe_read", {}));
+      if (!read.ok) return toolFailure(read, "probe_read");
+      adoptRead(read.sc);
+      const after = read.sc.note && read.sc.note.revision;
+      if (after !== noteRev) return fail("unexpected_result", `The note revision changed from ${noteRev} to ${after}`);
+      return pass("stale_selection");
+    },
+    "bridge.context": async () => {
+      if (S.toolPath !== "bridge") return skip("Needs the MCP Apps bridge (ui/initialize failed)");
+      if (!S.nonce) return fail("unexpected_result", "open_workspace returned no context_nonce");
+      await sendContext();
+      return skip(C.REASONS.contextOperator, S.nonce);
+    },
+    "bridge.message": async () => {
+      if (S.toolPath !== "bridge") return skip("Needs the MCP Apps bridge (ui/initialize failed)");
+      const result = await S.bridge.request("ui/message",
+        C.messageParams(`Autonom probe run ${S.run.run_id} is checking ui/message. Use Send to chat for the full results.`), { timeoutMs: 20000 });
+      if (result && result.isError === true) return fail("bridge_error", "The host answered ui/message with isError");
+      return pass();
+    },
+    "bridge.media": async () => {
+      const blocked = await needTools();
+      if (blocked) return blocked;
+      return bridgeMedia();
+    },
+    "model.tool": async () => skip(C.REASONS.modelOperator),
+    "media.webcodecs": async () => {
+      if (typeof VideoDecoder !== "function" || typeof EncodedVideoChunk !== "function") {
+        tile.set("unsupported");
+        return fail("decoder_unavailable", "VideoDecoder is not available in this page", null, []);
+      }
+      const supported = [];
+      for (const codec of [C.FIXTURE_CODEC, ...C.EXTRA_CODECS]) {
+        try {
+          const answer = await VideoDecoder.isConfigSupported({ codec, optimizeForLatency: true });
+          if (answer && answer.supported) supported.push(codec);
+        } catch {
+          // Unsupported or malformed config: not listed.
+        }
+      }
+      if (!supported.includes(C.FIXTURE_CODEC)) {
+        tile.set("unsupported");
+        return fail("decoder_unavailable", `${C.FIXTURE_CODEC} is not supported`, null, supported);
+      }
+      return pass(supported);
+    },
+  };
+
+  function adoptRead(sc) {
+    S.lastRead = sc;
+    if (sc.server && typeof sc.server === "object") S.serverInfo = sc.server;
+    if (sc.note && Number.isInteger(sc.note.revision)) S.noteRevision = sc.note.revision;
+    if (sc.selection && Number.isInteger(sc.selection.revision)) {
+      S.selection = { target_ref: sc.selection.target_ref ?? null, revision: sc.selection.revision };
+    }
+    const refused = sc.media && Array.isArray(sc.media.refused_origins) ? sc.media.refused_origins : [];
+    S.extra["bridge.read"] = [
+      ["autonom", String(sc.autonom && sc.autonom.version || "?")],
+      ["devices", String(Array.isArray(sc.devices) ? sc.devices.length : 0)],
+      ["refused origins", refused.length ? refused.map((r) => `${r.origin} (${r.count})`).join(", ") : "none"],
+    ];
+  }
+
+  async function bridgeMedia() {
+    const t0 = now();
+    const callMs = [];
+    let decoded = 0;
+    let firstAt = 0;
+    let lastAt = 0;
+    let decodeError = null;
+    let configured = false;
+    let after = -1;
+    feed.stop();
+    setMediaTitle("Video decode · Bridge");
+    tile.set("connecting");
+    const dec = makeDecoder((frame) => {
+      tile.draw(frame);
+      decoded += 1;
+      lastAt = now();
+      if (!firstAt) firstAt = lastAt;
+    }, (error) => { decodeError = error; });
+    try {
+      while (decoded < 60 && now() - t0 < 20000 && !decodeError) {
+        const c0 = now();
+        const outcome = C.toolOutcome(await callTool("probe_media_frames", { count: 10, after_seq: after }));
+        callMs.push(now() - c0);
+        if (!outcome.ok) return toolFailure(outcome, "probe_media_frames");
+        const missing = C.missingFields(outcome.sc, C.MEDIA_FRAMES_FIELDS);
+        if (missing.length) return fail("unexpected_result", `probe_media_frames is missing ${missing.join(", ")}`);
+        const frames = Array.isArray(outcome.meta.frames) ? outcome.meta.frames : [];
+        if (!frames.length) return fail("unexpected_result", "probe_media_frames returned no frames in _meta");
+        if (!configured) {
+          try {
+            dec.configure(typeof outcome.sc.codec === "string" ? outcome.sc.codec : C.FIXTURE_CODEC);
+          } catch (error) {
+            return fail("decoder_error", `configure: ${error && error.message ? error.message : error}`);
+          }
+          configured = true;
+        }
+        for (const frame of frames) {
+          if (typeof frame.data_b64 !== "string" || !Number.isInteger(frame.seq)) return fail("unexpected_result", "A frame in _meta has no seq or data_b64");
+          try {
+            dec.decode(frame.seq, frame.key === true, C.base64ToBytes(frame.data_b64));
+          } catch (error) {
+            decodeError = decodeError || error;
+            break;
+          }
+        }
+        if (decodeError) break;
+        after = Number.isInteger(outcome.sc.last_seq) ? outcome.sc.last_seq : frames[frames.length - 1].seq;
+        await dec.decoder.flush().catch((error) => { decodeError = decodeError || error; });
+      }
+      if (decodeError) return fail("decoder_error", String(decodeError.message || decodeError));
+      if (decoded < 60) return fail("decode_timeout", `Decoded ${decoded} of 60 frames in 20 s`);
+      const seconds = Math.max(0.001, (lastAt - t0) / 1000);
+      return pass({ fps: C.round1(decoded / seconds), call_ms_median: C.round1(C.median(callMs)), frames: decoded });
+    } finally {
+      dec.close();
+    }
+  }
+
+  // Route runners (5.5). Every network failure records a page-side code and the CSP clue when one was seen.
+  function needToken(route) {
+    if (!S.token) {
+      const media = S.workspace ? S.workspace.media : null;
+      const why = media && media.state === "failed" ? `media ${media.error_code || "failed"}: ${media.error || ""}` : "open_workspace gave no media token";
+      return fail("no_token", why.trim());
+    }
+    if (!routeOrigin(route)) return fail("unexpected_result", `No ${route} origin`);
+    return null;
+  }
+
+  async function wsFailure(error, origin) {
+    await sleep(80);
+    const code = error && error.code ? error.code : "ws_closed_before_open";
+    return fail(code, error && error.message ? error.message : "WebSocket failed", cspClue(origin));
+  }
+
+  function routeRunner(kind, route) {
+    return async () => {
+      const blocked = needToken(route);
+      if (blocked && kind !== "csp") return blocked;
+      const origin = routeOrigin(route);
+      if (kind === "fetch") return runFetch(route, origin);
+      if (kind === "ws") return runWs(route, origin);
+      if (kind === "input") return runInput(route, origin);
+      if (kind === "decode") return runDecode(route, origin);
+      if (kind === "reconnect") return runReconnect(route, origin);
+      return runCsp(route, origin);
+    };
+  }
+
+  async function runFetch(route, origin) {
+    S.attempted[route] = true;
+    const nonce = `n${C.defaultRandomHex(12)}`;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 5000);
+    const t0 = now();
+    let response;
+    try {
+      response = await fetch(C.pingUrl(origin, nonce), {
+        method: "GET", headers: { Authorization: `Bearer ${S.token}` }, cache: "no-store", credentials: "omit", mode: "cors", signal: controller.signal,
+      });
+    } catch (error) {
+      clearTimeout(timer);
+      await sleep(80);
+      const clue = cspClue(origin);
+      if (route === "local" && !clue) {
+        showNotice(`The probe server at ${origin.replace(/^https?:\/\//, "")} did not answer. Start it by opening the probe again (open_workspace).`, "error");
+      }
+      return fail("fetch_failed", error && error.name === "AbortError" ? "no answer within 5 s" : String(error && error.message || error), clue);
+    }
+    clearTimeout(timer);
+    const ms = Math.round(now() - t0);
+    let body = null;
+    try { body = await response.json(); } catch { body = null; }
+    if (!response.ok) return fail(`http_${response.status}`, `${response.status} ${body && body.error_code ? body.error_code : response.statusText}`);
+    if (!body || body.ok !== true || body.nonce !== nonce) return fail("unexpected_result", "The ping answer did not echo the nonce");
+    S.extra[`net.fetch.${route}`] = [["origin seen", String(body.origin_seen ?? "none")], ["host seen", String(body.host_seen ?? "?")]];
+    return pass(ms, "ms");
+  }
+
+  async function runWs(route, origin) {
+    S.attempted[route] = true;
+    const t0 = now();
+    const sock = new Sock(C.wsUrl(origin, "fixture"), C.wsProtocols(S.token));
+    try {
+      await sock.opened(5000);
+    } catch (error) {
+      return wsFailure(error, origin);
+    }
+    const connectMs = Math.round(now() - t0);
+    try {
+      if (sock.ws.protocol !== C.WS_SUBPROTOCOL) {
+        return fail("unexpected_result", "The server selected an unexpected subprotocol");
+      }
+      for (let i = 1; i <= 3; i += 1) sock.send({ type: "echo", payload: `echo-${i}` });
+      for (let i = 1; i <= 3; i += 1) {
+        let msg;
+        try {
+          msg = await sock.waitText((m) => m.type === "echo", 3000);
+        } catch (error) {
+          return fail("ws_echo_mismatch", error && error.closed ? `closed before echo ${i}` : `echo ${i} did not come back within 3 s`);
+        }
+        if (msg.payload !== `echo-${i}`) return fail("ws_echo_mismatch", `echo ${i} came back as ${JSON.stringify(String(msg.payload)).slice(0, 40)}`);
+      }
+      const closed = await sock.close(1000);
+      if (!closed || closed.code !== 1000) return fail("unexpected_result", `closed with ${closed ? closed.code : "no close"}, expected 1000`);
+      return pass(connectMs, "ms");
+    } finally {
+      sock.close(1000);
+    }
+  }
+
+  async function runInput(route, origin) {
+    const sock = new Sock(C.wsUrl(origin, "fixture"), C.wsProtocols(S.token));
+    try {
+      await sock.opened(5000);
+    } catch (error) {
+      return wsFailure(error, origin);
+    }
+    try {
+      const rtts = [];
+      for (let seq = 1; seq <= 20; seq += 1) {
+        const tClient = now();
+        sock.send({ type: "ping", seq, t_client: tClient });
+        try {
+          await sock.waitText((m) => m.type === "pong" && m.seq === seq, 2000);
+        } catch {
+          return fail("ws_echo_mismatch", `${rtts.length} of 20 pings came back`);
+        }
+        rtts.push(now() - tClient);
+      }
+      const value = { median: C.round1(C.median(rtts)), p95: C.round1(C.p95(rtts)), n: rtts.length };
+      S.rtt[route] = value;
+      return pass(value, "ms");
+    } finally {
+      sock.close(1000);
+    }
+  }
+
+  async function runDecode(route, origin) {
+    tile.set("connecting");
+    try {
+      await feed.start(route, 30);
+    } catch (error) {
+      feed.stop();
+      return wsFailure(error, origin);
+    }
+    const startFrames = feed.frameTimes.length;
+    const ok = await waitUntil(() => feed.genFrames >= 60 || feed.error || !feed.wanted, 15000);
+    if (feed.error) {
+      const message = String(feed.error.message || feed.error);
+      feed.stop();
+      tile.set("idle");
+      return fail("decoder_error", message);
+    }
+    if (!ok || feed.genFrames < 60) {
+      const got = feed.genFrames;
+      feed.stop();
+      tile.set("idle");
+      return fail("decode_timeout", `Decoded ${got} of 60 frames in 15 s`);
+    }
+    const times = feed.frameTimes.slice(startFrames);
+    const span = Math.max(1, times[times.length - 1] - times[0]);
+    const value = {
+      fps: C.round1((times.length - 1) / (span / 1000)),
+      decode_ms_median: C.round1(C.median(feed.decodeMs)),
+      frame_age_ms_median: C.round1(C.median(feed.ages)),
+      clock: route === "local" ? "local" : "unsynced",
+      frames: feed.genFrames,
+    };
+    feed.fps = 15;
+    feed.send({ type: "start", fps: 15 });
+    return pass(value);
+  }
+
+  async function runReconnect(route, origin) {
+    if (!(feed.live() && feed.route === route)) {
+      try {
+        await feed.start(route, 15);
+      } catch (error) {
+        feed.stop();
+        return wsFailure(error, origin);
+      }
+      if (!(await waitUntil(() => feed.genFrames > 0, 5000))) return fail("decode_timeout", "No frame before the drop");
+    }
+    const gen = feed.generation;
+    const t0 = now();
+    feed.send({ type: "drop" });
+    const ok = await waitUntil(() => feed.generation > gen && feed.genFrames > 0, 5000);
+    if (!ok) {
+      const clue = cspClue(origin);
+      return fail("reconnect_timeout", feed.generation > gen ? "Reconnected but no new frame within 5 s" : "No reconnect within 5 s", clue);
+    }
+    return pass(Math.round(feed.genFirstFrameAt - t0), "ms");
+  }
+
+  async function runCsp(route, origin) {
+    if (!S.attempted[route]) return skip(C.REASONS.noRequests);
+    await sleep(100);
+    const count = C.cspCountFor(S.violations, origin);
+    if (count === 0) return pass(0, "count");
+    return fail("unexpected_result", `${count} securitypolicyviolation events for ${origin}`, "csp:connect-src", count);
+  }
+
+  for (const route of C.ROUTES) {
+    RUNNERS[`net.fetch.${route}`] = routeRunner("fetch", route);
+    RUNNERS[`net.ws.${route}`] = routeRunner("ws", route);
+    RUNNERS[`input.rtt.${route}`] = routeRunner("input", route);
+    RUNNERS[`media.decode.${route}`] = routeRunner("decode", route);
+    RUNNERS[`net.reconnect.${route}`] = routeRunner("reconnect", route);
+    RUNNERS[`net.csp.${route}`] = routeRunner("csp", route);
+  }
+
+  // Fixture devices: one decoded frame drawn and one tap acknowledged (5.3).
+  let deviceSock = null;
+  function deviceRunner(platform, route) {
+    return async () => {
+      const device = C.firstAllowedDevice(allowedDevices(), platform);
+      if (!device) return skip(`No allowed ${platform} device configured`);
+      const blocked = needToken(route);
+      if (blocked) return blocked;
+      const origin = routeOrigin(route);
+      const resume = feed.wanted ? feed.route : null;
+      feed.stop();
+      setMediaTitle(`${platform === "android" ? "Android" : "iOS"} · ${device.id}`);
+      tile.set("connecting");
+      const value = { target: device.id, spec: device.spec };
+      const sock = new Sock(C.wsUrl(origin, device.spec), C.wsProtocols(S.token));
+      deviceSock = sock;
+      let frames = 0;
+      let decodeError = null;
+      let needKey = true;
+      const dec = makeDecoder((frame) => { tile.draw(frame); frames += 1; }, (error) => { decodeError = error; });
+      sock.onText = (msg) => {
+        if (msg.type === "config") {
+          try { dec.configure(String(msg.codec)); needKey = true; } catch (error) { decodeError = error; }
+        }
+      };
+      sock.onBinary = (buffer) => {
+        let frame;
+        try { frame = C.parseFrameHeader(buffer); } catch { return; }
+        if (needKey && !frame.key) return;
+        try { if (dec.decode(frame.seq, frame.key, frame.payload)) needKey = false; } catch (error) { decodeError = error; }
+      };
+      try {
+        try {
+          await sock.opened(10000);
+        } catch (error) {
+          return { ...(await wsFailure(error, origin)), value };
+        }
+        const drawn = await waitUntil(() => frames > 0 || decodeError || sock.closeEvent, 20000);
+        if (decodeError) return fail("decoder_error", String(decodeError.message || decodeError), null, value);
+        if (!drawn || frames === 0) {
+          const why = sock.closeEvent ? `closed ${sock.closeEvent.code} before a frame` : "no decoded device frame within 20 s";
+          return fail("decode_timeout", why, null, value);
+        }
+        const t0 = now();
+        sock.send({ type: "tap", seq: 1, x: 0.05, y: 0.5 });
+        let ack;
+        try {
+          ack = await sock.waitText((m) => m.type === "tap_ack" && m.seq === 1, 10000);
+        } catch {
+          return fail("unexpected_result", "No tap_ack within 10 s", null, value);
+        }
+        if (ack.ok !== true) return fail("unexpected_result", `tap_ack ${ack.error_code || "error"}: ${ack.error || ""}`, null, value);
+        return pass({ ...value, frames, tap_ms: Math.round(now() - t0) });
+      } finally {
+        dec.close();
+        await sock.close(1000);
+        deviceSock = null;
+        if (resume) feed.start(resume, 15).catch(() => tile.set("idle"));
+        else tile.set("idle");
+      }
+    };
+  }
+  RUNNERS["device.android.local"] = deviceRunner("android", "local");
+  RUNNERS["device.ios.remote"] = deviceRunner("ios", "remote");
+
+  // ------------------------------------------------------------------------------------------- runner
+  async function runIds(ids) {
+    const order = C.executionOrder(ids, { include: (dep) => S.run.checks[dep].status === "pending" && !DEVICE_IDS.includes(dep) });
+    S.progress.total = Math.max(S.progress.total, order.length);
+    for (const id of order) {
+      const record = S.run.checks[id];
+      if (record.status !== "pending") {
+        S.progress.done += 1;
+        continue;
+      }
+      const reason = preconditionReason(id);
+      const unmet = reason ? null : C.unmetDependency(S.run, id);
+      if (reason || unmet) {
+        C.setStatus(S.run, id, { status: "not_exercised", reason: reason || `Needs ${unmet}`, duration_ms: null });
+      } else {
+        C.setStatus(S.run, id, { status: "running" });
+        renderCheck(id);
+        renderProgress();
+        let outcome;
+        try {
+          outcome = await RUNNERS[id]();
+        } catch (error) {
+          outcome = { status: "fail", error: errorOf(error, "unexpected_result") };
+        }
+        C.setStatus(S.run, id, outcome || fail("unexpected_result", "No outcome"));
+      }
+      C.blockDependants(S.run, id);
+      S.progress.done += 1;
+      renderAll();
+    }
+  }
+
+  async function runAll() {
+    if (S.running) return;
+    S.running = true;
+    renderProgress();
+    await ready;
+    S.run = C.createRun();
+    S.attempted = { local: false, remote: false };
+    S.entryByOperator = null;
+    S.extra = { ...(S.extra["host.init"] ? { "host.init": S.extra["host.init"] } : {}) };
+    S.progress = { done: 0, total: C.CHECK_IDS.length };
+    html.dataset.probeState = "running";
+    renderAll();
+    try {
+      await runIds(C.RUN_ALL_ORDER);
+      for (const id of DEVICE_IDS) {
+        if (S.run.checks[id].status === "pending") C.setStatus(S.run, id, { status: "not_exercised", reason: C.REASONS.devices, duration_ms: null });
+        S.progress.done += 1;
+      }
+    } finally {
+      C.finishRun(S.run);
+      S.running = false;
+      S.ranOnce = true;
+      html.dataset.probeState = "done";
+      renderAll();
+      renderSummary(true);
+    }
+    await saveResults();
+  }
+
+  async function runSome(ids, { reset = true } = {}) {
+    if (S.running) return;
+    S.running = true;
+    await ready;
+    if (reset) C.resetChecks(S.run, ids);
+    S.progress = { done: 0, total: ids.length };
+    html.dataset.probeState = "running";
+    renderAll();
+    try {
+      await runIds(ids);
+    } finally {
+      C.finishRun(S.run);
+      S.running = false;
+      html.dataset.probeState = "done";
+      renderAll();
+      renderSummary(true);
+    }
+    await saveResults();
+  }
+
+  function rerun(id) {
+    const ids = DEVICE_IDS.includes(id) ? [id] : [id, ...C.dependantsOf(id, { transitive: true }).filter((d) => !DEVICE_IDS.includes(d))];
+    return runSome(ids);
+  }
+
+  async function operatorAnswer(id, status, value) {
+    if (S.running && S.run.checks[id].status === "running") return;
+    if (id === "host.entry") S.entryByOperator = value;
+    const fields = status === "pass"
+      ? { status: "pass", value, observed_by: "operator", duration_ms: null }
+      : { status: "fail", value, observed_by: "operator", duration_ms: null, error: { code: "unexpected_result", message: OPERATOR_FAIL[id] || "The operator marked this check failed" } };
+    C.setStatus(S.run, id, fields);
+    C.finishRun(S.run);
+    renderAll();
+    renderSummary(true);
+    await saveResults();
+  }
+  const OPERATOR_FAIL = {
+    "bridge.context": "The chat did not answer with the probe nonce",
+    "model.tool": "The chat did not show a probe_read result",
+  };
+
+  // ------------------------------------------------------------------------------------------ results
+  function hostRecord() {
+    const info = (S.init.result && S.init.result.hostInfo) || {};
+    const ctx = S.hostContext;
+    const entryRecord = S.run.checks["host.entry"];
+    let entry = C.detectEntry(ctx);
+    if (entry === "unknown" && (entryRecord.value === "global" || entryRecord.value === "thread")) entry = entryRecord.value;
+    const server = S.serverInfo;
+    return {
+      name: info.name || null,
+      version: info.version || null,
+      protocol: (S.init.result && S.init.result.protocolVersion) || null,
+      entry,
+      display_mode: typeof ctx.displayMode === "string" ? ctx.displayMode : (window.openai && window.openai.displayMode) || null,
+      theme: S.theme || currentTheme(),
+      container: C.containerSize(ctx.containerDimensions),
+      platform: typeof ctx.platform === "string" ? ctx.platform : null,
+      user_agent: String(typeof ctx.userAgent === "string" ? ctx.userAgent : navigator.userAgent).slice(0, 200),
+      token_path: S.tokenPath,
+      theme_changes: S.themeChanges,
+      mcp: server ? {
+        protocol_version: server.protocol_version, client: server.client,
+        client_ui_extension: server.client_ui_extension, methods_seen: server.methods_seen,
+      } : null,
+    };
+  }
+  function routesRecord() {
+    return {
+      local: { origin: localOrigin() },
+      remote: S.remote ? { origin: S.remote.origin, label: S.remote.label, selected: true } : { origin: null, label: null, selected: false },
+    };
+  }
+  function currentResults() {
+    return C.scrubForExport(C.resultsJson(S.run, { host: hostRecord(), routes: routesRecord() }), S.token ? [S.token] : []);
+  }
+
+  async function saveResults() {
+    const saved = $("pb-saved");
+    if (!S.toolPath) {
+      saved.textContent = S.inHost ? "Not saved: no tool path." : "Not saved outside the host. Use Copy results JSON.";
+      saved.hidden = false;
+      return;
+    }
+    try {
+      const outcome = C.toolOutcome(await callTool("probe_save_results", { results: currentResults() }));
+      if (outcome.ok && outcome.sc.saved) {
+        saved.textContent = `Saved as ${outcome.sc.saved.path_hint || outcome.sc.saved.run_id}.`;
+      } else {
+        saved.textContent = `Not saved: ${outcome.errorCode || "error"}${outcome.sc.error ? ` (${redactText(outcome.sc.error)})` : ""}.`;
+      }
+    } catch (error) {
+      saved.textContent = `Not saved: ${error.code || "bridge_error"}.`;
+    }
+    saved.hidden = false;
+  }
+
+  let copyTimer = null;
+  async function copyResults() {
+    const button = $("pb-copy");
+    const text = JSON.stringify(currentResults(), null, 2);
+    try {
+      if (!navigator.clipboard || typeof navigator.clipboard.writeText !== "function") throw new Error("no clipboard");
+      await navigator.clipboard.writeText(text);
+      button.innerHTML = `${CHECK_ICON}<span>Copied</span>`;
+      clearTimeout(copyTimer);
+      copyTimer = setTimeout(() => { button.textContent = "Copy results JSON"; }, 1600);
+    } catch {
+      button.textContent = "Copy blocked";
+      const box = $("pb-copybox");
+      const area = $("pb-json");
+      area.value = text;
+      box.hidden = false;
+      area.focus();
+      area.select();
+    }
+  }
+
+  async function sendToChat() {
+    if (S.toolPath !== "bridge") {
+      showNotice("Send to chat needs the MCP Apps bridge, which this host did not provide.", "error");
+      return;
+    }
+    const button = $("pb-send");
+    button.disabled = true;
+    let outcome;
+    const t0 = now();
+    try {
+      const result = await S.bridge.request("ui/message", C.messageParams(C.summaryLine(S.run), currentResults()), { timeoutMs: 20000 });
+      outcome = result && result.isError === true ? fail("bridge_error", "The host answered ui/message with isError") : pass();
+    } catch (error) {
+      outcome = { status: "fail", error: errorOf(error, "bridge_error") };
+    } finally {
+      button.disabled = false;
+    }
+    if (!S.running) {
+      C.setStatus(S.run, "bridge.message", { ...outcome, duration_ms: Math.round(now() - t0) });
+      renderAll();
+      renderSummary(true);
+      await saveResults();
+    }
+  }
+
+  // ------------------------------------------------------------------------------------------ render
+  function showNotice(text, kind) {
+    const notice = $("pb-notice");
+    notice.textContent = text;
+    notice.dataset.kind = kind;
+    notice.hidden = false;
+  }
+
+  function el(tag, attrs = {}, ...children) {
+    const node = document.createElement(tag);
+    for (const [key, value] of Object.entries(attrs)) {
+      if (value === null || value === undefined || value === false) continue;
+      if (key === "class") node.className = value;
+      else if (key === "text") node.textContent = value;
+      else if (key.startsWith("on")) node.addEventListener(key.slice(2), value);
+      else node.setAttribute(key, value === true ? "" : String(value));
+    }
+    for (const child of children.flat()) if (child !== null && child !== undefined) node.append(child);
+    return node;
+  }
+
+  // Static glyph markup only (no data), so innerHTML is safe here.
+  function setGlyph(slot, status) {
+    const key = status === "pass" || status === "fail" || status === "running" ? status : "skip";
+    if (slot.dataset.glyph !== key) {
+      slot.innerHTML = GLYPHS[key];
+      slot.dataset.glyph = key;
+    }
+    return slot;
+  }
+  function glyph(status) {
+    return setGlyph(el("span", { class: "pb-glyph" }), status);
+  }
+
+  function statusText(record) {
+    if (record.status === "running") return "Running";
+    if (record.status === "pass") return "Pass";
+    if (record.status === "fail") return "Fail";
+    return "Not exercised";
+  }
+
+  function kvList(record, extra) {
+    const rows = [["Status", statusText(record)]];
+    const value = C.formatValue(record);
+    if (value) rows.push(["Value", value]);
+    if (record.value && typeof record.value === "object" && !Array.isArray(record.value)) {
+      for (const [key, inner] of Object.entries(record.value)) {
+        if (inner !== null && typeof inner !== "object") rows.push([key.replace(/_/g, " "), String(inner)]);
+      }
+    }
+    if (record.reason && record.status !== "pass" && record.status !== "fail") rows.push(["Reason", record.reason]);
+    if (record.observed_by === "operator") rows.push(["Observed by", "operator"]);
+    if (record.started_at) rows.push(["Started", record.started_at]);
+    if (record.duration_ms !== null && record.duration_ms !== undefined) rows.push(["Duration", `${record.duration_ms} ms`]);
+    for (const row of extra || []) rows.push(row);
+    const dl = el("dl", { class: "pb-kv" });
+    for (const [key, val] of rows) dl.append(el("dt", { text: key }), el("dd", { text: redactText(val) }));
+    return dl;
+  }
+
+  function errorBlock(record) {
+    if (record.status !== "fail" || !record.error) return [];
+    const nodes = [el("p", { class: "pb-err", text: redactText(`${record.error.code}: ${record.error.message}`) })];
+    if (record.error.clue) nodes.push(el("p", { class: "pb-clue", text: record.error.clue === "csp:connect-src" ? "CSP violation: connect-src" : `Clue: ${record.error.clue}` }));
+    return nodes;
+  }
+
+  const expanded = new Set();
+  const rowNodes = new Map();
+
+  function buildMatrixRow(li) {
+    const key = li.dataset.row;
+    const ids = { local: li.dataset.local, remote: li.dataset.remote };
+    const label = C.checkById(ids.local).label;
+    const detailId = `pb-d-${key}`;
+    const cells = {};
+    for (const route of C.ROUTES) cells[route] = el("span", { class: "pb-cell", "data-route": route });
+    const chevron = el("span");
+    chevron.innerHTML = CHEVRON;
+    const button = el("button", { type: "button", class: "pb-row pb-grid", "aria-expanded": "false", "aria-controls": detailId },
+      el("span", { class: "pb-label", text: label }), cells.local, cells.remote, chevron.firstChild);
+    const detail = el("div", { class: "pb-detail", id: detailId, hidden: true });
+    const desc = el("p", { class: "pb-desc", text: C.checkById(ids.local).describe });
+    const routeBoxes = {};
+    const routeWrap = el("div", { class: "pb-route-details" });
+    for (const route of C.ROUTES) {
+      const body = el("div");
+      const again = el("button", { type: "button", class: "btn small pb-again", onclick: () => rerun(ids[route]), text: "Run again" });
+      routeBoxes[route] = { body, again };
+      routeWrap.append(el("div", { class: "pb-route-detail" }, el("h3", { text: route === "local" ? "Local" : "Remote" }), body, again));
+    }
+    detail.append(desc, routeWrap);
+    button.addEventListener("click", () => toggle(button, detail, key));
+    li.replaceChildren(button, detail);
+    const render = () => {
+      for (const route of C.ROUTES) {
+        const record = S.run.checks[ids[route]];
+        const text = record.status === "pass" || record.status === "fail" ? C.formatValue(record) : "";
+        cells[route].replaceChildren(glyph(record.status), document.createTextNode(text));
+        routeBoxes[route].body.replaceChildren(kvList(record, S.extra[ids[route]]), ...errorBlock(record));
+        routeBoxes[route].again.disabled = S.running;
+      }
+      button.setAttribute("aria-label", C.rowAccessibleName(label, C.ROUTES.map((route) => ({ route, record: S.run.checks[ids[route]] }))));
+    };
+    rowNodes.set(ids.local, render);
+    rowNodes.set(ids.remote, render);
+    render();
+  }
+
+  function manualBlock(id) {
+    const wrap = el("div", { class: "pb-manual", hidden: true });
+    const text = el("p");
+    const actions = el("div", { class: "pb-manual-actions" });
+    if (id === "host.entry") {
+      text.textContent = "Where was the probe opened? Choose what you did.";
+      actions.append(
+        el("button", { type: "button", class: "btn small", onclick: () => operatorAnswer(id, "pass", "global"), text: "Sidebar (global)" }),
+        el("button", { type: "button", class: "btn small", onclick: () => operatorAnswer(id, "pass", "thread"), text: "Conversation (thread)" }),
+      );
+    } else {
+      actions.append(
+        el("button", { type: "button", class: "btn small", onclick: () => operatorAnswer(id, "pass", id === "bridge.context" ? S.nonce : null), text: "Passed" }),
+        el("button", { type: "button", class: "btn small", onclick: () => operatorAnswer(id, "fail", id === "bridge.context" ? S.nonce : null), text: "Failed" }),
+      );
+    }
+    wrap.append(text, actions);
+    const render = () => {
+      const record = S.run.checks[id];
+      const waiting = record.status === "not_exercised" && MANUAL_REASONS.has(record.reason);
+      wrap.hidden = !waiting;
+      if (id === "bridge.context") {
+        text.replaceChildren(document.createTextNode("Ask in the chat: "), el("em", { text: "What is the Autonom probe nonce?" }),
+          document.createTextNode(" It should answer "), el("strong", { text: S.nonce || "(no nonce)" }), document.createTextNode("."));
+      } else if (id === "model.tool") {
+        text.replaceChildren(document.createTextNode("Ask in the chat: "), el("em", { text: "Call probe_read from the Autonom probe." }),
+          document.createTextNode(" Press Passed when the chat shows its result."));
+      }
+      for (const button of actions.querySelectorAll("button")) button.disabled = S.running;
+    };
+    return { wrap, render };
+  }
+
+  function buildHostRow(li) {
+    const id = li.dataset.check;
+    const check = C.checkById(id);
+    const detailId = `pb-d-${id.replace(/\./g, "-")}`;
+    const glyphSlot = el("span", { class: "pb-glyph" });
+    const value = el("span", { class: "pb-val" });
+    const chevron = el("span");
+    chevron.innerHTML = CHEVRON;
+    const button = el("button", { type: "button", class: "pb-row pb-hrow", "aria-expanded": "false", "aria-controls": detailId },
+      glyphSlot, el("span", { class: "pb-label", text: check.label }), value, chevron.firstChild);
+    const detail = el("div", { class: "pb-detail", id: detailId, hidden: true });
+    const body = el("div");
+    const again = el("button", { type: "button", class: "btn small pb-again", onclick: () => rerun(id), text: "Run again" });
+    detail.append(el("p", { class: "pb-desc", text: check.describe }), body, again);
+    button.addEventListener("click", () => toggle(button, detail, id));
+    const manual = check.manual ? manualBlock(id) : null;
+    li.replaceChildren(button, ...(manual ? [manual.wrap] : []), detail);
+    const render = () => {
+      const record = S.run.checks[id];
+      setGlyph(glyphSlot, record.status);
+      let text = C.formatValue(record);
+      if (record.status === "not_exercised" && MANUAL_REASONS.has(record.reason)) text = "Needs you";
+      else if (record.status === "pending" || (record.status === "not_exercised" && !text)) text = shortReason(record);
+      let mono = id.startsWith("device.") && Boolean(record.value && record.value.target);
+      if (id.startsWith("device.") && !record.value) {
+        const device = C.firstAllowedDevice(allowedDevices(), id === "device.android.local" ? "android" : "ios");
+        if (device && (record.status === "pending" || record.reason === C.REASONS.devices)) {
+          text = device.id;
+          mono = true;
+        }
+      }
+      value.className = mono ? "pb-val mono" : "pb-val";
+      value.textContent = text;
+      body.replaceChildren(kvList(record, S.extra[id]), ...errorBlock(record));
+      again.disabled = S.running;
+      button.setAttribute("aria-label", `${check.label}: ${C.STATUS_WORDS[record.status] || "not exercised"}${text ? ` ${text}` : ""}`);
+      if (manual) manual.render();
+    };
+    rowNodes.set(id, render);
+    render();
+  }
+
+  function shortReason(record) {
+    if (!record.reason) return "";
+    if (record.reason === C.REASONS.devices) return "Run after synthetic";
+    if (record.reason === C.REASONS.notStarted) return "";
+    return record.reason.length > 28 ? `${record.reason.slice(0, 27)}…` : record.reason;
+  }
+
+  function toggle(button, detail, key) {
+    const open = button.getAttribute("aria-expanded") !== "true";
+    button.setAttribute("aria-expanded", String(open));
+    detail.hidden = !open;
+    if (open) expanded.add(key);
+    else expanded.delete(key);
+  }
+
+  function renderCheck(id) {
+    const render = rowNodes.get(id);
+    if (render) render();
+  }
+
+  function renderProgress() {
+    const run = $("pb-run");
+    if (S.running) {
+      const done = Math.min(S.progress.done, S.progress.total || C.CHECK_IDS.length);
+      run.textContent = `Running… ${done}/${S.progress.total || C.CHECK_IDS.length}`;
+      run.disabled = true;
+    } else {
+      run.textContent = S.ranOnce ? "Run again" : "Run all";
+      run.disabled = false;
+    }
+    $("pb-run-devices").disabled = S.running;
+    $("pb-pick").disabled = S.running;
+  }
+
+  function renderSummary(final) {
+    if (!final) return;
+    const summary = $("pb-summary");
+    summary.replaceChildren(...C.summaryParts(C.summarize(S.run)).map((part) => (part.danger ? el("span", { class: "danger", text: part.text }) : document.createTextNode(part.text))));
+  }
+
+  function renderRoutes() {
+    const local = localOrigin();
+    const remote = S.remote;
+    $("pb-route-caption").textContent = `Local ${local ? local.replace(/^https?:\/\//, "") : "unknown"} · Remote ${remote ? `${remote.label} (${remote.origin.replace(/^https?:\/\//, "")})` : "None"}`;
+    $("pb-pick").setAttribute("aria-label", `Remote origin: ${remote ? remote.label : "None"}`);
+    $("pb-switch-remote").disabled = !remote;
+    $("pb-switch-local").setAttribute("aria-pressed", String(feed.route !== "remote"));
+    $("pb-switch-remote").setAttribute("aria-pressed", String(feed.route === "remote"));
+  }
+
+  function renderEnv() {
+    const env = $("pb-env");
+    const record = S.run.checks["media.webcodecs"];
+    const info = (S.init.result && S.init.result.hostInfo) || {};
+    const hostText = S.init.state === "ok" ? ([info.name, info.version].filter(Boolean).join(" ") || "unnamed")
+      : S.init.state === "outside" ? "none (plain browser)" : S.init.state;
+    const rows = [
+      ["Host", hostText],
+      ["Entry", C.detectEntry(S.hostContext) !== "unknown" ? C.detectEntry(S.hostContext) : (S.entryByOperator || "unknown")],
+      ["Theme", S.theme || `${currentTheme()} (system)`],
+      ["Size", sizeValue().text],
+      ["Token path", S.tokenPath || "none"],
+      ["WebCodecs", Array.isArray(record.value) ? (record.value.length ? record.value.join(", ") : "none") : "not checked"],
+    ];
+    env.replaceChildren(...rows.flatMap(([key, value]) => [el("dt", { text: key }), el("dd", { text: String(value) })]));
+  }
+
+  function renderAll() {
+    for (const render of new Set(rowNodes.values())) render();
+    renderProgress();
+    renderRoutes();
+    renderEnv();
+    $("pb-version").textContent = config.probe_version || C.PROBE_VERSION;
+  }
+
+  // ---------------------------------------------------------------------------------- remote picker
+  const menu = $("pb-menu");
+  const pick = $("pb-pick");
+  function closeMenu(focus) {
+    menu.hidden = true;
+    pick.setAttribute("aria-expanded", "false");
+    if (focus) pick.focus();
+  }
+  function openMenu() {
+    const choices = [...remoteRoutes(), null];
+    menu.replaceChildren(...choices.map((choice) => {
+      const selected = choice ? Boolean(S.remote && S.remote.label === choice.label) : !S.remote;
+      const item = el("button", { type: "button", class: "pb-menu-item", role: "menuitemradio", "aria-checked": String(selected), tabindex: "-1",
+        onclick: () => { chooseRemote(choice); closeMenu(true); } });
+      const mark = el("span");
+      if (selected) mark.innerHTML = CHECK_ICON;
+      item.append(mark, el("span", { text: choice ? choice.label : "None" }));
+      if (choice) item.append(el("small", { text: choice.origin }));
+      return item;
+    }));
+    menu.hidden = false;
+    pick.setAttribute("aria-expanded", "true");
+    const items = [...menu.querySelectorAll(".pb-menu-item")];
+    (items.find((item) => item.getAttribute("aria-checked") === "true") || items[0]).focus();
+  }
+  function chooseRemote(choice) {
+    const changed = (choice ? choice.label : null) !== (S.remote ? S.remote.label : null);
+    S.remote = choice;
+    S.remoteChosen = true;
+    if (changed) {
+      if (feed.route === "remote") feed.stop();
+      const ids = C.CHECKS.filter((c) => c.route === "remote").map((c) => c.id);
+      C.resetChecks(S.run, ids);
+      S.attempted.remote = false;
+    }
+    renderAll();
+  }
+  pick.addEventListener("click", () => (menu.hidden ? openMenu() : closeMenu(false)));
+  menu.addEventListener("keydown", (event) => {
+    const items = [...menu.querySelectorAll(".pb-menu-item")];
+    const at = items.indexOf(document.activeElement);
+    if (event.key === "ArrowDown") { event.preventDefault(); items[(at + 1) % items.length].focus(); }
+    else if (event.key === "ArrowUp") { event.preventDefault(); items[(at - 1 + items.length) % items.length].focus(); }
+    else if (event.key === "Escape") { event.preventDefault(); closeMenu(true); }
+    else if (event.key === "Tab") closeMenu(false);
+  });
+  document.addEventListener("click", (event) => {
+    if (!menu.hidden && !menu.contains(event.target) && !pick.contains(event.target)) closeMenu(false);
+  });
+
+  // ----------------------------------------------------------------------------------------- wiring
+  S.remote = remoteRoutes()[0] || null;
+  for (const li of document.querySelectorAll("#pb-matrix [data-row]")) buildMatrixRow(li);
+  for (const li of document.querySelectorAll("#pb-host [data-check], #pb-devices [data-check]")) buildHostRow(li);
+  $("pb-run").addEventListener("click", () => runAll());
+  $("pb-run-devices").addEventListener("click", () => runSome(DEVICE_IDS));
+  $("pb-copy").addEventListener("click", () => copyResults());
+  $("pb-send").addEventListener("click", () => sendToChat());
+  $("pb-switch-local").addEventListener("click", () => {
+    if (S.token && feed.route !== "local") feed.start("local", 15).catch(() => tile.set("idle"));
+    renderRoutes();
+  });
+  $("pb-switch-remote").addEventListener("click", () => {
+    if (S.token && S.remote && feed.route !== "remote") feed.start("remote", 15).catch(() => tile.set("idle"));
+    renderRoutes();
+  });
+
+  // A small read-only handle for the fake-host harness; it never exposes the token.
+  globalThis.AutonomProbe = Object.freeze({
+    get state() { return html.dataset.probeState; },
+    results: () => currentResults(),
+    runAll: () => runAll(),
+    runDevices: () => runSome(DEVICE_IDS),
+  });
+
+  boot().catch((error) => {
+    showNotice(`The probe failed to start: ${redactText(error && error.message ? error.message : String(error))}`, "error");
+    finishBoot();
+  });
+}
+</script>
+</body>
+</html>
