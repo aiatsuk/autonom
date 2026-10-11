@@ -1,0 +1,765 @@
+{
+  "schema": 1,
+  "comment": "Shared by tests/test_control_lease.py and tests/canvas-control.test.mjs: the admission rule (contract 2.4, one or more cases per row) and the lease file names (contract 2.1). Both suites must produce exactly these results.",
+  "admission": [
+    {
+      "name": "no lease file, no claim",
+      "row": 1,
+      "lease": null,
+      "claim": null,
+      "now_ms": 1000,
+      "expect": "admitted"
+    },
+    {
+      "name": "never granted lease (holder null, generation 0), no claim",
+      "row": 1,
+      "lease": {
+        "schema": 1,
+        "platform": "android",
+        "target_id": "emulator-5584",
+        "generation": 0,
+        "holder": null,
+        "session_id": null,
+        "acquired_at": null,
+        "renewed_at": null,
+        "expires_at": null,
+        "expires_at_ms": null,
+        "ttl_ms": null,
+        "previous_holder": null,
+        "reason": null,
+        "updated_at": "1970-01-01T00:00:00.000Z",
+        "updated_at_ms": 0
+      },
+      "claim": null,
+      "now_ms": 1000,
+      "expect": "admitted"
+    },
+    {
+      "name": "no lease file, claim",
+      "row": 2,
+      "lease": null,
+      "claim": {
+        "holder_id": "agent:worker-1",
+        "generation": 1
+      },
+      "now_ms": 1000,
+      "expect": "control_not_held"
+    },
+    {
+      "name": "no lease file, claim without generation",
+      "row": 2,
+      "lease": null,
+      "claim": {
+        "holder_id": "agent:worker-1",
+        "generation": null
+      },
+      "now_ms": 1000,
+      "expect": "control_not_held"
+    },
+    {
+      "name": "held, no claim",
+      "row": 3,
+      "lease": {
+        "schema": 1,
+        "platform": "android",
+        "target_id": "emulator-5584",
+        "generation": 2,
+        "holder": {
+          "kind": "agent",
+          "id": "agent:worker-1",
+          "label": "worker-1"
+        },
+        "session_id": null,
+        "acquired_at": "1970-01-01T00:00:00.000Z",
+        "renewed_at": "1970-01-01T00:00:00.000Z",
+        "expires_at": "1970-01-01T00:00:05.000Z",
+        "expires_at_ms": 5000,
+        "ttl_ms": 5000,
+        "previous_holder": null,
+        "reason": "acquired",
+        "updated_at": "1970-01-01T00:00:00.000Z",
+        "updated_at_ms": 0
+      },
+      "claim": null,
+      "now_ms": 1000,
+      "expect": "control_held"
+    },
+    {
+      "name": "held by a human, no claim",
+      "row": 3,
+      "lease": {
+        "schema": 1,
+        "platform": "android",
+        "target_id": "emulator-5584",
+        "generation": 1,
+        "holder": {
+          "kind": "human",
+          "id": "canvas:3277:41234",
+          "label": "41234"
+        },
+        "session_id": null,
+        "acquired_at": "1970-01-01T00:00:00.000Z",
+        "renewed_at": "1970-01-01T00:00:00.000Z",
+        "expires_at": "1970-01-01T00:00:05.000Z",
+        "expires_at_ms": 5000,
+        "ttl_ms": 5000,
+        "previous_holder": null,
+        "reason": "acquired",
+        "updated_at": "1970-01-01T00:00:00.000Z",
+        "updated_at_ms": 0
+      },
+      "claim": null,
+      "now_ms": 1000,
+      "expect": "control_held"
+    },
+    {
+      "name": "free (released), no claim",
+      "row": 4,
+      "lease": {
+        "schema": 1,
+        "platform": "android",
+        "target_id": "emulator-5584",
+        "generation": 2,
+        "holder": null,
+        "session_id": null,
+        "acquired_at": "1970-01-01T00:00:00.000Z",
+        "renewed_at": "1970-01-01T00:00:00.000Z",
+        "expires_at": null,
+        "expires_at_ms": null,
+        "ttl_ms": null,
+        "previous_holder": null,
+        "reason": "released",
+        "updated_at": "1970-01-01T00:00:00.000Z",
+        "updated_at_ms": 0
+      },
+      "claim": null,
+      "now_ms": 1000,
+      "expect": "admitted"
+    },
+    {
+      "name": "expired, no claim",
+      "row": 4,
+      "lease": {
+        "schema": 1,
+        "platform": "android",
+        "target_id": "emulator-5584",
+        "generation": 2,
+        "holder": {
+          "kind": "agent",
+          "id": "agent:worker-1",
+          "label": "worker-1"
+        },
+        "session_id": null,
+        "acquired_at": "1970-01-01T00:00:00.000Z",
+        "renewed_at": "1970-01-01T00:00:00.000Z",
+        "expires_at": "1970-01-01T00:00:05.000Z",
+        "expires_at_ms": 5000,
+        "ttl_ms": 5000,
+        "previous_holder": null,
+        "reason": "acquired",
+        "updated_at": "1970-01-01T00:00:00.000Z",
+        "updated_at_ms": 0
+      },
+      "claim": null,
+      "now_ms": 6000,
+      "expect": "admitted"
+    },
+    {
+      "name": "expires exactly now (now_ms == expires_at_ms) is expired, no claim",
+      "row": 4,
+      "lease": {
+        "schema": 1,
+        "platform": "android",
+        "target_id": "emulator-5584",
+        "generation": 2,
+        "holder": {
+          "kind": "agent",
+          "id": "agent:worker-1",
+          "label": "worker-1"
+        },
+        "session_id": null,
+        "acquired_at": "1970-01-01T00:00:00.000Z",
+        "renewed_at": "1970-01-01T00:00:00.000Z",
+        "expires_at": "1970-01-01T00:00:05.000Z",
+        "expires_at_ms": 5000,
+        "ttl_ms": 5000,
+        "previous_holder": null,
+        "reason": "acquired",
+        "updated_at": "1970-01-01T00:00:00.000Z",
+        "updated_at_ms": 0
+      },
+      "claim": null,
+      "now_ms": 5000,
+      "expect": "admitted"
+    },
+    {
+      "name": "held, same holder, same generation",
+      "row": 5,
+      "lease": {
+        "schema": 1,
+        "platform": "android",
+        "target_id": "emulator-5584",
+        "generation": 3,
+        "holder": {
+          "kind": "agent",
+          "id": "agent:worker-1",
+          "label": "worker-1"
+        },
+        "session_id": null,
+        "acquired_at": "1970-01-01T00:00:00.000Z",
+        "renewed_at": "1970-01-01T00:00:00.000Z",
+        "expires_at": "1970-01-01T00:00:05.000Z",
+        "expires_at_ms": 5000,
+        "ttl_ms": 5000,
+        "previous_holder": null,
+        "reason": "acquired",
+        "updated_at": "1970-01-01T00:00:00.000Z",
+        "updated_at_ms": 0
+      },
+      "claim": {
+        "holder_id": "agent:worker-1",
+        "generation": 3
+      },
+      "now_ms": 1000,
+      "expect": "admitted"
+    },
+    {
+      "name": "held, same holder, no generation",
+      "row": 5,
+      "lease": {
+        "schema": 1,
+        "platform": "android",
+        "target_id": "emulator-5584",
+        "generation": 3,
+        "holder": {
+          "kind": "agent",
+          "id": "agent:worker-1",
+          "label": "worker-1"
+        },
+        "session_id": null,
+        "acquired_at": "1970-01-01T00:00:00.000Z",
+        "renewed_at": "1970-01-01T00:00:00.000Z",
+        "expires_at": "1970-01-01T00:00:05.000Z",
+        "expires_at_ms": 5000,
+        "ttl_ms": 5000,
+        "previous_holder": null,
+        "reason": "acquired",
+        "updated_at": "1970-01-01T00:00:00.000Z",
+        "updated_at_ms": 0
+      },
+      "claim": {
+        "holder_id": "agent:worker-1",
+        "generation": null
+      },
+      "now_ms": 4999,
+      "expect": "admitted"
+    },
+    {
+      "name": "held, same holder, older generation",
+      "row": 6,
+      "lease": {
+        "schema": 1,
+        "platform": "android",
+        "target_id": "emulator-5584",
+        "generation": 3,
+        "holder": {
+          "kind": "agent",
+          "id": "agent:worker-1",
+          "label": "worker-1"
+        },
+        "session_id": null,
+        "acquired_at": "1970-01-01T00:00:00.000Z",
+        "renewed_at": "1970-01-01T00:00:00.000Z",
+        "expires_at": "1970-01-01T00:00:05.000Z",
+        "expires_at_ms": 5000,
+        "ttl_ms": 5000,
+        "previous_holder": null,
+        "reason": "acquired",
+        "updated_at": "1970-01-01T00:00:00.000Z",
+        "updated_at_ms": 0
+      },
+      "claim": {
+        "holder_id": "agent:worker-1",
+        "generation": 2
+      },
+      "now_ms": 1000,
+      "expect": "control_generation_stale"
+    },
+    {
+      "name": "held, same holder, newer generation",
+      "row": 6,
+      "lease": {
+        "schema": 1,
+        "platform": "android",
+        "target_id": "emulator-5584",
+        "generation": 3,
+        "holder": {
+          "kind": "agent",
+          "id": "agent:worker-1",
+          "label": "worker-1"
+        },
+        "session_id": null,
+        "acquired_at": "1970-01-01T00:00:00.000Z",
+        "renewed_at": "1970-01-01T00:00:00.000Z",
+        "expires_at": "1970-01-01T00:00:05.000Z",
+        "expires_at_ms": 5000,
+        "ttl_ms": 5000,
+        "previous_holder": null,
+        "reason": "acquired",
+        "updated_at": "1970-01-01T00:00:00.000Z",
+        "updated_at_ms": 0
+      },
+      "claim": {
+        "holder_id": "agent:worker-1",
+        "generation": 4
+      },
+      "now_ms": 1000,
+      "expect": "control_generation_stale"
+    },
+    {
+      "name": "takeover: human holds generation 4, replaced agent claims generation 3",
+      "row": 7,
+      "lease": {
+        "schema": 1,
+        "platform": "android",
+        "target_id": "emulator-5584",
+        "generation": 4,
+        "holder": {
+          "kind": "human",
+          "id": "canvas:3277:41234",
+          "label": "41234"
+        },
+        "session_id": null,
+        "acquired_at": "1970-01-01T00:00:00.000Z",
+        "renewed_at": "1970-01-01T00:00:00.000Z",
+        "expires_at": "1970-01-01T00:00:05.000Z",
+        "expires_at_ms": 5000,
+        "ttl_ms": 5000,
+        "previous_holder": null,
+        "reason": "acquired",
+        "updated_at": "1970-01-01T00:00:00.000Z",
+        "updated_at_ms": 0
+      },
+      "claim": {
+        "holder_id": "agent:worker-1",
+        "generation": 3
+      },
+      "now_ms": 1000,
+      "expect": "control_generation_stale"
+    },
+    {
+      "name": "free at generation 5, claim at generation 2",
+      "row": 7,
+      "lease": {
+        "schema": 1,
+        "platform": "android",
+        "target_id": "emulator-5584",
+        "generation": 5,
+        "holder": null,
+        "session_id": null,
+        "acquired_at": "1970-01-01T00:00:00.000Z",
+        "renewed_at": "1970-01-01T00:00:00.000Z",
+        "expires_at": null,
+        "expires_at_ms": null,
+        "ttl_ms": null,
+        "previous_holder": null,
+        "reason": "released",
+        "updated_at": "1970-01-01T00:00:00.000Z",
+        "updated_at_ms": 0
+      },
+      "claim": {
+        "holder_id": "agent:worker-1",
+        "generation": 2
+      },
+      "now_ms": 1000,
+      "expect": "control_generation_stale"
+    },
+    {
+      "name": "expired other holder, older claim generation",
+      "row": 7,
+      "lease": {
+        "schema": 1,
+        "platform": "android",
+        "target_id": "emulator-5584",
+        "generation": 5,
+        "holder": {
+          "kind": "agent",
+          "id": "agent:other",
+          "label": "other"
+        },
+        "session_id": null,
+        "acquired_at": "1970-01-01T00:00:00.000Z",
+        "renewed_at": "1970-01-01T00:00:00.000Z",
+        "expires_at": "1970-01-01T00:00:05.000Z",
+        "expires_at_ms": 5000,
+        "ttl_ms": 5000,
+        "previous_holder": null,
+        "reason": "acquired",
+        "updated_at": "1970-01-01T00:00:00.000Z",
+        "updated_at_ms": 0
+      },
+      "claim": {
+        "holder_id": "agent:worker-1",
+        "generation": 4
+      },
+      "now_ms": 9000,
+      "expect": "control_generation_stale"
+    },
+    {
+      "name": "takeover: same replaced agent claim without generation",
+      "row": 8,
+      "lease": {
+        "schema": 1,
+        "platform": "android",
+        "target_id": "emulator-5584",
+        "generation": 4,
+        "holder": {
+          "kind": "human",
+          "id": "canvas:3277:41234",
+          "label": "41234"
+        },
+        "session_id": null,
+        "acquired_at": "1970-01-01T00:00:00.000Z",
+        "renewed_at": "1970-01-01T00:00:00.000Z",
+        "expires_at": "1970-01-01T00:00:05.000Z",
+        "expires_at_ms": 5000,
+        "ttl_ms": 5000,
+        "previous_holder": null,
+        "reason": "acquired",
+        "updated_at": "1970-01-01T00:00:00.000Z",
+        "updated_at_ms": 0
+      },
+      "claim": {
+        "holder_id": "agent:worker-1",
+        "generation": null
+      },
+      "now_ms": 1000,
+      "expect": "control_held"
+    },
+    {
+      "name": "held by another holder, claim at the same generation",
+      "row": 8,
+      "lease": {
+        "schema": 1,
+        "platform": "android",
+        "target_id": "emulator-5584",
+        "generation": 4,
+        "holder": {
+          "kind": "agent",
+          "id": "agent:other",
+          "label": "other"
+        },
+        "session_id": null,
+        "acquired_at": "1970-01-01T00:00:00.000Z",
+        "renewed_at": "1970-01-01T00:00:00.000Z",
+        "expires_at": "1970-01-01T00:00:05.000Z",
+        "expires_at_ms": 5000,
+        "ttl_ms": 5000,
+        "previous_holder": null,
+        "reason": "acquired",
+        "updated_at": "1970-01-01T00:00:00.000Z",
+        "updated_at_ms": 0
+      },
+      "claim": {
+        "holder_id": "agent:worker-1",
+        "generation": 4
+      },
+      "now_ms": 1000,
+      "expect": "control_held"
+    },
+    {
+      "name": "held by another holder, claim at a newer generation",
+      "row": 8,
+      "lease": {
+        "schema": 1,
+        "platform": "android",
+        "target_id": "emulator-5584",
+        "generation": 4,
+        "holder": {
+          "kind": "agent",
+          "id": "agent:other",
+          "label": "other"
+        },
+        "session_id": null,
+        "acquired_at": "1970-01-01T00:00:00.000Z",
+        "renewed_at": "1970-01-01T00:00:00.000Z",
+        "expires_at": "1970-01-01T00:00:05.000Z",
+        "expires_at_ms": 5000,
+        "ttl_ms": 5000,
+        "previous_holder": null,
+        "reason": "acquired",
+        "updated_at": "1970-01-01T00:00:00.000Z",
+        "updated_at_ms": 0
+      },
+      "claim": {
+        "holder_id": "agent:worker-1",
+        "generation": 5
+      },
+      "now_ms": 1000,
+      "expect": "control_held"
+    },
+    {
+      "name": "expired, same holder, same generation",
+      "row": 9,
+      "lease": {
+        "schema": 1,
+        "platform": "android",
+        "target_id": "emulator-5584",
+        "generation": 3,
+        "holder": {
+          "kind": "agent",
+          "id": "agent:worker-1",
+          "label": "worker-1"
+        },
+        "session_id": null,
+        "acquired_at": "1970-01-01T00:00:00.000Z",
+        "renewed_at": "1970-01-01T00:00:00.000Z",
+        "expires_at": "1970-01-01T00:00:05.000Z",
+        "expires_at_ms": 5000,
+        "ttl_ms": 5000,
+        "previous_holder": null,
+        "reason": "acquired",
+        "updated_at": "1970-01-01T00:00:00.000Z",
+        "updated_at_ms": 0
+      },
+      "claim": {
+        "holder_id": "agent:worker-1",
+        "generation": 3
+      },
+      "now_ms": 7000,
+      "expect": "control_lease_expired"
+    },
+    {
+      "name": "expired, same holder, no generation",
+      "row": 9,
+      "lease": {
+        "schema": 1,
+        "platform": "android",
+        "target_id": "emulator-5584",
+        "generation": 3,
+        "holder": {
+          "kind": "agent",
+          "id": "agent:worker-1",
+          "label": "worker-1"
+        },
+        "session_id": null,
+        "acquired_at": "1970-01-01T00:00:00.000Z",
+        "renewed_at": "1970-01-01T00:00:00.000Z",
+        "expires_at": "1970-01-01T00:00:05.000Z",
+        "expires_at_ms": 5000,
+        "ttl_ms": 5000,
+        "previous_holder": null,
+        "reason": "acquired",
+        "updated_at": "1970-01-01T00:00:00.000Z",
+        "updated_at_ms": 0
+      },
+      "claim": {
+        "holder_id": "agent:worker-1",
+        "generation": null
+      },
+      "now_ms": 7000,
+      "expect": "control_lease_expired"
+    },
+    {
+      "name": "expires exactly now, same holder, same generation",
+      "row": 9,
+      "lease": {
+        "schema": 1,
+        "platform": "android",
+        "target_id": "emulator-5584",
+        "generation": 3,
+        "holder": {
+          "kind": "agent",
+          "id": "agent:worker-1",
+          "label": "worker-1"
+        },
+        "session_id": null,
+        "acquired_at": "1970-01-01T00:00:00.000Z",
+        "renewed_at": "1970-01-01T00:00:00.000Z",
+        "expires_at": "1970-01-01T00:00:05.000Z",
+        "expires_at_ms": 5000,
+        "ttl_ms": 5000,
+        "previous_holder": null,
+        "reason": "acquired",
+        "updated_at": "1970-01-01T00:00:00.000Z",
+        "updated_at_ms": 0
+      },
+      "claim": {
+        "holder_id": "agent:worker-1",
+        "generation": 3
+      },
+      "now_ms": 5000,
+      "expect": "control_lease_expired"
+    },
+    {
+      "name": "free, claim at the lease generation",
+      "row": 10,
+      "lease": {
+        "schema": 1,
+        "platform": "android",
+        "target_id": "emulator-5584",
+        "generation": 3,
+        "holder": null,
+        "session_id": null,
+        "acquired_at": "1970-01-01T00:00:00.000Z",
+        "renewed_at": "1970-01-01T00:00:00.000Z",
+        "expires_at": null,
+        "expires_at_ms": null,
+        "ttl_ms": null,
+        "previous_holder": null,
+        "reason": "released",
+        "updated_at": "1970-01-01T00:00:00.000Z",
+        "updated_at_ms": 0
+      },
+      "claim": {
+        "holder_id": "agent:worker-1",
+        "generation": 3
+      },
+      "now_ms": 1000,
+      "expect": "control_not_held"
+    },
+    {
+      "name": "free, claim without generation",
+      "row": 10,
+      "lease": {
+        "schema": 1,
+        "platform": "android",
+        "target_id": "emulator-5584",
+        "generation": 3,
+        "holder": null,
+        "session_id": null,
+        "acquired_at": "1970-01-01T00:00:00.000Z",
+        "renewed_at": "1970-01-01T00:00:00.000Z",
+        "expires_at": null,
+        "expires_at_ms": null,
+        "ttl_ms": null,
+        "previous_holder": null,
+        "reason": "released",
+        "updated_at": "1970-01-01T00:00:00.000Z",
+        "updated_at_ms": 0
+      },
+      "claim": {
+        "holder_id": "agent:worker-1",
+        "generation": null
+      },
+      "now_ms": 1000,
+      "expect": "control_not_held"
+    },
+    {
+      "name": "expired other holder, claim without generation",
+      "row": 10,
+      "lease": {
+        "schema": 1,
+        "platform": "android",
+        "target_id": "emulator-5584",
+        "generation": 3,
+        "holder": {
+          "kind": "agent",
+          "id": "agent:other",
+          "label": "other"
+        },
+        "session_id": null,
+        "acquired_at": "1970-01-01T00:00:00.000Z",
+        "renewed_at": "1970-01-01T00:00:00.000Z",
+        "expires_at": "1970-01-01T00:00:05.000Z",
+        "expires_at_ms": 5000,
+        "ttl_ms": 5000,
+        "previous_holder": null,
+        "reason": "acquired",
+        "updated_at": "1970-01-01T00:00:00.000Z",
+        "updated_at_ms": 0
+      },
+      "claim": {
+        "holder_id": "agent:worker-1",
+        "generation": null
+      },
+      "now_ms": 9000,
+      "expect": "control_not_held"
+    },
+    {
+      "name": "expired, same holder, newer generation",
+      "row": 10,
+      "lease": {
+        "schema": 1,
+        "platform": "android",
+        "target_id": "emulator-5584",
+        "generation": 3,
+        "holder": {
+          "kind": "agent",
+          "id": "agent:worker-1",
+          "label": "worker-1"
+        },
+        "session_id": null,
+        "acquired_at": "1970-01-01T00:00:00.000Z",
+        "renewed_at": "1970-01-01T00:00:00.000Z",
+        "expires_at": "1970-01-01T00:00:05.000Z",
+        "expires_at_ms": 5000,
+        "ttl_ms": 5000,
+        "previous_holder": null,
+        "reason": "acquired",
+        "updated_at": "1970-01-01T00:00:00.000Z",
+        "updated_at_ms": 0
+      },
+      "claim": {
+        "holder_id": "agent:worker-1",
+        "generation": 4
+      },
+      "now_ms": 9000,
+      "expect": "control_not_held"
+    },
+    {
+      "name": "free, claim at a newer generation",
+      "row": 10,
+      "lease": {
+        "schema": 1,
+        "platform": "android",
+        "target_id": "emulator-5584",
+        "generation": 3,
+        "holder": null,
+        "session_id": null,
+        "acquired_at": "1970-01-01T00:00:00.000Z",
+        "renewed_at": "1970-01-01T00:00:00.000Z",
+        "expires_at": null,
+        "expires_at_ms": null,
+        "ttl_ms": null,
+        "previous_holder": null,
+        "reason": "released",
+        "updated_at": "1970-01-01T00:00:00.000Z",
+        "updated_at_ms": 0
+      },
+      "claim": {
+        "holder_id": "agent:worker-1",
+        "generation": 9
+      },
+      "now_ms": 1000,
+      "expect": "control_not_held"
+    }
+  ],
+  "paths": [
+    {
+      "platform": "android",
+      "target_id": "emulator-5584",
+      "file": "android__emulator-5584.json"
+    },
+    {
+      "platform": "android",
+      "target_id": "127.0.0.1:5555",
+      "file": "android__127.0.0.1_5555-6460677a198b.json"
+    },
+    {
+      "platform": "android",
+      "target_id": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "file": "android__xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx-aa20c23e3201.json"
+    },
+    {
+      "platform": "android",
+      "target_id": "usb:1-2.3/yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy",
+      "file": "android__usb_1-2.3_yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy-7c44459cc27c.json"
+    },
+    {
+      "platform": "ios",
+      "target_id": "45A342A1-AA2F-4F40-8EFD-F0D0C590ECE5",
+      "file": "ios__45A342A1-AA2F-4F40-8EFD-F0D0C590ECE5.json"
+    }
+  ]
+}

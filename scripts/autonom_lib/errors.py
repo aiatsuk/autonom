@@ -192,6 +192,11 @@ NOT_AUTOMATIC = "not_automatic"  # confirm or dismiss of a finding that is not a
 PROFILE_INVALID = "profile_invalid"  # an app profile that does not parse or holds credential-shaped values
 NOT_A_PRETEST_PACK = "not_a_pretest_pack"  # a path that is not a finalized pre-test pack
 DRAFT_UNAVAILABLE = "draft_unavailable"  # no draft flow can be built or found for the finding
+# --- Control lease (P2) -------------------------------------------------------
+CONTROL_HELD = "control_held"                          # another live holder controls the target
+CONTROL_GENERATION_STALE = "control_generation_stale"  # the claim's generation is not the lease's
+CONTROL_LEASE_EXPIRED = "control_lease_expired"        # the claimed lease expired; acquire again
+CONTROL_NOT_HELD = "control_not_held"                  # a claim, release or renew without that lease
 
 class AutonomError(RuntimeError):
     """An expected failure with a stable code and an actionable hint."""

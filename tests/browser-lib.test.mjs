@@ -295,3 +295,20 @@ test("a token starting with a dash passes as --token=VALUE", () => {
   assert.equal(parseArgs(["--token", "plain"]).token, "plain");
   assert.throws(() => parseArgs(["--token="]), /Pass a value after --token/);
 });
+
+test("parseArgs: --control-idle takes 15 to 3600 seconds, default 120 (the idle release of the control lease)", () => {
+  assert.equal(parseArgs([]).controlIdle, 120);
+  assert.equal(parseArgs([]).controlIdleExplicit, undefined);
+  const values = parseArgs(["--serial", "emulator-5584", "--control-idle", "20"]);
+  assert.equal(values.controlIdle, 20);
+  assert.equal(values.controlIdleExplicit, true);
+  assert.equal(parseArgs(["--split", "--control-idle", "3600"]).controlIdle, 3600);
+  assert.equal(parseArgs(["--control-idle", "15"]).controlIdle, 15);
+  for (const value of ["14", "3601", "0", "-5", "20.5", "2e1", "twenty", ""]) {
+    assert.throws(() => parseArgs(["--control-idle", value]),
+      value === "" ? /Pass a value after --control-idle|--control-idle must be/ : /--control-idle must be an integer from 15 to 3600 seconds/,
+      value);
+  }
+  assert.throws(() => parseArgs(["--control-idle"]), /Pass a value after --control-idle/);
+  assert.throws(() => parseArgs(["--control-idle", "--no-auth"]), /Pass a value after --control-idle/);
+});

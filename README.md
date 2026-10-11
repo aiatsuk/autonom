@@ -110,6 +110,16 @@ so an agent branches on a stable code instead of parsing prose. A second
 `verified: true` on a `simulator` control means the state was read back,
 never only that the command ran.
 
+Several agents and people can share one machine. `session start --alongside
+--label NAME` keeps one live session per device, and `session list` shows
+them. Who may change a device right now is its **control lease**
+(`autonom control status|acquire|renew|release`): with no lease nothing
+changes; once someone holds it, other agents' device-changing commands are
+refused with `control_held` (nothing runs) and a running flow ends
+`interrupted`. A person's first input in the Mobile Canvas takes the lease
+automatically; **Take over**, **Hand back** and an idle timeout
+(`canvas serve --control-idle`, 120 s by default) are explicit.
+
 On iOS the tree comes from idb; input goes through idb, or AXe
 (`brew install cameroncooke/axe/axe`) when `doctor` reports idb's HID broken —
 see [`docs/INSTALL.md`](docs/INSTALL.md) for the Xcode 27 fix.

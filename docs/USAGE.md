@@ -273,6 +273,62 @@ Notes:
   boot a device; with `--shutdown-booted` the Canvas shuts down what it booted
   when it stops. Pass `--port 0` for a free port.
 
+## Share a device between agents and a person
+
+```text
+Start one session per device: `autonom session start --serial emulator-5584
+--label checkout`, then `autonom session start --serial emulator-5586
+--alongside --label search`. `autonom session list` shows both live sessions,
+their labels and which one is current. Before a long job on emulator-5584,
+run `autonom control acquire --serial emulator-5584 --holder agent:checkout
+--ttl 600` and pass the printed claim (`--control-holder agent:checkout
+--control-generation <n>`, or the `env` it prints) to every command and flow
+on that device; renew with `autonom control renew` before the TTL ends and
+release with `autonom control release` when done. If a command answers
+`control_held` or `control_generation_stale`, or a flow ends
+`interrupted`, someone else has the device: report the holder from the
+error, wait until `autonom control status --serial emulator-5584` reads
+`free`, and only then run the flow again.
+```
+
+Notes:
+- With no lease file a device works exactly as before: nobody needs to
+  acquire anything. The lease only matters once someone holds it.
+- In the Mobile Canvas a person's **first input** on a device nobody holds
+  takes the lease automatically: unclaimed agent commands on that device are
+  refused `control_held` (exit 2, nothing ran), and a running flow stops
+  before its next device action with `status: "interrupted"`,
+  `failure.failure_class: "control_lost"` (exit 1). The page then reads "You
+  have control" with a **Release** button.
+- A person sees "Agent '<label>' has control" while an agent holds the
+  lease; input is off until they press **Take over**, which replaces the
+  agent at once (its next action fails `control_generation_stale`). After a
+  Take over the button reads **Hand back**.
+- The person's lease ends on Hand back or Release, after `--control-idle`
+  seconds without input (`autonom canvas serve --control-idle 300`; default
+  120, 15..3600), or about 30 s after the page closes. Hand back never
+  restarts an interrupted run.
+- `control acquire --takeover` is refused for an agent holder
+  (`takeover_requires: "human"`); only a person's Take over replaces a live
+  holder. An agent lease expires after its TTL (default 60 s, 5..3600; a
+  renew without `--ttl` keeps that TTL); a
+  claimed flow that runs longer ends `interrupted` with
+  `control_lease_expired` unless it is renewed in parallel.
+- The lease is a coordination rule between cooperating processes of one
+  user, not a security boundary. Any process of that user can call
+  `control acquire --kind human --takeover`, or reuse a holder id and
+  generation it read from a refusal or from `control status`. The lease
+  files are private to the user (mode 0600 in a 0700 directory), so other
+  users can neither read nor forge them. Do not rely on the lease to keep a
+  misbehaving agent off a device.
+- Reading never needs the lease: `ui tree`, `screenshot`, `record`, `logs`,
+  `journal`, `session list`, `session stop` and `control status` always run.
+  Host-side network work (`network start`, `network mock …`) is not gated
+  either; `network attach|detach|stop` are.
+- `--operation-id ID` names an action in the journal (`operation_id`); an
+  admitted command's JSON gains `control: {generation, holder_id,
+  operation_id}` once a lease exists or a claim was given.
+
 ## Tap one of several identical controls
 
 ```text

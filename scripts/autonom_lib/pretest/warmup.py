@@ -44,6 +44,7 @@ from pathlib import Path
 from typing import Any
 
 from .. import actions as actions_mod
+from .. import control as control_mod
 from .. import errors
 from .. import ui as ui_mod
 from ..atlas import fingerprint as fingerprint_mod
@@ -301,6 +302,10 @@ def _replay_tap(session: dict[str, Any], target: Any, edge: dict[str, Any],
                                   "the recorded selector matched nothing on this screen",
                                   hint="The screen changed since the map recorded it.")
     x, y = ui_mod.center_of(node)
+    # The host control lease admits each replayed tap before the pre-test guard
+    # (inside `ui.tap`) counts it: a refusal sends nothing and costs no budget.
+    control_mod.admit(target.platform, target.target_id,
+                      control_mod.invocation().get("claim"))
     ui_mod.tap(target, x, y, node=node)
     actions_mod.record_detail(session, "tap", {
         "kind": "tap", "coordinate": False, "origin": "warmup",

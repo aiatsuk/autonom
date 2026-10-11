@@ -70,7 +70,12 @@ already in another tab with "Move here" (a device lives in one tab), and the
   (`session start --alongside`, never written to `current.json`) or reuses the live
   session on that target; detaching ends only the sessions the Canvas started. An
   agent's `--serial X` commands bind to the session on X, so both journal together.
-  A tile shows "No Autonom session: …" with Reconnect when the start failed.
+  A tile shows "No Autonom session: …" with Reconnect when the start failed, and
+  "Session stopped" (input refused, `session_stopped`) when its session was
+  stopped elsewhere. `autonom session list` shows every live session.
+- **Shared control.** A person's first input on a tile takes that device's
+  control lease, so agents on it are refused until Hand back or idle release
+  (`--control-idle`, default 120 s); see Shared control below.
 - **Focus.** One tile is focused (click it, or Ctrl+Alt+1..4; Ctrl+Alt+Left/Right
   switch tabs). It streams at full rate; the others drop to at most 30 fps and
   1024 px (Android) or half scale (iOS), and tiles of tabs no window shows stop
@@ -464,6 +469,59 @@ and key that connection held, and every client sees the new state. Page
 connections are `human`; a token client may pass
 `?origin=agent|replay|system`.
 
+### Shared control (the host lease)
+
+The handoff above works inside one Canvas. Between processes (CLI agents,
+flows, other Canvases) each device has one **control lease** in the machine
+state (`<state>/control/<platform>__<target>.json`; `autonom control status`
+shows it). With no lease file everything behaves as before.
+
+- **Shared** (nobody holds the lease): the page reads "Shared" and input is
+  on. A person's **first input takes control by itself**, with no click: a
+  touch, gesture, key, scroll, text, paste, system button, display change,
+  HTTP `/tap`, `/swipe`, `/key`, `/text`, `/display`, or a Tools/Actions
+  device op (permissions, location, simulate, network attach/detach/stop, app
+  install, launch, open URL, language). Observation and host-side ops
+  (screenshot, recording, network start, mocks) never take it. The grant
+  raises the lease's generation, so agent commands and flows on that device
+  are refused from their next device action (`control_held`; a running flow
+  ends `interrupted`). Input that arrives while the grant is pending waits
+  for it in order (at most 2 s, then it is refused `control_not_held`).
+- **You have control**: the button reads **Release**, or **Hand back** after
+  a Take over. The Canvas renews the lease (30 s lifetime) while a person's
+  page is connected or sent input in the last 30 s.
+- **Someone else has control** (an agent or another Canvas): "Agent '<label>'
+  has control"; input is off and a click shows "Take over to use the
+  screen". An input never takes a live lease from someone; only **Take over**
+  (`{"mode":"takeover"}` from a person) does, and the page names who was
+  replaced.
+- **Hand back** (`{"mode":"release"}` from a person while holding) frees the
+  device. It does not restart an interrupted agent run; the agent re-runs or
+  continues once `control status` shows the device free.
+- **Idle release**: after `--control-idle SECONDS` without human input
+  (default 120, range 15..3600) the Canvas releases by itself and journals a
+  `control` record with mode `idle`; the next input takes control again with
+  a new generation. A page that closes stops renewing, so the lease expires
+  within 30 s. A lease lost to someone else or to expiry is journaled with
+  mode `lost`, and every pointer and key this Canvas held is lifted.
+
+Lease refusals answer HTTP 409 with `error_code` `control_held` (also on
+`/tools/call`); a WebSocket refusal is an `error` message with `code`.
+Queued input stamped before a lease change is dropped with
+`control_generation_stale` (an up or key-up is still sent). `/status`, the
+`state` message, `POST /control` and `/api/devices` carry `lease` (`state`,
+`holder`, `generation`, `expires_at`, `mine`, `took_over_from`, `ended_by`,
+`idle_s`) and `session_stopped`. HTTP input answers keep their body. Inside
+one Canvas the lease is shared by all its origins: an automatic grant does
+not change the local owner, so an agent client of the same Canvas keeps
+working until a person presses Take over.
+
+In a workspace Canvas every device passes the id of the session it started
+or reused to its action bridge, tools process and log feed. When that
+session is stopped elsewhere, input is refused (`session_stopped`) and the
+tile shows "Session stopped"; the Canvas does not start a new one. Detach and
+stop release a held lease (or leave it to expire).
+
 ### Driving it from a script
 
 ```text
@@ -596,7 +654,12 @@ there is one `ui text` entry written by the bridge as it types, naming idb):
 | text | text entry | `text_len`, and `text` unless `sensitive` |
 | paste | paste | `text_len` only |
 | system | button | `op` |
-| control | handoff change | `mode`, `owner` |
+| control | a `control` message on `/ws/control` (pause, resume, Take over, Hand back), a lost lease, an idle release (never the automatic grant) | `mode` (`pause`, `resume`, `takeover`, `release`, `lost`, `idle`), `owner` |
+
+The HTTP route `POST /control` (and `/d/<id>/control`) changes control the
+same way but journals nothing: its record is the Canvas command log and the
+lease file (`control status`). Only the lost and idle endings of a lease
+reach the journal whichever route took it.
 
 A display change writes one `ui display` record on every Android transport,
 with `preset`, `width`, `height`, `density` (as read back), its origin and

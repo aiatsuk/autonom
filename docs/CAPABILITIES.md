@@ -15,6 +15,8 @@ Legend: ✅ shipped · ⚠️ partial · 🔜 planned · ❌ not planned for nea
 | Environment diagnosis | ✅ | ✅ | `autonom doctor` — tools, capabilities (`ios_tree` and `ios_hid` separately: the tree needs idb, input needs a companion that loads SimulatorKit or AXe), orphans, every active `AUTONOM_*` override (`override_path_missing`), and emulators still routed through another session's live proxy (`device_attached_to_foreign_proxy`); `--strict` exits 1 with `ok: false` and the `strict_failures` list. `optional_tools.scrcpy` says where the Mobile Canvas would find scrcpy-server, from which `source`, at which `version`, and whether it is the 4.1 it needs (`ready`, `install_hint`); an optional tool never fails `--strict` |
 | Session + artifact dirs | ✅ | ✅ | machine-global `~/.autonom/sessions/<id>/`; `autonom session *`; `session start` refuses with `session_already_active` while one is live, reports what `--install`/`--launch` did (`installed`, `launched` with the launch report), and a failed `--install`/`--launch` rolls the new session back (`session_rolled_back`); `session stop` also stops every registered process the session owns (`process_teardown`) and names an idb companion it did not start (`companion_left_running`) |
 | Session journal (actions + notes) | ✅ | ✅ | `journal.ndjson`; `autonom journal` / `note`; secret-safe |
+| Several sessions, listed and labelled (Unreleased) | ✅ | ✅ | one live session per target (`session start --alongside`); `session list` shows the live ones (`--all` adds stopped records) with `label`, `current` and `live`, never touching a device; `session start --label TEXT` names a session for people. Action detail files get collision-safe names under concurrency, and a detail that cannot be written is an `evidence_write_failed` warning, never a repeated input |
+| Shared control lease (Unreleased) | ✅ | ✅ | one host-wide lease per target (`control status\|acquire\|renew\|release`; holder kind `agent` or `human`, a generation that only grows, an expiry). With no lease file nothing changes; once one is held, every device-changing verb, flow step, Canvas input and Canvas Tools/Actions device op is admitted only for the holder's claim (`--control-holder`, `--control-generation`, or `AUTONOM_CONTROL_HOLDER`/`AUTONOM_CONTROL_GENERATION`), checked immediately before the device is touched; refusals are `control_held`, `control_generation_stale`, `control_lease_expired`, `control_not_held`, and a refused flow ends `interrupted` (`control_lost`). Reading (trees, screenshots, recordings, logs, journal) is never gated. In the Mobile Canvas a person's first input on a free device takes the lease automatically; Take over replaces an agent; Hand back, idle release (`--control-idle`, default 120 s) or a closed page end it. Admission and the device call are not atomic: one already admitted input can pass a takeover (milliseconds for flows and the Canvas, up to one UI snapshot for a selector `ui tap`/`ui type`). The lease coordinates cooperating processes of one user and is not a security boundary (any process of that user can take over with `--kind human`) |
 | Boot / install / launch / terminate | ✅ | ✅ | simulator boots automatically on session start; an Android resume launch is `am start -W` on the launcher activity (`component`, `launch` report; `monkey` only when no launcher activity resolves) |
 | Clear app data | ✅ | ⚠️ | Android `pm clear`; iOS uninstall+reinstall, or `--strategy privacy` for permissions only |
 | Compact UI / accessibility tree | ✅ | ✅ | UIAutomator; idb `describe-all`; one node shape on both platforms (`long_clickable`, `checkable` included); live trees carry `screen` (the bounds' coordinate space) and `truncated` exactly when `--max-nodes` cut the list; a node that cannot be on screen (iOS lists Flutter's scroll cache at a 0x0 frame) stays in the tree marked `visible: false`, live or `--dump`; `--format outline` prints one indented line per node, `--interactable` keeps only nodes an agent can act on (focusable-only labels are not; long-press-only and checkable controls are) |
@@ -143,6 +145,8 @@ artifact commands such as reports, put session selection before the verb:
 `autonom --session-id <id> report build`.
 
 ```bash
+autonom [--control-holder ID] [--control-generation N] [--operation-id ID] <verb> ...
+                                 # control claim, before or after the verb (exact spellings)
 autonom version
 autonom devices [list] [--platform android|ios]
 autonom devices boot [--avd NAME | --target ID] [--no-wait] [--timeout S] [--emulator PATH]
@@ -153,7 +157,8 @@ autonom tour [--run] [--avd NAME] [--flow PATH] [--human] [--shutdown]
 autonom capabilities [--probe]
 
 autonom session start [--app-id ID] [--install PATH] [--launch [ID]] [--activity C] [--log-stream]
-                      [--alongside] [--started-by canvas:PORT:PID]
+                      [--alongside] [--started-by canvas:PORT:PID] [--label TEXT]
+autonom session list [--all]
 autonom session show|stop
 autonom session outputs [--session-id ID]
 autonom session launch <app-id> [--activity C] [--arg A] [--setenv K=V] [--fresh]
@@ -301,7 +306,7 @@ autonom canvas serve [--port N] [--transport auto|scrcpy|idb|screenrecord|screen
                      [--idb-companion PATH] [--token TOKEN] [--no-auth]
                      [--device PLATFORM:ID]... [--split] [--workspace NAME] [--ephemeral]
                      [--bootable avd:NAME[@PORT]|simulator:UDID]... [--shutdown-booted]
-                     [--install-root DIR]... [--captures-dir DIR]
+                     [--install-root DIR]... [--captures-dir DIR] [--control-idle SECONDS]
 autonom canvas stop [--port N | --workspace NAME | --all]
 autonom canvas attach [--port N | --workspace NAME] [--tab ID|NAME]
 autonom canvas detach [--port N | --workspace NAME] [--device-id ID]
@@ -324,6 +329,11 @@ autonom network mock update <id> [--url U | --match GLOB] [--method M] [--host H
 autonom network mock list [--all] | show <id> | remove <id> | clear
 autonom network mock enable [<id>|--all] | disable [<id>|--all]
 autonom network export [--har PATH]
+
+autonom control status [--all]
+autonom control acquire [--holder ID] [--kind agent|human] [--label TEXT] [--ttl SECONDS] [--takeover]
+autonom control release [--holder ID] [--generation N]
+autonom control renew [--holder ID] [--generation N] [--ttl SECONDS]
 
 autonom processes
 autonom cleanup [--dry-run] [--all]
@@ -405,6 +415,8 @@ a missing file, or a profile's `login_flow`/`warmup_flow` that does not exist).
 | `AUTONOM_IOS_LOG_MAX_MB` | Per-file cap of the `session start --log-stream` file on iOS, in MB (default 50, one rotation) |
 | `AUTONOM_IDB_STATE_FILE` | The fb-idb client's companion registry (default `/tmp/idb/state`), read to decide whether a stale-companion retry pruned anything |
 | `AUTONOM_CORESIMULATOR_DEVICES` | The CoreSimulator `Devices` directory `simulator keyboard` edits (default `~/Library/Developer/CoreSimulator/Devices`); point it at a mounted tree to pin a remote Mac's simulator |
+| `AUTONOM_CONTROL_HOLDER`, `AUTONOM_CONTROL_GENERATION` | The control lease claim of every command (`--control-holder`, `--control-generation` win over them); `control acquire` and `control renew` print both under `env` |
+| `AUTONOM_CONTROL_NOW_MS`, `AUTONOM_CANVAS_HUMAN_TTL_S` | Tests only, and only with `AUTONOM_TEST_MODE=1`: the lease clock of `control.py` in epoch milliseconds, and a shorter human lease (5..30 s) in the Canvas; ignored otherwise |
 | `AUTONOM_PREFIX`, `AUTONOM_BIN_DIR` | Installer only: bundle home and the directory `autonom` is linked into |
 | `AUTONOM_REQUIRE_SHELLCHECK` | Dev tooling only: `run_checks.sh` fails instead of skipping the shell lint when shellcheck is missing (set by CI) |
 | `AUTONOM_TEST_JOBS` | Dev tooling only: worker count of `tests/run_parallel.py`, the parallel unit-suite runner `run_checks.sh` uses (default: twice the CPU count) |
@@ -434,6 +446,7 @@ What each earlier limitation cost, and what replaced it.
 | No record of what an agent did | Append-only `journal.ndjson` — every verb, its scrubbed argv, the result, and the failures, plus agent notes |
 | A screenshot that silently showed mocked data | Provenance embedded in the PNG; captures taken under an active rule are flagged `screenshot_shows_mocked_data` |
 | Before/after captures that differed by the battery glyph, the signal bars, or an autocorrected word | `simulator status-bar pin` and `simulator keyboard pin` fix the state the app does not own, so a diff shows only what the app changed; the clock stays real unless pinned on purpose |
+| Agents, flows and a person driving one device at the same time | The host-wide control lease: a person's first Canvas input takes the device, agents are refused (`control_held`) and flows end `interrupted` before their next device action, Take over and Hand back are explicit, and every session lists and journals only its own device |
 | A failed flow that named the broken step and nothing else | The `repair` block: reconstruct the state, inspect the live tree, edit, re-verify — in the CLI's own commands |
 
 The harness intentionally does not claim that trend analysis proves a memory

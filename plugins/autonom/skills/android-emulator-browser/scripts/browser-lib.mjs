@@ -7,6 +7,7 @@ import { randomBytes } from "node:crypto";
 
 import { ANDROID_KEYCODES } from "./scrcpy-lib.mjs";
 import { DEVICE_ID_PATTERN, MAX_DEVICES } from "./canvas-devices.mjs";
+import { DEFAULT_CONTROL_IDLE_S, parseControlIdle } from "./canvas-control.mjs";
 
 export const DEFAULT_PORT = 3277;
 export const DEFAULT_FPS = 15;
@@ -187,6 +188,8 @@ export function parseArgs(argv) {
     devices: [],
     bootable: [],
     installRoots: [],
+    // Seconds without human input after which the Canvas hands its control lease back (DEC-014).
+    controlIdle: DEFAULT_CONTROL_IDLE_S,
   };
 
   for (let i = 0; i < argv.length; i += 1) {
@@ -293,6 +296,10 @@ export function parseArgs(argv) {
         break;
       case "--captures-dir":
         options.capturesDir = requireFlagValue(argv, ++i, flag);
+        break;
+      case "--control-idle":
+        options.controlIdle = parseControlIdle(requireFlagValue(argv, ++i, flag));
+        options.controlIdleExplicit = true;
         break;
       default:
         throw new Error(`Unknown argument: ${flag}`);
