@@ -42,6 +42,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+from .. import control as control_mod
 from .. import device_state, errors, ios_simctl, providers, simulator as simulator_mod
 from .. import journal as journal_mod
 from .. import screenshot as screenshot_mod
@@ -54,6 +55,7 @@ from . import selectors as flow_selectors
 from . import validator as flow_validator
 from .events import EventWriter
 from .schema import (
+    CONTROL_LOST,
     Evidence,
     Flow,
     FlowSelector,
@@ -149,7 +151,7 @@ class StepOutcome:
 @dataclass
 class RunResult:
     run_id: str
-    status: str            # passed | failed
+    status: str            # passed | failed | replayed | interrupted (control lease lost)
     steps: list = field(default_factory=list)
     failure: dict | None = None
     hook_failures: list = field(default_factory=list)
@@ -197,6 +199,41 @@ def _repin_fields(repin: dict[str, Any] | None) -> dict[str, Any]:
 
 class _Stop(Exception):
     """Internal: a step failed as a test failure; unwind to the run loop."""
+
+
+# Flow commands that change what the device shows (contract 5.5): admitted
+# against the control lease at the start of their dispatch and immediately
+# before every device actuator call. Every other command only reads the
+# screen, sets run variables, or composes steps.
+MUTATING_COMMANDS = frozenset({
+    "launchApp", "stopApp", "clearState", "openLink", "tapOn", "longPressOn",
+    "doubleTapOn", "setOrientation", "inputText", "pasteText", "eraseText", "pressKey",
+    "back", "swipe", "scroll", "scrollUntilVisible", "setLocation", "setPermissions",
+    "addMedia",
+})
+NON_MUTATING_COMMANDS = frozenset({
+    "assertVisible", "assertNotVisible", "assertEnabled", "assertChecked", "waitUntil",
+    "waitForSettled", "copyTextFrom", "setClipboard", "takeScreenshot", "checkpoint",
+    "note", "runFlow", "group", "repeat", "retry",
+})
+CONTROL_CODES = frozenset({
+    errors.CONTROL_HELD, errors.CONTROL_GENERATION_STALE, errors.CONTROL_LEASE_EXPIRED,
+    errors.CONTROL_NOT_HELD,
+})
+
+
+class _ControlLost(Exception):
+    """Internal: the control lease refused a mutation; the run is interrupted.
+
+    Deliberately neither an `errors.AutonomError` nor a `_Stop`: no per-step
+    handler, retry block or runFlow child catches it, so it unwinds to
+    `run()` and no later step (and no cleanup hook) acts on a device someone
+    else now controls."""
+
+    def __init__(self, error: errors.AutonomError) -> None:
+        super().__init__(error.message)
+        self.error = error
+        self.outcome: StepOutcome | None = None
 
 
 class _ReplayReached(Exception):
@@ -326,6 +363,7 @@ class Executor:
 
         result.started_at_ms = self._wall_ms()
         aborted: errors.AutonomError | None = None
+        interrupted: _ControlLost | None = None
         replay_reached = False
         try:
             self._apply_setup(flow)
@@ -361,6 +399,12 @@ class Executor:
             }
         except _Stop:
             result.status = "failed"
+        except _ControlLost as lost:
+            # The control lease moved: stop here. The refused step is recorded
+            # as skipped, no later step runs, and the cleanup hooks are not
+            # run (they would mutate a device someone else now controls).
+            result.status = "interrupted"
+            interrupted = lost
         except errors.AutonomError as exc:
             # infrastructure / flow-definition failures abort the run — but the
             # evidence must survive them, or the one case a human most needs to
@@ -372,9 +416,12 @@ class Executor:
             # must not become the run's failure
             terminal = self._terminal
             if (flow.on_flow_complete and not self.config.dry_run
-                    and not replay_reached):
+                    and not replay_reached and interrupted is None):
                 self._run_complete_hooks(flow, root_values, writer, result,
                                          evidence)
+
+        if interrupted is not None:
+            self._record_interruption(interrupted, flow, writer, result)
 
         if result.status == "failed" and result.steps:
             # The step that ENDED the run. The first failed step is wrong
@@ -419,6 +466,54 @@ class Executor:
         if aborted is not None:
             raise aborted  # evidence is written; the envelope still reaches the CLI
         return result
+
+    # -- control lease ----------------------------------------------------------
+
+    def _admit(self) -> None:
+        """Admit the next device mutation against the target's control lease
+        (contract 5.5), with the invocation's claim and the operation id
+        `<run_id>:<step index>`. Called immediately before every actuator
+        call, not only at step start: a step may poll for seconds before it
+        acts. Without a lease file and without a claim it admits and changes
+        nothing; a refusal raises `_ControlLost`."""
+        current = control_mod.invocation()
+        operation_id = (f"{self._writer_run_id}:{self._counter}"
+                        if self._writer_run_id else None)
+        try:
+            control_mod.admit(self.target.platform, self.target.target_id,
+                              current.get("claim"), operation_id=operation_id)
+        except errors.AutonomError as exc:
+            if exc.code in CONTROL_CODES:
+                raise _ControlLost(exc) from None
+            raise
+
+    def _record_interruption(self, lost: _ControlLost, flow: Flow,
+                             writer: EventWriter, result: RunResult) -> None:
+        """The refused step (skipped, `control_lost`), the run's failure and
+        the `flow.step.refused` event of an interrupted run."""
+        error = lost.error
+        extra = error.extra or {}
+        outcome = lost.outcome
+        if outcome is not None:
+            result.steps.append(outcome)
+        result.failure = {
+            "step_index": outcome.index if outcome else None,
+            "command": outcome.command if outcome else "setup",
+            "line": outcome.line if outcome else None,
+            "flow": outcome.flow if outcome else flow.path,
+            "error_code": error.code,
+            "failure_class": CONTROL_LOST,
+            "error": error.message,
+            "holder": extra.get("holder"),
+            "generation": extra.get("generation"),
+        }
+        writer.emit("flow.step.refused", {
+            "step_index": outcome.index if outcome else self._counter,
+            "command": outcome.command if outcome else "setup",
+            "error_code": error.code,
+            "holder": extra.get("holder"),
+            "generation": extra.get("generation"),
+        })
 
     @staticmethod
     def _flow_digest(flow: Flow) -> str | None:
@@ -966,23 +1061,29 @@ class Executor:
                     raise errors.AutonomError(
                         errors.FLOW_HEADER_INVALID,
                         "setup.location needs latitude and longitude")
+                self._admit()
                 result = device_state.set_location(
                     self.target, f"{value['latitude']},{value['longitude']}")
             elif kind == "orientation":
+                self._admit()
                 result = device_state.set_orientation(self.target, str(value))
             elif kind == "appearance":
+                self._admit()
                 result = simulator_mod.apply(
                     self.target, "appearance", str(value), {})
             elif kind == "network" and isinstance(value, str):
+                self._admit()
                 result = simulator_mod.apply(self.target, "network", value, {})
             elif kind == "permissions":
                 results = []
                 if isinstance(value, dict):
                     for service, action in value.items():
+                        self._admit()
                         results.append(device_state.permissions(
                             self.target, str(action), str(service), flow.app_id))
                 elif isinstance(value, list):
                     for service in value:
+                        self._admit()
                         results.append(device_state.permissions(
                             self.target, "grant", str(service), flow.app_id))
                 else:
@@ -995,6 +1096,7 @@ class Executor:
                     raise errors.AutonomError(
                         errors.FLOW_HEADER_INVALID, "setup.reset needs appId")
                 if self.target.platform == ANDROID:
+                    self._admit()
                     session_mod.clear_data(
                         self.target.tool, self.target.target_id, flow.app_id)
                     result = {"cleared": flow.app_id, "strategy": "pm-clear"}
@@ -1004,7 +1106,9 @@ class Executor:
                         raise errors.AutonomError(
                             errors.IOS_CLEAR_REQUIRES_INSTALL_PATH,
                             "setup.reset on iOS needs the recorded .app install path")
+                    self._admit()
                     ios_simctl.uninstall(self.target.tool, self.target.target_id, flow.app_id)
+                    self._admit()
                     ios_simctl.install(self.target.tool, self.target.target_id,
                                        Path(install_path))
                     result = {"cleared": flow.app_id, "strategy": "reinstall"}
@@ -1320,6 +1424,9 @@ class Executor:
         try:
             self._execute_steps(body, child, child_values,
                                 writer, result, evidence, hook=hook)
+        except _ControlLost:
+            self._block_stack.pop()
+            raise
         except _Stop:
             failed = result.steps[-1] if len(result.steps) > before else None
             outcome.status = "failed"
@@ -1390,15 +1497,19 @@ class Executor:
         except (_Stop, errors.AutonomError):
             status = "failed"
             raise
+        except _ControlLost:
+            status = "interrupted"
+            raise
         finally:
             self._block_stack.pop()
             duration = int((self.clock() - started) * 1000)
-            writer.emit("flow.step.finished", {
-                "step_index": index, "command": "group", "label": step.label,
-                "file": flow.path, "line": step.line, "status": status,
-                "duration_ms": duration,
-                "attempts": 1,
-            })
+            if status != "interrupted":  # only flow.run.finished follows a refusal
+                writer.emit("flow.step.finished", {
+                    "step_index": index, "command": "group", "label": step.label,
+                    "file": flow.path, "line": step.line, "status": status,
+                    "duration_ms": duration,
+                    "attempts": 1,
+                })
             result.blocks.append({
                 "index": index, "command": "group", "label": step.label,
                 "line": step.line, "flow": flow.path, "status": status,
@@ -1453,6 +1564,9 @@ class Executor:
         except (_Stop, errors.AutonomError):
             status = "failed"
             raise
+        except _ControlLost:
+            status = "interrupted"
+            raise
         finally:
             self._block_stack.pop()
             duration = int((self.clock() - started) * 1000)
@@ -1465,7 +1579,8 @@ class Executor:
             }
             if stop_reason:
                 finished["stop_reason"] = stop_reason
-            writer.emit("flow.step.finished", finished)
+            if status != "interrupted":  # only flow.run.finished follows a refusal
+                writer.emit("flow.step.finished", finished)
             block = {
                 "index": block_index, "command": "repeat", "label": step.label,
                 "line": step.line, "flow": flow.path, "status": status,
@@ -1546,6 +1661,16 @@ class Executor:
                                              started, started_ms, depth, parent,
                                              "failed", attempt_spans)
                     raise
+            except _ControlLost:
+                # never retried; recorded like group and repeat, and only
+                # flow.run.finished follows the refusal (no step event)
+                attempt_spans.append({"n": attempt, "first_index": first_index,
+                                      "last_index": self._counter,
+                                      "status": "interrupted"})
+                self._record_retry_block(result, step, flow, block_index,
+                                         started, started_ms, depth, parent,
+                                         "interrupted", attempt_spans)
+                raise
             finally:
                 self._retry_attempt = previous_attempt
         finally:
@@ -1592,6 +1717,21 @@ class Executor:
             try:
                 self._execute_steps([step], flow, values, writer, result,
                                     evidence, hook="onFlowComplete")
+            except _ControlLost as lost:
+                # The lease moved during cleanup: the run's outcome stands,
+                # this hook is recorded as refused and no further hook runs.
+                if lost.outcome is not None:
+                    result.steps.append(lost.outcome)
+                hook_payload.update({
+                    "status": "failed", "error_code": lost.error.code,
+                    "failure_class": CONTROL_LOST, "error": lost.error.message,
+                })
+                result.hook_failures.append({
+                    "command": step.command, "line": step.line,
+                    "error_code": lost.error.code, "error": lost.error.message,
+                })
+                writer.emit("flow.hook.finished", hook_payload)
+                break
             except (_Stop, errors.AutonomError) as exc:
                 failed = next((s for s in result.steps[before:]
                                if s.status == "failed"), None)
@@ -1675,6 +1815,21 @@ class Executor:
                 outcome.status = "failed"
                 if evidence.mode != "minimal":
                     self._capture_failure_evidence(index, writer)
+        except _ControlLost as lost:
+            # Refused by the control lease: the step is recorded as skipped
+            # (never repeated) and the run unwinds to `run()`; no
+            # `flow.step.finished` follows, `run()` emits `flow.step.refused`.
+            outcome.status = "skipped"
+            outcome.skip_reason = CONTROL_LOST
+            outcome.error_code = lost.error.code
+            outcome.failure_class = CONTROL_LOST
+            outcome.error = lost.error.message
+            outcome.duration_ms = int((self.clock() - started) * 1000)
+            outcome.attempts = max(attempts[0], 1)
+            outcome.finished_at_ms = self._wall_ms()
+            if lost.outcome is None:
+                lost.outcome = outcome
+            raise
         else:
             outcome.target = self._target_record(sensitive=sensitive)
             outcome.postcondition_fingerprint = self._auto_evidence(
@@ -1810,8 +1965,13 @@ class Executor:
     def _dispatch(self, step: Step, flow: Flow, attempts: list) -> bool:
         command = step.command
         target = self.target
+        if command in MUTATING_COMMANDS:
+            # An early refusal: a step under a lease it may not use never
+            # starts polling. Each actuator call below is admitted again.
+            self._admit()
         if command == "launchApp":
             if step.args.get("clearState"):
+                self._admit()
                 session_mod.clear_data(target.tool, target.target_id, flow.app_id)
             # Fresh by default: on real devices a resumed task put the first
             # selector on a subscreen (Android Settings: a search activity of
@@ -1820,25 +1980,34 @@ class Executor:
             resume = bool(step.args.get("resume"))
             if target.platform == IOS:
                 if not resume:
+                    self._admit()
                     ios_simctl.terminate(target.tool, target.target_id, flow.app_id)
+                launch_env = self._ios_launch_env()
+                self._admit()
                 ios_simctl.launch(target.tool, target.target_id, flow.app_id,
-                                  env=self._ios_launch_env())
+                                  env=launch_env)
             elif resume:
+                self._admit()
                 session_mod.launch_app(target.tool, target.target_id, flow.app_id)
             else:
+                self._admit()
                 session_mod.launch_app_fresh(target.tool, target.target_id, flow.app_id)
             return False
         if command == "stopApp":
             if target.platform == IOS:
+                self._admit()
                 ios_simctl.terminate(target.tool, target.target_id, flow.app_id)
             else:
+                self._admit()
                 session_mod.force_stop(target.tool, target.target_id, flow.app_id)
             return False
         if command == "clearState":
+            self._admit()
             session_mod.clear_data(target.tool, target.target_id, flow.app_id)
             return False
         if command == "openLink":
             url, secret = self._resolve(step.args["url"])
+            self._admit()
             device_state.open_url(target, url)
             return secret
         if command == "tapOn":
@@ -1856,16 +2025,21 @@ class Executor:
             selector, secret = self._resolve_selector(step.selector)
             node = self._poll_for_one(selector, step, attempts)
             x, y = ui_mod.center_of(node)
+            screen = self._screen_size()
+            self._admit()
             ui_mod.long_press(target, x, y, step.args.get("durationMs", 600),
-                              screen=self._screen_size())
+                              screen=screen)
             return secret
         if command == "doubleTapOn":
             selector, secret = self._resolve_selector(step.selector)
             node = self._poll_for_one(selector, step, attempts)
             x, y = ui_mod.center_of(node)
-            ui_mod.double_tap(target, x, y, screen=self._screen_size())
+            screen = self._screen_size()
+            self._admit()
+            ui_mod.double_tap(target, x, y, screen=screen)
             return secret
         if command == "setOrientation":
+            self._admit()
             device_state.set_orientation(target, step.args["orientation"])
             self._screen_fetched = False  # dimensions just swapped
             return False
@@ -1878,6 +2052,7 @@ class Executor:
                 # node the way assertions poll, then fail as a test failure —
                 # a green step that verifiably did nothing is the worst outcome.
                 self._require_focused_field(step, attempts)
+            self._admit()
             ui_mod.type_text(target, value)
             return secret
         if command == "copyTextFrom":
@@ -1919,18 +2094,22 @@ class Executor:
                     "COPIED_TEXT is not set",
                     hint="copyTextFrom or setClipboard must run first.",
                 )
+            self._admit()
             ui_mod.type_text(target, value)
             return sensitive
         if command == "eraseText":
             key = "KEYCODE_DEL" if target.platform == ANDROID else "42"
             for _ in range(step.args.get("chars", 50)):
+                self._admit()
                 ui_mod.press_key(target, key)
             return False
         if command == "pressKey":
             key, secret = self._resolve(step.args["key"])
+            self._admit()
             ui_mod.press_key(target, key)
             return secret
         if command == "back":
+            self._admit()
             ui_mod.press_key(target, "KEYCODE_BACK")
             return False
         if command == "swipe":
@@ -1977,16 +2156,19 @@ class Executor:
             self._wait_for_settled(step, attempts)
             return False
         if command == "setLocation":
+            self._admit()
             device_state.set_location(
                 target, f"{step.args['latitude']},{step.args['longitude']}")
             return False
         if command == "setPermissions":
+            self._admit()
             device_state.permissions(target, step.args["action"],
                                      step.args["service"],
                                      step.args.get("appId") or flow.app_id)
             return False
         if command == "addMedia":
             path, secret = self._resolve(step.args["path"])
+            self._admit()
             device_state.add_media(target, Path(path))
             return secret
         if command == "takeScreenshot":
@@ -2180,12 +2362,16 @@ class Executor:
         refresh the cache once (the app may have rotated mid-flow) and retry
         the guard. The guard raises *before* dispatch, so this can never
         double-tap."""
+        screen = self._screen_size()
         try:
-            ui_mod.tap(self.target, x, y, screen=self._screen_size(), **({"node": node} if node else {}))
+            self._admit()
+            ui_mod.tap(self.target, x, y, screen=screen, **({"node": node} if node else {}))
         except errors.AutonomError as exc:
             if exc.code != errors.COORDINATE_SPACE_MISMATCH:
                 raise
-            ui_mod.tap(self.target, x, y, screen=self._refresh_screen(), **({"node": node} if node else {}))
+            screen = self._refresh_screen()
+            self._admit()
+            ui_mod.tap(self.target, x, y, screen=screen, **({"node": node} if node else {}))
 
     def _swipe(self, direction: str, duration_ms: int) -> None:
         def geometry(screen):
@@ -2207,6 +2393,7 @@ class Executor:
             )
         try:
             (x1, y1), (x2, y2) = geometry(screen)
+            self._admit()
             ui_mod.swipe(self.target, x1, y1, x2, y2, duration_ms / 1000,
                          screen=screen)
         except errors.AutonomError as exc:
@@ -2216,6 +2403,7 @@ class Executor:
             if not screen:
                 raise
             (x1, y1), (x2, y2) = geometry(screen)
+            self._admit()
             ui_mod.swipe(self.target, x1, y1, x2, y2, duration_ms / 1000,
                          screen=screen)
 
@@ -2240,6 +2428,7 @@ class Executor:
 
         try:
             x, y, x2, y2 = geometry(screen)
+            self._admit()
             ui_mod.swipe(self.target, x, y, x2, y2, duration_ms / 1000,
                          screen=screen)
         except errors.AutonomError as exc:
@@ -2249,6 +2438,7 @@ class Executor:
             if not screen:
                 raise
             x, y, x2, y2 = geometry(screen)
+            self._admit()
             ui_mod.swipe(self.target, x, y, x2, y2, duration_ms / 1000,
                          screen=screen)
 
@@ -2273,6 +2463,7 @@ class Executor:
             x1, y1 = width // 2, height // 2
             x2, y2 = (x1, y1 - shift) if vertical else (x1 - shift, y1)
             try:
+                self._admit()
                 ui_mod.swipe(self.target, x1, y1, x2, y2, 0.2, screen=screen)
             except errors.AutonomError as exc:
                 if exc.code != errors.COORDINATE_SPACE_MISMATCH:

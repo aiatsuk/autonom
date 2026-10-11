@@ -46,6 +46,14 @@ NEW_CODES.update({
     "WORKSPACE_IN_USE": "workspace_in_use",
 })
 
+# Control lease (run ws-p1p2-control, contract 4.6).
+NEW_CODES.update({
+    "CONTROL_HELD": "control_held",
+    "CONTROL_GENERATION_STALE": "control_generation_stale",
+    "CONTROL_LEASE_EXPIRED": "control_lease_expired",
+    "CONTROL_NOT_HELD": "control_not_held",
+})
+
 EXISTING_CODES = {
     "FLOW_NOT_FOUND": "flow_not_found",
     "FLOW_FILE_NOT_FOUND": "flow_file_not_found",

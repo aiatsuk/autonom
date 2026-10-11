@@ -82,6 +82,53 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
   review commands with the pack's real, shell-quoted directory, and the
   verdict reason names the check title. `pretest flows` prints a `flows` list
   (`flow`, `check_id`, `run_id`, `status`, `verdict`).
+- **`autonom session list` and session labels.** `session list` prints the
+  live sessions of this machine (`--all` adds stopped ones) as
+  `{"ok", "sessions", "count"}`, each with `session_id`, `platform`,
+  `target_id`, `label`, `started_at`, `stopped_at`, `started_by`, `current`
+  and `live`; target flags filter it, it needs no session and never touches
+  a device. An unreadable record is skipped with a `session_unreadable`
+  warning. `session start --label TEXT` (1-64 printable characters) stores a
+  name for people; older records list with `label: null`.
+- **Host-wide control lease.** One lease file per target in the machine state
+  (`<state>/control/<platform>__<target>.json`), written only under a lock,
+  with a holder (`kind` agent or human, `id`, `label`), a generation that
+  only grows (it survives release and expiry), an expiry and an operation id
+  per admitted action. New verbs `control status [--all]`, `control acquire
+  --holder ID [--kind] [--label] [--ttl] [--takeover]`, `control release` and
+  `control renew`, and the global claim flags `--control-holder`,
+  `--control-generation` and `--operation-id` (env `AUTONOM_CONTROL_HOLDER`,
+  `AUTONOM_CONTROL_GENERATION`; exact spellings only). Once a lease exists,
+  every device-changing verb, mutating flow step, Canvas input and Canvas
+  Tools/Actions device op is admitted only for the holder's claim, checked
+  immediately before the device is touched; refusals are the new codes
+  `control_held`, `control_generation_stale`, `control_lease_expired` and
+  `control_not_held` with the holder, generation and a hint. Reading
+  (trees, screenshots, recordings, logs, journal) is never gated, and
+  `ui tree` under someone else's lease skips its accessibility recovery.
+  Admitted actions carry `control` in their JSON and `operation_id` in the
+  journal.
+- **Shared control in the Mobile Canvas.** A person's first input on a
+  device nobody holds takes the human lease automatically (no click), so
+  agents and flows on that device stop before their next device action.
+  An input refused because the device stream is still starting takes no
+  lease.
+  **Take over** replaces a live holder, **Hand back** frees the device, and
+  the Canvas releases by itself after `--control-idle SECONDS` without input
+  (default 120, 15..3600; new `canvas serve` flag) or about 30 s after the
+  page closes. The page shows Shared, "You have control", or who has control
+  with Take over; `/status`, state messages, `POST /control` and
+  `/api/devices` carry `lease` and `session_stopped`; lost and idle-released
+  leases are journaled as `control` records (modes `lost`, `idle`), as are
+  Take over and Hand back sent over `/ws/control` (not through HTTP
+  `POST /control`).
+- **Explicit session binding in the Canvas.** A workspace Canvas passes each
+  device's session id to its action bridge, tools process and log feed; a
+  session stopped elsewhere refuses input (`session_stopped`) and shows as
+  stopped instead of journaling into another session.
+- `tests/live/control_split_live.mjs`: the live acceptance of concurrent
+  sessions and shared control on the split test devices (base, `--ios`,
+  `--legacy`; `--dry-run` and `--self-test` need no device).
 
 ### Changed
 
@@ -108,6 +155,51 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
   warm-up never reads other variables.
 - `ui swipe --duration` is documented as seconds and refuses values over 60
   (`invalid_value`, "seconds, e.g. 0.4").
+- **Flow runs can end `interrupted`.** A lease refusal inside a run ends it
+  with status `interrupted` (`flow run` exit 1, `failure_class:
+  "control_lost"`, the refused step `skipped`, a `flow.step.refused` event,
+  no `onFlowComplete`, manifest `execution_status: "broken"`). A `retry:`
+  block never retries it; `proof` answers `inconclusive` for it and the
+  suite report no longer shows such a suite as passed.
+- **`report suite`, `control renew` and dry runs under a lease.** `report
+  suite` exits 1 for an interrupted run and lists it under `failures`; the
+  `interrupted` count and a per-failure `status` appear only when such a run
+  is present, so a suite without one answers exactly as in 0.35.1. `control
+  renew` and an in-place `control acquire` without `--ttl` keep the lease's
+  own TTL instead of the kind default, and `flow run --dry-run` stays
+  read-only and is not refused under someone else's lease.
+- **Collision-safe action details.** Detail files keep their
+  `NNNN_<slug>.json` names but are numbered after the highest existing index
+  and written by hard link (or `O_EXCL`), so concurrent writers never share
+  or overwrite one; a detail that cannot be written becomes an
+  `evidence_write_failed` warning in the command's JSON instead of an error,
+  and the device input is never repeated.
+- **Compatibility.** With no lease file for a target and no person's Canvas
+  input on it, every verb, flow, Canvas route and bridge op answers exactly
+  as in 0.35.1. The one intentional change: a person's first Canvas input now takes the
+  host-wide human lease, so CLI agents and flows on that device are refused
+  until Hand back, idle release or expiry. Admission is checked just before
+  each device call, not atomically with it: a takeover in that window lets
+  one already admitted input through (milliseconds for flows and the Canvas,
+  up to one UI snapshot for a selector `ui tap`/`ui type`). The lease
+  coordinates cooperating processes of one user and is not a security
+  boundary: any process of that user can take over with `--kind human`.
+  See `docs/COMPATIBILITY.md`.
+- **Control lease and ticket pre-test together.** The lease is checked
+  before the pre-test guard on every path (verbs, flow steps, Canvas bridge
+  and tools, warm-up replay taps), so a refused lease never uses pre-test
+  budget. `pretest flows`, `repro`, `rerun` and `warmup` run their flows
+  under the lease like `flow run`; the other `pretest` verbs need no lease.
+  An interrupted run makes its pre-test check `blocked`.
+
+### Fixed
+- **Canvas bridge requests are no longer lost to adb.** The action bridge and
+  the tools process gave every child process their request pipe as standard
+  input, and `adb shell` forwards what it reads there to the device: a request
+  written while one ran (such as a person's first touch right after a screen
+  size read) was never answered. Children now read the null device. A touch
+  whose down is refused answers once; its moves and up are dropped without a
+  "Pointer N is not down" error.
 
 ## [0.35.1] - 2026-10-10
 

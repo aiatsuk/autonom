@@ -52,6 +52,7 @@ from autonom_lib import actions as actions_mod  # noqa: E402
 from autonom_lib import accessibility as accessibility_mod  # noqa: E402
 from autonom_lib import adb as adb_mod  # noqa: E402
 from autonom_lib import consent as consent_mod  # noqa: E402
+from autonom_lib import control as control_mod  # noqa: E402
 from autonom_lib import device_state  # noqa: E402
 from autonom_lib import doctor as doctor_mod  # noqa: E402
 from autonom_lib import emulator as emulator_mod  # noqa: E402
@@ -107,8 +108,32 @@ _LAST_EMIT: dict[str, Any] | None = None
 _ROOT_PARSER: argparse.ArgumentParser | None = None
 
 
+def _control_payload() -> dict[str, Any] | None:
+    """The `control` object of an admitted MUTATING/FLOW verb (contract 5.4):
+    only when a lease file existed for the target or a claim was given, so a
+    verb on a target without a lease prints exactly what it printed before."""
+    current = control_mod.invocation()
+    if current.get("mode") not in control_mod.ADMITTED_MODES:
+        return None
+    for result in current.get("admitted", {}).values():
+        if result.get("generation") is not None or current.get("claim") is not None:
+            return {"generation": result.get("generation"),
+                    "holder_id": result.get("holder_id"),
+                    "operation_id": result.get("operation_id")}
+    return None
+
+
+def _with_control(data: Any) -> Any:
+    if isinstance(data, dict):
+        control = _control_payload()
+        if control is not None:
+            data.setdefault("control", control)
+    return data
+
+
 def emit(data: Any, *, as_json: bool) -> int:
     global _LAST_EMIT
+    _with_control(data)
     if isinstance(data, dict) and data.get("platform") == IOS:
         # UI provenance measured by this invocation (which backend served the
         # tree and the input, and why it fell back); never overrides a key
@@ -147,6 +172,11 @@ def _target(args: argparse.Namespace) -> Target:
                 f"not {target.target_id}",
                 "Drop the target flags, or name the session that owns that target.",
                 session_id=record.get("session_id"), target_id=record.get("target_id"))
+    # Control lease admission (contract 5.4): MUTATING and FLOW verbs are
+    # admitted once per target here, the first device-facing call of every
+    # handler; every other class reads nothing. A refusal raises before any
+    # device call.
+    control_mod.admit_once(target.platform, target.target_id)
     return target
 
 
@@ -347,6 +377,9 @@ def cmd_devices_boot(args: argparse.Namespace) -> int:
 
 def cmd_devices_shutdown(args: argparse.Namespace) -> int:
     target = platform_mod.resolve(args)
+    # Resolved without `_target` (no session binding): admitted here, before
+    # the simulator lookup and the shutdown.
+    control_mod.admit_once(target.platform, target.target_id)
     if target.platform == IOS:
         simulator = ios_simctl.find_simulator(target.tool, target.target_id)
         already = simulator is not None and simulator.state == "Shutdown"
@@ -422,6 +455,7 @@ def _already_active(record: dict[str, Any], *, gone: bool = False,
 
 def cmd_session_start(args: argparse.Namespace) -> int:
     started_by = _started_by(args)
+    label = session_mod.validate_label(getattr(args, "label", None))
     alongside_flag = bool(getattr(args, "alongside", False))
     explicit = _explicit_target_flags(args)
     # One session per target. `current.json` keeps naming the machine's
@@ -444,6 +478,9 @@ def cmd_session_start(args: argparse.Namespace) -> int:
         session_mod.select(live["session_id"])
         raise _already_active(live, with_started_by=True)
     # Everything that can be refused is refused before the session exists.
+    # With --install or --launch the start drives the device: admitted here
+    # like a mutating verb (a plain start is lifecycle and reads nothing).
+    control_mod.admit_once(target.platform, target.target_id)
     install_path = Path(args.install).expanduser() if args.install else None
     if install_path is not None and not install_path.exists():
         raise errors.AutonomError(
@@ -483,6 +520,7 @@ def cmd_session_start(args: argparse.Namespace) -> int:
             alongside=alongside,
             started_by=started_by,
             exclusive=True,
+            label=label,
         )
     except errors.AutonomError as exc:
         # Lost a race on this target under the store lock: like the refusal
@@ -566,6 +604,29 @@ def cmd_session_start(args: argparse.Namespace) -> int:
                                "installed": installed, "launched": launched}
     if target.platform == IOS:
         payload["booted"] = booted
+    if warnings:
+        payload["warnings"] = warnings
+    return emit(payload, as_json=True)
+
+
+def cmd_session_list(args: argparse.Namespace) -> int:
+    """The sessions of the machine store: live ones, every one with --all.
+
+    Needs no session and never resolves a device: optional target flags
+    filter by comparing strings (`--serial` is an Android id, `--udid` an
+    iOS one, `--platform` narrows either way)."""
+    platform_mod._check_conflicts(args)  # noqa: SLF001 - pure flag check
+    wanted_id = next((getattr(args, flag, None) for flag in ("target", "serial", "udid")
+                      if getattr(args, flag, None)), None)
+    wanted_platform = getattr(args, "platform", None) or (
+        "android" if getattr(args, "serial", None) else
+        "ios" if getattr(args, "udid", None) else None)
+    entries, warnings = session_mod.list_sessions(include_stopped=bool(getattr(args, "all", False)))
+    if wanted_id is not None:
+        entries = [entry for entry in entries if entry["target_id"] == str(wanted_id)]
+    if wanted_platform is not None:
+        entries = [entry for entry in entries if entry["platform"] == wanted_platform]
+    payload: dict[str, Any] = {"ok": True, "sessions": entries, "count": len(entries)}
     if warnings:
         payload["warnings"] = warnings
     return emit(payload, as_json=True)
@@ -952,6 +1013,21 @@ def _snapshot(args: argparse.Namespace) -> tuple[list[dict[str, Any]], str, str,
     return ui_mod.snapshot(target), "device", target.target_id, target
 
 
+def _recovery_admitted(target: Target) -> bool:
+    """The control gate of the implicit accessibility recovery of `ui tree`
+    (contract 5.4): a read-only verb that would write secure settings,
+    force-stop and relaunch the app. Under a lease this invocation may not
+    use, the recovery is skipped (the tree and its sparse warning stay);
+    without a lease file and without a claim it runs as before. A lease file
+    that cannot be read never counts as free."""
+    try:
+        lease = control_mod.read_lease(target.platform, target.target_id)
+    except errors.AutonomError:
+        return False
+    claim = control_mod.invocation().get("claim")
+    return control_mod.admission(lease, claim, control_mod._now_ms()) is None  # noqa: SLF001
+
+
 def cmd_ui_tree(args: argparse.Namespace) -> int:
     dump = getattr(args, "dump", None)
     warnings: list[dict[str, Any]] = []
@@ -1016,7 +1092,8 @@ def cmd_ui_tree(args: argparse.Namespace) -> int:
                     whole = ui_mod.snapshot(target)
                     if accessibility_mod.eligible(target, current, whole) and \
                             accessibility_mod.flutter_shell(whole) and \
-                            accessibility_mod.foreground_app(target) == current["app_id"]:
+                            accessibility_mod.foreground_app(target) == current["app_id"] and \
+                            _recovery_admitted(target):
                         accessibility_mod.enable(target, current)
                         from autonom_lib.pretest import guard as pretest_guard
 
@@ -1410,9 +1487,11 @@ def cmd_ui_find(args: argparse.Namespace) -> int:
         "count": len(matches),
         "matches": matches,
     }
+    evidence_warning = None
     if target:
         payload.update(target.identity())
-        detail = actions_mod.record_detail(session_mod.load_current(), "find", {
+        detail, evidence_warning = actions_mod.record_detail_checked(
+            session_mod.load_current(), "find", {
             "kind": "find",
             "selector": {
                 **{k: v for k, v in _selectors(args).items() if v is not None},
@@ -1441,6 +1520,8 @@ def cmd_ui_find(args: argparse.Namespace) -> int:
                 "error": "--text matched nothing, but the same value matches desc",
                 "hint": hint,
             })
+    if evidence_warning:
+        payload.setdefault("warnings", []).append(evidence_warning)
     return emit(payload, as_json=True)
 
 
@@ -1509,7 +1590,8 @@ def cmd_ui_tap(args: argparse.Namespace) -> int:
         backend = _backend(ui_mod.long_press(target, x, y, duration))
     else:
         backend = _backend(ui_mod.tap(target, x, y, node=node))
-    detail = actions_mod.record_detail(session_mod.load_current(), "tap", {
+    detail, evidence_warning = actions_mod.record_detail_checked(
+        session_mod.load_current(), "tap", {
         "kind": "tap",
         "coordinate": node is None,
         "selector": None if node is None else {
@@ -1529,6 +1611,8 @@ def cmd_ui_tap(args: argparse.Namespace) -> int:
         payload["duration_ms"] = duration
     if detail:
         payload["detail"] = detail
+    if evidence_warning:
+        payload.setdefault("warnings", []).append(evidence_warning)
     return emit({**payload, **target.identity()}, as_json=True)
 
 
@@ -1594,7 +1678,8 @@ def cmd_ui_type(args: argparse.Namespace) -> int:
             }
     backend = _backend(ui_mod.type_text(target, args.text))
     sensitive = bool(getattr(args, "sensitive", False))
-    detail = actions_mod.record_detail(session_mod.load_current(), "type", {
+    detail, evidence_warning = actions_mod.record_detail_checked(
+        session_mod.load_current(), "type", {
         "kind": "type",
         "sensitive": sensitive,
         # Screenshots already capture what the screen shows; the typed value
@@ -1619,6 +1704,8 @@ def cmd_ui_type(args: argparse.Namespace) -> int:
         payload["focus"] = "verified" if certainty == "focused" else "unverified"
     if focus_warning:
         payload["warnings"] = [focus_warning]
+    if evidence_warning:
+        payload.setdefault("warnings", []).append(evidence_warning)
     return emit({**payload, **target.identity()}, as_json=True)
 
 
@@ -3386,7 +3473,7 @@ def cmd_flow_run(args: argparse.Namespace) -> int:
         emit(summary, as_json=True)
     else:
         global _LAST_EMIT
-        _LAST_EMIT = summary  # the journal summary stays useful in events mode
+        _LAST_EMIT = _with_control(summary)  # the journal summary stays useful in events mode
     return exit_code
 
 
@@ -4430,6 +4517,10 @@ def cmd_report_suite(args: argparse.Namespace) -> int:
     os.chmod(junit_path, mode)  # CI must be able to read the JUnit it consumes
     failed = [m for m in manifests if m.get("status") == "failed"]
     replayed = [m for m in manifests if m.get("status") == "replayed"]
+    interrupted = [m for m in manifests if m.get("status") == "interrupted"]
+    # exactly what suite.html calls failed: any run that neither passed nor
+    # was a prefix replay (an interrupted run included) fails the suite
+    not_passed = [m for m in manifests if m.get("status") not in ("passed", "replayed")]
     # the same counts suite.xml carries, so the JSON and the JUnit agree; a
     # broken run (aborted, often with no failed step) is counted on its own
     junit_counts = {"tests": 0, "failures": 0, "errors": 0, "skipped": 0}
@@ -4449,20 +4540,27 @@ def cmd_report_suite(args: argparse.Namespace) -> int:
         "junit": str(junit_path),
         "sensitive": any(m.get("sensitive") for m in manifests),
     }
+    # additive only when present: a suite with no interrupted run answers
+    # with exactly the keys it had before the control lease existed
+    if interrupted:
+        payload["interrupted"] = len(interrupted)
     if pages:
         payload["pages"] = len(pages)
         payload["screenshots"] = args.screenshots
-    if failed:
-        payload["failures"] = [
-            {"flow": m.get("flow_name"), "flow_id": m.get("flow_id"),
-             "error_code": (m.get("primary_error") or {}).get("error_code")}
-            for m in failed
-        ]
+    if not_passed:
+        failures = []
+        for m in not_passed:
+            entry = {"flow": m.get("flow_name"), "flow_id": m.get("flow_id"),
+                     "error_code": (m.get("primary_error") or {}).get("error_code")}
+            if m.get("status") != "failed":
+                entry["status"] = m.get("status")
+            failures.append(entry)
+        payload["failures"] = failures
     if args.open:
         import webbrowser
         payload["opened"] = bool(webbrowser.open(html_path.as_uri()))
     emit(payload, as_json=True)
-    return 1 if failed else 0
+    return 1 if not_passed else 0
 
 
 def cmd_report_build(args: argparse.Namespace) -> int:
@@ -5046,6 +5144,7 @@ CANVAS_MAX_SIZE_HINT = ("Without --max-size scrcpy follows the device's H.264 en
                         "software only, native with a hardware one, 1280 when it cannot tell); "
                         "screenrecord uses 1280.")
 CANVAS_BIT_RATE = (100_000, 100_000_000)
+CANVAS_CONTROL_IDLE = (15, 3600)
 SCRCPY_VERSION_TEXT = re.compile(doctor_mod.SCRCPY_VERSION_TOKEN)
 
 
@@ -5353,6 +5452,29 @@ def _canvas_check_values(args: argparse.Namespace) -> None:
             f"--max-size must be 0 (native size) or {CANVAS_MAX_SIZE[0]}..{CANVAS_MAX_SIZE[1]}, "
             f"got {args.max_size}", CANVAS_MAX_SIZE_HINT)
     _canvas_bounded("--bit-rate", args.bit_rate, CANVAS_BIT_RATE, "12000000")
+    _canvas_control_idle(args)
+
+
+def _canvas_control_idle(args: argparse.Namespace) -> int | None:
+    """`--control-idle SECONDS`: an integer 15..3600, refused before node starts."""
+    raw = getattr(args, "control_idle", None)
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    low, high = CANVAS_CONTROL_IDLE
+    if not re.fullmatch(r"[0-9]{1,5}", text) or not low <= int(text) <= high:
+        raise errors.AutonomError(
+            errors.INVALID_VALUE,
+            f"--control-idle must be a whole number of seconds from {low} to {high}, got {raw!r}",
+            "Omit it for the default of 120 seconds.", option="control_idle")
+    return int(text)
+
+
+def _canvas_control_args(args: argparse.Namespace) -> list[str]:
+    """`--control-idle N` for node, only when given: the node argv of before stays
+    byte for byte without it."""
+    idle = _canvas_control_idle(args)
+    return [] if idle is None else ["--control-idle", str(idle)]
 
 
 def _canvas_shared_args(args: argparse.Namespace, scrcpy_server: str | None) -> list[str]:
@@ -5486,6 +5608,7 @@ def _canvas_serve_single(args: argparse.Namespace, install_roots: list[str]) -> 
         command += _canvas_token_args(args.token)
     # Additive: without these flags the command is the one of before, byte for byte.
     command += _canvas_action_args(args, install_roots)
+    command += _canvas_control_args(args)
     # Supervised in its own process group and registered (supervisor and
     # node child) for its whole life, so `processes` lists the pair, `cleanup
     # --all` and `session stop` can stop it, and killing this CLI takes node
@@ -5585,6 +5708,7 @@ def _canvas_serve_workspace(args: argparse.Namespace, devices: list[tuple[str, s
     if args.token:
         command += _canvas_token_args(args.token)
     command += _canvas_action_args(args, install_roots)
+    command += _canvas_control_args(args)
     # No session owner: a session stop never reaps a workspace Canvas (contract 3.4).
     return processes_mod.run_supervised(
         command, kind="canvas", owner=None, artifacts_dir=None, port=args.port, workspace=name)
@@ -5731,6 +5855,240 @@ def cmd_canvas_detach(args: argparse.Namespace) -> int:
                  "session_stopped": bool(answer.get("session_stopped"))}, as_json=True)
 
 
+# --- control lease -------------------------------------------------------------
+
+
+def _control_holder(args: argparse.Namespace, verb: str) -> str:
+    """`--holder`, else the invocation's claim (`--control-holder` /
+    `AUTONOM_CONTROL_HOLDER`)."""
+    holder = getattr(args, "holder", None)
+    if holder is None:
+        claim = control_mod.invocation().get("claim")
+        holder = claim.holder_id if claim is not None else None
+    if holder is None:
+        raise errors.AutonomError(
+            errors.USAGE_ERROR, f"control {verb} needs a holder id",
+            f"Pass --holder ID (or set AUTONOM_CONTROL_HOLDER), e.g. "
+            f"'autonom control {verb} --holder agent:worker-1'.")
+    return holder
+
+
+def _control_generation(args: argparse.Namespace, holder: str) -> Any:
+    """`--generation`, else the claim's generation when the claim names the
+    same holder."""
+    generation = getattr(args, "generation", None)
+    if generation is not None:
+        return generation
+    claim = control_mod.invocation().get("claim")
+    if claim is not None and claim.holder_id == holder:
+        return claim.generation
+    return None
+
+
+def _control_bound_session(target: Target) -> str | None:
+    """The session this invocation is bound to, when it is live on the target."""
+    try:
+        record = session_mod.load_current()
+    except Exception:  # noqa: BLE001 - a broken store binds nothing
+        return None
+    if (record and not record.get("stopped_at")
+            and (record.get("target_id") or record.get("serial")) == target.target_id
+            and (record.get("platform") or ANDROID) == target.platform):
+        return record.get("session_id")
+    return None
+
+
+def _control_env(holder: str, generation: int) -> dict[str, str]:
+    return {control_mod.ENV_HOLDER: holder, control_mod.ENV_GENERATION: str(generation)}
+
+
+def cmd_control_status(args: argparse.Namespace) -> int:
+    """Lock-free view of the leases: the target's (explicit target flags or
+    a bound session), else every lease file of this machine."""
+    if not getattr(args, "all", False):
+        try:
+            bound = session_mod.load_current()
+        except Exception:  # noqa: BLE001 - status without a session lists every lease
+            bound = None
+        if _explicit_target_flags(args) or bound:
+            target = _target(args)
+            leases = control_mod.status(target.platform, target.target_id)
+            return emit({"ok": True, "leases": leases, "count": len(leases),
+                         "lease": leases[0] if leases else None, **target.identity()},
+                        as_json=True)
+    leases = control_mod.status()
+    return emit({"ok": True, "leases": leases, "count": len(leases)}, as_json=True)
+
+
+def cmd_control_acquire(args: argparse.Namespace) -> int:
+    target = _target(args)
+    holder = _control_holder(args, "acquire")
+    answer = control_mod.acquire(
+        target.platform, target.target_id, holder_id=holder, kind=args.kind,
+        label=args.label, ttl_s=args.ttl, takeover=bool(args.takeover),
+        session_id=_control_bound_session(target))
+    return emit({**answer, **target.identity(),
+                 "env": _control_env(holder, answer["generation"])}, as_json=True)
+
+
+def cmd_control_release(args: argparse.Namespace) -> int:
+    target = _target(args)
+    holder = _control_holder(args, "release")
+    answer = control_mod.release(target.platform, target.target_id, holder_id=holder,
+                                 generation=_control_generation(args, holder))
+    return emit({**answer, **target.identity()}, as_json=True)
+
+
+def cmd_control_renew(args: argparse.Namespace) -> int:
+    target = _target(args)
+    holder = _control_holder(args, "renew")
+    answer = control_mod.renew(target.platform, target.target_id, holder_id=holder,
+                               generation=_control_generation(args, holder), ttl_s=args.ttl)
+    return emit({**answer, **target.identity(),
+                 "env": _control_env(holder, answer["generation"])}, as_json=True)
+
+
+# --- verb classification (contract 5.3) -------------------------------------
+# Every verb path printed by walking build_parser() (aliases included; bare
+# group forms such as `devices` and `canvas` too) is in exactly one table, so
+# a new verb cannot ship unclassified (tests/test_verb_classification.py).
+# READONLY, LIFECYCLE and HOST verbs are never admitted; MUTATING verbs are
+# admitted once per target before their first device call; FLOW verbs at
+# start and before every mutating flow step.
+
+_ATLAS_VERBS = ("update", "show", "coverage", "paths", "export", "diff")
+
+_CONTROL_READONLY: frozenset[str] = frozenset({
+    "version", "devices", "devices list", "session outputs", "session show", "session list",
+    "ui tree", "ui find", "ui wait", "screenshot", "note add", "note list", "journal",
+    "shots list", "shots show", "doctor", "capabilities", "processes", "location get",
+    "crash list", "crash show", "file ls", "file pull", "record start", "record stop",
+    "flow check", "flow fmt", "flow list", "flow create", "flow import", "flow export",
+    "teach start", "teach mark", "teach stop", "teach show", "teach compile",
+    "app-skill validate", "app-skill promote",
+    *(f"atlas {verb}" for verb in _ATLAS_VERBS),
+    *(f"runtime-map {verb}" for verb in _ATLAS_VERBS),
+    "report build", "report open", "report export", "report suite", "report model",
+    "report bundle", "report verify", "report annotate", "report gate", "report history",
+    "report watch", "report pack", "report merge", "report finalize",
+    "ci pack", "ci merge", "ci finalize", "ci publish", "agent export", "agent inspect",
+    "network status", "network requests list", "network requests follow",
+    "network requests show", "network export",
+    "metrics snapshot", "metrics series", "metrics memory capture", "metrics memory analyze",
+    "metrics frames reset", "metrics frames capture", "metrics frames flutter-summary",
+    "metrics trace", "metrics list-presets", "logs tail", "logs follow", "control status",
+    # Ticket pre-test: these record pre-test state on the host (checks, findings,
+    # reviews, packs) or only read the device (health baselines, crash lists,
+    # logs, `a11y`'s one tree read); none sends input.
+    "pretest status", "pretest context", "pretest list", "pretest check add",
+    "pretest check begin", "pretest check end", "pretest check list",
+    "pretest finding add", "pretest finding list", "pretest health", "pretest pack",
+    "pretest review", "pretest review-status", "pretest kit", "pretest flow-draft",
+    "pretest a11y", "pretest events",
+})
+# `session start` is MUTATING for the new session's target when --install or
+# --launch is given (checked before the install).
+_CONTROL_LIFECYCLE: frozenset[str] = frozenset({
+    "session start", "session stop", "devices boot", "canvas", "canvas serve", "canvas stop",
+    "canvas attach", "canvas detach", "canvas list", "cleanup", "control acquire",
+    "control release", "control renew", "pretest start", "pretest stop",
+})
+_CONTROL_HOST: frozenset[str] = frozenset({
+    "network start", "network mock add", "network mock list", "network mock show",
+    "network mock update", "network mock enable", "network mock disable",
+    "network mock remove", "network mock clear",
+})
+_CONTROL_MUTATING: frozenset[str] = frozenset({
+    "devices shutdown", "session launch", "session force-stop", "session clear",
+    "session uninstall", "ui tap", "ui swipe", "ui pinch", "ui rotate", "ui shake", "ui type",
+    "ui key", "open", "permissions", "location set", "location clear", "media add",
+    "network attach", "network detach", "network stop", "metrics memory warn",
+})
+# `teach approve` and `tour` run flows only with --run (else READONLY);
+# `report serve` admits each /replay through the flow executor. The pre-test
+# verbs that run flows (`flows`, `repro`, `rerun`, `warmup`) go through the
+# same executor, so every mutating step is admitted like `flow run`; the
+# warm-up's Runtime Map replay admits each of its taps itself.
+_CONTROL_FLOW: frozenset[str] = frozenset({
+    "flow run", "proof", "replay", "ci run", "teach approve", "report serve", "tour",
+    "pretest flows", "pretest repro", "pretest rerun", "pretest warmup",
+})
+# Verbs whose class depends on their positional action: the READONLY actions
+# are listed, every other action is MUTATING.
+_CONTROL_BY_ACTION: dict[str, frozenset[str]] = {
+    "ui accessibility": frozenset({"status"}),
+    "simulator battery": frozenset(),
+    "simulator network": frozenset(),
+    "simulator push": frozenset(),
+    "simulator sms": frozenset(),
+    "simulator call": frozenset(),
+    "simulator biometric": frozenset(),
+    "simulator clipboard": frozenset({"get"}),
+    "simulator appearance": frozenset(),
+    "simulator text-size": frozenset(),
+    "simulator status-bar": frozenset(),
+    "simulator keyboard": frozenset({"show"}),
+    "simulator animations": frozenset({"show"}),
+}
+_CONTROL_RUN_FLAG_VERBS = frozenset({"teach approve", "tour"})
+_CONTROL_ERROR_CODES = frozenset({
+    errors.CONTROL_HELD, errors.CONTROL_GENERATION_STALE, errors.CONTROL_LEASE_EXPIRED,
+    errors.CONTROL_NOT_HELD,
+})
+
+
+def _verb_path(args: argparse.Namespace) -> str:
+    """The parsed verb path as the parser walk prints it (`network mock add`)."""
+    node = _ROOT_PARSER or build_parser()
+    parts: list[str] = []
+    while True:
+        action = next((item for item in node._actions  # noqa: SLF001
+                       if isinstance(item, argparse._SubParsersAction)), None)  # noqa: SLF001
+        if action is None:
+            break
+        name = getattr(args, action.dest, None)
+        chosen = action.choices.get(name) if name else None
+        if chosen is None:
+            break
+        parts.append(name)
+        node = chosen
+    return " ".join(parts)
+
+
+def _control_mode(args: argparse.Namespace) -> str:
+    """The control class of the parsed verb (contract 5.3), as an invocation mode."""
+    verb = _verb_path(args)
+    if verb in _CONTROL_BY_ACTION:
+        return ("readonly" if getattr(args, "action", None) in _CONTROL_BY_ACTION[verb]
+                else "mutating")
+    if verb == "session start":
+        driving = getattr(args, "install", None) or getattr(args, "launch", None) is not None
+        return "mutating" if driving else "lifecycle"
+    if verb in _CONTROL_RUN_FLAG_VERBS:
+        return "flow" if getattr(args, "run", False) else "readonly"
+    if verb == "flow run" and getattr(args, "dry_run", False):
+        return "readonly"  # a dry run plans the steps and touches no device
+    if verb in _CONTROL_READONLY:
+        return "readonly"
+    if verb in _CONTROL_LIFECYCLE:
+        return "lifecycle"
+    if verb in _CONTROL_HOST:
+        return "host"
+    if verb in _CONTROL_FLOW:
+        return "flow"
+    # MUTATING, and anything unclassified: admitted (never silently free).
+    return "mutating"
+
+
+def _begin_control(args: argparse.Namespace) -> None:
+    """The invocation's control context: claim (flags over env), operation id
+    and the verb's class."""
+    claim = control_mod.claim_from(getattr(args, "control_holder", None),
+                                   getattr(args, "control_generation", None))
+    control_mod.begin_invocation(claim=claim, operation_id=getattr(args, "operation_id", None),
+                                 mode=_control_mode(args))
+
+
 # --- parser ------------------------------------------------------------------
 
 
@@ -5829,10 +6187,80 @@ class _JsonArgumentParser(argparse.ArgumentParser):
         raise SystemExit(2)
 
 
+# The control claim of an invocation (contract 5.1): option -> namespace dest.
+# Spelled in full only (journal.EXACT_ONLY_OPTIONS) and accepted before or
+# after the verb.
+_CONTROL_CLAIM_FLAGS = {
+    "--control-holder": "control_holder",
+    "--control-generation": "control_generation",
+    "--operation-id": "operation_id",
+}
+_NEGATIVE_NUMBER = re.compile(r"^-\d+$|^-\d*\.\d+$")
+
+
+def _split_control_flags(argv: list[str]) -> tuple[dict[str, Any], list[str], str | None]:
+    """(claim values by dest, the remaining argv, the flag that lacks a value).
+
+    The claim flags are read wherever they stand before a `--` terminator,
+    in their exact spellings only (`--flag value` or `--flag=value`; the last
+    one wins). They are not argparse options of any parser: the leaves keep
+    exactly the option lists (and abbreviations) they had, and the journal
+    and the flow compiler read the remaining argv as before."""
+    values: dict[str, Any] = {dest: None for dest in _CONTROL_CLAIM_FLAGS.values()}
+    rest: list[str] = []
+    missing: str | None = None
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token == "--":
+            rest.extend(argv[index:])
+            break
+        name, equals, inline = token.partition("=")
+        if name in _CONTROL_CLAIM_FLAGS and (equals or token == name):
+            if equals:
+                values[_CONTROL_CLAIM_FLAGS[name]] = inline
+                index += 1
+                continue
+            following = argv[index + 1] if index + 1 < len(argv) else None
+            if following is None or following == "--" or (
+                    following.startswith("-") and not _NEGATIVE_NUMBER.match(following)):
+                missing = missing or name
+                index += 1
+                continue
+            values[_CONTROL_CLAIM_FLAGS[name]] = following
+            index += 2
+            continue
+        rest.append(token)
+        index += 1
+    return values, rest, missing
+
+
+def _strip_control_flags(argv: list[str]) -> list[str]:
+    """argv without the claim flags (the journal records the operation id)."""
+    return _split_control_flags(argv)[1]
+
+
+class _RootArgumentParser(_JsonArgumentParser):
+    """The top-level parser: reads the control claim flags wherever they stand."""
+
+    def parse_known_args(self, args=None, namespace=None):  # type: ignore[override]
+        argv = sys.argv[1:] if args is None else list(args)
+        values, rest, missing = _split_control_flags(argv)
+        if missing is not None:
+            self.error(f"argument {missing}: expected one argument")
+        parsed, extras = super().parse_known_args(rest, namespace)
+        for dest, value in values.items():
+            setattr(parsed, dest, value)
+        return parsed, extras
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = _JsonArgumentParser(
+    parser = _RootArgumentParser(
         prog="autonom",
         description="Universal mobile test/debug control plane for AI agents (Android + iOS).",
+        epilog="control claim, before or after the verb (exact spellings): "
+               "--control-holder ID, --control-generation N, --operation-id ID "
+               "(env AUTONOM_CONTROL_HOLDER, AUTONOM_CONTROL_GENERATION)",
     )
     parser.add_argument("--session-id",
                         help="bind this command to a session (a stopped one: read-only verbs)")
@@ -5854,7 +6282,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ios-hid", choices=("auto", "idb", "axe"),
                         help="iOS input backend: auto (idb, AXe when idb HID is "
                              "broken), idb, or axe (AUTONOM_IOS_HID)")
-    sub = parser.add_subparsers(dest="command", required=True)
+    # The control claim flags (--control-holder ID, --control-generation N,
+    # --operation-id ID) are read by _RootArgumentParser before or after the
+    # verb, not declared here: every option list stays the one of before.
+    sub = parser.add_subparsers(dest="command", required=True,
+                                parser_class=_JsonArgumentParser)
     target_flags = target_flags_parent()
 
     p = sub.add_parser("version", help="print CLI version")
@@ -5908,7 +6340,17 @@ def build_parser() -> argparse.ArgumentParser:
                         "(current.json is left as it is)")
     p.add_argument("--started-by", metavar="canvas:PORT:PID",
                    help="record who started the session (with --alongside only)")
+    p.add_argument("--label", metavar="TEXT",
+                   help="a name for the session, shown by 'session list' (1-64 printable characters)")
+    # `--la` keeps reaching --launch: --label is matched only when spelled in full.
+    p.exact_only_options = journal_mod.EXACT_ONLY_OPTIONS | {"--label"}
     p.set_defaults(func=cmd_session_start)
+
+    p = session_sub.add_parser("list", help="list the live sessions of this machine (all with --all)",
+                               parents=[target_flags])
+    p.add_argument("--all", action="store_true",
+                   help="include stopped sessions")
+    p.set_defaults(func=cmd_session_list)
 
     p = session_sub.add_parser("stop", help="stop current session metadata", parents=[target_flags])
     p.set_defaults(func=cmd_session_stop)
@@ -6188,6 +6630,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--captures-dir", metavar="DIR",
                    help="screenshots and recordings (default: AUTONOM_CAPTURES_DIR, "
                         "else ~/Downloads/Autonom)")
+    p.add_argument("--control-idle", metavar="SECONDS",
+                   help="release the human control lease after this many seconds without "
+                        f"human input ({CANVAS_CONTROL_IDLE[0]}-{CANVAS_CONTROL_IDLE[1]}; "
+                        "default 120)")
+    # Exact-only: `--c`/`--ca` keep reaching --captures-dir.
+    p.exact_only_options = journal_mod.EXACT_ONLY_OPTIONS | {"--control-idle"}
     p.set_defaults(func=cmd_canvas_serve)
 
     def canvas_selector(parser: argparse.ArgumentParser) -> None:
@@ -6947,6 +7395,46 @@ def build_parser() -> argparse.ArgumentParser:
                    help="file poll interval in milliseconds")
     p.set_defaults(func=cmd_logs_follow)
 
+    control = sub.add_parser(
+        "control", help="the host-wide control lease of a target: status, acquire, "
+                        "renew, release")
+    control_sub = control.add_subparsers(dest="control_command", required=True)
+    p = control_sub.add_parser("status", parents=[target_flags],
+                               help="the lease of the target (every lease without a "
+                                    "target or session, or with --all)")
+    p.add_argument("--all", action="store_true", help="every lease file of this machine")
+    p.set_defaults(func=cmd_control_status)
+    p = control_sub.add_parser("acquire", parents=[target_flags],
+                               help="take the target's lease (renews your own live lease)")
+    p.add_argument("--holder", metavar="ID",
+                   help="holder id (default: --control-holder / AUTONOM_CONTROL_HOLDER)")
+    p.add_argument("--kind", choices=control_mod.KINDS, default="agent")
+    p.add_argument("--label", metavar="TEXT", help="shown to people (default: the holder id)")
+    p.add_argument("--ttl", type=int, metavar="SECONDS",
+                   help=f"lease lifetime ({control_mod.MIN_TTL_S}-{control_mod.MAX_TTL_S}; "
+                        f"default {control_mod.DEFAULT_AGENT_TTL_S} for an agent)")
+    p.add_argument("--takeover", action="store_true",
+                   help="replace a live holder (a human only)")
+    p.set_defaults(func=cmd_control_acquire)
+    p = control_sub.add_parser("release", parents=[target_flags],
+                               help="give the lease back (the generation is kept)")
+    p.add_argument("--holder", metavar="ID",
+                   help="holder id (default: --control-holder / AUTONOM_CONTROL_HOLDER)")
+    p.add_argument("--generation", metavar="N",
+                   help="the generation your acquire returned (checked when given)")
+    p.set_defaults(func=cmd_control_release)
+    p = control_sub.add_parser("renew", parents=[target_flags],
+                               help="extend your live lease at the same generation")
+    p.add_argument("--holder", metavar="ID",
+                   help="holder id (default: --control-holder / AUTONOM_CONTROL_HOLDER)")
+    p.add_argument("--generation", metavar="N",
+                   help="the generation your acquire returned (default: "
+                        "--control-generation / AUTONOM_CONTROL_GENERATION)")
+    p.add_argument("--ttl", type=int, metavar="SECONDS",
+                   help=f"new lifetime from now ({control_mod.MIN_TTL_S}-{control_mod.MAX_TTL_S}; "
+                        "default: the lease's own lifetime)")
+    p.set_defaults(func=cmd_control_renew)
+
     return parser
 
 
@@ -6963,6 +7451,7 @@ _SUBCOMMAND_DESTS = (
     "logs_command", "metrics_command", "teach_command", "app_skill_command",
     "simulator_command", "canvas_command", "ci_command", "agent_command",
     "pretest_command", "pretest_check_command", "pretest_finding_command",
+    "control_command",
 )
 
 
@@ -6991,10 +7480,17 @@ def _journal_command(args: argparse.Namespace, argv: list[str], ok: bool,
     if not session:
         return
     argv, args = _redact_pair_values(args, argv)
+    # The invocation's operation id, only when the verb was admitted under a
+    # lease or a claim (its `control` object was emitted) or a lease refused
+    # it: entries of verbs on targets without a lease keep their shape.
+    emitted = _LAST_EMIT if isinstance(_LAST_EMIT, dict) else {}
+    operation_id = None
+    if isinstance(emitted.get("control"), dict) or error_code in _CONTROL_ERROR_CODES:
+        operation_id = control_mod.invocation().get("operation_id")
     journal_mod.record_action(
         session, verb=_verb_string(args), argv=argv,
         payload=_LAST_EMIT, ok=ok, error_code=error_code,
-        args=args, parser=_ROOT_PARSER,
+        args=args, parser=_ROOT_PARSER, operation_id=operation_id,
     )
     if ok:
         _journal_mock_state(session, args)
@@ -7133,7 +7629,7 @@ def _os_error(exc: OSError) -> errors.AutonomError:
 # Verbs that only read what a session recorded: a stopped session may be
 # named with --session-id for these, and for nothing that drives a device.
 _READONLY_COMMANDS = {"journal", "shots", "logs", "report"}
-_READONLY_SESSION_COMMANDS = {"show", "outputs"}
+_READONLY_SESSION_COMMANDS = {"show", "outputs", "list"}
 # `report serve` replays flow steps on the device through /replay, so it is
 # not a read-only verb for a stopped session named with --session-id.
 _DRIVING_REPORT_COMMANDS = {"serve"}
@@ -7187,7 +7683,8 @@ def _select_session(args: argparse.Namespace) -> None:
         args.command == "report"
         and getattr(args, "report_command", None) in _DRIVING_REPORT_COMMANDS)) or (
         args.command == "session"
-        and getattr(args, "session_command", None) in _READONLY_SESSION_COMMANDS)
+        and getattr(args, "session_command", None) in _READONLY_SESSION_COMMANDS) or (
+        args.command == "control" and getattr(args, "control_command", None) == "status")
     if record.get("stopped_at") and not readonly:
         raise errors.AutonomError(
             errors.SESSION_STOPPED, f"session {selected} has stopped",
@@ -7202,7 +7699,9 @@ def main(argv: list[str] | None = None) -> int:
     _LAST_EMIT = None
     parser = build_parser()
     _ROOT_PARSER = parser
-    argv_used = list(argv) if argv is not None else sys.argv[1:]
+    # The claim flags are not options of any parser: the journal resolves the
+    # argv the parsers saw (the entry carries the operation id instead).
+    argv_used = _strip_control_flags(list(argv) if argv is not None else sys.argv[1:])
     args = _parse(parser, argv)
     context_token = session_mod.select(None)
     before_session = None
@@ -7213,6 +7712,9 @@ def main(argv: list[str] | None = None) -> int:
             platform_mod.apply_tool_overrides(args)
             _apply_ios_overrides(args)
             _select_session(args)
+            # Control lease context (contract 5.4): claim, operation id and the
+            # verb's class; MUTATING/FLOW verbs are admitted in `_target`.
+            _begin_control(args)
             # Only `session stop` journals through this snapshot. A broken
             # current.json must not fail session-independent verbs (version,
             # processes, devices); verbs that need the session fail on their own.
@@ -7286,6 +7788,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             _journal_command(args, argv_used, ok, error_code, before_session)
         finally:
+            control_mod.end_invocation()
             session_mod._SELECTED.reset(context_token)
 
 

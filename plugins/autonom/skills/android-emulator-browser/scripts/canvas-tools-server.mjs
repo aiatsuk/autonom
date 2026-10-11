@@ -82,7 +82,15 @@ export const ACTION_LOCAL_OPS = Object.freeze(["captures.delete"]);
 // `captures.file` is internal: only the file route asks it, /tools/call refuses it.
 const CALLABLE_OPS = Object.freeze([...TOOLS_OPS, ...ACTION_READ_OPS, ...ACTION_DEVICE_OPS, ...ACTION_LOCAL_OPS]);
 
+// The device ops admitted against the host control lease (contract 4.3; the same list as
+// LEASED_TOOLS_OPS in scripts/autonom_canvas_tools.py). Reads, host-side work
+// (`network.start`, `mocks.*`) and observation (`capture.screenshot`, `record.*`,
+// `captures.*`) never need a lease and never take one.
+export const LEASED_TOOLS_OPS = Object.freeze(["permissions.set", "location.set", "location.clear", "simulate",
+  "network.attach", "network.detach", "network.stop", "app.install", "app.launch", "app.open_url", "app.locale"]);
+
 const READ_OPS = new Set(TOOLS_READ_OPS);
+const LEASED = new Set(LEASED_TOOLS_OPS);
 const ALL_OPS = new Set(TOOLS_OPS);
 const CALLABLE = new Set(CALLABLE_OPS);
 const CONTROLLED = new Set([...TOOLS_MUTATING_OPS, ...ACTION_DEVICE_OPS]);
@@ -99,6 +107,9 @@ const STATUS_409 = new Set([
   "session_target_mismatch", "emulator_only", "proxy_not_running",
   "physical_device_attach_unsupported", "install_not_configured", "recording_already_active",
   "recording_not_active",
+  // The host control lease and the bound session (contract 6.5).
+  "control_held", "control_generation_stale", "control_lease_expired", "control_not_held",
+  "session_stopped", "session_not_found",
 ]);
 const STATUS_413 = new Set(["capture_too_large"]);
 
@@ -140,6 +151,11 @@ export function isCallableOp(op) {
 /** An op the Canvas control rule applies to: Tools mutations and Actions device ops. */
 export function isControlledOp(op) {
   return typeof op === "string" && CONTROLLED.has(op);
+}
+
+/** A device op the host control lease applies to (LEASED_TOOLS_OPS). */
+export function isLeasedToolsOp(op) {
+  return typeof op === "string" && LEASED.has(op);
 }
 
 function failure(status, errorCode, error, hint = null, capability = null) {
@@ -231,8 +247,12 @@ export class ToolsClient {
     now = () => performance.now(),
     opTimeoutsMs = OP_TIMEOUT_MS,
     closeGraceMs = TOOLS_CLOSE_GRACE_MS,
+    binding = null,
   }) {
     this.spawnTools = spawnTools;
+    // The request fields of the device's session binding and lease claim (contract 6.5):
+    // only the known ones are written, so other requests stay as they were.
+    this.binding = binding;
     this.timeoutMs = timeoutMs;
     this.opTimeoutsMs = opTimeoutsMs ?? {};
     this.closeGraceMs = closeGraceMs;
@@ -336,7 +356,8 @@ export class ToolsClient {
       }, timeoutMs);
       this.pending.set(id, { child, resolve: resolvePromise, timer });
       try {
-        child.stdin.write(`${JSON.stringify({ id, op, payload, origin })}\n`);
+        const extra = this.binding ? this.binding() : {};
+        child.stdin.write(`${JSON.stringify({ id, op, payload, origin, ...extra })}\n`);
       } catch {
         // The exit handler answers it.
       }
@@ -629,6 +650,7 @@ export function createCanvasTools({
   deviceName = null,
   commandLog = null,
   opTimeoutsMs,
+  binding = null,
 }) {
   const repoScripts = resolve(import.meta.dirname, "../../../../../scripts");
   const toolsScript = toolsPath ?? resolve(repoScripts, "autonom_canvas_tools.py");
@@ -645,11 +667,14 @@ export function createCanvasTools({
     timeoutMs,
     restartIntervalMs,
     opTimeoutsMs,
+    binding,
   });
   const targetFlag = platform === "ios" ? "--udid" : "--serial";
   const toolFlag = platform === "ios" ? "--simctl" : "--adb";
   const feed = new LogFeed({
-    spawnFollow: (packageName, match = null) => spawn(python, [autonomScript, "--platform", platform, targetFlag, target,
+    // A device bound to a session follows that session's log feed (`--session-id`, 6.5).
+    spawnFollow: (packageName, match = null) => spawn(python, [autonomScript, ...boundSessionArgs(binding),
+      "--platform", platform, targetFlag, target,
       toolFlag, tool, "logs", "follow", "--source", "device",
       ...(packageName ? ["--package", packageName] : []),
       ...(match ? ["--grep", literalPattern(match)] : [])],
@@ -678,6 +703,11 @@ export function createCanvasTools({
       await Promise.all([client.close(), feed.close()]);
     },
   };
+}
+
+function boundSessionArgs(binding) {
+  const sessionId = binding ? binding().session_id : null;
+  return typeof sessionId === "string" && sessionId ? ["--session-id", sessionId] : [];
 }
 
 /** The command-log summary of a tools call: names only, never contents; URLs as scheme+host. */
@@ -855,11 +885,26 @@ function readInteger(raw, name, minimum, maximum, fallback) {
 }
 
 /**
+ * The answer of a refused controlled op: a lease or session refusal (with a code) is 409
+ * with that code; paused input and the local owner rule stay 403 `control_refused`.
+ */
+function refusedAnswer(refused) {
+  if (typeof refused === "string") return failure(403, "control_refused", refused);
+  if (refused.code) return failure(409, refused.code, refused.message);
+  return failure(403, "control_refused", refused.message);
+}
+
+/**
  * Answer one /tools/* request: resolves {status, body}. The caller has already checked
  * authorization and CSRF. `readBody()` reads the JSON body (with the Canvas body limit);
- * `refusal(origin)` is the Canvas control rule, a message when input is refused.
+ * `refusal(origin, {leased})` is the Canvas control rule: null, or a message (or
+ * {message, code}) when input is refused; the host lease applies only to leased ops.
+ * `acquire(origin)`, when given, takes the human lease before a person's leased op
+ * (contract 6.4): it resolves null, or the failure {status, code, message}.
  */
-export async function handleToolsRoute(tools, { method, url, origin, readBody, refusal, request = null, response = null }) {
+export async function handleToolsRoute(tools, {
+  method, url, origin, readBody, refusal, acquire = null, request = null, response = null,
+}) {
   try {
     if (method === "POST" && url.pathname === "/tools/call") {
       const body = await readBody();
@@ -875,8 +920,18 @@ export async function handleToolsRoute(tools, { method, url, origin, readBody, r
         return badRequest("invalid_value", "payload must be a JSON object");
       }
       if (isControlledOp(body.op)) {
-        const refused = refusal(origin);
-        if (refused) return failure(403, "control_refused", refused);
+        const leased = isLeasedToolsOp(body.op);
+        const refused = refusal(origin, { leased });
+        if (refused) return refusedAnswer(refused);
+        if (leased && origin === "human" && typeof acquire === "function") {
+          const failed = await acquire(origin);
+          if (failed) {
+            return failure(failed.status ?? 409, failed.code ?? (failed.status === 502 ? "backend_failed" : "control_not_held"),
+              failed.message ?? "Device control could not be taken");
+          }
+          const late = refusal(origin, { leased });
+          if (late) return refusedAnswer(late);
+        }
       }
       return await tools.call(body.op, payload, origin);
     }

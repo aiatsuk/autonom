@@ -227,6 +227,10 @@ def verdict(selected: list[dict[str, Any]], runs: list[dict[str, Any]],
         return "not_covered"
     if any(run["status"] == "failed" for run in runs):
         return "fail"
+    if any(run["status"] == "interrupted" for run in runs):
+        # The control lease moved mid-run: the suite did not finish, so it
+        # proves nothing either way (never a pass).
+        return "inconclusive"
     executed = [step for run in runs for step in run.get("steps", [])]
     if executed and all(step.get("status") == "skipped" for step in executed):
         return "inconclusive"

@@ -115,6 +115,7 @@ def new_record(
     session_id: str,
     tooling: dict[str, Any] | None = None,
     started_by: dict[str, Any] | None = None,
+    label: str | None = None,
 ) -> dict[str, Any]:
     record: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
@@ -142,6 +143,9 @@ def new_record(
         # Who started the session: null for a person or an agent at the CLI,
         # {"kind": "canvas", "port", "pid"} for a Canvas workspace.
         "started_by": dict(started_by) if started_by else None,
+        # A free-text name a person gave the session (`session start
+        # --label`), shown by `session list`; null when none was given.
+        "label": label,
     }
     if platform == "android":
         # DEC-004: `serial` and `adb` are permanent for Android callers.
@@ -218,6 +222,7 @@ def start_session(
     alongside: bool = False,
     started_by: dict[str, Any] | None = None,
     exclusive: bool = False,
+    label: str | None = None,
 ) -> dict[str, Any]:
     """Create the artifact tree and the session record.
 
@@ -269,6 +274,7 @@ def start_session(
             session_id=session_id,
             tooling=resolved_tooling,
             started_by=started_by,
+            label=label,
         )
         if alongside:
             # Bound to the new session for its own save: `save` then leaves
@@ -530,6 +536,97 @@ def live_sessions(cwd: Path | None = None) -> list[dict[str, Any]]:
                                   written.get(str(item.get("session_id")), 0),
                                   str(item.get("session_id") or "")))
     return listed
+
+
+LABEL_MAX = 64
+
+
+def validate_label(label: str | None) -> str | None:
+    """A session label as given to `session start --label`: 1..64 printable
+    characters (no newline or other control character), else
+    `invalid_value`. None stays None."""
+    if label is None:
+        return None
+    if not isinstance(label, str) or not 1 <= len(label) <= LABEL_MAX \
+            or not label.isprintable():
+        raise errors.AutonomError(
+            errors.INVALID_VALUE,
+            f"--label must be 1 to {LABEL_MAX} printable characters",
+            "For example --label 'checkout bug'; no newlines or control characters.")
+    return label
+
+
+# The keys of one `session list` entry, in this order.
+LIST_KEYS = ("session_id", "platform", "target_id", "label", "started_at",
+             "stopped_at", "started_by", "current", "live")
+
+
+def _list_entry(record: dict[str, Any], *, current: bool, live: bool) -> dict[str, Any]:
+    return {
+        "session_id": record.get("session_id"),
+        "platform": record.get("platform") or "android",
+        "target_id": record.get("target_id") or record.get("serial"),
+        "label": record.get("label"),
+        "started_at": record.get("started_at"),
+        "stopped_at": record.get("stopped_at"),
+        "started_by": record.get("started_by"),
+        "current": current,
+        "live": live,
+    }
+
+
+def list_sessions(*, include_stopped: bool = False,
+                  cwd: Path | None = None) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """The sessions of the store as `session list` shows them: (entries,
+    warnings).
+
+    By default the live sessions (`live_sessions`): `current` is True for
+    the one `current.json` names. With `include_stopped`, also every
+    `s_*/session.json` of the store, read without the lock; a record that
+    cannot be read or parsed is skipped with a `session_unreadable` warning.
+    Read-only: nothing is written; a stale target pointer is dropped only
+    through `live_for_target`, as every lookup does. Ordered by
+    `started_at`, then `session_id`."""
+    live = live_sessions(cwd)
+    live_ids = {str(record.get("session_id")) for record in live}
+    entries: dict[str, dict[str, Any]] = {}
+    warnings: list[dict[str, Any]] = []
+    if include_stopped:
+        try:
+            current_id = _current_id(cwd)
+        except Exception:  # noqa: BLE001 - an unreadable pointer names nothing
+            current_id = None
+        root = artifacts_root(cwd)
+        for directory in sorted(root.glob("s_*")):
+            session_id = directory.name
+            if not _SESSION_ID.fullmatch(session_id) or not directory.is_dir():
+                continue
+            path = directory / "session.json"
+            if not path.exists():
+                continue
+            try:
+                stored = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(stored, dict):
+                    raise ValueError("session.json is not a JSON object")
+            except (OSError, ValueError) as exc:
+                warnings.append({"code": "session_unreadable", "session_id": session_id,
+                                 "error": str(exc) or exc.__class__.__name__})
+                continue
+            record = upgrade(stored)
+            # The directory names the session; a record that disagrees is
+            # listed under its directory, the id every other verb resolves.
+            record["session_id"] = session_id
+            is_live = session_id in live_ids
+            entries[session_id] = _list_entry(
+                record, current=is_live and session_id == current_id, live=is_live)
+    for record in live:
+        session_id = str(record.get("session_id"))
+        if session_id not in entries:
+            entries[session_id] = _list_entry(
+                record, current=bool(record.get("primary")), live=True)
+    listed = sorted(entries.values(), key=lambda item: (str(item.get("started_at") or ""),
+                                                        str(item.get("session_id") or "")))
+    return listed, warnings
 
 
 def _write_atomic(path: Path, payload: str) -> None:

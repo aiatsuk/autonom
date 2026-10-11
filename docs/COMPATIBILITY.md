@@ -85,6 +85,10 @@ strengthened, never silently weakened.
   `open_url_not_recoverable` (`flow create`).
   `network status` now raises `persistent_mocks_active` as `network start`
   and `doctor` do.
+- The shared control round adds four codes, `control_held`,
+  `control_generation_stale`, `control_lease_expired` and `control_not_held`,
+  and the warning codes `evidence_write_failed` and `session_unreadable`; see
+  [Concurrent sessions and shared control](#concurrent-sessions-and-shared-control-unreleased).
 
 ## Response shape
 
@@ -403,6 +407,67 @@ drawer `recording_not_active`, `capture_not_found`, `capture_too_large`,
 | Sessions | — | the workspace Canvas starts `session start --alongside --started-by canvas:<port>:<pid>` per attached device or reuses the live one on that target; `current.json` is never written by it; detach and stop end only the sessions it started |
 | Captures | — | the Actions drawer saves to `~/Downloads/Autonom/<device>/` (`--captures-dir`, `AUTONOM_CAPTURES_DIR`); at 200 files or 2 GB per device folder the oldest indexed captures are deleted |
 
+### Concurrent sessions and shared control (Unreleased)
+
+Additive, with one intentional change (the Canvas's automatic human lease).
+Error codes added (pinned by `tests/test_error_codes_additive.py`, emitted
+only once a lease exists or a claim is given):
+
+| Code | Emitted by |
+| --- | --- |
+| `control_held` | a device-changing command, flow step, Canvas input or Tools op while another live holder has the target's control lease; `control acquire` against a live holder (with `takeover_requires: "human"` for an agent's `--takeover`) |
+| `control_generation_stale` | a claim whose generation is older than the lease's (the holder was taken over), or a release/renew at another generation; Canvas input queued before a lease change (HTTP 409) |
+| `control_lease_expired` | the claim's own lease expired (no revival by `renew`) |
+| `control_not_held` | a claim without that lease (no lease file, a free lease, another expired holder), or a release/renew of a lease the caller does not hold; a Canvas input whose automatic grant was not a valid grant or did not answer within 2 s (a dead bridge is 502) |
+
+Every control refusal is the usual envelope (exit 2) plus `platform`,
+`target_id`, `capability: "control.lease"`, `generation`, `holder`,
+`expires_at`, and `claimed_holder`/`claimed_generation` when a claim was
+given. Warning codes added (`warnings[].code`, never an `error_code`):
+`evidence_write_failed` (an action detail could not be saved; the device
+action ran once and the command still exits 0) and `session_unreadable`
+(`session list --all` skipped a record).
+
+| Surface | Before | Now |
+| --- | --- | --- |
+| No lease file for a target and no human Canvas input on it | — | every CLI verb, flow, Canvas route, WebSocket message, bridge and tools op behaves and answers exactly as before: no `control` key, same exit codes, same journal entries |
+| `session list [--all]` | — | `{"ok", "sessions": [{"session_id", "platform", "target_id", "label", "started_at", "stopped_at", "started_by", "current", "live"}], "count"}` (`warnings` only when non-empty); read-only, no device call, target flags filter it |
+| `session start --label TEXT` | — | 1..64 printable characters (`invalid_value` otherwise), stored as the record's `label` and echoed in the start payload; records without it read `label: null`. `--la` still means `--launch` |
+| `session start` refusals, `--alongside`, `--started-by`, `current.json`, `--session-id` rules, `session_target_mismatch`, `session stop` | — | unchanged |
+| `control status [--all]`, `control acquire --holder ID [--kind] [--label] [--ttl] [--takeover]`, `control release`, `control renew` | — | new verbs; JSON answers `acquired`/`renewed`/`taken_over`/`released`/`was_expired`, `lease`, `generation`, `state`, the target identity, and `env` (`AUTONOM_CONTROL_HOLDER`, `AUTONOM_CONTROL_GENERATION`) for acquire and renew. Holder id `^[A-Za-z0-9._:@-]{1,128}$`, label 1..80 printable characters, TTL 5..3600 s (agent default 60, human 30) |
+| Global `--control-holder ID`, `--control-generation N`, `--operation-id ID` | — | before or after the verb, exact spellings only (no abbreviation); flags win over `AUTONOM_CONTROL_HOLDER`/`AUTONOM_CONTROL_GENERATION`; `--control-generation` without a holder is `usage_error`. No existing option changed meaning |
+| Success payload of an admitted device-changing verb or flow | — | gains `control: {"generation", "holder_id", "operation_id"}` only when a lease file existed for the target or a claim was given; journal entries then carry `operation_id` |
+| `ui tree` under someone else's lease | — | still exits 0 with its tree and the `sparse_accessibility_tree` warning, but skips the implicit accessibility recovery (no settings write, force-stop or relaunch) |
+| Flow run status | `passed`, `failed`, `replayed` | unchanged, plus `interrupted` (exit 1 from `flow run`) only after a lease refusal: `failure.failure_class: "control_lost"`, the refused step `skipped` with `skip_reason: "control_lost"`, a `flow.step.refused` event, no `onFlowComplete`, manifest `execution_status: "broken"`, `proof_verdict: "inconclusive"`. `proof` answers `inconclusive` for an interrupted run (still `fail` when another run failed); the suite HTML marks it not passed; `retry:` never retries it |
+| `report suite` | exit 1 and `failures` only for `failed` runs | also exit 1 for an `interrupted` run, listed under `failures`; the `interrupted` count and a failure entry's `status` (any status other than `failed`) are added only when such a run is present, so a suite without one answers with the same keys and values as before |
+| `control renew`, `control acquire` by the live holder (in place), without `--ttl` | — | keep the lease's own TTL (a lease acquired with `--ttl 600` renews for 600 s), not the kind default |
+| `flow run --dry-run` under someone else's lease | — | read-only: plans the steps (`status: "planned"`, exit 0) and is never refused; a real run under the same lease is still refused |
+| `canvas serve --control-idle SECONDS` | — | 15..3600 (`invalid_value` otherwise, before node starts), passed to node only when given, so the node argv of a Canvas without it is unchanged byte for byte |
+| Single-device Canvas (`canvas serve --serial X`) | — | same node argv, stdout, routes, headers and `/status` keys; additions are `lease` and `session_stopped` in `/status`, state messages, `POST /control` and `/api/devices` (the `/d/<id>/status` `device` keys are unchanged) |
+| A person's first Canvas input on a device nobody holds | the input ran; agents kept working | **intentional change:** the Canvas takes the host-wide human lease first, so CLI agents and flows on that device are refused `control_held` until Hand back, idle release (`--control-idle`, default 120 s) or expiry (about 30 s after the last page closes). The Canvas's own answers, journal and local owner rule stay as before: HTTP input bodies are unchanged, the automatic grant journals nothing, and agent input of the same Canvas is still admitted |
+| Canvas lease refusals | — | HTTP input and `/tools/call` answer 409 with `error_code` (`control_held`, `control_generation_stale`, `control_lease_expired`, `control_not_held`, `session_stopped`, `session_target_mismatch`, `session_not_found`); pause and local-owner refusals keep their old answers (409 without `error_code`; 403 `control_refused` on `/tools/call`); WebSocket `error` messages add `code` |
+| Canvas `control` journal records | modes `pause`, `resume`, `takeover`, `release` | adds `lost` (the lease moved to another holder or expired) and `idle` (idle release) |
+| Bridge and tools NDJSON requests | `id`, `op`, `payload`, `origin` | unchanged without the new optional `session_id` and `control`; with them, a stopped, missing or foreign session is refused before any device action; new bridge ops `control-acquire`, `control-release`, `control-renew`, `control-status`; the tools `context` answer adds `session_id` |
+| Action detail names | `NNNN_<slug>.json`, numbered by count | same pattern, numbered after the highest existing index and written by hard link or `O_EXCL`, so concurrent writers never share or overwrite a name; readers unchanged |
+
+Residual (RISK-002): admission is checked immediately before each device
+call, not atomically with it. A Take over that lands in that window lets one
+already admitted input through: milliseconds for flow steps and Canvas
+input, up to one UI snapshot (about 1-3 s) for a selector `ui tap` or
+`ui type`, which admit once when their target is resolved.
+
+Residual (RISK-019): the lease is a coordination rule between cooperating
+processes of one user, not a security boundary. An agent's `control acquire
+--takeover` is refused (`takeover_requires: "human"`), but any process of the
+same user can pass `--kind human --takeover`, or reuse the holder id and
+generation that a refusal or `control status` shows. Lease files are mode
+0600 in a 0700 directory, so other users cannot read or forge them.
+
+Journal note: a Take over or Hand back sent as a `control` message over
+`/ws/control` writes a `control` journal record; the same change through
+HTTP `POST /control` writes none (only the Canvas command log). Lost and
+idle endings are journaled either way.
+
 ### iOS UI recovery and `--session-id` (0.32.0)
 
 Additive, with two behaviour changes listed at the end. A host that passes
@@ -450,7 +515,8 @@ Behaviour changes:
   `ok: false` and `strict_failures`) —
   a diagnostic that fails is useless in a pipeline (`scripts/autonom.py`).
   `ui wait --settled` exits `1` when the screen never settled within
-  `--timeout-ms`, like `flow run`'s test failures.
+  `--timeout-ms`, like `flow run`'s test failures. `flow run` also exits `1`
+  for a run that ended `interrupted` by the control lease.
 - stdout carries exactly **one pretty-printed JSON document** per invocation;
   human prose and consent prompts go to stderr. Documented exceptions are
   opt-in streaming modes — `flow run --events`, `logs follow`,

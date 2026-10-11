@@ -14,6 +14,13 @@ in order.
     {"id": 1, "ok": false, "error_code": "...", "error": "...", "hint": null,
      "capability": null}
 
+A request may also carry `session_id` (the session the Canvas bound this
+device to: the ops that need a session use it, or are refused when it stopped
+or belongs to another target) and `control` (`{"holder_id", "generation"}`,
+the Canvas's lease claim). The device ops of `LEASED_TOOLS_OPS` are admitted
+against the target's control lease before their first device call. Requests
+without these fields are processed as before.
+
 One bad request never stops the process, and stdout carries protocol lines
 only: at start the real stdout is moved to a private descriptor and file
 descriptor 1 points at stderr, so nothing a library or a child process prints
@@ -91,6 +98,13 @@ OPS = (READ_OPS + MUTATING_OPS + ACTION_READ_OPS + ACTION_DEVICE_OPS + ACTION_LO
        + INTERNAL_OPS)
 # Ops answered without the journal: reads, the gallery's own deletes, the file lookup.
 UNJOURNALED_OPS = READ_OPS + ACTION_READ_OPS + ACTION_LOCAL_OPS + INTERNAL_OPS
+# The device ops admitted against the host-wide control lease before their
+# first device call (contract 4.3; the same set as the Node tools server's).
+# Reads, host-side work (`network.start`, `mocks.*`) and observation
+# (`capture.screenshot`, `record.*`, `captures.*`) never need a lease.
+LEASED_TOOLS_OPS = ("permissions.set", "location.set", "location.clear", "simulate",
+                    "network.attach", "network.detach", "network.stop", "app.install",
+                    "app.launch", "app.open_url", "app.locale")
 
 RECORD_LIMIT_S = 180
 RECORD_STOP_WAIT_S = 10.0
@@ -227,6 +241,9 @@ class Tools:
         self.recording: dict[str, Any] | None = None
         self.origin = "human"  # the origin of the request being answered
         self.last_recording: dict[str, Any] | None = None
+        # The session id the request being dispatched is bound to (its
+        # envelope's `session_id`), or None for today's lookup.
+        self.bound_session_id: str | None = None
         self.handlers: dict[str, Callable[..., Any]] = {
             "context": self.context,
             "permissions.list": self.permissions_list,
@@ -274,7 +291,13 @@ class Tools:
         that session, so a save never moves `current.json` to it.
 
         An unreadable session record counts as none: the read panels still work.
+
+        A request bound to a session (`session_id` in its envelope) uses that
+        session only: a missing, stopped or other-target session is refused
+        (`bridge.bound_session`) for every op that needs the session.
         """
+        if self.bound_session_id is not None:
+            return bridge.bound_session(self.target, self.bound_session_id)
         try:
             record = bridge.journal_session(self.target)
         except Exception:  # noqa: BLE001 - a corrupt current.json is no session
@@ -361,6 +384,7 @@ class Tools:
             "emulator": self.emulator,
             "session": ({"id": record.get("session_id"), "app_id": record.get("app_id")}
                         if record else None),
+            "session_id": record.get("session_id") if record else None,
             "app_id": app_id,
             "privacy_services": privacy,
             "android_permission_aliases": aliases,
@@ -1204,11 +1228,27 @@ class Tools:
             payload = {}
         if not isinstance(payload, dict):
             raise _invalid(f"{op} payload must be an object")
+        claim = bridge.parse_claim(message.get("control"))
+        session_id = message.get("session_id")
+        if session_id is not None and not isinstance(session_id, str):
+            raise _invalid("session_id must be a session id string or null")
+        self.bound_session_id = session_id
+        try:
+            return self._dispatch(op, origin, payload, claim)
+        finally:
+            self.bound_session_id = None
+
+    def _dispatch(self, op: str, origin: str, payload: dict[str, Any],
+                  claim: Any) -> dict[str, Any]:
         handler = self.handlers[op]
         if op in UNJOURNALED_OPS:
             return handler(payload)
         record = self.session()
         self.origin = origin
+        # Lease admission comes before the op's first device call and before the
+        # pre-test guard: a refusal runs nothing and consumes no pre-test budget.
+        admitted = (bridge.admit_input(self.target, claim)
+                    if op in LEASED_TOOLS_OPS else None)
         try:
             # A person's own Canvas actions are exempt from the pre-test guard;
             # an agent's go through it exactly like the CLI's verbs.
@@ -1220,6 +1260,10 @@ class Tools:
         except Exception:
             self._journal(record, op, origin, [], {}, False, errors.BACKEND_FAILED)
             raise
+        if admitted is not None:
+            summary = {**summary, "control": dict(admitted)}
+            if isinstance(result, dict):
+                result = {**result, "control": dict(admitted)}
         self._journal(record, op, origin, words, summary, True)
         return result
 
@@ -1347,9 +1391,10 @@ def main() -> int:
     # Partial files a stopped process left in this device's folder (never created here).
     captures.sweep(tools._captures_path())  # noqa: SLF001
     out = _protocol_stream()
+    requests = bridge.request_stream(binary=True)
     signal.signal(signal.SIGTERM, _terminate)
     try:
-        for raw in sys.stdin.buffer:
+        for raw in requests:
             line = raw.decode("utf-8", errors="replace").strip()
             if not line:
                 continue

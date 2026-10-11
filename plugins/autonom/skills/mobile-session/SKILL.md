@@ -189,6 +189,10 @@ export AUTONOM_IDB_COMPANION=mac-farm-01:10882
 | `app_not_debuggable` | `file ls`/`pull` need a debuggable build; release and system apps refuse run-as |
 | `simulator_must_be_shutdown` | `simulator keyboard pin` needs a shut-down simulator; pass `--value reboot=true` or shut it down first |
 | `simulator_data_not_found` | the simulator has no data directory yet — boot it once, or set `AUTONOM_CORESIMULATOR_DEVICES` |
+| `control_held` | someone else (a person in the Canvas, another agent) holds the device's control lease; nothing ran — wait for `control status` to show it free |
+| `control_generation_stale` | your lease was replaced (a person took over); acquire again, and never replay an input whose outcome you did not see |
+| `control_lease_expired` | your lease ran out; renew before the expiry or acquire again |
+| `control_not_held` | you claimed a lease you do not hold (or there is none); acquire it, or drop the claim |
 
 ## Backend recovery and explicit sessions
 
@@ -230,6 +234,59 @@ launcher Activity automatically.
 Use before/after trees or screenshots to verify the actual result. Fallback choices
 and flow steps remain in the session journal. See `docs/IOS_UI_RECOVERY.md` in the
 Autonom repository for implementation details and the Reader regression flows.
+
+## Several sessions and shared control
+
+```bash
+python3 <autonom-root>/scripts/autonom.py session start --serial emulator-5584 --label checkout
+python3 <autonom-root>/scripts/autonom.py session list            # live sessions; --all adds stopped ones
+python3 <autonom-root>/scripts/autonom.py control status --serial emulator-5584
+python3 <autonom-root>/scripts/autonom.py control acquire --serial emulator-5584 --holder agent:checkout --ttl 300
+python3 <autonom-root>/scripts/autonom.py --control-holder agent:checkout --control-generation 3 ui tap --serial emulator-5584 --desc Pay
+python3 <autonom-root>/scripts/autonom.py control renew --serial emulator-5584 --holder agent:checkout --generation 3
+python3 <autonom-root>/scripts/autonom.py control release --serial emulator-5584 --holder agent:checkout
+```
+
+- `session list` prints `{"ok", "sessions", "count"}`; each entry has `session_id`,
+  `platform`, `target_id`, `label`, `started_at`, `stopped_at`, `started_by`,
+  `current` and `live`. It never touches a device; target flags filter it. A
+  record that cannot be read is skipped with a `session_unreadable` warning.
+  `--label TEXT` (1-64 printable characters) names a session for people.
+- **The control lease** says who may change a device right now: one file per
+  target in the machine state, with a holder (`kind` `agent` or `human`, `id`,
+  `label`), a generation that only grows, and an expiry. With no lease file
+  nothing changes: every verb works as before. Once a lease is held, every
+  command that changes the device (`ui tap|swipe|type|key|pinch|rotate|shake`,
+  `open`, `permissions`, `location set|clear`, `media add`, `session
+  launch|force-stop|clear|uninstall`, `network attach|detach|stop`,
+  `devices shutdown`, mutating `simulator` and `ui accessibility` actions, and
+  every mutating flow step) is admitted only for the holder's claim, checked
+  just before the device is touched; a refusal exits 2 with the holder,
+  `generation`, `capability: "control.lease"` and a hint, and nothing ran.
+  Reading the screen, screenshots, recordings, logs, journal, `session list`,
+  `session stop` and `control status` are never refused. `ui tree` still
+  answers under someone else's lease but skips its accessibility recovery.
+- **Claim** with `--control-holder ID` and `--control-generation N` (before or
+  after the verb, exact spellings only) or with `AUTONOM_CONTROL_HOLDER` and
+  `AUTONOM_CONTROL_GENERATION`; `control acquire` prints both as `env`.
+  `--operation-id ID` names the action in the journal (`operation_id`). An
+  admitted command's JSON gains `control: {generation, holder_id,
+  operation_id}` only when a lease exists or a claim was given.
+- An agent lease lasts `--ttl` seconds (default 60, 5..3600): renew it during
+  long work (a renew without `--ttl` keeps the lease's own TTL), or the next
+  action fails `control_lease_expired`. Never take
+  over a live holder: `--takeover` is refused for an agent holder
+  (`takeover_requires: "human"`) and `--kind human` is for people only. The
+  Canvas's Take over replaces an agent at once, and the agent's next action
+  fails `control_generation_stale`. The lease coordinates cooperating
+  processes of one user; it is not a security boundary, so never reuse a
+  holder id or generation you read from a refusal.
+- **A person in the Canvas takes control by their first input** on a device
+  nobody holds. From then on unclaimed agent actions on that device are
+  refused `control_held` until the person presses Hand back, the Canvas's
+  idle timeout releases it (120 s by default) or the page is closed (the
+  lease expires within 30 s). Do not retry in a loop: poll `control status`
+  and continue once it reads `free`.
 
 ## Related skills
 

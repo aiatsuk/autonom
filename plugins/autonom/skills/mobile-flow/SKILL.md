@@ -114,6 +114,21 @@ tags: [smoke, auth]
   for you.
 - A run that aborted on a definition or infrastructure error is a JUnit
   `<error>` (`errors="1"`), never a green suite.
+- `status: "interrupted"` (exit `1`, never a pass) means someone else took
+  the device: a person's first input in the Canvas, a Take over, or another
+  holder of the device's control lease. The lease is checked immediately
+  before every device action of every mutating step (also inside polling,
+  retries and `scrollUntilVisible` attempts), so the step that was refused
+  never ran and no later step runs. `failure` carries the control code
+  (`control_held`, `control_generation_stale`, `control_lease_expired`,
+  `control_not_held`), `failure_class: "control_lost"`, `holder` and
+  `generation`; the refused step is listed `skipped` with `skip_reason:
+  "control_lost"`; the events have `flow.step.refused` then
+  `flow.run.finished`; `onFlowComplete` is skipped (it would change the
+  device); the manifest reads `execution_status: "broken"` and `proof`
+  answers `inconclusive`. A `retry:` block never retries it. Re-run the flow
+  yourself once `autonom control status` shows the device `free`; Hand back
+  in the Canvas does not restart it.
 
 ## Rules
 
@@ -140,6 +155,12 @@ tags: [smoke, auth]
    mtime-preserving copy does not count.
 6. Flow files are source — commit them. If the repository blanket-ignores
    `.autonom/`, un-ignore the flows subtree (`!.autonom/flows/**`).
+7. A flow run under a claimed lease (`--control-holder` /
+   `AUTONOM_CONTROL_HOLDER`) stops when the lease runs out: the executor
+   never renews on its own, so a flow longer than the lease's TTL ends
+   `interrupted` with `control_lease_expired`. Acquire with a longer
+   `--ttl` (at most 3600 s) or run `autonom control renew` in parallel.
+   Without a claim and with no lease on the device a flow runs as before.
 
 ## Failure codes
 
@@ -156,6 +177,7 @@ tags: [smoke, auth]
 | `flow_source_changed` | `teach approve` / `app-skill promote`: the flow or a `runFlow` child changed since its replays or receipt |
 | `comments_would_be_lost` | `flow fmt --write` would drop comments; pass `--drop-comments` to accept that |
 | `no_active_session` | run `session start` first (see mobile-session) |
+| `control_held` / `control_generation_stale` / `control_lease_expired` / `control_not_held` | the device's control lease refused a mutating step: the run ends `interrupted` (`failure_class: control_lost`), see Reading a run |
 
 ## Related
 

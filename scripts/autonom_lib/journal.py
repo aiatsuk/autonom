@@ -69,8 +69,12 @@ _TARGET_VALUE_FLAGS = {
 }
 # Value-taking target flags argparse matches only when spelled in full
 # (`EXACT_ONLY_OPTIONS`): added after abbreviations of the older flags were in
-# use, so `--u` stays `--udid` and `--se` stays `--serial`.
-EXACT_ONLY_OPTIONS = frozenset({"--session-id", "--ui-backend"})
+# use, so `--u` stays `--udid` and `--se` stays `--serial`. The control claim
+# flags (`--control-holder`, `--control-generation`, `--operation-id`) came
+# after `--o`/`--ou` (`--out`) and `--c`/`--ca` (`--captures-dir`) were in use,
+# so they are exact-only from the start.
+EXACT_ONLY_OPTIONS = frozenset({"--session-id", "--ui-backend", "--control-holder",
+                                "--control-generation", "--operation-id"})
 # Fields worth lifting from a command's result into the timeline summary.
 # Deliberately excludes anything free-form or body-shaped ("typed", previews).
 _SUMMARY_KEYS = (
@@ -722,6 +726,7 @@ def record_action(
     origin: str = "agent",
     args: Any = None,
     parser: Any = None,
+    operation_id: str | None = None,
 ) -> None:
     """Journal one CLI action.
 
@@ -729,6 +734,10 @@ def record_action(
     is then also resolved exactly as argparse resolved it. Whatever is passed,
     the argv written is `scrub_for_journal`: the per-token union of every
     applicable scrub, never less masked than the previous release.
+
+    `operation_id` (the control lease attribution of an admitted or refused
+    mutation) is written only when given, so entries without one keep the
+    shape of before.
     """
     try:
         scrubbed = scrub_for_journal(argv, args, parser)
@@ -746,6 +755,8 @@ def record_action(
         entry["result"] = summary
     if error_code:
         entry["error_code"] = error_code
+    if operation_id:
+        entry["operation_id"] = operation_id
     append(session, entry)
 
 

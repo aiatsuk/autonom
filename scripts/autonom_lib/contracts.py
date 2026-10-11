@@ -101,6 +101,9 @@ def execution_status(manifest_status: str | None,
         return "passed"
     if manifest_status == "skipped":
         return "skipped"
+    if manifest_status == "interrupted":
+        # The control lease moved mid-run: nothing about the app was decided.
+        return "broken"
     if manifest_status == "failed":
         failure_class = (primary_error or {}).get("failure_class")
         return "failed" if failure_class in (None, "test_failure") else "broken"

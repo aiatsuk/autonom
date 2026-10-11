@@ -87,6 +87,24 @@ import { renderWorkspacePage } from "./canvas-workspace-page.mjs";
 import { actionsButton, actionsMarkup, actionsScript, actionsStyles } from "./canvas-actions-page.mjs";
 import { createActivityApiRoute, createCommandLog } from "./canvas-activity.mjs";
 import {
+  AUTO_ACQUIRE_WAIT_MS,
+  CONTROL_GENERATION_STALE,
+  CONTROL_HELD,
+  CONTROL_NOT_HELD,
+  DEFAULT_CONTROL_IDLE_S,
+  HUMAN_LEASE_TTL_S,
+  LEASE_ERROR_CODES,
+  LEASE_POLL_MS,
+  LEASE_RENEW_MS,
+  createFileCache,
+  describeHolder,
+  leaseFor,
+  leasePath,
+  leaseState,
+  sessionRecordPath,
+  sessionStatus,
+} from "./canvas-control.mjs";
+import {
   DEFAULT_VIDEO_OPTIONS,
   ERROR_CODE,
   IDB_CAPABILITY,
@@ -687,6 +705,11 @@ function respondError(response, error, { api = true } = {}) {
   }
   const status = error?.statusCode ?? 500;
   if (!api) {
+    // A lease or session refusal names its code (contract 6.3); other answers are as before.
+    if (error?.errorCode) {
+      sendJson(response, status, { ok: false, error: error.message, error_code: error.errorCode });
+      return;
+    }
     sendJson(response, status, { error: error?.message ?? String(error) });
     return;
   }
@@ -1126,6 +1149,9 @@ function deviceSummary(server, entry) {
     attached_at: entry.attachedAt,
     // The profile the stream runs now (the fields above are the planned one).
     profile_applied: appliedProfileOf(server, entry, multipart),
+    // The host control lease and the bound session (contract 6.7); null before the device is live.
+    lease: context?.lease ? leaseStatus(context) : null,
+    session_stopped: context?.lease ? (refreshSession(context), sessionStoppedOf(context)) : false,
   };
 }
 
@@ -1972,14 +1998,17 @@ export function createDeviceContext(server, device) {
   let inputQueue = Promise.resolve();
   const id = `${platform}~${serial}`;
   const workspace = server.mode === "workspace";
+  // Every bridge and tools request carries the device's bound session and this Canvas's
+  // lease claim (contract 6.5); `context` is read when a request is written.
+  const binding = () => requestBinding(context);
   // A workspace Canvas restarts a bridge that exits (contract 3.8); the single-device one
   // keeps the bridge it started with.
   const actionBridge = workspace
-    ? createRestartingBridge(options, adbPath, serial, { onFailed: () => server.bridgeFailed?.(id) })
-    : createActionBridge(options, adbPath, serial);
+    ? createRestartingBridge(options, adbPath, serial, { onFailed: () => server.bridgeFailed?.(id), binding })
+    : createActionBridge(options, adbPath, serial, { binding });
   // The panel tools: their own process and the device log feed, apart from input.
   const tools = createToolsFor(options, adbPath, serial, {
-    deviceId: id, deviceName: device.name ?? null, commandLog: server.commandLog ?? null,
+    deviceId: id, deviceName: device.name ?? null, commandLog: server.commandLog ?? null, binding,
   });
 
   const context = {
@@ -2083,16 +2112,25 @@ export function createDeviceContext(server, device) {
     journalDropped: 0,
     broadcaster: null,
     shuttingDown: false,
-    enqueueInput(task) {
+    // The host control lease of this device (contract 6.2).
+    lease: null,
+    enqueueInput(task, { release = false } = {}) {
+      // Stamped now: input queued before a control change does not run after it (6.4),
+      // except a release, which only lets go of what the device holds.
+      const epoch = context.lease.epoch;
       inputQueue = inputQueue.catch(() => {}).then(() => {
         // Once the Canvas stops, queued input is dropped instead of delaying the restore.
         if (context.shuttingDown) throw inputError(503, "Canvas is stopping");
+        if (!release && context.lease.epoch !== epoch) {
+          throw inputError(409, "Input queued before a control change was not sent", CONTROL_GENERATION_STALE);
+        }
         return task();
       });
       context.inputEnqueued += 1;
       return inputQueue;
     },
   };
+  context.lease = createLeaseState(context);
   context.broadcaster = new FrameBroadcaster(context);
   return context;
 }
@@ -2122,11 +2160,14 @@ async function closeDevice(context) {
   context.broadcaster.stop();
   clearTimeout(context.idleTimer);
   clearTimeout(context.displayWatch);
+  clearInterval(context.lease.pollTimer);
   // The device server and the adb forward must be gone before the process is, and the
   // display back as it was, within the 5 s the supervisor allows after SIGTERM.
-  // The tools process and the log feed go with it: no orphans.
+  // The tools process and the log feed go with it: no orphans. A held control lease is
+  // handed back first, through the bridge, while it still runs (bounded, 6.4).
   await Promise.race([
-    Promise.all([stopSession(context), restoreDisplay(context), restoreDeviceRotation(context), context.tools.close()]),
+    Promise.all([releaseLeaseOnClose(context), stopSession(context), restoreDisplay(context),
+      restoreDeviceRotation(context), context.tools.close()]),
     sleep(SHUTDOWN_STOP_MS),
   ]);
   context.actionBridge.close();
@@ -2171,6 +2212,8 @@ Options:
   --tools PATH                Override autonom_canvas_tools.py (the panel tools process).
   --autonom PATH              Override scripts/autonom.py for the device log feed.
   --no-auth                   Disable token protection (isolated local use only).
+  --control-idle SECONDS      Hand the device's control lease back after this long without
+                              human input (default: ${DEFAULT_CONTROL_IDLE_S}; 15 to 3600).
 
 Workspace (tabs of 1-4 tiles, devices attached and detached while it runs):
   --workspace NAME            Open the named workspace (default: default).
@@ -2299,7 +2342,12 @@ async function handleRequest(context, request, response) {
     const answer = await handleToolsRoute(context.tools, {
       method: request.method, url, origin,
       readBody: () => readJsonBody(request),
-      refusal: (from) => refusal(context, from),
+      refusal: (from, rule = {}) => refusal(context, from, rule),
+      // A person's leased Tools/Actions op takes the lease first, like other input (6.4).
+      acquire: () => ensureHumanLease(context).then((failure) => {
+        if (!failure) context.lease.lastHumanHttpAt = performance.now();
+        return failure;
+      }),
       request, response, deviceId: context.id,
     });
     if (answer?.handled) return;
@@ -2554,7 +2602,12 @@ function fallbackReason(context) {
 
 async function sendStatus(context, response) {
   const [measured] = await Promise.all([
-    iosStreamDisplay(context) ?? context.actionBridge.call("screen-size", {}, "system"),
+    // A bound session that stopped refuses the measure (contract 4.2); /status still answers,
+    // so the page can show the device as stopped.
+    iosStreamDisplay(context) ?? context.actionBridge.call("screen-size", {}, "system").catch((error) => {
+      if (!error.errorCode) throw error;
+      return { display: null };
+    }),
     freshDisplay(context),
   ]);
   if (measured.display) context.display = measured.display;
@@ -2581,6 +2634,8 @@ async function sendStatus(context, response) {
     scrcpy: scrcpyStatus(context),
     idb: idbStatus(context),
     tools: context.tools.status(),
+    lease: leaseStatus(context),
+    session_stopped: (refreshSession(context), sessionStoppedOf(context)),
     ...(context.server?.mode === "workspace" ? { device: context.server.deviceStatus(context) } : {}),
   });
 }
@@ -3459,6 +3514,8 @@ function stateMessage(context) {
     ...(context.server?.mode === "workspace"
       ? { profile: context.server.profileName(context), focused: context.server.focus?.focus === context.id }
       : {}),
+    // The host control lease and the bound session (contract 6.7).
+    ...(context.lease ? { lease: leaseStatus(context), session_stopped: sessionStoppedOf(context) } : {}),
   });
   // `presets` stays the last field, so the text is what serializing it in place gives.
   return `${fields.slice(0, -1)},"presets":${DISPLAY_PRESETS_JSON}}`;
@@ -3868,8 +3925,9 @@ function openControlClient(context, ws, origin, socket) {
     ws, socket, origin, pointers: new Map(), lifted: new Map(), keys: new Set(), gesture: null,
     scroll: null, journalWaiting: 0, paused: false, socketPaused: false, held: [], heldNext: 0, heldBytes: 0,
     stateStale: false,
-    // iOS: pointers refused while another finger was down (their moves and ups are ignored),
-    // and this connection's input waiting in the iOS input queue.
+    // Pointers whose down was refused (their moves and ups are ignored): on iOS while another
+    // finger was down, on every platform when the lease or the device refused the down; and
+    // this connection's input waiting in the iOS input queue.
     refused: new Set(), iosWaiting: 0,
   };
   context.controlClients.add(client);
@@ -3924,7 +3982,8 @@ function receive(context, client, data, isBinary) {
  * waits for its clipboard ack, which holds the input of every connection.
  */
 function inputPressure(context, client, share) {
-  return context.rotationPending || context.clipboardHold !== null || pastBounds(context, client, share);
+  return context.rotationPending || context.clipboardHold !== null || context.lease?.busy != null ||
+    pastBounds(context, client, share);
 }
 
 function pastBounds(context, client, share) {
@@ -4040,15 +4099,533 @@ function sendControlText(context, client, text) {
   client.ws.send(text);
 }
 
-function refusal(context, origin) {
-  if (context.state.inputPaused) return "Canvas input is paused";
-  if (context.state.controlOwner !== "shared" && context.state.controlOwner !== origin) {
-    return `Canvas control is owned by ${context.state.controlOwner}`;
+class InputError extends Error {}
+
+// ---------------------------------------------------------------------------------------
+// The host control lease (contract 6). The lease file is written only by the bridge's
+// control ops; this Canvas reads it on every admission. A person's first input on a device
+// nobody holds takes the human lease (DEC-013); Take over replaces a live holder; Hand back
+// and the idle timeout release it; a lease lost to another holder or to expiry ends this
+// Canvas's control. Without a lease file every route behaves as before.
+
+// A human page that sent input over HTTP counts as present this long (renewing goes on).
+const LEASE_HTTP_PRESENCE_MS = 30_000;
+// A held lease is released at stop within this long, or left to expire.
+const LEASE_RELEASE_WAIT_MS = 500;
+const LEASE_ERROR_SET = new Set(LEASE_ERROR_CODES);
+
+/** The human lease TTL: 30 s; a test seam (AUTONOM_TEST_MODE=1) may shorten it to 5 s. */
+function humanLeaseTtl() {
+  const raw = env.AUTONOM_CANVAS_HUMAN_TTL_S ?? "";
+  if (env.AUTONOM_TEST_MODE === "1" && /^\d{1,4}$/.test(raw)) {
+    const value = Number(raw);
+    if (value >= 5 && value <= HUMAN_LEASE_TTL_S) return value;
+  }
+  return HUMAN_LEASE_TTL_S;
+}
+
+function createLeaseState(context) {
+  const lease = {
+    cache: createFileCache(leasePath(env, context.options.platform, context.serial)),
+    // The bound session's record, watched while its id is known (6.6).
+    session: null,
+    sessionStatus: "none",
+    view: { state: "none", holder: null, generation: null, expires_at: null, expires_at_ms: null },
+    key: null,
+    held: null,
+    epoch: 0,
+    pollTimer: null,
+    renewing: false,
+    renewedAt: -Infinity,
+    lastHumanInputAt: -Infinity,
+    lastHumanHttpAt: -Infinity,
+    acquiring: null,
+    // A lease op the WebSocket input waits for (an acquire, Take over, Hand back), and the
+    // messages that wait with it, in arrival order.
+    busy: null,
+    waiting: [],
+    releasing: null,
+    changeQueued: false,
+    tookOverFrom: null,
+    endedBy: null,
+  };
+  context.lease = lease;
+  refreshLease(context);
+  lease.pollTimer = setInterval(() => leaseTick(context), LEASE_POLL_MS);
+  lease.pollTimer.unref?.();
+  return lease;
+}
+
+/** This Canvas as a lease holder: `canvas:<port>:<pid>`, label `Canvas <port>`. */
+function holderOf(context) {
+  const port = context.port ?? 0;
+  return { id: `canvas:${port}:${process.pid}`, label: `Canvas ${port}` };
+}
+
+/** The session id this device is bound to: the workspace's link, null on the single-device Canvas. */
+function boundSessionId(context) {
+  if (context.server?.mode !== "workspace") return null;
+  return context.server.registry?.get(context.id)?.session?.session_id ?? null;
+}
+
+/** The extra fields of a bridge or tools request: only those known, so other requests stay as they were. */
+function requestBinding(context) {
+  if (!context?.lease) return {};
+  const extra = {};
+  const sessionId = boundSessionId(context);
+  if (sessionId) extra.session_id = sessionId;
+  const { held } = context.lease;
+  if (held) extra.control = { holder_id: held.holder_id, generation: held.generation };
+  return extra;
+}
+
+function controlIdleMs(context) {
+  const seconds = context.options.controlIdle ?? DEFAULT_CONTROL_IDLE_S;
+  return seconds * 1000;
+}
+
+/**
+ * Read the lease (a stat; the file only when it changed) and update the view. A change of
+ * holder, generation or state bumps the epoch and runs onLeaseChange soon, except a grant
+ * to this Canvas (its own acquire adds rights to input it already admitted).
+ */
+function refreshLease(context) {
+  const lease = context.lease;
+  const { value } = lease.cache.get();
+  const file = leaseFor(value, { platform: context.options.platform, target: context.serial });
+  const state = leaseState(file, Date.now());
+  const holder = state === "held" || state === "expired" ? { ...file.holder } : null;
+  lease.view = {
+    state, holder, generation: file ? file.generation : null,
+    expires_at: holder ? (file.expires_at ?? null) : null,
+    expires_at_ms: holder ? file.expires_at_ms : null,
+    previous_holder: file?.previous_holder ?? null,
+  };
+  const key = `${state}|${holder?.id ?? ""}|${lease.view.generation ?? ""}`;
+  if (key !== lease.key) {
+    const first = lease.key === null;
+    lease.key = key;
+    const own = state === "held" && holder.id === holderOf(context).id;
+    if (!first && !own) {
+      lease.epoch += 1;
+      scheduleLeaseChange(context);
+    }
+  }
+  return lease.view;
+}
+
+/** The bound session's status: "none" (no binding), "live", "stopped", "mismatch" or "missing". */
+function refreshSession(context) {
+  const lease = context.lease;
+  const id = boundSessionId(context);
+  if (!id) {
+    lease.session = null;
+    lease.sessionStatus = "none";
+    return lease.sessionStatus;
+  }
+  if (lease.session?.id !== id) {
+    const path = sessionRecordPath(env, id);
+    lease.session = { id, cache: path ? createFileCache(path) : null };
+  }
+  const record = lease.session.cache ? lease.session.cache.get().value : null;
+  lease.sessionStatus = sessionStatus(record, { platform: context.options.platform, target: context.serial });
+  return lease.sessionStatus;
+}
+
+function sessionStoppedOf(context) {
+  const status = context.lease.sessionStatus;
+  return status === "stopped" || status === "mismatch";
+}
+
+/** Whether this Canvas holds the lease the file names now. */
+function holdsLease(context) {
+  const { held, view } = context.lease;
+  return Boolean(held) && view.state === "held" && view.holder?.id === held.holder_id &&
+    view.generation === held.generation;
+}
+
+/** The `lease` object of /status, state messages, POST /control and /api/devices (6.7). */
+function leaseStatus(context) {
+  const lease = context.lease;
+  const view = refreshLease(context);
+  return {
+    state: view.state,
+    holder: view.holder ? { ...view.holder } : null,
+    generation: view.generation,
+    expires_at: view.expires_at,
+    mine: view.state === "held" && view.holder?.id === holderOf(context).id,
+    took_over_from: lease.tookOverFrom ? { ...lease.tookOverFrom } : null,
+    ended_by: lease.endedBy,
+    idle_s: controlIdleMs(context) / 1000,
+  };
+}
+
+function scheduleLeaseChange(context) {
+  const lease = context.lease;
+  if (lease.changeQueued) return;
+  lease.changeQueued = true;
+  queueMicrotask(() => {
+    lease.changeQueued = false;
+    onLeaseChange(context);
+  });
+}
+
+/**
+ * Another holder, a takeover by someone else, a release or an expiry: a lease this Canvas
+ * held and no longer holds is lost (journaled, every client's held input lifted); clients
+ * refused now let go of what they hold; every client gets the new state.
+ */
+function onLeaseChange(context) {
+  if (context.shuttingDown) return;
+  const lease = context.lease;
+  if (lease.held && !holdsLease(context)) {
+    endHeld(context, "lost");
+    journalLeaseEnd(context, "lost");
+    for (const client of context.controlClients) releaseInput(context, client);
+  } else {
+    for (const client of context.controlClients) {
+      if (refusal(context, client.origin)) releaseInput(context, client);
+    }
+  }
+  broadcastState(context);
+}
+
+/** This Canvas stops holding the lease (lost, released or idle): the local owner is shared again. */
+function endHeld(context, reason) {
+  const lease = context.lease;
+  lease.held = null;
+  lease.tookOverFrom = null;
+  lease.endedBy = reason;
+  lease.renewedAt = -Infinity;
+  context.state.controlOwner = "shared";
+}
+
+/** The journal record of a lease this Canvas lost or released after its idle timeout. */
+function journalLeaseEnd(context, mode) {
+  journal(context, { origin: "human", journalWaiting: 0 }, { kind: "control", mode, owner: "human" });
+}
+
+/** A lease op through the bridge; answers the result or rejects with the bridge error. */
+function leaseCall(context, op, payload) {
+  return context.actionBridge.call(op, payload, "human");
+}
+
+function validGrant(result) {
+  return Boolean(result) && result.acquired === true && Number.isSafeInteger(result.generation);
+}
+
+/** An acquire (or Take over) through the bridge; resolves null on a grant, else the failure. */
+async function acquireLease(context, { takeover }) {
+  const lease = context.lease;
+  const holder = holderOf(context);
+  const payload = { holder_id: holder.id, label: holder.label, kind: "human", ttl_s: humanLeaseTtl(), takeover };
+  const sessionId = boundSessionId(context);
+  if (sessionId) payload.session_id = sessionId;
+  let result;
+  try {
+    result = await leaseCall(context, "control-acquire", payload);
+  } catch (error) {
+    const failure = {
+      status: error.errorCode ? 409 : (error.statusCode ?? 502),
+      code: error.errorCode ?? null,
+      message: `Device control could not be taken: ${error.message}`,
+    };
+    context.state.lastError = `control: ${failure.message}`;
+    return failure;
+  }
+  if (!validGrant(result)) {
+    const failure = { status: 409, code: CONTROL_NOT_HELD, message: "Device control could not be taken: the bridge did not grant the lease" };
+    context.state.lastError = `control: ${failure.message}`;
+    return failure;
+  }
+  lease.held = { holder_id: holder.id, generation: result.generation };
+  lease.endedBy = null;
+  lease.renewedAt = performance.now();
+  if (result.taken_over) lease.tookOverFrom = result.lease?.previous_holder ?? null;
+  else if (!takeover) lease.tookOverFrom = null;
+  lease.cache.reset();
+  refreshLease(context);
+  return null;
+}
+
+/**
+ * The lease before a human input reaches the device (DEC-013): nothing to do while this
+ * Canvas holds it; in Shared state one acquire, which concurrent inputs share and wait for
+ * at most AUTO_ACQUIRE_WAIT_MS; never over a live holder. Resolves null when the input may
+ * go on, else the failure {status, code, message}.
+ */
+async function ensureHumanLease(context) {
+  const lease = context.lease;
+  lease.lastHumanInputAt = performance.now();
+  const view = refreshLease(context);
+  if (holdsLease(context)) return null;
+  const ours = holderOf(context).id;
+  if (view.state === "held" && view.holder?.id !== ours) {
+    return { status: 409, code: CONTROL_HELD, message: `Device control is held by ${describeHolder(view.holder, view.generation)}` };
+  }
+  if (!lease.acquiring) {
+    const acquiring = acquireLease(context, { takeover: false }).then((failure) => {
+      if (!failure) broadcastState(context);
+      return failure;
+    });
+    lease.acquiring = acquiring;
+    acquiring.finally(() => {
+      if (lease.acquiring === acquiring) lease.acquiring = null;
+    }).catch(() => {});
+  }
+  let timer = null;
+  const timedOut = new Promise((resolvePromise) => {
+    timer = setTimeout(() => resolvePromise({
+      status: 409, code: CONTROL_NOT_HELD,
+      message: `Device control could not be taken within ${AUTO_ACQUIRE_WAIT_MS} ms; the input was not sent`,
+    }), AUTO_ACQUIRE_WAIT_MS);
+    timer.unref?.();
+  });
+  const failure = await Promise.race([lease.acquiring, timedOut]);
+  clearTimeout(timer);
+  if (failure) {
+    if (failure.code === CONTROL_NOT_HELD) context.state.lastError = `control: ${failure.message}`;
+    return failure;
   }
   return null;
 }
 
-class InputError extends Error {}
+/** The HTTP error of a lease failure: 409 with its code, or the bridge's own status. */
+function leaseError(failure) {
+  const error = httpError(failure.status ?? 409, failure.message);
+  if (failure.code && LEASE_ERROR_SET.has(failure.code)) error.errorCode = failure.code;
+  return error;
+}
+
+/** A human HTTP input takes the lease first (6.4); other origins never do. */
+async function admitHttpInput(context, origin) {
+  if (origin !== "human") return;
+  const failure = await ensureHumanLease(context);
+  if (failure) throw leaseError(failure);
+  context.lease.lastHumanHttpAt = performance.now();
+}
+
+/** The explicit Take over (human): a grant over any holder, or nothing changes. */
+async function takeOverLease(context) {
+  const failure = await acquireLease(context, { takeover: true });
+  if (failure) throw failure.code ? leaseError(failure) : httpError(failure.status ?? 502, failure.message);
+  const lease = context.lease;
+  lease.epoch += 1;
+  lease.lastHumanInputAt = performance.now();
+}
+
+/** Hand back (or the idle release): the lease is released; a failed release lets it expire. */
+async function handBackLease(context, reason) {
+  const lease = context.lease;
+  const held = lease.held;
+  endHeld(context, reason);
+  lease.epoch += 1;
+  if (!held) return;
+  try {
+    await leaseCall(context, "control-release", { holder_id: held.holder_id, generation: held.generation });
+  } catch (error) {
+    context.state.lastError = `control: the lease was not released (${error.message}); it expires on its own`;
+  }
+  lease.cache.reset();
+  refreshLease(context);
+}
+
+/** At stop: a held lease is released unless the bridge is busy, waiting at most 500 ms. */
+async function releaseLeaseOnClose(context) {
+  const lease = context.lease;
+  const held = lease.held;
+  if (!held) return;
+  lease.held = null;
+  if (context.actionBridge.busy()) return;
+  const releasing = leaseCall(context, "control-release", { holder_id: held.holder_id, generation: held.generation })
+    .catch(() => {});
+  await Promise.race([releasing, sleep(LEASE_RELEASE_WAIT_MS)]);
+}
+
+function humanPresent(context) {
+  for (const client of context.controlClients) if (client.origin === "human") return true;
+  return performance.now() - context.lease.lastHumanHttpAt < LEASE_HTTP_PRESENCE_MS;
+}
+
+/** Renew while a person is here and not idle; a refused renew means the lease is lost. */
+async function renewLease(context) {
+  const lease = context.lease;
+  const held = lease.held;
+  lease.renewing = true;
+  lease.renewedAt = performance.now();
+  try {
+    await leaseCall(context, "control-renew", { holder_id: held.holder_id, generation: held.generation, ttl_s: humanLeaseTtl() });
+  } catch (error) {
+    if (lease.held === held && LEASE_ERROR_SET.has(error.errorCode)) {
+      lease.cache.reset();
+      refreshLease(context);
+      if (lease.held === held) {
+        endHeld(context, "lost");
+        lease.epoch += 1;
+        journalLeaseEnd(context, "lost");
+        for (const client of context.controlClients) releaseInput(context, client);
+        broadcastState(context);
+      }
+    } else {
+      context.state.lastError = `control: the lease was not renewed (${error.message})`;
+    }
+  } finally {
+    lease.renewing = false;
+  }
+}
+
+/** The idle release (DEC-014): the lease goes back with a `control` record of mode idle. */
+async function idleRelease(context) {
+  const lease = context.lease;
+  lease.releasing = handBackLease(context, "idle");
+  journalLeaseEnd(context, "idle");
+  for (const client of context.controlClients) {
+    if (refusal(context, client.origin)) releaseInput(context, client);
+  }
+  broadcastState(context);
+  try {
+    await lease.releasing;
+  } finally {
+    lease.releasing = null;
+    broadcastState(context);
+  }
+}
+
+/** Every LEASE_POLL_MS while the device has clients or a held lease: changes, renew, idle. */
+function leaseTick(context) {
+  if (context.shuttingDown) return;
+  const lease = context.lease;
+  if (!lease.held && !context.videoClients.size && !context.controlClients.size) return;
+  const before = context.lease.sessionStatus;
+  refreshLease(context);
+  if (refreshSession(context) !== before) broadcastState(context);
+  if (!lease.held || lease.renewing || lease.busy || lease.acquiring || lease.releasing) return;
+  const now = performance.now();
+  if (now - lease.lastHumanInputAt >= controlIdleMs(context)) {
+    idleRelease(context).catch(() => {});
+    return;
+  }
+  const every = Math.min(LEASE_RENEW_MS, (humanLeaseTtl() * 1000) / 3);
+  if (humanPresent(context) && now - lease.renewedAt >= every) renewLease(context).catch(() => {});
+}
+
+/**
+ * The Canvas rule for one input (6.3): null when it may go on, else {message, code}. Paused
+ * input and the local owner answer as before (no code); a live lease of another holder
+ * (only for leased ops) and a bound session that stopped answer with their code.
+ */
+function refusal(context, origin, { leased = true } = {}) {
+  if (context.state.inputPaused) return { message: "Canvas input is paused", code: null };
+  if (context.lease) {
+    const view = refreshLease(context);
+    if (leased && view.state === "held" && view.holder?.id !== holderOf(context).id) {
+      return { message: `Device control is held by ${describeHolder(view.holder, view.generation)}`, code: CONTROL_HELD };
+    }
+    const session = refreshSession(context);
+    if (session === "stopped" || session === "mismatch") {
+      const id = context.lease.session?.id;
+      return session === "stopped"
+        ? { message: `The Autonom session ${id} of this device has stopped`, code: "session_stopped" }
+        : { message: `The Autonom session ${id} belongs to another device`, code: "session_target_mismatch" };
+    }
+  }
+  if (context.state.controlOwner !== "shared" && context.state.controlOwner !== origin) {
+    return { message: `Canvas control is owned by ${context.state.controlOwner}`, code: null };
+  }
+  return null;
+}
+
+/** An InputError for a refusal, carrying its code when it has one. */
+function refusalError(refused, statusCode = null) {
+  const error = statusCode === null ? new InputError(refused.message) : inputError(statusCode, refused.message);
+  if (refused.code) error.errorCode = refused.code;
+  return error;
+}
+
+/**
+ * Whether the device path is ready for `message`: a display change goes through adb, needs
+ * no session and exists on Android only; every other input needs the connected scrcpy or
+ * idb session.
+ */
+function inputReachesDevice(context, message) {
+  if (message.t === "display") return context.options.platform === "android";
+  return Boolean(context.session?.connected);
+}
+
+/** Whether a WebSocket message starts human input that needs the lease (6.4). */
+function startsInput(message) {
+  switch (message.t) {
+    case "touch":
+    case "key":
+      return message.a === "down";
+    case "scroll":
+    case "text":
+    case "paste":
+    case "display":
+      return true;
+    case "system":
+      return message.op !== "keyframe";
+    default:
+      return false;
+  }
+}
+
+function isInputMessage(message) {
+  return ["touch", "key", "scroll", "text", "paste", "display", "system"].includes(message.t) &&
+    !(message.t === "system" && message.op === "keyframe");
+}
+
+/**
+ * A WebSocket message waits for a lease op (`work`, resolving null or a failure): it and the
+ * messages read after it (held by inputPressure in arrival order) run once the op settled.
+ */
+function waitForLease(context, client, message, work) {
+  const lease = context.lease;
+  lease.waiting.push({ client, message, trigger: true });
+  const busy = Promise.resolve().then(work).then(
+    (failure) => failure ?? null,
+    (error) => ({ status: error.statusCode ?? 502, code: error.errorCode ?? null, message: error.message }));
+  lease.busy = busy;
+  busy.then((failure) => {
+    if (lease.busy === busy) lease.busy = null;
+    const waiting = lease.waiting;
+    lease.waiting = [];
+    for (const item of waiting) {
+      if (item.client.ws.readyState !== READY_STATE.OPEN) continue;
+      if (!item.trigger) {
+        // Read while the op ran by a path that does not wait: handled now, in order.
+        runControlMessage(context, item.client, item.message);
+        continue;
+      }
+      if (failure) {
+        refuseDown(item.client, item.message);
+        const forType = item.message.t === "system" && item.message.op === "rotate" ? "rotate" : item.message.t;
+        const answer = { t: "error", message: failure.message, for: forType };
+        if (failure.code) answer.code = failure.code;
+        reply(context, item.client, answer);
+        continue;
+      }
+      runControlMessage(context, item.client, item.message, { leaseDone: true });
+    }
+    resumeAllReading(context);
+  });
+}
+
+/** A refused touch down answers once: the moves and the up of that pointer are dropped. */
+function refuseDown(client, message) {
+  if (message.t === "touch" && message.a === "down" && !client.pointers.has(message.id)) refusePointer(client, message.id);
+}
+
+/** A move or up of a pointer whose down was refused, and that is not down now: dropped. */
+function dropsRefusedPointer(context, client, message) {
+  if (message.t !== "touch" || message.a === "down" || !client.refused.has(message.id)) return false;
+  const finger = context.iosFinger;
+  const iosLive = Boolean(finger) && finger.client === client && !finger.wheel && iosFingerIds(finger).includes(message.id);
+  if (client.pointers.has(message.id) || iosLive) return false;
+  if (message.a !== "move") client.refused.delete(message.id);
+  return true;
+}
+
 
 /**
  * The shared parser knows device input only; a display change is this server's own
@@ -4071,24 +4648,59 @@ function handleControlMessage(context, client, raw) {
     reply(context, client, { t: "error", message: error.message, for: error.for ?? null });
     return;
   }
+  runControlMessage(context, client, message);
+}
+
+/**
+ * One parsed control message. A person's first input on a device nobody holds, and a
+ * person's Take over or Hand back, first wait for their lease op (waitForLease); the
+ * message runs once it settled, `leaseDone`.
+ */
+function runControlMessage(context, client, message, { leaseDone = false } = {}) {
+  const lease = context.lease;
+  if (client.origin === "human" && isInputMessage(message)) lease.lastHumanInputAt = performance.now();
+  if (!leaseDone && lease.busy) {
+    lease.waiting.push({ client, message });
+    return;
+  }
+  if (!leaseDone && client.origin === "human") {
+    // Only input the device path would admit takes the lease: one refused because the stream
+    // is not ready yet (requireSession) is answered below and leaves the lease alone (DEC-013).
+    if (startsInput(message) && !holdsLease(context) && !refusal(context, client.origin) &&
+      inputReachesDevice(context, message)) {
+      waitForLease(context, client, message, () => ensureHumanLease(context));
+      return;
+    }
+    if (message.t === "control" && (message.mode === "takeover" || (message.mode === "release" && lease.held))) {
+      waitForLease(context, client, message, async () => {
+        await applyControl(context, message.mode, client.origin);
+        return null;
+      });
+      return;
+    }
+  }
   try {
-    dispatchControl(context, client, message);
+    dispatchControl(context, client, message, { applied: leaseDone && message.t === "control" });
   } catch (error) {
     // Every refusal is answered on the connection; none may take the Canvas down.
     if (!(error instanceof InputError)) context.state.lastError = error.message;
+    refuseDown(client, message);
     // A refused Rotate answers as one, so the page's Rotate button is enabled again.
     const answersFor = message.t === "system" && message.op === "rotate" ? "rotate" : message.t;
-    reply(context, client, { t: "error", message: error.message, for: answersFor });
+    const answer = { t: "error", message: error.message, for: answersFor };
+    if (error.errorCode) answer.code = error.errorCode;
+    reply(context, client, answer);
   }
 }
 
-function dispatchControl(context, client, message) {
+function dispatchControl(context, client, message, { applied = false } = {}) {
   switch (message.t) {
     case "ping":
       reply(context, client, { t: "pong", ts: message.ts });
       return;
     case "control":
-      applyControl(context, message.mode, client.origin);
+      // A person's Take over or Hand back was applied before (waitForLease).
+      if (!applied) applyLocalControl(context, message.mode, client.origin);
       journal(context, client, {
         kind: "control", mode: message.mode, owner: context.state.controlOwner,
       });
@@ -4110,9 +4722,11 @@ function dispatchControl(context, client, message) {
     default:
       break;
   }
+  // The refusal went with the down; that pointer's moves and up need no answer.
+  if (dropsRefusedPointer(context, client, message)) return;
   // Handoff is checked per message, so a takeover stops a gesture already in progress.
   const refused = refusal(context, client.origin);
-  if (refused) throw new InputError(refused);
+  if (refused) throw refusalError(refused);
   if (message.t === "display") {
     // `wm` goes through adb, not the device server, so no session is needed.
     finishScroll(context, client);
@@ -4314,6 +4928,7 @@ function touch(context, client, message) {
   const point = toVideoPixels(message.x, message.y, size);
   if (message.a === "down") {
     client.lifted.delete(message.id);
+    client.refused.delete(message.id);
     if (client.pointers.has(message.id)) throw new InputError(`Pointer ${message.id} is already down`);
     const deviceId = allocateDevicePointer(context);
     if (deviceId === null) throw new InputError(`At most ${MAX_POINTERS} pointers can be down`);
@@ -5050,14 +5665,15 @@ async function runIosText(context, item) {
   const { client, payload } = item;
   try {
     const refused = refusal(context, client.origin);
-    if (refused) throw new InputError(refused);
+    if (refused) throw refusalError(refused);
     await context.enqueueInput(() => {
       const late = refusal(context, client.origin);
-      if (late) throw new InputError(late);
+      if (late) throw refusalError(late);
       return context.actionBridge.call("text", payload, client.origin);
     });
   } catch (error) {
-    reply(context, client, { t: "error", message: error.message, for: "text" });
+    reply(context, client, { t: "error", message: error.message, for: "text",
+      ...(error.errorCode ? { code: error.errorCode } : {}) });
   }
 }
 
@@ -5123,7 +5739,7 @@ function iosTouch(context, client, message) {
         iosStartPinch(context, client, finger, message);
         return;
       }
-      iosRefusePointer(client, id);
+      refusePointer(client, id);
       throw new InputError(IOS_ONE_FINGER);
     }
     const point = iosPoint(context, message.x, message.y);
@@ -5183,7 +5799,7 @@ function iosFingerIds(finger) {
 }
 
 /** A refused pointer: its moves and up are ignored without an answer. */
-function iosRefusePointer(client, id) {
+function refusePointer(client, id) {
   client.refused.add(id);
   if (client.refused.size > LIFTED_POINTERS_MAX) client.refused.delete(client.refused.values().next().value);
 }
@@ -5223,7 +5839,7 @@ function iosPinchPointer(context, client, finger, message) {
   }
   context.iosFinger = null;
   // The other pointer is done with the pinch: its moves and up need no answer.
-  for (const other of finger.pinch.pointers.keys()) if (other !== message.id) iosRefusePointer(client, other);
+  for (const other of finger.pinch.pointers.keys()) if (other !== message.id) refusePointer(client, other);
   let pinch;
   try {
     pinch = iosPinchEvent(context, finger.pinch);
@@ -5505,24 +6121,28 @@ async function runIosPaste(context, item) {
   const typed = !setOnly;
   try {
     const refused = refusal(context, client.origin);
-    if (refused) throw new InputError(refused);
+    if (refused) throw refusalError(refused);
     await context.enqueueInput(async () => {
       const late = refusal(context, client.origin);
-      if (late) throw new InputError(late);
+      if (late) throw refusalError(late);
       await runSimctlClipboard(context, "pbcopy", text).catch((error) => {
         context.state.lastError = `clipboard: ${error.message}`;
         throw new InputError(`The Simulator clipboard could not be set: ${error.message}`);
       });
       if (!typed) return;
       const lateType = refusal(context, client.origin);
-      if (lateType) throw new InputError(`The Simulator clipboard was set, but the text was not typed: ${lateType}`);
+      if (lateType) {
+        throw refusalError({ ...lateType,
+          message: `The Simulator clipboard was set, but the text was not typed: ${lateType.message}` });
+      }
       // The bridge types it and journals it as this paste, with its length only.
       await context.actionBridge.call("text", { text, sensitive: true, transport: "idb", paste: true }, client.origin);
     });
     if (!typed) journalNow(context, client, { kind: "paste", text_len: codePoints(text) });
     reply(context, client, typed ? { t: "paste", typed: true } : { t: "paste", typed: false, message: setOnly });
   } catch (error) {
-    reply(context, client, { t: "error", message: error.message, for: "paste" });
+    reply(context, client, { t: "error", message: error.message, for: "paste",
+      ...(error.errorCode ? { code: error.errorCode } : {}) });
   }
 }
 
@@ -5582,8 +6202,19 @@ function iosOrphanInput(context, client) {
   finishGesture(context, client);
 }
 
-/** Pause/resume/takeover/release for HTTP and WebSocket alike. */
-function applyControl(context, mode, origin) {
+/**
+ * Pause/resume/takeover/release for HTTP and WebSocket alike. A person's Take over first
+ * takes the host lease over any holder (nothing changes when that fails); a person's
+ * release while this Canvas holds the lease hands it back (6.4).
+ */
+async function applyControl(context, mode, origin) {
+  if (origin === "human" && mode === "takeover") await takeOverLease(context);
+  else if (origin === "human" && mode === "release" && context.lease.held) await handBackLease(context, "released");
+  applyLocalControl(context, mode, origin);
+}
+
+/** The local owner rule of before (6.3 rule 5), and the lifting of input it refuses now. */
+function applyLocalControl(context, mode, origin) {
   if (mode === "pause") context.state.inputPaused = true;
   else if (mode === "resume") context.state.inputPaused = false;
   else if (mode === "takeover") context.state.controlOwner = origin;
@@ -5595,9 +6226,10 @@ function applyControl(context, mode, origin) {
   broadcastState(context);
 }
 
-function inputError(statusCode, message) {
+function inputError(statusCode, message, code = null) {
   const error = new InputError(message);
   error.statusCode = statusCode;
+  if (code) error.errorCode = code;
   return error;
 }
 
@@ -5624,6 +6256,7 @@ function replyDisplayError(context, client, error) {
   if (!(error instanceof InputError)) context.state.lastError = error.message;
   const message = { t: "error", message: error.message, for: "display" };
   if (error.superseded) message.superseded = true;
+  if (error.errorCode) message.code = error.errorCode;
   reply(context, client, message);
 }
 
@@ -5723,7 +6356,7 @@ function assertDisplayGoesOn(context, origin, client) {
   }
   // Control may have changed hands while this change waited for the ones before it.
   const refused = refusal(context, origin);
-  if (refused) throw inputError(409, refused);
+  if (refused) throw refusalError(refused, 409);
 }
 
 /** Lift every held finger and key before the display changes, as a takeover does. */
@@ -5977,7 +6610,8 @@ async function journalRestore(context, record) {
   }
   let bridge = null;
   try {
-    bridge = createActionBridge(context.options, context.adbPath, context.serial);
+    bridge = createActionBridge(context.options, context.adbPath, context.serial,
+      { binding: () => requestBinding(context) });
     context.restoreBridge = bridge;
     await new Promise((resolvePromise, reject) => {
       // A bridge that cannot start answers nothing; its error must not end the stop.
@@ -6089,7 +6723,18 @@ async function journalPayload(context, record) {
 
 function assertControl(context, origin) {
   const refused = refusal(context, origin);
-  if (refused) throw httpError(409, refused);
+  if (!refused) return;
+  // Paused input and the local owner answer as before; the lease and the session with a code.
+  const error = httpError(409, refused.message);
+  if (refused.code) error.errorCode = refused.code;
+  throw error;
+}
+
+/** An HTTP input answer keeps its body of before: the bridge's lease attribution is left out (6.5). */
+function inputAnswer(result) {
+  if (!result || typeof result !== "object" || !("control" in result)) return result;
+  const { control: _control, ...rest } = result;
+  return rest;
 }
 
 /**
@@ -6127,12 +6772,13 @@ async function tap(context, response, body, origin) {
   const x = normalizeCoordinate(body.x, "x");
   const y = normalizeCoordinate(body.y, "y");
   const sent = sentDisplaySize(body);
+  await admitHttpInput(context, origin);
   // Scaled when its turn comes, so after any display change queued before it.
   const result = await context.enqueueInput(() => {
     const [[tx, ty]] = onCurrentDisplay(context, sent, [[x, y]]);
     return context.actionBridge.call("tap", { x: tx, y: ty }, origin);
   });
-  sendJson(response, 200, result);
+  sendJson(response, 200, inputAnswer(result));
 }
 
 async function swipe(context, response, body, origin) {
@@ -6143,20 +6789,22 @@ async function swipe(context, response, body, origin) {
   const y2 = normalizeCoordinate(body.y2, "y2");
   const duration = Math.min(5000, Math.max(1, normalizeCoordinate(body.duration ?? 250, "duration")));
   const sent = sentDisplaySize(body);
+  await admitHttpInput(context, origin);
   const result = await context.enqueueInput(() => {
     const [[sx1, sy1], [sx2, sy2]] = onCurrentDisplay(context, sent, [[x1, y1], [x2, y2]]);
     return context.actionBridge.call("swipe", { x1: sx1, y1: sy1, x2: sx2, y2: sy2, duration }, origin);
   });
-  sendJson(response, 200, result);
+  sendJson(response, 200, inputAnswer(result));
 }
 
 async function key(context, response, body, origin) {
   assertControl(context, origin);
   const value = String(body.key ?? "");
   if (!isSafeKeyCode(value)) throw httpError(400, "Unsupported key code");
+  await admitHttpInput(context, origin);
   const result = await context.enqueueInput(
     () => context.actionBridge.call("key", { key: value }, origin));
-  sendJson(response, 200, result);
+  sendJson(response, 200, inputAnswer(result));
 }
 
 async function text(context, response, body, origin) {
@@ -6166,21 +6814,24 @@ async function text(context, response, body, origin) {
   } catch (error) {
     throw httpError(400, error.message);
   }
+  await admitHttpInput(context, origin);
   const result = await context.enqueueInput(() => context.actionBridge.call(
     "text", { text: String(body.text ?? ""), sensitive: Boolean(body.sensitive) }, origin));
-  sendJson(response, 200, result);
+  sendJson(response, 200, inputAnswer(result));
 }
 
 async function control(context, response, body, origin) {
-  applyControl(context, String(body.mode ?? ""), origin);
+  await applyControl(context, String(body.mode ?? ""), origin);
   sendJson(response, 200, { ok: true, control_owner: context.state.controlOwner,
-    input_paused: context.state.inputPaused });
+    input_paused: context.state.inputPaused, lease: leaseStatus(context),
+    session_stopped: sessionStoppedOf(context) });
 }
 
 async function setDisplay(context, response, body, origin) {
   assertDisplayPlatform(context);
   assertControl(context, origin);
   const preset = displayPreset(body?.preset);
+  await admitHttpInput(context, origin);
   let display;
   try {
     display = await requestDisplay(context, preset, origin);
@@ -6193,7 +6844,9 @@ async function setDisplay(context, response, body, origin) {
 }
 
 /** The panel tools of this Canvas (canvas-tools-server.mjs), started with the Canvas. */
-function createToolsFor(options, adbPath, serial, { deviceId = null, deviceName = null, commandLog = null } = {}) {
+function createToolsFor(options, adbPath, serial, {
+  deviceId = null, deviceName = null, commandLog = null, binding = null,
+} = {}) {
   const childEnv = { ...env };
   if (options.idb) childEnv.AUTONOM_IDB = options.idb;
   return createCanvasTools({
@@ -6209,6 +6862,7 @@ function createToolsFor(options, adbPath, serial, { deviceId = null, deviceName 
     deviceId,
     deviceName,
     commandLog,
+    binding,
   });
 }
 
@@ -6217,8 +6871,8 @@ function createToolsFor(options, adbPath, serial, { deviceId = null, deviceName 
  * after 1 s, doubling to 30 s, reset once one ran 60 s; calls meanwhile reject 502 as for a
  * bridge that is gone. After 10 failed restarts `onFailed` marks the device failed.
  */
-function createRestartingBridge(options, adbPath, serial, { onFailed = () => {} } = {}) {
-  let current = createActionBridge(options, adbPath, serial);
+function createRestartingBridge(options, adbPath, serial, { onFailed = () => {}, binding = null } = {}) {
+  let current = createActionBridge(options, adbPath, serial, { binding });
   let closed = false;
   let delay = BRIDGE_RESTART_MIN_MS;
   let failures = 0;
@@ -6239,7 +6893,7 @@ function createRestartingBridge(options, adbPath, serial, { onFailed = () => {} 
       timer = setTimeout(() => {
         timer = null;
         if (closed) return;
-        current = createActionBridge(options, adbPath, serial);
+        current = createActionBridge(options, adbPath, serial, { binding });
         startedAt = performance.now();
         watch(current);
       }, delay);
@@ -6261,7 +6915,12 @@ function createRestartingBridge(options, adbPath, serial, { onFailed = () => {} 
   };
 }
 
-function createActionBridge(options, adbPath, serial) {
+/**
+ * The persistent action bridge of one device. `binding()` adds the request fields of the
+ * device's session binding and lease claim (contract 6.5); a lease or session refusal
+ * rejects with HTTP 409 and its `errorCode`, any other failure with 502 as before.
+ */
+function createActionBridge(options, adbPath, serial, { binding = null } = {}) {
   const python = options.python ?? env.PYTHON ?? "python3";
   const bridgePath = options.bridge ?? resolve(
     import.meta.dirname, "../../../../../scripts/autonom_canvas_bridge.py");
@@ -6280,8 +6939,14 @@ function createActionBridge(options, adbPath, serial) {
     const waiter = pending.get(message.id);
     if (!waiter) return;
     pending.delete(message.id);
-    if (message.ok) waiter.resolve(message.result);
-    else waiter.reject(httpError(502, message.error ?? "Canvas action failed"));
+    if (message.ok) {
+      waiter.resolve(message.result);
+      return;
+    }
+    const leaseRefusal = LEASE_ERROR_SET.has(message.error_code);
+    const error = httpError(leaseRefusal ? 409 : 502, message.error ?? "Canvas action failed");
+    if (leaseRefusal) error.errorCode = message.error_code;
+    waiter.reject(error);
   });
   child.on("exit", (code) => {
     for (const waiter of pending.values()) {
@@ -6297,9 +6962,10 @@ function createActionBridge(options, adbPath, serial) {
         return Promise.reject(httpError(502, `Canvas action bridge exited ${child.exitCode}: ${stderr}`));
       }
       const id = ++nextId;
+      const extra = binding ? binding() : {};
       return new Promise((resolvePromise, reject) => {
         pending.set(id, { op, resolve: resolvePromise, reject });
-        child.stdin.write(`${JSON.stringify({ id, op, payload, origin })}\n`);
+        child.stdin.write(`${JSON.stringify({ id, op, payload, origin, ...extra })}\n`);
       });
     },
     /** Whether a call other than a journal record waits for its answer: input can take seconds. */
@@ -6809,7 +7475,7 @@ const sizeOptions=[...document.querySelectorAll("[data-preset]")];
 const inputControls=[...document.querySelectorAll("[data-system],[data-code],[data-key]"),textInput,sendButton];
 const ctx=video.getContext("2d");
 let csrf=null,logicalDisplay=null,reconnectTimer=null,pointer=null,displayBusy=false,refocusPicker=false,menuOpen=false,noteAt=0,frameRatio=0,rotation=0;
-const view={transport:null,mode:null,reason:"",status:null,owner:"shared",paused:false,session:"idle",clients:null,width:0,height:0,note:"",rtt:null,preset:null,density:null,clipboard:false,rotateBusy:false};
+const view={transport:null,mode:null,reason:"",status:null,owner:"shared",paused:false,session:"idle",clients:null,width:0,height:0,note:"",rtt:null,preset:null,density:null,clipboard:false,rotateBusy:false,lease:null,sessionStopped:false};
 const stats={decoder:"none",codec:null,framesDecoded:0,framesRendered:0,framesDropped:0,packets:0,bytes:0,errors:0,renderTimes:[],lastFrameAt:0};
 let videoSocket=null,controlSocket=null,decoder=null,config=null,waitingKey=true,drawScheduled=false,configuring=false,pendingChunks=[];
 const MAX_QUEUED_FRAMES=2,frameQueue=[];
@@ -6869,11 +7535,15 @@ function connectControl(){if(controlSocket||!fastActive())return;const socket=ne
 function closeControlSocket(){const socket=controlSocket;controlSocket=null;if(socket)socket.close()}
 function onControlMessage(message){if(message.t==="state")applyState(message);else if(message.t==="display")onDisplay(message.display);else if(message.t==="rotation"){view.rotateBusy=false;syncControls();note(message.legacy?"Rotation requested through scrcpy":"Device rotated")}else if(message.t==="error"){stats.errors+=1;note(message.message);if(message.for==="rotate"){view.rotateBusy=false;syncControls()}if(message.for==="display"){displayBusy=false;syncPicker()}}else if(message.t==="clipboard"){if(typeof message.text!=="string"){note("the device clipboard has no text");return}textInput.value=message.text;if(navigator.clipboard&&navigator.clipboard.writeText)navigator.clipboard.writeText(message.text).catch(()=>{});note("device clipboard copied")}else if(message.t==="paste"){if(message.message)note(message.message)}else if(message.t==="pong"){view.rtt=Math.round(performance.now()-message.ts)}}
 function sendControl(message){if(!controlSocket||controlSocket.readyState!==1)return false;controlSocket.send(JSON.stringify(message));return true}
-function applyState(message){view.owner=message.owner;view.paused=message.paused;view.session=message.session;view.clients=message.clients;if("clipboard" in message){view.clipboard=message.clipboard===true;if(iosFast())applyHint()}if("preset" in message){view.preset=message.preset;view.density=message.density}syncPicker();if("rotation" in message)setRotation(message.rotation);if(view.mode==="webcodecs"&&message.width&&message.height)setVideoSize(message.width,message.height);if(message.transport&&message.transport!==view.transport){view.transport=message.transport;applyTransport()}}
+function applyLease(data){if("lease" in data)view.lease=data.lease&&typeof data.lease==="object"?data.lease:null;if("session_stopped" in data)view.sessionStopped=data.session_stopped===true}
+function applyState(message){view.owner=message.owner;view.paused=message.paused;view.session=message.session;view.clients=message.clients;applyLease(message);if("clipboard" in message){view.clipboard=message.clipboard===true;if(iosFast())applyHint()}if("preset" in message){view.preset=message.preset;view.density=message.density}syncPicker();if("rotation" in message)setRotation(message.rotation);if(view.mode==="webcodecs"&&message.width&&message.height)setVideoSize(message.width,message.height);if(message.transport&&message.transport!==view.transport){view.transport=message.transport;applyTransport()}}
 function applyHint(){setText(ui.hint,iosFast()?(view.clipboard?"Plain ASCII up to 300 bytes is typed into the Simulator; longer or other text is set on its clipboard: touch and hold, then Paste.":"Typed into the Simulator, up to 300 bytes at a time."):scrcpyActive()?"Any language. Longer text is pasted through the device clipboard.":"Letters, digits and punctuation of plain ASCII on this transport.")}
 function applyTransport(){textInput.placeholder=fastActive()?"Text to type":"ASCII text to type";applyHint();for(const button of document.querySelectorAll("[data-scrcpy]"))button.hidden=!scrcpyActive();for(const button of document.querySelectorAll("[data-idb]"))button.hidden=!iosFast();if(fastActive()){connectControl();if(!view.mode){if(typeof VideoDecoder==="function"&&typeof EncodedVideoChunk==="function")startWebCodecs();else startMultipart("VideoDecoder is not available in this browser")}}else{closeControlSocket();if(view.mode!=="multipart")startMultipart("")}}
 // Size picker (Android): the preset in effect is selected; a choice goes the way other input goes.
-function canSendInput(){return !view.paused&&(view.owner==="shared"||view.owner==="human")}
+function leaseMine(){return Boolean(view.lease&&view.lease.mine)}
+function foreignHeld(){const lease=view.lease;return Boolean(lease&&lease.state==="held"&&!lease.mine)}
+function idleText(seconds){const value=Number(seconds)||0;return value%60===0?value/60+" min":value+" s"}
+function canSendInput(){return !view.paused&&(view.owner==="shared"||view.owner==="human")&&!foreignHeld()&&!view.sessionStopped}
 // Called every render too: nothing already shown is set again, so an open menu stays as it is.
 // A button disabled while focused drops the focus to the page; when a change chosen from it
 // is answered and the button is enabled again, the focus comes back unless it moved on.
@@ -6902,9 +7572,11 @@ if(sizePicker){
   document.addEventListener("pointerdown",event=>{if(menuOpen&&!sizeMenu.contains(event.target)&&!sizePicker.contains(event.target))closeMenu(false)});
 }
 // Controls that cannot act look and are disabled (PAGE-004); handoff goes the way input goes.
-function syncControls(){const ready=Boolean(view.status)&&canSendInput(),owner=OWNERS[view.owner]||[String(view.owner),"holds control"];for(const control of inputControls){const disabled=!ready||(control.dataset.system==="rotate"&&view.rotateBusy);if(control.disabled!==disabled)control.disabled=disabled}setText(ui.ownerName,owner[0]);setText(ui.ownerDetail,"· "+(view.paused?"input is paused":owner[1]));setText(ui.chip,owner[0]+(view.paused?" · Paused":""));setState(ui.ownerDot,ready?"live":"warn");setText(ui.take,view.owner==="human"?"Release":"Take control");setText(ui.pause,view.paused?"Resume input":"Pause input");for(const button of [ui.take,ui.pause])if(button.disabled===Boolean(view.status))button.disabled=!view.status}
-function setControl(mode){if(fastActive()&&sendControl({t:"control",mode}))return;post("/control",{mode}).then(result=>{view.owner=result.control_owner;view.paused=result.input_paused;syncPicker()}).catch(error=>note(error.message))}
-ui.take.addEventListener("click",()=>setControl(view.owner==="human"?"release":"takeover"));
+function leaseOwner(){const lease=view.lease,owner=OWNERS[view.owner]||[String(view.owner),"holds control"];if(view.sessionStopped)return["Session stopped","this device's Autonom session has stopped"];if(!lease)return owner;if(foreignHeld()){const holder=lease.holder||{};return[(holder.kind==="agent"?"Agent":"Someone else")+" '"+(holder.label||"")+"' has control","Take over to use the screen"]}if(leaseMine())return["You have control","Released after "+idleText(lease.idle_s)+" idle"];if(lease.ended_by==="idle")return[owner[0],"your control ended after "+idleText(lease.idle_s)+" idle"];if(lease.ended_by==="lost")return[owner[0],"control moved to "+(lease.holder&&lease.holder.label?lease.holder.label:"another holder")];return owner}
+function takeLabel(){if(foreignHeld())return"Take over";if(leaseMine())return view.lease.took_over_from?"Hand back":"Release";return view.owner==="human"?"Release":"Take control"}
+function syncControls(){const ready=Boolean(view.status)&&canSendInput(),owner=leaseOwner();for(const control of inputControls){const disabled=!ready||(control.dataset.system==="rotate"&&view.rotateBusy);if(control.disabled!==disabled)control.disabled=disabled}setText(ui.ownerName,owner[0]);setText(ui.ownerDetail,"· "+(view.paused?"input is paused":owner[1]));setText(ui.chip,owner[0]+(view.paused?" · Paused":""));setState(ui.ownerDot,ready?"live":"warn");setText(ui.take,takeLabel());setText(ui.pause,view.paused?"Resume input":"Pause input");for(const button of [ui.take,ui.pause])if(button.disabled===Boolean(view.status))button.disabled=!view.status}
+function setControl(mode){if(fastActive()&&sendControl({t:"control",mode}))return;post("/control",{mode}).then(result=>{view.owner=result.control_owner;view.paused=result.input_paused;applyLease(result);syncPicker()}).catch(error=>note(error.message))}
+ui.take.addEventListener("click",()=>setControl(foreignHeld()?"takeover":(leaseMine()||view.owner==="human")?"release":"takeover"));
 ui.pause.addEventListener("click",()=>setControl(view.paused?"resume":"pause"));
 ui.inspector.addEventListener("click",()=>{const hidden=document.body.classList.toggle("no-inspector");ui.inspector.setAttribute("aria-pressed",String(!hidden));ui.inspector.title=hidden?"Show inspector":"Hide inspector"});
 // iOS Safari shows :active press feedback only while the document has a touch listener.
@@ -6918,7 +7590,7 @@ function mirrorId(id){return -1000-id}
 function sendTouch(action,id,at,pinch,p){const mirror=()=>sendControl({t:"touch",a:action,id:mirrorId(id),x:1-at.x,y:1-at.y,p});if(pinch&&iosFast())mirror();sendControl({t:"touch",a:action,id,x:at.x,y:at.y,p});if(pinch&&!iosFast())mirror()}
 // iOS takes two fingers at most, sent as one pinch when either lifts.
 function iosFingers(){let count=0;for(const active of activePointers.values())count+=active.pinch?2:1;return count}
-function onPointerDown(event){if(!fastActive()){legacyPointerDown(event);return}if(event.pointerType==="mouse"&&event.button!==0)return;const at=normalized(event,false);if(!at)return;event.preventDefault();const pinch=event.pointerType==="mouse"&&(event.ctrlKey||event.altKey);if(iosFast()&&iosFingers()+(pinch?2:1)>2){note("the iOS Simulator takes two fingers at most, sent as one pinch when one lifts");return}surface().focus();surface().setPointerCapture(event.pointerId);activePointers.set(event.pointerId,{pinch});sendTouch("down",event.pointerId,at,pinch,pressure(event))}
+function onPointerDown(event){if(foreignHeld()){note("Take over to use the screen");return}if(!fastActive()){legacyPointerDown(event);return}if(event.pointerType==="mouse"&&event.button!==0)return;const at=normalized(event,false);if(!at)return;event.preventDefault();const pinch=event.pointerType==="mouse"&&(event.ctrlKey||event.altKey);if(iosFast()&&iosFingers()+(pinch?2:1)>2){note("the iOS Simulator takes two fingers at most, sent as one pinch when one lifts");return}surface().focus();surface().setPointerCapture(event.pointerId);activePointers.set(event.pointerId,{pinch});sendTouch("down",event.pointerId,at,pinch,pressure(event))}
 function onPointerMove(event){const active=activePointers.get(event.pointerId);if(!active)return;const at=normalized(event,true);if(at)sendTouch("move",event.pointerId,at,active.pinch,pressure(event))}
 function onPointerEnd(event,action){const active=activePointers.get(event.pointerId);if(!active)return;activePointers.delete(event.pointerId);const at=normalized(event,true)||{x:0.5,y:0.5};sendTouch(action,event.pointerId,at,active.pinch,0)}
 function legacyPointerDown(event){const p=point(event);if(!p)return;image.setPointerCapture(event.pointerId);pointer={...p,time:performance.now(),id:event.pointerId}}
@@ -6960,7 +7632,7 @@ function displayText(){const display=logicalDisplay||{},size=sizeText(display.wi
 function liveState(){if(!view.status)return"idle";if(view.paused)return"warn";if(view.mode==="webcodecs")return view.session==="streaming"&&stats.framesRendered?"live":"idle";return view.mode==="multipart"&&image.naturalWidth?"live":"idle"}
 function captionText(){if(view.mode==="webcodecs")return stats.renderTimes.length+" fps"+(view.rtt!=null?" · "+view.rtt+" ms":"")+" · WebCodecs";if(view.mode==="multipart")return(view.transport?view.transport+" · ":"")+"multipart stream";return"Connecting…"}
 function renderChrome(){const data=view.status||{},webcodecs=view.mode==="webcodecs";if(view.status)setText(ui.target,(data.platform==="ios"?"iOS":"Android")+" · "+(view.transport||"connecting"));setState(ui.liveDot,liveState());setText(ui.dims,displayText());setText(ui.caption,captionText());setText(ui.notice,view.note&&Date.now()-noteAt<NOTICE_MS?view.note:"");setText(ui.transport,fastActive()?view.transport+" · "+(webcodecs?"WebCodecs":"multipart"):view.transport||"connecting");setText(ui.codec,webcodecs?stats.codec||"waiting":"—");setText(ui.frames,webcodecs?stats.renderTimes.length+" fps · "+stats.framesDropped+" dropped":(data.frames_sent??0)+" sent");setText(ui.videoSize,(webcodecs?sizeText(view.width,view.height):sizeText(image.naturalWidth,image.naturalHeight))||"waiting");setText(ui.display,displayText()||"unknown");setText(ui.clients,view.clients?view.clients.video+" video · "+view.clients.control+" control":(data.stream_clients??0)+" stream");if(view.mode==="multipart"&&image.naturalWidth)fitFrame(image.naturalWidth,image.naturalHeight)}
-async function poll(){try{const response=await fetch(url("/status")),data=await response.json();if(!response.ok)throw new Error(data.error||response.statusText);view.status=data;logicalDisplay=data.display;view.owner=data.control_owner;view.paused=data.input_paused;if(data.display&&"preset" in data.display){view.preset=data.display.preset;view.density=data.display.density}rememberDefaultSize(data.display);syncPicker();if(data.transport!==view.transport){view.transport=data.transport;applyTransport()}}catch(error){note(error.message);if(!view.mode)startMultipart("status unavailable")}finally{setTimeout(poll,1200)}}
+async function poll(){try{const response=await fetch(url("/status")),data=await response.json();if(!response.ok)throw new Error(data.error||response.statusText);view.status=data;logicalDisplay=data.display;view.owner=data.control_owner;view.paused=data.input_paused;applyLease(data);if(data.display&&"preset" in data.display){view.preset=data.display.preset;view.density=data.display.density}rememberDefaultSize(data.display);syncPicker();if(data.transport!==view.transport){view.transport=data.transport;applyTransport()}}catch(error){note(error.message);if(!view.mode)startMultipart("status unavailable")}finally{setTimeout(poll,1200)}}
 function snapshot(){return{transport:view.transport,mode:view.mode,decoder:stats.decoder,fallbackReason:view.reason||null,codec:stats.codec,framesDecoded:stats.framesDecoded,framesRendered:stats.framesRendered,framesDropped:stats.framesDropped,decodeQueueSize:decoder?decoder.decodeQueueSize:0,fps:stats.renderTimes.length,packets:stats.packets,bytes:stats.bytes,errors:stats.errors,lastFrameAt:stats.lastFrameAt,width:view.width,height:view.height,rotation,session:view.session,owner:view.owner,paused:view.paused,clients:view.clients,control:controlSocket?controlSocket.readyState:-1,video:videoSocket?videoSocket.readyState:-1,rtt:view.rtt,note:view.note,display:{preset:view.preset,density:view.density,picker:sizePicker?sizePicker.value:null,pickerDisabled:sizePicker?sizePicker.disabled:null},status:statusEl.textContent}}
 window.autonomCanvas=Object.freeze({stats:snapshot,send:sendControl});
 async function authenticate(){const body=bootstrapToken?{token:bootstrapToken}:{};const response=await fetch("/auth",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});const payload=await response.json().catch(()=>({}));if(response.ok){csrf=payload.csrf;return}if(bootstrapToken)throw new Error(payload.error||"Authentication failed");note("open the Canvas URL with its #token to sign in")}

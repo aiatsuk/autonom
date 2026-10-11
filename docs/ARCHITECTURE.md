@@ -50,7 +50,7 @@ overridable by `AUTONOM_HOME`:
 | Root | Default | Holds |
 | --- | --- | --- |
 | Session store | `~/.autonom/sessions/<id>/` | `session.json`, `journal.ndjson`, shots, trees, logs, network flows, recordings, crashes, pulled files |
-| Machine state | `$XDG_STATE_HOME/autonom`, else `~/.local/state/autonom` | mock registry, process registry, mitmproxy confdir (CA key, mode `0700`), `simulator-state/<target>.json` and `simulator-prefs/<udid>.json` pin snapshots |
+| Machine state | `$XDG_STATE_HOME/autonom`, else `~/.local/state/autonom` | mock registry, process registry, mitmproxy confdir (CA key, mode `0700`), `simulator-state/<target>.json` and `simulator-prefs/<udid>.json` pin snapshots, `control/<platform>__<target>.json` control leases (see [Control lease](#control-lease)) |
 | Per-app knowledge | `~/.autonom/apps/<package>/` | `mobile-memory` overlays and flow runbooks |
 
 The consequence that matters: a session started in one directory is found from
@@ -69,7 +69,10 @@ scripts/autonom.py            argparse surface, JSON emit, and the journal choke
 scripts/autonom_lib/
   platform.py                 Target identity, resolution precedence, unified device listing
   errors.py                   AutonomError + the stable error_code vocabulary
-  session.py                  schema v2 records, v1 in-memory upgrade, teardown registry
+  session.py                  schema v2 records, v1 in-memory upgrade, teardown registry,
+                              `session list` (live sessions, or every record with --all)
+  control.py                  the host-wide control lease: lock-written lease files, the
+                              admission rule, the per-invocation claim and admit-once state
   journal.py                  append-only journal.ndjson: every verb, parser-resolved scrubbed argv, notes
   consent.py                  the consent gate: per-invocation flag + typed phrase, never cached
   selector.py                 shared selector matching and duplicate policy
@@ -129,7 +132,9 @@ scripts/autonom_lib/
     verdict.py / kit.py       the ticket verdict; the 18-case edge-case kit
     pack.py / summary.py      the integrity-checked pack, summary.json and summary.md
     view.py / review.py       offline index.html; QA review annotations
-  actions.py                  per-action detail records feeding the Session -> Flow compiler
+  actions.py                  per-action detail records feeding the Session -> Flow compiler;
+                              collision-safe names (hard-link or O_EXCL), a failed write is a
+                              warning, never a repeated input
   network/
     proxy.py                  mitmdump lifecycle, machine-level confdir, CA publication
     mitm_addon.py             in-proxy addon: record, redact, serve mocks
@@ -166,7 +171,8 @@ Two rules carry the design.
 | Verb | Purpose |
 | --- | --- |
 | `version`, `devices`, `doctor` | identify the CLI, discover targets, diagnose the machine |
-| `session *` | start/show/stop, launch/clear/force-stop/uninstall, artifact dirs |
+| `session *` | start/show/list/stop, launch/clear/force-stop/uninstall, artifact dirs |
+| `control status\|acquire\|renew\|release` | the host-wide control lease of a target (see [Control lease](#control-lease)) |
 | `ui tree\|find\|wait\|tap\|swipe\|type\|key` | understand and control the screen; `ui pinch\|rotate\|shake` exist but have no backend on either platform and are refused |
 | `screenshot`, `shots list\|show`, `record start\|stop` | visual evidence and its provenance |
 | `note add\|list`, `journal` | the run's own record: what was done, what was concluded |
@@ -305,6 +311,99 @@ pin merges only keys not yet recorded, so the snapshot always describes the
 device before the **first** pin, and `clear`/`reset` restores exactly that
 and deletes the section. `keyboard pin` keeps its own per-UDID snapshot under
 `simulator-prefs/` with the same merge rule.
+
+### Control lease
+
+Several agents, flows and Canvases can work on one machine at once, each
+device with its own session (`session start --alongside`; `session list`
+shows them). Who may *change* a device right now is the **control lease**:
+one file per target, `<state>/control/<platform>__<safe target>.json`
+(`0600` in a `0700` directory; the safe target part is
+`session._safe_target`). Only `control.py` writes it, always under
+`flock(<state>/control/.lock)` and with an fsynced temporary file renamed
+into place, so a reader without the lock (admission, `control status`, the
+Canvas in Node) sees the old or the new file, never a partial one.
+
+```text
+{"schema": 1, "platform", "target_id", "generation",
+ "holder": {"kind": "human"|"agent", "id", "label"} | null,
+ "session_id", "acquired_at", "renewed_at", "expires_at", "expires_at_ms", "ttl_ms",
+ "previous_holder", "reason": "acquired"|"taken_over"|"renewed"|"released", "updated_at", ...}
+```
+
+- The **generation** grows by one with every grant and never goes down: it
+  survives release and expiry. A claim names a holder id and, optionally, the
+  generation it was given (`--control-holder`/`--control-generation`, or
+  `AUTONOM_CONTROL_HOLDER`/`AUTONOM_CONTROL_GENERATION`).
+- **Admission** is one rule, the same in Python (`control.admission`) and
+  Node (`canvas-control.mjs`), pinned by one shared fixture
+  (`tests/fixtures/control_cases.json`). No lease file and no claim: admitted
+  exactly as before. A live holder admits only its own claim at its own
+  generation; anyone else gets `control_held`, a claim of an older
+  generation gets `control_generation_stale` (it was taken over), the
+  holder's own expired lease gets `control_lease_expired`, and a claim
+  without a matching lease gets `control_not_held`. A free or expired lease
+  admits unclaimed callers. Every refusal carries `platform`, `target_id`,
+  `capability: "control.lease"`, `generation`, `holder` and `expires_at`.
+- **Where it is checked.** Every verb belongs to one class
+  (`tests/test_verb_classification.py` walks the parser so no verb ships
+  unclassified): read-only, lifecycle and host-side verbs are never
+  admitted; mutating verbs are admitted once per target in `_target()`
+  before their first device call; flow verbs (`flow run`, `proof`, `replay`,
+  `ci run`, `teach approve --run`, `tour --run`, `report serve` replays) are
+  admitted immediately before every device actuator call of the executor,
+  inside polls and retries too. The Canvas checks it in `refusal()` for every
+  HTTP and WebSocket input and every Tools/Actions op of `LEASED_TOOLS_OPS`,
+  and the Python bridge and tools processes check it again before they act.
+  `ui tree` stays read-only: under someone else's lease it skips its
+  accessibility recovery (no settings write, no relaunch).
+- **Lease before the pre-test guard.** While a ticket pre-test is active,
+  both the lease admission and the pre-test guard (budget, forbidden taps,
+  allowed apps) must pass before any input. The lease is checked first
+  everywhere: in `_target()` for verbs, in the executor's `_admit()` before
+  the actuator call (whose shared `ui`/`device_state`/`session` function runs
+  the guard), in the bridge and tools processes before the handler, and
+  before each Runtime Map replay tap of `pretest warmup`. A lease refusal
+  therefore never consumes pre-test budget or records a guard refusal; a
+  guard refusal comes only after the lease admitted the input (admission is
+  a read and costs nothing). The pre-test verbs that run flows (`pretest
+  flows`, `repro`, `rerun`, `warmup`) are flow verbs; the other pre-test
+  verbs only record state or read the device and are never admitted. An
+  interrupted run counts as broken there: its check is `blocked`, and
+  `repro` stops without recording a result.
+- **Flows.** A refusal inside a run raises an internal exception that no
+  step handler, `retry:` block or `runFlow` child catches: the run ends
+  `interrupted` (`failure_class: control_lost`, a `flow.step.refused` event,
+  the refused step `skipped`, no `onFlowComplete`), `execution_status:
+  broken`, and `proof` answers `inconclusive`. A run is never resumed by the
+  host.
+- **People.** A Canvas is the holder `canvas:<port>:<pid>` (kind `human`,
+  label `Canvas <port>`). A person's first input on a device nobody holds
+  takes the lease (30 s lifetime, renewed while the page is there); the
+  generation bump stops every agent mutation on that device from its next
+  action. Only an explicit Take over replaces a live holder; Hand back, the
+  idle timeout (`--control-idle`, default 120 s) or a closed page ends it.
+  Lease ops go through the bridge (`control-acquire|release|renew|status`);
+  Node only reads lease files.
+- **Attribution.** Each admitted mutation gets an operation id (`op_<12
+  hex>`, `--operation-id`, or `<run_id>:<step>` in a flow), written to the
+  journal as `operation_id` and to the action detail and JSON answer as
+  `control`, only when a lease exists or a claim was given.
+- **Known window (RISK-002).** Admission is checked immediately before each
+  device call, not atomically with it. A takeover that lands in between lets
+  one input that was already admitted through: milliseconds for a flow step
+  or Canvas input, up to one UI snapshot (about 1-3 s) for a selector
+  `ui tap`/`ui type`, which admits once in `_target()`.
+- **Not a security boundary (RISK-019).** The lease coordinates cooperating
+  processes of one user. Any process of that user can run `control acquire
+  --kind human --takeover`, or present a holder id and generation it read
+  from a refusal or `control status`; nothing authenticates a holder. The
+  0700 directory and 0600 files keep other users from reading or forging
+  leases. Authenticated holders belong to the planned host API.
+- **Journal of a Canvas control change.** A `control` message on
+  `/ws/control` is journaled as a `control` record; the HTTP route
+  `POST /control` is not (it reaches only the Canvas command log). Lost and
+  idle lease endings are journaled from either route.
 
 ## Mobile Canvas
 
@@ -456,6 +555,16 @@ one device never writes into the record of a session on another. The rule is
 the same for `record` and for the HTTP input the bridge actuates (`tap`,
 `swipe`, `key`, `text`).
 
+A workspace Canvas binds each device explicitly: every bridge and tools
+request carries the `session_id` the Canvas started or reused for that
+device (and the log feed child gets `--session-id`), and `bound_session()`
+refuses a stopped session (`session_stopped`), another target's session
+(`session_target_mismatch`) or a missing one (`session_not_found`) before
+any device action. A request without a `session_id` (the single-device
+Canvas, a device whose session is still starting) keeps the lookup above.
+Requests also carry the Canvas's lease claim (`control`) when it holds one,
+so the bridge's own admission sees the same holder as the Canvas.
+
 ### Backpressure
 
 Nothing a client sends is buffered without bound. A control connection stops
@@ -499,7 +608,10 @@ the session on X, so an agent's commands journal next to the Canvas's. A
 device lives in one tab; tabs persist in `<state>/canvas/workspaces/<name>.json`
 and one lock file keeps a workspace to one Canvas. Only the focused tile
 streams at full rate; a crash inside one device's scope restores that device
-alone. With `--serial`, `--udid`, `--target` or one `--device` the Canvas is
+alone. Each device keeps its own lease view: a 250 ms poll drives the page's
+control state, while admission re-reads the lease file (a `stat`, the file
+only when it changed) on every input, and queued input stamped before a lease
+change is dropped (`control_generation_stale`) except lifts. With `--serial`, `--udid`, `--target` or one `--device` the Canvas is
 the single-device Canvas of before, byte for byte.
 
 ### Canvas security

@@ -54,11 +54,70 @@ if (args.join(" ") === "simctl list devices --json") {
 
 // The input bridge: every call succeeds, and each is logged.
 const FAKE_BRIDGE = String.raw`
-import { appendFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { createInterface } from "node:readline";
+// Like the real bridge (contract 4.3): the control-* ops keep this target's lease file in
+// the test's AUTONOM_HOME, written atomically, and answer grants and refusals alike.
+const LEASE_ARGS = process.argv.slice(2);
+const leaseArg = (name) => LEASE_ARGS[LEASE_ARGS.indexOf(name) + 1];
+const LEASE_PLATFORM = leaseArg("--platform");
+const LEASE_TARGET = leaseArg("--target");
+const LEASE_DIR = process.env.AUTONOM_HOME ? join(process.env.AUTONOM_HOME, "control") : null;
+const LEASE_FILE = LEASE_DIR && join(LEASE_DIR, LEASE_PLATFORM + "__" + LEASE_TARGET.replace(/[^A-Za-z0-9._-]/g, "_") + ".json");
+function leaseOp(op, payload = {}) {
+  const refuse = (code) => ({ error_code: code, error: "fake lease refusal: " + code });
+  if (!LEASE_FILE) return refuse("control_not_held");
+  let lease = null;
+  try { lease = JSON.parse(readFileSync(LEASE_FILE, "utf8")); } catch { lease = null; }
+  const now = Date.now();
+  const iso = (ms) => new Date(ms).toISOString();
+  const held = Boolean(lease && lease.holder && now < lease.expires_at_ms);
+  const same = Boolean(lease && lease.holder && lease.holder.id === payload.holder_id);
+  const ttl = (payload.ttl_s ?? 30) * 1000;
+  const save = (next) => {
+    mkdirSync(LEASE_DIR, { recursive: true });
+    const temporary = LEASE_FILE + "." + process.pid + ".tmp";
+    writeFileSync(temporary, JSON.stringify(next));
+    renameSync(temporary, LEASE_FILE);
+    return next;
+  };
+  const stamp = (next, reason) => Object.assign(next, { reason, updated_at: iso(now), updated_at_ms: now });
+  const extend = (next) => Object.assign(next, { renewed_at: iso(now), expires_at: iso(now + ttl), expires_at_ms: now + ttl, ttl_ms: ttl });
+  const grant = (next, renewed, takenOver) => ({ result: { ok: true, acquired: true, renewed, taken_over: takenOver,
+    lease: next, generation: next.generation, state: "held" } });
+  if (op === "control-status") return { result: { ok: true, lease } };
+  if (op === "control-acquire") {
+    if (held && same) return grant(save(stamp(extend({ ...lease }), "renewed")), true, false);
+    if (held && (!payload.takeover || payload.kind === "agent")) return refuse("control_held");
+    const next = { schema: 1, platform: LEASE_PLATFORM, target_id: LEASE_TARGET, generation: (lease?.generation ?? 0) + 1,
+      holder: { kind: payload.kind ?? "agent", id: payload.holder_id, label: payload.label ?? payload.holder_id },
+      session_id: payload.session_id ?? null, acquired_at: iso(now) };
+    extend(next);
+    next.previous_holder = held ? lease.holder : null;
+    return grant(save(stamp(next, held ? "taken_over" : "acquired")), false, held);
+  }
+  if (op === "control-release") {
+    if (!same || (payload.generation != null && payload.generation !== lease.generation)) return refuse("control_not_held");
+    return { result: { ok: true, released: true, was_expired: !held, lease: save(stamp({ ...lease, holder: null }, "released")) } };
+  }
+  if (!same) return refuse("control_not_held");
+  if (payload.generation !== lease.generation) return refuse("control_generation_stale");
+  if (!held) return refuse("control_lease_expired");
+  return grant(save(stamp(extend({ ...lease }), "renewed")), true, false);
+}
+const isLeaseOp = (message) => typeof message.op === "string" && message.op.startsWith("control-");
+const leaseAnswer = (message) => {
+  const answer = leaseOp(message.op, message.payload ?? {});
+  return answer.result ? { id: message.id, ok: true, result: answer.result } : { id: message.id, ok: false, ...answer };
+};
 createInterface({ input: process.stdin }).on("line", (line) => {
   const message = JSON.parse(line);
   appendFileSync(process.env.FAKE_BRIDGE_LOG, line + "\n");
+  if (isLeaseOp(message)) {
+    process.stdout.write(JSON.stringify(leaseAnswer(message)) + "\n");
+    return;
+  }
   const result = { ok: true, display: { width: 1080, height: 2400 } };
   process.stdout.write(JSON.stringify({ id: message.id, ok: true, result }) + "\n");
 });

@@ -78,6 +78,33 @@ capability from `requires.capabilities` or `setup` it lacks
 summary lists every run under `runs`; a single-file run carries the same
 `runs` list (of one) next to its run's own keys.
 
+A run's `status` is `passed`, `failed`, `replayed` (prefix replay, below) or
+`interrupted`. **`interrupted`** means the device's control lease refused a
+mutation: a person's first input in the Mobile Canvas, a Take over, another
+holder, or the run's own claimed lease expired (`docs/ARCHITECTURE.md`,
+Control lease). The lease is checked at the start of every mutating step and
+again immediately before every device action the executor takes (inside
+polls, retries, `scrollUntilVisible` attempts and the setup writes), so the
+refused action never ran, the step that was running is not repeated and no
+later step runs. `flow run` exits `1`; `failure` carries `step_index`,
+`command`, `line`, `flow`, the control `error_code` (`control_held`,
+`control_generation_stale`, `control_lease_expired`, `control_not_held`),
+`failure_class: "control_lost"`, `error`, `holder` and `generation`; the
+refused step is listed with `status: "skipped"` and `skip_reason:
+"control_lost"`; the events end with `flow.step.refused` and
+`flow.run.finished`; `onFlowComplete` hooks are skipped (they would change
+the device); the manifest reads `execution_status: "broken"` and
+`proof_verdict: "inconclusive"`. A `retry:` block never retries it, and
+nothing resumes the run: run it again once `autonom control status` shows
+the device free. With no lease file and no claim (`--control-holder` /
+`AUTONOM_CONTROL_HOLDER`) a run behaves exactly as before. A claimed run is
+never renewed by the executor, so a run longer than its lease's TTL ends
+`interrupted` with `control_lease_expired` unless the agent renews in
+parallel (`autonom control renew`) or acquired a longer `--ttl` (at most
+3600 s). `proof`, `replay`, `ci run`, `teach approve --run`, `tour --run`
+and `report serve` replays use the same executor and treat `interrupted` as
+not passed.
+
 `--until-step N` is prefix replay for debugging: it executes one flow through
 runtime leaf step `N`, returns status `replayed`, skips `onFlowComplete`, and
 leaves the target at that state. It reconstructs state from the flow start; it

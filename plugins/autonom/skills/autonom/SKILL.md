@@ -97,7 +97,8 @@ reads it back — the record you use to re-check or hand off a flow.
 | Area | Verbs |
 | --- | --- |
 | Discover | `doctor`, `devices`, `devices boot/shutdown` |
-| Session | `session start/show/stop/launch/force-stop/clear/uninstall` |
+| Session | `session start/show/list/stop/launch/force-stop/clear/uninstall` (`session start --label`, `session list [--all]`) |
+| Shared control | `control status/acquire/renew/release` — the device's control lease; claim it with `--control-holder`/`--control-generation` |
 | Screen | `ui tree/find/wait/tap/swipe/type/key` (`ui wait --settled`, `ui tree --format outline`); `find`/`tap` resolve on-screen matches first, and a node that is not on screen is `visible: false` in the tree and refused by `tap` (`element_offscreen`); `pinch/rotate/shake` are refused on both platforms; iOS input via idb or AXe, named in `backend` |
 | First run | `tour` — overview, the workflow, this machine's targets, and `--run` to walk three screens into Settings: before/after screenshots, hierarchy, and device log attached to each tap or back, an assertion that the screen changed after each, an HTML/JUnit report, and a written account |
 | Evidence | `screenshot` (with `width`/`height`), `shots list/show`, `record start/stop`, `note add/list`, `journal` |
@@ -155,6 +156,15 @@ screenshot + UI tree + logs → profile / memory / network → before/after repl
 - **One explicit target.** With more than one device attached, pass `--target` /
   `--serial` / `--udid`; ambiguity is an error listing candidates, never a guess.
 - **iOS text lives in `desc`** (from `AXLabel`), not `text` — select with `--desc`.
+- **A person can take the device.** In the Mobile Canvas a person's first
+  input on a device nobody holds takes its control lease; from then on your
+  device-changing commands are refused `control_held` (exit 2, nothing ran)
+  and a running flow ends `interrupted`. Do not retry in a loop: wait until
+  `autonom control status` reads `free` (Hand back, idle release after 120 s,
+  or the page closed), then re-run. To keep a device for a longer job,
+  `control acquire --holder agent:<name>` and pass the printed claim; a
+  person can still Take over, and your next action then fails
+  `control_generation_stale`.
 
 ## Where things live
 
@@ -163,7 +173,7 @@ screenshot + UI tree + logs → profile / memory / network → before/after repl
                             crashes, files, journal.ndjson, session.json,
                             flows/<run_id>/events.ndjson  (flow run evidence)
 ~/.autonom/apps/<package>/  per-app knowledge: app.md, flows/, bodies/  (mobile-memory)
-~/.local/state/autonom/     mocks registry, process registry  (machine-level, persistent)
+~/.local/state/autonom/     mocks registry, process registry, control/ leases  (machine-level, persistent)
 ```
 Flow *files* are repository source (conventionally `.autonom/flows/` in the
 app repo — see `mobile-flow`); only run artifacts land under `~/.autonom`.
@@ -175,7 +185,9 @@ Keep device actions inside the Autonom CLI, including screenshots and recovery.
 without changing the current session. A stopped session stays readable (`journal`,
 `shots`, `logs`, `report` but not `report serve`, `session show|outputs`) and refuses
 everything else with `session_stopped`; another target's flags are refused with `session_target_mismatch`.
-One session per machine store still applies: `session start` refuses a second one.
+One session per machine store still applies: `session start` refuses a second one
+unless `--alongside` (one live session per target); `autonom session list` shows
+the live ones with their labels and which is `current`.
 A stopped session's journal never grows: a command that names it is journaled in the
 current session, if there is one.
 

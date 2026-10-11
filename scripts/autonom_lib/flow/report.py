@@ -22,6 +22,9 @@ from typing import Any
 from xml.sax.saxutils import escape as xml_escape, quoteattr
 
 _MAX_INLINE_IMAGE = 2_000_000  # bytes of PNG we are willing to inline
+# A run stopped because the device's control lease moved (contract 5.5): its
+# own colour, never the pass green.
+INTERRUPTED_COLOR = "#bc4c00"
 
 
 def load_manifest(run_dir: Path) -> dict[str, Any]:
@@ -371,7 +374,7 @@ def render_run_page(manifest: dict[str, Any], evidence: dict[int, dict],
     e = html.escape
     status = manifest.get("status", "unknown")
     color = {"passed": "#1a7f37", "failed": "#b42318",
-             "replayed": "#9a6700"}.get(status, "#555")
+             "replayed": "#9a6700", "interrupted": INTERRUPTED_COLOR}.get(status, "#555")
     nav = []
     blocks = []
     reproduction = _shorten(str(manifest.get("reproduction", "")), base)
@@ -632,10 +635,16 @@ def render_suite_html(manifests: list[dict[str, Any]],
     passed = [m for m in manifests if m.get("status") == "passed"]
     failed = [m for m in manifests if m.get("status") == "failed"]
     replayed = [m for m in manifests if m.get("status") == "replayed"]
+    interrupted = [m for m in manifests if m.get("status") == "interrupted"]
     total_ms = sum(step.get("duration_ms", 0)
                    for m in manifests for step in m.get("steps", []))
-    status = "failed" if failed else "passed"
-    color = "#b42318" if failed else "#1a7f37"
+    # Only passed runs and prefix replays count as passing: an interrupted
+    # run (the control lease moved) or any other status never marks the
+    # suite passed.
+    not_passed = [m for m in manifests
+                  if m.get("status") not in ("passed", "replayed")]
+    status = "failed" if not_passed else "passed"
+    color = "#b42318" if not_passed else "#1a7f37"
 
     def step_rows(manifest: dict[str, Any]) -> str:
         rows = []
@@ -693,8 +702,15 @@ def render_suite_html(manifests: list[dict[str, Any]],
         if any(m.get("sensitive") for m in manifests) else "")
     failed_list = "".join(
         f"<li class='s-failed'>{e(str(m.get('flow_name','')))} — "
-        f"{e(str((m.get('primary_error') or {}).get('error_code','')))}</li>"
-        for m in failed) or "<li class='s-passed'>none</li>"
+        f"{e(str((m.get('primary_error') or {}).get('error_code','')))}"
+        + (f" <span class='s-interrupted'>(interrupted)</span>"
+           if m.get("status") == "interrupted" else "") + "</li>"
+        for m in [*failed, *interrupted]) or "<li class='s-passed'>none</li>"
+    interrupted_total = (
+        f"\n  <div class=\"s-interrupted\">{len(interrupted)}<span>interrupted</span></div>"
+        if interrupted else "")
+    interrupted_style = (
+        f"\n  .s-interrupted {{ color: {INTERRUPTED_COLOR}; }}" if interrupted else "")
 
     return f"""<meta charset="utf-8">
 <meta http-equiv="Content-Security-Policy"
@@ -709,7 +725,7 @@ def render_suite_html(manifests: list[dict[str, Any]],
   code {{ background: #f6f8fa; padding: .1em .3em; border-radius: 4px; }}
   .status {{ color: {color}; font-weight: 700; }}
   .s-failed {{ color: #b42318; }} .s-passed {{ color: #1a7f37; }}
-  .s-skipped {{ color: #9a6700; }}
+  .s-skipped {{ color: #9a6700; }}{interrupted_style}
   .muted {{ color: #57606a; font-weight: 400; }}
   summary {{ cursor: pointer; padding: .35rem 0; }}
   .totals {{ display: flex; gap: 2rem; margin: 1rem 0; }}
@@ -723,7 +739,7 @@ def render_suite_html(manifests: list[dict[str, Any]],
   <div>{len(manifests)}<span>flows</span></div>
   <div class="s-passed">{len(passed)}<span>passed</span></div>
   <div class="s-failed">{len(failed)}<span>failed</span></div>
-  <div class="s-skipped">{len(replayed)}<span>prefix replays</span></div>
+  <div class="s-skipped">{len(replayed)}<span>prefix replays</span></div>{interrupted_total}
   <div>{total_ms/1000:.0f}s<span>total step time</span></div>
 </div>
 {sensitive_note}

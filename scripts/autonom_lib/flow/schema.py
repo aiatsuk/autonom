@@ -24,6 +24,9 @@ from ..providers import SEMANTIC_CAPABILITIES
 TEST_FAILURE = "test_failure"
 FLOW_DEFINITION = "flow_definition"
 INFRASTRUCTURE = "infrastructure"
+# The device's control lease moved to another holder (or expired) while the
+# flow ran: neither the app's fault nor the flow's; the run is `interrupted`.
+CONTROL_LOST = "control_lost"
 
 _FAILURE_CLASS_BY_CODE = {
     # The app under test did not behave as the flow asserts.
@@ -56,6 +59,11 @@ _FAILURE_CLASS_BY_CODE = {
     errors.FLOW_REPLAY_STEP_NOT_REACHED: FLOW_DEFINITION,
     errors.UNSUPPORTED_ON_PLATFORM: FLOW_DEFINITION,
     errors.UNSUPPORTED_KEY_FOR_PLATFORM: FLOW_DEFINITION,
+    # The control lease refused a mutation (contract 5.5).
+    errors.CONTROL_HELD: CONTROL_LOST,
+    errors.CONTROL_GENERATION_STALE: CONTROL_LOST,
+    errors.CONTROL_LEASE_EXPIRED: CONTROL_LOST,
+    errors.CONTROL_NOT_HELD: CONTROL_LOST,
 }
 
 
