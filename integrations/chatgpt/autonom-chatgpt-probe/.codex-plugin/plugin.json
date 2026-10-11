@@ -1,0 +1,20 @@
+{
+  "name": "autonom-chatgpt-probe",
+  "version": "0.1.0",
+  "description": "Development probe for Autonom in ChatGPT desktop: checks MCP tools, the app bridge, model context, loopback media and H.264 decoding. Not part of the Autonom plugin.",
+  "author": {"name": "Andrei Iatsuk", "url": "https://github.com/aiatsuk"},
+  "homepage": "https://github.com/aiatsuk/autonom",
+  "repository": "https://github.com/aiatsuk/autonom",
+  "license": "MIT",
+  "keywords": ["autonom", "chatgpt", "mcp", "probe"],
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Autonom probe",
+    "shortDescription": "P0 host-contract probe for Autonom",
+    "longDescription": "A development-only plugin that measures what ChatGPT desktop allows a local Autonom integration to do: tool calls, the MCP Apps bridge, model context, loopback fetch and WebSocket, WebCodecs H.264 decoding and reconnects. Requires a local Autonom checkout or install, Python 3 and Node.",
+    "developerName": "Andrei Iatsuk",
+    "category": "Developer Tools",
+    "capabilities": ["Interactive", "Read", "Write"],
+    "defaultPrompt": ["Open the Autonom probe and run all checks."]
+  }
+}
