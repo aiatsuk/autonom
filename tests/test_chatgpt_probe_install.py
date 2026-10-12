@@ -789,8 +789,12 @@ class RepositoryTests(unittest.TestCase):
                               stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                               timeout=120, check=False)
         self.assertEqual(proc.returncode, 0, proc.stderr.decode("utf-8"))
+        # Same rule as scripts/validate_plugin.py: skill folders holding a SKILL.md.
+        skill_dirs = [p.parent.name for p in (ROOT / "plugins" / "autonom" / "skills").glob("*/SKILL.md")]
+        self.assertTrue(skill_dirs)
+        self.assertNotIn(NAME, skill_dirs)
         self.assertEqual(proc.stdout.decode("utf-8").strip(),
-                         "Validated Codex and Claude manifests and 24 skills.")
+                         f"Validated Codex and Claude manifests and {len(skill_dirs)} skills.")
 
     def test_readme_covers_the_contract_topics(self) -> None:
         text = (ROOT / "integrations" / "chatgpt" / "README.md").read_text(encoding="utf-8")
