@@ -42,6 +42,9 @@ SERVER = SERVER_DIR / "probe_server.py"
 LAUNCHER = PLUGIN / "bin" / "launch.sh"
 FAKE_CLI = ROOT / "tests" / "fakes" / "fake_probe_cli.py"
 FAKE_MEDIA = ROOT / "tests" / "fakes" / "fake_probe_media.py"
+# The fake media child gets this long to print its ready line, so a slow CI runner
+# cannot fail a test that is not about the limit (the product default is 5 s).
+MEDIA_READY_TIMEOUT = "60"
 
 SCHEMA = "autonom.chatgpt-probe/v1"
 UI_URI = "ui://autonom-probe/probe.html"
@@ -245,6 +248,7 @@ class ProbeServerCase(EnvSandboxMixin, unittest.TestCase):
             "AUTONOM_CLI": str(FAKE_CLI),
             "AUTONOM_PROBE_NODE": sys.executable,
             "AUTONOM_PROBE_MEDIA_SCRIPT": str(FAKE_MEDIA),
+            "AUTONOM_PROBE_MEDIA_READY_TIMEOUT": MEDIA_READY_TIMEOUT,
             "AUTONOM_PROBE_UI_DIR": str(self.ui_dir),
             "AUTONOM_ROOT": str(ROOT),
             "FAKE_PROBE_CLI_LOG": str(self.cli_log),
@@ -1065,14 +1069,15 @@ class OpenWorkspaceTests(ProbeServerCase):
                 self.assertEqual(probe.close(), 0)
 
     def test_silent_child_times_out_and_is_killed(self) -> None:
-        probe = self.started(FAKE_PROBE_MEDIA_MODE="silent")
+        probe = self.started(FAKE_PROBE_MEDIA_MODE="silent", AUTONOM_PROBE_MEDIA_READY_TIMEOUT="2")
         started = time.monotonic()
         media = self.call_ok(probe, "open_workspace")["structuredContent"]["media"]
         elapsed = time.monotonic() - started
-        self.assertGreaterEqual(elapsed, 4.5)
+        self.assertGreaterEqual(elapsed, 1.8)
         self.assertLess(elapsed, 10.0)
         self.assertEqual((media["state"], media["error_code"]), ("failed", "media_start_failed"))
-        self.assertIn("no ready line", media["reason"])
+        self.assertRegex(media["reason"], r"^no ready line within 2 s \(waited [0-9.]+ s; "
+                                          r"AUTONOM_PROBE_MEDIA_READY_TIMEOUT raises the limit\)")
         pid = self.media_starts()[0]["pid"]
         self.assertTrue(wait_dead(pid, 3.0), "the silent media child is still running")
 
@@ -1361,6 +1366,27 @@ class RefusalBranchTests(ProbeServerCase):
                 self.assertEqual(structured["exit_code"], 0)
                 self.assertIn("host", structured)
                 probe.close()
+
+    def test_media_ready_timeout_defaults_to_5_s_and_takes_an_override(self) -> None:
+        probe_env = import_server_modules()[0]
+        cases = [(None, 5.0, None), ("0.5", 0.5, None), ("600", 600.0, None),
+                 ("0", 5.0, "AUTONOM_PROBE_MEDIA_READY_TIMEOUT"),
+                 ("601", 5.0, "AUTONOM_PROBE_MEDIA_READY_TIMEOUT"),
+                 ("soon", 5.0, "AUTONOM_PROBE_MEDIA_READY_TIMEOUT")]
+        for value, limit, problem in cases:
+            with self.subTest(value=value):
+                env = {} if value is None else {"AUTONOM_PROBE_MEDIA_READY_TIMEOUT": value}
+                config = probe_env.load_config(env, self.home)
+                self.assertEqual(config["media_ready_timeout_s"], limit)
+                if problem:
+                    self.assertIn(problem, config["config_error"])
+                else:
+                    self.assertIsNone(config["config_error"])
+
+    def test_bad_media_ready_timeout_override_is_a_config_error(self) -> None:
+        probe = self.started(AUTONOM_PROBE_MEDIA_READY_TIMEOUT="soon")
+        server = self.call_ok(probe, "probe_read")["structuredContent"]["server"]
+        self.assertIn("AUTONOM_PROBE_MEDIA_READY_TIMEOUT", server["config_error"])
 
     def test_bad_cli_timeout_override_is_a_config_error(self) -> None:
         probe = self.started(AUTONOM_PROBE_CLI_TIMEOUT="soon")

@@ -29,6 +29,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import socketserver
 import sys
 import threading
 import time
@@ -50,6 +51,16 @@ def arg(argv: list, name: str, default: str = "") -> str:
 
 def frame_bytes(seq: int) -> bytes:
     return b"\x00\x00\x00\x01\x65" + seq.to_bytes(4, "big") + bytes(range(23))
+
+
+class Server(ThreadingHTTPServer):
+    """HTTPServer.server_bind looks up the host name with socket.getfqdn, a reverse DNS
+    query that can take tens of seconds on a CI runner: longer than the probe server
+    waits for the ready line. Nothing here reads the name, so skip the lookup."""
+
+    def server_bind(self) -> None:
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = "127.0.0.1", self.server_address[1]
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -131,7 +142,7 @@ def main(argv: list) -> int:
         sys.stderr.write(json.dumps({"ok": False, "error_code": "token_missing"}) + "\n")
         return 2
     Handler.token = token
-    server = ThreadingHTTPServer(("127.0.0.1", int(arg(argv, "--port", "0"))), Handler)
+    server = Server(("127.0.0.1", int(arg(argv, "--port", "0"))), Handler)
     server.daemon_threads = True
     threading.Thread(target=server.serve_forever, daemon=True).start()
     print(json.dumps({"event": "ready", "port": server.server_address[1], "pid": os.getpid(),

@@ -92,6 +92,10 @@ All keys are optional; flags of `install` write the first four.
 
 A bad value never crashes the server: it is reported as `config_error` by `probe_read`.
 
+The media endpoint has 5 s to print its ready line. On a slow machine, such as a CI
+runner, the environment variable `AUTONOM_PROBE_MEDIA_READY_TIMEOUT` (seconds, up to 600)
+raises that limit.
+
 ## Security model
 
 - The media endpoint listens on `127.0.0.1` only and checks the `Host` header (DNS rebinding).

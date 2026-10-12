@@ -197,6 +197,9 @@ class PackageCase(EnvSandboxMixin, unittest.TestCase):
             "AUTONOM_PROBE_CLI_PYTHON": sys.executable,
             "AUTONOM_PROBE_NODE": sys.executable,
             "AUTONOM_PROBE_MEDIA_SCRIPT": str(FAKE_MEDIA),
+            # A slow CI runner gets this long to start the fake media child; the test of
+            # the real endpoint keeps the product default (5 s).
+            "AUTONOM_PROBE_MEDIA_READY_TIMEOUT": "60",
             "AUTONOM_ROOT": str(ROOT),
             "PYTHONDONTWRITEBYTECODE": "1",
         })
@@ -502,7 +505,8 @@ class RealMediaTests(PackageCase):
             conn.close()
 
     def test_frames_ping_and_status_from_the_real_endpoint(self) -> None:
-        server = self.start(AUTONOM_PROBE_NODE=NODE, AUTONOM_PROBE_MEDIA_SCRIPT=None)
+        server = self.start(AUTONOM_PROBE_NODE=NODE, AUTONOM_PROBE_MEDIA_SCRIPT=None,
+                            AUTONOM_PROBE_MEDIA_READY_TIMEOUT=None)
         opened = server.call("open_workspace", {})
         media = opened["structuredContent"]["media"]
         self.assertEqual(media["state"], "running", server.stderr_text())

@@ -21,10 +21,9 @@ import threading
 import time
 from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
-from probe_env import ProbeError, Resolver, child_env, is_int
+from probe_env import DEFAULT_MEDIA_READY_TIMEOUT, ProbeError, Resolver, child_env, is_int
 from probe_state import MEDIA, StateStore
 
-READY_TIMEOUT_S = 5.0
 STOP_GRACE_S = 2.0
 TAIL_LINES = 50
 REASON_CHARS = 400
@@ -185,11 +184,14 @@ class MediaChild:
         ]
         for thread in self._threads:
             thread.start()
+        ready_timeout = float(self.config.get("media_ready_timeout_s") or DEFAULT_MEDIA_READY_TIMEOUT)
+        started = time.monotonic()
         try:
-            line = first.get(timeout=READY_TIMEOUT_S)
+            line = first.get(timeout=ready_timeout)
             timed_out = False
         except queue.Empty:
             line, timed_out = None, True
+        waited = time.monotonic() - started
         message: Any = None
         if line is not None:
             try:
@@ -208,7 +210,7 @@ class MediaChild:
         code = proc.returncode
         port_in_use = (isinstance(message, dict) and message.get("event") == "error"
                        and message.get("error_code") == "media_port_in_use") or code == 3
-        reason = self._reason(token, timed_out, line, code)
+        reason = self._reason(token, timed_out, line, code, ready_timeout, waited)
         self._clear()
         if port_in_use:
             raise ProbeError("media_port_in_use",
@@ -217,11 +219,13 @@ class MediaChild:
         raise ProbeError("media_start_failed", "The probe media endpoint did not become ready",
                          reason=reason)
 
-    def _reason(self, token: str, timed_out: bool, line: Optional[str], code: Optional[int]) -> str:
+    def _reason(self, token: str, timed_out: bool, line: Optional[str], code: Optional[int],
+                limit: float, waited: float) -> str:
         with self._tail_lock:
             tail = "\n".join(self._stderr_tail)
         if timed_out:
-            head = "no ready line within %d s" % int(READY_TIMEOUT_S)
+            head = ("no ready line within %g s (waited %.1f s; AUTONOM_PROBE_MEDIA_READY_TIMEOUT "
+                    "raises the limit)" % (limit, waited))
         elif line is None:
             head = "exited with code %s before ready" % code
         else:
