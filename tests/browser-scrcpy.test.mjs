@@ -3957,6 +3957,7 @@ test("journal flood: 100k control messages against a journal that stops answerin
   await deaf.next((message) => message.json?.t === "state");
   deaf.socket.pause();
   blind.socket.pause();
+  const stalledAt = Date.now();
   const count = 100_000;
   const total = FLOOD_WARM_UP + count;
   const run = 500;
@@ -3976,26 +3977,36 @@ test("journal flood: 100k control messages against a journal that stops answerin
   assert.equal(control.count("error"), 0, "control messages were refused");
   // States are snapshots: clients that fell behind skipped most, and catch up with the last.
   await waitFor(() => lastState?.paused === false, 5000, "the flooding client's current state");
-  for (const [name, ws] of [["the /ws/control client that never read", deaf], ["the /ws/video client that never read", blind]]) {
-    const before = { states: ws.json("state").length, bytes: ws.received };
-    const resumed = Date.now();
-    ws.socket.resume();
+  // Both clients read again at once. While they did not read, the receiving side dropped
+  // segments and TCP backed off its retransmission timer, doubling it each time: on a busy
+  // machine it reaches about as long as the clients did not read (seen on Linux CI: 13 s
+  // after a 25 s stall). Nothing reaches a client before that timer fires, so the wait for
+  // the current state is that long plus 10 s. A client that never catches up still fails.
+  const clients = [["the /ws/control client that never read", deaf], ["the /ws/video client that never read", blind]];
+  const resumed = Date.now();
+  const stalledMs = resumed - stalledAt;
+  const limitMs = stalledMs + 10_000;
+  const before = new Map(clients.map(([, ws]) => [ws, { states: ws.json("state").length, bytes: ws.received }]));
+  for (const [, ws] of clients) ws.socket.resume();
+  for (const [name, ws] of clients) {
     // The current state follows once the backlog has drained, and on a busy machine Canvas
     // may still be working through the flood then: a client that went quiet on an old
     // state gets more time, and one that never catches up still fails below.
     const caughtUp = async () => {
       await quiet(ws);
-      return ws.json("state").at(-1).paused === false;
+      return ws.json("state").at(-1)?.paused === false;
     };
-    await waitFor(caughtUp, 10_000, "the current state").catch(() => {});
+    await waitFor(caughtUp, Math.max(0, resumed + limitMs - Date.now()), "the current state").catch(() => {});
     const states = ws.json("state");
-    if (states.at(-1).paused !== false) {
+    if (states.at(-1)?.paused !== false) {
       const last = { ...states.at(-1) };
       delete last.presets;
       const now = await status(canvas);
-      assert.fail(`${name} missed the current state: ${Date.now() - resumed} ms after it read again it had ` +
-        `${states.length} states (${states.length - before.states} since) and ${ws.received} bytes ` +
-        `(${ws.received - before.bytes} since); its last state was ${JSON.stringify(last)}; ` +
+      const { states: statesBefore, bytes: bytesBefore } = before.get(ws);
+      assert.fail(`${name} missed the current state: ${Date.now() - resumed} ms after it read again ` +
+        `(limit ${limitMs} ms after ${stalledMs} ms without reading) it had ` +
+        `${states.length} states (${states.length - statesBefore} since) and ${ws.received} bytes ` +
+        `(${ws.received - bytesBefore} since); its last state was ${JSON.stringify(last)}; ` +
         `the Canvas has input_paused ${now.input_paused} and clients ${JSON.stringify(now.scrcpy)}`);
     }
   }
