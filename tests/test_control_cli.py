@@ -9,6 +9,7 @@
   admitted; a matching claim (flags or env, before or after the verb) is
   admitted with a `control` object; a stale claim is refused;
 - `ui tree` skips its implicit accessibility recovery under a foreign lease;
+- each `pretest warmup` Runtime Map replay tap is admitted before it is sent;
 - claim, label, ttl and operation id validation; `canvas serve --control-idle`;
 - without a lease file the output is byte for byte the one of before;
 - no existing option changes meaning (the abbreviation table of 5.1).
@@ -636,9 +637,87 @@ class CompatibilityTests(ControlCliCase):
         self.assertNotIn("control", payload)
 
 
+class WarmupReplayControlTests(ControlCliCase):
+    """`pretest warmup`: each Runtime Map replay tap is admitted by the lease
+    before it is sent (`pretest/warmup.py`, `_replay_tap`)."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        from autonom_lib import platform as platform_mod
+        from autonom_lib import ui as ui_mod
+        from autonom_lib import ui_android
+        from autonom_lib.atlas import fingerprint as fingerprint_mod
+        from autonom_lib.pretest import warmup as warmup_mod
+        self.warmup = warmup_mod
+        fixtures = ROOT / "tests/fixtures/pretest"
+        self.home_dump = fixtures / "warmup_home.xml"
+        self.cart_dump = fixtures / "warmup_cart.xml"
+        self.target = platform_mod.Target("android", SERIAL, str(FAKE_ADB), {"serial": SERIAL})
+        ids: dict[str, str] = {}
+        for name, dump in (("home", self.home_dump), ("cart", self.cart_dump)):
+            self.write_state(ui_dump=str(dump))
+            ids[name] = fingerprint_mod.fingerprint(ui_mod.snapshot(self.target))["structure"]
+        self.write_state(ui_dump=str(self.home_dump))
+        self.ids = ids
+        detail = json.dumps({"text": "Cart", "mode": "contains", "case_sensitive": False,
+                             "index": None})
+        self.graph = {
+            "screens": {ids["home"]: {"screen_id": ids["home"], "labels": ["Home"]},
+                        ids["cart"]: {"screen_id": ids["cart"], "labels": ["Your cart"]}},
+            "transitions": {f"{ids['home']}->{ids['cart']}::tapOn": {
+                "from": ids["home"], "to": ids["cart"], "command": "tapOn",
+                "detail": detail, "success": 1, "failure": 0}}}
+        original = ui_android.tap
+        state_path, cart = self.state, str(self.cart_dump)
+
+        def tap_moves_to_cart(adb, serial, x, y):
+            original(adb, serial, x, y)
+            state = json.loads(state_path.read_text("utf-8"))
+            state["ui_dump"] = cart
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+
+        patcher = mock.patch.object(ui_android, "tap", side_effect=tap_moves_to_cart)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.clear_calls()
+
+    def walk(self) -> dict:
+        hints = [{"screen_id": self.ids["cart"], "labels": ["Your cart"], "hint": True}]
+        result = self.warmup.walk({}, self.target, self.graph, hints)
+        return result["hints"][0]
+
+    def input_taps(self) -> list[list[str]]:
+        return [argv for argv in self.calls() if "input" in argv and "tap" in argv]
+
+    def test_a_foreign_lease_stops_the_replay_before_any_tap(self) -> None:
+        self.human_lease()
+        hint = self.walk()
+        self.assertEqual(hint["status"], "known", hint)
+        self.assertEqual(hint["reason"], f"replay stopped: {errors.CONTROL_HELD}")
+        self.assertEqual(hint["replayed"], 0)
+        self.assertEqual(self.input_taps(), [])
+
+    def test_without_a_lease_the_replay_taps_once(self) -> None:
+        hint = self.walk()
+        self.assertEqual(hint["status"], "reached", hint)
+        self.assertEqual(hint["replayed"], 1)
+        self.assertEqual(len(self.input_taps()), 1)
+        self.assertFalse((self.home / "control").exists(), "admission created files")
+
+    def test_the_holder_of_the_lease_may_replay(self) -> None:
+        control_mod.acquire("android", SERIAL, holder_id="agent:a", kind="agent", ttl_s=3600)
+        claim = control_mod.Claim(holder_id="agent:a", generation=None)
+        with mock.patch.object(control_mod, "invocation",
+                               return_value={**control_mod.invocation(), "claim": claim}):
+            hint = self.walk()
+        self.assertEqual(hint["status"], "reached", hint)
+        self.assertEqual(len(self.input_taps()), 1)
+
+
 class AbbreviationTests(unittest.TestCase):
     """No existing option changes meaning (contract 5.1): every spelling below
-    parses exactly as at 9acc89c (recorded), both after the verb and before it."""
+    parses exactly as at 9acc89c (recorded) on the same interpreter, both after
+    the verb and before it."""
 
     SPELLINGS = ("--o", "--ou", "--c", "--ca", "--co", "--con", "--cont", "--op", "--ope",
                  "--la", "--l", "--v", "--val", "--j", "--head", "--tok", "--to", "--ser",
@@ -678,12 +757,45 @@ class AbbreviationTests(unittest.TestCase):
                                      "--ud": "udid", "--t": "target", "--ta": "target",
                                      "--ad": "adb"},
     }
+    # Leaf spellings that are also an ambiguous prefix of the TOP-LEVEL options
+    # (`--a`: --adb/--axe, `--s`: --serial/--session-id/--simctl). Older argparse
+    # (3.11, early 3.12) classifies every argv string against the top-level
+    # parser first and refuses them there; newer argparse leaves them to the
+    # subparser. 9acc89c itself parses them that way on each interpreter, so
+    # the expectation follows the running interpreter, not the branch.
+    TOP_LEVEL_AMBIGUOUS = {("ui tap", "leaf"): ("--a",), ("report export", "leaf"): ("--s",),
+                           ("canvas serve", "leaf"): ("--a",)}
     NEW_DESTS = {"control_holder", "control_generation", "operation_id", "control_idle"}
 
     @classmethod
     def setUpClass(cls) -> None:
         cls.cli = load_cli("autonom_cli_control_abbrev")
         cls.parser = cls.cli.build_parser()
+
+    @staticmethod
+    def top_level_ambiguity_refuses_leaf_spellings() -> bool:
+        """Probe this interpreter's argparse with the same shape as the CLI:
+        top-level --adb and --axe, a subcommand that has --adb of its own."""
+        probe = argparse.ArgumentParser(add_help=False, exit_on_error=False)
+        probe.add_argument("--adb")
+        probe.add_argument("--axe")
+        leaf = probe.add_subparsers(dest="command").add_parser("leaf", add_help=False)
+        leaf.add_argument("--adb")
+        with contextlib.redirect_stderr(io.StringIO()):
+            try:
+                probe.parse_args(["leaf", "--a", "x"])
+            except (argparse.ArgumentError, SystemExit):
+                return True
+        return False
+
+    def expected(self) -> dict:
+        """RECORDED (9acc89c on an interpreter with the newer argparse), minus
+        the top-level-ambiguous leaf spellings where this argparse refuses them."""
+        if not self.top_level_ambiguity_refuses_leaf_spellings():
+            return self.RECORDED
+        return {key: {spelling: dest for spelling, dest in resolved.items()
+                      if spelling not in self.TOP_LEVEL_AMBIGUOUS.get(key, ())}
+                for key, resolved in self.RECORDED.items()}
 
     def parse(self, argv: list[str]) -> dict | None:
         with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
@@ -695,7 +807,7 @@ class AbbreviationTests(unittest.TestCase):
                 if key != "func" and key not in self.NEW_DESTS}
 
     def test_recorded_spellings_keep_their_meaning(self) -> None:
-        for (verb, position), resolved in self.RECORDED.items():
+        for (verb, position), resolved in self.expected().items():
             path = verb.split()
             base = self.parse(path)
             self.assertIsNotNone(base, verb)
