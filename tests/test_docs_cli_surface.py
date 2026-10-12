@@ -268,8 +268,13 @@ class PretestDocsTests(unittest.TestCase):
         plan = (ROOT / "docs/plans/PHASE_7_TICKET_PRETEST.md").read_text(encoding="utf-8")
         self.assertIn("**Status:** implemented", plan)
         changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
-        unreleased = changelog.split("## [Unreleased]", 1)[1].split("\n## [", 1)[0]
-        self.assertIn("autonom pretest", unreleased)
+        # Unreleased until the release that ships it, then its 0.36.0 section.
+        sections = {}
+        for chunk in changelog.split("\n## [")[1:]:
+            name, _, body = chunk.partition("]")
+            sections[name] = body
+        self.assertIn("autonom pretest",
+                      sections.get("Unreleased", "") + sections.get("0.36.0", ""))
 
 
 if __name__ == "__main__":
