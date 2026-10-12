@@ -231,8 +231,14 @@ class MediaChild:
         else:
             # Redact before cutting: a cut through the token would hide it from redact().
             head = "unexpected first line: %s" % redact(line, token)[:120]
-        text = head + (": " + tail if tail else "")
-        return redact(text, token)[-REASON_CHARS:]
+        # The head says what went wrong, so a long stderr tail is cut, never the head.
+        # Both are redacted before cutting.
+        head = redact(head, token)
+        tail = redact(tail, token)
+        room = REASON_CHARS - len(head) - 2
+        if not tail or room <= 0:
+            return head[:REASON_CHARS]
+        return head + ": " + tail[-room:]
 
     def _drain_stdout(self, proc: subprocess.Popen, first: "queue.Queue[Optional[str]]",
                       token: str) -> None:

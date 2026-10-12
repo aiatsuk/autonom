@@ -10,6 +10,7 @@ set ``AUTONOM_PROBE_NODE`` to the Python interpreter). The token comes from
                  behind ``Authorization: Bearer <token>``; exit on stdin EOF
 ``port_in_use``  print ``{"event":"error","error_code":"media_port_in_use"}``, exit 3
 ``silent``       print nothing and wait to be killed
+``noisy``        write 50 long stderr lines, then print nothing and wait to be killed
 ``crash``        write a diagnostic that includes the token to stderr and exit 1
                  (the server must redact it from the reason it reports)
 ``junk``         print a first line that is not the ready event, then wait
@@ -128,7 +129,11 @@ def main(argv: list) -> int:
     pad = int(os.environ.get("FAKE_PROBE_MEDIA_PAD") or -1)
     if mode == "junk":
         print("starting up..." if pad < 0 else "y" * pad + token, flush=True)
-    if mode in ("silent", "junk"):
+    if mode == "noisy":
+        for index in range(50):
+            sys.stderr.write("warn: line %d %s\n" % (index, "noise " * 20))
+        sys.stderr.flush()
+    if mode in ("silent", "noisy", "junk"):
         while True:
             time.sleep(60)
     if mode == "crash":
