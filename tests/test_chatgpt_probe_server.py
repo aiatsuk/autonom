@@ -1081,6 +1081,18 @@ class OpenWorkspaceTests(ProbeServerCase):
         pid = self.media_starts()[0]["pid"]
         self.assertTrue(wait_dead(pid, 3.0), "the silent media child is still running")
 
+    def test_a_long_stderr_tail_never_cuts_the_timeout_head(self) -> None:
+        probe = self.started(FAKE_PROBE_MEDIA_MODE="noisy", AUTONOM_PROBE_MEDIA_READY_TIMEOUT="1")
+        media = self.call_ok(probe, "open_workspace")["structuredContent"]["media"]
+        reason = media["reason"]
+        self.assertEqual(media["error_code"], "media_start_failed")
+        self.assertLessEqual(len(reason), 400)
+        self.assertRegex(reason, r"^no ready line within 1 s \(waited [0-9.]+ s; "
+                                 r"AUTONOM_PROBE_MEDIA_READY_TIMEOUT raises the limit\): ")
+        # The newest stderr is kept, the oldest is cut.
+        self.assertIn("warn: line 49 ", reason)
+        self.assertNotIn("warn: line 0 ", reason)
+
     def test_missing_node_and_root_are_reported_in_media(self) -> None:
         for overrides, code in (({"AUTONOM_PROBE_NODE": str(self.tmp / "no-node")}, "node_not_found"),
                                 ({"AUTONOM_ROOT": str(self.tmp)}, "autonom_root_not_found")):
