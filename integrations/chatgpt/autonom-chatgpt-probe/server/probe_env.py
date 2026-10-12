@@ -22,6 +22,9 @@ SCHEMA_VERSION = "autonom.chatgpt-probe/v1"
 DEFAULT_MEDIA_PORT = 47811
 SANDBOX_ORIGIN = "https://web-sandbox.oaiusercontent.com"
 DEFAULT_CLI_TIMEOUT = 15.0
+# How long the media child has to print its ready line. Node prints it well within
+# this; AUTONOM_PROBE_MEDIA_READY_TIMEOUT raises it for slow machines such as CI runners.
+DEFAULT_MEDIA_READY_TIMEOUT = 5.0
 MIN_CLI_PYTHON = (3, 11)
 
 PLUGIN_DIR = Path(__file__).resolve().parents[1]
@@ -212,6 +215,7 @@ def default_config() -> Dict[str, Any]:
         "autonom_root": None,
         "adb": None,
         "cli_timeout_s": DEFAULT_CLI_TIMEOUT,
+        "media_ready_timeout_s": DEFAULT_MEDIA_READY_TIMEOUT,
         "config_error": None,
     }
 
@@ -327,6 +331,17 @@ def load_config(env: Mapping[str, str], home: Path) -> Dict[str, Any]:
             config["cli_timeout_s"] = seconds
         else:
             problems.append("AUTONOM_PROBE_CLI_TIMEOUT must be a number of seconds")
+
+    override = env.get("AUTONOM_PROBE_MEDIA_READY_TIMEOUT")
+    if override:
+        try:
+            seconds = float(override)
+        except ValueError:
+            seconds = -1.0
+        if 0 < seconds <= 600:
+            config["media_ready_timeout_s"] = seconds
+        else:
+            problems.append("AUTONOM_PROBE_MEDIA_READY_TIMEOUT must be a number of seconds")
 
     if problems:
         config["config_error"] = "; ".join(problems)[:1000]

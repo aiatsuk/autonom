@@ -28,6 +28,8 @@ SERIAL = "emulator-5580"
 SERIAL_B = "emulator-5584"
 UDID = "45A342A1-AA2F-4F40-8EFD-F0D0C590ECE5"
 TOKEN = "tok-SECRET-1f2e3d"
+# How long a fake Canvas may take to write its port before the test fails.
+FAKE_CANVAS_START_S = 60
 TOOL_ENV = ("AUTONOM_ADB", "AUTONOM_SIMCTL", "AUTONOM_IDB", "AUTONOM_MITMDUMP", "AUTONOM_AXE",
             "AUTONOM_IOS_HID", "AUTONOM_IDB_COMPANION", "AUTONOM_IDB_COMPANION_BIN",
             "AUTONOM_IDB_STATE_FILE", "AUTONOM_FAKE_STATE", "AUTONOM_FAKE_LOG", "AUTONOM_EMULATOR",
@@ -56,7 +58,7 @@ with open(os.environ["FAKE_NODE_OUT"], "w", encoding="utf-8") as handle:
 # A running Canvas: answers the routes the CLI calls, logs every request (method, path,
 # authorization, body) as one JSON line, and exits on POST /api/stop unless told not to.
 FAKE_CANVAS = r'''
-import json, os, sys, threading
+import json, os, socketserver, sys, threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 LOG = os.environ["FAKE_CANVAS_LOG"]
@@ -122,7 +124,14 @@ class Handler(BaseHTTPRequestHandler):
             return self.answer(200, {"ok": True, "detached": device, "session_stopped": True})
         self.answer(404, {"ok": False, "error": "Not found", "error_code": "not_found", "hint": None})
 
-server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+class Server(ThreadingHTTPServer):
+    # HTTPServer.server_bind looks up the host name (socket.getfqdn), a reverse DNS query
+    # that can take tens of seconds on a CI runner. Nothing here reads the name.
+    def server_bind(self):
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = "127.0.0.1", self.server_address[1]
+
+server = Server(("127.0.0.1", 0), Handler)
 with open(os.environ["FAKE_CANVAS_PORT"], "w", encoding="utf-8") as handle:
     handle.write(str(server.server_address[1]))
 server.serve_forever()
@@ -208,13 +217,21 @@ class CanvasCliCase(unittest.TestCase):
         log, port_file = folder / "requests.log", folder / "port"
         env = dict(self.env, FAKE_CANVAS_LOG=str(log), FAKE_CANVAS_PORT=str(port_file),
                    FAKE_CANVAS_IGNORE_STOP="1" if ignore_stop else "0")
-        process = subprocess.Popen([sys.executable, str(script)], env=env,
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        stderr_file = folder / "stderr.log"
+        with stderr_file.open("wb") as stderr:
+            process = subprocess.Popen([sys.executable, str(script)], env=env,
+                                       stdout=subprocess.DEVNULL, stderr=stderr)
         self.addCleanup(self._kill, process)
-        deadline = time.monotonic() + 15
+        # Only a slow machine waits long here: the fake writes its port at once.
+        started = time.monotonic()
         while not port_file.exists() or not port_file.read_text(encoding="utf-8").strip():
-            self.assertLess(time.monotonic(), deadline, "the fake Canvas did not start")
-            self.assertIsNone(process.poll(), "the fake Canvas exited")
+            elapsed = time.monotonic() - started
+            code = process.poll()
+            if code is not None or elapsed > FAKE_CANVAS_START_S:
+                tail = stderr_file.read_text(encoding="utf-8", errors="replace")[-2000:]
+                state = "exited with code %s" % code if code is not None else "is still running"
+                self.fail("the fake Canvas wrote no port after %.1f s (limit %d s); it %s; "
+                          "stderr: %s" % (elapsed, FAKE_CANVAS_START_S, state, tail or "(empty)"))
             time.sleep(0.05)
         port = int(port_file.read_text(encoding="utf-8"))
         document = self.discovery(port, process.pid, workspace=workspace, mode=mode, token=token)
