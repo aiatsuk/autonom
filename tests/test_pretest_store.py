@@ -1321,19 +1321,22 @@ class RedactionTests(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 2.0)
 
     def test_rework_query_key_is_linear_on_empty_bracket_groups(self) -> None:
-        def best(fn, value) -> float:
+        # CPU time, not wall time: under the parallel check run a preempted
+        # call counts only the time it actually ran, so load cannot inflate it
+        def best(fn, value, calls: int = 1, rounds: int = 2) -> float:
             times = []
-            for _ in range(2):
-                started = time.monotonic()
-                fn(value)
-                times.append(time.monotonic() - started)
+            for _ in range(rounds):
+                started = time.process_time()
+                for _ in range(calls):
+                    fn(value)
+                times.append(time.process_time() - started)
             return min(times)
 
-        def key(n: int) -> str:
-            return "a" + "[]" * n
+        def key(n: int, tail: str = "") -> str:
+            return "a" + "[]" * n + tail
 
-        def url(n: int) -> str:
-            return "https://h/?a" + "[]" * n + "=1"
+        def url(n: int, tail: str = "") -> str:
+            return "https://h/?a" + "[]" * n + tail + "=1"
 
         # the reviewer's 1.6 MB line: the key helpers alone stay fast
         self.assertEqual(store._query_key(key(800_000)), "a")  # noqa: SLF001
@@ -1341,12 +1344,28 @@ class RedactionTests(unittest.TestCase):
         self.assertLess(best(store._scrub_url, url(800_000)), 1.0)  # noqa: SLF001
         self.assertEqual(store._scrub_url(url(800_000)),  # noqa: SLF001
                          store.redact.scrub_url(url(800_000)))
-        # four times the input costs about four times the time, not sixteen
+        # a run followed by another character is the shape the old trailing
+        # "(\[..\])+$" regex retries at every "[" (over 1 s at this size);
+        # the reversed, anchored match fails at once
+        self.assertEqual(store._query_key(key(10_000, "x")), key(10_000, "x"))  # noqa: SLF001
+        self.assertLess(best(store._query_key, key(10_000, "x")), 0.1)  # noqa: SLF001
+        self.assertLess(best(store.redact_text, url(10_000, "x")), 0.2)
+        # eight times the input costs about eight times the time; quadratic
+        # would be 64. The bound sits between them on a log scale (sqrt(8 *
+        # 64) ~ 23), so it leaves about 3x for noise on either side. Each
+        # sample repeats the call until the small one takes 20 ms, and the
+        # sizes alternate over five rounds so both see the same machine.
         for fn, make in ((store._query_key, key), (store.redact_text, url)):  # noqa: SLF001
             with self.subTest(fn=fn.__name__):
-                small = max(best(fn, make(100_000)), 0.005)
-                large = best(fn, make(400_000))
-                self.assertLess(large / small, 9.0, (small, large))
+                small_value, large_value = make(50_000), make(400_000)
+                calls = 1
+                while best(fn, small_value, calls, rounds=1) < 0.02:
+                    calls *= 2
+                small = large = float("inf")
+                for _ in range(5):
+                    small = min(small, best(fn, small_value, calls, rounds=1))
+                    large = min(large, best(fn, large_value, calls, rounds=1))
+                self.assertLess(large / small, 23.0, (calls, small, large))
 
 
     def test_round_4_unicode_blanks_are_separators(self) -> None:
