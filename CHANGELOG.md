@@ -7,7 +7,7 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
 
 ## [Unreleased]
 
-## [0.36.0] - 2026-10-12
+## [0.36.0] - 2026-10-13
 
 ### Added
 - **Ticket pre-test (`autonom pretest`, plan `docs/plans/PHASE_7_TICKET_PRETEST.md`).**
@@ -136,7 +136,9 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
   scripts, used to measure what ChatGPT desktop lets a local Autonom
   integration do (plan `docs/plans/CHATGPT_DEVICE_WORKSPACE.md`, results
   `docs/plans/CHATGPT_P0_RESULTS.md`). It is not part of the Autonom plugin
-  and is not in the release bundle.
+  and is not in the release bundle. `AUTONOM_PROBE_MEDIA_READY_TIMEOUT`
+  (seconds, up to 600) raises its media endpoint's 5 s start limit on slow
+  machines.
 
 ### Changed
 
