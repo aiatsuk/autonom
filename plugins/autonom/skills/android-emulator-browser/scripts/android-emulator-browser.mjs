@@ -539,7 +539,7 @@ export async function startCanvas(options, hooks = {}, { processHandlers = true,
     if (reason) console.log(`Fallback reason: ${reason}`);
   }
   console.log(`Preview at ${pageUrl}`);
-  console.log(`Open this exact URL in the visible Codex side-panel browser: ${pageUrl}`);
+  console.log(`Open this exact URL in your agent's visible side-panel browser: ${pageUrl}`);
   if (!token) console.warn("WARNING: authentication is disabled");
 
   server.discoveryPath = join(stateBase(environment), "canvas", `${server.port}.json`);
@@ -2177,7 +2177,7 @@ async function closeDevice(context) {
 function printHelp() {
   console.log(`android-emulator-browser
 
-Token-protected Android/iOS device preview and input bridge for the Codex side-panel browser.
+Token-protected Android/iOS device preview and input bridge for an agent's side-panel browser.
 
 Usage:
   android-emulator-browser --platform android --serial <adb-serial> [options]
@@ -7572,7 +7572,7 @@ if(sizePicker){
   document.addEventListener("pointerdown",event=>{if(menuOpen&&!sizeMenu.contains(event.target)&&!sizePicker.contains(event.target))closeMenu(false)});
 }
 // Controls that cannot act look and are disabled (PAGE-004); handoff goes the way input goes.
-function leaseOwner(){const lease=view.lease,owner=OWNERS[view.owner]||[String(view.owner),"holds control"];if(view.sessionStopped)return["Session stopped","this device's Autonom session has stopped"];if(!lease)return owner;if(foreignHeld()){const holder=lease.holder||{};return[(holder.kind==="agent"?"Agent":"Someone else")+" '"+(holder.label||"")+"' has control","Take over to use the screen"]}if(leaseMine())return["You have control","Released after "+idleText(lease.idle_s)+" idle"];if(lease.ended_by==="idle")return[owner[0],"your control ended after "+idleText(lease.idle_s)+" idle"];if(lease.ended_by==="lost")return[owner[0],"control moved to "+(lease.holder&&lease.holder.label?lease.holder.label:"another holder")];return owner}
+function leaseOwner(){const lease=view.lease,owner=OWNERS[view.owner]||[String(view.owner),"holds control"];if(view.sessionStopped)return["Session stopped","this device's Autonom session has stopped"];if(!lease)return owner;if(foreignHeld()){const holder=lease.holder||{};return[(holder.kind==="agent"?"Agent":"Someone else")+" '"+(holder.label||"")+"' has control","Take over to use the screen"]}if(leaseMine()){const from=lease.took_over_from,idle="eleased after "+idleText(lease.idle_s)+" idle";return["You have control",from?"took over from "+(from.kind==="agent"?"agent":"someone")+" '"+(from.label||from.id||"")+"' · r"+idle:"R"+idle]}if(lease.ended_by==="idle")return[owner[0],"your control ended after "+idleText(lease.idle_s)+" idle"];if(lease.ended_by==="lost")return[owner[0],"control moved to "+(lease.holder&&lease.holder.label?lease.holder.label:"another holder")];return owner}
 function takeLabel(){if(foreignHeld())return"Take over";if(leaseMine())return view.lease.took_over_from?"Hand back":"Release";return view.owner==="human"?"Release":"Take control"}
 function syncControls(){const ready=Boolean(view.status)&&canSendInput(),owner=leaseOwner();for(const control of inputControls){const disabled=!ready||(control.dataset.system==="rotate"&&view.rotateBusy);if(control.disabled!==disabled)control.disabled=disabled}setText(ui.ownerName,owner[0]);setText(ui.ownerDetail,"· "+(view.paused?"input is paused":owner[1]));setText(ui.chip,owner[0]+(view.paused?" · Paused":""));setState(ui.ownerDot,ready?"live":"warn");setText(ui.take,takeLabel());setText(ui.pause,view.paused?"Resume input":"Pause input");for(const button of [ui.take,ui.pause])if(button.disabled===Boolean(view.status))button.disabled=!view.status}
 function setControl(mode){if(fastActive()&&sendControl({t:"control",mode}))return;post("/control",{mode}).then(result=>{view.owner=result.control_owner;view.paused=result.input_paused;applyLease(result);syncPicker()}).catch(error=>note(error.message))}

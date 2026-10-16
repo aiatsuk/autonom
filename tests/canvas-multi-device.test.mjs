@@ -193,7 +193,7 @@ function canvasArgs(world, args) {
 }
 
 /** The final line the Canvas prints on start-up, after `Preview at`. */
-const STARTED_LINE = /^Open this exact URL in the visible \S+ side-panel browser: \S+\n/m;
+const STARTED_LINE = /^Open this exact URL in your agent's visible side-panel browser: \S+\n/m;
 
 /** Start the Canvas; resolves once it prints its last start-up line, or with its exit when `expectExit`. */
 function startCanvas(world, args, { expectExit = false } = {}) {
@@ -283,7 +283,7 @@ test("a workspace Canvas with no device stays up, writes its files and stops on 
   const world = await makeWorld(t, { devices: [] });
   const canvas = await startCanvas(world, ["--workspace", "empty"]);
   assert.match(canvas.stdout(), /^autonom Canvas workspace empty ready\nTransport preference: screencap\nPreview at /);
-  assert.match(canvas.stdout(), /Open this exact URL in the visible \S+ side-panel browser: http:\/\/127\.0\.0\.1:\d+\/#token=/);
+  assert.match(canvas.stdout(), /Open this exact URL in your agent's visible side-panel browser: http:\/\/127\.0\.0\.1:\d+\/#token=/);
   const workspace = (await api(canvas, "GET", "/api/workspace")).json;
   assert.equal(workspace.mode, "workspace");
   assert.equal(workspace.name, "empty");
