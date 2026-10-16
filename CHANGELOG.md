@@ -7,6 +7,19 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
 
 ## [Unreleased]
 
+## [0.36.1] - 2026-10-16
+
+### Fixed
+- **The Canvas names who it took over from.** After Take over the page reads
+  "You have control · took over from agent '<label>'", and `control status`
+  gains `took_over_from` (the replaced holder's `kind`, `id` and `label`) while
+  that lease is held, renewals included; it is `null` otherwise. The field is
+  additive.
+- **The Canvas start line no longer names one agent host.** `canvas serve`
+  prints "Open this exact URL in your agent's visible side-panel browser"
+  instead of naming Codex, so it reads right in any agent with a side
+  browser.
+
 ## [0.36.0] - 2026-10-13
 
 ### Added
