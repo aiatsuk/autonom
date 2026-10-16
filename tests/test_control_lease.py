@@ -37,7 +37,7 @@ AGENT = "agent:worker-1"
 OTHER = "agent:other"
 HUMAN = "canvas:3277:41234"
 STATUS_KEYS = ["platform", "target_id", "state", "generation", "holder", "expires_at",
-               "remaining_ms", "session_id", "updated_at"]
+               "remaining_ms", "session_id", "updated_at", "took_over_from"]
 REFUSAL_KEYS = {"platform", "target_id", "capability", "generation", "holder", "expires_at"}
 
 
@@ -190,6 +190,11 @@ class WriteTests(_Home):
         self.assertTrue(taken["taken_over"])
         self.assertEqual(taken["lease"]["reason"], "taken_over")
         self.assertEqual(taken["lease"]["previous_holder"]["id"], AGENT)
+        # Status names the replaced holder while the takeover lease is held, renewals included.
+        shown = control.status("android", SERIAL, now_ms=NOW + 3)[0]
+        self.assertEqual(shown["took_over_from"]["id"], AGENT)
+        control.renew("android", SERIAL, holder_id=HUMAN, generation=3, now_ms=NOW + 3)
+        self.assertEqual(control.status("android", SERIAL, now_ms=NOW + 3)[0]["took_over_from"]["id"], AGENT)
         # The replaced agent learns its lease was replaced.
         self.refused("control_generation_stale", control.admit, "android", SERIAL,
                      control.Claim(AGENT, 2), now_ms=NOW + 4)
@@ -197,6 +202,7 @@ class WriteTests(_Home):
         again = control.acquire("android", SERIAL, holder_id=AGENT, now_ms=NOW + 6)
         self.assertEqual(again["generation"], 4)
         self.assertIsNone(again["lease"]["previous_holder"])
+        self.assertIsNone(control.status("android", SERIAL, now_ms=NOW + 6)[0]["took_over_from"])
 
     def test_acquire_by_the_same_live_holder_renews_in_place(self) -> None:
         control.acquire("android", SERIAL, holder_id=AGENT, now_ms=NOW)

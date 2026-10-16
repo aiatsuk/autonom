@@ -553,7 +553,7 @@ function startCanvas(world, { transport = "screencap", args = [] } = {}) {
   return new Promise((resolvePromise, reject) => {
     const timer = setTimeout(() => reject(new Error(`Canvas did not start: ${output}`)), 20_000);
     child.stdout.on("data", () => {
-      const match = output.match(/Open this exact URL in the visible \S+ side-panel browser: http:\/\/127\.0\.0\.1:(\d+)\//);
+      const match = output.match(/Open this exact URL in your agent's visible side-panel browser: http:\/\/127\.0\.0\.1:(\d+)\//);
       if (!match) return;
       clearTimeout(timer);
       resolvePromise({ child, port: Number(match[1]), origin: `http://127.0.0.1:${match[1]}`, exited,

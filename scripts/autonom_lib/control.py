@@ -785,7 +785,7 @@ def renew(platform: str, target_id: str, *, holder_id: str, generation: int,
 # --- Status -------------------------------------------------------------------
 
 _STATUS_KEYS = ("platform", "target_id", "state", "generation", "holder", "expires_at",
-                "remaining_ms", "session_id", "updated_at")
+                "remaining_ms", "session_id", "updated_at", "took_over_from")
 
 
 def _status_entry(lease: dict, now: int) -> dict:
@@ -805,7 +805,16 @@ def _status_entry(lease: dict, now: int) -> dict:
         "remaining_ms": remaining,
         "session_id": lease.get("session_id"),
         "updated_at": lease.get("updated_at"),
+        "took_over_from": _took_over_from(lease, state),
     }
+
+
+def _took_over_from(lease: dict, state: str) -> dict | None:
+    """The holder a Take over replaced, while the lease it granted is still held."""
+    previous = lease.get("previous_holder")
+    if state != "held":
+        return None
+    return dict(previous) if isinstance(previous, dict) else None
 
 
 def _unreadable_entry(platform: str | None, target_id: str | None, name: str) -> dict:

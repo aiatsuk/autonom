@@ -407,7 +407,7 @@ drawer `recording_not_active`, `capture_not_found`, `capture_too_large`,
 | Sessions | — | the workspace Canvas starts `session start --alongside --started-by canvas:<port>:<pid>` per attached device or reuses the live one on that target; `current.json` is never written by it; detach and stop end only the sessions it started |
 | Captures | — | the Actions drawer saves to `~/Downloads/Autonom/<device>/` (`--captures-dir`, `AUTONOM_CAPTURES_DIR`); at 200 files or 2 GB per device folder the oldest indexed captures are deleted |
 
-### Concurrent sessions and shared control (Unreleased)
+### Concurrent sessions and shared control (0.36.0)
 
 Additive, with one intentional change (the Canvas's automatic human lease).
 Error codes added (pinned by `tests/test_error_codes_additive.py`, emitted
