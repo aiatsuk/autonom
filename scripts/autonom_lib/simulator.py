@@ -653,6 +653,131 @@ _NETWORK_SPEEDS = ("gsm", "hscsd", "gprs", "edge", "umts", "hsdpa", "lte", "evdo
 _NETWORK_DELAYS = ("gprs", "edge", "umts", "none")
 _NUMERIC_RANGE = re.compile(r"^\d+(?::\d+)?$")
 
+# What `emu network status` reads back for each named profile, as
+# (upload, download) kbit/s and (minimum, maximum) latency ms. Emulator
+# releases have shipped two speed tables (the console documentation's and
+# the newer source table); a read-back matching either is the profile asked for.
+_SPEED_KBPS: dict[str, tuple[tuple[float, float], ...]] = {
+    "gsm": ((14.4, 14.4),),
+    "hscsd": ((14.4, 57.6),),
+    "gprs": ((28.8, 57.6), (40.0, 80.0)),
+    "edge": ((473.6, 473.6), (118.4, 236.8)),
+    "umts": ((384.0, 384.0), (128.0, 1920.0)),
+    "hsdpa": ((5760.0, 13980.0), (348.0, 14400.0)),
+    "lte": ((58000.0, 173000.0),),
+    "evdo": ((75000.0, 280000.0),),
+    "full": ((0.0, 0.0),),
+}
+_DELAY_MS: dict[str, tuple[int, int]] = {
+    "gprs": (150, 550), "edge": (80, 400), "umts": (35, 200), "none": (0, 0)}
+_STATUS_FIELDS = {
+    "download_bps": re.compile(r"download\s+speed:\s*(\d+)\s*bits/s", re.I),
+    "upload_bps": re.compile(r"upload\s+speed:\s*(\d+)\s*bits/s", re.I),
+    "min_latency_ms": re.compile(r"minimum\s+latency:\s*(\d+)\s*ms", re.I),
+    "max_latency_ms": re.compile(r"maximum\s+latency:\s*(\d+)\s*ms", re.I),
+}
+# `settings get global wifi_on`: 1 on, 2 on (airplane mode), 0 off, 3 off
+# (airplane mode, scanning); `mobile_data`: 1 on, 0 off.
+_WIFI_ON = {"1": True, "2": True, "0": False, "3": False}
+_DATA_ON = {"1": True, "0": False}
+NETWORK_READ_BACK_TRIES = 4
+NETWORK_READ_BACK_PAUSE_S = 0.5
+
+
+def _network_unverified(result: dict[str, Any], reason: str) -> dict[str, Any]:
+    """No read-back could be made: `verified: false`, and why."""
+    _unverified(result)
+    result["verified_reason"] = reason
+    return result
+
+
+def _network_checked(result: dict[str, Any], ok: bool, reason: str) -> dict[str, Any]:
+    """A read-back was made: true only when it matched; else why not."""
+    _checked(result, ok)
+    if not ok:
+        result["verified_reason"] = reason
+    return result
+
+
+def _range_pair(text: str) -> tuple[float, float]:
+    first, _, second = text.partition(":")
+    return float(first), float(second or first)
+
+
+def parse_network_status(text: str) -> dict[str, int] | None:
+    """The four numbers of an emulator `network status` answer, or None
+    when any is missing (an emulator without the console command)."""
+    observed: dict[str, int] = {}
+    for key, pattern in _STATUS_FIELDS.items():
+        match = pattern.search(text or "")
+        if not match:
+            return None
+        observed[key] = int(match.group(1))
+    return observed
+
+
+def _bps_matches(observed: int, kbps: float) -> bool:
+    expected = kbps * 1000
+    return abs(observed - expected) <= max(1.0, expected * 0.001)
+
+
+def _shape_matches(observed: dict[str, int], speed: str, delay: str) -> tuple[bool, str]:
+    speeds = (_range_pair(speed),) if _NUMERIC_RANGE.match(speed) else _SPEED_KBPS[speed]
+    delays = _range_pair(delay) if _NUMERIC_RANGE.match(delay) else _DELAY_MS[delay]
+    speed_ok = any(_bps_matches(observed["upload_bps"], up)
+                   and _bps_matches(observed["download_bps"], down) for up, down in speeds)
+    delay_ok = (observed["min_latency_ms"] == int(delays[0])
+                and observed["max_latency_ms"] == int(delays[1]))
+    if speed_ok and delay_ok:
+        return True, ""
+    parts = []
+    if not speed_ok:
+        parts.append(f"speed up {observed['upload_bps']} / down {observed['download_bps']} "
+                     f"bits/s, not {speed!r}")
+    if not delay_ok:
+        parts.append(f"latency {observed['min_latency_ms']}-{observed['max_latency_ms']} ms, "
+                     f"not {delay!r}")
+    return False, "read-back showed " + " and ".join(parts)
+
+
+def _read_network_switches(target: Target) -> tuple[bool | None, bool | None, dict[str, str]]:
+    raw: dict[str, str] = {}
+    for key in ("wifi_on", "mobile_data"):
+        completed = adb_mod.run_adb(target.tool, ["shell", "settings", "get", "global", key],
+                                    serial=target.target_id, timeout=30, check=False)
+        out = completed.stdout if isinstance(completed.stdout, str) else ""
+        raw[key] = out.strip() if not completed.returncode else ""
+    return _WIFI_ON.get(raw["wifi_on"]), _DATA_ON.get(raw["mobile_data"]), raw
+
+
+def _verify_switches(target: Target, result: dict[str, Any], enabled: bool) -> dict[str, Any]:
+    """Read Wi-Fi and mobile data back; `svc` applies them asynchronously,
+    so a mismatch is re-read a few times before it is reported."""
+    wanted = "on" if enabled else "off"
+    wifi = data = None
+    raw: dict[str, str] = {}
+    for attempt in range(NETWORK_READ_BACK_TRIES):
+        wifi, data, raw = _read_network_switches(target)
+        if wifi is None or data is None:
+            break
+        if wifi == enabled and data == enabled:
+            break
+        if attempt + 1 < NETWORK_READ_BACK_TRIES:
+            time.sleep(NETWORK_READ_BACK_PAUSE_S)
+    result["observed_network"] = {"wifi_on": raw.get("wifi_on", ""),
+                          "mobile_data": raw.get("mobile_data", "")}
+    if wifi is None or data is None:
+        unread = [key for key, value in (("wifi_on", wifi), ("mobile_data", data))
+                  if value is None]
+        return _network_unverified(
+            result, "no read-back available: adb 'settings get global "
+                    + "/".join(unread) + "' gave no on/off value")
+    if wifi == enabled and data == enabled:
+        return _network_checked(result, True, "")
+    showed = ", ".join(f"{name} {'on' if value else 'off'}"
+                       for name, value in (("Wi-Fi", wifi), ("mobile data", data)))
+    return _network_checked(result, False, f"read-back showed {showed}, expected {wanted}")
+
 
 def _network(target: Target, action: str, values: dict[str, Any]) -> dict[str, Any]:
     if target.platform == IOS:
@@ -666,7 +791,7 @@ def _network(target: Target, action: str, values: dict[str, Any]) -> dict[str, A
         state = "enable" if enabled else "disable"
         _adb(target, ["shell", "svc", "wifi", state])
         _adb(target, ["shell", "svc", "data", state])
-        return _unverified({"control": "network", "action": action})
+        return _verify_switches(target, {"control": "network", "action": action}, enabled)
     speed = str(values.get("speed", "full")).strip()
     delay = str(values.get("delay", "none")).strip()
     for key, value, names in (("speed", speed, _NETWORK_SPEEDS),
@@ -678,8 +803,19 @@ def _network(target: Target, action: str, values: dict[str, Any]) -> dict[str, A
                 f"got {value!r}")
     _adb(target, ["emu", "network", "speed", speed])
     _adb(target, ["emu", "network", "delay", delay])
-    return _unverified({"control": "network", "action": "shape", "speed": speed,
-                        "delay": delay})
+    result: dict[str, Any] = {"control": "network", "action": "shape", "speed": speed,
+                              "delay": delay}
+    completed = adb_mod.run_adb(target.tool, ["emu", "network", "status"],
+                                serial=target.target_id, timeout=30, check=False)
+    text = completed.stdout if isinstance(completed.stdout, str) else ""
+    observed = None if completed.returncode else parse_network_status(text)
+    if observed is None:
+        return _network_unverified(
+            result, "no read-back available: adb 'emu network status' printed no "
+                    "speeds and latencies")
+    result["observed_network"] = observed
+    ok, reason = _shape_matches(observed, speed, delay)
+    return _network_checked(result, ok, reason)
 
 
 PUSH_JSON_HINT = (
@@ -867,14 +1003,17 @@ def shell_quote(text: str) -> str:
     return "'" + text.replace("'", "'\\''") + "'"
 
 
+CLIPBOARD_UNAVAILABLE_MESSAGE = "Android does not let a shell read the clipboard (Android 10+)"
+CLIPBOARD_UNAVAILABLE_HINT = "paste into a text field (long-press → Paste) and read it with ui find"
+
+
 def _clipboard_get(target: Target) -> dict[str, Any]:
     if target.platform != IOS:
+        # Android 10+ answers clipboard reads only to the focused app (or the
+        # default IME); a shell is neither, and a helper app is out of scope.
         raise errors.AutonomError(
-            errors.UNSUPPORTED_ON_PLATFORM,
-            "Android has no host-level clipboard read: 'cmd clipboard' has no get, "
-            "and the clipboard service answers only the focused app",
-            "Paste into a field with 'autonom ui key KEYCODE_PASTE' and read the "
-            "field with 'autonom ui find', or read it from the app under test.",
+            errors.CLIPBOARD_UNAVAILABLE, CLIPBOARD_UNAVAILABLE_MESSAGE,
+            CLIPBOARD_UNAVAILABLE_HINT,
             control="clipboard", action="get", valid_actions=["set"])
     text, why = ios_simctl.read_pasteboard(target.tool, target.target_id)
     if text is None:

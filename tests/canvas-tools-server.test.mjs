@@ -427,9 +427,10 @@ test("call: a known op reaches the tools process with its payload and origin; un
     { origin: "agent" });
   assert.equal(answer.status, 200);
   assert.deepEqual(answer.body, { ok: true, result: { op: "mocks.list", payload: { a: 1 }, origin: "agent" } });
-  // A missing payload is an empty one; an unknown origin header is human, as for input.
+  // A missing payload is an empty one; an unknown origin header is an agent, as for input
+  // (RISK-018: human only when named exactly).
   const plain = await api(canvas, auth, "POST", "/tools/call", { op: "network.status" }, { origin: "nobody" });
-  assert.deepEqual(plain.body.result, { op: "network.status", payload: {}, origin: "human" });
+  assert.deepEqual(plain.body.result, { op: "network.status", payload: {}, origin: "agent" });
   // A non-protocol line on the tools stdout is skipped.
   const noisy = await api(canvas, auth, "POST", "/tools/call", { op: "mocks.list", payload: { fake: "noise" } });
   assert.equal(noisy.status, 200);

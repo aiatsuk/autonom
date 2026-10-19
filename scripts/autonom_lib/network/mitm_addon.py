@@ -15,6 +15,7 @@ The redaction tables below are by-value copies of `redact.REDACTED_HEADERS` and
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -31,6 +32,11 @@ REDACTED_HEADERS = frozenset({
 })
 PLACEHOLDER = "<redacted>"
 PREVIEW_LIMIT = 2048
+# A `delay_s` above this is clamped, and a `hang` rule holds a flow at most
+# this long before the flow is killed and recorded as incomplete.
+HANG_CAP_S = 120.0
+HANG_POLL_S = 0.25
+ERROR_KINDS = ("client_abort", "upstream_error", "hang_cap", "other")
 TRUNCATION_MARKER = "…[truncated]"
 
 SENSITIVE_FIELDS = (
@@ -257,6 +263,118 @@ def server_ip(flow):
     return None
 
 
+def rule_delay(rule) -> float | None:
+    """The rule's delay in seconds, or None. Bad values are ignored, big ones capped.
+
+    The registry is validated on write, but the addon must never crash or
+    stall on a hand-edited file.
+    """
+    value = (rule or {}).get("delay_s")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if value != value or value <= 0:  # NaN or not positive
+        return None
+    return float(min(value, HANG_CAP_S))
+
+
+def rule_hangs(rule) -> bool:
+    return (rule or {}).get("hang") is True
+
+
+# Words that name the server side outright; they win over a closed client.
+# The DNS and connect texts are what mitmdump 12.2.3 reports on macOS.
+_UPSTREAM_WORDS = ("server", "upstream", "connect to", "failed to connect", "connect call",
+                   "tls", "ssl", "certificate", "dns", "resolve", "nodename", "not known",
+                   "getaddrinfo", "refused", "unreachable")
+# Words that fit either side ("peer closed connection" is what mitmproxy says
+# when an HTTP/2 client goes away); a closed client connection decides them.
+_AMBIGUOUS_WORDS = ("timed out", "timeout", "peer")
+
+
+def classify_error(message, *, client_side=None) -> str:
+    """Map a mitmproxy flow error to one of `ERROR_KINDS` (never `hang_cap`).
+
+    A message that names the client or the server decides. Otherwise
+    `client_side=True` (the client connection is known to be closed) makes it
+    a client abort, and an ambiguous message ("peer closed connection",
+    "timed out") without that is an upstream error.
+    """
+    text = str(message or "").lower()
+    if "client" in text and any(
+            word in text for word in ("disconnect", "closed", "abort", "reset", "cancel")):
+        return "client_abort"
+    if any(word in text for word in _UPSTREAM_WORDS):
+        return "upstream_error"
+    if client_side is True:
+        return "client_abort"
+    if any(word in text for word in _AMBIGUOUS_WORDS):
+        return "upstream_error"
+    return "other"
+
+
+def client_closed_at(flow):
+    """When the client's connection closed (epoch seconds), else None.
+
+    mitmproxy 12 queues a flow's stream events while its request hook is
+    awaited, so `flow.error` stays None for the whole hold and the error hook
+    only runs after the hook returns. The client connection object is updated
+    at once, though: its `timestamp_end` is set and its state becomes CLOSED
+    as soon as the client hangs up (checked with mitmdump 12.2.3 and
+    `curl --max-time`, HTTP/1.1 and HTTP/2). That is the signal a delayed or
+    held flow polls.
+    """
+    connection = getattr(flow, "client_conn", None)
+    if connection is None:
+        return None
+    ended = getattr(connection, "timestamp_end", None)
+    if isinstance(ended, (int, float)) and not isinstance(ended, bool) and ended > 0:
+        return float(ended)
+    if getattr(getattr(connection, "state", None), "name", None) == "CLOSED":
+        return time.time()
+    return None
+
+
+def _iso(seconds) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(seconds))
+
+
+def incomplete_record(flow, identifier: str, error_kind: str, *, now=None,
+                      ended=None) -> dict:
+    """The store record of a flow that ended without a response.
+
+    Method, host, path, a scrubbed URL, timing and the mock id only: never
+    headers or bodies, since an aborted request is often a login. `ended`
+    defaults to the flow error's time, else `now`.
+    """
+    if error_kind not in ERROR_KINDS:
+        error_kind = "other"
+    request = flow.request
+    now = time.time() if now is None else now
+    started = getattr(request, "timestamp_start", None) or None
+    error = getattr(flow, "error", None)
+    ended = ended or getattr(error, "timestamp", None) or now
+    mock_id = (getattr(flow, "metadata", None) or {}).get("autonom_mock_id")
+    record = {
+        "id": identifier,
+        "completed": False,
+        "error_kind": error_kind,
+        "started_at": _iso(started or now),
+        "started_at_ms": int((started or now) * 1000),
+        "method": request.method,
+        "url": scrub_url(getattr(request, "pretty_url", None)),
+        "host": flow_host(flow),
+        "path": (request.path or "").split("?", 1)[0],
+        "status": None,
+        "mocked": bool(mock_id),
+        "mock_id": mock_id,
+        "client_ip": client_ip(flow),
+    }
+    if started:
+        record["finished_at_ms"] = int(ended * 1000)
+        record["duration_ms"] = max(0, int((ended - started) * 1000))
+    return record
+
+
 # --- addon --------------------------------------------------------------------
 
 
@@ -271,6 +389,11 @@ class AutonomRecorder:
         self._rules: list = []
         self._rules_mtime: float | None = None
         self._rules_warned = False
+        # Seams for the unit tests; mitmproxy never touches them.
+        self._sleep = asyncio.sleep
+        self._clock = time.monotonic
+        self.hang_cap_s = HANG_CAP_S
+        self.hang_poll_s = HANG_POLL_S
 
     # -- mitmproxy hooks --
 
@@ -301,15 +424,113 @@ class AutonomRecorder:
         if "autonom_capture_bodies" in updates:
             self.capture_bodies = bool(ctx.options.autonom_capture_bodies)
 
-    def request(self, flow) -> None:
+    def request(self, flow):
+        """Serve a matching mock; a `delay_s` / `hang` rule waits without blocking.
+
+        A plain mock is served at once and the hook returns None. A rule that
+        waits returns a coroutine instead: mitmproxy awaits an awaitable hook
+        result on the event loop (its addon manager accepts sync and async
+        hooks alike), so a delayed or held flow never stalls any other flow.
+        """
         # Host-based rules match the requested name, never the CONNECT IP.
         rule = select_rule(
             self._load_rules(), flow.request.method, flow.request.pretty_url, flow_host(flow)
         )
         if not rule:
-            return
-        from mitmproxy import http  # noqa: PLC0415
+            return None
+        if rule_hangs(rule) or rule_delay(rule):
+            return self._wait_then_serve(flow, rule)
+        self._serve(flow, rule)
+        return None
 
+    async def _wait_then_serve(self, flow, rule) -> None:
+        # Marked before any wait, so an abort meanwhile records `mocked`.
+        flow.metadata["autonom_mock_id"] = rule.get("id")
+        if rule_hangs(rule):
+            rule = await self._hold(flow, rule)
+            if rule is None:
+                return
+        delay = rule_delay(rule)
+        if delay:
+            flow.metadata["autonom_mock_id"] = rule.get("id")
+            if not await self._wait(flow, delay):
+                return
+        self._serve(flow, rule)
+
+    async def _wait(self, flow, seconds: float) -> bool:
+        """Sleep `seconds` in short steps; False when the client hung up meanwhile.
+
+        One long sleep would serve a response nobody reads and record the
+        flow only once mitmproxy gets to its queued close.
+        """
+        deadline = self._clock() + seconds
+        while True:
+            if self._client_left(flow):
+                return False
+            remaining = deadline - self._clock()
+            if remaining <= 0:
+                return True
+            await self._sleep(min(self.hang_poll_s, remaining))
+
+    async def _hold(self, flow, rule):
+        """Hold a flow while its `hang` rule stays in force.
+
+        Returns the rule to serve when it was switched to answering, None when
+        the request should go upstream (rule removed or disabled), the client
+        hung up (recorded as `client_abort`), or the flow was killed at the cap
+        (recorded as `hang_cap`).
+
+        Limitation: an HTTP/2 client that cancels one stream but keeps its
+        connection open is not visible during the hold (mitmproxy queues the
+        stream reset), so that flow is held to the cap.
+        """
+        identifier = rule.get("id")
+        deadline = self._clock() + self.hang_cap_s
+        while True:
+            if self._client_left(flow):
+                return None
+            remaining = deadline - self._clock()
+            if remaining <= 0:
+                self._end_incomplete(flow, "hang_cap")
+                return None
+            await self._sleep(min(self.hang_poll_s, remaining))
+            if self._client_left(flow):
+                return None
+            current = next((item for item in self._load_rules()
+                            if isinstance(item, dict) and item.get("id") == identifier), None)
+            if current is None or not current.get("enabled", True):
+                # Released: the request continues to the real server.
+                flow.metadata.pop("autonom_mock_id", None)
+                return None
+            if not rule_hangs(current):
+                return current
+
+    def _client_left(self, flow) -> bool:
+        """Record and end a waiting flow whose client hung up; True if so."""
+        closed = client_closed_at(flow)
+        if closed is None:
+            return False
+        self._end_incomplete(flow, "client_abort", ended=closed)
+        return True
+
+    def _end_incomplete(self, flow, kind: str, *, ended=None) -> None:
+        """Write the one incomplete record and kill the flow.
+
+        The kill keeps mitmproxy from sending a request nobody waits for
+        upstream once the hook returns; the error hook that follows sees
+        `autonom_recorded` and adds nothing.
+        """
+        if not flow.metadata.get("autonom_recorded"):
+            flow.metadata["autonom_recorded"] = True
+            if self.directory:
+                self.counter += 1
+                self._append(incomplete_record(flow, flow_id(self.counter), kind, ended=ended))
+        try:
+            flow.kill()
+        except Exception:  # noqa: BLE001 - an already-dead flow is fine
+            pass
+
+    def _serve(self, flow, rule) -> None:
         response = rule.get("response") or {}
         body = b""
         body_path = response.get("body_path")
@@ -323,23 +544,43 @@ class AutonomRecorder:
                     body = handle.read()
             except OSError:
                 body = b""
-        flow.response = http.Response.make(
+        flow.response = self._make_response(
             int(response.get("status", 200)),
             body,
             {str(k): str(v) for k, v in (response.get("headers") or {}).items()},
         )
         flow.metadata["autonom_mock_id"] = rule.get("id")
 
+    @staticmethod
+    def _make_response(status: int, body: bytes, headers: dict):
+        from mitmproxy import http  # noqa: PLC0415
+
+        return http.Response.make(status, body, headers)
+
+    def error(self, flow) -> None:
+        """A flow that ended without a response: one incomplete record."""
+        if not self.directory or flow.metadata.get("autonom_recorded"):
+            return
+        flow.metadata["autonom_recorded"] = True
+        error = getattr(flow, "error", None)
+        closed = client_closed_at(flow)
+        kind = classify_error(getattr(error, "msg", None) or error,
+                              client_side=True if closed is not None else None)
+        self.counter += 1
+        self._append(incomplete_record(flow, flow_id(self.counter), kind))
+
     def response(self, flow) -> None:
         if not self.directory:
             return
         self.counter += 1
         identifier = flow_id(self.counter)
+        flow.metadata["autonom_recorded"] = True
         started = getattr(flow.request, "timestamp_start", None) or time.time()
         ended = getattr(flow.response, "timestamp_end", None) or time.time()
 
         record = {
             "id": identifier,
+            "completed": True,
             "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(started)),
             # Millisecond boundaries let a flow report correlate requests to
             # individual steps. Keep the ISO field for human/CLI compatibility.

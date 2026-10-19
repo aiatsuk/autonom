@@ -60,6 +60,7 @@ PATH_OUTSIDE_CONTAINER = "path_outside_container"
 RECORDING_ALREADY_ACTIVE = "recording_already_active"
 OUTPUT_NOT_WRITABLE = "output_not_writable"  # the requested output path cannot be written
 INVALID_SIMULATOR_ACTION = "invalid_simulator_action"  # an unknown simulator action name
+CLIPBOARD_UNAVAILABLE = "clipboard_unavailable"  # the platform does not let a shell read the clipboard
 
 # --- Network -----------------------------------------------------------------
 PORT_UNAVAILABLE = "port_unavailable"
@@ -192,6 +193,10 @@ NOT_AUTOMATIC = "not_automatic"  # confirm or dismiss of a finding that is not a
 PROFILE_INVALID = "profile_invalid"  # an app profile that does not parse or holds credential-shaped values
 NOT_A_PRETEST_PACK = "not_a_pretest_pack"  # a path that is not a finalized pre-test pack
 DRAFT_UNAVAILABLE = "draft_unavailable"  # no draft flow can be built or found for the finding
+PRETEST_DAMAGED = "pretest_damaged"  # the active pre-test state file is unreadable; no input sent
+RACE_NEEDS_COUNT = "race_needs_count"  # a race edge case needs --observed-count N
+CHECK_NOT_ENDED = "check_not_ended"  # a change to a check that has not been ended yet
+GIT_MISSING = "git_missing"  # git is not on PATH
 # --- Control lease (P2) -------------------------------------------------------
 CONTROL_HELD = "control_held"                          # another live holder controls the target
 CONTROL_GENERATION_STALE = "control_generation_stale"  # the claim's generation is not the lease's

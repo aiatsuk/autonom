@@ -105,7 +105,9 @@ class BindingCase(EnvSandboxMixin, unittest.TestCase):
                 for line in self.log.read_text(encoding="utf-8").splitlines() if line.strip()]
 
     def input_calls(self) -> list[list[str]]:
-        return [argv for argv in self.calls() if "input" in argv]
+        # `dumpsys input` reads the screen rotation; it sends no input.
+        return [argv for argv in self.calls()
+                if "input" in argv and "dumpsys" not in argv]
 
     def journal(self, record: dict) -> list[dict]:
         path = Path(record["artifacts_dir"]) / "journal.ndjson"

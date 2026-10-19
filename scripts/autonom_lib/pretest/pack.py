@@ -17,7 +17,11 @@ and one atomic rename)::
       integrity.json finalized.json
       annotations/           review decisions, written later, outside integrity
 
-Order: an open check is ended ``inconclusive`` ("open at pack time"), the
+Order: first the pack's parent directory is created and a test file is
+written and removed there (``output_not_writable`` otherwise, with every
+check left as it was); then an open check is ended ``inconclusive`` ("open
+at pack time"), and if the pack still cannot be written before it is
+finalized, the checks this call ended are open again. Then the
 pre-test's end time is taken, health is computed and its automatic
 findings written, then the pack is staged and finalized, and only then is
 the end time saved and the record marked ``packed`` (which clears the active
@@ -43,6 +47,10 @@ Each check also lists the requests captured in its time window
 (``check_requests``: method, host, path without the query, status, mocked,
 duration and start time when known; never headers or bodies), at most
 ``MAX_CHECK_REQUESTS`` per check with ``requests_truncated`` counting the rest.
+A request that never completed (its store row says ``completed: false``)
+keeps ``completed: false`` and its ``error_kind`` (``client_abort``,
+``upstream_error``, ``hang_cap`` or ``other``); a completed request carries
+neither field.
 A finding's steps run from its check's start to its latest evidence
 (``repro.cut_at_evidence``).
 
@@ -63,7 +71,10 @@ compared, so a ``pretest stop`` after the crash does not make a matching pack
 stale. When the pre-test changed after that pack was sealed, the build
 refuses with ``report_bundle_finalized`` (``stale: true`` and the names of the
 differing record files) and leaves both the old pack and the record as they
-are, so the caller packs again into a new ``--out``.
+are. Every refusal about a pack that already exists (another ``--out`` for
+a packed pre-test, a changed pack, a stale pack found by ``_adopt``) uses
+``FINALIZED_HINT``: verify the original pack or start a new pre-test; no
+hint says to pack again into a new directory.
 
 ``verify(pack)`` first walks the whole pack with ``lstat`` only and refuses
 it, reading nothing, when any entry is a symlink or special file (contract
@@ -118,6 +129,14 @@ _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _OS_METADATA = frozenset({".DS_Store", "Thumbs.db", "desktop.ini"})
 _RECORDING_SUFFIXES = (".mp4", ".mov", ".webm")
 MAX_CHECK_REQUESTS = 200
+# The hint of every refusal about a pack that already exists (a tampered
+# pack, a finalized re-pack, an earlier pack in --out): a pre-test has one
+# pack, so the hint never says to pack it again.
+FINALIZED_HINT = ("this pre-test is already packed; verify the original pack with "
+                  "'autonom report verify <pack>' or start a new pre-test")
+# The hint of a pack that fails verification (``verify``).
+DAMAGED_HINT = ("Packs are immutable: restore the pack from a copy. A packed pre-test is "
+                "never packed again; start a new pre-test to test the ticket again.")
 
 
 # --- small helpers ---------------------------------------------------------------------
@@ -425,15 +444,23 @@ def check_requests(session: dict[str, Any], checks: list[dict[str, Any]]
             bucket["truncated"] += 1
             continue
         status = row.get("status")
-        path = str(row.get("path") or "").split("?", 1)[0].split("#", 1)[0]
-        item: dict[str, Any] = {
-            "method": store.clip(row.get("method"), 16),
-            "host": store.clip(row.get("host"), 255),
-            "path": store.clip(path, 500) if path else None,
-            "status": status if isinstance(status, int) and not isinstance(status, bool)
-            else None,
-            "mocked": bool(row.get("mocked") or row.get("mock_id")),
-        }
+        try:
+            path = str(row.get("path") or "").split("?", 1)[0].split("#", 1)[0]
+            item: dict[str, Any] = {
+                "method": store.clip(row.get("method"), 16),
+                "host": store.clip(row.get("host"), 255),
+                "path": store.clip(path, 500) if path else None,
+                "status": status if isinstance(status, int) and not isinstance(status, bool)
+                else None,
+                "mocked": bool(row.get("mocked") or row.get("mock_id")),
+            }
+        except RecursionError:  # a value nested too deep to print: skip the line
+            continue
+        if row.get("completed") is False:
+            item["completed"] = False
+            kind = row.get("error_kind")
+            item["error_kind"] = (store.clip(kind, 32) if isinstance(kind, str) else None) \
+                or "other"
         duration = row.get("duration_ms")
         if isinstance(duration, (int, float)) and not isinstance(duration, bool) \
                 and duration >= 0:
@@ -648,8 +675,16 @@ def _result(record: dict[str, Any], pack: Path, integrity: str, verdict: str | N
             "idempotent": idempotent, "pretest_id": record["pretest_id"], **extra}
 
 
-def _existing(record: dict[str, Any], pack: Path) -> dict[str, Any]:
-    verified = verify(pack)
+def _existing(record: dict[str, Any], pack: Path, hint: str = FINALIZED_HINT
+              ) -> dict[str, Any]:
+    try:
+        verified = verify(pack)
+    except errors.AutonomError as exc:
+        if exc.code == errors.REPORT_INTEGRITY_FAILED:
+            # the pack of this pre-test was changed: the hint names what the
+            # tool allows from here (never "pack it again" for a packed one)
+            exc.hint = hint
+        raise
     summary = _read_json(pack / "summary.json") or {}
     finalized = _read_json(pack / bundle_writer_mod.FINALIZED_NAME) or {}
     return _result(record, pack, str(finalized.get("integrity_sha256") or ""),
@@ -682,9 +717,7 @@ def build(session: dict[str, Any], record: dict[str, Any], *, out: str | Path | 
                 raise errors.AutonomError(
                     errors.PRETEST_FINALIZED,
                     f"pre-test {pretest_id} is already packed at {recorded}",
-                    hint="A packed pre-test has one pack; verify it with "
-                         "'autonom report verify <pack>' or omit --out.",
-                    pretest_id=pretest_id, pack=str(recorded))
+                    hint=FINALIZED_HINT, pretest_id=pretest_id, pack=str(recorded))
             result = _existing(current, recorded)
             record.clear()
             record.update(current)
@@ -737,10 +770,7 @@ def _adopt(session: dict[str, Any], record: dict[str, Any], out: Path) -> dict[s
             errors.REPORT_BUNDLE_FINALIZED,
             f"{out} holds an earlier pack of {record['pretest_id']} that no longer "
             "matches the pre-test",
-            hint="The pre-test changed after that pack was finalized. Pack it again into "
-                 "a new directory with 'autonom pretest pack --out <new-dir>'; the earlier "
-                 "pack is left unchanged.",
-            out=str(out), pretest_id=record["pretest_id"], stale=True, differs=differs)
+            hint=FINALIZED_HINT, out=str(out), pretest_id=record["pretest_id"], stale=True, differs=differs)
     _seal(session, record, out, result["integrity_sha256"], sealed_end)
     return result
 
@@ -814,8 +844,76 @@ def _pack_differences(session: dict[str, Any], record: dict[str, Any],
     return differs or [bundle_writer_mod.DESCRIPTOR_NAME]
 
 
+def _probe_out(out: Path) -> None:
+    """Refuse with ``output_not_writable`` unless the pack's parent directory
+    can be created and written (a test file is created there and removed).
+    Runs before any check is closed, so a pack that cannot be written leaves
+    the pre-test as it was."""
+    parent = out.parent
+    try:
+        parent.mkdir(parents=True, exist_ok=True)
+        fd, name = tempfile.mkstemp(prefix=".pack-write-test-", dir=parent)
+        try:
+            os.write(fd, b"x")
+        finally:
+            os.close(fd)
+            os.unlink(name)
+    except OSError as exc:
+        reason = exc.strerror or type(exc).__name__
+        raise errors.AutonomError(
+            errors.OUTPUT_NOT_WRITABLE,
+            f"cannot write the pack to {out}: {parent} cannot be written ({reason})",
+            hint="Choose an --out directory whose parent you can write, or omit --out for "
+                 "the default <pre-test>/pack. Open checks were left open.",
+            out=str(out), reason=reason) from None
+
+
+def _checks_size(path: Path) -> int | None:
+    try:
+        return os.lstat(path).st_size
+    except OSError:
+        return None
+
+
+def _reopen(session: dict[str, Any], pretest_id: str, path: Path, size: int | None,
+            closed: list[str]) -> bool:
+    """Undo the ``end`` events this build appended (the caller holds the
+    pre-test lock, so nothing else was appended): cut ``checks.ndjson`` back
+    to its size before them and point ``active.json`` at the open check
+    again. Returns whether the checks are open again."""
+    try:
+        if size is None:
+            os.unlink(path)
+        else:
+            os.truncate(path, size)
+        store.set_open_check(session, pretest_id, closed[-1])
+    except (OSError, errors.AutonomError):
+        return False
+    return True
+
+
 def _build_locked(session: dict[str, Any], record: dict[str, Any], out: Path,
                   target: Any) -> dict[str, Any]:
+    pretest_id = record["pretest_id"]
+    directory = store.pretest_dir(session, pretest_id)
+    # 0. the pack's parent must be writable before anything changes
+    _probe_out(out)
+    checks_path = directory / store.CHECKS_FILE
+    checks_size = _checks_size(checks_path)
+    closed: list[str] = []
+    try:
+        return _build_closing(session, record, out, target, closed)
+    except BaseException as exc:
+        # the bundle could not be written after all: the checks this call
+        # closed are open again, so they can still be ended by hand
+        if closed and _reopen(session, pretest_id, checks_path, checks_size, closed):
+            if isinstance(exc, errors.AutonomError):
+                exc.extra.setdefault("reopened_checks", list(closed))
+        raise
+
+
+def _build_closing(session: dict[str, Any], record: dict[str, Any], out: Path,
+                   target: Any, closed: list[str]) -> dict[str, Any]:
     pretest_id = record["pretest_id"]
     directory = store.pretest_dir(session, pretest_id)
     # 1. end the pre-test: no check stays open, the end time is fixed once
@@ -823,6 +921,7 @@ def _build_locked(session: dict[str, Any], record: dict[str, Any], out: Path,
         if item["state"] == "open":
             checks_mod.end(session, record, item["check_id"], verdict="inconclusive",
                            note=OPEN_AT_PACK)
+            closed.append(item["check_id"])
     record.update(store.load(session, pretest_id))
     # the end time of this attempt, kept in memory until the pack is sealed;
     # a stopped pre-test keeps the time it was stopped
@@ -936,6 +1035,9 @@ def _build_locked(session: dict[str, Any], record: dict[str, Any], out: Path,
                                                              "pretest_id": pretest_id})
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
+    # finalized: from here on the pack holds those check ends, so a failure
+    # below never reopens them (a retry adopts the pack)
+    closed.clear()
     _seal(session, record, out, sealed["integrity_sha256"], ended_at)
     return _result(record, out, sealed["integrity_sha256"], verdict["verdict"], False,
                    files=sealed["files"], warnings=evidence.warnings + [
@@ -1177,9 +1279,8 @@ def _integrity_refusal(root: Path, failures: list[dict[str, Any]],
                        nested: list[dict[str, Any]]) -> errors.AutonomError:
     return errors.AutonomError(
         errors.REPORT_INTEGRITY_FAILED, "pre-test pack integrity verification failed",
-        hint="A file changed after the pack was finalized (see failures). Packs are "
-             "immutable: restore the file or pack the pre-test again into a new "
-             "directory.", pack=str(root), failures=failures, nested=nested)
+        hint="A file changed after the pack was finalized (see failures). "
+             + DAMAGED_HINT, pack=str(root), failures=failures, nested=nested)
 
 
 def _scan_refusal(root: Path) -> errors.AutonomError | None:
@@ -1304,8 +1405,7 @@ def verify(pack: str | Path) -> dict[str, Any]:
     except Exception as exc:  # noqa: BLE001 - a scan that cannot finish proves nothing
         raise errors.AutonomError(
             errors.REPORT_INTEGRITY_FAILED, "pre-test pack could not be verified",
-            hint="The pack is damaged or unreadable (see failures). Packs are immutable: "
-                 "restore it from a copy or pack the pre-test again into a new directory.",
+            hint="The pack is damaged or unreadable (see failures). " + DAMAGED_HINT,
             pack=str(root), failures=[{"path": "", "reason": type(exc).__name__}],
             nested=[]) from None
     if refusal is not None:
@@ -1327,8 +1427,7 @@ def verify(pack: str | Path) -> dict[str, Any]:
     except Exception as exc:  # noqa: BLE001 - malformed packs are refusals, not crashes
         raise errors.AutonomError(
             errors.REPORT_INTEGRITY_FAILED, "pre-test pack could not be verified",
-            hint="The pack is damaged or unreadable (see failures). Packs are immutable: "
-                 "restore it from a copy or pack the pre-test again into a new directory.",
+            hint="The pack is damaged or unreadable (see failures). " + DAMAGED_HINT,
             pack=str(root), failures=[{"path": "", "reason": type(exc).__name__}],
             nested=[]) from None
     if failures:

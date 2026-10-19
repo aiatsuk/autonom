@@ -857,10 +857,14 @@ class ClipboardTests(Base):
         code, payload = self.ios("simulator", "clipboard", "get")
         self.assertEqual(payload["text"], "naïve")
 
-    def test_android_clipboard_get_is_unsupported(self) -> None:
+    def test_android_clipboard_get_is_unavailable(self) -> None:
         code, payload = self.android("simulator", "clipboard", "get")
         self.assertEqual(code, 2, payload)
-        self.assertEqual(payload["error_code"], errors.UNSUPPORTED_ON_PLATFORM)
+        self.assertEqual(payload["error_code"], errors.CLIPBOARD_UNAVAILABLE)
+        self.assertEqual(payload["error"],
+                         "Android does not let a shell read the clipboard (Android 10+)")
+        self.assertEqual(payload["hint"], "paste into a text field (long-press → Paste) "
+                                          "and read it with ui find")
         self.assertEqual(self.argv_log("adb"), [], "refused before any device command")
 
     def test_android_set_without_the_shell_command_exits_2(self) -> None:

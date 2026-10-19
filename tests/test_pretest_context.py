@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -130,7 +131,8 @@ class DiffFilesTests(RepoCase):
         self.write(repo, "a.txt", "x\n")
         self.commit(repo, "only")
         self.assertEqual(context_mod.diff_files(repo, "main", None),
-                         {"changed_files": [], "diff_truncated": False})
+                         {"changed_files": [], "diff_truncated": False,
+                          "skipped_untracked": []})
         self.assertEqual(context_mod.diff_files(repo, "main", "main")["changed_files"], [])
 
     def test_untracked_files_count_against_the_working_tree_only(self) -> None:
@@ -309,21 +311,98 @@ class DiffFilesTests(RepoCase):
         tree = self.git(repo, "rev-parse", "HEAD^{tree}").strip()
         with self.assertRaises(errors.AutonomError) as caught:
             context_mod.diff_files(repo, tree, None)
-        self.assertEqual(caught.exception.code, errors.BACKEND_FAILED)
+        self.assertEqual(caught.exception.code, errors.INVALID_VALUE)
+        self.assertTrue(caught.exception.extra["reason"])
 
-    def test_git_failures_are_backend_failed(self) -> None:
+    def test_git_failures_are_invalid_value_with_gits_own_text(self) -> None:
+        """fu-016: an unknown ref and a directory that is not a repository
+        are invalid_value naming git's first stderr line; never empty."""
         repo = self.init()
         self.write(repo, "a.txt", "x\n")
         self.commit(repo, "only")
         with self.assertRaises(errors.AutonomError) as caught:
             context_mod.diff_files(repo, "no-such-ref", None)
-        self.assertEqual(caught.exception.code, errors.BACKEND_FAILED)
-        self.assertTrue(caught.exception.hint)
+        error = caught.exception
+        self.assertEqual(error.code, errors.INVALID_VALUE)
+        self.assertTrue(error.hint)
+        self.assertIn("--base no-such-ref is not a commit", error.message)
+        self.assertTrue(error.extra["reason"].strip())
+        self.assertIn(error.extra["reason"], error.message)
+        self.assertNotIn("not on PATH", error.message)
+        json.dumps(error.as_dict())
+        with self.assertRaises(errors.AutonomError) as caught:
+            context_mod.diff_files(repo, "main", "no-such-head")
+        self.assertEqual(caught.exception.code, errors.INVALID_VALUE)
+        self.assertIn("--head no-such-head", caught.exception.message)
         outside = self.root / "not-a-repo"
         outside.mkdir()
         with self.assertRaises(errors.AutonomError) as caught:
             context_mod.diff_files(outside, "main", None)
-        self.assertEqual(caught.exception.code, errors.BACKEND_FAILED)
+        error = caught.exception
+        self.assertEqual(error.code, errors.INVALID_VALUE)
+        self.assertTrue(error.extra["reason"].strip())
+        self.assertIn(error.extra["reason"].splitlines()[0], error.message)
+        self.assertNotIn("not on PATH", error.message)
+
+    def test_git_error_without_stderr_still_has_a_reason(self) -> None:
+        repo = self.init()
+        failed = subprocess.CompletedProcess(["git"], 129, stdout=b"", stderr=b"\n  \n")
+        with mock.patch.object(context_mod.subprocess, "run", return_value=failed):
+            with self.assertRaises(errors.AutonomError) as caught:
+                context_mod._git_bytes(repo, ["status"], "status")
+        self.assertEqual(caught.exception.code, errors.INVALID_VALUE)
+        self.assertEqual(caught.exception.extra["reason"], "git exited with status 129")
+        self.assertTrue(caught.exception.message.endswith("git exited with status 129"))
+        # a multi-line stderr keeps only its first non-empty line
+        failed = subprocess.CompletedProcess(["git"], 128, stdout=b"",
+                                             stderr=b"\nfatal: first\nhint: second\n")
+        with mock.patch.object(context_mod.subprocess, "run", return_value=failed):
+            with self.assertRaises(errors.AutonomError) as caught:
+                context_mod._git_bytes(repo, ["status"], "status")
+        self.assertEqual(caught.exception.extra["reason"], "fatal: first")
+
+    def test_missing_git_binary_is_git_missing(self) -> None:
+        """fu-016: only a missing git executable says 'git is not on PATH'."""
+        repo = self.init()
+        with mock.patch.object(context_mod.subprocess, "run",
+                               side_effect=FileNotFoundError(2, "No such file", "git")):
+            with self.assertRaises(errors.AutonomError) as caught:
+                context_mod.diff_files(repo, "main", None)
+        self.assertEqual(caught.exception.code, errors.GIT_MISSING)
+        self.assertEqual(caught.exception.message, "git is not on PATH")
+        self.assertTrue(caught.exception.hint)
+        json.dumps(caught.exception.as_dict())
+        # the streamed -U0 diff reports the same
+        with mock.patch.object(context_mod.subprocess, "Popen",
+                               side_effect=FileNotFoundError(2, "No such file", "git")):
+            with self.assertRaises(errors.AutonomError) as caught:
+                context_mod._hunks(repo, "main", 1000)
+        self.assertEqual(caught.exception.code, errors.GIT_MISSING)
+        # and with git really absent from PATH
+        with mock.patch.dict(os.environ, {"PATH": str(self.root / "empty-bin")}):
+            with self.assertRaises(errors.AutonomError) as caught:
+                context_mod.diff_files(repo, "main", None)
+        self.assertEqual(caught.exception.code, errors.GIT_MISSING)
+
+    def test_missing_or_file_repo_is_invalid_value_not_git_missing(self) -> None:
+        """fu-016: a missing --repo or a file as --repo is never 'git is not on PATH'."""
+        missing = self.root / "no-such-repo"
+        a_file = self.root / "a-file"
+        a_file.write_text("x\n", encoding="utf-8")
+        for repo in (missing, a_file):
+            for call in (lambda r: context_mod.diff_files(r, "main", None),
+                         lambda r: context_mod.build(r, "main", None, None, None, None),
+                         lambda r: context_mod._hunks(r, "main", 1000)):
+                with self.subTest(repo=repo.name):
+                    with self.assertRaises(errors.AutonomError) as caught:
+                        call(repo)
+                    error = caught.exception
+                    self.assertEqual(error.code, errors.INVALID_VALUE)
+                    self.assertIn("is not a directory", error.message)
+                    self.assertIn(str(repo), error.message)
+                    self.assertTrue(error.hint)
+                    self.assertNotIn("PATH", error.message)
+                    json.dumps(error.as_dict())
 
 
 class BuildTests(RepoCase):
@@ -366,9 +445,55 @@ class BuildTests(RepoCase):
         # hints never count as coverage: the flows block is computed without them
         self.assertNotIn("scr_cart", json.dumps(context["flows"]))
 
+    def test_pr_flow_for_ios_on_android_session_is_warned(self) -> None:
+        """A.10: the context passes the session platform to the selection and
+        keeps its warning in ``flows.warnings``; the flow stays selected."""
+        repo = self.feature_repo()
+        self.write(repo, ".autonom/flows/ios.yaml",
+                   "schema: autonom.dev/flow/v1\nappId: com.example.app\nname: iPhone only\n"
+                   "tags: [pull-request]\nrequires:\n  platform:\n    - ios\n---\n"
+                   "- assertVisible:\n    selector:\n      id: x\n")
+        expected = [{"code": "flow_platform_mismatch",
+                     "message": "flow iPhone only is for ios",
+                     "flow": ".autonom/flows/ios.yaml", "platforms": ["ios"],
+                     "session_platform": "android"}]
+        for kwargs, session in (({}, {"platform": "android"}),
+                                ({"platform": "android"}, None),
+                                ({"platform": "android"}, {"platform": "ios"})):
+            with self.subTest(kwargs=kwargs, session=session):
+                context = context_mod.build(repo, "main", "feature", None, session,
+                                            "com.example.app", **kwargs)
+                self.assertTrue(any(item["flow"].endswith("ios.yaml")
+                                    for item in context["flows"]["selected"]))
+                self.assertEqual(context["flows"]["warnings"], expected)
+        context = context_mod.build(repo, "main", "feature", None, {"platform": "ios"},
+                                    "com.example.app")
+        self.assertEqual(context["flows"]["warnings"], [])
+        self.assertEqual(context_mod.build(None, None, None, None, None, None)
+                         ["flows"]["warnings"], [])
+
+    def test_missing_flows_dir_is_invalid_value(self) -> None:
+        """fu-021: an explicit --flows that does not exist is refused."""
+        repo = self.feature_repo()
+        missing = repo / "nope"
+        for repo_arg in (repo, None):
+            with self.subTest(repo=repo_arg):
+                with self.assertRaises(errors.AutonomError) as caught:
+                    context_mod.build(repo_arg, "main", None, missing, None, "com.none")
+                error = caught.exception
+                self.assertEqual(error.code, errors.INVALID_VALUE)
+                self.assertEqual(error.message, f"--flows {missing} does not exist")
+                self.assertTrue(error.hint)
+                json.dumps(error.as_dict())
+        # an existing directory (even an empty one) is fine
+        empty = repo / "empty-flows"
+        empty.mkdir()
+        context = context_mod.build(repo, "main", None, empty, None, "com.none")
+        self.assertEqual(context["flows"]["selected"], [])
+
     def test_no_flows_dir_and_no_map(self) -> None:
         repo = self.feature_repo()
-        context = context_mod.build(repo, "main", None, repo / "nope", None, "com.none")
+        context = context_mod.build(repo, "main", None, None, None, "com.none")
         self.assertEqual(context["flows"]["selected"], [])
         self.assertEqual(context["flows"]["invalid"], [])
         self.assertEqual(sorted(context["flows"]["uncovered_files"]),
@@ -380,6 +505,7 @@ class BuildTests(RepoCase):
     def test_without_a_repo_the_context_is_empty(self) -> None:
         context = context_mod.build(None, None, None, None, None, None)
         self.assertEqual(context["changed_files"], [])
+        self.assertEqual(context["skipped_untracked"], [])
         self.assertEqual(context["flows"]["selected"], [])
         self.assertFalse(context["diff_truncated"])
 
@@ -389,6 +515,97 @@ class BuildTests(RepoCase):
         (graph_dir / "graph.json").write_text("{", encoding="utf-8")
         self.assertEqual(context_mod.runtime_map_hints("com.bad", ["lib/cart/a.dart"],
                                                        ["lib/cart"]), [])
+
+
+class UntrackedReadTests(RepoCase):
+    """fu-017: untracked files are read without following a symlink and
+    without blocking; anything else is skipped and listed."""
+
+    def alarm(self, seconds: int = 5) -> None:
+        if not hasattr(signal, "SIGALRM"):
+            self.skipTest("no SIGALRM on this platform")
+
+        def fire(_signum, _frame):
+            raise TimeoutError("reading untracked files blocked")
+
+        previous = signal.signal(signal.SIGALRM, fire)
+        signal.alarm(seconds)
+
+        def restore() -> None:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, previous)
+
+        self.addCleanup(restore)
+
+    def repo_with_specials(self) -> Path:
+        if not hasattr(os, "mkfifo"):
+            self.skipTest("no FIFOs on this platform")
+        repo = self.init()
+        self.write(repo, "a.txt", "x\n")
+        self.commit(repo, "only")
+        os.mkfifo(repo / "pipe")
+        os.symlink("pipe", repo / "pipe-link")
+        self.write(repo, "real.txt", "one\ntwo\n")
+        os.symlink("real.txt", repo / "real-link")
+        return repo
+
+    def test_fifo_and_symlinks_do_not_block_and_are_listed(self) -> None:
+        repo = self.repo_with_specials()
+        self.alarm()
+        # git itself does not list a FIFO; name it as if it did, so the
+        # reader meets both kinds
+        listed = ["pipe", "pipe-link", "real-link", "real.txt"]
+        with mock.patch.object(context_mod, "_untracked", return_value=listed):
+            result = context_mod.diff_files(repo, "main", None)
+        self.assertEqual(sorted(result["skipped_untracked"]),
+                         ["pipe", "pipe-link", "real-link"])
+        files = {item["path"]: item for item in result["changed_files"]}
+        self.assertEqual(files["real.txt"]["ranges"], [[1, 2]])
+        for name in ("pipe", "pipe-link", "real-link"):
+            self.assertEqual(files[name]["ranges"], [], name)
+            self.assertEqual(files[name]["status"], "A")
+
+    def test_build_lists_skipped_untracked_in_context(self) -> None:
+        repo = self.repo_with_specials()
+        self.alarm()
+        context = context_mod.build(repo, "main", None, None, None, None)
+        # git lists the symlinks, not the FIFO
+        self.assertIn("pipe-link", context["skipped_untracked"])
+        self.assertIn("real-link", context["skipped_untracked"])
+        self.assertNotIn("real.txt", context["skipped_untracked"])
+        json.dumps(context)
+
+    def test_a_symlink_swapped_in_after_lstat_is_not_followed(self) -> None:
+        repo = self.repo_with_specials()
+        self.alarm()
+        regular = os.lstat(repo / "real.txt")
+        real_lstat = os.lstat
+
+        def lying_lstat(path, *args, **kwargs):
+            if str(path).endswith("pipe-link"):
+                return regular  # as if it was a regular file a moment ago
+            return real_lstat(path, *args, **kwargs)
+
+        with mock.patch.object(context_mod.os, "lstat", side_effect=lying_lstat):
+            with self.assertRaises(OSError):
+                context_mod.read_untracked(repo / "pipe-link")
+            with mock.patch.object(context_mod, "_untracked", return_value=["pipe-link"]):
+                result = context_mod.diff_files(repo, "main", None)
+        self.assertEqual(result["skipped_untracked"], ["pipe-link"])
+
+    def test_large_and_binary_untracked_files_keep_their_rules(self) -> None:
+        repo = self.init()
+        self.write(repo, "a.txt", "x\n")
+        self.commit(repo, "only")
+        self.write(repo, "blob.bin", b"\x00\x01")
+        with mock.patch.object(context_mod, "UNTRACKED_READ_LIMIT", 4):
+            self.write(repo, "big.txt", "123456789\n")
+            result = context_mod.diff_files(repo, "main", None)
+        files = {item["path"]: item for item in result["changed_files"]}
+        self.assertTrue(files["blob.bin"]["binary"])
+        self.assertEqual(files["big.txt"]["ranges"], [])
+        self.assertTrue(result["diff_truncated"])
+        self.assertEqual(result["skipped_untracked"], [])
 
 
 if __name__ == "__main__":

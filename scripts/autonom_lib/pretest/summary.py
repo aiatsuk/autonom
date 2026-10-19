@@ -58,6 +58,42 @@ _EVIDENCE_ID = re.compile(r"^e-[1-9]\d*$")
 _PACK_PATH = re.compile(r"^(?:blobs/sha256/[0-9a-f]{2}/[0-9a-f]{64}|runs/[A-Za-z0-9._-]+/)$")
 REVIEW_PLACEHOLDER = "<pack>"
 MD_REQUESTS = 30
+# Global flags whose value is a path on the machine that ran the pre-test, not
+# part of the step: a repro command drops the flag and its value.
+HOST_ONLY_FLAGS = ("--adb",)
+
+
+def drop_host_flags(args: Any) -> list[Any]:
+    """``args`` of a repro step without ``--adb <path>`` / ``--adb=<path>``
+    (``HOST_ONLY_FLAGS``); everything else is kept in order. Anything that is
+    not a list gives an empty list."""
+    if not isinstance(args, list):
+        return []
+    out: list[Any] = []
+    skip = False
+    for arg in args:
+        if skip:
+            skip = False
+            continue
+        text = arg if isinstance(arg, str) else None
+        if text in HOST_ONLY_FLAGS:
+            skip = True
+            continue
+        if text is not None and any(text.startswith(flag + "=") for flag in HOST_ONLY_FLAGS):
+            continue
+        out.append(arg)
+    return out
+
+
+def repro_steps(steps: Any) -> list[Any]:
+    """Repro steps as kept in a summary: each step's ``args`` without the
+    host-only flags (``drop_host_flags``); other fields unchanged."""
+    out: list[Any] = []
+    for step in steps if isinstance(steps, list) else []:
+        if isinstance(step, dict) and "args" in step:
+            step = {**step, "args": drop_host_flags(step.get("args"))}
+        out.append(step)
+    return out
 
 
 # --- build ---------------------------------------------------------------------------
@@ -129,7 +165,7 @@ def build_summary(record: dict[str, Any], checks: list[dict[str, Any]],
             "ended_at": check.get("ended_at"), "duration_s": check.get("duration_s"),
             "run_ids": list(check.get("run_ids") or []),
             "evidence": list(check_evidence.get(cid) or []),
-            "repro": list(check_repro.get(cid) or []),
+            "repro": repro_steps(list(check_repro.get(cid) or [])),
             "before": before.get(cid), "after": after.get(cid),
             "requests": [dict(item) for item in
                          _list(_dict(check_requests.get(cid)).get("requests"))
@@ -147,7 +183,7 @@ def build_summary(record: dict[str, Any], checks: list[dict[str, Any]],
             "confirmed": finding.get("confirmed"),
             "evidence": list(finding_evidence.get(fid) or []),
             "refs": list(finding.get("evidence") or []),
-            "repro": list(finding_repro.get(fid) or []),
+            "repro": repro_steps(list(finding_repro.get(fid) or [])),
             "reproduced": finding.get("reproduced"), "stability": finding.get("stability"),
             "repro_runs": list(finding.get("repro_runs") or []),
             "draft_flow": finding.get("draft_flow"),
@@ -354,10 +390,14 @@ def summary_failures(summary: Any) -> list[str]:
                     and _is_str(req.get("host"), nullable=True)
                     and _is_str(req.get("path"), nullable=True)
                     and (req.get("status") is None or _is_count(req.get("status")))
+                    and ("completed" not in req or isinstance(req.get("completed"), bool))
+                    and ("error_kind" not in req
+                         or _is_str(req.get("error_kind"), nullable=True))
                     and not any(key in req for key in _REQUEST_SECRETS)
                     for req in requests):
                 failures.append(f"{where}.requests must be a list of {{method, host, path, "
-                                "status, mocked, duration_ms?, started_at?}}")
+                                "status, mocked, duration_ms?, started_at?, completed?, "
+                                "error_kind?}")
         if "requests_truncated" in item and not _is_count(item["requests_truncated"]):
             failures.append(f"{where}.requests_truncated must be an integer >= 0")
     findings = summary.get("findings")
@@ -568,7 +608,7 @@ def _step_text(step: Any) -> str:
     if not isinstance(step, dict):
         return "—"
     parts = [str(step.get("verb") or "step")]
-    parts += [str(arg) for arg in step.get("args") or [] if arg is not None]
+    parts += [str(arg) for arg in drop_host_flags(step.get("args")) if arg is not None]
     selector = step.get("selector")
     if isinstance(selector, dict):
         parts += [f"{key}={value}" for key, value in selector.items()]
@@ -602,11 +642,26 @@ def _evidence_lines(ids: list[str], by_id: dict[str, dict[str, Any]]) -> list[st
     return out
 
 
+def incomplete_text(item: dict[str, Any]) -> str | None:
+    """``never completed (hang_cap)`` for a request whose row says
+    ``completed: false``; None for any other request."""
+    if item.get("completed") is not False:
+        return None
+    kind = item.get("error_kind")
+    kind = kind.strip() if isinstance(kind, str) else ""
+    return f"never completed ({kind})" if kind else "never completed"
+
+
 def request_text(item: dict[str, Any]) -> str:
-    """One captured request in one line: ``GET host/path → 200 (mocked, 120 ms)``."""
+    """One captured request in one line: ``GET host/path → 200 (mocked, 120 ms)``;
+    a request that never completed reads ``→ never completed (hang_cap)``."""
     text = f"{item.get('method') or '?'} {item.get('host') or ''}{item.get('path') or ''}"
     status = item.get("status")
-    text += f" → {status}" if status is not None else " → no status"
+    incomplete = incomplete_text(item)
+    if incomplete:
+        text += f" → {incomplete}"
+    else:
+        text += f" → {status}" if status is not None else " → no status"
     extras = []
     if item.get("mocked"):
         extras.append("mocked")

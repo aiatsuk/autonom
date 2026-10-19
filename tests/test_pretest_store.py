@@ -277,7 +277,7 @@ class StartTests(PretestBase):
         self.assert_code(errors.INVALID_VALUE, self.create, kind="bogus")
         self.assert_code(errors.INVALID_VALUE, self.create, base=None)
         self.assert_code(errors.INVALID_VALUE, self.create, rerun_of={"checks": []})
-        self.assert_code(errors.BACKEND_FAILED, self.create, base="no-such-ref")
+        self.assert_code(errors.INVALID_VALUE, self.create, base="no-such-ref")
         victim = self.root / "victim.txt"
         victim.write_text("keep me\n", encoding="utf-8")
         self.assert_code(errors.INVALID_VALUE, self.create, base=f"--output={victim}")
@@ -312,7 +312,363 @@ class StartTests(PretestBase):
         error = self.assert_code(errors.INVALID_VALUE, store.load, self.session,
                                  record["pretest_id"])
         self.assertTrue(error.extra["failures"])
+        # RISK-042: a damaged active record is not "no pre-test"
+        self.assert_code(errors.PRETEST_DAMAGED, store.active, self.session)
+
+
+class DamagedActiveRecordTests(PretestBase):
+    """B.8 / RISK-042: an unreadable or invalid active record."""
+
+    def record_path(self, record: dict) -> Path:
+        return self.pretests() / record["pretest_id"] / "pretest.json"
+
+    def damage(self, record: dict, content: bytes) -> Path:
+        path = self.record_path(record)
+        path.write_bytes(content)
+        return path
+
+    def assert_damaged(self, record: dict) -> errors.AutonomError:
+        error = self.assert_code(errors.PRETEST_DAMAGED, store.active, self.session)
+        path = str(self.record_path(record))
+        self.assertIn(path, error.message)
+        self.assertEqual(error.hint, "autonom pretest stop --force, or restore the file")
+        self.assertEqual(error.extra["pretest_id"], record["pretest_id"])
+        self.assertEqual(error.extra["path"], path)
+        self.assertTrue(error.extra["reason"])
+        return error
+
+    def test_every_damage_form_raises_pretest_damaged(self) -> None:
+        record = self.create()
+        good = json.dumps(record).encode("utf-8")
+        cases = {
+            "truncated": (b"{", "not valid JSON"),
+            "empty": (b"", "not valid JSON"),
+            "array": (b"[]", "record must be an object"),
+            "not utf-8": (b"\xff\xfe{", "not UTF-8 text"),
+            "bad status": (json.dumps({**record, "status": "weird"}).encode(),
+                           "status must be one of"),
+            "missing field": (json.dumps({k: v for k, v in record.items()
+                                          if k != "budget"}).encode(), "budget"),
+            "other id": (json.dumps({**record, "pretest_id":
+                                     "pt_20260101T000000_abcdef"}).encode(),
+                         "the pointer names"),
+        }
+        for name, (content, reason) in cases.items():
+            with self.subTest(case=name):
+                self.damage(record, content)
+                error = self.assert_damaged(record)
+                self.assertIn(reason, error.extra["reason"])
+                status = store.damaged_status(self.session)
+                self.assertEqual(status["status"], "damaged")
+                self.assertEqual(status["reason"], error.extra["reason"])
+                self.assert_code(errors.PRETEST_DAMAGED, store.require_active, self.session)
+                # attribution (the evidence hot path) never raises
+                self.assertIn(store.attribution(self.session),
+                              ({}, {"pretest_id": record["pretest_id"]}))
+        self.damage(record, good)
+        self.assertEqual(store.active(self.session)["pretest_id"], record["pretest_id"])
+        self.assertIsNone(store.damaged_status(self.session))
+
+    def test_a_directory_in_place_of_the_record_is_damage(self) -> None:
+        record = self.create()
+        path = self.record_path(record)
+        path.unlink()
+        path.mkdir()
+        error = self.assert_damaged(record)
+        self.assertIn("cannot be read", error.extra["reason"])
+
+    def test_a_validator_crash_is_damage_not_a_crash(self) -> None:
+        record = self.create()
+        with mock.patch.object(store, "_failures_for_record", side_effect=TypeError("x")):
+            error = self.assert_damaged(record)
+        self.assertIn("validation failed (TypeError)", error.extra["reason"])
+
+    def test_the_reason_is_redacted(self) -> None:
+        record = self.create()
+        with mock.patch.object(store, "_failures_for_record",
+                               return_value=["token: sk-live-ABCDEFGH12345678"]):
+            error = self.assert_damaged(record)
+        self.assertNotIn("sk-live-ABCDEFGH12345678", error.extra["reason"])
+        self.assertNotIn("sk-live-ABCDEFGH12345678", json.dumps(error.as_dict()))
+
+    def test_no_record_or_a_finished_one_is_still_no_pretest(self) -> None:
         self.assertIsNone(store.active(self.session))
+        self.assertIsNone(store.damaged_status(self.session))
+        record = self.create()
+        stopped = {**record, "status": "stopped", "ended_at": store.now()}
+        self.record_path(record).write_text(json.dumps(stopped), encoding="utf-8")
+        self.assertIsNone(store.active(self.session))
+        self.assertIsNone(store.damaged_status(self.session))
+        self.record_path(record).unlink()
+        self.assertIsNone(store.active(self.session))
+        self.assertIsNone(store.damaged_status(self.session))
+
+    def test_start_is_refused_while_the_active_record_is_damaged(self) -> None:
+        record = self.create()
+        self.damage(record, b"{")
+        self.assert_code(errors.PRETEST_DAMAGED, self.create)
+        self.assertEqual(self.pretest_dirs(), [record["pretest_id"]])
+
+    def test_stop_marks_stopped_and_keeps_the_damaged_file(self) -> None:
+        record = self.create()
+        check = checks_mod.add(self.session, record, title="Cart", kind="ticket")
+        checks_mod.begin(self.session, record, check["check_id"])
+        partial = {key: record[key] for key in ("title", "target", "created_at", "budget",
+                                                 "ticket_ref", "base", "app_id")}
+        partial["status"] = 7  # invalid: the record is damaged
+        content = json.dumps(partial).encode("utf-8")
+        self.damage(record, content)
+        self.assert_damaged(record)
+        stopped = store.stop(self.session, force=True)
+        self.assertEqual(stopped["status"], "stopped")
+        self.assertEqual(stopped["pretest_id"], record["pretest_id"])
+        self.assertEqual(stopped["damaged"]["file"], "pretest.json.damaged")
+        self.assertIn("status must be one of", stopped["damaged"]["reason"])
+        directory = self.pretests() / record["pretest_id"]
+        kept = directory / "pretest.json.damaged"
+        self.assertEqual(kept.read_bytes(), content)
+        self.assertEqual(stat.S_IMODE(kept.stat().st_mode), 0o600)
+        saved = store.load(self.session, record["pretest_id"])
+        self.assertNotIn("damaged", saved)
+        self.assertEqual(saved["status"], "stopped")
+        # salvaged fields survive; the rest is rebuilt from the session
+        self.assertEqual(saved["title"], record["title"])
+        self.assertEqual(saved["created_at"], record["created_at"])
+        self.assertEqual(saved["target"], record["target"])
+        self.assertEqual(saved["budget"], record["budget"])
+        self.assertEqual(saved["base"], "main")
+        self.assertEqual(saved["session_id"], "s_test")
+        self.assertIsNone(store.active_ids(self.session))
+        self.assertIsNone(store.active(self.session))
+        self.assertIsNone(store.damaged_status(self.session))
+        folded = checks_mod.fold(self.session, saved)
+        self.assertEqual(folded[0]["state"], "ended")
+        self.assertEqual(folded[0]["verdict"], "inconclusive")
+        self.assertIn(record["pretest_id"],
+                      [item["pretest_id"] for item in store.list_records(self.session)])
+        # a new pre-test may start
+        self.assertEqual(self.create()["status"], "active")
+
+    def test_stop_without_force_recovers_garbage_too(self) -> None:
+        record = self.create()
+        self.damage(record, b"\x00garbage")
+        stopped = store.stop(self.session)
+        self.assertEqual(stopped["status"], "stopped")
+        self.assertEqual(stopped["title"], "Damaged pre-test")
+        self.assertEqual(stopped["target"], {"platform": "android",
+                                             "target_id": "emulator-5554"})
+        self.assertEqual(stopped["budget"]["allow_apps"], ["com.example.app"])
+        self.assertIn("not valid JSON", stopped["damaged"]["reason"])
+        self.assert_code(errors.NO_ACTIVE_PRETEST, store.stop, self.session)
+
+    def test_an_older_damaged_copy_is_never_overwritten(self) -> None:
+        record = self.create()
+        directory = self.pretests() / record["pretest_id"]
+        (directory / "pretest.json.damaged").write_bytes(b"older")
+        self.damage(record, b"newer")
+        stopped = store.stop(self.session)
+        self.assertEqual(stopped["damaged"]["file"], "pretest.json.damaged.1")
+        self.assertEqual((directory / "pretest.json.damaged").read_bytes(), b"older")
+        self.assertEqual((directory / "pretest.json.damaged.1").read_bytes(), b"newer")
+
+    def test_stop_refuses_when_no_device_can_be_recovered(self) -> None:
+        record = self.create()
+        path = self.damage(record, b"{")
+        session = {**self.session, "platform": None, "target_id": None}
+        error = self.assert_code(errors.PRETEST_DAMAGED, store.stop, session)
+        self.assertEqual(error.extra["pretest_id"], record["pretest_id"])
+        self.assertEqual(path.read_bytes(), b"{")
+        self.assertFalse((path.parent / "pretest.json.damaged").exists())
+        self.assertEqual(store.active_ids(self.session), (record["pretest_id"], None))
+
+    def test_stop_refuses_when_the_file_cannot_be_copied_aside(self) -> None:
+        record = self.create()
+        path = self.damage(record, b"{")
+        with mock.patch.object(store.os, "replace", side_effect=PermissionError(13, "denied")):
+            error = self.assert_code(errors.PRETEST_DAMAGED, store.stop, self.session)
+        self.assertIn("could not be copied aside", error.message)
+        self.assertEqual(error.extra["path"], str(path))
+        self.assertEqual(path.read_bytes(), b"{")
+        self.assertFalse((path.parent / "pretest.json.damaged").exists())
+        self.assert_damaged(record)
+
+    def test_the_damaged_file_is_copied_never_moved(self) -> None:
+        """While the rebuilt record is written, pretest.json still exists."""
+        record = self.create()
+        path = self.damage(record, b"{broken")
+        seen: list[tuple[bool, bytes, bytes]] = []
+        real_write = store.write_json
+
+        def watching(target, value):
+            if Path(target) == path:
+                kept = path.parent / "pretest.json.damaged"
+                seen.append((path.exists(), path.read_bytes(), kept.read_bytes()))
+            return real_write(target, value)
+
+        with mock.patch.object(store, "write_json", side_effect=watching):
+            stopped = store.stop(self.session, force=True)
+        self.assertEqual(stopped["status"], "stopped")
+        self.assertEqual(seen[0], (True, b"{broken", b"{broken"))
+        self.assertEqual((path.parent / "pretest.json.damaged").read_bytes(), b"{broken")
+
+    def write_fails_for(self, path: Path, exc: BaseException):
+        real_write = store.write_json
+
+        def failing(target, value):
+            if Path(target) == path:
+                raise exc
+            return real_write(target, value)
+
+        return mock.patch.object(store, "write_json", side_effect=failing)
+
+    def test_a_failed_rebuild_write_keeps_the_guard_and_can_be_retried(self) -> None:
+        record = self.create()
+        path = self.damage(record, b"{")
+        with self.write_fails_for(path, OSError(28, "No space left on device")):
+            error = self.assert_code(errors.PRETEST_DAMAGED, store.stop, self.session,
+                                     force=True)
+        self.assertIn("could not be written", error.message)
+        self.assertIn("stop --force", error.hint)
+        self.assertEqual(path.read_bytes(), b"{")
+        self.assertFalse((path.parent / "pretest.json.damaged").exists())
+        # the guard's source still refuses; the pointer still names the pre-test
+        self.assert_damaged(record)
+        self.assert_code(errors.PRETEST_DAMAGED, store.require_active, self.session)
+        self.assertEqual(store.active_ids(self.session), (record["pretest_id"], None))
+        stopped = store.stop(self.session, force=True)
+        self.assertEqual(stopped["status"], "stopped")
+        self.assertEqual(stopped["damaged"]["file"], "pretest.json.damaged")
+        self.assertEqual((path.parent / "pretest.json.damaged").read_bytes(), b"{")
+
+    def test_a_crash_between_copy_and_rebuild_keeps_the_guard(self) -> None:
+        """A process killed after the copy: the damaged original is still there."""
+        record = self.create()
+        path = self.damage(record, b"[]")
+
+        class Killed(BaseException):
+            pass
+
+        with self.write_fails_for(path, Killed()):
+            with self.assertRaises(Killed):
+                store.stop(self.session, force=True)
+        self.assertEqual(path.read_bytes(), b"[]")
+        self.assertEqual((path.parent / "pretest.json.damaged").read_bytes(), b"[]")
+        self.assert_damaged(record)
+        self.assertEqual(store.active_ids(self.session), (record["pretest_id"], None))
+        stopped = store.stop(self.session, force=True)
+        self.assertEqual(stopped["status"], "stopped")
+        self.assertEqual(stopped["damaged"]["file"], "pretest.json.damaged.1")
+        self.assertEqual((path.parent / "pretest.json.damaged").read_bytes(), b"[]")
+        self.assertEqual((path.parent / "pretest.json.damaged.1").read_bytes(), b"[]")
+        self.assertIsNone(store.damaged_status(self.session))
+
+    def test_a_directory_record_is_moved_aside_and_stopped(self) -> None:
+        record = self.create()
+        path = self.record_path(record)
+        path.unlink()
+        path.mkdir()
+        stopped = store.stop(self.session, force=True)
+        self.assertEqual(stopped["status"], "stopped")
+        self.assertTrue((path.parent / "pretest.json.damaged").is_dir())
+        self.assertEqual(store.load(self.session, record["pretest_id"])["status"], "stopped")
+
+    def test_a_failed_write_after_moving_a_directory_puts_it_back(self) -> None:
+        record = self.create()
+        path = self.record_path(record)
+        path.unlink()
+        path.mkdir()
+        with self.write_fails_for(path, OSError(28, "No space left on device")):
+            self.assert_code(errors.PRETEST_DAMAGED, store.stop, self.session, force=True)
+        self.assertTrue(path.is_dir())
+        self.assertFalse((path.parent / "pretest.json.damaged").exists())
+        self.assert_damaged(record)
+
+    def link_record_to(self, record: dict, target: Path) -> Path:
+        path = self.record_path(record)
+        path.unlink()
+        path.symlink_to(target)
+        return path
+
+    def outside_targets(self) -> tuple[Path, Path]:
+        """A 0755 directory and a 0644 file outside the pre-test directory."""
+        outside = self.root / "outside"
+        outside.mkdir()
+        directory = outside / "shared"
+        directory.mkdir()
+        os.chmod(directory, 0o755)
+        target = outside / "notes.txt"
+        target.write_bytes(b"{")  # not a record: reads as damage through the link
+        os.chmod(target, 0o644)
+        return directory, target
+
+    def assert_link_moved_aside(self, record: dict, path: Path, target: Path) -> None:
+        kept = path.parent / "pretest.json.damaged"
+        self.assertTrue(kept.is_symlink())
+        self.assertEqual(Path(os.readlink(kept)), target)
+        self.assertFalse(path.is_symlink())
+        self.assertEqual(store.load(self.session, record["pretest_id"])["status"], "stopped")
+
+    def test_a_symlinked_record_never_changes_its_targets_mode(self) -> None:
+        """Fix v5 r2 item 1: stop --force moves a linked record aside without
+        touching the permissions of what it points at."""
+        directory, target = self.outside_targets()
+        for name, linked, mode in (("directory", directory, 0o755),
+                                   ("file", target, 0o644)):
+            with self.subTest(target=name):
+                record = self.create()
+                path = self.link_record_to(record, linked)
+                self.assert_damaged(record)
+                stopped = store.stop(self.session, force=True)
+                self.assertEqual(stopped["status"], "stopped")
+                self.assertEqual(stopped["damaged"]["file"], "pretest.json.damaged")
+                self.assertEqual(stat.S_IMODE(os.stat(linked).st_mode), mode)
+                self.assert_link_moved_aside(record, path, linked)
+        self.assertEqual(target.read_bytes(), b"{")
+        self.assertEqual(os.listdir(directory), [])
+
+    def test_a_symlinked_record_is_left_alone_without_link_chmod(self) -> None:
+        """Where a link's own mode cannot be set, the mode change is skipped."""
+        directory, target = self.outside_targets()
+        calls: list[str] = []
+        real_chmod = os.chmod
+
+        def watching(path, mode, *args, **kwargs):
+            calls.append(str(path))
+            return real_chmod(path, mode, *args, **kwargs)
+
+        for name, linked, mode in (("directory", directory, 0o755),
+                                   ("file", target, 0o644)):
+            with self.subTest(target=name):
+                record = self.create()
+                path = self.link_record_to(record, linked)
+                kept = str(path.parent / "pretest.json.damaged")
+                calls.clear()
+                with mock.patch.object(store.os, "supports_follow_symlinks", frozenset()), \
+                        mock.patch.object(store.os, "chmod", side_effect=watching):
+                    stopped = store.stop(self.session, force=True)
+                self.assertEqual(stopped["status"], "stopped")
+                self.assertNotIn(kept, calls)
+                self.assertEqual(stat.S_IMODE(os.stat(linked).st_mode), mode)
+                self.assert_link_moved_aside(record, path, linked)
+
+    def test_a_moved_aside_directory_still_becomes_owner_only(self) -> None:
+        record = self.create()
+        path = self.record_path(record)
+        path.unlink()
+        path.mkdir(mode=0o755)
+        store.stop(self.session, force=True)
+        kept = path.parent / "pretest.json.damaged"
+        self.assertEqual(stat.S_IMODE(os.lstat(kept).st_mode), 0o600)
+
+    def test_stop_after_a_repair_takes_the_normal_path(self) -> None:
+        record = self.create()
+        self.damage(record, b"{")
+        damage = store.damaged_status(self.session)
+        self.record_path(record).write_text(json.dumps(record), encoding="utf-8")
+        stopped = store._stop_damaged(self.session, damage)  # noqa: SLF001
+        self.assertEqual(stopped["status"], "stopped")
+        self.assertNotIn("damaged", stopped)
+        self.assertFalse((self.record_path(record).parent / "pretest.json.damaged").exists())
 
 
 class ActivePointerTests(PretestBase):
@@ -1637,6 +1993,31 @@ class ConcurrencyTests(PretestBase):
         self.assertEqual([f["finding_id"] for f in found], [f"f-{n}" for n in range(1, 25)])
         path = self.pretests() / record["pretest_id"] / "checks.ndjson"
         self.assertEqual(len(path.read_text().splitlines()), 24)
+
+
+class ReadLinesTests(unittest.TestCase):
+    def test_torn_deep_and_non_object_lines_are_skipped(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "x.ndjson"
+            path.write_text("\n".join([
+                '{"a": 1}', "[" * 1_000_000 + "]" * 1_000_000, "[1]", "3",
+                '{"b": 2}', '{"torn": ']) + "\n", encoding="utf-8")
+            self.assertEqual(store.read_lines(path), [{"a": 1}, {"b": 2}])
+            self.assertEqual(store.read_lines(Path(tmp) / "missing"), [])
+
+    def test_an_object_nested_too_deep_to_print_is_skipped(self) -> None:
+        # json.loads reads it, but str() of the id would raise RecursionError
+        # in every reader that compares ids (repro, findings).
+        deep = "[" * 100_000 + "]" * 100_000
+        ok = "[" * 50 + "]" * 50
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "x.ndjson"
+            path.write_text("\n".join([
+                '{"id": %s}' % deep, '{"id": "a", "v": %s}' % ok]) + "\n",
+                encoding="utf-8")
+            rows = store.read_lines(path)
+            self.assertEqual([row["id"] for row in rows], ["a"])
+            self.assertEqual(str(rows[0]["v"]).count("["), 50)
 
 
 if __name__ == "__main__":

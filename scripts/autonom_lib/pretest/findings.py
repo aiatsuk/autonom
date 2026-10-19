@@ -10,7 +10,7 @@
 Evidence refs are checked against the session when the finding is written,
 so a finding can never point at a screenshot that was not taken:
 
-    shot:<row number in shots/index.jsonl, or the file name>
+    shot:<row number in shots/index.jsonl (at most 9 digits), or the file name>
     tree:<file under trees/>        action:<file stem under actions/>
     request:<flow id in network/flows.jsonl>
     log:<from-ISO>..<to-ISO>        run:<run id under flows/>
@@ -32,6 +32,10 @@ SEVERITIES = ("blocker", "major", "minor", "info")
 ORIGINS = ("agent", "auto")
 SOURCES = ("crash", "log", "request", "metrics", "a11y", "analytics")
 STABILITIES = ("stable", "intermittent", "not_reproduced")
+_SHOT_NUMBER = re.compile(r"[0-9]+")
+# A row number has at most this many digits; a longer one names no row (and
+# int() of thousands of digits raises ValueError).
+SHOT_NUMBER_DIGITS = 9
 REF_KINDS = ("shot", "tree", "action", "request", "log", "run", "crash")
 UPDATE_FIELDS = ("reproduced", "stability", "repro_runs", "draft_flow")
 FINDING_ID = re.compile(r"^f-[1-9]\d*$")
@@ -82,7 +86,11 @@ def _resolve_shot(session: dict[str, Any], ref: str, value: str) -> dict[str, An
 
     rows = screenshot_mod.load_index(session)
     chosen: tuple[int, dict[str, Any]] | None = None
-    if value.isdigit():
+    if _SHOT_NUMBER.fullmatch(value) and len(value) > SHOT_NUMBER_DIGITS:
+        raise _unknown(ref, "no such screenshot in shots/index.jsonl")
+    if _SHOT_NUMBER.fullmatch(value):
+        # ASCII digits only: str.isdigit() also takes "²" or "１", which
+        # int() refuses or reads as another row
         number = int(value)
         if 1 <= number <= len(rows):
             chosen = (number, rows[number - 1])
@@ -120,7 +128,11 @@ def _resolve_request(session: dict[str, Any], ref: str, value: str) -> dict[str,
 
     path = network_store.flows_path(session)
     for row in store.read_lines(path):
-        if str(row.get("id")) == value:
+        ident = row.get("id")
+        # A flow id is text (or a number); anything else is no id, and str()
+        # of a deeply nested one would raise RecursionError.
+        if isinstance(ident, (str, int)) and not isinstance(ident, bool) \
+                and str(ident) == value:
             request = row.get("request") if isinstance(row.get("request"), dict) else {}
             response = row.get("response") if isinstance(row.get("response"), dict) else {}
             data = {"id": value,

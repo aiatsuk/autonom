@@ -4,12 +4,24 @@
 
     {"event": "add",   "check_id": "chk-1", "title", "kind", "case", "why", "flow", ...}
     {"event": "begin", "check_id": "chk-1", ...}
-    {"event": "end",   "check_id": "chk-1", "verdict", "note", "run_id", ...}
+    {"event": "end",   "check_id": "chk-1", "verdict", "note", "run_id",
+                                            ["observed_count"], ...}
+    {"event": "amended", "check_id": "chk-1", "old_verdict", "new_verdict", "note",
+                                              "at", ["observed_count"], ...}
 
 Every line also carries ``ts`` (ISO UTC, milliseconds) and ``journal_seq``
 (the newest journal sequence at that moment), so a check's window can be
 matched against the journal, logs and captured traffic later. ``fold``
 turns the events into one state per check, in add order.
+
+``amend`` (A.9) corrects the verdict of an ended check of the active
+pre-test: it appends an ``amended`` event and the folded state carries the
+latest verdict, its note and the list of ``amendments``, so the summary and
+the pack use the latest verdict. A check of a race kit case
+(``RACE_CASES``: the double tap) passes only with an observed request count
+(``observed_count``, A.12 / RISK-038), when the caller asks for that rule
+(``pretest check end`` and ``check amend`` do). The count is stored on the
+check and, so the summary shows it, leads the folded ``note``.
 """
 from __future__ import annotations
 
@@ -25,7 +37,12 @@ from . import store
 KINDS = ("ticket", "edge", "regression", "network", "a11y", "analytics")
 VERDICTS = ("pass", "fail", "blocked", "not_covered", "inconclusive")
 STATES = ("added", "open", "ended")
-EVENTS = ("add", "begin", "end")
+EVENTS = ("add", "begin", "end", "amended")
+# Kit cases whose pass depends on how many requests a fast repeat really sent
+# (edge-case-kit.md: `double-tap`); device input can be slower than the race.
+RACE_CASES = ("double-tap",)
+RACE_HINT = ("count the requests (network requests) and pass --observed-count, or end "
+             "with --verdict inconclusive")
 TITLE_LIMIT = 200
 TEXT_LIMIT = 4000
 
@@ -63,7 +80,7 @@ def event_failures(event: Any) -> list[str]:
     failures: list[str] = []
     kind = event.get("event")
     if kind not in EVENTS:
-        failures.append("event must be add, begin or end")
+        failures.append("event must be add, begin, end or amended")
     if not isinstance(event.get("check_id"), str) or not store.CHECK_ID.match(
             event.get("check_id") or ""):
         failures.append("check_id must look like chk-N")
@@ -92,7 +109,22 @@ def event_failures(event: Any) -> list[str]:
                 failures.append(f"missing {key}")
             elif event[key] is not None and not isinstance(event[key], str):
                 failures.append(f"{key} must be a string or null")
+    if kind == "amended":
+        for key in ("old_verdict", "new_verdict"):
+            if event.get(key) not in VERDICTS:
+                failures.append(f"{key} must be one of " + ", ".join(VERDICTS))
+        if not isinstance(event.get("note"), str) or not event.get("note"):
+            failures.append("note must be a non-empty string")
+        if not isinstance(event.get("at"), str) or parse_ts(event.get("at")) is None:
+            failures.append("at must be an ISO timestamp")
+    if kind in ("end", "amended") and "observed_count" in event \
+            and not _is_count(event["observed_count"]):
+        failures.append("observed_count must be an integer >= 0")
     return failures
+
+
+def _is_count(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
 def validate_event(event: Any) -> dict[str, Any]:
@@ -143,10 +175,40 @@ def fold_events(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
             state["seq_to"] = event["journal_seq"]
             if event.get("run_id") and event["run_id"] not in state["run_ids"]:
                 state["run_ids"].append(event["run_id"])
+            if "observed_count" in event:
+                state["observed_count"] = event["observed_count"]
             began, ended = parse_ts(state["began_at"]), parse_ts(state["ended_at"])
             if began and ended:
                 state["duration_s"] = round(max(0.0, (ended - began).total_seconds()), 3)
-    return list(states.values())
+        elif event["event"] == "amended" and state["state"] == "ended":
+            # keys appear only when used, so the fold (and a pack's digest) of
+            # a pre-test without amendments or counts is what it always was
+            state.setdefault("amendments", []).append({
+                "old_verdict": state["verdict"], "new_verdict": event["new_verdict"],
+                "note": event["note"], "previous_note": state.get("note"),
+                "at": event["at"]})
+            state["verdict"] = event["new_verdict"]
+            state["note"] = event["note"]
+            if "observed_count" in event:
+                state["observed_count"] = event["observed_count"]
+    return [_shown(state) for state in states.values()]
+
+
+def _shown(state: dict[str, Any]) -> dict[str, Any]:
+    """The folded state as readers see it: a stored request count
+    (``observed requests: N``) and the last amendment (``amended from V``)
+    lead the note, so summary.md and summary.json, which print the note,
+    show both. A state with neither is returned unchanged."""
+    parts: list[str] = []
+    if "observed_count" in state:
+        parts.append(f"observed requests: {state['observed_count']}")
+    if state.get("amendments"):
+        parts.append(f"amended from {state['amendments'][-1]['old_verdict']}")
+    if not parts:
+        return state
+    if state.get("note"):
+        parts.append(state["note"])
+    return {**state, "note": "; ".join(parts)}
 
 
 def fold(session: dict[str, Any], record: dict[str, Any]) -> list[dict[str, Any]]:
@@ -270,12 +332,41 @@ def begin(session: dict[str, Any], record: dict[str, Any], check_id: str) -> dic
     return _find(fold(session, record), check_id)
 
 
-def end(session: dict[str, Any], record: dict[str, Any], check_id: str, *,
-        verdict: str, note: str | None = None, run_id: str | None = None) -> dict[str, Any]:
+def _check_verdict(verdict: str) -> None:
     if verdict not in VERDICTS:
         raise errors.AutonomError(
             errors.INVALID_VERDICT, f"unknown verdict {verdict!r}",
             hint="Verdicts: " + ", ".join(VERDICTS) + ".", verdict=verdict)
+
+
+def _check_count(observed_count: Any) -> None:
+    if observed_count is not None and not _is_count(observed_count):
+        raise errors.AutonomError(
+            errors.INVALID_VALUE,
+            f"--observed-count must be a whole number >= 0, got {observed_count!r}",
+            hint="Count the requests in 'autonom network requests list', e.g. "
+                 "--observed-count 1.", observed_count=str(observed_count))
+
+
+def _race_rule(state: dict[str, Any], verdict: str, observed_count: int | None) -> None:
+    """A pass of a race kit case needs the observed request count (A.12)."""
+    if verdict != "pass" or state.get("case") not in RACE_CASES or observed_count is not None:
+        return
+    raise errors.AutonomError(
+        errors.RACE_NEEDS_COUNT,
+        f"check {state['check_id']} is the {state['case']} case: a pass needs the observed "
+        "request count", hint=RACE_HINT, check_id=state["check_id"], case=state["case"])
+
+
+def end(session: dict[str, Any], record: dict[str, Any], check_id: str, *,
+        verdict: str, note: str | None = None, run_id: str | None = None,
+        observed_count: int | None = None, race_rule: bool = False) -> dict[str, Any]:
+    """End the open check. ``observed_count`` (an integer >= 0) is stored on
+    the check; with ``race_rule`` (the CLI's ``check end``) a ``pass`` of a
+    race kit case without it is refused with ``race_needs_count``. Library
+    callers that end checks from flow runs keep the old behaviour."""
+    _check_verdict(verdict)
+    _check_count(observed_count)
     store.ensure_mutable(record)
     with store.lock(session, record["pretest_id"]):
         current = store.load(session, record["pretest_id"])
@@ -300,10 +391,60 @@ def end(session: dict[str, Any], record: dict[str, Any], check_id: str, *,
                 errors.NO_OPEN_CHECK, f"check {check_id} is not open ({state['state']})",
                 hint=hint, check_id=check_id, open_check_id=opened, state=state["state"],
                 verdict=state.get("verdict"))
+        if race_rule:
+            _race_rule(state, verdict, observed_count)
         event = {"event": "end", "check_id": check_id, "verdict": verdict,
                  "note": _text(note, TEXT_LIMIT),
                  "run_id": str(run_id) if run_id else None, **_stamp(session)}
+        if observed_count is not None:
+            event["observed_count"] = observed_count
         validate_event(event)
         store.append_line(_path(session, current), event)
         store.set_open_check(session, current["pretest_id"], None)
+    return _find(fold(session, record), check_id)
+
+
+def amend(session: dict[str, Any], record: dict[str, Any], check_id: str, *,
+          verdict: str, note: str, observed_count: int | None = None) -> dict[str, Any]:
+    """Correct the verdict of an ended check of the active pre-test (A.9).
+
+    Appends ``{"event": "amended", "old_verdict", "new_verdict", "note",
+    "at"}`` (and ``observed_count`` when given); the fold then carries the new
+    verdict. Refusals: ``invalid_verdict``, ``invalid_value`` (no note, a bad
+    count), ``pretest_finalized`` (packed), ``no_active_pretest`` (stopped),
+    ``unknown_check``, ``check_not_ended`` and, for a pass of a race kit case
+    with no count stored or given, ``race_needs_count``."""
+    _check_verdict(verdict)
+    _check_count(observed_count)
+    clean_note = _text(note, TEXT_LIMIT)
+    if not clean_note or not clean_note.strip():
+        raise errors.AutonomError(
+            errors.INVALID_VALUE, "an amendment needs --note",
+            hint="Say why the verdict changes, e.g. --note 'the 500 came from the "
+                 "test backend, not the app'.", check_id=check_id)
+    store.check_open_record(record)
+    with store.lock(session, record["pretest_id"]):
+        current = store.load(session, record["pretest_id"])
+        store.check_open_record(current)
+        states = fold_events(events(session, current))
+        state = next((item for item in states if item["check_id"] == check_id), None)
+        if state is None:
+            _find(states, check_id)  # raises unknown_check
+        if state["state"] != "ended":
+            hint = (f"End it with 'autonom pretest check end {check_id} --verdict <verdict>'."
+                    if state["state"] == "open" else
+                    f"Begin it with 'autonom pretest check begin {check_id}', then end it.")
+            raise errors.AutonomError(
+                errors.CHECK_NOT_ENDED,
+                f"check {check_id} is {state['state']}, not ended: only an ended check "
+                "can be amended", hint=hint, check_id=check_id, state=state["state"])
+        _race_rule(state, verdict, observed_count if observed_count is not None
+                   else state.get("observed_count"))
+        stamp = _stamp(session)
+        event = {"event": "amended", "check_id": check_id, "old_verdict": state["verdict"],
+                 "new_verdict": verdict, "note": clean_note, "at": stamp["ts"], **stamp}
+        if observed_count is not None:
+            event["observed_count"] = observed_count
+        validate_event(event)
+        store.append_line(_path(session, current), event)
     return _find(fold(session, record), check_id)

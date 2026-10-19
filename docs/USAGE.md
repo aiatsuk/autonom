@@ -431,6 +431,13 @@ autonom pretest check end chk-1 --verdict fail --note "500 not handled"
 autonom pretest finding add --check chk-1 --severity major --title "Error swallowed" \
     --expected "an error message" --actual "an empty list" --evidence shot:1
 
+autonom pretest check amend chk-1 --verdict blocked \
+    --note "the 500 came from the test backend"   # correct an ended check; the pack shows the latest verdict
+autonom pretest check add "Double tap on Pay sends one order" --kind edge --case double-tap
+autonom pretest check begin chk-4
+autonom network requests list --path '*/orders*'  # count what the double tap really sent
+autonom pretest check end chk-4 --verdict pass --observed-count 1   # a double-tap pass needs the count
+
 autonom pretest flows                         # each selected flow becomes a regression check;
                                               # `flows` lists {flow, check_id, run_id, status, verdict}
 autonom pretest status                        # budget used and left, open check, counts
@@ -446,8 +453,27 @@ host, path, status, mocked, duration), each step lists the mocks active at
 that moment, screenshots taken under a mock are marked as mocked data, and a
 finding's steps to reproduce stop at its latest evidence. `index.html` opened
 from disk fills the review commands with the pack's own directory. An ended
-check cannot be ended again (`no_open_check`): add a finding instead.
-`ui swipe --duration` is in seconds (`--duration 0.4`).
+check cannot be ended again (`no_open_check`); correct its verdict with
+`pretest check amend <id> --verdict V --note TEXT` (refused for a check that
+is not ended yet, `check_not_ended`, and after `pack`, `pretest_finalized`).
+A `--verdict pass` of a `double-tap` check needs `--observed-count N`, the
+requests you counted (`race_needs_count` otherwise; end it `inconclusive`
+when you cannot count); the count shows in the check's note in `summary.md`
+and `summary.json`. `ui swipe --duration` is in seconds, more than 0 and at
+most 60 (`--duration 0.4`).
+
+Slow and stuck responses for the `slow` and `timeout` cases:
+
+```bash
+autonom network mock add --match '*/api/catalog*' --json '{"items": []}' --delay 3   # answers after 3 s
+autonom network mock update m_1 --hang        # held until removed or disabled, or 120 s (then recorded incomplete)
+autonom network requests list                 # an incomplete request: completed false, status null, error_kind
+autonom network mock remove m_1
+```
+
+A `--body-file` mock without a Content-Type `--header` is served with the type
+of its extension (`.json` as `application/json`, `.html` as
+`text/html; charset=utf-8`, unknown ones as `application/octet-stream`).
 
 Then QA reviews the pack (no session needed except for `more-checks`):
 
@@ -486,12 +512,20 @@ is gone. `repro` records a result only when all N runs reached a verdict: a
 broken run, a dead device or a spent budget stops it and nothing is recorded.
 `repro` works on the active pre-test only (`--pack` is refused with
 `pretest_finalized`); `autonom pretest flow-draft f-1 --pack <pack>` writes a
-draft from a pack without changing it, and `rerun` without `--check` runs every
+draft from a pack without changing it. Its `repro` field names
+`pretest rerun <pack> --check <id>` when rerun will replay that file (the
+default draft path, and the check has no flow of its own); a draft written
+with a custom `--out` is replayed with `autonom flow run <draft>`. `rerun`
+without `--check` runs every
 check of the pack that has a flow or draft. The child gets this session's app
 and the default safety rules, never the pack's.
 
 `autonom pretest stop` closes a pre-test without a pack, and
-`autonom pretest list` shows the session's pre-tests. A tap on forbidden text,
+`autonom pretest list` shows the session's pre-tests. When the active
+pre-test's `pretest.json` is damaged, `autonom pretest status` answers
+`status: damaged` with the reason, every guarded device action refuses with
+`pretest_damaged`, and `autonom pretest stop --force` stops it, keeping the
+file as `pretest.json.damaged`. A tap on forbidden text,
 an app outside `--allow-app` or a spent budget is refused before any input
 reaches the device (`forbidden_action`, `app_not_allowed`, `budget_exhausted`);
 the refusal is in the journal. Every journal entry, screenshot and saved tree made while a check

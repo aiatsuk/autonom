@@ -48,6 +48,10 @@ def entry_for(flow: dict[str, Any]) -> dict[str, Any]:
     response_headers = flow.get("response_headers_preview") or {}
     sizes = flow.get("sizes") or {}
     duration = flow.get("duration_ms") or 0
+    # A request that never got a response (A.3) is stored with `completed:
+    # false` and `status: None`; HAR 1.2 wants an integer, and 0 is the
+    # usual "no response" value. The record keeps why it ended in `_autonom`.
+    incomplete = flow.get("completed") is False
 
     entry: dict[str, Any] = {
         "startedDateTime": flow.get("started_at"),
@@ -63,7 +67,7 @@ def entry_for(flow: dict[str, Any]) -> dict[str, Any]:
             "bodySize": sizes.get("request_bytes", 0),
         },
         "response": {
-            "status": flow.get("status"),
+            "status": 0 if incomplete else flow.get("status"),
             "statusText": "",
             "httpVersion": "HTTP/1.1",
             "cookies": [],
@@ -82,6 +86,9 @@ def entry_for(flow: dict[str, Any]) -> dict[str, Any]:
         "_autonom": {"id": flow.get("id"), "mocked": bool(flow.get("mocked")),
                      "mock_id": flow.get("mock_id")},
     }
+    if incomplete:
+        entry["_autonom"]["completed"] = False
+        entry["_autonom"]["error_kind"] = flow.get("error_kind")
     body = flow.get("request_body_preview")
     if body:
         entry["request"]["postData"] = {

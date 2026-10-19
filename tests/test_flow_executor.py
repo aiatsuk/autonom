@@ -1197,6 +1197,112 @@ class PollCadenceTests(EnvSandboxMixin, unittest.TestCase):
         self.assertEqual(caught.exception.extra["failure_class"], "infrastructure")
 
 
+class PostActionEvidenceTests(EnvSandboxMixin, unittest.TestCase):
+    """A.7: `always` takes the after-shot right after the action, before the
+    step's own wait (postcondition); other modes keep their boundary."""
+
+    # the same in-process, fake-clock executor as PollCadenceTests
+    setUp = PollCadenceTests.setUp
+    _executor = PollCadenceTests._executor
+
+    _NODE = {"ref": "n1", "text": "Login", "bounds": [0, 0, 100, 50],
+             "enabled": True}
+    _TOAST = {"ref": "n2", "text": "Saved", "bounds": [0, 60, 100, 90],
+              "enabled": True}
+
+    def _evidence_flow(self, evidence: str, postcondition_id: str = "Saved"):
+        head = ("schema: autonom.dev/flow/v1\nappId: com.example.app\nname: t\n"
+                f"evidence:\n{evidence}---\n")
+        body = ("- tapOn:\n    selector:\n      text: Login\n"
+                "    postcondition:\n"
+                f"      text: {postcondition_id}\n"
+                "    timeoutMs: 1000\n")
+        return flow_schema.build_flow(
+            flow_parser.parse_document(head + body, "t.yaml"))
+
+    def _run_recording(self, flow, after_tap_nodes):
+        order: list[str] = []
+        state = {"tapped": False}
+
+        def snapshot(_target):
+            order.append("wait" if state["tapped"] else "find")
+            return after_tap_nodes if state["tapped"] else [self._NODE]
+
+        def tap(*_args, **_kwargs):
+            state["tapped"] = True
+            order.append("action")
+
+        def shot(_target, _session, label="", task=None):
+            order.append(f"shot:{label}")
+            return {"path": str(Path(self.tmp.name) / f"{label}.png")}
+
+        runner, _sleeps = self._executor(interval_ms=250)
+        with mock.patch("autonom_lib.ui.snapshot", side_effect=snapshot), \
+             mock.patch("autonom_lib.ui.tap", side_effect=tap), \
+             mock.patch("autonom_lib.screenshot.capture_evidence",
+                        side_effect=shot), \
+             mock.patch("autonom_lib.simulator.repin_before_capture",
+                        return_value=None):
+            result = runner.run(flow)
+        return result, order
+
+    def _events(self, result) -> list[dict]:
+        path = Path(result.events_path)
+        return [json.loads(line) for line in
+                path.read_text(encoding="utf-8").splitlines()]
+
+    def test_always_shoots_after_the_action_before_the_postcondition(self) -> None:
+        flow = self._evidence_flow("  mode: always\n  collect: [screenshot]\n")
+        result, order = self._run_recording(flow, [self._TOAST])
+        self.assertEqual(result.status, "passed")
+        # the step-1 shots only (failure capture is not involved)
+        trimmed = [item for item in order if item != "find"]
+        self.assertEqual(trimmed[:3],
+                         ["shot:step-1-before", "action", "shot:step-1-after"])
+        self.assertEqual(trimmed[3], "wait",
+                         "the postcondition wait runs after the after-shot")
+        self.assertEqual(order.count("shot:step-1-after"), 1,
+                         "exactly one after-shot per step")
+
+    def test_always_journal_order_is_action_shot_wait(self) -> None:
+        flow = self._evidence_flow("  mode: always\n  collect: [screenshot]\n")
+        result, _order = self._run_recording(flow, [self._TOAST])
+        kinds = [(e["kind"], e["payload"].get("phase"))
+                 for e in self._events(result)
+                 if e["kind"] in ("flow.step.started", "flow.evidence.captured",
+                                  "flow.step.finished")]
+        self.assertEqual(kinds, [
+            ("flow.step.started", None),
+            ("flow.evidence.captured", "before"),
+            ("flow.evidence.captured", "after"),
+            ("flow.step.finished", None),
+        ])
+
+    def test_always_keeps_the_after_shot_when_the_postcondition_fails(self) -> None:
+        flow = self._evidence_flow("  mode: always\n  collect: [screenshot]\n")
+        result, order = self._run_recording(flow, [])
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.failure["error_code"], "flow_assertion_timeout")
+        self.assertIn("shot:step-1-after", order)
+        self.assertLess(order.index("shot:step-1-after"), order.index("wait"),
+                        "the after-shot precedes the failing wait")
+
+    def test_custom_mode_keeps_its_boundaries(self) -> None:
+        # beforeMutation only: a mutation gets its before-shot, no after-shot
+        flow = self._evidence_flow(
+            "  mode: custom\n  beforeMutation: true\n  collect: [screenshot]\n")
+        result, order = self._run_recording(flow, [self._TOAST])
+        self.assertEqual(result.status, "passed")
+        shots = [item for item in order if item.startswith("shot:")]
+        self.assertEqual(shots, ["shot:step-1-before"])
+
+    def test_on_failure_mode_takes_no_step_shots(self) -> None:
+        flow = self._evidence_flow("  mode: on-failure\n  collect: [screenshot]\n")
+        result, order = self._run_recording(flow, [self._TOAST])
+        self.assertEqual(result.status, "passed")
+        self.assertEqual([item for item in order if item.startswith("shot:")], [])
+
+
 class WhenEnvEqualsRedactionTests(unittest.TestCase):
     def test_secret_name_is_redacted_and_plain_values_are_not(self) -> None:
         secret = flow_schema.WhenClause(env_equals={"PASSWORD": "wrong"})

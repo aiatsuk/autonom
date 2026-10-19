@@ -257,6 +257,100 @@ class NoPretestTests(GuardBase):
         self.assertEqual(len(self.inputs()), 2)
 
 
+# --- damaged active record (B.8 / RISK-042) ---------------------------------------
+
+
+class DamagedRecordTests(GuardBase):
+    def damage(self, record: dict, content: bytes = b"{") -> Path:
+        path = store.pretest_dir(self.session, record["pretest_id"]) / store.RECORD_FILE
+        path.write_bytes(content)
+        return path
+
+    def test_every_guarded_verb_refuses_and_sends_nothing(self) -> None:
+        record = self.start_pretest(max_actions=50)
+        path = self.damage(record)
+        other = Target("android", "emulator-5556", str(FAKE_ADB), {"serial": "emulator-5556"})
+        attempts = {
+            "tap": lambda: ui_mod.tap(self.target, 300, 360, screen=(1080, 2400)),
+            "long-press": lambda: ui_mod.long_press(self.target, 10, 10, screen=(1080, 2400)),
+            "swipe": lambda: ui_mod.swipe(self.target, 1, 2, 3, 4, 0.1, screen=(1080, 2400)),
+            "type": lambda: ui_mod.type_text(self.target, "hello"),
+            "key": lambda: ui_mod.press_key(self.target, "KEYCODE_BACK"),
+            "open": lambda: device_state.open_url(self.target, "myapp://x"),
+            "launch": lambda: session_mod.launch_app(str(FAKE_ADB), SERIAL, APP,
+                                                     activity=".Main"),
+            "stop": lambda: session_mod.force_stop(str(FAKE_ADB), SERIAL, APP),
+            "clear": lambda: session_mod.clear_data(str(FAKE_ADB), SERIAL, APP),
+            # the damaged record holds the target: no device is exempt
+            "tap on another target": lambda: ui_mod.tap(other, 1, 1, screen=(1080, 2400)),
+        }
+        for name, attempt in attempts.items():
+            with self.subTest(verb=name):
+                payload = self.refused(errors.PRETEST_DAMAGED, attempt)
+                self.assertEqual(payload["pretest_id"], record["pretest_id"])
+                self.assertEqual(payload["path"], str(path))
+                self.assertIn(str(path), payload["error"])
+                self.assertIn("not valid JSON", payload["reason"])
+                self.assertEqual(payload["hint"],
+                                 "autonom pretest stop --force, or restore the file")
+                self.assertIn(payload["verb"], guard.MUTATING_VERBS)
+                json.dumps(payload)
+        self.assertEqual(self.inputs(), [])
+        self.assertFalse(any("uiautomator" in " ".join(c) for c in self.calls()))
+        budget = self.budget(record)
+        self.assertEqual(budget["actions_used"], 0)
+        self.assertEqual({item["code"] for item in budget["refusals"]},
+                         {errors.PRETEST_DAMAGED})
+        self.assertEqual(len(budget["refusals"]), len(attempts))
+
+    def test_before_mutation_refuses_directly(self) -> None:
+        record = self.start_pretest()
+        self.damage(record, json.dumps({**record, "status": "weird"}).encode())
+        payload = self.refused(errors.PRETEST_DAMAGED, guard.before_mutation, "tap",
+                               target=self.target, point=(1, 1))
+        self.assertEqual(payload["verb"], "tap")
+        self.assertIn("status must be one of", payload["reason"])
+
+    def test_refusal_is_raised_even_when_budget_json_cannot_be_written(self) -> None:
+        record = self.start_pretest()
+        self.damage(record)
+        with mock.patch.object(store, "write_json", side_effect=OSError("disk full")):
+            self.refused(errors.PRETEST_DAMAGED, guard.before_mutation, "tap",
+                         target=self.target, point=(1, 1))
+        self.assertEqual(self.inputs(), [])
+
+    def test_exempt_input_is_not_refused(self) -> None:
+        record = self.start_pretest()
+        self.damage(record)
+        with guard.exempt():
+            self.assertFalse(guard.before_mutation("tap", target=self.target, point=(1, 1)))
+
+    def test_usage_reports_damaged(self) -> None:
+        record = self.start_pretest()
+        path = self.damage(record)
+        usage = guard.usage(self.session)
+        self.assertEqual(usage["status"], "damaged")
+        self.assertEqual(usage["pretest_id"], record["pretest_id"])
+        self.assertEqual(usage["path"], str(path))
+        self.assertIn("not valid JSON", usage["reason"])
+
+    def test_after_stop_the_guard_is_a_no_op_again(self) -> None:
+        record = self.start_pretest(max_actions=1)
+        self.damage(record)
+        stopped = store.stop(self.session, force=True)
+        self.assertEqual(stopped["status"], "stopped")
+        ui_mod.tap(self.target, 300, 360, screen=(1080, 2400))
+        ui_mod.tap(self.target, 300, 360, screen=(1080, 2400))
+        self.assertEqual(len(self.inputs()), 2)
+        self.assertEqual(guard.usage(self.session), {})
+
+    def test_a_stale_pointer_without_a_record_is_still_a_no_op(self) -> None:
+        record = self.start_pretest(max_actions=1)
+        (store.pretest_dir(self.session, record["pretest_id"]) / store.RECORD_FILE).unlink()
+        self.assertFalse(guard.before_mutation("tap", target=self.target, point=(1, 1)))
+        self.assertEqual(guard.usage(self.session), {})
+
+
 # --- budgets -----------------------------------------------------------------------
 
 
@@ -1253,7 +1347,8 @@ class GuardCliTests(unittest.TestCase):
 
     def input_taps(self) -> int:
         lines = self.log.read_text(encoding="utf-8").splitlines() if self.log.exists() else []
-        return sum(1 for line in lines if "input" in json.loads(line)["argv"])
+        argvs = [json.loads(line)["argv"] for line in lines]
+        return sum(1 for argv in argvs if "input" in argv and "dumpsys" not in argv)
 
     def start(self, **budget) -> dict:
         started = self.cli("session", "start", "--serial", SERIAL, "--app-id", APP)

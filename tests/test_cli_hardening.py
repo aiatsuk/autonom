@@ -559,17 +559,27 @@ class UiTreeTests(CliCase):
         state = json.loads(self.state.read_text())
         self.assertEqual(state["settings_secure"], {"accessibility_enabled": "0"})
 
+    def recovery_calls(self) -> list[list[str]]:
+        """Adb calls that only accessibility recovery makes.
+
+        Reading the screen rotation (`settings get system user_rotation`,
+        `dumpsys input`) is allowed during `ui tree`; touching the secure
+        accessibility settings or force-stopping the app is not.
+        """
+        return [row for row in self.calls("adb")
+                if ("settings" in row and "secure" in row) or "force-stop" in row]
+
     def test_no_auto_recovery_without_session_or_on_wrong_app(self) -> None:
         sparse = self.sparse_dump()
         self.write_state(ui_dump=str(sparse))
         self.android("ui", "tree")
-        self.assertFalse(any("settings" in row for row in self.calls("adb")))
+        self.assertEqual(self.recovery_calls(), [])
         self.start_android()
         self.write_state(ui_dump=str(sparse), foreground_app="com.other.app")
         code, payload = self.android("ui", "tree")
         self.assertEqual(code, 0, payload)
         self.assertNotIn("accessibility_recovery", payload)
-        self.assertFalse(any("settings" in row for row in self.calls("adb")))
+        self.assertEqual(self.recovery_calls(), [])
 
     def test_manual_accessibility_enable_reset_and_no_auto_flag(self) -> None:
         self.start_android()

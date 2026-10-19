@@ -19,10 +19,13 @@ of the screen:
   same label (case and spacing ignored); a control nested in another control
   of the same group is not counted twice.
 
-A control is a visible node with an area that is clickable, long-clickable,
-checkable, or has an input or control role (text field, switch, checkbox,
-radio, slider, link, button). On Android, nodes of another package (the
-status bar, the keyboard) are left out.
+A control is a visible node with an area that is clickable, long-clickable or
+checkable, or that looks interactive without saying so: its role or class is a
+button, link, switch, checkbox, radio, slider or text field (Android class
+names such as ``android.widget.ImageButton``, iOS ``XCUIElementType…`` types
+and ``AX…`` roles), or it carries an action trait (``traits`` naming a button,
+link, adjustable or search field, or custom ``actions``). On Android, nodes of
+another package (the status bar, the keyboard) are left out.
 
 Each problem becomes an automatic finding: ``origin: "auto"``, ``source:
 "a11y"``, ``severity: "minor"``, ``confirmed: false``, the node bounds in the
@@ -63,6 +66,27 @@ LABEL_LIMIT = 120
 MAX_FINDINGS = 200
 CONTROL_ROLES = frozenset({"textfield", "securetextfield", "searchfield", "switch",
                            "checkbox", "radio", "slider", "link", "button"})
+# Short Android class names (the part after the last dot) of controls that
+# need not say clickable: Compose and Flutter often leave the flag off.
+CONTROL_CLASSES = frozenset({
+    "button", "imagebutton", "materialbutton", "appcompatbutton", "appcompatimagebutton",
+    "floatingactionbutton", "extendedfloatingactionbutton", "togglebutton", "compoundbutton",
+    "chip", "switch", "switchcompat", "switchmaterial", "materialswitch", "checkbox",
+    "appcompatcheckbox", "materialcheckbox", "checkedtextview", "radiobutton",
+    "appcompatradiobutton", "materialradiobutton", "seekbar", "appcompatseekbar", "slider",
+    "ratingbar", "edittext", "appcompatedittext", "textinputedittext",
+    "autocompletetextview", "multiautocompletetextview", "searchview",
+})
+# Role words, after an ``XCUIElementType``/``AX`` prefix and case are dropped.
+CONTROL_ROLE_WORDS = frozenset({
+    "button", "link", "switch", "toggle", "checkbox", "radio", "radiobutton", "slider",
+    "textfield", "securetextfield", "searchfield", "textarea", "edittext", "togglebutton",
+    "menubutton", "popupbutton", "incrementor", "stepper", "segmentedcontrol",
+})
+# UIAccessibilityTraits (and their AX spellings) that mean a person can act on the node.
+ACTION_TRAITS = frozenset({"button", "link", "adjustable", "searchfield", "keyboardkey",
+                           "togglebutton", "allowsdirectinteraction"})
+_ROLE_PREFIX = re.compile(r"^(xcuielementtype|uiaccessibilitytrait|ax)", re.IGNORECASE)
 LABEL_FIELDS = ("text", "desc", "hint")
 SYSTEM_PACKAGES = ("com.android.systemui", "com.google.android.inputmethod",
                    "com.android.inputmethod")
@@ -132,7 +156,41 @@ def is_control(node: dict[str, Any], *, platform: str, app_id: str | None) -> bo
         if app_id and package != app_id:
             return False
     return bool(node.get("clickable") or node.get("long_clickable") or node.get("checkable")
-                or (node.get("role") or "") in CONTROL_ROLES)
+                or (node.get("role") or "") in CONTROL_ROLES or looks_interactive(node))
+
+
+def _word(value: Any) -> str:
+    """A role, type or trait name as a bare lower-case word: ``XCUIElementTypeButton``,
+    ``AXButton`` and ``button`` are all ``button``."""
+    text = str(value or "").strip()
+    return _ROLE_PREFIX.sub("", text).replace("_", "").replace(" ", "").lower()
+
+
+def _trait_words(traits: Any) -> set[str]:
+    if isinstance(traits, str):
+        items: list[Any] = re.split(r"[\s,|]+", traits)
+    elif isinstance(traits, (list, tuple, set, frozenset)):
+        items = list(traits)
+    else:
+        return set()
+    return {_word(item) for item in items if isinstance(item, str) and item.strip()}
+
+
+def looks_interactive(node: dict[str, Any]) -> bool:
+    """A node that is a control by its role, class or traits, whatever its
+    clickable flag says (an iOS button, a link, a Compose button left
+    non-clickable, a node with an action trait)."""
+    if _word(node.get("role")) in CONTROL_ROLE_WORDS:
+        return True
+    name = str(node.get("class") or "").strip()
+    if name:
+        short = name.rsplit(".", 1)[-1].rsplit("$", 1)[-1].lower()
+        if short in CONTROL_CLASSES or _word(name) in CONTROL_ROLE_WORDS:
+            return True
+    if _trait_words(node.get("traits")) & ACTION_TRAITS:
+        return True
+    actions = node.get("actions")
+    return isinstance(actions, (list, tuple)) and any(actions)
 
 
 def _children(nodes: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:

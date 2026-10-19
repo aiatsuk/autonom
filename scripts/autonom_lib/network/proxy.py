@@ -154,6 +154,9 @@ def connectivity_check_pattern() -> str:
     return "^(" + "|".join(host.replace(".", r"\.") for host in CONNECTIVITY_CHECK_HOSTS) + "):"
 
 
+LAZY_CONNECT_OPTION = "connection_strategy=lazy"
+
+
 def build_argv(
     mitmdump: str,
     *,
@@ -173,6 +176,10 @@ def build_argv(
         "-s", str(ADDON),
         "--set", f"autonom_dir={directory}",
         "--set", f"autonom_capture_bodies={'true' if capture_bodies else 'false'}",
+        # Connect upstream only once the client's request is known. With the
+        # default eager strategy a CONNECT to an unreachable host fails before
+        # the addon sees the request, so a mock for that host never fires.
+        "--set", LAZY_CONNECT_OPTION,
     ]
     if mocks_file:
         argv += ["--set", f"autonom_mocks={mocks_file}"]

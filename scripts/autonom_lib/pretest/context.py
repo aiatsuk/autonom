@@ -24,8 +24,11 @@ so ``pretest start`` creates nothing.
 """
 from __future__ import annotations
 
+import errno
 import json
+import os
 import re
+import stat
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -64,22 +67,56 @@ def is_import_line(text: str) -> bool:
 _STATUS_MAP = {"M": "M", "A": "A", "D": "D", "R": "R", "C": "A", "T": "M"}
 
 
+def _git_missing() -> errors.AutonomError:
+    return errors.AutonomError(
+        errors.GIT_MISSING, "git is not on PATH",
+        hint="The pre-test reads the diff with git; install git or add it to PATH.")
+
+
+def require_repo_dir(repo: Path) -> Path:
+    """``repo`` when it is an existing directory, else ``invalid_value``
+    ("--repo <path> is not a directory"). Checked before git runs, so a
+    missing repository is never reported as a missing git."""
+    try:
+        is_dir = Path(repo).is_dir()
+    except (OSError, ValueError):
+        is_dir = False
+    if not is_dir:
+        raise errors.AutonomError(
+            errors.INVALID_VALUE, f"--repo {repo} is not a directory",
+            hint="Pass the repository's working tree with --repo <dir>, or run from inside it.",
+            repo=str(repo))
+    return Path(repo)
+
+
+def _git_reason(stderr: bytes, returncode: int) -> str:
+    """The first non-empty line of git's stderr; never empty."""
+    for line in stderr.decode("utf-8", "replace").splitlines():
+        if line.strip():
+            return store.clip(line.strip(), 300) or line.strip()[:300]
+    return f"git exited with status {returncode}"
+
+
 def _git_bytes(repo: Path, argv: list[str], what: str) -> bytes:
+    require_repo_dir(repo)
     try:
         completed = subprocess.run(
             ["git", "-c", "core.quotepath=off", *argv],
             cwd=repo, capture_output=True, timeout=60, check=False)
-    except FileNotFoundError:
-        raise errors.AutonomError(errors.BACKEND_FAILED, "git is not on PATH",
-                                  hint="The pre-test reads the diff with git.") from None
+    except (FileNotFoundError, NotADirectoryError) as exc:
+        # cwd was checked above: unless the directory vanished in between, the
+        # missing executable is git itself
+        require_repo_dir(repo)
+        raise _git_missing() from exc
     except subprocess.TimeoutExpired:
         raise errors.AutonomError(errors.BACKEND_FAILED, f"git {what} timed out",
                                   hint="Check the repository is local and not locked.") from None
     if completed.returncode != 0:
-        message = completed.stderr.decode("utf-8", "replace").strip()[:300]
+        reason = _git_reason(completed.stderr, completed.returncode)
         raise errors.AutonomError(
-            errors.BACKEND_FAILED, f"git {what} failed: {message}",
-            hint="Run from inside the repository; --base and --head must exist locally.")
+            errors.INVALID_VALUE, f"git {what} failed: {reason}",
+            hint="Run from inside the repository (or pass --repo); --base and --head "
+                 "must exist locally.", reason=reason)
     return completed.stdout
 
 
@@ -99,8 +136,18 @@ def verify_ref(repo: Path, ref: Any, flag: str) -> str:
             errors.INVALID_VALUE, f"{flag} {ref!r} is not a git ref",
             hint=f"Name a branch, tag or commit, e.g. {flag} main; a ref never "
                  "starts with '-'.", ref=ref)
-    _git_bytes(repo, ["rev-parse", "--verify", "--quiet", "--end-of-options",
-                      f"{ref}^{{commit}}"], f"rev-parse {ref}")
+    try:
+        _git_bytes(repo, ["rev-parse", "--verify", "--end-of-options",
+                          f"{ref}^{{commit}}"], f"rev-parse {ref}")
+    except errors.AutonomError as exc:
+        reason = exc.extra.get("reason")
+        if exc.code != errors.INVALID_VALUE or not reason:
+            raise
+        # git ran and refused: the ref names no commit in this repository
+        raise errors.AutonomError(
+            errors.INVALID_VALUE, f"{flag} {ref} is not a commit in {repo}: {reason}",
+            hint=f"Name a branch, tag or commit that exists locally, e.g. {flag} main "
+                 "('git fetch' first for a remote branch).", ref=ref, reason=reason) from None
     return ref
 
 
@@ -197,12 +244,13 @@ def _hunks(repo: Path, target: str, cap_bytes: int,
     argv = ["git", "-c", "core.quotepath=off", "diff", "-U0", "-M", "--no-color",
             "--no-ext-diff", "--src-prefix=a/", "--dst-prefix=b/", "--end-of-options",
             target, "--"]
+    require_repo_dir(repo)
     try:
         process = subprocess.Popen(argv, cwd=repo, stdout=subprocess.PIPE,
                                    stderr=subprocess.PIPE)
-    except FileNotFoundError:
-        raise errors.AutonomError(errors.BACKEND_FAILED, "git is not on PATH",
-                                  hint="The pre-test reads the diff with git.") from None
+    except (FileNotFoundError, NotADirectoryError) as exc:
+        require_repo_dir(repo)
+        raise _git_missing() from exc
     found: dict[str, dict[str, list]] = {}
     current: dict[str, list] | None = None
     in_header = False
@@ -261,10 +309,11 @@ def _hunks(repo: Path, target: str, cap_bytes: int,
             process.stderr.close()
         code = process.wait()
     if not truncated and code != 0:
+        reason = _git_reason(stderr, code)
         raise errors.AutonomError(
-            errors.BACKEND_FAILED,
-            f"git diff -U0 {target} failed: {stderr.decode('utf-8', 'replace').strip()[:300]}",
-            hint="Run from inside the repository; --base and --head must exist locally.")
+            errors.INVALID_VALUE, f"git diff -U0 {target} failed: {reason}",
+            hint="Run from inside the repository (or pass --repo); --base and --head "
+                 "must exist locally.", reason=reason)
     return found, truncated, min(used, cap_bytes)
 
 
@@ -272,6 +321,42 @@ def _untracked(repo: Path) -> list[str]:
     raw = _git_bytes(repo, ["ls-files", "--others", "--exclude-standard", "--full-name", "-z"],
                      "ls-files --others")
     return [name for name in _z_fields(raw) if name]
+
+
+class _NotRegular(OSError):
+    """An untracked path that is not a regular file (never opened)."""
+
+
+def read_untracked(path: Path) -> bytes:
+    """At most ``UNTRACKED_READ_LIMIT + 1`` bytes of an untracked file, read
+    without blocking: ``lstat`` first, so a symlink, FIFO, socket or device
+    node is ``_NotRegular`` and never opened; the open does not follow a
+    symlink and does not block (``O_NOFOLLOW | O_NONBLOCK``), and the opened
+    file is checked again, so one swapped in between is refused too."""
+    info = os.lstat(path)
+    if not stat.S_ISREG(info.st_mode):
+        raise _NotRegular(errno.EINVAL, "not a regular file", str(path))
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise _NotRegular(errno.ELOOP, "a symlink", str(path)) from None
+        raise
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise _NotRegular(errno.EINVAL, "not a regular file", str(path))
+        chunks: list[bytes] = []
+        wanted = UNTRACKED_READ_LIMIT + 1
+        while wanted > 0:
+            chunk = os.read(fd, min(wanted, 1024 * 1024))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            wanted -= len(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
 
 
 def diff_files(repo: str | Path, base: str, head: str | None,
@@ -295,6 +380,7 @@ def diff_files(repo: str | Path, base: str, head: str | None,
         item["ranges"] = [] if item["binary"] else info["ranges"]
         item["functions"] = [] if item["binary"] else info["functions"]
         files.append(item)
+    skipped: list[str] = []
     if head is None:
         # Like proof: against the working tree a new, never-added file is a change.
         listed = {item["path"] for item in files}
@@ -304,8 +390,12 @@ def diff_files(repo: str | Path, base: str, head: str | None,
             item = {"path": name, "status": "A", "binary": False, "ranges": [],
                     "functions": []}
             try:
-                with open(repo_path / name, "rb") as handle:
-                    data = handle.read(UNTRACKED_READ_LIMIT + 1)
+                data = read_untracked(repo_path / name)
+            except _NotRegular:
+                # a symlink, FIFO, socket or device: listed, never opened
+                skipped.append(name)
+                files.append(item)
+                continue
             except OSError:
                 data = b""
             if b"\0" in data[:8000]:
@@ -318,7 +408,8 @@ def diff_files(repo: str | Path, base: str, head: str | None,
                     lines = data.count(b"\n") + (0 if data.endswith(b"\n") else 1)
                     item["ranges"] = [[1, lines]]
             files.append(item)
-    return {"changed_files": files, "diff_truncated": truncated}
+    return {"changed_files": files, "diff_truncated": truncated,
+            "skipped_untracked": skipped}
 
 
 # --- Runtime Map hints -------------------------------------------------------------
@@ -391,10 +482,30 @@ def runtime_map_hints(app_id: str | None, changed: list[str],
     return hints
 
 
+def require_flows_dir(flows_dir: str | Path) -> Path:
+    """An explicit ``--flows`` that does not exist is ``invalid_value``
+    ("--flows <path> does not exist"); the default directory may be absent."""
+    path = Path(flows_dir).expanduser()
+    try:
+        exists = path.exists()
+    except (OSError, ValueError):
+        exists = False
+    if not exists:
+        raise errors.AutonomError(
+            errors.INVALID_VALUE, f"--flows {flows_dir} does not exist",
+            hint="Pass the directory that holds the Flow v1 files, or omit --flows to use "
+                 "<repo>/.autonom/flows.", flows=str(flows_dir))
+    return path
+
+
 def build(repo: str | Path | None, base: str | None, head: str | None,
           flows_dir: str | Path | None, session: dict[str, Any] | None,
-          app_id: str | None) -> dict[str, Any]:
-    """``autonom.pretest-context/v1`` for ``repo`` between ``base`` and ``head``."""
+          app_id: str | None, *, platform: str | None = None) -> dict[str, Any]:
+    """``autonom.pretest-context/v1`` for ``repo`` between ``base`` and ``head``.
+
+    ``platform`` (default: the session's) is passed to ``proof.select_suite``;
+    a pull-request flow for another platform is still selected and its
+    ``flow <name> is for <platform>`` warning lands in ``flows.warnings``."""
     context: dict[str, Any] = {
         "schema": CONTEXT_SCHEMA,
         "repo": str(repo) if repo else None,
@@ -403,13 +514,17 @@ def build(repo: str | Path | None, base: str | None, head: str | None,
         "changed_files": [],
         "diff_truncated": False,
         "changed_areas": [],
-        "flows": {"flows_dir": None, "selected": [], "invalid": [], "uncovered_files": []},
+        "flows": {"flows_dir": None, "selected": [], "invalid": [], "uncovered_files": [],
+                  "warnings": []},
         "runtime_map_hints": [],
         "profile": None,
+        "skipped_untracked": [],
     }
+    if flows_dir:
+        require_flows_dir(flows_dir)
     if not repo or not base:
         return context
-    repo_path = Path(repo).resolve()
+    repo_path = require_repo_dir(Path(repo).expanduser()).resolve()
     from . import profile as profile_mod
 
     context["profile"] = profile_mod.context_block(repo_path, app_id)
@@ -420,16 +535,20 @@ def build(repo: str | Path | None, base: str | None, head: str | None,
             names.append(item["path"])
     context["changed_files"] = diff["changed_files"]
     context["diff_truncated"] = diff["diff_truncated"]
+    context["skipped_untracked"] = list(diff.get("skipped_untracked") or [])
     context["changed_areas"] = proof.changed_areas(names) if names else []
     directory = Path(flows_dir) if flows_dir else repo_path / ".autonom" / "flows"
     covered: list[str] = []
     if directory.is_dir():
-        suite = proof.select_suite(directory, repo_path, names)
+        if platform is None and isinstance(session, dict):
+            platform = session.get("platform") or None
+        suite = proof.select_suite(directory, repo_path, names, platform=platform)
         context["flows"]["flows_dir"] = str(directory.resolve())
         context["flows"]["selected"] = [
             {"flow": str(Path(entry["path"]).resolve()), "reasons": list(entry["reasons"])}
             for entry in suite["selected"]]
         context["flows"]["invalid"] = list(suite["invalid"])
+        context["flows"]["warnings"] = list(suite.get("warnings") or [])
         covered = list(suite["covered"])
     context["flows"]["uncovered_files"] = [name for name in names if name not in covered]
     context["runtime_map_hints"] = runtime_map_hints(app_id, names, context["changed_areas"])

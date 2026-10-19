@@ -442,14 +442,16 @@ class TestSocket extends EventEmitter {
   }
 }
 
-function openControl(canvas, path = "/ws/control") {
+/** A token client's /ws/control; `origin: null` names none (an agent since RISK-018). */
+function openControl(canvas, path = "/ws/control", { origin = "human" } = {}) {
+  const query = `?token=${TOKEN}${origin === null ? "" : `&origin=${origin}`}`;
   return new Promise((resolvePromise, reject) => {
     const socket = connect(canvas.port, "127.0.0.1");
     let data = Buffer.alloc(0);
     socket.on("error", reject);
     socket.on("connect", () => {
       socket.write([
-        `GET ${path}?token=${TOKEN} HTTP/1.1`, `Host: 127.0.0.1:${canvas.port}`, "Upgrade: websocket",
+        `GET ${path}${query} HTTP/1.1`, `Host: 127.0.0.1:${canvas.port}`, "Upgrade: websocket",
         "Connection: Upgrade", `Sec-WebSocket-Key: ${randomBytes(16).toString("base64")}`,
         "Sec-WebSocket-Version: 13", "", "",
       ].join("\r\n"));
@@ -571,10 +573,11 @@ async function stopCanvas(canvas) {
   return await canvas.exited;
 }
 
+/** `origin: null` sends no X-Autonom-Origin header at all. */
 async function http(canvas, method, path, { body, origin = "human" } = {}) {
   const response = await fetch(`${canvas.origin}${path}`, {
     method,
-    headers: { Authorization: `Bearer ${TOKEN}`, "X-Autonom-Origin": origin,
+    headers: { Authorization: `Bearer ${TOKEN}`, ...(origin === null ? {} : { "X-Autonom-Origin": origin }),
       ...(body === undefined ? {} : { "Content-Type": "application/json" }) },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
@@ -1119,4 +1122,85 @@ test("14: right after a Take over and Hand back, a person's first touch takes th
     ["control_not_held"]);
   assert.equal(late.device.touches().length, 0);
   await stopCanvas(slow);
+});
+
+// --- RISK-018: a client that names no origin is an agent -----------------------------------
+
+test("RISK-018: an HTTP tap without X-Autonom-Origin reaches the bridge as agent and takes no lease; an explicit human does", { timeout: 60_000 }, async (t) => {
+  const world = await makeWorld(t);
+  const canvas = await startCanvas(world);
+  const unnamed = await tap(canvas, 11, 12, null);
+  assert.equal(unnamed.status, 200, unnamed.text);
+  assert.equal((await bridgeOps(world, "control-acquire")).length, 0, "a client without an origin took the human lease");
+  assert.equal(existsSync(world.leaseFile), false);
+  // An empty header is no origin too.
+  const empty = await tap(canvas, 13, 14, "");
+  assert.equal(empty.status, 200, empty.text);
+  assert.equal((await bridgeOps(world, "control-acquire")).length, 0);
+  const human = await tap(canvas, 15, 16, "human");
+  assert.equal(human.status, 200, human.text);
+  assert.equal((await bridgeOps(world, "control-acquire")).length, 1, "the explicit human tap takes the lease");
+  assert.deepEqual((await bridgeOps(world, "tap")).map((request) => [request.origin, request.payload.x]),
+    [["agent", 11], ["agent", 13], ["human", 15]]);
+  await stopCanvas(canvas);
+});
+
+test("RISK-018: an unknown X-Autonom-Origin value (Agent, bogus, HUMAN) is an agent and takes no lease; ?origin=bogus is still 400", { timeout: 60_000 }, async (t) => {
+  const world = await makeWorld(t);
+  const canvas = await startCanvas(world);
+  for (const [index, origin] of ["Agent", "bogus", "HUMAN"].entries()) {
+    const response = await tap(canvas, 31 + index, 32, origin);
+    assert.equal(response.status, 200, response.text);
+  }
+  assert.equal((await bridgeOps(world, "control-acquire")).length, 0, "an unknown origin took the human lease");
+  assert.equal(existsSync(world.leaseFile), false);
+  assert.deepEqual((await bridgeOps(world, "tap")).map((request) => [request.origin, request.payload.x]),
+    [["agent", 31], ["agent", 32], ["agent", 33]]);
+  await assert.rejects(openControl(canvas, "/ws/control", { origin: "bogus" }), /upgrade answered 400/);
+  await stopCanvas(canvas);
+});
+
+test("RISK-018: with auth off the explicit human origin is still human and a missing one is agent", { timeout: 60_000 }, async (t) => {
+  const world = await makeWorld(t);
+  const canvas = await startCanvas(world, { args: ["--no-auth"] });
+  assert.equal((await tap(canvas, 21, 22, null)).status, 200);
+  assert.equal((await bridgeOps(world, "control-acquire")).length, 0);
+  assert.equal((await tap(canvas, 23, 24, "human")).status, 200);
+  assert.equal((await bridgeOps(world, "control-acquire")).length, 1);
+  assert.deepEqual((await bridgeOps(world, "tap")).map((request) => request.origin), ["agent", "human"]);
+  await stopCanvas(canvas);
+});
+
+test("RISK-018: a /ws/control client without ?origin= journals as agent and takes no lease; ?origin=human does", { timeout: 60_000 }, async (t) => {
+  const world = await makeWorld(t);
+  const canvas = await startCanvas(world, { transport: "scrcpy" });
+  const agent = await openControl(canvas, "/ws/control", { origin: null });
+  await waitFor(() => world.device.connected, 10_000, "the fake device connection");
+  await agent.next((message) => message.t === "state" && message.session === "streaming" && message.width);
+  agent.send({ t: "touch", a: "down", id: 1, x: 0.5, y: 0.5 });
+  agent.send({ t: "touch", a: "up", id: 1, x: 0.5, y: 0.5 });
+  const records = await waitFor(async () => {
+    const found = await bridgeOps(world, "record");
+    return found.length >= 1 && found;
+  }, 5000, "the agent touch's journal record");
+  assert.deepEqual(records.map((request) => request.origin), ["agent"]);
+  assert.equal((await bridgeOps(world, "control-acquire")).length, 0, "a client without an origin took the human lease");
+  agent.close();
+  const human = await openControl(canvas);
+  await human.next((message) => message.t === "state" && message.session === "streaming" && message.width);
+  human.send({ t: "touch", a: "down", id: 2, x: 0.5, y: 0.5 });
+  human.send({ t: "touch", a: "up", id: 2, x: 0.5, y: 0.5 });
+  await waitFor(async () => (await bridgeOps(world, "record")).length >= 2, 5000, "the human touch's journal record");
+  assert.deepEqual((await bridgeOps(world, "record")).map((request) => request.origin), ["agent", "human"]);
+  assert.equal((await bridgeOps(world, "control-acquire")).length, 1, "the explicit human touch takes the lease");
+  await stopCanvas(canvas);
+});
+
+test("RISK-018: the device page names its own input human on HTTP and on the control WebSocket", { timeout: 60_000 }, async (t) => {
+  const world = await makeWorld(t);
+  const canvas = await startCanvas(world, { args: ["--no-auth"] });
+  const page = await (await fetch(`${canvas.origin}/`)).text();
+  assert.match(page, /"X-Autonom-Origin":"human"/);
+  assert.match(page, /function wsUrl\(path\)\{[^}]*params\.set\("origin","human"\)/);
+  await stopCanvas(canvas);
 });

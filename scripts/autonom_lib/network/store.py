@@ -1,7 +1,8 @@
 """Flow store: read, filter, and bound what an agent sees (CAP-NET-003, CAP-NET-005).
 
 The store is append-only JSONL, so a proxy crash costs at most the final partial
-line — which the reader skips with a warning rather than failing.
+line — which the reader skips with a warning rather than failing. A line that
+is JSON but not an object is skipped the same way, and counted.
 
 Listing is capped (default 50) and reports `total_matched` plus `truncated`, so an
 agent is never silently shown a subset and left to conclude the rest do not exist.
@@ -18,34 +19,96 @@ from .. import errors
 from . import redact
 
 DEFAULT_MAX = 50
+# A store line nested deeper than this is no record the tool wrote: json.loads
+# may still read it, but str(), repr() or the scrubbers then raise
+# RecursionError, so readers skip it like a line that is not a record.
+MAX_LINE_DEPTH = 200
+
+
+def too_deep(value: Any, limit: int = MAX_LINE_DEPTH) -> bool:
+    """Whether lists and objects in ``value`` nest more than ``limit`` levels.
+    Walks without recursion, so it never raises RecursionError itself."""
+    stack: list[tuple[Any, int]] = [(value, 1)]
+    while stack:
+        item, depth = stack.pop()
+        if not isinstance(item, (dict, list)):
+            continue
+        if depth > limit:
+            return True
+        children = item.values() if isinstance(item, dict) else item
+        stack.extend((child, depth + 1) for child in children)
+    return False
 
 
 def flows_path(record: dict[str, Any]) -> Path:
     return Path(record["artifacts_dir"]) / "network" / "flows.jsonl"
 
 
-def read_all(record: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def read_all_counted(
+    record: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int]:
+    """Every readable flow record, the warnings, and how many lines were skipped.
+
+    A line is skipped, never fatal, when it is not JSON (a torn final write)
+    or is JSON but not an object (`[]`, `"x"`, `3`): readers such as
+    `pretest events` and `network requests` index the records as mappings.
+    An object nested more than `MAX_LINE_DEPTH` levels is counted with the
+    non-objects (printing or scrubbing it would raise RecursionError).
+    """
     path = flows_path(record)
     warnings: list[dict[str, Any]] = []
     if not path.exists():
-        return [], warnings
+        return [], warnings, 0
     flows: list[dict[str, Any]] = []
     truncated = 0
+    not_objects = 0
     for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
         line = line.strip()
         if not line:
             continue
         try:
-            flows.append(redact.scrub_flow(json.loads(line)))
-        except json.JSONDecodeError:
+            parsed = json.loads(line)
+        except (json.JSONDecodeError, RecursionError):
             truncated += 1
+            continue
+        if not isinstance(parsed, dict) or too_deep(parsed):
+            not_objects += 1
+            continue
+        try:
+            flows.append(redact.scrub_flow(parsed))
+        except (TypeError, ValueError, AttributeError, RecursionError):
+            not_objects += 1
     if truncated:
         warnings.append({
             "code": "truncated_flow_record",
             "error": f"skipped {truncated} unparseable line(s)",
             "hint": "The proxy was probably interrupted mid-write; earlier flows are intact.",
+            "skipped": truncated,
         })
+    if not_objects:
+        warnings.append({
+            "code": "invalid_flow_record",
+            "error": f"skipped {not_objects} line(s) that are not flow records (JSON objects)",
+            "hint": "network/flows.jsonl was edited or written by something other than "
+                    "the proxy; the other flows are intact.",
+            "skipped": not_objects,
+        })
+    return flows, warnings, truncated + not_objects
+
+
+def read_all(record: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """`read_all_counted` without the count; each skip warning carries `skipped`."""
+    flows, warnings, _skipped = read_all_counted(record)
     return flows, warnings
+
+
+def skipped_count(warnings: list[dict[str, Any]]) -> int:
+    """Lines `read_all` skipped, from its warnings."""
+    return sum(int(item.get("skipped") or 0) for item in warnings
+               if isinstance(item, dict) and item.get("code") in SKIP_WARNING_CODES)
+
+
+SKIP_WARNING_CODES = ("truncated_flow_record", "invalid_flow_record")
 
 
 def _since_cutoff(seconds: float) -> str:
@@ -65,18 +128,18 @@ def filter_flows(
     cutoff = _since_cutoff(since_seconds) if since_seconds else None
     result = []
     for flow in flows:
-        if host and (flow.get("host") or "").lower() != host.lower():
+        if host and str(flow.get("host") or "").lower() != host.lower():
             continue
-        if method and (flow.get("method") or "").upper() != method.upper():
+        if method and str(flow.get("method") or "").upper() != method.upper():
             continue
         if status is not None and flow.get("status") != status:
             continue
         if path_glob and not (
-            fnmatch.fnmatch(flow.get("path") or "", path_glob)
-            or fnmatch.fnmatch(flow.get("url") or "", path_glob)
+            fnmatch.fnmatch(str(flow.get("path") or ""), path_glob)
+            or fnmatch.fnmatch(str(flow.get("url") or ""), path_glob)
         ):
             continue
-        if cutoff and (flow.get("started_at") or "") < cutoff:
+        if cutoff and str(flow.get("started_at") or "") < cutoff:
             continue
         if mocked is not None and bool(flow.get("mocked")) is not mocked:
             continue
@@ -108,7 +171,7 @@ def listing(
     since_id: str | None = None,
     **filters: Any,
 ) -> dict[str, Any]:
-    flows, warnings = read_all(record)
+    flows, warnings, skipped = read_all_counted(record)
     if since_id:
         flows = after_id(flows, since_id, warnings)
     matched = filter_flows(flows, **filters)
@@ -119,6 +182,8 @@ def listing(
         "truncated": len(limited) < len(matched),
         "requests": limited,
     }
+    if skipped:
+        payload["skipped"] = skipped
     if warnings:
         payload["warnings"] = warnings
     return payload

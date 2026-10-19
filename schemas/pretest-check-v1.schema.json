@@ -2,11 +2,11 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://autonom.dev/schemas/pretest-check-v1.schema.json",
   "title": "Autonom Ticket Pre-test Check Event v1",
-  "description": "One line of pretests/<pretest_id>/checks.ndjson. $defs.state is the folded state per check that status, pack and summary read.",
+  "description": "One line of pretests/<pretest_id>/checks.ndjson. $defs.state is the folded state per check that status, pack and summary read. An amended event (autonom pretest check amend) corrects the verdict of an ended check; the folded state carries the latest verdict.",
   "type": "object",
   "required": ["event", "check_id", "ts", "journal_seq"],
   "properties": {
-    "event": {"enum": ["add", "begin", "end"]},
+    "event": {"enum": ["add", "begin", "end", "amended"]},
     "check_id": {"type": "string", "pattern": "^chk-[1-9][0-9]*$"},
     "ts": {"type": "string", "minLength": 1},
     "journal_seq": {"type": "integer", "minimum": 0}
@@ -32,7 +32,21 @@
         "properties": {
           "verdict": {"$ref": "#/$defs/verdict"},
           "note": {"type": ["string", "null"]},
-          "run_id": {"type": ["string", "null"]}
+          "run_id": {"type": ["string", "null"]},
+          "observed_count": {"$ref": "#/$defs/observed_count"}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"event": {"const": "amended"}}},
+      "then": {
+        "required": ["old_verdict", "new_verdict", "note", "at"],
+        "properties": {
+          "old_verdict": {"$ref": "#/$defs/verdict"},
+          "new_verdict": {"$ref": "#/$defs/verdict"},
+          "note": {"type": "string", "minLength": 1},
+          "at": {"type": "string", "minLength": 1},
+          "observed_count": {"$ref": "#/$defs/observed_count"}
         }
       }
     }
@@ -40,6 +54,19 @@
   "$defs": {
     "kind": {"enum": ["ticket", "edge", "regression", "network", "a11y", "analytics"]},
     "verdict": {"enum": ["pass", "fail", "blocked", "not_covered", "inconclusive"]},
+    "observed_count": {"type": "integer", "minimum": 0,
+                       "description": "Requests counted during a race kit case (double-tap); required for a pass of that case by 'pretest check end'."},
+    "amendment": {
+      "type": "object",
+      "required": ["old_verdict", "new_verdict", "note", "previous_note", "at"],
+      "properties": {
+        "old_verdict": {"$ref": "#/$defs/verdict"},
+        "new_verdict": {"$ref": "#/$defs/verdict"},
+        "note": {"type": "string"},
+        "previous_note": {"type": ["string", "null"]},
+        "at": {"type": "string"}
+      }
+    },
     "kit_id": {"enum": ["offline", "slow", "server-error", "timeout", "background-resume",
                         "process-death", "rotation", "dark-mode", "large-text", "locale",
                         "permission-denied", "empty-input", "long-input", "emoji-input",
@@ -64,7 +91,9 @@
         "ended_at": {"type": ["string", "null"]},
         "duration_s": {"type": ["number", "null"]},
         "seq_from": {"type": ["integer", "null"]},
-        "seq_to": {"type": ["integer", "null"]}
+        "seq_to": {"type": ["integer", "null"]},
+        "observed_count": {"$ref": "#/$defs/observed_count"},
+        "amendments": {"type": "array", "items": {"$ref": "#/$defs/amendment"}}
       }
     }
   }

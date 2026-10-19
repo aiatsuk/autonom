@@ -6,6 +6,8 @@ contract iOS must match.
 """
 from __future__ import annotations
 
+import re
+import subprocess
 from typing import Any
 
 from . import adb as adb_mod
@@ -150,7 +152,9 @@ def dump_hierarchy(adb: str, serial: str, *, retries: int = 1) -> str:
     )
 
 
-def screen_size(adb: str, serial: str) -> tuple[int, int] | None:
+def natural_size(adb: str, serial: str) -> tuple[int, int] | None:
+    """`wm size` (the override when one is set): the display in its natural
+    orientation, whatever the current rotation is."""
     completed = adb_mod.run_adb(adb, ["shell", "wm", "size"], serial=serial, timeout=10, check=False)
     text = completed.stdout if isinstance(completed.stdout, str) else ""
     for line in reversed(text.splitlines()):
@@ -161,6 +165,77 @@ def screen_size(adb: str, serial: str) -> tuple[int, int] | None:
             except ValueError:
                 continue
     return None
+
+
+_SURFACE_ORIENTATION = re.compile(r"SurfaceOrientation:\s*([0-3])\b")
+_CURRENT_ROTATION = re.compile(r"\bmCurrentRotation=(?:ROTATION_)?(\d+)\b")
+_ROTATION_BY_DEGREES = {"0": 0, "90": 1, "180": 2, "270": 3}
+
+
+def _shell_text(adb: str, serial: str, args: list[str]) -> str:
+    """The command's output, or ``""`` when it fails, times out or cannot be
+    started: a rotation source that does not answer names no rotation, so
+    ``screen_size`` keeps the natural size."""
+    try:
+        completed = adb_mod.run_adb(adb, ["shell", *args], serial=serial, timeout=10,
+                                    check=False)
+    except (subprocess.TimeoutExpired, OSError):
+        return ""
+    if completed.returncode:
+        return ""
+    return completed.stdout if isinstance(completed.stdout, str) else ""
+
+
+def parse_rotation(input_dump: str = "", window_dump: str = "",
+                   user_rotation: str = "") -> int | None:
+    """The display rotation (0..3, quarter turns) from the first source that
+    names one: `dumpsys input` SurfaceOrientation, `dumpsys window`
+    mCurrentRotation (`ROTATION_90` or `1`), `settings get system
+    user_rotation`. None when none does."""
+    match = _SURFACE_ORIENTATION.search(input_dump or "")
+    if match:
+        return int(match.group(1))
+    match = _CURRENT_ROTATION.search(window_dump or "")
+    if match:
+        value = match.group(1)
+        if "ROTATION_" in match.group(0):
+            if value in _ROTATION_BY_DEGREES:
+                return _ROTATION_BY_DEGREES[value]
+        elif value in ("0", "1", "2", "3"):
+            return int(value)
+    value = (user_rotation or "").strip()
+    if value in ("0", "1", "2", "3"):
+        return int(value)
+    return None
+
+
+def rotation(adb: str, serial: str) -> int | None:
+    """The current display rotation, each source asked only when the one
+    before it named none."""
+    found = parse_rotation(_shell_text(adb, serial, ["dumpsys", "input"]))
+    if found is not None:
+        return found
+    found = parse_rotation(window_dump=_shell_text(adb, serial, ["dumpsys", "window", "displays"]))
+    if found is not None:
+        return found
+    return parse_rotation(user_rotation=_shell_text(
+        adb, serial, ["settings", "get", "system", "user_rotation"]))
+
+
+def rotated_size(size: tuple[int, int], turns: int | None) -> tuple[int, int]:
+    """A quarter turn (rotation 1 or 3) swaps width and height."""
+    width, height = size
+    return (height, width) if turns in (1, 3) else (width, height)
+
+
+def screen_size(adb: str, serial: str) -> tuple[int, int] | None:
+    """The screen as input coordinates see it now: the natural `wm size`,
+    swapped while the display is turned to landscape. An unknown rotation
+    keeps the natural size."""
+    size = natural_size(adb, serial)
+    if size is None:
+        return None
+    return rotated_size(size, rotation(adb, serial))
 
 
 def tap(adb: str, serial: str, x: int, y: int) -> None:

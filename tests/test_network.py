@@ -50,8 +50,8 @@ class AddonBoundaryTests(unittest.TestCase):
                 if node.level:  # a relative import would reach into autonom_lib
                     self.fail("addon uses a relative import")
         self.assertNotIn("autonom_lib", imported)
-        self.assertTrue(imported <= {"json", "os", "time", "typing", "fnmatch", "re", "mitmproxy",
-                                     "__future__"}, imported)
+        self.assertTrue(imported <= {"asyncio", "json", "os", "time", "typing", "fnmatch", "re",
+                                     "mitmproxy", "__future__"}, imported)
 
     def test_addon_is_importable_without_mitmproxy(self) -> None:
         self.assertEqual(mitm_addon.addons, [])
@@ -104,6 +104,15 @@ class ProxyBindTests(unittest.TestCase):
                                 confdir=Path("/tmp/n/ca"), capture_bodies=False)
         self.assertIn("--listen-host", argv)
         self.assertEqual(argv[argv.index("--listen-host") + 1], "127.0.0.1")
+
+    def test_argv_connects_upstream_lazily(self) -> None:
+        """A.1 — the proxy, not a hand-written config.yaml, sets the strategy."""
+        argv = proxy.build_argv("mitmdump", port=8080, directory=Path("/tmp/n"),
+                                confdir=Path("/tmp/n/ca"), capture_bodies=False)
+        index = argv.index("connection_strategy=lazy")
+        self.assertEqual(argv[index - 1], "--set")
+        self.assertEqual(argv.count("connection_strategy=lazy"), 1)
+        self.assertEqual(argv[-1], "-q")
 
     def test_no_wildcard_bind_anywhere_in_the_network_package(self) -> None:
         for path in (ROOT / "scripts/autonom_lib/network").glob("*.py"):
@@ -467,6 +476,216 @@ class MockRuleTests(unittest.TestCase):
         self.assertEqual(oct(resolved.stat().st_mode & 0o777), "0o700")
 
 
+class BodyFileContentTypeTests(unittest.TestCase):
+    """A.5 — `--body-file` without a Content-Type header: type from the extension."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.registry = Path(self.tmp.name) / "registry"
+        self.registry.mkdir()
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def _file(self, name: str, text: str = "x") -> Path:
+        path = Path(self.tmp.name) / name
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def test_the_extension_table(self) -> None:
+        cases = {
+            "a.json": "application/json", "a.JSON": "application/json",
+            "a.html": "text/html; charset=utf-8", "a.htm": "text/html; charset=utf-8",
+            "a.txt": "text/plain; charset=utf-8", "a.xml": "application/xml",
+            "a.png": "image/png", "a.jpg": "image/jpeg", "a.jpeg": "image/jpeg",
+            "a.bin": "application/octet-stream", "noext": "application/octet-stream",
+            "dir.json/file": "application/octet-stream",
+        }
+        for name, expected in cases.items():
+            with self.subTest(name=name):
+                self.assertEqual(mocks.content_type_for(name), expected)
+
+    def test_add_with_a_body_file_sets_the_type(self) -> None:
+        rule = mocks.add(url_glob="*", body_file=self._file("ok.json", "{}"),
+                         registry=self.registry)
+        self.assertEqual(rule["response"]["headers"], {"Content-Type": "application/json"})
+        stored = mocks.load(self.registry)[0]
+        self.assertEqual(stored["response"]["headers"]["Content-Type"], "application/json")
+
+    def test_an_explicit_content_type_header_wins_in_any_case(self) -> None:
+        rule = mocks.add(url_glob="*", body_file=self._file("ok.json", "{}"),
+                         headers={"content-type": "text/x-custom", "X-A": "1"},
+                         registry=self.registry)
+        self.assertEqual(rule["response"]["headers"],
+                         {"content-type": "text/x-custom", "X-A": "1"})
+
+    def test_other_headers_are_kept_beside_the_derived_type(self) -> None:
+        rule = mocks.add(url_glob="*", body_file=self._file("page.html"),
+                         headers={"X-A": "1"}, registry=self.registry)
+        self.assertEqual(rule["response"]["headers"],
+                         {"X-A": "1", "Content-Type": "text/html; charset=utf-8"})
+
+    def test_an_inline_body_gets_json_only_when_it_looks_like_json(self) -> None:
+        rule = mocks.add(url_glob="*", body_text='{"a": 1}', registry=self.registry)
+        self.assertEqual(rule["response"]["headers"], {"Content-Type": "application/json"})
+        self.assertIs(rule["response"]["content_type_implicit"], True)
+        for text in ("plain words", "", "   "):
+            with self.subTest(text=text):
+                plain = mocks.add(url_glob="*", body_text=text, registry=self.registry)
+                self.assertEqual(plain["response"]["headers"], {})
+                self.assertNotIn("content_type_implicit", plain["response"])
+
+    def test_implicit_content_type_helper(self) -> None:
+        self.assertEqual(mocks.implicit_content_type(body_file="a.png"), "image/png")
+        self.assertEqual(mocks.implicit_content_type(body_text=" [1]"), "application/json")
+        self.assertIsNone(mocks.implicit_content_type(body_text="ok"))
+        self.assertIsNone(mocks.implicit_content_type())
+
+    def test_an_explicit_type_is_not_marked_implicit(self) -> None:
+        rule = mocks.add(url_glob="*", body_file=self._file("a.json", "{}"),
+                         headers={"Content-Type": "application/json"}, registry=self.registry)
+        self.assertNotIn("content_type_implicit", rule["response"])
+        derived = mocks.add(url_glob="*", body_file=self._file("a.json", "{}"),
+                            registry=self.registry)
+        self.assertIs(derived["response"]["content_type_implicit"], True)
+
+    def test_update_with_a_new_file_follows_its_extension(self) -> None:
+        rule = mocks.add(url_glob="*", body_file=self._file("a.json", "{}"),
+                         registry=self.registry)
+        updated = mocks.update(rule["id"], body_file=self._file("b.png"), registry=self.registry)
+        self.assertEqual(updated["response"]["headers"], {"Content-Type": "image/png"})
+
+    def test_update_keeps_an_explicit_type_when_the_file_changes(self) -> None:
+        rule = mocks.add(url_glob="*", body_file=self._file("a.json", "{}"),
+                         headers={"Content-Type": "application/vnd.x+json"},
+                         registry=self.registry)
+        updated = mocks.update(rule["id"], body_file=self._file("b.txt"), registry=self.registry)
+        self.assertEqual(updated["response"]["headers"],
+                         {"Content-Type": "application/vnd.x+json"})
+
+    def test_update_with_explicit_headers_and_a_file(self) -> None:
+        rule = mocks.add(url_glob="*", body_text="{}", registry=self.registry)
+        derived = mocks.update(rule["id"], body_file=self._file("a.xml"), headers={"X-B": "2"},
+                               registry=self.registry)
+        self.assertEqual(derived["response"]["headers"],
+                         {"X-B": "2", "Content-Type": "application/xml"})
+        explicit = mocks.update(rule["id"], body_file=self._file("c.json", "{}"),
+                                headers={"Content-Type": "text/plain"}, registry=self.registry)
+        self.assertEqual(explicit["response"]["headers"], {"Content-Type": "text/plain"})
+
+    def test_a_header_only_update_keeps_the_extension_type(self) -> None:
+        rule = mocks.add(url_glob="*", body_file=self._file("a.json", "{}"),
+                         registry=self.registry)
+        updated = mocks.update(rule["id"], headers={"X-A": "1"}, registry=self.registry)
+        self.assertEqual(updated["response"]["headers"],
+                         {"X-A": "1", "Content-Type": "application/json"})
+        self.assertIs(updated["response"]["content_type_implicit"], True)
+        # Still implicit, so the next file change follows the new extension.
+        follow = mocks.update(rule["id"], body_file=self._file("b.png"), registry=self.registry)
+        self.assertEqual(follow["response"]["headers"], {"X-A": "1", "Content-Type": "image/png"})
+        stored = mocks.load(self.registry)[0]["response"]
+        self.assertEqual(stored["headers"], {"X-A": "1", "Content-Type": "image/png"})
+        self.assertIs(stored["content_type_implicit"], True)
+
+    def test_a_header_only_update_naming_a_type_makes_it_explicit(self) -> None:
+        rule = mocks.add(url_glob="*", body_file=self._file("a.json", "{}"),
+                         registry=self.registry)
+        updated = mocks.update(rule["id"], headers={"content-type": "text/x-mine"},
+                               registry=self.registry)
+        self.assertEqual(updated["response"]["headers"], {"content-type": "text/x-mine"})
+        self.assertNotIn("content_type_implicit", updated["response"])
+        kept = mocks.update(rule["id"], body_file=self._file("b.png"), registry=self.registry)
+        self.assertEqual(kept["response"]["headers"], {"content-type": "text/x-mine"})
+        kept = mocks.update(rule["id"], body_text='{"a": 1}', registry=self.registry)
+        self.assertEqual(kept["response"]["headers"], {"content-type": "text/x-mine"})
+
+    def test_a_header_only_update_drops_an_explicit_type_it_does_not_repeat(self) -> None:
+        """`--header` replaces the header set; only an implicit type is carried over."""
+        rule = mocks.add(url_glob="*", body_text="{}", headers={"Content-Type": "text/plain"},
+                         registry=self.registry)
+        updated = mocks.update(rule["id"], headers={"X-A": "1"}, registry=self.registry)
+        self.assertEqual(updated["response"]["headers"], {"X-A": "1"})
+        self.assertNotIn("content_type_implicit", updated["response"])
+
+    def test_json_replaces_an_extension_type(self) -> None:
+        rule = mocks.add(url_glob="*", body_file=self._file("page.html"), registry=self.registry)
+        as_json = mocks.update(rule["id"], body_text='{"a": 1}', registry=self.registry)
+        self.assertEqual(as_json["response"]["headers"], {"Content-Type": "application/json"})
+        self.assertIs(as_json["response"]["content_type_implicit"], True)
+        as_text = mocks.update(rule["id"], body_text="plain", registry=self.registry)
+        self.assertEqual(as_text["response"]["headers"], {})
+        self.assertNotIn("content_type_implicit", as_text["response"])
+
+    def test_a_body_file_replaces_the_json_default_type(self) -> None:
+        rule = mocks.add(url_glob="*", body_text='{"a": 1}', headers={"X-A": "1"},
+                         registry=self.registry)
+        updated = mocks.update(rule["id"], body_file=self._file("pic.png"),
+                               registry=self.registry)
+        self.assertEqual(updated["response"]["headers"], {"X-A": "1", "Content-Type": "image/png"})
+
+    def test_a_new_body_keeps_an_explicit_type(self) -> None:
+        rule = mocks.add(url_glob="*", body_text="{}", headers={"Content-Type": "text/plain"},
+                         registry=self.registry)
+        for kwargs in ({"body_text": "[1]"}, {"body_text": "words"},
+                       {"body_file": self._file("x.png")}):
+            with self.subTest(kwargs=kwargs):
+                updated = mocks.update(rule["id"], **kwargs, registry=self.registry)
+                self.assertEqual(updated["response"]["headers"], {"Content-Type": "text/plain"})
+                self.assertNotIn("content_type_implicit", updated["response"])
+
+    def test_a_rule_without_the_marker_counts_as_explicit(self) -> None:
+        """Rules written before the marker existed keep their stored type."""
+        rule = mocks.add(url_glob="*", body_text="{}", headers={"Content-Type": "application/json"},
+                         registry=self.registry)
+        self.assertNotIn("content_type_implicit", rule["response"])
+        updated = mocks.update(rule["id"], body_file=self._file("x.png"), registry=self.registry)
+        self.assertEqual(updated["response"]["headers"], {"Content-Type": "application/json"})
+
+    def test_updates_without_headers_or_body_leave_the_type_alone(self) -> None:
+        rule = mocks.add(url_glob="*", body_file=self._file("a.json", "{}"),
+                         registry=self.registry)
+        updated = mocks.update(rule["id"], status=503, note="n", registry=self.registry)
+        self.assertEqual(updated["response"]["headers"], {"Content-Type": "application/json"})
+        self.assertIs(updated["response"]["content_type_implicit"], True)
+
+    def test_the_helper_leaves_headers_alone_without_a_file(self) -> None:
+        self.assertEqual(mocks.with_body_file_content_type({"A": "1"}, None), {"A": "1"})
+        self.assertEqual(mocks.with_body_file_content_type(None, None), {})
+        self.assertEqual(mocks.with_body_file_content_type(None, "x.jpg"),
+                         {"Content-Type": "image/jpeg"})
+
+    def test_a_missing_body_file_is_still_refused(self) -> None:
+        with self.assertRaises(errors.AutonomError) as caught:
+            mocks.add(url_glob="*", body_file=Path(self.tmp.name) / "nope.json",
+                      registry=self.registry)
+        self.assertEqual(caught.exception.code, errors.BODY_FILE_NOT_FOUND)
+        self.assertEqual(mocks.load(self.registry), [])
+
+
+class AddonResponseRecordTests(unittest.TestCase):
+    def test_a_completed_flow_is_marked_completed_and_recorded_once(self) -> None:
+        from types import SimpleNamespace
+
+        with tempfile.TemporaryDirectory() as tmp:
+            recorder = mitm_addon.AutonomRecorder()
+            recorder.directory = tmp
+            headers = SimpleNamespace(items=lambda: [("Host", "h.example")])
+            flow = SimpleNamespace(
+                request=SimpleNamespace(method="GET", pretty_url="https://h.example/x",
+                                        host="h.example", path="/x", headers=headers,
+                                        content=b"", timestamp_start=1.0),
+                response=SimpleNamespace(status_code=200, content=b"", timestamp_end=1.1,
+                                         headers=headers),
+                error=SimpleNamespace(msg="Client disconnected.", timestamp=1.2),
+                metadata={},
+            )
+            recorder.response(flow)
+            recorder.error(flow)  # an error after the response adds nothing
+            lines = (Path(tmp) / "flows.jsonl").read_text("utf-8").splitlines()
+        self.assertEqual(len(lines), 1)
+        self.assertIs(json.loads(lines[0])["completed"], True)
+
+
 class UrlSugarTests(unittest.TestCase):
     """`--url <exact endpoint>` — the one-liner shape."""
 
@@ -730,6 +949,83 @@ class StoreTests(unittest.TestCase):
         self.assertNotIn("f_9999", [f["id"] for f in flows])
         self.assertEqual(warnings[0]["code"], "truncated_flow_record")
 
+    def _append_lines(self, *lines: str) -> None:
+        with store.flows_path(self.record).open("a", encoding="utf-8") as handle:
+            for line in lines:
+                handle.write(line + "\n")
+
+    def test_lines_that_are_not_objects_are_skipped_and_counted(self) -> None:
+        """B.7 — `[]`, `"x"`, `3`, `null` are JSON but not flow records."""
+        before, _ = store.read_all(self.record)
+        self._append_lines("[]", '"text"', "3", "null", "true", '[{"id": "f_8888"}]',
+                           '{"id": "f_9000", "method": "GET", "path": "/ok"}')
+        flows, warnings, skipped = store.read_all_counted(self.record)
+        self.assertEqual(skipped, 6)
+        self.assertEqual(len(flows), len(before) + 1)
+        self.assertTrue(all(isinstance(flow, dict) for flow in flows))
+        self.assertEqual([w["code"] for w in warnings], ["invalid_flow_record"])
+        self.assertEqual(warnings[0]["skipped"], 6)
+        self.assertTrue(warnings[0]["hint"])
+        self.assertEqual(store.skipped_count(warnings), 6)
+        legacy_flows, legacy_warnings = store.read_all(self.record)
+        self.assertEqual(legacy_flows, flows)
+        self.assertEqual(legacy_warnings, warnings)
+
+    def test_torn_and_non_object_lines_are_counted_separately(self) -> None:
+        self._append_lines("[1, 2]", '{"id": "f_9001"')
+        _flows, warnings, skipped = store.read_all_counted(self.record)
+        self.assertEqual(skipped, 2)
+        self.assertEqual({w["code"]: w["skipped"] for w in warnings},
+                         {"truncated_flow_record": 1, "invalid_flow_record": 1})
+        self.assertEqual(store.skipped_count(warnings + [{"code": "other", "skipped": 9}]), 2)
+
+    def test_listing_and_find_survive_bad_lines(self) -> None:
+        self._append_lines("[]", "42", '{"id": "f_9002", "host": 7, "method": null, '
+                           '"path": ["x"], "started_at": 5, "status": 200}')
+        payload = store.listing(self.record, host="api.example.com", method="GET",
+                                path_glob="*", since_seconds=100_000_000)
+        self.assertEqual(payload["skipped"], 2)
+        self.assertIn("invalid_flow_record", [w["code"] for w in payload["warnings"]])
+        everything = store.listing(self.record)
+        self.assertIn("f_9002", [flow["id"] for flow in everything["requests"]])
+        self.assertEqual(store.find(self.record, "f_9002")["status"], 200)
+
+    def test_a_line_nested_too_deep_is_skipped_and_counted(self) -> None:
+        # json.loads reads both lines; scrubbing the header (or printing the
+        # path) would raise RecursionError, so both count as invalid records.
+        deep = "[" * 100_000 + "]" * 100_000
+        before, _ = store.read_all(self.record)
+        self._append_lines('{"id": "f_d1", "request_headers_preview": {"x-a": %s}}' % deep,
+                           '{"id": "f_d2", "path": %s}' % deep,
+                           '{"id": "f_9003", "method": "GET", "path": "/ok"}')
+        flows, warnings, skipped = store.read_all_counted(self.record)
+        self.assertEqual(skipped, 2)
+        self.assertEqual([w["code"] for w in warnings], ["invalid_flow_record"])
+        self.assertEqual([f["id"] for f in flows][len(before):], ["f_9003"])
+        self.assertIn("f_9003", [f["id"] for f in store.listing(self.record)["requests"]])
+
+    def test_too_deep_counts_levels_without_recursion(self) -> None:
+        value: object = "leaf"
+        for _ in range(store.MAX_LINE_DEPTH):
+            value = [value]
+        self.assertFalse(store.too_deep({"a": 1, "b": [1, {"c": None}]}))
+        self.assertFalse(store.too_deep(value))
+        self.assertTrue(store.too_deep({"a": value}))
+        self.assertFalse(store.too_deep("text"))
+        nested: list = []
+        for _ in range(100_000):
+            nested = [nested]
+        self.assertTrue(store.too_deep(nested))
+
+    def test_a_clean_store_reports_no_skips(self) -> None:
+        _flows, warnings, skipped = store.read_all_counted(self.record)
+        self.assertEqual((warnings, skipped), ([], 0))
+        self.assertNotIn("skipped", store.listing(self.record))
+
+    def test_a_missing_store_is_empty(self) -> None:
+        store.flows_path(self.record).unlink()
+        self.assertEqual(store.read_all_counted(self.record), ([], [], 0))
+
     def test_unknown_flow_id_is_an_error(self) -> None:
         with self.assertRaises(errors.AutonomError) as caught:
             store.find(self.record, "f_9999")
@@ -739,6 +1035,109 @@ class StoreTests(unittest.TestCase):
         with self.assertRaises(errors.AutonomError) as caught:
             store.require_bodies(self.record)
         self.assertEqual(caught.exception.code, errors.BODIES_NOT_CAPTURED)
+
+
+class RequestsFollowHostileLinesTests(unittest.TestCase):
+    """B.7: ``network requests follow`` skips lines that are not flow records
+    (and lines the scrubber refuses), counts them on the eof line, and never
+    prints a traceback."""
+
+    def setUp(self) -> None:
+        import argparse
+        import importlib.util
+
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.record = make_record(Path(self.tmp.name))
+        spec = importlib.util.spec_from_file_location("autonom_cli_follow_test", CLI)
+        self.cli = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.cli)
+        self.args = argparse.Namespace(
+            host=None, method=None, status=None, path=None, mocked=None,
+            interval=0.05, max=0, max_seconds=0.3, from_start=True)
+
+    def follow(self) -> tuple[int, list[dict]]:
+        from contextlib import redirect_stdout
+        from unittest import mock
+
+        out = io.StringIO()
+        real_scrub = self.cli.redact_mod.scrub_flow
+
+        def scrub(row):
+            if row.get("id") == "f_boom":
+                raise RecursionError("maximum recursion depth exceeded")
+            if row.get("id") == "f_bad":
+                raise ValueError("bad value")
+            return real_scrub(row)
+
+        with mock.patch.object(self.cli.session_mod, "require_current",
+                               return_value=self.record), \
+                mock.patch.object(self.cli.redact_mod, "scrub_flow", side_effect=scrub), \
+                redirect_stdout(out):
+            code = self.cli.cmd_network_requests_follow(self.args)
+        self.assertNotIn("Traceback", out.getvalue())
+        return code, [json.loads(line) for line in out.getvalue().splitlines() if line]
+
+    def test_hostile_lines_are_skipped_and_counted(self) -> None:
+        valid = {"id": "f_0001", "host": "a.example.com", "method": "GET", "status": 200,
+                 "path": "/x", "url": "https://a.example.com/x",
+                 "started_at": "2026-10-17T00:00:00Z"}
+        lines = ["3", "null", "[1]", '"x"', "[" * 100000 + "]" * 100000,
+                 "{torn", json.dumps({"id": "f_boom"}), json.dumps({"id": "f_bad"}),
+                 json.dumps(valid)]
+        store.flows_path(self.record).write_text("\n".join(lines) + "\n", encoding="utf-8")
+        code, events = self.follow()
+        self.assertEqual(code, 0)
+        self.assertEqual([e["flow"]["id"] for e in events if e["kind"] == "flow"],
+                         ["f_0001"])
+        self.assertEqual(events[-1], {"kind": "eof", "reason": "max_seconds", "count": 1,
+                                      "skipped": 8})
+        self.assertEqual(self.cli._LAST_EMIT["skipped"], 8)  # noqa: SLF001
+
+    def test_clean_store_has_no_skipped_key(self) -> None:
+        store.flows_path(self.record).write_text(
+            json.dumps({"id": "f_0001", "host": "a", "started_at": "x"}) + "\n",
+            encoding="utf-8")
+        _code, events = self.follow()
+        self.assertNotIn("skipped", events[-1])
+
+    def test_too_deep_values_are_skipped_under_every_filter(self) -> None:
+        deep = "[" * 100000 + "]" * 100000
+        lines = [
+            '{"id": "f_h", "host": ' + deep + ', "started_at": "x"}',
+            '{"id": "f_m", "method": ' + deep + ', "started_at": "x"}',
+            '{"id": "f_p", "path": ' + deep + ', "started_at": "x"}',
+            json.dumps({"id": "f_0001", "host": "a", "method": "GET", "path": "/x",
+                        "started_at": "x"}),
+        ]
+        store.flows_path(self.record).write_text("\n".join(lines) + "\n", encoding="utf-8")
+        for name, value in (("host", "a"), ("method", "GET"), ("path", "/x*")):
+            with self.subTest(filter=name):
+                for key in ("host", "method", "path"):
+                    setattr(self.args, key, None)
+                setattr(self.args, name, value)
+                code, events = self.follow()
+                self.assertEqual(code, 0)
+                self.assertEqual([e["flow"]["id"] for e in events if e["kind"] == "flow"],
+                                 ["f_0001"])
+                self.assertEqual(events[-1]["skipped"], 3)
+
+    def test_a_non_string_id_is_skipped_and_counted(self) -> None:
+        lines = ['{"id": [1], "host": "a"}', '{"id": {"x": 1}, "host": "a"}',
+                 json.dumps({"id": "f_0001", "host": "a", "started_at": "x"})]
+        store.flows_path(self.record).write_text("\n".join(lines) + "\n", encoding="utf-8")
+        code, events = self.follow()
+        self.assertEqual(code, 0)
+        self.assertEqual([e["flow"]["id"] for e in events if e["kind"] == "flow"], ["f_0001"])
+        self.assertEqual(events[-1]["skipped"], 2)
+
+    def test_a_non_string_id_in_the_baseline_does_not_crash(self) -> None:
+        self.args.from_start = False
+        store.flows_path(self.record).write_text('{"id": [1], "host": "a"}\n',
+                                                 encoding="utf-8")
+        code, events = self.follow()
+        self.assertEqual(code, 0)
+        self.assertEqual(events[-1]["kind"], "eof")
 
 
 class HarTests(unittest.TestCase):
@@ -781,6 +1180,27 @@ class HarTests(unittest.TestCase):
         log = har.build(self.flows)["log"]
         tagged = [e for e in log["entries"] if e["_autonom"]["mocked"]]
         self.assertEqual(len(tagged), sum(1 for f in self.flows if f["mocked"]))
+
+    def test_incomplete_request_exports_status_zero_and_keeps_why(self) -> None:
+        incomplete = {"id": "f_0099", "completed": False, "error_kind": "hang_cap",
+                      "started_at": "2026-10-17T10:00:00Z", "method": "GET",
+                      "url": "https://api.example.test/slow", "host": "api.example.test",
+                      "path": "/slow", "status": None, "mocked": True, "mock_id": "m_1",
+                      "duration_ms": 120000}
+        entry = har.build([incomplete])["log"]["entries"][0]
+        self.assertEqual(entry["response"]["status"], 0)
+        self.assertIsInstance(entry["response"]["status"], int)
+        self.assertIs(entry["_autonom"]["completed"], False)
+        self.assertEqual(entry["_autonom"]["error_kind"], "hang_cap")
+        self.assertEqual(entry["time"], 120000)
+        self.assertTrue(entry["_autonom"]["mocked"])
+
+    def test_completed_records_export_unchanged(self) -> None:
+        for flow in self.flows:
+            for marked in (flow, dict(flow, completed=True)):
+                entry = har.entry_for(marked)
+                self.assertEqual(entry["response"]["status"], flow["status"])
+                self.assertEqual(set(entry["_autonom"]), {"id", "mocked", "mock_id"})
 
 
 if __name__ == "__main__":

@@ -383,8 +383,10 @@ class RefusalTests(ControlCliCase):
                 code, payload = self.android(*argv)
                 if argv[0] == "simulator":
                     # Android has no such query; what matters is that the
-                    # lease did not refuse it.
+                    # lease did not refuse it: the answer is the platform's.
                     self.assertNotIn(payload.get("error_code"), control_mod_codes())
+                    self.assertEqual(code, 2, payload)
+                    self.assertEqual(payload["error_code"], errors.CLIPBOARD_UNAVAILABLE)
                     continue
                 self.assertEqual(code, 0, payload)
                 self.assertNotIn("control", payload)
@@ -926,6 +928,46 @@ class CanvasControlIdleTests(EnvSandboxMixin, unittest.TestCase):
                 self.assertEqual(code, 2)
                 self.assertEqual(json.loads(err)["error_code"], errors.INVALID_VALUE)
         self.assertEqual(self.commands, [])
+
+
+
+class ClipboardGetTests(ControlCliCase):
+    """`simulator clipboard get`: refused on Android with a recipe (fu-008),
+    unchanged on iOS."""
+
+    UDID = "AAAAAAAA-1111-2222-3333-DDDDDDDDDDDD"
+
+    def test_android_get_is_refused_with_the_paste_recipe(self) -> None:
+        code, payload = self.android("simulator", "clipboard", "get")
+        self.assertEqual(code, 2, payload)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["error_code"], errors.CLIPBOARD_UNAVAILABLE)
+        self.assertEqual(payload["error_code"], "clipboard_unavailable")
+        self.assertEqual(payload["error"],
+                         "Android does not let a shell read the clipboard (Android 10+)")
+        self.assertEqual(payload["hint"],
+                         "paste into a text field (long-press → Paste) and read it with ui find")
+        self.assertEqual(payload["control"], "clipboard")
+        self.assertEqual(payload["valid_actions"], ["set"])
+        self.assertFalse([call for call in self.calls() if "clipboard" in call],
+                         "refused before any clipboard command reached the device")
+
+    def test_android_set_is_unchanged(self) -> None:
+        code, payload = self.android("simulator", "clipboard", "set", "--value", "text=hi")
+        self.assertEqual(code, 0, payload)
+        self.assertTrue(payload["supported"])
+
+    def test_ios_get_still_reads_the_pasteboard(self) -> None:
+        self.write_state(simctl_devices={"devices": {
+            "com.apple.CoreSimulator.SimRuntime.iOS-26-0": [
+                {"udid": self.UDID, "name": "iPhone 17 Pro", "state": "Booted",
+                 "isAvailable": True}]}}, pasteboard="copied text")
+        cli = load_cli("autonom_cli_control_clipboard")
+        code, payload = self.in_process(cli, "--simctl", str(FAKE_SIMCTL), "--udid", self.UDID,
+                                        "simulator", "clipboard", "get")
+        self.assertEqual(code, 0, payload)
+        self.assertEqual(payload["text"], "copied text")
+        self.assertTrue(payload["verified"])
 
 
 if __name__ == "__main__":

@@ -31,6 +31,7 @@ import os
 import re
 import secrets
 import shutil
+import stat
 import threading
 import time
 from pathlib import Path
@@ -38,6 +39,7 @@ from typing import Any, Iterator
 
 from .. import contracts, errors
 from ..network import redact
+from ..network import store as network_store
 from . import RECORD_SCHEMA
 
 ROOT_NAME = "pretests"
@@ -350,10 +352,11 @@ def write_json(path: Path, value: Any) -> None:
     """Atomic, owner-only JSON write (temp file in the same directory)."""
     scratch = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
     try:
-        fd = os.open(scratch, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        fd = os.open(scratch, os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+                     | getattr(os, "O_NOFOLLOW", 0), 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            os.fchmod(handle.fileno(), 0o600)  # never follows a link at the scratch name
             handle.write(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
-        os.chmod(scratch, 0o600)
         os.replace(scratch, path)
     finally:
         with contextlib.suppress(OSError):
@@ -392,7 +395,9 @@ def append_line(path: Path, value: dict[str, Any]) -> None:
 
 
 def read_lines(path: Path) -> list[dict[str, Any]]:
-    """Every parseable JSON object line; a torn final line is skipped."""
+    """Every parseable JSON object line; a torn final line, or one nested
+    past the parser's limit or ``network.store.MAX_LINE_DEPTH`` levels (any
+    str() of it would raise RecursionError), is skipped."""
     try:
         text = path.read_text(encoding="utf-8")
     except OSError:
@@ -404,9 +409,9 @@ def read_lines(path: Path) -> list[dict[str, Any]]:
             continue
         try:
             item = json.loads(line)
-        except json.JSONDecodeError:
+        except (ValueError, RecursionError):
             continue
-        if isinstance(item, dict):
+        if isinstance(item, dict) and not network_store.too_deep(item):
             out.append(item)
     return out
 
@@ -538,18 +543,100 @@ def attribution(session: dict[str, Any] | None) -> dict[str, str]:
     return out
 
 
-def active(session: dict[str, Any] | None) -> dict[str, Any] | None:
-    """The active pre-test's record, or None on any read problem."""
+DAMAGED_SUFFIX = ".damaged"
+DAMAGED_HINT = "autonom pretest stop --force, or restore the file"
+
+
+def _inspect_active(session: dict[str, Any] | None
+                    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """``(record, damage)`` for the pre-test ``active.json`` names.
+
+    ``record`` is the active record (None when there is none: no pointer, a
+    garbage pointer, a pointer whose directory or record file is gone, or a
+    valid record that is no longer active). ``damage`` is
+    ``{"pretest_id", "path", "reason"}`` when the pointer names a record file
+    that exists but cannot be read, is not JSON, is not an object, does not
+    satisfy autonom.pretest/v1 or names another pre-test (RISK-042)."""
+    ids = active_ids(session)
+    if not ids:
+        return None, None
+    pretest_id = ids[0]
     try:
-        ids = active_ids(session)
-        if not ids:
-            return None
-        record = _read_json(pretest_dir(session, ids[0]) / RECORD_FILE)
-        if not isinstance(record, dict) or record.get("status") != "active":
-            return None
-        return record
+        path = pretest_dir(session, pretest_id) / RECORD_FILE
+    except Exception:  # noqa: BLE001 - active_ids already checked the shape
+        return None, None
+
+    def damaged(reason: str) -> tuple[None, dict[str, Any]]:
+        reason = redact_text(reason) or "unknown problem"
+        return None, {"pretest_id": pretest_id, "path": str(path), "reason": reason}
+
+    try:
+        record = _read_json(path)
+    except FileNotFoundError:
+        return None, None  # a stale pointer: nothing is damaged
+    except NotADirectoryError:
+        return None, None  # the pre-test "directory" is a file: no record there
+    except json.JSONDecodeError as exc:
+        return damaged(f"not valid JSON ({exc.msg} at line {exc.lineno} column {exc.colno})")
+    except UnicodeDecodeError:
+        return damaged("not UTF-8 text")
+    except OSError as exc:
+        return damaged(f"cannot be read ({exc.strerror or type(exc).__name__})")
+    except Exception as exc:  # noqa: BLE001 - e.g. a JSON nesting too deep
+        return damaged(f"cannot be parsed ({type(exc).__name__})")
+    try:
+        failures = _failures_for_record(record)
+    except Exception as exc:  # noqa: BLE001 - a validator crash is damage too
+        failures = [f"validation failed ({type(exc).__name__})"]
+    if not failures and record.get("pretest_id") != pretest_id:
+        failures = [f"pretest_id is {record.get('pretest_id')!r}, the pointer names "
+                    f"{pretest_id}"]
+    if failures:
+        return damaged("; ".join(failures[:5])
+                       + (f" (and {len(failures) - 5} more)" if len(failures) > 5 else ""))
+    if record.get("status") != "active":
+        return None, None
+    return record, None
+
+
+def damaged_error(damage: dict[str, Any], *, suffix: str = "",
+                  **extra: Any) -> errors.AutonomError:
+    """The ``pretest_damaged`` refusal for ``damage`` (``_inspect_active``)."""
+    return errors.AutonomError(
+        errors.PRETEST_DAMAGED,
+        f"the active pre-test's record {damage['path']} is damaged: "
+        f"{damage['reason']}{suffix}",
+        hint=DAMAGED_HINT, pretest_id=damage["pretest_id"], path=damage["path"],
+        reason=damage["reason"], **extra)
+
+
+def active(session: dict[str, Any] | None) -> dict[str, Any] | None:
+    """The active pre-test's record, or None when there is none (no pointer,
+    a stale pointer, a record that is no longer active). Raises
+    ``pretest_damaged`` when the pointer names a record file that is
+    unreadable or invalid: an unreadable record is not "no pre-test", so
+    nothing may run unguarded (RISK-042)."""
+    try:
+        record, damage = _inspect_active(session)
+    except errors.AutonomError:
+        raise
+    except Exception:  # noqa: BLE001 - an unexpected problem reads as no pre-test
+        return None
+    if damage is not None:
+        raise damaged_error(damage)
+    return record
+
+
+def damaged_status(session: dict[str, Any] | None) -> dict[str, Any] | None:
+    """``{"status": "damaged", "pretest_id", "path", "reason"}`` when the
+    active record is damaged, else None; never raises (``pretest status``)."""
+    try:
+        _record, damage = _inspect_active(session)
     except Exception:  # noqa: BLE001
         return None
+    if damage is None:
+        return None
+    return {"status": "damaged", **damage}
 
 
 def _write_active(session: dict[str, Any], pretest_id: str, check_id: str | None) -> None:
@@ -879,7 +966,8 @@ def create(session: dict[str, Any] | None, *, target: Any, ticket_text: str,
     from . import context as context_mod
 
     if context is None:
-        context_doc = context_mod.build(repo_path, base, head, flows_path, session, app_id)
+        context_doc = context_mod.build(repo_path, base, head, flows_path, session, app_id,
+                                        platform=target_block["platform"])
     else:
         context_doc = json.loads(json.dumps(context))
     baseline_doc = baseline_mod.capture(target, session, app_id)
@@ -941,11 +1029,22 @@ def newest_unpointed_active(session: dict[str, Any]) -> dict[str, Any] | None:
                                                record["pretest_id"]))
 
 
-def stop(session: dict[str, Any] | None) -> dict[str, Any]:
+def stop(session: dict[str, Any] | None, *, force: bool = False) -> dict[str, Any]:
     """Close the active pre-test without a pack. An open check is ended
     ``inconclusive`` so no check is left half open. Without a pointer, the
-    newest record still marked active is stopped (crash recovery)."""
+    newest record still marked active is stopped (crash recovery).
+
+    A damaged active record (RISK-042) is stopped too: the damaged file is
+    kept as ``pretest.json.damaged`` and a stopped record rebuilt from what
+    can be salvaged takes its place; the result carries
+    ``damaged: {"reason", "file"}``. ``force`` is the CLI's ``--force``,
+    which the ``pretest_damaged`` hint names; the recovery runs with or
+    without it, so a CLI without the flag still recovers."""
+    del force  # accepted for the CLI; see above
     if session:
+        damage = damaged_status(session)
+        if damage is not None:
+            return _stop_damaged(session, damage)
         _clear_stale_pointer(session)
     if session and active(session) is None:
         orphan = newest_unpointed_active(session)
@@ -976,6 +1075,165 @@ def _stop_record(session: dict[str, Any], record: dict[str, Any]) -> dict[str, A
         validate_record(record)
         _finish(session, record)
     return record
+
+
+def _salvage_str(data: dict[str, Any], key: str) -> str | None:
+    value = data.get(key)
+    return value if isinstance(value, str) and value else None
+
+
+def _salvaged_record(session: dict[str, Any], pretest_id: str,
+                     data: Any) -> dict[str, Any]:
+    """A valid ``active`` record for ``pretest_id`` from what the damaged
+    file still holds (fields that pass their own check) and the session."""
+    data = data if isinstance(data, dict) else {}
+    target = data.get("target")
+    if not (isinstance(target, dict) and target.get("platform") in PLATFORMS
+            and isinstance(target.get("target_id"), str) and target.get("target_id")):
+        target = {"platform": session.get("platform"),
+                  "target_id": session.get("target_id")}
+    if target.get("platform") not in PLATFORMS or not target.get("target_id"):
+        raise errors.AutonomError(
+            errors.PRETEST_DAMAGED,
+            f"pre-test {pretest_id} is damaged and its device cannot be recovered",
+            hint="Restore the file pretest.json from a copy, or end the session "
+                 "with 'autonom session stop'.", pretest_id=pretest_id)
+    app_id = _salvage_str(data, "app_id") or session.get("app_id")
+    try:
+        budget = _normalize_budget(data.get("budget") if isinstance(
+            data.get("budget"), dict) else None, app_id)
+    except errors.AutonomError:
+        budget = _normalize_budget(None, app_id)
+    kind = data.get("kind") if data.get("kind") in KINDS else "pretest"
+    record: dict[str, Any] = {
+        "schema": RECORD_SCHEMA,
+        "pretest_id": pretest_id,
+        "session_id": _salvage_str(data, "session_id")
+        or str(session.get("session_id") or "unknown"),
+        "status": "active",
+        "title": clip(_salvage_str(data, "title"), TITLE_LIMIT) or "Damaged pre-test",
+        "ticket_ref": clip(_salvage_str(data, "ticket_ref"), TITLE_LIMIT) or None,
+        "created_at": _salvage_str(data, "created_at") or now(),
+        "ended_at": None,
+        "target": {"platform": str(target["platform"]), "target_id": str(target["target_id"])},
+        "app_id": app_id,
+        "budget": budget,
+        "kind": kind,
+        "rerun_of": None,
+        "pack": None,
+    }
+    for key in ("repo", "base", "head", "flows_dir", "parent_pack"):
+        record[key] = _salvage_str(data, key)
+    rerun_of = data.get("rerun_of")
+    if isinstance(rerun_of, dict) and isinstance(rerun_of.get("pack"), str) \
+            and isinstance(rerun_of.get("checks"), list):
+        record["rerun_of"] = contracts.redact_value(rerun_of)
+    if _failures_for_record(record):  # a salvaged value still slipped through
+        for key in ("repo", "base", "head", "flows_dir", "parent_pack", "rerun_of"):
+            record[key] = None
+        record["created_at"] = now()
+    return validate_record(record)
+
+
+def _damaged_copy(path: Path) -> Path:
+    """``pretest.json.damaged``; an older copy is kept (``.damaged.1``, …)."""
+    candidate = path.with_name(path.name + DAMAGED_SUFFIX)
+    number = 1
+    while candidate.exists() or candidate.is_symlink():
+        candidate = path.with_name(f"{path.name}{DAMAGED_SUFFIX}.{number}")
+        number += 1
+    return candidate
+
+
+def _keep_damaged_copy(path: Path, copy: Path) -> None:
+    """Copy the damaged record file to ``copy`` (owner-only) and leave the
+    original in place, so ``active.json`` never points at a missing record
+    (which would read as a stale pointer and lift the guard). The copy is
+    written to a temp file first, so ``copy`` is whole or absent. A record
+    path that is not a regular file (a directory, a symlink) cannot be copied
+    and is moved aside instead. No mode change ever follows a symlink: a
+    damaged record that links elsewhere must not change its target's
+    permissions."""
+    info = os.lstat(path)
+    if not stat.S_ISREG(info.st_mode):
+        os.replace(path, copy)
+        with contextlib.suppress(OSError, NotImplementedError):
+            if os.chmod in os.supports_follow_symlinks:
+                os.chmod(copy, 0o600, follow_symlinks=False)
+            elif not stat.S_ISLNK(os.lstat(copy).st_mode):
+                os.chmod(copy, 0o600)
+            # else: this platform cannot set a link's own mode; leave it
+        return
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    with os.fdopen(fd, "rb") as handle:
+        content = handle.read()
+    scratch = copy.with_name(f".{copy.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        out = os.open(scratch, os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+                      | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        with os.fdopen(out, "wb") as handle:
+            os.fchmod(handle.fileno(), 0o600)  # the file just opened, never a link target
+            handle.write(content)
+        os.replace(scratch, copy)
+    finally:
+        with contextlib.suppress(OSError):
+            scratch.unlink()
+
+
+def _stop_damaged(session: dict[str, Any], damage: dict[str, Any]) -> dict[str, Any]:
+    """Stop a pre-test whose active record is damaged (see ``stop``).
+
+    Crash-safe order: (1) copy the damaged file to ``pretest.json.damaged``
+    (the original stays), (2) atomically write the rebuilt record over
+    ``pretest.json``, (3) stop it the normal way. A failure or crash before (2)
+    leaves the damaged original, so the guard still refuses with
+    ``pretest_damaged`` and ``stop --force`` can be run again (an older copy
+    is never overwritten: the next one is ``.damaged.1``)."""
+    pretest_id = damage["pretest_id"]
+    path = pretest_dir(session, pretest_id) / RECORD_FILE
+    with lock(session, pretest_id):
+        current = damaged_status(session)
+        if current is None or current["pretest_id"] != pretest_id:
+            # repaired or stopped by another process meanwhile: the normal path
+            return stop(session)
+        try:
+            data = _read_json(path)
+        except Exception:  # noqa: BLE001 - nothing to salvage
+            data = None
+        rebuilt = _salvaged_record(session, pretest_id, data)
+        copy = _damaged_copy(path)
+        try:
+            _keep_damaged_copy(path, copy)
+        except OSError as exc:
+            raise errors.AutonomError(
+                errors.PRETEST_DAMAGED,
+                f"the damaged record {path} could not be copied aside: "
+                f"{exc.strerror or type(exc).__name__}",
+                hint="Check the permissions of the pre-test directory, or restore "
+                     "the file by hand.", pretest_id=pretest_id, path=str(path)) from None
+        try:
+            write_json(path, rebuilt)
+        except OSError as exc:
+            # a copied original is still in place (the write is atomic), so the
+            # guard keeps refusing: drop this attempt's copy so a retry keeps the
+            # plain name; a non-file moved aside goes back
+            with contextlib.suppress(OSError):
+                if os.path.lexists(path):
+                    if copy.is_file() and not copy.is_symlink():
+                        copy.unlink()
+                elif os.path.lexists(copy):
+                    os.replace(copy, path)
+            raise errors.AutonomError(
+                errors.PRETEST_DAMAGED,
+                f"the rebuilt record could not be written over {path}: "
+                f"{exc.strerror or type(exc).__name__}",
+                hint="Check the free space and permissions of the pre-test directory, "
+                     "then run autonom pretest stop --force again.",
+                pretest_id=pretest_id, path=str(path)) from None
+        record = _stop_record(session, rebuilt)
+    out = dict(record)
+    out["damaged"] = {"reason": current["reason"], "file": copy.name}
+    return out
 
 
 def _finish(session: dict[str, Any], record: dict[str, Any]) -> None:

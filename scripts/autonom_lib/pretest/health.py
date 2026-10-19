@@ -43,11 +43,19 @@ block is unavailable.
   the block says how many (``truncated_lines``).
 - requests: flows appended to ``network/flows.jsonl`` after the baseline
   that answered 5xx, answered 4xx without a mock, or never completed. A flow
-  the proxy answered from a mock (``mocked: true``) is never a failure: the
-  test asked for that answer. Each row carries its ``line`` in the file;
-  flow ids restart with every proxy process, so a row whose id is not unique
-  in the file says ``duplicate_id: true`` and gets no ``request:<id>``
-  evidence ref (it would resolve to another row).
+  the proxy answered or held from a mock (``mocked: true``) is never a
+  failure: the test asked for that answer. That includes a request a
+  ``hang`` mock held until the cap (``error_kind: hang_cap``): the proxy marks
+  the mock before the hold, so such a row is always mocked. Nor is a request
+  the app itself cancelled (``completed: false``, ``error_kind:
+  client_abort``). An unmocked request that never completed for another
+  reason (an upstream error, a timeout) is a failure ("Request never
+  completed"). A line that is not a JSON object, or is nested too deep to
+  read, is skipped. Each row
+  carries its ``line`` in the file; flow ids restart with every proxy
+  process, so a row whose id is not unique in the file says
+  ``duplicate_id: true`` and gets no ``request:<id>`` evidence ref (it would
+  resolve to another row).
 - metrics: one fresh snapshot against the baseline's. Memory is a lead when
   it grew by both 20 % and 20 MB, CPU when it rose by 50 points. One snapshot
   proves nothing, so these are only ever called leads.
@@ -527,6 +535,8 @@ def _flow_time(row: dict[str, Any]) -> datetime | None:
 def _failure_reason(row: dict[str, Any]) -> str | None:
     if row.get("mocked") or row.get("mock_id"):
         return None  # the proxy answered from a mock: the test asked for it
+    if row.get("completed") is False and row.get("error_kind") == "client_abort":
+        return None  # the app cancelled it (left a screen, a second tap)
     status = row.get("status")
     if row.get("error") or not isinstance(status, int) or isinstance(status, bool):
         return "incomplete"
@@ -569,42 +579,46 @@ def _requests(session: dict[str, Any], baseline: dict[str, Any],
             continue
         try:
             row = json.loads(line)
-        except (json.JSONDecodeError, ValueError):
-            continue
-        if not isinstance(row, dict):
-            continue
-        if row.get("id") is not None:
+            if not isinstance(row, dict):
+                continue
             # Ids restart with every proxy process: count them over the whole file.
-            id_counts[str(row["id"])] = id_counts.get(str(row["id"]), 0) + 1
+            flow_id = str(row["id"]) if row.get("id") is not None else None
+        except (ValueError, RecursionError):  # not JSON, or nested past the limit
+            continue
+        if flow_id is not None:
+            id_counts[flow_id] = id_counts.get(flow_id, 0) + 1
         if number > skip:
             rows.append((number, row))
     failed: list[dict[str, Any]] = []
     total = 0
     for number, row in rows:
-        row = redact.scrub_flow(row)
-        stamp = _flow_time(row)
-        if by_time and since is not None and (stamp is None or stamp < since):
-            continue
-        reason = _failure_reason(row)
-        if reason is None:
-            continue
+        try:
+            row = redact.scrub_flow(row)
+            stamp = _flow_time(row)
+            if by_time and since is not None and (stamp is None or stamp < since):
+                continue
+            reason = _failure_reason(row)
+            if reason is None:
+                continue
+            status = row.get("status")
+            flow_id = str(row.get("id")) if row.get("id") is not None else None
+            item = {
+                "id": flow_id,
+                "method": store.clip(row.get("method"), 16),
+                "host": store.clip(row.get("host"), 255),
+                "path": store.clip(row.get("path"), 500),
+                "status": status if isinstance(status, int) and not isinstance(status, bool)
+                else None,
+                "reason": reason,
+                "started_at": _iso(stamp) if stamp else None,
+                "check_id": attribute(stamp, checks) if stamp else None,
+                "line": number,
+            }
+        except RecursionError:
+            continue  # a value nested too deep to print: skip the line
         total += 1
         if len(failed) >= MAX_FAILED_REQUESTS:
             continue
-        status = row.get("status")
-        flow_id = str(row.get("id")) if row.get("id") is not None else None
-        item = {
-            "id": flow_id,
-            "method": store.clip(row.get("method"), 16),
-            "host": store.clip(row.get("host"), 255),
-            "path": store.clip(row.get("path"), 500),
-            "status": status if isinstance(status, int) and not isinstance(status, bool)
-            else None,
-            "reason": reason,
-            "started_at": _iso(stamp) if stamp else None,
-            "check_id": attribute(stamp, checks) if stamp else None,
-            "line": number,
-        }
         if flow_id is not None and id_counts.get(flow_id, 0) > 1:
             item["duplicate_id"] = True
         failed.append(item)

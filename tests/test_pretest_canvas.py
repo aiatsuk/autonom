@@ -145,8 +145,8 @@ class CanvasPretestCase(EnvSandboxMixin, unittest.TestCase):
                 self.log.read_text(encoding="utf-8").splitlines() if line.strip()]
 
     def inputs(self) -> list[list[str]]:
-        return [argv for argv in self.calls()
-                if "input" in argv or ("am" in argv and "start" in argv)]
+        return [argv for argv in self.calls() if "dumpsys" not in argv
+                and ("input" in argv or ("am" in argv and "start" in argv))]
 
     def used(self, record: dict) -> int:
         return store.read_budget(self.session, record["pretest_id"])["actions_used"]
@@ -477,6 +477,32 @@ class BridgeGuardTests(CanvasPretestCase):
         self.bridge("key", {"key": "KEYCODE_BACK"}, "agent")
         self.bridge("text", {"text": "hello"}, "agent")
         self.assertEqual(self.used(record), 3)
+
+    def test_a_tap_from_a_client_without_an_origin_is_counted_as_agent(self) -> None:
+        # RISK-018: the Canvas forwards a tap whose client named no origin as `agent`
+        # (normalizeOrigin), so the guard counts it and can refuse it.
+        record = self.start_pretest(max_actions=1)
+        forwarded = {"id": 1, "op": "tap", "origin": "agent", "payload": {"x": 300, "y": 650}}
+        bridge.dispatch(self.target, forwarded)
+        self.assertEqual(self.used(record), 1)
+        (entry,) = self.journal()
+        self.assertEqual((entry["origin"], entry["ok"]), ("agent", True))
+        self.clear_log()
+        self.assert_refusal(errors.BUDGET_EXHAUSTED, "tap", {"x": 300, "y": 650})
+        self.assertEqual(self.inputs(), [])
+
+    def test_a_bridge_message_without_an_origin_is_refused_never_exempt(self) -> None:
+        record = self.start_pretest()
+        for message in ({"id": 1, "op": "tap", "payload": {"x": 300, "y": 650}},
+                        {"id": 2, "op": "tap", "origin": None, "payload": {"x": 300, "y": 650}},
+                        {"id": 3, "op": "tap", "origin": "", "payload": {"x": 300, "y": 650}}):
+            with self.subTest(origin=message.get("origin", "missing")):
+                with self.assertRaises(errors.AutonomError) as caught:
+                    bridge.dispatch(self.target, message)
+                self.assertEqual(caught.exception.code, errors.FLOW_COMMAND_INVALID)
+        self.assertEqual(self.inputs(), [])
+        self.assertEqual(self.used(record), 0)
+        self.assertFalse(guard.is_exempt())
 
     def test_replay_and_system_origins_are_guarded_too(self) -> None:
         record = self.start_pretest()

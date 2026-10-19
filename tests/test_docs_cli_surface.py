@@ -260,7 +260,8 @@ class PretestDocsTests(unittest.TestCase):
                      "INVALID_VERDICT", "UNKNOWN_FINDING", "INVALID_SEVERITY",
                      "EVIDENCE_REF_UNKNOWN", "BUDGET_EXHAUSTED", "FORBIDDEN_ACTION",
                      "APP_NOT_ALLOWED", "REVIEW_NEEDS_FINDING", "NOT_AUTOMATIC",
-                     "PROFILE_INVALID", "NOT_A_PRETEST_PACK", "DRAFT_UNAVAILABLE"):
+                     "PROFILE_INVALID", "NOT_A_PRETEST_PACK", "DRAFT_UNAVAILABLE",
+                     "PRETEST_DAMAGED", "RACE_NEEDS_COUNT", "CHECK_NOT_ENDED", "GIT_MISSING"):
             code = getattr(errors, name)
             self.assertIn(f"`{code}`", section[1].split("\n## ", 1)[0], code)
 
@@ -275,6 +276,55 @@ class PretestDocsTests(unittest.TestCase):
             sections[name] = body
         self.assertIn("autonom pretest",
                       sections.get("Unreleased", "") + sections.get("0.36.0", ""))
+
+
+class FollowupDocsTests(unittest.TestCase):
+    """The pre-test follow-ups: the new verb and flags are in the CLI block
+    (checked both ways above), walked through in USAGE, and each item has a
+    line under CHANGELOG's Unreleased section."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.surface = parser_surface(load_cli().build_parser())
+        cls.documented = documented_surface()
+        cls.usage = (ROOT / "docs/USAGE.md").read_text(encoding="utf-8")
+        changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        cls.unreleased = changelog.split("## [Unreleased]", 1)[1].split("\n## [", 1)[0]
+
+    def test_new_flags_exist_and_are_documented(self) -> None:
+        expected = {
+            "pretest check amend": {"--verdict", "--note", "--observed-count"},
+            "pretest check end": {"--observed-count"},
+            "pretest stop": {"--force"},
+            "network mock add": {"--delay", "--hang"},
+            "network mock update": {"--delay", "--hang"},
+        }
+        for verb, flags in expected.items():
+            with self.subTest(verb=verb):
+                self.assertTrue(flags <= self.surface[verb], self.surface.get(verb))
+                self.assertTrue(flags <= self.documented[verb], self.documented.get(verb))
+
+    def test_usage_walks_through_them(self) -> None:
+        for text in ("autonom pretest check amend chk-1 --verdict blocked",
+                     "--observed-count 1", "--delay 3", "--hang",
+                     "autonom pretest stop --force", "pretest_damaged",
+                     "race_needs_count", "check_not_ended"):
+            self.assertIn(text, self.usage)
+
+    def test_unreleased_names_every_item(self) -> None:
+        self.assertIn("### Added", self.unreleased)
+        self.assertIn("### Changed", self.unreleased)
+        self.assertIn("### Fixed", self.unreleased)
+        for text in ("--delay SECONDS", "--hang", "completed: false", "check amend",
+                     "--observed-count", "stop --force", "verified_reason",
+                     "is for <platform>", "connection_strategy=lazy", "Content-Type",
+                     "rotation", "evidence `always`", "small-target", "origin",
+                     "printed once", "clipboard_unavailable", "pretest_damaged",
+                     "ui swipe --duration", "report verify <pack>", "shot:<n>",
+                     "git_missing", "skipped_untracked", "not UTF-8", "not an object",
+                     "--out` can be written", "--ticket <dir>", "--env NAME",
+                     "flow-draft --out ''", "--adb <path>"):
+            self.assertIn(text, self.unreleased, text)
 
 
 if __name__ == "__main__":
