@@ -53,7 +53,9 @@ def read_all_counted(
     or is JSON but not an object (`[]`, `"x"`, `3`): readers such as
     `pretest events` and `network requests` index the records as mappings.
     An object nested more than `MAX_LINE_DEPTH` levels is counted with the
-    non-objects (printing or scrubbing it would raise RecursionError).
+    non-objects (printing or scrubbing it would raise RecursionError), and so
+    is a line `json.loads` itself refuses with RecursionError: only a
+    `json.JSONDecodeError` counts as a torn write.
     """
     path = flows_path(record)
     warnings: list[dict[str, Any]] = []
@@ -68,8 +70,15 @@ def read_all_counted(
             continue
         try:
             parsed = json.loads(line)
-        except (json.JSONDecodeError, RecursionError):
-            truncated += 1
+        except json.JSONDecodeError:
+            truncated += 1  # not JSON: a torn final write
+            continue
+        except (ValueError, RecursionError):
+            # Valid JSON the parser refuses: nested past its own limit (on
+            # older Pythons json.loads raises RecursionError where newer ones
+            # parse and `too_deep` refuses) or a number past the digit limit.
+            # Not a torn write — counted with the non-objects on every version.
+            not_objects += 1
             continue
         if not isinstance(parsed, dict) or too_deep(parsed):
             not_objects += 1

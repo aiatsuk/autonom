@@ -1004,6 +1004,56 @@ class StoreTests(unittest.TestCase):
         self.assertEqual([f["id"] for f in flows][len(before):], ["f_9003"])
         self.assertIn("f_9003", [f["id"] for f in store.listing(self.record)["requests"]])
 
+    def _read_with_parser_raising(self, marker: str, exc: BaseException):
+        """`read_all_counted` with json.loads raising ``exc`` for the line
+        carrying ``marker`` and parsing every other line for real."""
+        from unittest import mock
+
+        real_loads = json.loads
+
+        def loads(text, *args, **kwargs):
+            if marker in text:
+                raise exc
+            return real_loads(text, *args, **kwargs)
+
+        with mock.patch.object(store.json, "loads", side_effect=loads):
+            return store.read_all_counted(self.record)
+
+    def test_a_line_the_parser_refuses_as_too_deep_is_invalid_not_torn(self) -> None:
+        # Python 3.11 raises RecursionError inside json.loads where 3.14 parses
+        # the line and too_deep refuses it: either way it is an invalid record.
+        before, _ = store.read_all(self.record)
+        self._append_lines('{"id": "f_r1", "deep": true}',
+                           '{"id": "f_9004", "method": "GET", "path": "/ok"}')
+        flows, warnings, skipped = self._read_with_parser_raising(
+            "f_r1", RecursionError("maximum recursion depth exceeded while decoding"))
+        self.assertEqual(skipped, 1)
+        self.assertEqual({w["code"]: w["skipped"] for w in warnings},
+                         {"invalid_flow_record": 1})
+        self.assertEqual([f["id"] for f in flows][len(before):], ["f_9004"])
+
+    def test_a_line_that_is_not_json_is_torn_not_invalid(self) -> None:
+        before, _ = store.read_all(self.record)
+        self._append_lines('{"id": "f_t1", "method": "GET"}',
+                           '{"id": "f_9005", "method": "GET", "path": "/ok"}')
+        flows, warnings, skipped = self._read_with_parser_raising(
+            "f_t1", json.JSONDecodeError("Expecting ',' delimiter", '{"id"', 5))
+        self.assertEqual(skipped, 1)
+        self.assertEqual({w["code"]: w["skipped"] for w in warnings},
+                         {"truncated_flow_record": 1})
+        self.assertEqual([f["id"] for f in flows][len(before):], ["f_9005"])
+
+    def test_a_number_past_the_digit_limit_is_invalid_not_a_crash(self) -> None:
+        # json.loads raises a plain ValueError (not JSONDecodeError) for it.
+        before, _ = store.read_all(self.record)
+        self._append_lines('{"id": "f_n1", "size": %s}' % ("9" * 5000),
+                           '{"id": "f_9006", "method": "GET", "path": "/ok"}')
+        flows, warnings, skipped = self._read_with_parser_raising(
+            "f_n1", ValueError("Exceeds the limit (4300 digits) for integer string conversion"))
+        self.assertEqual(skipped, 1)
+        self.assertEqual([w["code"] for w in warnings], ["invalid_flow_record"])
+        self.assertEqual([f["id"] for f in flows][len(before):], ["f_9006"])
+
     def test_too_deep_counts_levels_without_recursion(self) -> None:
         value: object = "leaf"
         for _ in range(store.MAX_LINE_DEPTH):

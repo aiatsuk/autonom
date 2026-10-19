@@ -433,7 +433,9 @@ def check_requests(session: dict[str, Any], checks: list[dict[str, Any]]
             row = json.loads(line)
         except (ValueError, RecursionError):  # a torn or hostile line is skipped
             continue
-        if not isinstance(row, dict):
+        # Too deep is skipped whether the parser refused it (RecursionError on
+        # older Pythons) or read it, so every version keeps the same rows.
+        if not isinstance(row, dict) or network_store.too_deep(row):
             continue
         stamp = _flow_stamp(row)
         owner = health_mod.attribute(stamp, checks)
