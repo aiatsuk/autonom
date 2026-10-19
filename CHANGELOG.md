@@ -110,9 +110,13 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
   `pretest events`, `network requests`, `network requests follow` (with or
   without filters) and `request:<id>` evidence refs instead of crashing them;
   the pre-test's journal and check and finding logs skip such a line the same
-  way. The readers that also check depth (the network store's and the
-  pre-test store's line readers) skip a line nested deeper than their limit
-  too. `network requests follow` also skips and
+  way. The readers that also check depth (the network store's, the
+  pre-test store's line readers and the request readers of `pretest health`
+  and `pretest pack`) skip a line nested deeper than their limit too, with the
+  same result on every Python version: the network store counts it as
+  `invalid_flow_record` whether `json.loads` refuses it (Python 3.11) or reads
+  it, and only a line that is not JSON counts as `truncated_flow_record`.
+  `network requests follow` also skips and
   counts a record whose `id` is not a string instead of failing on it.
 - **Android rotation lookup** that times out keeps the natural screen size
   instead of failing the command.

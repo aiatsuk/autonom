@@ -420,6 +420,30 @@ class RequestTests(HealthBase):
         self.assertEqual([item["data"]["id"] for item in written
                           if item["source"] == "request"], ["ok500"])
 
+    def test_a_too_deep_line_is_skipped_on_every_python(self) -> None:
+        # 300 levels parse on every version (no RecursionError) and are past
+        # store.MAX_LINE_DEPTH, so the line is skipped exactly as on a Python
+        # whose json.loads refuses it; the deep value is in a field health
+        # never prints, so only the depth check can skip it.
+        stamp = int(self.at(5).timestamp() * 1000)
+        deep = "[" * 300 + "]" * 300
+        path = self.artifacts / "network/flows.jsonl"
+        path.write_text('{"id": "deep500", "status": 500, "started_at_ms": %d, '
+                        '"extra": %s}\n' % (stamp, deep), encoding="utf-8")
+        self.flows(self.flow("ok500", 500, 5))
+        block = health_mod.compute(self.session, self.record, self.target)["requests"]
+        self.assertEqual([row["id"] for row in block["failed"]], ["ok500"])
+        real_loads = json.loads
+
+        def loads(text, *args, **kwargs):
+            if "deep500" in text:
+                raise RecursionError("maximum recursion depth exceeded while decoding")
+            return real_loads(text, *args, **kwargs)
+
+        with mock.patch.object(health_mod.json, "loads", side_effect=loads):
+            refused = health_mod.compute(self.session, self.record, self.target)["requests"]
+        self.assertEqual(refused["failed"], block["failed"])
+
     def incomplete(self, flow_id: str, kind: str, minutes: float, *,
                    mock_id: str | None = None) -> dict:
         row = self.flow(flow_id, None, minutes)

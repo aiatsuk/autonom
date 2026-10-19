@@ -579,7 +579,9 @@ def _requests(session: dict[str, Any], baseline: dict[str, Any],
             continue
         try:
             row = json.loads(line)
-            if not isinstance(row, dict):
+            # Too deep is skipped whether the parser refused it (RecursionError
+            # on older Pythons) or read it: the same line, the same outcome.
+            if not isinstance(row, dict) or network_store.too_deep(row):
                 continue
             # Ids restart with every proxy process: count them over the whole file.
             flow_id = str(row["id"]) if row.get("id") is not None else None

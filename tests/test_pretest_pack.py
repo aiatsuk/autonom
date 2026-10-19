@@ -2007,6 +2007,23 @@ class FixRound3PackTests(PackBase):
         found = pack_mod.check_requests(self.session, checks)
         self.assertEqual([r["path"] for r in found[chk]["requests"]], ["/api/after"])
 
+    def test_a_too_deep_line_is_skipped_on_every_python(self) -> None:
+        # 300 levels parse on every version and are past store.MAX_LINE_DEPTH;
+        # the deep value is in a field the pack never prints, so only the
+        # depth check skips it — the same rows as where json.loads refuses it.
+        def during(check_id: str) -> None:
+            deep = ('{"id": "deep", "started_at_ms": %d, "method": "GET", '
+                    '"path": "/api/deep", "status": 500, "extra": %s}'
+                    % (int(time.time() * 1000), "[" * 300 + "]" * 300))
+            with (self.artifacts / "network" / "flows.jsonl").open("a", encoding="utf-8") as fh:
+                fh.write(deep + "\n")
+            self.request("after", path="/api/after")
+
+        chk = self.add_check("Deep field", during=during)
+        checks = checks_mod.fold(self.session, self.record)
+        found = pack_mod.check_requests(self.session, checks)
+        self.assertEqual([r["path"] for r in found[chk]["requests"]], ["/api/after"])
+
     def test_a_deep_id_line_does_not_crash_the_steps_of_a_request_finding(self) -> None:
         # health files an automatic finding on "after"; cutting that finding's
         # steps reads every flows.jsonl row's id (repro._request_time), and the
