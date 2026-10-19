@@ -80,7 +80,9 @@ class ActionJournalTests(JournalBase):
         self.assertEqual(failed[0].get("error_code"), "unsupported_on_platform")
 
     def test_nothing_is_written_without_a_session(self) -> None:
-        self.run_cli("open", "myapp://x")
+        # An explicit serial keeps target discovery on the fake adb; without it
+        # the CLI also asks the host's real `simctl`, which can hang for minutes.
+        self.run_cli("open", "myapp://x", "--serial", "emulator-5554")
         self.assertEqual(self.journal_lines(), [])
 
 
@@ -91,6 +93,22 @@ class SecretRedactionTests(JournalBase):
         blob = json.dumps(self.journal_lines(), ensure_ascii=False)
         self.assertNotIn("hunter2-password", blob)
         self.assertIn("<16 chars>", blob)
+
+    def test_mock_headers_keep_content_type_and_mask_credentials(self) -> None:
+        """A.5 — only secret-looking header names lose their value."""
+        self.start()
+        self.run_cli("network", "mock", "add", "--match", "*/login",
+                     "--header", "Content-Type: text/plain",
+                     "--header", "Authorization: Bearer HDRSECRET1",
+                     "--header=X-Session-Id: HDRSECRET2",
+                     "--json", '{"ok":true}')
+        entries = [e for e in self.journal_lines()
+                   if e.get("verb") == "network mock" and "add" in e.get("argv", [])]
+        self.assertEqual(len(entries), 1)
+        self.assertIn("Content-Type: text/plain", entries[0]["argv"])
+        blob = json.dumps(self.journal_lines(), ensure_ascii=False)
+        self.assertNotIn("HDRSECRET1", blob)
+        self.assertNotIn("HDRSECRET2", blob)
 
     def test_mock_body_json_is_masked(self) -> None:
         self.start()
@@ -137,6 +155,132 @@ class ScrubUnitTests(unittest.TestCase):
     def test_non_sensitive_argv_passes_through(self) -> None:
         argv = ["ui", "tap", "--desc", "Continue"]
         self.assertEqual(journal_mod.scrub_argv(argv), argv)
+
+
+class HeaderMaskingTests(unittest.TestCase):
+    """A.5 — `--header` values are masked by header name, not wholesale."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        import importlib
+
+        cls.parser = importlib.import_module("autonom").build_parser()
+
+    def scrub(self, argv: list[str], *, parser: bool = True) -> list[str]:
+        if not parser:
+            return journal_mod.scrub_for_journal(argv)
+        import contextlib
+        import io
+
+        with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+            args = self.parser.parse_args(argv)
+        return journal_mod.scrub_for_journal(argv, args, self.parser)
+
+    def test_secret_names(self) -> None:
+        for name in ("Authorization", "cookie", "Set-Cookie", "X-API-Key",
+                     "Proxy-Authorization", "X-Auth-Token", "X-Client-Secret", "Api-Key",
+                     "X-Password", "Session", "X-Session-Id", "WWW-Authenticate"):
+            with self.subTest(name=name):
+                self.assertTrue(journal_mod.secret_header_name(name))
+        for name in ("Content-Type", "Accept", "Cache-Control", "X-Request-Id", "Retry-After"):
+            with self.subTest(name=name):
+                self.assertFalse(journal_mod.secret_header_name(name))
+
+    def test_header_for_journal(self) -> None:
+        self.assertEqual(journal_mod.header_for_journal("Content-Type: application/json"),
+                         "Content-Type: application/json")
+        self.assertEqual(journal_mod.header_for_journal("Retry-After:5"), "Retry-After:5")
+        self.assertNotIn("hunter2",
+                         journal_mod.header_for_journal("X-Trace: password=hunter2") or "")
+        for value in ("Authorization: Bearer x", "Cookie: s=1", "no colon here",
+                      "https://h/p?token=x", "Bad Name: v", '{"a":"b"}', ": empty name", ""):
+            with self.subTest(value=value):
+                self.assertIsNone(journal_mod.header_for_journal(value))
+
+    def test_with_the_parser_every_spelling_is_resolved(self) -> None:
+        argv = ["network", "mock", "add", "--url", "https://x/", "--head", "Content-Type: a/b",
+                "--hea=Accept: */*", "--header", "Authorization: Bearer PSECRET1",
+                "--header=Cookie: PSECRET2", "--json", '{"k":"PSECRET3"}']
+        scrubbed = self.scrub(argv)
+        self.assertEqual(len(scrubbed), len(argv))
+        self.assertEqual(scrubbed[6], "Content-Type: a/b")
+        self.assertEqual(scrubbed[7], "--header=Accept: */*")
+        self.assertEqual(scrubbed[9], "***")
+        self.assertEqual(scrubbed[10], "--header=***")
+        self.assertEqual(scrubbed[12], "***")
+        self.assertNotIn("PSECRET", " ".join(scrubbed))
+
+    def test_update_is_covered_too(self) -> None:
+        argv = ["network", "mock", "update", "m_1", "--header", "Content-Type: text/html"]
+        self.assertEqual(self.scrub(argv)[-1], "Content-Type: text/html")
+
+    def test_without_a_parser_only_the_exact_flag_under_network_mock(self) -> None:
+        argv = ["network", "mock", "add", "--url", "https://x/",
+                "--header", "Content-Type: a/b", "--head", "Accept: */*",
+                "--header=Authorization: Bearer NSECRET"]
+        scrubbed = self.scrub(argv, parser=False)
+        self.assertEqual(scrubbed[6], "Content-Type: a/b")
+        self.assertEqual(scrubbed[8], "***")  # abbreviation: stays masked
+        self.assertEqual(scrubbed[9], "--header=***")
+
+    def test_typed_text_after_a_terminator_is_never_shown(self) -> None:
+        argv = ["ui", "type", "--", "--header", "Content-Type: SECRETTYPED"]
+        for parser in (False, True):
+            with self.subTest(parser=parser):
+                try:
+                    scrubbed = self.scrub(argv, parser=parser)
+                except SystemExit:
+                    continue
+                self.assertNotIn("SECRETTYPED", " ".join(scrubbed))
+        argv = ["network", "mock", "add", "--url", "https://x/", "--note", "n", "--",
+                "--header", "Content-Type: AFTERTERM"]
+        self.assertNotIn("Content-Type: AFTERTERM", self.scrub(argv, parser=False))
+
+    def test_other_commands_never_unmask_a_header_shaped_value(self) -> None:
+        argv = ["note", "add", "--header", "Content-Type: x"]
+        self.assertEqual(journal_mod._header_values(argv), [])  # noqa: SLF001
+
+    # A harmless name in front of a line break would otherwise show a second,
+    # smuggled header line (often a credential) in the journal.
+    SMUGGLED = (
+        "Accept: */*\r\nAuthorization: Bearer CTLSECRET",   # CRLF
+        "Accept: */*\nAuthorization: Bearer CTLSECRET",     # LF
+        "Accept: */*\rCookie: CTLSECRET",                   # bare CR
+        "Content-Type: a/b\r\n",                            # trailing CRLF only
+        "Content-Type: a/b\tCTLSECRET",                     # tab
+        "Content-Type: a/b\x00CTLSECRET",                   # NUL
+        "Content-Type: a/b\x1bCTLSECRET",                   # ESC
+        "Content-Type: a/b\x7fCTLSECRET",                   # DEL
+        "Content-Type: a/b\x85CTLSECRET",                   # C1 next line
+        "Content-Type: a/b CTLSECRET",                 # line separator
+        "Content-Type: a/b CTLSECRET",                 # paragraph separator
+    )
+
+    def test_a_value_with_a_control_character_is_fully_masked(self) -> None:
+        for value in self.SMUGGLED:
+            with self.subTest(value=value):
+                self.assertIsNone(journal_mod.header_for_journal(value))
+        # Non-control Unicode stays visible.
+        self.assertEqual(journal_mod.header_for_journal("X-Label: café"), "X-Label: café")
+
+    def test_control_characters_are_masked_in_every_spelling(self) -> None:
+        for value in self.SMUGGLED:
+            for parser in (True, False):
+                for form in ("split", "inline"):
+                    with self.subTest(value=value, parser=parser, form=form):
+                        tail = (["--header", value] if form == "split"
+                                else [f"--header={value}"])
+                        argv = ["network", "mock", "add", "--url", "https://x/", *tail]
+                        try:
+                            scrubbed = self.scrub(argv, parser=parser)
+                        except SystemExit:
+                            self.fail("the parser refused the argv")
+                        self.assertEqual(scrubbed[-1],
+                                         "***" if form == "split" else "--header=***")
+                        blob = " ".join(scrubbed)
+                        self.assertNotIn("CTLSECRET", blob)
+                        self.assertNotIn("\n", blob)
+                        self.assertNotIn("\r", blob)
 
 
 if __name__ == "__main__":

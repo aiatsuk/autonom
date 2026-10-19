@@ -25,7 +25,9 @@ than a nicety: a half-written file observed mid-request would drop every rule.
 from __future__ import annotations
 
 import json
+import math
 import os
+import re
 import shutil
 import tempfile
 import time
@@ -35,6 +37,24 @@ from typing import Any, Iterable
 from .. import errors
 
 BODY_INLINE_LIMIT = 1_048_576  # 1 MiB — an inline --json body beyond this is a file
+# A delayed or held response never waits longer than this; the addon applies
+# the same cap to `hang` and then kills the flow (recorded as incomplete).
+MAX_DELAY_S = 120.0
+DELAY_HINT = "delay is seconds in (0, 120], e.g. 2.5"
+
+# `--body-file` without an explicit Content-Type header: the type follows the
+# file extension, so a JSON fixture is not served as an untyped blob.
+CONTENT_TYPES_BY_EXTENSION = {
+    ".json": "application/json",
+    ".html": "text/html; charset=utf-8",
+    ".htm": "text/html; charset=utf-8",
+    ".txt": "text/plain; charset=utf-8",
+    ".xml": "application/xml",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+}
+DEFAULT_CONTENT_TYPE = "application/octet-stream"
 
 
 def registry_dir() -> Path:
@@ -280,6 +300,104 @@ def parse_header_args(values: Iterable[str] | None) -> dict[str, str] | None:
     return headers
 
 
+def content_type_for(path: Path | str) -> str:
+    """The Content-Type a `--body-file` is served with when none is given."""
+    return CONTENT_TYPES_BY_EXTENSION.get(Path(str(path)).suffix.lower(), DEFAULT_CONTENT_TYPE)
+
+
+def has_content_type(headers: dict[str, str] | None) -> bool:
+    return any(str(name).strip().lower() == "content-type" for name in (headers or {}))
+
+
+def with_body_file_content_type(headers: dict[str, str] | None,
+                                body_file: Path | str | None) -> dict[str, str]:
+    """`headers` plus a Content-Type from `body_file`'s extension.
+
+    An explicit Content-Type header (any case) always wins; without a body
+    file the headers are returned unchanged.
+    """
+    result = dict(headers or {})
+    if body_file is not None and not has_content_type(result):
+        result["Content-Type"] = content_type_for(body_file)
+    return result
+
+
+def implicit_content_type(body_file: Path | str | None = None,
+                          body_text: str | None = None) -> str | None:
+    """The type a body gets when its author named none, or None.
+
+    A `--body-file` follows its extension; an inline `--json` body that looks
+    like JSON (starts with `{` or `[`) is application/json; other inline text
+    gets no type, as before.
+    """
+    if body_file is not None:
+        return content_type_for(body_file)
+    if body_text is not None and body_text.lstrip()[:1] in ("{", "["):
+        return "application/json"
+    return None
+
+
+def _without_content_type(headers: dict[str, str] | None) -> dict[str, str]:
+    return {name: value for name, value in (headers or {}).items()
+            if str(name).strip().lower() != "content-type"}
+
+
+def _content_type_value(headers: dict[str, str] | None) -> str | None:
+    for name, value in (headers or {}).items():
+        if str(name).strip().lower() == "content-type":
+            return value
+    return None
+
+
+# A delay given as text is a plain decimal: `3`, `0.5`, `.5`, `2.` — never
+# `2_5`, `1e1`, `+3`, `inf` or `nan`, which float() would read.
+_PLAIN_DECIMAL = re.compile(r"(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)")
+
+
+def validate_delay(delay_s: Any = None, hang: Any = None) -> float | None:
+    """The checked `delay_s` (or None). `delay_s` and `hang` exclude each other.
+
+    A delay must be a finite number of seconds in (0, 120]; a bool, a string
+    that is not a plain decimal (``_PLAIN_DECIMAL``: no underscores, signs or
+    exponents), NaN or infinity is refused like an out-of-range one.
+    """
+    if delay_s is not None and hang:
+        raise errors.AutonomError(
+            errors.INVALID_VALUE,
+            "--delay and --hang both given; a mock rule takes one of them",
+            DELAY_HINT,
+        )
+    if delay_s is None:
+        return None
+    try:
+        if isinstance(delay_s, bool):
+            raise ValueError("bool")
+        if isinstance(delay_s, str) and not _PLAIN_DECIMAL.fullmatch(delay_s.strip()):
+            raise ValueError("not a plain decimal")
+        seconds = float(delay_s)
+    except (TypeError, ValueError):
+        seconds = math.nan
+    if not math.isfinite(seconds) or not 0 < seconds <= MAX_DELAY_S:
+        raise errors.AutonomError(
+            errors.INVALID_VALUE,
+            f"--delay {delay_s} is not a number of seconds in (0, 120]",
+            DELAY_HINT,
+        )
+    return seconds
+
+
+def _apply_timing(rule: dict[str, Any], delay_s: float | None, hang: bool | None) -> None:
+    """Store `delay_s` / `hang` on a rule so it never carries both."""
+    if delay_s is not None:
+        rule["delay_s"] = delay_s
+        rule.pop("hang", None)
+    if hang:
+        rule["hang"] = True
+        rule.pop("delay_s", None)
+    elif hang is not None:
+        rule.pop("hang", None)
+
+
 def validate_response(*, status: int | None = None, body_text: str | None = None) -> None:
     """Refuse a response the proxy could not serve as the author meant it.
 
@@ -350,10 +468,19 @@ def add(
     body_file: Path | None = None,
     body_text: str | None = None,
     note: str | None = None,
+    delay_s: float | None = None,
+    hang: bool = False,
     registry: Path | None = None,
 ) -> dict[str, Any]:
     require_target(url_glob)
     validate_response(status=status, body_text=body_text)
+    delay_s = validate_delay(delay_s, hang)
+    # A type the author did not name is marked implicit, so a later body
+    # change can replace it while an explicit `--header` type always stays.
+    implicit = None if has_content_type(headers) else implicit_content_type(body_file, body_text)
+    headers = dict(headers or {})
+    if implicit:
+        headers["Content-Type"] = implicit
     payload = _read_payload(registry)
     identifier = _next_id(payload)
     body_path = _store_body(
@@ -376,6 +503,9 @@ def add(
         "note": note,
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
+    if implicit:
+        rule["response"]["content_type_implicit"] = True
+    _apply_timing(rule, delay_s, hang or None)
     payload["mocks"].append(rule)
     _write_payload(payload, registry)
     return rule
@@ -411,10 +541,23 @@ def update(
     body_file: Path | None = None,
     body_text: str | None = None,
     note: str | None = None,
+    delay_s: float | None = None,
+    hang: bool | None = None,
     registry: Path | None = None,
 ) -> dict[str, Any]:
-    """Partial update. Only the fields actually supplied are touched."""
+    """Partial update. Only the fields actually supplied are touched.
+
+    A new `delay_s` replaces a stored `hang` and `hang=True` a stored delay;
+    `hang=False` switches a held rule back to answering at once.
+
+    Content-Type: `headers` replaces the header set, but an implicit type
+    (from the body file's extension or a JSON-looking inline body) survives a
+    header-only update that names no Content-Type. A new body (`body_file` or
+    `body_text`) replaces an implicit type with the new body's own; a
+    Content-Type the author gave explicitly is never replaced by a body change.
+    """
     validate_response(status=status, body_text=body_text)
+    delay_s = validate_delay(delay_s, hang)
     payload = _read_payload(registry)
     rule = _find(payload["mocks"], identifier)
 
@@ -431,14 +574,37 @@ def update(
     response = rule.setdefault("response", {})
     if status is not None:
         response["status"] = int(status)
+    implicit = response.get("content_type_implicit") is True
+    current = dict(response.get("headers") or {})
     if headers is not None:
-        response["headers"] = headers
+        kept = _content_type_value(current) if implicit else None
+        current = dict(headers)
+        if has_content_type(current):
+            implicit = False  # the author named the type: it is explicit now
+        elif kept is not None:
+            current["Content-Type"] = kept  # header-only update keeps it
+        else:
+            implicit = False
     if body_file is not None or body_text is not None:
         response["body_path"] = _store_body(
             identifier, body_file=body_file, body_text=body_text, registry=registry
         )
+        if implicit or not has_content_type(current):
+            # No type of the author's own: follow the new body.
+            current = _without_content_type(current)
+            new_type = implicit_content_type(body_file, body_text)
+            implicit = new_type is not None
+            if new_type:
+                current["Content-Type"] = new_type
+    if headers is not None or body_file is not None or body_text is not None:
+        response["headers"] = current
+        if implicit:
+            response["content_type_implicit"] = True
+        else:
+            response.pop("content_type_implicit", None)
     if note is not None:
         rule["note"] = note or None
+    _apply_timing(rule, delay_s, hang)
 
     rule["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     _write_payload(payload, registry)

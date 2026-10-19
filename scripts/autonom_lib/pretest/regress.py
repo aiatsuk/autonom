@@ -34,9 +34,9 @@ draft path) ``times`` times (1..10) through the flow executor. Each run is
 ``failed`` (a test failure: the finding reproduced), ``passed`` (not
 reproduced), ``broken`` (infrastructure or definition failure) or
 ``skipped`` (every step skipped); only failed and passed runs are
-conclusive, and a run refused by a guard (budget, forbidden action, app) never
-is. The finding gets ``reproduced: "k/N"`` (k failed runs out of the N runs
-asked for), ``stability`` (``stable`` k=N, ``intermittent`` 0<k<N,
+conclusive, and a run refused by a guard (budget, forbidden action, app, a
+damaged pre-test record) never is. The finding gets ``reproduced: "k/N"``
+(k failed runs out of the N runs asked for), ``stability`` (``stable`` k=N, ``intermittent`` 0<k<N,
 ``not_reproduced`` k=0) and ``repro_runs`` (the N run ids) as one ``update``
 event; the finding always stays a finding. N is always ``times``: the first
 run that reaches no verdict (broken, skipped, aborted, refused) stops the
@@ -54,7 +54,11 @@ one flow per chosen check: the check's own flow file, else the first draft of
 its findings that exists on this machine. Each becomes a child check with the
 parent's title, kind and case (so the child's pack pairs it with the parent
 check and shows ``before``/``after``), begun and ended with the run's verdict
-(passed→pass, failed→fail, broken→blocked, all skipped→inconclusive). Without
+(passed→pass, failed→fail, broken→blocked, all skipped→inconclusive). A replay
+that passes a race kit case (``checks.RACE_CASES``: the double tap) ends
+``inconclusive`` instead, with a note naming ``--observed-count``: a replay
+does not count the requests, and a race case passes only with a count
+(DEC-004 / RISK-038); amend the check with the count to make it a pass. Without
 ``--check`` every parent check with a flow is chosen. A chosen check without
 a flow, or a pack with no runnable check, is ``draft_unavailable`` and
 nothing is created. The child stays active so findings can be added; pack it
@@ -104,7 +108,7 @@ REPLAYABLE_COMMANDS = frozenset({
 })
 # guard refusals repeat the same way on every run: repro stops at the first
 _GUARD_REFUSALS = frozenset({errors.BUDGET_EXHAUSTED, errors.FORBIDDEN_ACTION,
-                             errors.APP_NOT_ALLOWED})
+                             errors.APP_NOT_ALLOWED, errors.PRETEST_DAMAGED})
 _SLUG = re.compile(r"[^a-z0-9]+")
 _GLOB_SPECIAL = re.compile(r"([*?\[])")
 
@@ -676,6 +680,13 @@ def plan_rerun(pack: str | Path, check_ids: Iterable[str] = ()) -> dict[str, Any
     return {**state, "plan": plan}
 
 
+def race_note(check_id: str, case: str) -> str:
+    """Why a replayed race case is not a pass (DEC-004 / RISK-038)."""
+    return (f"the replay passed, but the {case} case passes only with an observed request "
+            "count: count the requests ('autonom network requests') and run 'autonom "
+            f"pretest check amend {check_id} --verdict pass --observed-count N --note ...'")
+
+
 def rerun(session: dict[str, Any] | None, pack: str | Path, *, check_ids: Iterable[str],
           target: Any, config: Any = None) -> dict[str, Any]:
     """Start a rerun child of ``pack`` and run the chosen checks' flows."""
@@ -719,9 +730,12 @@ def rerun(session: dict[str, Any] | None, pack: str | Path, *, check_ids: Iterab
         failure = run["failure"] or {}
         note = (f"{failure.get('error_code')}: {failure.get('error')}"
                 if failure.get("error_code") else None)
+        verdict = VERDICTS[run["status"]]
+        if verdict == "pass" and before.get("case") in checks_mod.RACE_CASES:
+            verdict = "inconclusive"
+            note = race_note(added["check_id"], before["case"])
         ended = checks_mod.end(session, child, added["check_id"],
-                               verdict=VERDICTS[run["status"]], note=note,
-                               run_id=run["run_id"])
+                               verdict=verdict, note=note, run_id=run["run_id"])
         runs.append({"check_id": added["check_id"], "parent_check_id": before["check_id"],
                      "title": before["title"], "flow": item["flow"], "source": item["source"],
                      "run_id": run["run_id"], "status": run["status"],

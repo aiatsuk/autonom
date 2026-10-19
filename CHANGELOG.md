@@ -7,6 +7,125 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
 
 ## [Unreleased]
 
+### Added
+- **Slow and stuck mocks.** `network mock add|update --delay SECONDS`
+  (0 < s ≤ 120) answers late without holding other requests; `--hang` holds
+  the request until the rule is removed or disabled (it then goes upstream)
+  or 120 s pass (it is then killed and recorded incomplete). The two exclude
+  each other (`invalid_value`, hint "delay is seconds in (0, 120], e.g. 2.5");
+  `mock list` shows `delay_s` / `hang`.
+- **Requests that never complete are recorded.** A client abort, an upstream
+  error or the hang cap writes one record with `completed: false` and
+  `error_kind` (`client_abort`, `upstream_error`, `hang_cap`, `other`), never
+  headers or bodies; `network requests` and the pre-test pack list them.
+- **`pretest check amend <check-id> --verdict V --note TEXT`** corrects the
+  verdict of an ended check of the active pre-test (an `amended` event in
+  `checks.ndjson`, schema `pretest-check-v1`); the summary and the pack use
+  the latest verdict. Refused with `check_not_ended`, `unknown_check`,
+  `pretest_finalized`, `invalid_verdict` or `no_active_pretest`.
+- **Race checks need a count.** `pretest check end --verdict pass` of a
+  `double-tap` check needs `--observed-count N` (`race_needs_count`
+  otherwise); the count is stored on the check and leads its note in
+  `summary.md` and `summary.json`.
+- **`pretest stop --force`** stops a pre-test whose record is damaged and
+  keeps the file as `pretest.json.damaged`.
+- **Android emulator network controls are read back.** `simulator network`
+  shape/offline/online reports `verified: true` only when the read-back
+  matches, else `verified: false` with `verified_reason`. On the iOS Simulator
+  `simulator network` is still refused with `unsupported_capability`.
+- **A flow picked by pull-request tag for the other platform** is still
+  selected, with the warning `flow <name> is for <platform>` in `proof`
+  (`flow_warnings` and `warnings`), in `pretest start` (`flow_warnings`) and in
+  the pre-test context (`flows.warnings`).
+- **Skill notes:** `--log-stream` on iOS for `pretest health` app logs, the
+  app language by launch arguments, the Android clipboard recipe and the
+  race-count rule.
+
+### Changed
+- **The capture proxy connects upstream lazily** (`connection_strategy=lazy`),
+  so a mock answers even when the real host is unreachable; the live pre-test
+  script no longer writes that setting itself.
+- **`--body-file` mocks get a Content-Type from the extension** (`.json`,
+  `.html`/`.htm`, `.txt`, `.xml`, `.png`, `.jpg`/`.jpeg`, else
+  `application/octet-stream`) when no Content-Type `--header` is given; an
+  explicit header wins. The journal masks only secret-looking header values,
+  so `Content-Type` stays readable.
+- **Android `ui screen` and coordinate checks follow the rotation**: rotation
+  1 or 3 swaps width and height.
+- **Flow evidence `always`** takes the screenshot right after the step's
+  action, before its wait or assertion.
+- **The a11y small-target rule** also checks nodes that look interactive
+  without being clickable (buttons, links, switches, text fields, an action
+  trait), so Flutter iOS controls are seen.
+- **A Canvas client without `origin`, or with any value that is not exactly
+  `human`, `agent`, `replay` or `system`, counts as an agent**; the page sends
+  `origin: "human"` for its own input.
+- **Each warning is printed once** in a command's output.
+- **Requests that never complete in pre-test health:** an unmocked request
+  that ended in an upstream error or a timeout shows as a "Request never
+  completed" automatic signal (unconfirmed, like other automatic signals); a
+  request the app cancelled itself (`client_abort`) and a request a `hang`
+  mock held until the cap (`hang_cap`, always mocked) are not failures and
+  create no finding. The pack's requests per check keep
+  `completed: false` and `error_kind` and read "never completed (<kind>)".
+- **A replayed race check needs a count to pass:** `pretest rerun` ends a
+  `double-tap` check whose flow passed `inconclusive`, with a note naming
+  `pretest check amend … --observed-count N`; other cases are unchanged.
+
+### Fixed
+- **Android `clipboard get`** answers `clipboard_unavailable` ("Android does
+  not let a shell read the clipboard (Android 10+)") with a hint: paste into a
+  text field and read it with `ui find`.
+- **A damaged active `pretest.json`** no longer disables the guard: guarded
+  device actions refuse with `pretest_damaged` and send nothing, and
+  `pretest status` reports `status: damaged` with the reason.
+- **`ui swipe --duration`** must be finite and in (0, 60] seconds;
+  `--duration=-inf` was a raw error and negative values were accepted.
+- **Tampered or already packed pre-tests** name the right next step
+  (`report verify <pack>` or a new pre-test) instead of "pack again".
+- **`--evidence shot:<n>`** takes ASCII digits only; anything else is
+  `evidence_ref_unknown`.
+- **`pretest start` git errors** say what is wrong: `git_missing` when git is
+  not on `PATH`, `--repo <path> is not a directory`, or git's own first error
+  line.
+- **Untracked files in the diff context** are read without following
+  symlinks or blocking on FIFOs; skipped paths are listed in
+  `skipped_untracked`.
+- **A flow file that is not UTF-8** is listed invalid (`not UTF-8 text`)
+  instead of aborting `pretest start`.
+- **A JSON line that is not an object in `network/flows.jsonl`** is skipped
+  and counted; `pretest events`, `network requests` and `network requests
+  follow` (count on the eof line as `skipped`) no longer crash.
+- **Long digit strings** in `--observed-count` (more than 9 digits) are
+  `invalid_value`, and in `shot:<n>` refs `evidence_ref_unknown`, never a raw
+  error; `--delay` takes a plain decimal only (`2_5` and `1e1` are
+  `invalid_value`).
+- **HAR export of incomplete requests** gives `response.status` 0 (an
+  integer, as HAR 1.2 requires) instead of `null`, and keeps
+  `_autonom.completed: false` and `_autonom.error_kind`; completed requests
+  export as before.
+- **A `network/flows.jsonl` line that raises `RecursionError` when read**
+  (nested past the JSON parser's limit), or one that is not a JSON object, is
+  skipped by `pretest health`, `pretest pack` (including a finding's steps),
+  `pretest events`, `network requests`, `network requests follow` (with or
+  without filters) and `request:<id>` evidence refs instead of crashing them;
+  the pre-test's journal and check and finding logs skip such a line the same
+  way. The readers that also check depth (the network store's and the
+  pre-test store's line readers) skip a line nested deeper than their limit
+  too. `network requests follow` also skips and
+  counts a record whose `id` is not a string instead of failing on it.
+- **Android rotation lookup** that times out keeps the natural screen size
+  instead of failing the command.
+- **`pretest pack` checks that `--out` can be written** before it ends open
+  checks, and reopens them if the bundle write still fails.
+- **Smaller messages:** `--ticket <dir>` says the ticket must be a file;
+  `--env NAME` without `=` names the NAME=VALUE form (`invalid_value` on the
+  pre-test verbs); a missing `--flows` directory and `flow-draft --out ''`
+  are `invalid_value`; `flow-draft` says what it wrote and where, and with
+  `--pack` suggests `pretest rerun` only when rerun would replay the written
+  file (else `flow run <draft>`); repro commands in `summary.json` and
+  `index.html` drop `--adb <path>`.
+
 ## [0.36.1] - 2026-10-16
 
 ### Fixed

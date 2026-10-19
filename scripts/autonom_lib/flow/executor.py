@@ -1794,9 +1794,17 @@ class Executor:
         self._last_repin = None
         self._last_settle = None
         attempts = [0]
+        # `always` evidence shows what the action did, so its after-shot is
+        # taken right after the action, before the step's own wait
+        # (postcondition) — a short-lived toast or sheet must not be gone by
+        # then. The other modes keep the after-assertion boundary.
+        post_action_shot = evidence.mode == "always"
         try:
             secret_used = self._dispatch(step, flow, attempts)
             sensitive = sensitive or secret_used
+            if post_action_shot:
+                outcome.postcondition_fingerprint = self._auto_evidence(
+                    evidence, step, "after", index, writer)
             postcondition = step.args.get("postcondition")
             if postcondition is not None:
                 resolved, post_secret = self._resolve_selector(postcondition)
@@ -1832,8 +1840,9 @@ class Executor:
             raise
         else:
             outcome.target = self._target_record(sensitive=sensitive)
-            outcome.postcondition_fingerprint = self._auto_evidence(
-                evidence, step, "after", index, writer)
+            if not post_action_shot:
+                outcome.postcondition_fingerprint = self._auto_evidence(
+                    evidence, step, "after", index, writer)
         outcome.duration_ms = int((self.clock() - started) * 1000)
         outcome.attempts = max(attempts[0], 1)
         outcome.finished_at_ms = self._wall_ms()

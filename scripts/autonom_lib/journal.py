@@ -23,6 +23,7 @@ import json
 import re
 import sys
 import time
+import unicodedata
 from pathlib import Path
 from typing import Any
 
@@ -281,7 +282,88 @@ def scrub_for_journal(argv: list[str], args: Any = None, parser: Any = None) -> 
             pass
     candidates.append(scrub_argv(argv, args))
     candidates.append(_head_rule_scrub(argv))
-    return _most_masked(argv, candidates)
+    merged = _most_masked(argv, candidates)
+    for index, prefix, value in _header_values(argv, parser):
+        kept = header_for_journal(value)
+        if kept is not None:
+            merged[index] = prefix + kept
+    return merged
+
+
+# Header names whose value is a credential. Everything else under `--header`
+# (Content-Type, Accept, Cache-Control, ...) is kept: it is what a reader of
+# the journal needs to see which response a mock served.
+_SECRET_HEADER_NAMES = frozenset({
+    "authorization", "cookie", "set-cookie", "x-api-key", "proxy-authorization",
+})
+_SECRET_HEADER_PARTS = ("token", "secret", "key", "password", "session", "auth")
+_HEADER_NAME = re.compile(r"[A-Za-z0-9!#$%&'*+.^_`|~-]+")
+
+
+def secret_header_name(name: str) -> bool:
+    lowered = name.strip().lower()
+    return lowered in _SECRET_HEADER_NAMES or any(part in lowered for part in _SECRET_HEADER_PARTS)
+
+
+def header_for_journal(value: str) -> str | None:
+    """`Name: value` as the journal may show it, or None to keep it masked.
+
+    Only a well-formed header line with a non-secret name is shown, and its
+    value still gets content scrubbing. A secret name, a value without a
+    colon, a name that is not an HTTP token, something URL-shaped
+    (`https://...`), or a value holding a line break (CR, LF) or any other
+    control character stays fully masked: `"Accept: x\\r\\nAuthorization: y"`
+    smuggles a second, secret header behind a harmless name.
+    """
+    if any(_control_character(char) for char in value):
+        return None
+    name, colon, rest = value.partition(":")
+    if not colon or not _HEADER_NAME.fullmatch(name.strip()) or rest.startswith("//"):
+        return None
+    if secret_header_name(name):
+        return None
+    return _scrub_free(value)
+
+
+def _control_character(char: str) -> bool:
+    """C0/C1 controls, DEL, and the Unicode line and paragraph separators."""
+    return unicodedata.category(char) in ("Cc", "Zl", "Zp")
+
+
+def _header_values(argv: list[str], parser: Any = None) -> list[tuple[int, str, str]]:
+    """(index, prefix, value) of every `--header` value in `argv`.
+
+    With a parser that resolves the whole argv, every spelling argparse maps to
+    `--header` counts (`--hea X`, `--head=X` under `network mock add`). Without
+    one only the exact `--header` spelling under `network mock`, before any
+    `--` terminator, does; an abbreviation stays fully masked.
+    """
+    found: list[tuple[int, str, str]] = []
+    if parser is not None:
+        try:
+            tokens = canonical_argv(parser, argv)
+        except Exception:  # noqa: BLE001 - fall through to the exact spelling
+            tokens = None
+        if tokens is not None and not any(t.role in ("unknown", "stray") for t in tokens):
+            for index, token in enumerate(tokens):
+                if token.option != "--header":
+                    continue
+                if token.role == "value":
+                    found.append((index, "", token.raw))
+                elif token.role == "option" and token.inline is not None:
+                    found.append((index, "--header=", token.inline))
+            return found
+    words, terminator = _bare_words(argv)
+    if tuple(argv[index] for index in words[:2]) != ("network", "mock"):
+        return found  # only `network mock add|update` takes --header
+    end = len(argv) if terminator is None else terminator
+    for index in range(end):
+        token = argv[index]
+        if token == "--header" and index + 1 < end:
+            found.append((index + 1, "", argv[index + 1]))
+        elif token.startswith("--header="):
+            found.append((index, "--header=", token[len("--header="):]))
+    return found
 
 
 def _sensitive_flag(flag: str, path: tuple[str, ...]) -> bool:

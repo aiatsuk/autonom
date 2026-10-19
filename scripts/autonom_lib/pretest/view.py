@@ -31,7 +31,8 @@ Rules the document keeps (tp-019, design brief):
   commands keep the ``<pack>`` placeholder.
 - A screenshot taken while mocks were active carries a neutral "Mocked" tag
   on its caption; each check lists the requests captured in its window
-  (method, host, path, status, mocked, duration); the verdict reason names
+  (method, host, path, status, mocked, duration; a request that never
+  completed reads "never completed (<error kind>)"); the verdict reason names
   the check's title ("chk-9 failed: <title>").
 - Deterministic: the same input gives byte-identical output (no clock, no
   random ids).
@@ -56,6 +57,7 @@ import re
 from typing import Any, Iterable
 
 from .. import errors
+from .summary import drop_host_flags, incomplete_text, repro_steps
 
 SUMMARY_SCHEMA = "autonom.pretest-summary/v1"
 
@@ -227,6 +229,21 @@ def _pack_name(value: Any) -> str | None:
         if part.startswith("pt_"):
             return part
     return parts[-1] if parts else None
+
+
+def _embedded(summary: dict[str, Any]) -> dict[str, Any]:
+    """The summary as embedded in the page: repro steps of checks and
+    findings without host-only flags (``--adb <path>``), which a summary
+    written before they were dropped may still hold; nothing else changes."""
+    out = dict(summary)
+    for key in ("checks", "findings"):
+        items = summary.get(key)
+        if not isinstance(items, list):
+            continue
+        out[key] = [{**item, "repro": repro_steps(item["repro"])}
+                    if isinstance(item, dict) and isinstance(item.get("repro"), list)
+                    else item for item in items]
+    return out
 
 
 def _script_json(summary: dict[str, Any]) -> str:
@@ -446,7 +463,7 @@ def _requests(check: dict[str, Any]) -> str:
     for item in items:
         method = _str(item.get("method")) or "?"
         where = (_str(item.get("host")) or "") + (_str(item.get("path")) or "")
-        status = _str(item.get("status")) or "no status"
+        status = incomplete_text(item) or _str(item.get("status")) or "no status"
         extra = []
         if item.get("mocked") is True:
             extra.append("mocked")
@@ -471,7 +488,8 @@ def _step(step: Any) -> str:
         return ""
     verb = _str(step.get("verb")) or "step"
     parts = [f"<b>{_e(verb)}</b>"]
-    args = _strs(step.get("args"))
+    # a summary written before --adb was dropped may still hold it
+    args = _strs(drop_host_flags(step.get("args")))
     if args:
         parts.append(_e(" ".join(args)))
     selector = step.get("selector")
@@ -1234,7 +1252,7 @@ def render(summary: dict[str, Any], *, review: dict[str, Any] | None = None) -> 
         raise _refuse(f"the summary schema is not {SUMMARY_SCHEMA}", schema=shown[:80])
     if review is not None and not isinstance(review, dict):
         raise _refuse("the review status must be an object", got=type(review).__name__)
-    data = _script_json(summary)
+    data = _script_json(_embedded(summary))
     model = _Model(summary, review)
     verdict_word = _verdict(summary.get("verdict"))[2]
     title = _str(summary.get("title")) or "Untitled pre-test"

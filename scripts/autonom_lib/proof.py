@@ -134,29 +134,56 @@ def _flow_graph(file: Path, flow) -> tuple[list[Path], dict[str, Any] | None]:
                 pending.append((child, flow_validator.load_flow(child)))
             except errors.AutonomError as exc:
                 return reachable, {"code": exc.code, "message": exc.message,
-                                   "subflow": str(child)}
+                                   "subflow": str(child),
+                                   "reason": exc.extra.get("reason")}
     return reachable, None
 
 
+def _platform_warning(flow, display: str, platform: str | None) -> dict[str, Any] | None:
+    """A warning when ``flow`` cannot run on the session ``platform``."""
+    if not platform:
+        return None
+    platforms = flow_validator.flow_platforms(flow)
+    if not platforms or platform in platforms:
+        return None
+    name = flow.name or Path(display).stem
+    return {"code": "flow_platform_mismatch",
+            "message": f"flow {name} is for {', '.join(platforms)}",
+            "flow": display, "platforms": platforms,
+            "session_platform": platform}
+
+
 def select_suite(flows_dir: Path, repo: Path,
-                 changed: list[str]) -> dict[str, Any]:
-    """-> {selected [{path, flow, reasons}], covered [...], invalid [...]}.
+                 changed: list[str],
+                 platform: str | None = None) -> dict[str, Any]:
+    """-> {selected [{path, flow, reasons}], covered [...], invalid [...],
+    warnings [...]}.
 
     ``invalid`` lists every discovered flow that does not load (or whose
     subflow does not), repo-relative, with its error code — a flow that
-    cannot be read is a coverage gap to report, not a file to forget.
+    cannot be read is a coverage gap to report, not a file to forget. An
+    entry carries the refusal's ``reason`` when it names one — ``not UTF-8
+    text`` for a file that is not UTF-8.
+
+    ``platform`` is the session platform (``android``/``ios``); a flow
+    selected by its ``pull-request`` tag that cannot run there is still
+    selected, with a ``flow <name> is for <platform>`` warning.
     """
     selected: list[dict[str, Any]] = []
     covered: set[str] = set()
     invalid: list[dict[str, Any]] = []
+    warnings: list[dict[str, Any]] = []
     changed_set = set(changed)
     for file in flow_validator.discover(flows_dir):
         relative = _relative(file, repo)
         try:
             flow = flow_validator.load_flow(file)
         except errors.AutonomError as exc:
-            invalid.append({"flow": relative or str(file),
-                            "error_code": exc.code, "error": exc.message})
+            entry = {"flow": relative or str(file),
+                     "error_code": exc.code, "error": exc.message}
+            if exc.extra.get("reason"):
+                entry["reason"] = exc.extra["reason"]
+            invalid.append(entry)
             continue
         reasons: list[str] = []
         if relative and relative in changed_set:
@@ -168,7 +195,9 @@ def select_suite(flows_dir: Path, repo: Path,
                             "error_code": problem["code"],
                             "error": problem["message"],
                             "subflow": _relative(Path(problem["subflow"]), repo)
-                            or problem["subflow"]})
+                            or problem["subflow"],
+                            **({"reason": problem["reason"]}
+                               if problem.get("reason") else {})})
         changed_children = sorted({name for name in
                                    (_relative(child, repo) for child in reachable)
                                    if name and name in changed_set})
@@ -181,9 +210,13 @@ def select_suite(flows_dir: Path, repo: Path,
             covered.update(matched)
         if "pull-request" in flow.tags:
             reasons.append("tagged pull-request")
+            warning = _platform_warning(flow, relative or str(file), platform)
+            if warning is not None:
+                warnings.append(warning)
         if reasons:
             selected.append({"path": file, "flow": flow, "reasons": reasons})
-    return {"selected": selected, "covered": sorted(covered), "invalid": invalid}
+    return {"selected": selected, "covered": sorted(covered), "invalid": invalid,
+            "warnings": warnings}
 
 
 def select_flows(flows_dir: Path, repo: Path,

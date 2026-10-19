@@ -562,7 +562,9 @@ class PackRefusalTests(PackBase):
         error = self.assert_code(errors.REPORT_BUNDLE_FINALIZED, self.build)
         self.assertTrue(error.extra["stale"])
         self.assertIn(differs, error.extra["differs"])
-        self.assertIn("--out", error.hint)
+        # fu-013: the same hint as every refusal about an existing pack
+        self.assertEqual(error.hint, pack_mod.FINALIZED_HINT)
+        self.assertNotIn("again into", error.hint)
         self.assertEqual(tree_state(pack), before)
         self.assertEqual(store.load(self.session, self.record["pretest_id"])["status"],
                          "active")
@@ -1988,6 +1990,69 @@ class FixRound3PackTests(PackBase):
             self.assertNotIn("Authorization", text, name)
         self.assertTrue(pack_mod.verify(pack)["ok"])
 
+    def test_a_value_nested_too_deep_to_print_skips_only_its_line(self) -> None:
+        # json.loads reads this line, but str() of the method would raise
+        # RecursionError; the line is skipped and the next one still counts.
+        depth = 100_000
+
+        def during(check_id: str) -> None:
+            deep = ('{"id": "deep", "started_at_ms": %d, "method": %s, "status": 500}'
+                    % (int(time.time() * 1000), "[" * depth + "]" * depth))
+            with (self.artifacts / "network" / "flows.jsonl").open("a", encoding="utf-8") as fh:
+                fh.write(deep + "\n")
+            self.request("after", path="/api/after")
+
+        chk = self.add_check("Deep", during=during)
+        checks = checks_mod.fold(self.session, self.record)
+        found = pack_mod.check_requests(self.session, checks)
+        self.assertEqual([r["path"] for r in found[chk]["requests"]], ["/api/after"])
+
+    def test_a_deep_id_line_does_not_crash_the_steps_of_a_request_finding(self) -> None:
+        # health files an automatic finding on "after"; cutting that finding's
+        # steps reads every flows.jsonl row's id (repro._request_time), and the
+        # deep id before it must be skipped there too.
+        depth = 100_000
+
+        def during(check_id: str) -> None:
+            with (self.artifacts / "network" / "flows.jsonl").open("a", encoding="utf-8") as fh:
+                fh.write('{"id": %s, "status": 200, "started_at_ms": %d}\n'
+                         % ("[" * depth + "]" * depth, int(time.time() * 1000)))
+            self.request("after", status=503, path="/api/after")
+
+        self.add_check("Deep id", during=during, verdict="fail")
+        pack = Path(self.build()["pack"])
+        summary = self.read(pack, "summary.json")
+        by_id = {item["id"]: item for item in summary["evidence"]}
+        shown = [self.read(pack, by_id[eid]["path"]) for f in summary["findings"]
+                 if f["origin"] == "auto" for eid in f["evidence"]
+                 if by_id[eid]["kind"] == "request"]
+        self.assertEqual([item.get("id") for item in shown], ["after"])
+        self.assertTrue(pack_mod.verify(pack)["ok"])
+
+    def test_a_request_ref_to_a_deep_row_is_a_warning_not_a_crash(self) -> None:
+        # The id is plain text but the path is nested too deep to print: the
+        # row no longer resolves, so the pack warns about the ref and is written.
+        depth = 100_000
+        flows = self.artifacts / "network" / "flows.jsonl"
+        ids: dict = {}
+
+        def during(check_id: str) -> None:
+            self.request("fdeep", status=200, path="/api/fdeep")
+            ids["finding"] = findings_mod.add(
+                self.session, self.record, check_id=check_id, severity="minor",
+                title="Deep", actual="x", evidence=["request:fdeep"])["finding_id"]
+            row = json.loads(flows.read_text("utf-8").splitlines()[-1])
+            row["path"] = "@"
+            flows.write_text(json.dumps(row).replace('"@"', "[" * depth + "]" * depth)
+                             + "\n", encoding="utf-8")
+
+        self.add_check("Deep ref", during=during, verdict="fail")
+        self.assert_code(errors.EVIDENCE_REF_UNKNOWN, findings_mod.resolve_ref,
+                         self.session, "request:fdeep")
+        result = self.build()
+        self.assertIn("request:fdeep", [w["evidence"] for w in result["warnings"]])
+        self.assertTrue(pack_mod.verify(Path(result["pack"]))["ok"])
+
     def test_item3_requests_cap_and_unreadable_store(self) -> None:
         def during(check_id: str) -> None:
             for number in range(5):
@@ -2015,6 +2080,58 @@ class FixRound3PackTests(PackBase):
              "requests_truncated": -2}]})
         self.assertIn("checks[0].requests_truncated must be an integer >= 0", failures)
         self.assertTrue(any(f.startswith("checks[0].requests must be") for f in failures))
+
+    def test_requests_keep_incomplete_state(self) -> None:
+        """A store row with ``completed: false`` keeps that and its error
+        kind in the pack, and summary.md / index.html say it never completed."""
+        def during(check_id: str) -> None:
+            self.request("done", status=200, path="/api/done")
+            row = {"id": "hung", "started_at": iso_now(),
+                   "started_at_ms": int(time.time() * 1000), "method": "POST",
+                   "host": "api.example.com", "path": "/api/pay", "status": None,
+                   "mocked": True, "mock_id": "m_9", "completed": False,
+                   "error_kind": "hang_cap", "duration_ms": 120000}
+            plain = dict(row, id="gone", path="/api/gone", mocked=False, mock_id=None,
+                         duration_ms=None)
+            plain.pop("error_kind")
+            with (self.artifacts / "network" / "flows.jsonl").open(
+                    "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(row) + "\n" + json.dumps(plain) + "\n")
+
+        chk = self.add_check("Payment hangs", during=during, verdict="fail")
+        pack = Path(self.build()["pack"])
+        summary = self.read(pack, "summary.json")
+        requests = {r["path"]: r for r in
+                    next(c for c in summary["checks"] if c["check_id"] == chk)["requests"]}
+        self.assertNotIn("completed", requests["/api/done"])
+        self.assertNotIn("error_kind", requests["/api/done"])
+        self.assertIs(requests["/api/pay"]["completed"], False)
+        self.assertEqual(requests["/api/pay"]["error_kind"], "hang_cap")
+        self.assertEqual(requests["/api/gone"]["error_kind"], "other")
+        self.assertEqual(summary_mod.summary_failures(summary), [])
+        markdown = (pack / "summary.md").read_text("utf-8")
+        self.assertIn("  - POST api.example.com/api/pay → never completed (hang_cap) "
+                      "(mocked, 120000 ms)", markdown)
+        self.assertIn("  - POST api.example.com/api/gone → never completed (other)", markdown)
+        self.assertIn("  - GET api.example.com/api/done → 200", markdown)
+        html = (pack / "index.html").read_text("utf-8")
+        self.assertIn("api.example.com/api/pay \u2014 never completed (hang_cap)", html)
+        self.assertTrue(pack_mod.verify(pack)["ok"])
+        for bad_value in ({"completed": "no"}, {"error_kind": 3}):
+            bad = json.loads(json.dumps(summary))
+            check = next(c for c in bad["checks"] if c["check_id"] == chk)
+            check["requests"][0].update(bad_value)
+            self.assertTrue(any(f.endswith("requests must be a list of {method, host, path, "
+                                           "status, mocked, duration_ms?, started_at?, "
+                                           "completed?, error_kind?}")
+                                for f in summary_mod.summary_failures(bad)), bad_value)
+        nulled = json.loads(json.dumps(summary))
+        next(c for c in nulled["checks"] if c["check_id"] == chk)["requests"][0][
+            "error_kind"] = None
+        self.assertEqual(summary_mod.summary_failures(nulled), [])
+        self.assertEqual(summary_mod.request_text(
+            {"method": "GET", "host": "h", "path": "/x", "status": None, "mocked": False,
+             "completed": False}), "GET h/x → never completed")
 
     def test_item15_not_covered_lists_notes(self) -> None:
         self.add_check("Planned only", begin=False)
@@ -2495,6 +2612,263 @@ class ReviewTests(PackBase):
                      "return-to-dev needs at least one finding"):
             self.assertIn(text, failures)
         self.assert_code(errors.INVALID_VALUE, review_mod.validate, {})
+
+# --- follow-ups: fu-013, fu-022, fu-021 (pack part) ----------------------------------
+
+
+ADB_PATH = "/opt/private-sdk/platform-tools/adb"
+
+
+class FollowupHintTests(PackBase):
+    """fu-013: refusals about an existing pack never say to pack again."""
+
+    def cli(self, *argv: str):
+        import subprocess
+
+        return subprocess.run([sys.executable, str(ROOT / "scripts" / "autonom.py"), *argv],
+                              capture_output=True, text=True, timeout=120,
+                              env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+
+    def assert_hint_never_repacks(self, error: errors.AutonomError) -> None:
+        self.assertNotIn("again into", error.hint)
+        self.assertNotIn("pack the pre-test again", error.hint.lower())
+
+    def test_finalized_repack_and_tampered_pack_hints(self) -> None:
+        self.add_check("Done")
+        first = self.build()
+        pack = Path(first["pack"])
+        # packed: another --out
+        error = self.assert_code(errors.PRETEST_FINALIZED, self.build,
+                                 out=self.root / "elsewhere")
+        self.assertEqual(error.hint, pack_mod.FINALIZED_HINT)
+        self.assertEqual(error.hint, "this pre-test is already packed; verify the original "
+                                     "pack with 'autonom report verify <pack>' or start a "
+                                     "new pre-test")
+        self.assert_hint_never_repacks(error)
+        # the command the hint names is accepted and verifies the original
+        verified = self.cli("report", "verify", str(pack))
+        self.assertEqual(verified.returncode, 0, verified.stderr)
+        self.assertTrue(json.loads(verified.stdout)["ok"])
+        # packed, then tampered: re-pack refuses with the same hint
+        blob = pack / "summary.md"
+        original = blob.read_bytes()
+        blob.write_bytes(bytes([original[0] ^ 1]) + original[1:])
+        error = self.assert_code(errors.REPORT_INTEGRITY_FAILED, self.build)
+        self.assertEqual(error.hint, pack_mod.FINALIZED_HINT)
+        self.assertIn({"path": blob.relative_to(pack).as_posix(), "reason": "digest-mismatch"},
+                      error.extra["failures"])
+        self.assertEqual(store.load(self.session, self.record["pretest_id"])["status"],
+                         "packed")
+        # verify itself (report verify) never says to pack again either
+        direct = self.assert_code(errors.REPORT_INTEGRITY_FAILED, pack_mod.verify, pack)
+        self.assert_hint_never_repacks(direct)
+        self.assertIn("start a new pre-test", direct.hint)
+        refused = self.cli("report", "verify", str(pack))
+        self.assertEqual(refused.returncode, 2)
+        payload = json.loads(refused.stderr or refused.stdout)
+        self.assertEqual(payload["error_code"], errors.REPORT_INTEGRITY_FAILED)
+        self.assertNotIn("again into", payload["hint"])
+        blob.write_bytes(original)
+        self.assertTrue(self.build()["idempotent"])
+
+    def test_unreadable_pack_hint_never_repacks(self) -> None:
+        self.add_check("Done")
+        pack = Path(self.build()["pack"])
+        with mock.patch.object(pack_mod, "_verify_pack", side_effect=ValueError("boom")):
+            error = self.assert_code(errors.REPORT_INTEGRITY_FAILED, pack_mod.verify, pack)
+        self.assert_hint_never_repacks(error)
+        with mock.patch.object(pack_mod, "_scan_refusal", side_effect=ValueError("boom")):
+            error = self.assert_code(errors.REPORT_INTEGRITY_FAILED, pack_mod.verify, pack)
+        self.assert_hint_never_repacks(error)
+
+    def test_unmarked_tampered_pack_gives_the_finalized_hint(self) -> None:
+        """A finalized pack whose record was never marked (crash) and that was
+        changed since: ``_adopt`` uses the same hint as every other refusal
+        about an existing pack (contract B.1); a fresh pack into another
+        --out still works, the hint just does not offer it."""
+        self.add_check("Done")
+        with mock.patch.object(store, "mark_packed", side_effect=OSError("power cut")):
+            with self.assertRaises(OSError):
+                self.build()
+        pack = store.pretest_dir(self.session, self.record["pretest_id"]) / "pack"
+        self.record.update(store.load(self.session, self.record["pretest_id"]))
+        summary = pack / "summary.md"
+        summary.write_text(summary.read_text(encoding="utf-8") + "x", encoding="utf-8")
+        error = self.assert_code(errors.REPORT_INTEGRITY_FAILED, self.build)
+        self.assertEqual(error.hint, pack_mod.FINALIZED_HINT)
+        self.assertIn("autonom report verify <pack>", error.hint)
+        self.assert_hint_never_repacks(error)
+        self.assertFalse(hasattr(pack_mod, "ADOPT_HINT"))
+        fresh = self.build(out=self.root / "fresh")
+        self.assertFalse(fresh["idempotent"])
+
+
+class FollowupWriteCheckTests(PackBase):
+    """fu-022: the output is checked before any check is closed."""
+
+    def open_check(self) -> str:
+        return self.add_check("Still open", verdict=None)
+
+    def checks_file(self) -> Path:
+        return store.pretest_dir(self.session, self.record["pretest_id"]) / store.CHECKS_FILE
+
+    def assert_open_and_endable(self, check_id: str) -> None:
+        record = store.load(self.session, self.record["pretest_id"])
+        self.assertEqual(record["status"], "active")
+        state = checks_mod.fold(self.session, record)[0]
+        self.assertEqual((state["check_id"], state["state"]), (check_id, "open"))
+        self.assertEqual(store.active_ids(self.session),
+                         (self.record["pretest_id"], check_id))
+        ended = checks_mod.end(self.session, record, check_id, verdict="pass")
+        self.assertEqual((ended["state"], ended["verdict"]), ("ended", "pass"))
+
+    def test_unwritable_parent_leaves_the_open_check_open(self) -> None:
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            self.skipTest("root writes anywhere")
+        check_id = self.open_check()
+        before = self.checks_file().read_bytes()
+        locked = self.root / "locked"
+        locked.mkdir()
+        os.chmod(locked, 0o500)
+        self.addCleanup(os.chmod, locked, 0o700)
+        for out in (locked / "pack", locked / "deeper" / "pack"):
+            with self.subTest(out=out):
+                error = self.assert_code(errors.OUTPUT_NOT_WRITABLE, self.build, out=out)
+                self.assertIn(str(out), error.message)
+                self.assertTrue(error.extra["reason"])
+                self.assertEqual(self.checks_file().read_bytes(), before)
+                self.assertFalse(out.exists())
+        self.assertEqual(list(locked.iterdir()), [])
+        self.assertFalse((store.pretest_dir(self.session, self.record["pretest_id"])
+                          / "health.json").exists())
+        self.assert_open_and_endable(check_id)
+        # once the check is ended by hand, a writable --out packs
+        result = self.build(out=self.root / "ok" / "pack")
+        self.assertFalse(result["idempotent"])
+
+    def test_parent_that_is_a_file_is_refused_first(self) -> None:
+        check_id = self.open_check()
+        blocker = self.root / "a-file"
+        blocker.write_text("x", encoding="utf-8")
+        self.assert_code(errors.OUTPUT_NOT_WRITABLE, self.build, out=blocker / "pack")
+        self.assert_open_and_endable(check_id)
+
+    def test_probe_leaves_nothing_behind(self) -> None:
+        self.add_check("Done")
+        parent = self.root / "packs"
+        result = self.build(out=parent / "one")
+        self.assertEqual(sorted(path.name for path in parent.iterdir()), ["one"])
+        self.assertTrue(pack_mod.verify(result["pack"])["ok"])
+
+    def test_bundle_write_failure_reopens_the_checks_it_closed(self) -> None:
+        check_id = self.open_check()
+        before = self.checks_file().read_bytes()
+        with mock.patch.object(pack_mod.BundleWriter, "finalize",
+                               side_effect=OSError(28, "No space left on device")):
+            with self.assertRaises(OSError):
+                self.build()
+        self.assertEqual(self.checks_file().read_bytes(), before)
+        self.assertFalse((store.pretest_dir(self.session, self.record["pretest_id"])
+                          / "pack").exists())
+        # a refusal from the writer says which checks are open again
+        with mock.patch.object(pack_mod, "validate_manifest", side_effect=errors.AutonomError(
+                errors.INVALID_VALUE, "bad manifest", hint="bug")):
+            error = self.assert_code(errors.INVALID_VALUE, self.build)
+        self.assertEqual(error.extra["reopened_checks"], [check_id])
+        self.assertEqual(self.checks_file().read_bytes(), before)
+        self.assert_open_and_endable(check_id)
+        self.assertFalse(self.build()["idempotent"])
+
+    def test_failure_after_finalize_keeps_the_checks_ended(self) -> None:
+        """The pack holds the check ends once finalized: a failure while
+        marking the record never reopens them (a retry adopts the pack)."""
+        check_id = self.open_check()
+        with mock.patch.object(store, "mark_packed", side_effect=OSError("power cut")):
+            with self.assertRaises(OSError):
+                self.build()
+        record = store.load(self.session, self.record["pretest_id"])
+        state = checks_mod.fold(self.session, record)[0]
+        self.assertEqual((state["check_id"], state["state"], state["note"]),
+                         (check_id, "ended", pack_mod.OPEN_AT_PACK))
+        self.record.update(record)
+        self.assertTrue(self.build()["idempotent"])
+
+    def test_restore_failure_still_raises_the_write_error(self) -> None:
+        self.open_check()
+        with mock.patch.object(pack_mod.BundleWriter, "finalize",
+                               side_effect=OSError(5, "I/O error")), \
+                mock.patch.object(pack_mod.os, "truncate", side_effect=OSError(5, "ro")):
+            with self.assertRaises(OSError) as caught:
+                self.build()
+        self.assertEqual(caught.exception.strerror, "I/O error")
+
+
+class FollowupAdbReproTests(PackBase):
+    """fu-021 (pack part): repro commands drop the --adb value."""
+
+    def test_summary_and_index_hold_no_adb_path(self) -> None:
+        from autonom_lib.pretest import repro as repro_mod
+
+        def during(_check_id: str) -> None:
+            journal_mod.append(self.session, {
+                "kind": "action", "verb": "ui tap", "ok": True,
+                "argv": ["--adb", ADB_PATH, "ui", "tap", "--text", "Remove"]})
+            journal_mod.append(self.session, {
+                "kind": "action", "verb": "ui swipe", "ok": True,
+                "argv": [f"--adb={ADB_PATH}", "ui", "swipe", "--duration", "0.4"]})
+
+        check_id = self.add_check("Remove item", during=during, verdict="fail")
+        findings_mod.add(self.session, self.record, check_id=check_id, severity="major",
+                         title="Total is stale", actual="The total still shows 30")
+        record = store.load(self.session, self.record["pretest_id"])
+        raw = repro_mod.steps(self.session, checks_mod.fold(self.session, record)[0])
+        self.assertIn(ADB_PATH, json.dumps(raw))  # the journal holds it; the pack must not
+        pack = Path(self.build()["pack"])
+        for name in ("summary.json", "summary.md", "index.html", f"checks/{check_id}.json"):
+            text = (pack / name).read_text(encoding="utf-8")
+            self.assertNotIn(ADB_PATH, text, name)
+            self.assertNotIn("--adb", text, name)
+        summary = self.read(pack, "summary.json")
+        steps = summary["checks"][0]["repro"]
+        swipe = next(step for step in steps if step.get("verb") == "ui swipe")
+        self.assertIn("--duration", swipe["args"])
+        self.assertIn("0.4", swipe["args"])
+        self.assertTrue(summary["findings"][0]["repro"])
+        self.assertNotIn(ADB_PATH, json.dumps(summary["findings"][0]["repro"]))
+        self.assertEqual(summary_mod.summary_failures(summary), [])
+
+    def test_drop_host_flags(self) -> None:
+        drop = summary_mod.drop_host_flags
+        self.assertEqual(drop(["--adb", ADB_PATH, "--text", "Remove"]), ["--text", "Remove"])
+        self.assertEqual(drop([f"--adb={ADB_PATH}", "x"]), ["x"])
+        self.assertEqual(drop(["--adb"]), [])
+        self.assertEqual(drop(["--adbx", "y", "--serial", "e-1"]),
+                         ["--adbx", "y", "--serial", "e-1"])
+        self.assertEqual(drop([None, 3, "--adb", "p", "z"]), [None, 3, "z"])
+        self.assertEqual(drop(None), [])
+        self.assertEqual(drop("--adb p"), [])
+        self.assertEqual(summary_mod.repro_steps(
+            ["text step", {"verb": "ui tap", "args": ["--adb", "p", "a"], "seq": 1},
+             {"verb": "flow step"}]),
+            ["text step", {"verb": "ui tap", "args": ["a"], "seq": 1}, {"verb": "flow step"}])
+        self.assertEqual(summary_mod.repro_steps(None), [])
+
+    def test_view_drops_adb_from_an_older_summary(self) -> None:
+        self.add_check("Done")
+        pack = Path(self.build()["pack"])
+        summary = self.read(pack, "summary.json")
+        summary["checks"][0]["repro"] = [{"verb": "ui tap", "args": ["--adb", ADB_PATH,
+                                                                     "--serial", "e-1"]}]
+        html_text = view_mod.render(summary)
+        self.assertNotIn(ADB_PATH, html_text)
+        self.assertNotIn("--adb", html_text)
+        embedded = re.search(r'id="pretest-data">(.*?)</script>', html_text).group(1)
+        self.assertEqual(json.loads(embedded)["checks"][0]["repro"],
+                         [{"verb": "ui tap", "args": ["--serial", "e-1"]}])
+        self.assertIn("--serial e-1", html_text)
+        markdown = summary_mod.render_markdown(summary)
+        self.assertNotIn(ADB_PATH, markdown)
+        self.assertIn("--serial e-1", markdown)
 
 
 if __name__ == "__main__":

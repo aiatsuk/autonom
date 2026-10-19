@@ -659,6 +659,15 @@ class ReproTests(RegressCase):
             self.assertFalse(regress._conclusive({**refused, "failure": None,
                                                   "status": status}))
 
+    def test_a_damaged_record_refusal_is_a_guard_refusal(self) -> None:
+        """A step refused because pretest.json is damaged is never a verdict."""
+        self.assertIn(errors.PRETEST_DAMAGED, regress._GUARD_REFUSALS)
+        for status in ("failed", "passed"):
+            run = {"run_id": "fr_d", "status": status, "aborted": False,
+                   "failure": {"error_code": errors.PRETEST_DAMAGED,
+                               "failure_class": None}}
+            self.assertFalse(regress._conclusive(run), status)
+
 
 # --- rerun -------------------------------------------------------------------------------
 
@@ -727,6 +736,42 @@ class RerunTests(RegressCase):
         self.assertEqual((listed["kind"], listed["title"]),
                          ("regression", "Results regression"))
         self.assertEqual(listed["run_ids"], [run["run_id"]])
+
+    def race_pack(self, case: str) -> Path:
+        self.start_session()
+        self.ok("pretest", "start", "--ticket", str(self.ticket), "--base", "main",
+                "--repo", str(self.repo))
+        flow = self.root / "results.yaml"
+        flow.write_text("schema: autonom.dev/flow/v1\nappId: com.example.app\n"
+                        "name: Results visible\n---\n- assertVisible:\n    selector:\n"
+                        "      text: Results\n", encoding="utf-8")
+        self.ok("pretest", "check", "add", "Pay twice", "--kind", "edge", "--case", case,
+                "--flow", str(flow))
+        self.ok("pretest", "check", "begin", "chk-1")
+        self.ok("pretest", "check", "end", "chk-1", "--verdict", "fail")
+        return Path(self.ok("pretest", "pack")["pack"])
+
+    def test_a_replayed_race_case_needs_a_count_to_pass(self) -> None:
+        pack = self.race_pack("double-tap")
+        payload = self.ok("pretest", "rerun", str(pack))
+        run = payload["runs"][0]
+        self.assertEqual((run["status"], run["before"], run["after"]),
+                         ("passed", "fail", "inconclusive"))
+        listed = self.ok("pretest", "check", "list")["checks"][0]
+        self.assertEqual(listed["verdict"], "inconclusive")
+        self.assertIn("--observed-count", listed["note"])
+        self.assertIn(f"pretest check amend {listed['check_id']}", listed["note"])
+        # the count turns it into a pass, as the note says
+        amended = self.ok("pretest", "check", "amend", listed["check_id"], "--verdict", "pass",
+                          "--observed-count", "1", "--note", "one request")
+        self.assertEqual((amended["verdict"], amended["observed_count"]), ("pass", 1))
+
+    def test_other_kit_cases_still_pass_on_replay(self) -> None:
+        pack = self.race_pack("empty-input")
+        run = self.ok("pretest", "rerun", str(pack))["runs"][0]
+        self.assertEqual(run["after"], "pass")
+        self.assertNotIn("--observed-count",
+                         self.ok("pretest", "check", "list")["checks"][0].get("note") or "")
 
     def test_refusals_create_nothing(self) -> None:
         plain = self.root / "plain"

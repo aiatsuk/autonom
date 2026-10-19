@@ -943,8 +943,16 @@ class MockTests(ToolsCase):
     def test_a_json_body_gets_a_json_content_type(self) -> None:
         rule = self.add(body='{"a": 1}')
         self.assertEqual(rule["response"]["headers"], {"Content-Type": "application/json"})
+        # Other headers do not stop the JSON type (A.5)...
         rule = self.add(body='{"a": 1}', headers={"X-Test": "1"})
-        self.assertEqual(rule["response"]["headers"], {"X-Test": "1"})
+        self.assertEqual(rule["response"]["headers"],
+                         {"X-Test": "1", "Content-Type": "application/json"})
+        # ...but an explicit Content-Type still wins, in any letter case.
+        rule = self.add(body='{"a": 1}', headers={"Content-Type": "text/plain"})
+        self.assertEqual(rule["response"]["headers"], {"Content-Type": "text/plain"})
+        rule = self.add(body='{"a": 1}', headers={"content-type": "text/plain", "X-Test": "1"})
+        self.assertEqual(rule["response"]["headers"],
+                         {"content-type": "text/plain", "X-Test": "1"})
         self.assertEqual(self.add()["response"]["status"], 200)
 
     def test_an_empty_or_blank_body_gets_no_json_content_type(self) -> None:

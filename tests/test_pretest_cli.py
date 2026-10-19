@@ -712,12 +712,24 @@ class FlowsTests(PretestCliCase):
     def test_malformed_env_is_refused_before_any_check(self) -> None:
         self.start_session()
         self.start_pretest()
-        # the shared --env parser of flow run (its envelope has no hint)
-        self.refused("flow_command_invalid", "pretest", "flows", "--env", "NOEQUALS",
-                     hint=False)
+        # the pre-test verbs answer invalid_value, with the NAME=VALUE form as hint
+        for pair in ("NOEQUALS", "=value"):
+            with self.subTest(pair=pair):
+                payload = self.refused("invalid_value", "pretest", "flows", f"--env={pair}")
+                self.assertIn("use NAME=VALUE", payload["hint"])
+                self.assertEqual(payload["flag"], "--env")
+        for verb in (("warmup",), ("repro", "f-1", "--times", "1")):
+            with self.subTest(verb=verb[0]):
+                payload = self.refused("invalid_value", "pretest", *verb, "--env", "NOEQUALS")
+                self.assertIn("use NAME=VALUE", payload["hint"])
         self.refused("flow_secret_undefined", "pretest", "flows", "--secret",
                      "AUTONOM_TEST_SECRET_THAT_IS_NOT_SET")
         self.assertEqual(self.ok("pretest", "check", "list")["count"], 0)
+        # `flow run` keeps its own code, and now names the form too
+        flow = self.repo / ".autonom/flows/results.yaml"
+        payload = self.refused("flow_command_invalid", "flow", "run", str(flow),
+                               "--env", "NOEQUALS")
+        self.assertIn("use NAME=VALUE", payload["hint"])
 
 
 class FlowsInvalidSelectionTests(PretestCliCase):
@@ -757,6 +769,28 @@ class FlowsInvalidSelectionTests(PretestCliCase):
         self.assertIn(invalid["failure"]["error_code"], checks[1]["note"])
         self.assertIsNone(self.ok("pretest", "status")["open_check"])
         self.assertEqual(self.input_taps(), 0)
+
+
+class FlowPlatformWarningTests(PretestCliCase):
+    """A.10: ``pretest start`` on an Android target with a pull-request flow
+    for iOS keeps it selected and shows the platform warning."""
+
+    def test_start_shows_flow_platform_warning(self) -> None:
+        (self.repo / ".autonom/flows/ios.yaml").write_text(
+            "schema: autonom.dev/flow/v1\nappId: com.example.app\nname: iPhone only\n"
+            "tags: [pull-request]\nrequires:\n  platform:\n    - ios\n---\n"
+            "- assertVisible:\n    selector:\n      id: x\n", encoding="utf-8")
+        self.start_session()
+        started = self.start_pretest()
+        self.assertEqual(started["flow_warnings"], ["flow iPhone only is for ios"])
+        self.assertTrue(any(name.endswith("ios.yaml") for name in started["selected_flows"]))
+        context = self.ok("pretest", "context")
+        self.assertEqual([item["session_platform"] for item in context["flows"]["warnings"]],
+                         ["android"])
+
+    def test_start_without_mismatch_has_no_flow_warnings(self) -> None:
+        self.start_session()
+        self.assertNotIn("flow_warnings", self.start_pretest())
 
 
 class FlowsStoppedRunTests(PretestCliCase):
@@ -1123,6 +1157,234 @@ class PackReviewTests(PretestCliCase):
 
 
 # --- kit ---------------------------------------------------------------------------------
+
+
+class DamagedRecordCliTests(PretestCliCase):
+    """B.8 / RISK-042, the CLI part: `pretest status` reports a damaged
+    active record and `pretest stop --force` stops it."""
+
+    def test_status_reports_damage_and_stop_force_recovers(self) -> None:
+        self.start_session()
+        directory = Path(self.start_pretest()["dir"])
+        record = directory / "pretest.json"
+        record.write_text("{not json", encoding="utf-8")
+        status = self.ok("pretest", "status")
+        self.assertEqual(status["status"], "damaged")
+        self.assertTrue(status["reason"].startswith("not valid JSON"))
+        self.assertEqual(status["path"], str(record))
+        self.assertIn("pretest stop --force", status["hint"])
+        before = self.input_taps()
+        refused = self.refused("pretest_damaged", "ui", "tap", "--text", "Continue")
+        self.assertIn("pretest stop --force", refused["hint"])
+        self.assertEqual(self.input_taps(), before)  # nothing reached the device
+        self.refused("pretest_damaged", "pretest", "start", "--ticket", str(self.ticket),
+                     "--base", "main", "--repo", str(self.repo))
+        help_text = self.cli("pretest", "stop", "--help").stdout
+        self.assertIn("--force", help_text)
+        stopped = self.ok("pretest", "stop", "--force")
+        self.assertEqual(stopped["status"], "stopped")
+        self.assertEqual(stopped["damaged"]["file"], "pretest.json.damaged")
+        self.assertEqual((directory / "pretest.json.damaged").read_text(encoding="utf-8"),
+                         "{not json")
+        self.refused("no_active_pretest", "pretest", "status")
+        self.ok("ui", "tap", "--text", "Continue")  # the guard is gone with the pre-test
+
+    def test_stop_without_force_still_recovers(self) -> None:
+        self.start_session()
+        directory = Path(self.start_pretest()["dir"])
+        (directory / "pretest.json").write_text("[]", encoding="utf-8")
+        self.assertEqual(self.ok("pretest", "status")["status"], "damaged")
+        self.assertEqual(self.ok("pretest", "stop")["status"], "stopped")
+
+    def test_status_of_a_healthy_pretest_is_unchanged(self) -> None:
+        self.start_session()
+        self.start_pretest()
+        status = self.ok("pretest", "status")
+        self.assertEqual(status["status"], "active")
+        self.assertNotIn("reason", status)
+
+
+class SmallerMessagesTests(PretestCliCase):
+    """The smaller CLI items: --ticket <dir>, flow-draft --out '' and its
+    message, each warning printed once."""
+
+    def test_ticket_directory_is_a_specific_invalid_value(self) -> None:
+        self.start_session()
+        payload = self.refused("invalid_value", "pretest", "start", "--ticket", str(self.root),
+                               "--base", "main", "--repo", str(self.repo))
+        self.assertIn("--ticket must be a file", payload["error"])
+        self.assertIn("directory", payload["error"])
+        self.assertIn("'-'", payload["hint"])
+        self.assertFalse(list(self.home.rglob("pretests/pt_*")))
+
+    def test_flow_draft_empty_out_is_refused_first(self) -> None:
+        for value in ("", "  "):
+            with self.subTest(out=repr(value)):
+                payload = self.refused("invalid_value", "pretest", "flow-draft", "f-1",
+                                       f"--out={value}")
+                self.assertEqual(payload["flag"], "--out")
+                self.assertIn("default", payload["hint"])
+
+    def test_flow_draft_says_what_was_written_and_where(self) -> None:
+        cli = load_cli()
+        base = {"finding_id": "f-1", "check_id": "chk-2",
+                "draft_flow": "/repo/.autonom/flows/drafts/wb-7-f-1.yaml", "pack": None}
+        cases = [
+            ({"written": True, "recorded": True},
+             "wrote the draft flow to /repo/.autonom/flows/drafts/wb-7-f-1.yaml; "
+             "recorded it on finding f-1."),
+            ({"written": False, "recorded": False},
+             "the draft flow at /repo/.autonom/flows/drafts/wb-7-f-1.yaml already holds this "
+             "flow; nothing was written; finding f-1 already names it."),
+            ({"written": True, "recorded": False, "pack": "/packs/wb-7"},
+             "wrote the draft flow to /repo/.autonom/flows/drafts/wb-7-f-1.yaml; the pack is "
+             "final, so nothing was recorded on the finding."),
+        ]
+        for extra, start in cases:
+            with self.subTest(extra=extra):
+                message = cli._flow_draft_message({**base, **extra})
+                self.assertTrue(message.startswith(start), message)
+                self.assertTrue(message.endswith("Review its closing assertion before "
+                                                 "you run it."))
+        # through the verb: a pack's draft points at rerun (never at repro, refused
+        # there) when rerun would replay this very file
+        result = {**base, "written": True, "recorded": False, "pack": "/packs/wb-7",
+                  "repro": "autonom pretest repro f-1 --times 3", "warnings": []}
+        planned = {"plan": [{"check": {"check_id": "chk-2"}, "flow": base["draft_flow"],
+                             "source": "draft:f-1"}]}
+        with mock.patch("autonom_lib.pretest.regress.plan_rerun",
+                        return_value=planned) as plan_rerun:
+            code, out, _ = self.in_process(
+                cli, ["pretest", "flow-draft", "f-1", "--pack", "/packs/wb-7"],
+                mock.patch("autonom_lib.pretest.regress.flow_draft", return_value=dict(result)))
+        self.assertEqual(code, 0)
+        plan_rerun.assert_called_once_with("/packs/wb-7", ["chk-2"])
+        payload = json.loads(out)
+        self.assertEqual(payload["repro"], "autonom pretest rerun <pack> --check chk-2")
+        self.assertIn("nothing was recorded", payload["message"])
+        self.assertNotIn("does not replay", payload["message"])
+
+    def test_flow_draft_pack_custom_out_points_at_flow_run(self) -> None:
+        # A draft rerun would not find (custom --out, or the check has its own flow,
+        # or rerun is refused) is replayed with flow run on the written file.
+        cli = load_cli()
+        draft = "/tmp/my drafts/f1.yaml"
+        result = {"finding_id": "f-1", "check_id": "chk-2", "draft_flow": draft,
+                  "written": True, "recorded": False, "pack": "/packs/wb-7",
+                  "repro": "autonom pretest repro f-1 --times 3", "warnings": []}
+        other = {"plan": [{"check": {"check_id": "chk-2"},
+                           "flow": "/repo/flows/own.yaml", "source": "flow"}]}
+        refused = cli.errors.AutonomError(cli.errors.DRAFT_UNAVAILABLE,
+                                          "chk-2 has no flow or draft", hint="h")
+        for name, patch in (("other flow", {"return_value": other}),
+                            ("rerun refused", {"side_effect": refused})):
+            with self.subTest(name), \
+                    mock.patch("autonom_lib.pretest.regress.plan_rerun", **patch):
+                code, out, _ = self.in_process(
+                    cli, ["pretest", "flow-draft", "f-1", "--pack", "/packs/wb-7",
+                          "--out", draft],
+                    mock.patch("autonom_lib.pretest.regress.flow_draft",
+                               return_value=dict(result)))
+                self.assertEqual(code, 0)
+                payload = json.loads(out)
+                self.assertEqual(payload["repro"], "autonom flow run '/tmp/my drafts/f1.yaml'")
+                self.assertIn("'autonom pretest rerun <pack> --check chk-2' does not replay "
+                              "this file", payload["message"])
+                self.assertIn("autonom flow run", payload["message"])
+
+    def test_each_warning_is_printed_once(self) -> None:
+        cli = load_cli()
+        twice = {"code": "no_final_assertion", "error": "e", "hint": "h"}
+        other = {"code": "no_changed_files", "error": "e", "hint": "h"}
+        self.assertEqual(cli._unique_warnings([twice, dict(twice), other, twice, "x", "x"]),
+                         [twice, other, "x"])
+        self.assertEqual(cli._unique_warnings([]), [])
+        out = StringIO()
+        with redirect_stdout(out):
+            cli.emit({"ok": True, "warnings": [twice, dict(twice), other]}, as_json=True)
+        self.assertEqual(json.loads(out.getvalue())["warnings"], [twice, other])
+        # a warnings value that is not a list is left alone
+        out = StringIO()
+        with redirect_stdout(out):
+            cli.emit({"ok": True, "warnings": "x"}, as_json=True)
+        self.assertEqual(json.loads(out.getvalue())["warnings"], "x")
+
+
+class MockTimingCliTests(PretestCliCase):
+    """A.2 flags and A.5 Content-Type wiring of `network mock add|update`; no
+    session or device is needed (the registry is machine state)."""
+
+    DELAY_HINT = "delay is seconds in (0, 120], e.g. 2.5"
+
+    def registry(self) -> list[dict]:
+        return self.ok("network", "mock", "list", "--all")["mocks"]
+
+    def test_delay_and_hang_are_stored_and_listed(self) -> None:
+        added = self.ok("network", "mock", "add", "--match", "*/api/slow*", "--delay", "2.5")
+        rule = added["mock"]
+        self.assertEqual(rule["delay_s"], 2.5)
+        self.assertNotIn("hang", rule)
+        held = self.ok("network", "mock", "add", "--match", "*/api/stuck*", "--hang")["mock"]
+        self.assertIs(held["hang"], True)
+        self.assertNotIn("delay_s", held)
+        listed = {item["id"]: item for item in self.registry()}
+        self.assertEqual(listed[rule["id"]]["delay_s"], 2.5)
+        self.assertIs(listed[held["id"]]["hang"], True)
+        # update swaps one for the other; other fields stay
+        swapped = self.ok("network", "mock", "update", rule["id"], "--hang")["mock"]
+        self.assertIs(swapped["hang"], True)
+        self.assertNotIn("delay_s", swapped)
+        swapped = self.ok("network", "mock", "update", rule["id"], "--delay", "120")["mock"]
+        self.assertEqual(swapped["delay_s"], 120.0)
+        self.assertNotIn("hang", swapped)
+        untouched = self.ok("network", "mock", "update", rule["id"], "--status", "503")["mock"]
+        self.assertEqual(untouched["delay_s"], 120.0)
+
+    def test_bad_delay_is_refused_and_writes_nothing(self) -> None:
+        self.ok("network", "mock", "add", "--match", "*/api/x*")
+        before = self.registry()
+        for argv in (("--delay=0",), ("--delay=-1",), ("--delay=120.5",), ("--delay=nan",),
+                     ("--delay=inf",), ("--delay=abc",), ("--delay", "1", "--hang"),
+                     ("--delay=2_5",), ("--delay=1e1",)):
+            with self.subTest(argv=argv):
+                payload = self.refused("invalid_value", "network", "mock", "add",
+                                       "--match", "*/api/y*", *argv)
+                self.assertEqual(payload["hint"], self.DELAY_HINT)
+                payload = self.refused("invalid_value", "network", "mock", "update", "m_1",
+                                       *argv)
+                self.assertEqual(payload["hint"], self.DELAY_HINT)
+        self.assertEqual(self.registry(), before)
+
+    def test_body_file_content_type_follows_the_extension(self) -> None:
+        bodies = self.root / "bodies"
+        bodies.mkdir()
+        cases = {"items.json": "application/json", "page.HTML": "text/html; charset=utf-8",
+                 "a.txt": "text/plain; charset=utf-8", "a.xml": "application/xml",
+                 "a.png": "image/png", "a.jpeg": "image/jpeg",
+                 "a.bin": "application/octet-stream"}
+        for name, expected in cases.items():
+            with self.subTest(name=name):
+                path = bodies / name
+                path.write_bytes(b"{}")
+                rule = self.ok("network", "mock", "add", "--match", f"*/{name}*",
+                               "--body-file", str(path))["mock"]
+                self.assertEqual(rule["response"]["headers"], {"Content-Type": expected})
+        explicit = self.ok("network", "mock", "add", "--match", "*/explicit*", "--body-file",
+                           str(bodies / "items.json"), "--header",
+                           "content-type: text/plain")["mock"]
+        self.assertEqual(explicit["response"]["headers"], {"content-type": "text/plain"})
+        inline = self.ok("network", "mock", "add", "--match", "*/inline*",
+                         "--json", '{"a": 1}')["mock"]
+        self.assertEqual(inline["response"]["headers"], {"Content-Type": "application/json"})
+        text = self.ok("network", "mock", "add", "--match", "*/text*",
+                       "--json", "plain words")["mock"]
+        self.assertEqual(text["response"]["headers"], {})
+
+    def test_help_lists_delay_and_hang(self) -> None:
+        for verb in ("add", "update"):
+            text = self.cli("network", "mock", verb, "--help").stdout
+            self.assertIn("--delay", text)
+            self.assertIn("--hang", text)
 
 
 class KitTests(PretestCliCase):

@@ -26,6 +26,12 @@ Without an active pre-test (or inside ``exempt()``) it returns at once: it
 reads the session pointer and the small ``pretests/active.json`` file, never
 the device (tp-028).
 
+When ``active.json`` names a pre-test whose record file is unreadable or
+invalid, every guarded action on any target refuses with ``pretest_damaged``
+and sends no input (RISK-042): the record holds the target, budget and
+forbid patterns, so nothing can be checked. The refusal is appended to
+``budget.json.refusals`` (best effort). ``autonom pretest stop`` recovers.
+
 With an active pre-test on the same target it refuses, in this order:
 
 1. ``budget_exhausted`` -- ``max_minutes`` since the pre-test started have
@@ -158,14 +164,32 @@ def _governed(record: Mapping[str, Any], target: Any) -> bool:
     return not expected or not target_id or str(target_id) == str(expected)
 
 
-def _active(target: Any) -> tuple[dict[str, Any], dict[str, Any]] | None:
+def _active(target: Any, verb: str) -> tuple[dict[str, Any], dict[str, Any]] | None:
     session = _current_session()
     if session is None or store.active_ids(session) is None:
         return None
-    record = store.active(session)
+    try:
+        record = store.active(session)
+    except errors.AutonomError as exc:
+        if exc.code != errors.PRETEST_DAMAGED:
+            raise
+        raise _refuse_damaged(session, exc, verb) from None
     if record is None or not _governed(record, target):
         return None
     return session, record
+
+
+def _refuse_damaged(session: dict[str, Any], exc: errors.AutonomError,
+                    verb: str) -> errors.AutonomError:
+    """``pretest_damaged`` for a guarded action: the target, budget and
+    forbid patterns live in the damaged record, so no action is checked and
+    none is sent (RISK-042)."""
+    damage = {"pretest_id": exc.extra.get("pretest_id"), "path": exc.extra.get("path"),
+              "reason": exc.extra.get("reason")}
+    error = store.damaged_error(damage, suffix="; no input was sent", verb=verb)
+    if damage["pretest_id"]:
+        return _refuse(session, damage, verb, error)
+    return error
 
 
 # --- time --------------------------------------------------------------------------
@@ -561,7 +585,7 @@ def before_mutation(verb: str, *, node: Mapping[str, Any] | None = None,
     _LOCAL.follow_up = None  # any other guarded action ends a pending fresh launch
     if is_exempt():
         return False
-    found = _active(target)
+    found = _active(target, verb)
     if found is None:
         return False
     session, record = found
@@ -627,8 +651,12 @@ def take_follow_up(key: tuple[Any, ...]) -> bool:
 def usage(session: dict[str, Any] | None,
           record: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """The active (or given) pre-test's budget use, for ``pretest status``;
-    ``{}`` when there is none."""
+    ``{}`` when there is none, and ``{"status": "damaged", "pretest_id",
+    "path", "reason"}`` when the active record is damaged (RISK-042)."""
     if record is None:
+        damage = store.damaged_status(session)
+        if damage is not None:
+            return damage
         record = store.active(session)
     if not session or not record:
         return {}

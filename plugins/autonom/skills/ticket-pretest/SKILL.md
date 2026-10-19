@@ -55,9 +55,12 @@ autonom pretest start --ticket ticket.md --base main --ticket-ref APP-123 \
   refusal.
 - Every guarded point tap reads a fresh UI tree before it is sent, so rapid
   repeat taps are slow during a pre-test (about 2.5 s each). A race criterion
-  (double tap, double submit) passes only with an observed request count
-  (`network requests list` shows two vs one); without it end the check
-  `inconclusive` and say why in `--note`.
+  (the `double-tap` kit case: double tap, double submit) passes only with an
+  observed request count: count the requests in `network requests list` and
+  end with `pretest check end <id> --verdict pass --observed-count N` (an
+  integer, 0 or more; it is stored on the check and shown in `summary.md` and
+  `summary.json`). A pass without the count is refused (`race_needs_count`);
+  when you cannot count, end the check `inconclusive` and say why in `--note`.
 - The ticket is masked for credentials before it is written. Masking is best
   effort over known shapes, so still do not paste secrets into a ticket file.
 - One pre-test per session: `pretest_already_active` means finish or
@@ -145,6 +148,17 @@ autonom pretest check end chk-1 --verdict pass --note "3 results, first is Blue 
 - Set up and undo each edge case with its verbs from the kit table, and restore
   the device before the next check (network online, mocks removed, appearance
   and text size back, app relaunched).
+- Clipboard (a "Copy" button, a shared link): on Android
+  `simulator clipboard get` is refused with `clipboard_unavailable`, because
+  Android 10 and later do not let a shell read the clipboard. Paste instead:
+  tap a text field, long-press it, tap Paste (`ui tap --text 'Paste'`), then
+  read the pasted text with `ui find --text '<expected>'`. Use a field whose
+  content you may change, and clear it afterwards. On iOS
+  `simulator clipboard get` reads the Simulator clipboard directly.
+- App language on iOS: set it for one launch with launch arguments, e.g.
+  `autonom session launch com.example.app --fresh --arg=-AppleLanguages --arg='(ru)' --arg=-AppleLocale --arg=ru_RU`
+  (the `=` form keeps a value that starts with `-` from being read as a flag).
+  The next launch without them is back to the device language.
 
 ### 5. Run the regression flows
 
@@ -160,11 +174,21 @@ output lists each flow with its `check_id`, `run_id`, `status` and `verdict`
 
 A flow that needs live data the environment does not have (an account with
 orders, a seeded catalogue) fails or breaks for that reason, not because of the
-change. That is an environment block: there is no verb to amend an ended check
-(`check end` on it is refused with `no_open_check`), so record it in a finding on
-that check (`--severity info`, `--actual` naming the missing data) and in your
-report. When you run such a flow by hand inside your own check, end that check
-`blocked` with the reason in `--note`.
+change. That is an environment block. An ended check cannot be ended again
+(`no_open_check`); correct its verdict instead:
+
+```bash
+autonom pretest check amend chk-3 --verdict blocked \
+    --note "needs an account with orders; the test account has none"
+```
+
+`check amend <id> --verdict V --note TEXT` works on ended checks of the active
+pre-test only (`check_not_ended` for a check that is not ended yet,
+`pretest_finalized` after `pack`). It adds an `amended` entry (old verdict, new
+verdict, note, time) to the check's history, and the summary and pack use the
+latest verdict. Also say in your report which data was missing. When you run
+such a flow by hand inside your own check, end that check `blocked` with the
+reason in `--note`.
 
 ### 6. Record findings: expected vs actual, with evidence
 
@@ -202,6 +226,11 @@ autonom pretest finding list
 autonom pretest status         # actions used and left, minutes, open check, counts
 autonom pretest health         # new crashes, grouped error logs, failed requests, metric leads
 ```
+
+On iOS, start the session with `--log-stream`
+(`autonom session start --udid <sim> --app-id <app-id> --log-stream`) so that
+`pretest health` and `pack` see the app's logs; without it the log part of
+health is `unavailable`. Android reads logcat without it.
 
 `health` (also run by `pack`) compares with the baseline taken at start and
 writes automatic findings (`origin: auto`, `severity: info`,
@@ -300,7 +329,11 @@ current build. Its summary shows `before` (parent verdict and evidence) and
 - **Accessibility** — with a `--kind a11y` check open on the screen in question:
   `autonom pretest a11y`. It writes automatic `minor` findings for unlabelled
   controls, targets under 48 dp (Android) or 44 pt (iOS), and duplicate labels,
-  with bounds and the saved tree. It does not check contrast or reading order.
+  with bounds and the saved tree. A control is any node that is clickable,
+  long-clickable or checkable, or that looks interactive without saying so: a
+  button, link, switch, checkbox, radio, slider or text field by its class or
+  role (Android class names, iOS `XCUIElementType…` and `AX…` names), or a node
+  with an action trait. It does not check contrast or reading order.
 - **Analytics** — needs captured traffic (`network start` and `network attach`
   with `--i-understand-mitm`) and `events` rules in the profile. With a
   `--kind analytics` check open, do the action, then `autonom pretest events`:
@@ -345,15 +378,29 @@ only and refused on iOS (`unsupported_capability`); `simulator keyboard`
 a case cannot be set up on the target, end its check `not_covered` with the
 reason rather than faking it.
 
-Slow and timeout today: the only way to slow traffic is emulator network
-shaping (`simulator network shape`), which slows everything and cannot make one
-request hang. A mock cannot delay or hold its answer, and a request that never
-completes is not recorded by the capture (only finished requests reach
-`network requests list` and `pretest health`). So a true "never answers" case
-cannot be produced or proven yet: run the shaped version, judge the loading and
-timeout UI from screenshots, and end the check `inconclusive` (or
-`not_covered` on iOS) with that limit in `--note`. Mock delays and recording of
-unfinished requests are a planned follow-up.
+Slow and timeout on one request (both platforms, with capture on): the table
+lists emulator network shaping, which slows everything and is Android-emulator
+only. To slow or stall just the request the ticket is about, use a mock:
+
+```bash
+autonom network mock add --match '<url glob>' --json '<body>' --delay 3   # answers after 3 s
+autonom network mock add --match '<url glob>' --hang   # held until the mock is removed or disabled, or 120 s
+autonom network requests list                           # an unfinished request: completed false, error_kind
+autonom network mock remove <id>
+```
+
+`--delay N` takes seconds, more than 0 and at most 120 (`2.5` is fine); other
+requests are not held. `--hang` cannot be combined with `--delay`; the held
+request goes on upstream when you `network mock remove` or
+`network mock disable` the rule, and after 120 s it is killed.
+`network mock update <id> --delay N` (or `--hang`) changes an existing rule. A
+request that never completed (held to the cap, cancelled by the app, an
+upstream error) is recorded with `completed: false` and an `error_kind`
+(`hang_cap`, `client_abort`, `upstream_error`, `other`); it shows in
+`network requests list` without a status and in the pack's requests per check
+with `completed: false`. That record is the proof the request really never
+answered: cite it as `request:<id>` next to the screenshot of the stuck or
+timeout screen. Remove the mock before the next check.
 
 ## Guard rails and refusals
 
@@ -366,7 +413,11 @@ unfinished requests are a planned follow-up.
 | `no_open_check` / `unknown_check` | the id is not the open check / not in this pre-test | `pretest check list` |
 | `evidence_ref_unknown` | a ref does not resolve | list the artifacts and use the real id |
 | `pretest_finalized` | the pre-test is packed | use `review more-checks` or `rerun` |
+| `race_needs_count` | `check end --verdict pass` on a `double-tap` check without `--observed-count` | count the requests (`network requests list`) and pass `--observed-count N`, or end `inconclusive` |
+| `clipboard_unavailable` | Android does not let a shell read the clipboard | paste into a text field and read it with `ui find` (step 4) |
 | `no_active_pretest` / `pretest_already_active` | none active / one already active | `pretest list`, then `start` or `stop` |
+| `pretest_damaged` | the active pre-test's `pretest.json` cannot be read | `pretest status` shows `status: damaged` and the reason; `pretest stop --force` (or restore the file) |
+| `check_not_ended` | `check amend` on a check that is not ended yet | end it with `check end` first |
 
 Refusals happen before any input reaches the device and are journaled. Never
 work around one: no coordinate tap next to forbidden text, no direct `adb` or
@@ -376,6 +427,13 @@ verbs) are never counted.
 `autonom pretest stop` closes a pre-test without a pack; `pretest pack` can
 still pack a stopped one later. `autonom pretest list` shows the session's
 pre-tests.
+
+A damaged pre-test (its `pretest.json` unreadable or invalid) answers
+`pretest status` with `status: damaged` and the reason, and every guarded
+device action refuses with `pretest_damaged` before any input. Stop it with
+`autonom pretest stop --force`: the damaged file is kept as
+`pretest.json.damaged` and the pre-test is marked stopped. Say in your report
+that the pre-test was damaged and what you did about it.
 
 ## Related
 

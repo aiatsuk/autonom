@@ -398,6 +398,66 @@ class RequestTests(HealthBase):
         self.assertEqual([row["id"] for row in block["failed"]], ["ok500"])
 
 
+    def test_deep_and_non_object_lines_never_crash(self) -> None:
+        # Past the parser's limit json.loads raises RecursionError; below it a
+        # value can still be too deep for str(). Both lines are skipped, as
+        # are lines that are JSON but not an object.
+        too_deep = "[" * 1_000_000 + "]" * 1_000_000
+        deep_value = "[" * 100_000 + "]" * 100_000
+        stamp = int(self.at(5).timestamp() * 1000)
+        path = self.artifacts / "network/flows.jsonl"
+        path.write_text("\n".join([
+            "3", "null", '"x"', "[1]", too_deep,
+            '{"id": %s, "status": 500, "started_at_ms": %d}' % (deep_value, stamp),
+            '{"id": "d2", "method": %s, "status": 500, "started_at_ms": %d}'
+            % (deep_value, stamp),
+        ]) + "\n", encoding="utf-8")
+        self.flows(self.flow("ok500", 500, 5))
+        block = health_mod.compute(self.session, self.record, self.target)["requests"]
+        self.assertEqual(block["state"], "available")
+        self.assertEqual([row["id"] for row in block["failed"]], ["ok500"])
+        written = health_mod.run(self.session, self.record, self.target)["auto_findings"]
+        self.assertEqual([item["data"]["id"] for item in written
+                          if item["source"] == "request"], ["ok500"])
+
+    def incomplete(self, flow_id: str, kind: str, minutes: float, *,
+                   mock_id: str | None = None) -> dict:
+        row = self.flow(flow_id, None, minutes)
+        row.update(completed=False, error_kind=kind,
+                   mocked=bool(mock_id), mock_id=mock_id)
+        return row
+
+    def test_a_request_the_app_cancelled_is_not_a_failure(self) -> None:
+        self.check("Double tap", begin=10, end=20)
+        # A hang_cap row is always mocked: the addon marks the mock before
+        # the hold, so it is never a failure either.
+        self.flows(self.incomplete("f_abort", "client_abort", 12),
+                   self.incomplete("f_cap", "hang_cap", 13, mock_id="m_hang"),
+                   self.incomplete("f_up", "upstream_error", 14),
+                   self.incomplete("f_other", "other", 15))
+        block = health_mod.compute(self.session, self.record, self.target)["requests"]
+        rows = {row["id"]: row["reason"] for row in block["failed"]}
+        self.assertEqual(rows, {"f_up": "incomplete", "f_other": "incomplete"})
+        written = health_mod.run(self.session, self.record, self.target)["auto_findings"]
+        titles = sorted(item["title"] for item in written if item["source"] == "request")
+        self.assertEqual(len(titles), 2)
+        self.assertTrue(all(title.startswith("Request never completed") for title in titles))
+        self.assertFalse(any("f_abort" in str(item["data"]) or "f_cap" in str(item["data"])
+                             for item in written))
+
+    def test_an_unmocked_incomplete_request_reads_never_completed(self) -> None:
+        """An upstream failure or timeout with no mock is a failed request."""
+        self.check("Load cart", begin=10, end=20)
+        self.flows(self.incomplete("f_timeout", "upstream_error", 12))
+        block = health_mod.compute(self.session, self.record, self.target)["requests"]
+        self.assertEqual([(row["id"], row["reason"]) for row in block["failed"]],
+                         [("f_timeout", "incomplete")])
+        written = health_mod.run(self.session, self.record, self.target)["auto_findings"]
+        requests = [item for item in written if item["source"] == "request"]
+        self.assertEqual(len(requests), 1)
+        self.assertTrue(requests[0]["title"].startswith("Request never completed"))
+        self.assertIn("f_timeout", str(requests[0]["data"]))
+
     def test_repeated_flow_ids_after_a_proxy_restart(self) -> None:
         self.check("Remove item", begin=10, end=20)
         self.flows(self.flow("f_0003", 200, -5))

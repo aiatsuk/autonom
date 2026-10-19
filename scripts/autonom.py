@@ -6,6 +6,7 @@ import argparse
 import difflib
 import errno
 import json
+import math
 import os
 import shutil
 import re
@@ -131,9 +132,28 @@ def _with_control(data: Any) -> Any:
     return data
 
 
+def _unique_warnings(warnings: list[Any]) -> list[Any]:
+    """`warnings` with exact repeats dropped, first occurrence order kept."""
+    seen: set[str] = set()
+    out: list[Any] = []
+    for item in warnings:
+        try:
+            key = json.dumps(item, sort_keys=True, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            key = repr(item)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+    return out
+
+
 def emit(data: Any, *, as_json: bool) -> int:
     global _LAST_EMIT
     _with_control(data)
+    if isinstance(data, dict) and isinstance(data.get("warnings"), list):
+        # one cause reached through two paths is still one warning
+        data["warnings"] = _unique_warnings(data["warnings"])
     if isinstance(data, dict) and data.get("platform") == IOS:
         # UI provenance measured by this invocation (which backend served the
         # tree and the input, and why it fell back); never overrides a key
@@ -1621,16 +1641,23 @@ def cmd_ui_tap(args: argparse.Namespace) -> int:
 SWIPE_MAX_SECONDS = 60.0
 
 
-def cmd_ui_swipe(args: argparse.Namespace) -> int:
-    duration = args.duration
-    if duration != duration or duration > SWIPE_MAX_SECONDS:  # NaN or too long
+def _swipe_duration(duration: float) -> float:
+    """`--duration` of `ui swipe`: finite seconds in (0, SWIPE_MAX_SECONDS].
+    NaN, infinities, zero and negative values are refused like a value in
+    milliseconds, before anything reaches the device (B.2)."""
+    if not math.isfinite(duration) or not 0 < duration <= SWIPE_MAX_SECONDS:
         raise errors.AutonomError(
             errors.INVALID_VALUE,
-            f"--duration {duration:g} is not a swipe length: it is in seconds, at most "
-            f"{SWIPE_MAX_SECONDS:g}",
+            f"--duration {duration:g} is not a swipe length: it is in seconds, more than 0 "
+            f"and at most {SWIPE_MAX_SECONDS:g}",
             "--duration is seconds, e.g. 0.4 (not milliseconds).",
-            duration=duration if duration == duration and abs(duration) != float("inf")
-            else str(duration), max_seconds=SWIPE_MAX_SECONDS)
+            duration=duration if math.isfinite(duration) else str(duration),
+            max_seconds=SWIPE_MAX_SECONDS)
+    return duration
+
+
+def cmd_ui_swipe(args: argparse.Namespace) -> int:
+    _swipe_duration(args.duration)
     x1, y1 = _point(args.start, "--from")
     x2, y2 = _point(args.end, "--to")
     target = _target(args)
@@ -2746,7 +2773,12 @@ def cmd_network_requests_follow(args: argparse.Namespace) -> int:
     # by byte offset and parses only what was appended — never the whole
     # history again on every tick. A shrink means the store was replaced:
     # start over from byte 0; `seen` keeps replayed flows from re-emitting.
-    state = {"offset": 0, "buffer": b""}
+    # `skipped` counts lines that are not flow records — not JSON, deeper than
+    # the parser allows, JSON but not an object, nested deeper than
+    # `store.MAX_LINE_DEPTH`, or refused by the scrubber — exactly like
+    # `store.read_all_counted`; the eof line carries the count. A record whose
+    # id is not a string is counted too: it cannot be deduplicated.
+    state = {"offset": 0, "buffer": b"", "skipped": 0}
 
     def read_appended() -> list[dict[str, Any]]:
         if not flows_file.exists():
@@ -2768,9 +2800,22 @@ def cmd_network_requests_follow(args: argparse.Namespace) -> int:
             if not line:
                 continue
             try:
-                parsed.append(redact_mod.scrub_flow(json.loads(line)))
-            except json.JSONDecodeError:
-                continue  # a torn write; the next append completes nothing
+                row = json.loads(line)
+            except (ValueError, RecursionError):
+                state["skipped"] += 1  # a torn write or a hostile nesting depth
+                continue
+            if not isinstance(row, dict) or store_mod.too_deep(row):
+                # `3`, `null`, `[1]`, `"x"` are not flow records; a too-deep
+                # value would raise RecursionError when filtered or printed.
+                state["skipped"] += 1
+                continue
+            if row.get("id") is not None and not isinstance(row.get("id"), str):
+                state["skipped"] += 1  # a list or dict id is unhashable for `seen`
+                continue
+            try:
+                parsed.append(redact_mod.scrub_flow(row))
+            except (TypeError, ValueError, AttributeError, RecursionError):
+                state["skipped"] += 1
         return parsed
 
     if not args.from_start:
@@ -2788,8 +2833,13 @@ def cmd_network_requests_follow(args: argparse.Namespace) -> int:
             fresh.append(flow)
         return store_mod.filter_flows(fresh, **filters)
 
+    def emit_line(payload: Any) -> None:
+        if isinstance(payload, dict) and payload.get("kind") == "eof" and state["skipped"]:
+            payload["skipped"] = state["skipped"]  # the same dict becomes the journal payload
+        _stream_print(payload)
+
     return _finish_stream(follow_mod.follow_poll(
-        fetch_new, emit=_stream_print, interval=args.interval,
+        fetch_new, emit=emit_line, interval=args.interval,
         max_seconds=args.max_seconds, max_items=args.max))
 
 
@@ -2902,19 +2952,21 @@ def cmd_network_mock_add(args: argparse.Namespace) -> int:
     selector = _mock_selector(args)
     mocks_mod.require_target(selector.get("url_glob"))
     body_file, body_text = _mock_body(args)
-    default_headers = {}
-    if body_text is not None and body_text.lstrip()[:1] in "{[":
-        default_headers = {"Content-Type": "application/json"}
+    # No Content-Type of the author's own: the library types the body (a
+    # --body-file by its extension, JSON-looking --json as application/json)
+    # and marks the type implicit, so an explicit --header always wins (A.5).
     rule = mocks_mod.add(
         url_glob=selector["url_glob"],
         method=selector.get("method"),
         host=selector.get("host"),
         ignore_query=selector.get("ignore_query", False),
         status=args.status if args.status is not None else 200,
-        headers=_mock_headers(args) or default_headers,
+        headers=_mock_headers(args),
         body_file=body_file,
         body_text=body_text,
         note=getattr(args, "note", None),
+        delay_s=getattr(args, "delay", None),
+        hang=bool(getattr(args, "hang", None)),
     )
     return emit({"ok": True, "mock": rule, "registry": str(mocks_mod.registry_file())},
                 as_json=True)
@@ -2960,6 +3012,8 @@ def cmd_network_mock_update(args: argparse.Namespace) -> int:
         body_file=body_file,
         body_text=body_text,
         note=getattr(args, "note", None),
+        delay_s=getattr(args, "delay", None),
+        hang=getattr(args, "hang", None),
     )
     return emit({"ok": True, "mock": rule}, as_json=True)
 
@@ -3209,13 +3263,19 @@ def cmd_flow_export(args: argparse.Namespace) -> int:
     return emit(payload, as_json=True)
 
 
-def _flow_env_overrides(args: argparse.Namespace) -> dict[str, str]:
-    """One owner of --env parsing for every verb that runs flows."""
+ENV_HINT = "use NAME=VALUE, e.g. --env USER=qa"
+
+
+def _flow_env_overrides(args: argparse.Namespace,
+                        code: str = errors.FLOW_COMMAND_INVALID) -> dict[str, str]:
+    """One owner of --env parsing for every verb that runs flows. `flow run`
+    and `proof` keep their `flow_command_invalid`; the pre-test verbs pass
+    `invalid_value`. Either way the refusal names the NAME=VALUE form."""
     env_overrides: dict[str, str] = {}
     for pair in args.env or []:
-        if "=" not in pair:
+        if "=" not in pair or not pair.split("=", 1)[0]:
             raise errors.AutonomError(
-                errors.FLOW_COMMAND_INVALID, f"--env takes KEY=VALUE, got {pair!r}")
+                code, f"--env takes NAME=VALUE, got {pair!r}", ENV_HINT, flag="--env")
         key, value = pair.split("=", 1)
         env_overrides[key] = value
     return env_overrides
@@ -3480,6 +3540,26 @@ def cmd_flow_run(args: argparse.Namespace) -> int:
 # --- proof -------------------------------------------------------------------
 
 
+def _proof_platform(args: argparse.Namespace) -> str | None:
+    """The platform the proof's suite runs on, read without touching a device:
+    ``--platform``, else the kind of ``--serial``/``--udid``, else the active
+    session's platform; None when nothing names one."""
+    platform = getattr(args, "platform", None)
+    if platform:
+        return platform
+    if getattr(args, "serial", None):
+        return "android"
+    if getattr(args, "udid", None):
+        return "ios"
+    try:
+        record = session_mod.load_current()
+    except (OSError, ValueError, errors.AutonomError):
+        return None
+    if isinstance(record, dict) and (record.get("target_id") or record.get("serial")):
+        return record.get("platform") or "android"
+    return None
+
+
 def cmd_proof(args: argparse.Namespace) -> int:
     repo = Path(args.repo or ".").resolve()
     # A malformed --env is the caller's CLI mistake, exactly as in flow run —
@@ -3491,10 +3571,13 @@ def cmd_proof(args: argparse.Namespace) -> int:
     selected: list[dict[str, Any]] = []
     covered: list[str] = []
     invalid: list[dict[str, Any]] = []
+    flow_warnings: list[dict[str, Any]] = []
     if flows_dir.is_dir():
         # a flow that does not load is a coverage gap to report, not to forget
-        suite = proof_mod.select_suite(flows_dir, repo, changed)
+        suite = proof_mod.select_suite(flows_dir, repo, changed,
+                                       platform=_proof_platform(args))
         selected, covered, invalid = suite["selected"], suite["covered"], suite["invalid"]
+        flow_warnings = list(suite.get("warnings") or [])
     uncovered = [name for name in changed if name not in covered]
 
     runs: list[dict[str, Any]] = []
@@ -3550,6 +3633,11 @@ def cmd_proof(args: argparse.Namespace) -> int:
         result_payload["invalid_flows"] = invalid
     # `partial` on a pass with unverified changed files, plus warnings
     result_payload.update(proof_mod.coverage_flags(status, uncovered, invalid))
+    if flow_warnings:
+        # a pull-request flow for another platform is still selected; say so
+        result_payload["flow_warnings"] = flow_warnings
+        result_payload["warnings"] = list(result_payload.get("warnings") or []) + [
+            str(item.get("message")) for item in flow_warnings]
 
     if out_dir is not None:
         (out_dir / "proof.json").write_text(
@@ -3626,6 +3714,11 @@ def _read_ticket(raw: str) -> str:
                 else sys.stdin.read(limit + 1).encode("utf-8"))
     else:
         path = Path(raw).expanduser()
+        if path.is_dir():
+            raise errors.AutonomError(
+                errors.INVALID_VALUE, f"--ticket must be a file: {raw} is a directory",
+                "Pass the ticket's text or Markdown file (for example ticket.md inside "
+                "it), or '-' to read the text from stdin.", path=raw)
         if not path.is_file():
             raise errors.AutonomError(
                 errors.INVALID_VALUE, f"--ticket {raw}: no such file",
@@ -3732,6 +3825,9 @@ def cmd_pretest_start(args: argparse.Namespace) -> int:
         "diff_truncated": bool(context.get("diff_truncated")),
         "selected_flows": [entry.get("flow") for entry in flows.get("selected") or []
                            if isinstance(entry, dict)],
+        **({"flow_warnings": [str(item.get("message")) for item in flows["warnings"]
+                              if isinstance(item, dict) and item.get("message")]}
+           if isinstance(flows.get("warnings"), list) and flows["warnings"] else {}),
         "baseline": {key: (baseline.get(key) if isinstance(baseline.get(key), dict)
                            else {}).get("state")
                      for key in ("crashes", "logs", "network", "metrics")},
@@ -3742,8 +3838,15 @@ def cmd_pretest_status(args: argparse.Namespace) -> int:
     from autonom_lib.pretest import checks as pretest_checks
     from autonom_lib.pretest import findings as pretest_findings
     from autonom_lib.pretest import guard as pretest_guard
+    from autonom_lib.pretest import store as pretest_store
 
     session = _pretest_session()
+    damage = pretest_store.damaged_status(session)
+    if damage is not None:
+        # a damaged active record is a state to report, not a crash: every
+        # guarded device action refuses until it is stopped or restored
+        return emit({"ok": True, **damage, "hint": pretest_store.DAMAGED_HINT},
+                    as_json=True)
     record = _pretest_active(session)
     usage = pretest_guard.usage(session, record)
     states = pretest_checks.fold(session, record)
@@ -3784,7 +3887,7 @@ def cmd_pretest_context(args: argparse.Namespace) -> int:
 def cmd_pretest_stop(args: argparse.Namespace) -> int:
     from autonom_lib.pretest import store as pretest_store
 
-    record = pretest_store.stop(_pretest_session())
+    record = pretest_store.stop(_pretest_session(), force=bool(getattr(args, "force", False)))
     return emit({"ok": True, **record}, as_json=True)
 
 
@@ -3825,7 +3928,36 @@ def cmd_pretest_check_end(args: argparse.Namespace) -> int:
     session = _pretest_session()
     record = _pretest_active(session, changing=True)
     state = pretest_checks.end(session, record, args.check_id, verdict=args.verdict,
-                               note=args.note)
+                               note=args.note,
+                               observed_count=_observed_count(args.observed_count),
+                               race_rule=True)
+    return emit({"ok": True, "pretest_id": record["pretest_id"], **state}, as_json=True)
+
+
+def _observed_count(value: str | None) -> int | None:
+    """`--observed-count N`: a whole number >= 0 of at most 9 ASCII digits,
+    else invalid_value (a longer digit string is never a request count, and
+    int() of thousands of digits raises ValueError)."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not re.fullmatch(r"[0-9]{1,9}", text):
+        raise errors.AutonomError(
+            errors.INVALID_VALUE,
+            f"--observed-count must be a whole number >= 0, got {value!r}",
+            "Count the requests in 'autonom network requests list', e.g. "
+            "--observed-count 1.", flag="--observed-count")
+    return int(text)
+
+
+def cmd_pretest_check_amend(args: argparse.Namespace) -> int:
+    from autonom_lib.pretest import checks as pretest_checks
+
+    session = _pretest_session()
+    record = _pretest_active(session, changing=True)
+    state = pretest_checks.amend(session, record, args.check_id, verdict=args.verdict,
+                                 note=args.note,
+                                 observed_count=_observed_count(args.observed_count))
     return emit({"ok": True, "pretest_id": record["pretest_id"], **state}, as_json=True)
 
 
@@ -3890,7 +4022,7 @@ def cmd_pretest_flows(args: argparse.Namespace) -> int:
     context = _pretest_doc(session, record, "context")
     flows = context.get("flows") if isinstance(context.get("flows"), dict) else {}
     selected = [entry for entry in flows.get("selected") or [] if isinstance(entry, dict)]
-    env_overrides = _flow_env_overrides(args)
+    env_overrides = _flow_env_overrides(args, errors.INVALID_VALUE)
     secrets = _flow_secrets(args)
     runs: list[dict[str, Any]] = []
     if selected:
@@ -4123,9 +4255,53 @@ def cmd_pretest_kit(args: argparse.Namespace) -> int:
     return emit(payload, as_json=True)
 
 
+def _flow_draft_message(result: dict[str, Any]) -> str:
+    """What `pretest flow-draft` wrote and where, in one sentence."""
+    path = result.get("draft_flow")
+    if result.get("written"):
+        said = f"wrote the draft flow to {path}"
+    else:
+        said = f"the draft flow at {path} already holds this flow; nothing was written"
+    if result.get("pack"):
+        said += "; the pack is final, so nothing was recorded on the finding"
+    elif result.get("recorded"):
+        said += f"; recorded it on finding {result.get('finding_id')}"
+    else:
+        said += f"; finding {result.get('finding_id')} already names it"
+    return said + ". Review its closing assertion before you run it."
+
+
+def _same_file(left: Any, right: Any) -> bool:
+    try:
+        return Path(str(left)).expanduser().resolve() == Path(str(right)).expanduser().resolve()
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+def _pack_draft_repro(pack: str, check_id: str, draft: str) -> tuple[str, bool]:
+    """The next command for a draft written from a pack, and whether it is
+    `pretest rerun`. rerun replays the check's own flow, else a finding's
+    recorded draft or its default draft path, so a draft elsewhere (a custom
+    --out) is replayed with `flow run` instead."""
+    from autonom_lib.pretest import regress as pretest_regress
+
+    try:
+        planned = pretest_regress.plan_rerun(pack, [check_id])["plan"]
+    except errors.AutonomError:
+        planned = []
+    if any(_same_file(item.get("flow"), draft) for item in planned):
+        return f"autonom pretest rerun <pack> --check {check_id}", True
+    return f"autonom flow run {shlex.quote(draft)}", False
+
+
 def cmd_pretest_flow_draft(args: argparse.Namespace) -> int:
     from autonom_lib.pretest import regress as pretest_regress
 
+    if args.out is not None and not str(args.out).strip():
+        raise errors.AutonomError(
+            errors.INVALID_VALUE, "--out is empty",
+            "Pass a .yaml file path, or leave --out out for the default "
+            "<repo>/.autonom/flows/drafts/<ticket-slug>-<finding-id>.yaml.", flag="--out")
     if args.pack:
         # a pack is read (and verified) as it is; nothing is recorded in it
         session = session_mod.load_current()
@@ -4134,11 +4310,24 @@ def cmd_pretest_flow_draft(args: argparse.Namespace) -> int:
         session = _pretest_session()
         record = _pretest_active(session, changing=True)
         result = pretest_regress.flow_draft(session, record, args.finding_id, out=args.out)
-    return emit({"ok": True, **result}, as_json=True)
+    payload: dict[str, Any] = {"ok": True, **result, "message": _flow_draft_message(result)}
+    if result.get("pack") and result.get("check_id"):
+        # repro records on the active pre-test only (refused on a pack); rerun
+        # replays the draft only when it would find this very file
+        repro, by_rerun = _pack_draft_repro(str(result["pack"]), str(result["check_id"]),
+                                            str(result.get("draft_flow")))
+        payload["repro"] = repro
+        if not by_rerun:
+            payload["message"] += (
+                f" 'autonom pretest rerun <pack> --check {result['check_id']}' does not "
+                "replay this file (it uses the check's own flow or the draft at the default "
+                "path); replay it with 'autonom flow run'.")
+    return emit(payload, as_json=True)
 
 
 def _pretest_run_config(args: argparse.Namespace) -> Any:
-    return flow_executor.RunConfig(env=_flow_env_overrides(args), secrets=_flow_secrets(args))
+    return flow_executor.RunConfig(env=_flow_env_overrides(args, errors.INVALID_VALUE),
+                                   secrets=_flow_secrets(args))
 
 
 def cmd_pretest_repro(args: argparse.Namespace) -> int:
@@ -5981,7 +6170,7 @@ _CONTROL_READONLY: frozenset[str] = frozenset({
     # reviews, packs) or only read the device (health baselines, crash lists,
     # logs, `a11y`'s one tree read); none sends input.
     "pretest status", "pretest context", "pretest list", "pretest check add",
-    "pretest check begin", "pretest check end", "pretest check list",
+    "pretest check begin", "pretest check end", "pretest check amend", "pretest check list",
     "pretest finding add", "pretest finding list", "pretest health", "pretest pack",
     "pretest review", "pretest review-status", "pretest kit", "pretest flow-draft",
     "pretest a11y", "pretest events",
@@ -6845,7 +7034,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="app id open/launch may reach (repeatable; default: the session's app)")
     p.set_defaults(func=cmd_pretest_start)
     for verb, func, help_text in (
-        ("status", cmd_pretest_status, "the active pre-test: budget, open check, counts"),
+        ("status", cmd_pretest_status, "the active pre-test: budget, open check, counts "
+                                       "(status 'damaged' when its record is unreadable)"),
         ("context", cmd_pretest_context, "the diff context: files, hunks, flows, screen hints"),
         ("stop", cmd_pretest_stop, "close the active pre-test without a pack"),
         ("health", cmd_pretest_health, "device-health deltas since the baseline"),
@@ -6853,6 +7043,10 @@ def build_parser() -> argparse.ArgumentParser:
     ):
         p = pretest_sub.add_parser(verb, help=help_text, parents=[target_flags])
         p.set_defaults(func=func)
+        if verb == "stop":
+            p.add_argument("--force", action="store_true",
+                           help="also stop a pre-test whose record is damaged (kept as "
+                                "pretest.json.damaged)")
 
     check = pretest_sub.add_parser("check", help="plan, open and close checks")
     check_sub = check.add_subparsers(dest="pretest_check_command", required=True)
@@ -6874,7 +7068,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--verdict", required=True, metavar="V",
                    help="pass|fail|blocked|not_covered|inconclusive")
     p.add_argument("--note", help="what was seen")
+    p.add_argument("--observed-count", metavar="N",
+                   help="requests counted (network requests); a pass of the double-tap "
+                        "case needs it")
     p.set_defaults(func=cmd_pretest_check_end)
+    p = check_sub.add_parser("amend", help="correct the verdict of an ended check",
+                             parents=[target_flags])
+    p.add_argument("check_id")
+    p.add_argument("--verdict", required=True, metavar="V",
+                   help="pass|fail|blocked|not_covered|inconclusive")
+    p.add_argument("--note", required=True, help="why the verdict changes")
+    p.add_argument("--observed-count", metavar="N",
+                   help="requests counted; a pass of the double-tap case needs one "
+                        "(given here or at check end)")
+    p.set_defaults(func=cmd_pretest_check_amend)
     p = check_sub.add_parser("list", help="every check with state, verdict and time",
                              parents=[target_flags])
     p.set_defaults(func=cmd_pretest_check_list)
@@ -7265,8 +7472,16 @@ def build_parser() -> argparse.ArgumentParser:
         parser.add_argument("--header", action="append", help="'Name: value' (repeatable)")
         parser.add_argument("--json", help="inline response body; sets Content-Type "
                                            "automatically when it looks like JSON")
-        parser.add_argument("--body-file")
+        parser.add_argument("--body-file", help="response body file; without a Content-Type "
+                                                "--header its type follows the extension")
         parser.add_argument("--note", help="free-text label, shown in list")
+        parser.add_argument("--delay", metavar="SECONDS",
+                            help="answer after SECONDS (0 < SECONDS <= 120, e.g. 2.5); "
+                                 "other requests are not held")
+        parser.add_argument("--hang", action="store_true", default=None,
+                            help="hold the request until the mock is removed or disabled "
+                                 "(then it goes upstream) or 120 s pass (then it is "
+                                 "recorded incomplete); not with --delay")
         return parser
 
     p = mock_shape(mock_sub.add_parser("add", parents=[target_flags]))

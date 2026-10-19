@@ -26,6 +26,10 @@ from . import parser as parser_mod
 from . import schema as schema_mod
 
 
+# The ``reason`` a non-UTF-8 flow file is listed invalid with (contract B.6).
+NOT_UTF8_REASON = "not UTF-8 text"
+
+
 def workspace_root(flow_path: Path) -> Path:
     directory = flow_path.resolve().parent
     for ancestor in (directory, *directory.parents):
@@ -60,7 +64,20 @@ def load_flow(path: Path) -> schema_mod.Flow:
     # bytes that are also hashed: ``source_sha256`` names what was parsed,
     # not what the file holds by the time someone asks.
     digest = hashlib.sha256(raw).hexdigest()
-    text = raw.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
+    try:
+        decoded = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        # One latin-1 file must not take a whole suite (or `pretest start`)
+        # down with a traceback: it is a typed refusal callers list as invalid.
+        raise errors.AutonomError(
+            errors.FLOW_PARSE_ERROR,
+            f"{path}: {NOT_UTF8_REASON} (byte 0x{raw[exc.start]:02x} at "
+            f"offset {exc.start})",
+            hint="Save the flow file as UTF-8 (for example: iconv -f latin1 "
+                 "-t utf-8).",
+            file=str(path), reason=NOT_UTF8_REASON, offset=exc.start,
+        ) from None
+    text = decoded.replace("\r\n", "\n").replace("\r", "\n")
     # before the Maestro sniff: a BOM hides the `schema:` line from it
     text = parser_mod.strip_bom(text)
     if maestro_mod.is_maestro_document(text):
@@ -350,6 +367,35 @@ def discover_with_skipped(directory: Path) -> tuple[list[Path], list[dict]]:
             continue
         flows.append(path)
     return flows, skipped
+
+
+def invalid_entry(path: Path, exc: errors.AutonomError) -> dict:
+    """``{"file", "error_code", "error", "reason"?}`` for a flow that did
+    not load — the shape ``load_flows`` lists; ``reason`` is set when the
+    refusal names one (``not UTF-8 text`` for a non-UTF-8 file)."""
+    entry = {"file": str(path), "error_code": exc.code, "error": exc.message}
+    reason = exc.extra.get("reason")
+    if reason:
+        entry["reason"] = reason
+    return entry
+
+
+def load_flows(directory: Path) -> tuple[list[tuple[Path, schema_mod.Flow]],
+                                         list[dict]]:
+    """Load every discovered flow under ``directory``.
+
+    -> (loaded ``[(path, flow)]``, invalid ``[invalid_entry ...]``). A file
+    that does not load (bad YAML, not UTF-8, ...) is listed invalid and the
+    others still load; refusals other than ``AutonomError`` propagate.
+    """
+    loaded: list[tuple[Path, schema_mod.Flow]] = []
+    invalid: list[dict] = []
+    for path in discover(directory):
+        try:
+            loaded.append((path, load_flow(path)))
+        except errors.AutonomError as exc:
+            invalid.append(invalid_entry(path, exc))
+    return loaded, invalid
 
 
 def skipped_warning(skipped: list[dict]) -> dict | None:

@@ -2427,8 +2427,15 @@ function isSameOriginFetch(request, port) {
   return isCanvasOrigin(request.headers.origin, port);
 }
 
+/**
+ * The origin a request names in X-Autonom-Origin. A client that names none, or names a value
+ * that is not exactly one of ORIGINS ("Agent", "bogus"), is an agent (RISK-018 / DEC-003:
+ * fail closed, so its input is counted and guarded); a person's input is exempt only when it
+ * says `human` exactly, as the Canvas pages always do.
+ */
 function normalizeOrigin(value) {
-  return ORIGINS.includes(value) ? value : "human";
+  if (value === undefined || value === null || value === "") return "agent";
+  return ORIGINS.includes(value) ? value : "agent";
 }
 
 /**
@@ -2439,7 +2446,8 @@ function normalizeOrigin(value) {
 function authorizeUpgrade(context, request, url) {
   const originParam = url.searchParams.get("origin");
   const apiClient = () => {
-    if (originParam === null) return { ok: true, origin: "human" };
+    // No ?origin= is an agent, as for HTTP (RISK-018); the page names `human` itself.
+    if (originParam === null) return { ok: true, origin: "agent" };
     if (!ORIGINS.includes(originParam)) {
       return { ok: false, status: 400, message: "origin must be human, agent, replay, or system" };
     }
@@ -7483,7 +7491,7 @@ let videoRetry=500,controlRetry=500,videoRefusals=0;
 const supportedCodecs=new Map(),activePointers=new Map(),heldKeys=new Map();
 function setStatus(value){statusEl.textContent=value}
 function url(path,cacheBust=false){const params=new URLSearchParams();if(cacheBust)params.set("ts",String(Date.now()));const query=params.toString();return BASE+path+(query?"?"+query:"")}
-function wsUrl(path){const params=new URLSearchParams();if(csrf)params.set("csrf",csrf);const query=params.toString();return(location.protocol==="https:"?"wss://":"ws://")+location.host+BASE+path+(query?"?"+query:"")}
+function wsUrl(path){const params=new URLSearchParams();if(csrf)params.set("csrf",csrf);params.set("origin","human");const query=params.toString();return(location.protocol==="https:"?"wss://":"ws://")+location.host+BASE+path+(query?"?"+query:"")}
 async function post(path,body){const headers={"Content-Type":"application/json","X-Autonom-Origin":"human"};if(csrf)headers["X-Autonom-CSRF"]=csrf;const response=await fetch(url(path),{method:"POST",headers,body:JSON.stringify(body)});const payload=await response.json().catch(()=>({}));if(!response.ok)throw new Error(payload.error||response.statusText);return payload}
 function scrcpyActive(){return view.transport==="scrcpy"}
 // Video over /ws/video and input over /ws/control: scrcpy on Android, idb on the iOS Simulator.

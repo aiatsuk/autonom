@@ -28,10 +28,11 @@ Steps:
   1. `session start` (install --apk/--app when given, launch --app-id).
   2. Capture: with --proxy-port or --mock-path, `network start` (on --proxy-port when
      given) and, unless --in-app-proxy (the app routes itself through the proxy),
-     `network attach`. With --mock-path, `connection_strategy: lazy` is first written
-     to the temporary home's mitmproxy config (`$AUTONOM_HOME/ca/config.yaml`), so a
-     mocked request is answered without connecting upstream (a test-environment
-     workaround until Autonom sets it itself; reported as `proxy_lazy_connect`).
+     `network attach`. Autonom starts the proxy with `connection_strategy=lazy`, so a
+     mocked request is answered without connecting upstream; the script writes no
+     mitmproxy config of its own. `proxy_lazy_connect` reports whether the running
+     proxy's argv carries the setting (read from the proxy process named by
+     `network start`/`network status`; left out when it cannot be read).
   3. `pretest start` with a generated ticket (holding a fake bearer marker that must not
      reach the pack) and the repository's diff.
   4. Check 1: the covering flow, through `pretest flows` (or `check add/begin` + `flow run`
@@ -50,6 +51,13 @@ Steps:
      finding with the screenshot (and request) as evidence. The check ends
      `inconclusive` when a mocked 500 was seen (a person judges the screen) and
      `blocked` when none was.
+  5b. Check 3 (`--kind network`, kit case `slow`, with --mock-path only): the same mock
+     is changed to `--delay 3` and the navigation flow replayed; `delayed_duration_s` is
+     the longest captured duration of a request that rule answered. Then it is changed
+     to `--hang`, the flow replayed again, and the script waits up to 130 s for the
+     proxy's 120 s hang cap; `incomplete_requests` counts the records of that rule with
+     `completed: false`. The mock is removed at the end of the check. The check ends
+     `inconclusive` when both were seen, else `blocked`.
   6. `pretest pack --out <evidence-dir>/pack-<platform>-<run>`, `report verify`,
      `pretest review <pack> return-to-dev --finding <id>`, `report verify` again,
      `pretest review-status`.
@@ -61,7 +69,8 @@ Steps:
 Writes <evidence-dir>/pretest-<platform>.json (owner-only) with every observed value. It
 holds ids, counts, verdicts, codes and paths only: never the ticket text, request bodies or
 the bearer marker (the report is checked for it before it is written). `ok` needs two or
-more checks, the flow check run, the mock hit when --mock-path is given, the pack verified
+more checks, the flow check run, the mock hit when --mock-path is given (and then a
+delayed request of at least 3 s and one incomplete request), the pack verified
 before and after the review, the review recorded, the marker absent from the pack's
 ticket.md, no mock left in the registry, every restore step and (with --ui) the view check.
 Exit 0 when ok, 1 otherwise, 2 on bad arguments or a refused target (a JSON error with
@@ -96,6 +105,7 @@ if str(SCRIPTS) not in sys.path:
 
 from autonom_lib import errors  # noqa: E402  (stdlib only)
 from autonom_lib.contracts import redact_value  # noqa: E402
+from autonom_lib.network.proxy import LAZY_CONNECT_OPTION  # noqa: E402
 
 SCHEMA = "autonom.pretest-live/v1"
 REFUSED_TARGET = "emulator-5554"
@@ -109,6 +119,12 @@ FLOW_TIMEOUT = 1200
 VIEW_TIMEOUT = 600
 SETTLE_SECONDS = 8
 MOCK_STATUS = 500
+DELAY_SECONDS = 3
+# The proxy kills a held request after 120 s (`mocks.MAX_DELAY_S`); wait a little longer.
+HANG_WAIT_SECONDS = 130
+POLL_SECONDS = 5
+# A measured delay may be a few milliseconds short of the configured one at most.
+DELAY_TOLERANCE_S = 0.1
 # Variables that could point the CLI at state outside the temporary home.
 ISOLATED_ENV = ("AUTONOM_IDB_STATE_FILE", "AUTONOM_CAPTURES_DIR", "AUTONOM_UI_BACKEND")
 GIT = ["git", "-c", "user.name=pretest-live", "-c", "user.email=pretest-live@localhost",
@@ -160,25 +176,54 @@ def build_parser() -> argparse.ArgumentParser:
 
 # --- pure helpers (covered by --self-test) -------------------------------------------------
 
-# mitmproxy reads `config.yaml` from its confdir, which Autonom keeps at
-# `$AUTONOM_HOME/ca` (`network.proxy.ca_store`).
-MITM_CONFIG = Path("ca") / "config.yaml"
+def proxy_lazy_connect(pid: Any, runner=None) -> bool | None:
+    """Whether the proxy process `pid` runs with `connection_strategy=lazy`
+    (Autonom sets it at `network start`), read from its argv with `ps`.
+    None when there is no pid or the argv cannot be read."""
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return None
+    runner = runner or (lambda argv: run(argv, timeout=30, check=False))
+    try:
+        completed = runner(["ps", "-o", "command=", "-p", str(pid)])
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    argv = (getattr(completed, "stdout", "") or "").strip()
+    if getattr(completed, "returncode", 1) != 0 or not argv:
+        return None
+    return LAZY_CONNECT_OPTION in argv
 
 
-def write_lazy_connect(home: Path) -> Path:
-    """Write `connection_strategy: lazy` into the temporary home's mitmproxy
-    config before `network start`, so the proxy answers a mocked request
-    without first connecting to the real server (an unreachable or slow
-    upstream otherwise fails or delays the mock).
+def proxy_pid(*payloads: dict[str, Any]) -> int | None:
+    """The proxy pid from `network start` (top level) or `network status` (`proxy`)."""
+    for payload in payloads:
+        for source in (payload, payload.get("proxy") if isinstance(payload, dict) else None):
+            if isinstance(source, dict):
+                pid = source.get("pid")
+                if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0:
+                    return pid
+    return None
 
-    Test-environment workaround: Autonom does not set this itself yet; the
-    follow-up run adds it to the proxy start. Only the temporary
-    AUTONOM_HOME of this run is touched."""
-    path = home / MITM_CONFIG
-    owner_dir(path.parent)
-    write_owner_file(path, "# pretest_live.py: test-environment workaround until Autonom "
-                           "sets it\nconnection_strategy: lazy\n")
-    return path
+
+def rule_records(listing: dict[str, Any], mock_id: str | None,
+                 since_ms: int) -> list[dict[str, Any]]:
+    """Captured records the rule `mock_id` answered (or held) since `since_ms`."""
+    return [item for item in listing.get("requests") or []
+            if isinstance(item, dict) and mock_id and item.get("mock_id") == mock_id
+            and isinstance(item.get("started_at_ms"), int)
+            and item["started_at_ms"] >= since_ms]
+
+
+def delayed_duration_s(records: list[dict[str, Any]]) -> float | None:
+    """The longest duration (seconds) of the completed records, or None."""
+    durations = [item["duration_ms"] for item in records
+                 if item.get("completed") is not False
+                 and isinstance(item.get("duration_ms"), int)
+                 and not isinstance(item.get("duration_ms"), bool)]
+    return round(max(durations) / 1000, 3) if durations else None
+
+
+def incomplete_count(records: list[dict[str, Any]]) -> int:
+    return sum(1 for item in records if item.get("completed") is False)
 
 
 def refuse(code: str, message: str, hint: str, **extra: Any) -> errors.AutonomError:
@@ -319,6 +364,12 @@ def evaluate(report: dict[str, Any]) -> list[str]:
     network_check = report.get("check_network") or {}
     if report.get("options", {}).get("mock_path") and not network_check.get("mocked_500_seen"):
         failures.append("mock_not_hit")
+    if report.get("options", {}).get("mock_path"):
+        delayed = report.get("delayed_duration_s")
+        if not isinstance(delayed, (int, float)) or delayed < DELAY_SECONDS - DELAY_TOLERANCE_S:
+            failures.append("delay_not_observed")
+        if not report.get("incomplete_requests"):
+            failures.append("no_incomplete_request")
     if not (report.get("finding") or {}).get("finding_id"):
         failures.append("no_finding")
     pack = report.get("pack") or {}
@@ -472,16 +523,18 @@ def validate(args: argparse.Namespace) -> dict[str, Any]:
         "attach_device_proxy": capture and not args.in_app_proxy,
         "in_app_proxy": bool(args.in_app_proxy), "mock_path": args.mock_path,
         "mock_glob": mock_glob(args.mock_path) if args.mock_path else None,
-        "proxy_lazy_connect": args.mock_path is not None,
+        # set by Autonom at `network start`; the run reads it back from the proxy argv
+        "proxy_lazy_connect": "set by Autonom" if capture else None,
+        "delay_s": DELAY_SECONDS if args.mock_path is not None else None,
+        "hang_wait_s": HANG_WAIT_SECONDS if args.mock_path is not None else None,
         "env_names": [pair.split("=", 1)[0] for pair in args.env], "ui": bool(args.ui),
         "nav_flow": Path(chosen["flow"]).name if args.mock_path is not None else None,
         "steps": [
             "device online check" + (" (boot when Shutdown)" if args.platform == "ios" else ""),
             "temporary AUTONOM_HOME and git repo (main + live-change)",
             "session start" + (" --install" if install else "") + " --launch",
-            *(["write connection_strategy: lazy to $AUTONOM_HOME/ca/config.yaml "
-               "(test-environment workaround)"] if args.mock_path is not None else []),
-            *(["network start" + (f" --port {args.proxy_port}" if args.proxy_port else "")]
+            *(["network start" + (f" --port {args.proxy_port}" if args.proxy_port else "")
+               + " (Autonom sets connection_strategy=lazy; read back from the proxy argv)"]
               if capture else []),
             *(["network attach"] if capture and not args.in_app_proxy else []),
             "pretest start (generated ticket, --base main --head live-change)",
@@ -493,6 +546,12 @@ def validate(args: argparse.Namespace) -> dict[str, Any]:
                  status=MOCK_STATUS, flow=Path(chosen["flow"]).name)
              if args.mock_path else
              "check 2: network, relaunch, settle, screenshot, finding"),
+            *(["check 3: slow (kit case slow): network mock update --delay {delay}, flow run "
+               "of the same flow, delayed_duration_s from the captured request; network mock "
+               "update --hang, flow run, wait up to {wait} s for the hang cap, "
+               "incomplete_requests (completed: false); network mock remove".format(
+                   delay=DELAY_SECONDS, wait=HANG_WAIT_SECONDS)]
+              if args.mock_path else []),
             "pretest pack, report verify, review return-to-dev, report verify, review-status",
             *(["view check (4 screenshots)"] if args.ui else []),
             "restore: pretest stop if active, mock remove, network detach/stop, session stop",
@@ -741,6 +800,86 @@ def step_check_network(autonom: Autonom, report: dict[str, Any], plan: dict[str,
         result["verdict"] = ended.get("verdict") if ended.get("ok") else None
 
 
+def step_check_slow(autonom: Autonom, report: dict[str, Any], plan: dict[str, Any],
+                    state: dict[str, Any], env_args: list[str], *,
+                    clock=time.time, sleep=time.sleep) -> None:
+    """Check 3: the --mock-path rule delayed by DELAY_SECONDS, then held (`--hang`)
+    until the proxy's cap records the request incomplete; the rule is removed at the
+    end. Sets `delayed_duration_s` and `incomplete_requests` on the report."""
+    result: dict[str, Any] = {"mock_glob": plan["mock_glob"], "delay_s": DELAY_SECONDS}
+    report["check_slow"] = result
+    mock_id = state.get("mock_id")
+    if not plan["mock_glob"] or not mock_id:
+        result["skipped"] = "no mock on --mock-path"
+        return
+    added = autonom("pretest", "check", "add",
+                    f"A {DELAY_SECONDS} s delay and a held response on {plan['mock_glob']} "
+                    "do not freeze the screen", "--kind", "network", "--case", "slow",
+                    "--why", "a slow or stuck server must leave the app usable")
+    check_id = added["check_id"]
+    result["check_id"] = check_id
+    autonom("pretest", "check", "begin", check_id)
+    verdict, note = "blocked", "the slow-response check stopped early"
+    nav = nav_flow_path(state.get("selected_flow_paths") or [], plan,
+                        (report.get("repo") or {}).get("path"))
+    result["nav_flow"] = Path(nav).name if nav else None
+
+    def replay(prefix: str) -> None:
+        if nav:
+            ran = autonom("flow", "run", nav, *env_args, timeout=FLOW_TIMEOUT, expect_ok=False)
+            result[f"{prefix}_flow_run_id"] = ran.get("run_id")
+            result[f"{prefix}_flow_status"] = ran.get("status")
+        else:
+            launched = autonom("session", "launch", plan["app_id"], "--fresh", expect_ok=False)
+            result[f"{prefix}_relaunch_ok"] = bool(launched.get("ok"))
+
+    def records(since_ms: int) -> list[dict[str, Any]]:
+        listed = autonom("network", "requests", "list", "--mocked", "true", "--max", "500")
+        return rule_records(listed, mock_id, since_ms)
+
+    try:
+        delay_from = int(clock() * 1000)
+        autonom("network", "mock", "update", mock_id, "--delay", str(DELAY_SECONDS))
+        replay("delay")
+        delayed = records(delay_from)
+        report["delayed_duration_s"] = delayed_duration_s(delayed)
+        result["delayed_requests"] = sum(1 for item in delayed if item.get("completed") is not False)
+        hang_from = int(clock() * 1000)
+        autonom("network", "mock", "update", mock_id, "--hang")
+        replay("hang")
+        # Wait from the end of the replay: a request held late in the replay is
+        # capped 120 s after it started, which is still inside this window.
+        deadline = clock() + HANG_WAIT_SECONDS
+        polls = 0
+        while True:
+            held = records(hang_from)
+            polls += 1
+            if incomplete_count(held) or clock() >= deadline:
+                break
+            sleep(POLL_SECONDS)
+        report["incomplete_requests"] = incomplete_count(held)
+        result["hang_polls"] = polls
+        result["incomplete_error_kinds"] = sorted({str(item.get("error_kind"))
+                                                   for item in held
+                                                   if item.get("completed") is False})
+        if report["delayed_duration_s"] is not None and report["incomplete_requests"]:
+            verdict, note = "inconclusive", (
+                f"a {DELAY_SECONDS} s delay ({report['delayed_duration_s']} s measured) and "
+                f"{report['incomplete_requests']} held request(s) were served; a person "
+                "judges the screens")
+        else:
+            verdict, note = "blocked", "no delayed or no held request was captured"
+    finally:
+        # every mock of this run goes now; restore still checks the registry
+        removed = autonom("network", "mock", "remove", mock_id, expect_ok=False)
+        if removed.get("ok"):
+            state["mock_id"] = None
+            result["mock_removed"] = True
+        ended = autonom("pretest", "check", "end", check_id, "--verdict", verdict,
+                        "--note", note, expect_ok=False)
+        result["verdict"] = ended.get("verdict") if ended.get("ok") else None
+
+
 def step_pack_review(autonom: Autonom, report: dict[str, Any], plan: dict[str, Any],
                      evidence: Path, run_id: str, marker: str) -> Path:
     listed = autonom("pretest", "check", "list")
@@ -875,7 +1014,7 @@ def live(args: argparse.Namespace, plan: dict[str, Any]) -> int:
         "pretest": {}, "checks": [], "check_flow": None, "check_network": None,
         "finding": None, "pack": None, "review": None, "summary": None,
         "ticket_redacted": None, "view": None, "mocks_left": None,
-        "proxy_lazy_connect": False,
+        "check_slow": None, "delayed_duration_s": None, "incomplete_requests": None,
         "restore": {"ok": False, "steps": []}, "ok": False,
     }
     state: dict[str, Any] = {}
@@ -914,10 +1053,6 @@ def live(args: argparse.Namespace, plan: dict[str, Any]) -> int:
         started = autonom(*start, timeout=INSTALL_TIMEOUT)
         state["session"] = True
         report["session"] = {"started": True, "session_id": started.get("session_id")}
-        if plan["proxy_lazy_connect"]:
-            # before `network start`: mitmproxy reads its config once, at start
-            write_lazy_connect(home)
-            report["proxy_lazy_connect"] = True
         if plan["capture"]:
             network = ["network", "start", "--i-understand-mitm"]
             if plan["proxy_port"]:
@@ -926,6 +1061,12 @@ def live(args: argparse.Namespace, plan: dict[str, Any]) -> int:
             proxy = autonom(*network)
             report["network"] = {"started": True, "port": proxy.get("port"),
                                  "in_app_proxy": plan["in_app_proxy"], "attached": False}
+            # set by Autonom, never by this script: read back from the proxy's argv
+            pid = proxy_pid(proxy) or proxy_pid(autonom("network", "status", expect_ok=False))
+            lazy = proxy_lazy_connect(pid)
+            if lazy is not None:
+                report["proxy_lazy_connect"] = lazy
+                report["proxy_lazy_connect_source"] = "set by Autonom (proxy argv)"
             if plan["attach_device_proxy"]:
                 state["attached"] = True  # set first: a half-applied attach is undone too
                 attached = autonom("network", "attach", "--i-understand-mitm")
@@ -945,6 +1086,8 @@ def live(args: argparse.Namespace, plan: dict[str, Any]) -> int:
                                                for item in begun.get("selected_flows") or []]
         step_check_flow(autonom, report, plan, env_args)
         step_check_network(autonom, report, plan, state, run_id, env_args)
+        if plan["mock_glob"]:
+            step_check_slow(autonom, report, plan, state, env_args)
         pack = step_pack_review(autonom, report, plan, evidence, run_id, marker)
         if plan["ui"]:
             step_view(report, pack, evidence, plan["platform"])
@@ -1114,34 +1257,81 @@ class SelfTest(unittest.TestCase):
         self.assertTrue(fnmatch.fnmatch(plan["flow"]["changed_file"], "lib/**/search_*.dart"))
         self.assertEqual(plan["mock_glob"], "*/api/catalog*")
         self.assertTrue(plan["capture"] and plan["attach_device_proxy"])
-        self.assertTrue(plan["proxy_lazy_connect"])
-        lazy = [i for i, step in enumerate(plan["steps"]) if "connection_strategy: lazy" in step]
-        start = [i for i, step in enumerate(plan["steps"]) if step.startswith("network start")]
-        self.assertEqual(len(lazy), 1)
-        self.assertLess(lazy[0], start[0], "the config must be written before network start")
+        self.assertEqual(plan["proxy_lazy_connect"], "set by Autonom")
         self.assertFalse(self.evidence.exists())
 
-    def test_no_lazy_connect_without_a_mock(self) -> None:
+    def test_lazy_connect_is_autonoms_not_a_file_written_here(self) -> None:
+        # A.1: Autonom starts the proxy lazily; the script writes no mitmproxy config
+        self.assertNotIn("write_lazy_connect", globals())
+        self.assertNotIn("MITM_CONFIG", globals())
+        for extra in (("--mock-path", "/api/catalog"), ("--proxy-port", "8899")):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                main(self.argv("--dry-run", *extra))
+            plan = json.loads(out.getvalue())
+            self.assertFalse(any("config.yaml" in step for step in plan["steps"]), extra)
+            start = next(step for step in plan["steps"] if step.startswith("network start"))
+            self.assertIn("Autonom sets connection_strategy=lazy", start)
+        from autonom_lib.network import proxy as proxy_mod
+        argv = proxy_mod.build_argv("mitmdump", port=8899, directory=self.tmp,
+                                    confdir=self.tmp, capture_bodies=False)
+        self.assertIn(LAZY_CONNECT_OPTION, argv)
+
+    def test_no_lazy_connect_without_capture(self) -> None:
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            main(self.argv("--dry-run"))
+        plan = json.loads(out.getvalue())
+        self.assertIsNone(plan["proxy_lazy_connect"])
+        self.assertFalse(any("connection_strategy" in step for step in plan["steps"]))
+
+    def test_proxy_lazy_connect_reads_the_proxy_argv(self) -> None:
+        def ps(stdout: str, code: int = 0):
+            return lambda argv: subprocess.CompletedProcess(argv, code, stdout, "")
+        seen: list[list[str]] = []
+
+        def recording(argv):
+            seen.append(argv)
+            return subprocess.CompletedProcess(argv, 0, "mitmdump --set "
+                                               "connection_strategy=lazy -q\n", "")
+        self.assertTrue(proxy_lazy_connect(4242, recording))
+        self.assertEqual(seen, [["ps", "-o", "command=", "-p", "4242"]])
+        self.assertFalse(proxy_lazy_connect(4242, ps("mitmdump -q")))
+        # unknown: no pid, a failed or empty ps, ps missing -> omitted from the report
+        self.assertIsNone(proxy_lazy_connect(None, ps("x")))
+        self.assertIsNone(proxy_lazy_connect(True, ps("x")))
+        self.assertIsNone(proxy_lazy_connect(4242, ps("", 1)))
+        self.assertIsNone(proxy_lazy_connect(4242, ps("  ")))
+
+        def missing(argv):
+            raise FileNotFoundError("ps")
+        self.assertIsNone(proxy_lazy_connect(4242, missing))
+        self.assertEqual(proxy_pid({"pid": 7}), 7)
+        self.assertEqual(proxy_pid({"ok": True}, {"proxy": {"pid": 9}}), 9)
+        self.assertIsNone(proxy_pid({"pid": "7"}, {"proxy": None}))
+
+    def test_dry_run_plans_the_delay_and_hang_phase(self) -> None:
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            main(self.argv("--dry-run", "--mock-path", "/api/catalog"))
+        plan = json.loads(out.getvalue())
+        self.assertEqual((plan["delay_s"], plan["hang_wait_s"]), (3, 130))
+        steps = plan["steps"]
+        index = {name: next(i for i, step in enumerate(steps) if step.startswith(name))
+                 for name in ("check 2", "check 3", "pretest pack")}
+        self.assertLess(index["check 2"], index["check 3"])
+        self.assertLess(index["check 3"], index["pretest pack"])
+        third = steps[index["check 3"]]
+        for text in ("--delay 3", "delayed_duration_s", "--hang", "130 s",
+                     "incomplete_requests", "completed: false", "network mock remove"):
+            self.assertIn(text, third)
+        self.assertLess(third.index("--delay"), third.index("--hang"))
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             main(self.argv("--dry-run", "--proxy-port", "8899"))
         plan = json.loads(out.getvalue())
-        self.assertFalse(plan["proxy_lazy_connect"])
-        self.assertFalse(any("connection_strategy" in step for step in plan["steps"]))
-
-    def test_write_lazy_connect_into_the_mitm_confdir(self) -> None:
-        home = self.tmp / "home"
-        path = write_lazy_connect(home)
-        self.assertEqual(path, home / "ca" / "config.yaml")
-        text = path.read_text(encoding="utf-8")
-        self.assertIn("connection_strategy: lazy\n", text)
-        self.assertIn("workaround", text)
-        self.assertEqual(path.stat().st_mode & 0o777, FILE_MODE)
-        self.assertEqual((home / "ca").stat().st_mode & 0o777, DIR_MODE)
-        # the same place Autonom's proxy uses as mitmproxy's confdir
-        with mock.patch.dict(os.environ, {"AUTONOM_HOME": str(home)}):
-            from autonom_lib.network import proxy as proxy_mod
-            self.assertEqual(proxy_mod.ca_store(), path.parent)
+        self.assertIsNone(plan["delay_s"])
+        self.assertFalse(any(step.startswith("check 3") for step in plan["steps"]))
 
     def test_flow_without_covers_changes_the_flow_file(self) -> None:
         (self.flows / "results.yaml").write_text(
@@ -1209,6 +1399,7 @@ class SelfTest(unittest.TestCase):
                 "pack": {"verify_before": {"ok": True}, "verify_after": {"ok": True}},
                 "review": {"status_decision": "return-to-dev"}, "ticket_redacted": True,
                 "mocks_left": 0, "restore": {"steps": [{"ok": True}]},
+                "delayed_duration_s": 3.012, "incomplete_requests": 1,
                 "options": {"mock_path": "/api/x", "ui": True}, "view": {"ok": True}}
 
     def test_evaluate(self) -> None:
@@ -1226,6 +1417,8 @@ class SelfTest(unittest.TestCase):
             "restore": ("restore", {"steps": [{"ok": False}]}),
             "view_check": ("view", {"ok": False}),
             "session_not_started": ("session", {"started": False}),
+            "delay_not_observed": ("delayed_duration_s", 2.5),
+            "no_incomplete_request": ("incomplete_requests", 0),
         }
         for reason, (key, value) in cases.items():
             with self.subTest(reason=reason):
@@ -1238,6 +1431,15 @@ class SelfTest(unittest.TestCase):
         report = self.good_report()
         report["restore"] = {"steps": []}
         self.assertIn("restore", evaluate(report))
+        report = self.good_report()
+        report["delayed_duration_s"] = None
+        self.assertIn("delay_not_observed", evaluate(report))
+        self.assertEqual(evaluate({**self.good_report(), "delayed_duration_s": 2.95}), [])
+        # without --mock-path neither the delay nor the hang is asked for
+        report = self.good_report()
+        report.update(options={"mock_path": None, "ui": False}, delayed_duration_s=None,
+                      incomplete_requests=None)
+        self.assertEqual(evaluate(report), [])
 
     def test_scrub(self) -> None:
         text, leaked = scrub({"note": "x secretmarker y", "api_token": "abc"}, "secretmarker")
@@ -1378,6 +1580,179 @@ class SelfTest(unittest.TestCase):
         self.assertIsNone(result["nav_flow"])
         self.assertTrue(result["relaunch_ok"])
         self.assertEqual(result["verdict"], "inconclusive")
+
+    def run_slow_check(self, plan: dict[str, Any], state: dict[str, Any], *,
+                       delayed_ms: int | None, incomplete_after: int | None,
+                       incomplete_after_s: float | None = None
+                       ) -> tuple[list[tuple[str, ...]], dict[str, Any], list[float]]:
+        """step_check_slow against a fake CLI and a fake clock. `incomplete_after`
+        is the number of polls before the held request shows up as incomplete
+        (None: never); `incomplete_after_s` the same in seconds after the hang
+        replay returned (None: not by time); `delayed_ms` the duration of the
+        delayed request (None: none). The update takes 1 s, each replay 20 s."""
+        calls: list[tuple[str, ...]] = []
+        now = [1000.0]
+        slept: list[float] = []
+        phase: dict[str, Any] = {"name": None, "polls": 0, "replayed_at": None}
+
+        def clock() -> float:
+            return now[0]
+
+        def sleep(seconds: float) -> None:
+            slept.append(seconds)
+            now[0] += seconds
+
+        def fake(*argv: str, timeout: float = CLI_TIMEOUT,
+                 expect_ok: bool = True) -> dict[str, Any]:
+            calls.append(argv)
+            if argv[:3] == ("pretest", "check", "add"):
+                return {"ok": True, "check_id": "chk-3"}
+            if argv[:3] == ("pretest", "check", "end"):
+                return {"ok": True, "verdict": argv[argv.index("--verdict") + 1]}
+            if argv[:3] == ("network", "mock", "update"):
+                phase["name"] = "delay" if "--delay" in argv else "hang"
+                now[0] += 1
+                return {"ok": True}
+            if argv[:2] == ("flow", "run"):
+                now[0] += 20
+                if phase["name"] == "hang":
+                    phase["replayed_at"] = now[0]
+                return {"ok": False, "run_id": f"fr_{phase['name']}", "status": "failed"}
+            if argv[:3] == ("network", "requests", "list"):
+                start = int(now[0] * 1000) - 5000
+                other = {"id": "f_9", "mock_id": "m_9", "started_at_ms": start,
+                         "completed": False}
+                old = {"id": "f_0", "mock_id": "m_1", "started_at_ms": 1, "completed": False}
+                items = [other, old]
+                if phase["name"] == "delay" and delayed_ms is not None:
+                    items.append({"id": "f_1", "mock_id": "m_1", "started_at_ms": start,
+                                  "completed": True, "duration_ms": delayed_ms})
+                if phase["name"] == "hang":
+                    phase["polls"] += 1
+                    late = (incomplete_after_s is not None
+                            and now[0] - phase["replayed_at"] >= incomplete_after_s)
+                    if late or (incomplete_after is not None
+                                and phase["polls"] >= incomplete_after):
+                        items.append({"id": "f_2", "mock_id": "m_1", "started_at_ms": start,
+                                      "completed": False, "error_kind": "hang_cap",
+                                      "status": None})
+                return {"ok": True, "requests": items}
+            return {"ok": True}
+
+        report: dict[str, Any] = {"repo": {"path": None}}
+        step_check_slow(fake, report, plan, state, ["--env", "A=1"], clock=clock, sleep=sleep)
+        return calls, report, slept
+
+    def slow_plan(self) -> dict[str, Any]:
+        return {"mock_glob": "*/api/v1/catalog*", "capture": True, "app_id": "com.example.app",
+                "flow": choose_flow(self.flows, "android")}
+
+    def test_slow_check_measures_the_delay_and_the_held_request(self) -> None:
+        flow = str(self.flows / "results.yaml")
+        state = {"mock_id": "m_1", "selected_flow_paths": [flow]}
+        calls, report, slept = self.run_slow_check(self.slow_plan(), state, delayed_ms=3104,
+                                                   incomplete_after=3)
+        heads = [" ".join(argv[:3]) for argv in calls]
+        order = ["pretest check add", "pretest check begin", "network mock update",
+                 f"flow run {flow}", "network requests list", "network mock update",
+                 f"flow run {flow}", "network requests list", "network mock remove",
+                 "pretest check end"]
+        relevant = [h for h in heads if h in order]
+        # the hang phase polls the request list until the held request is recorded
+        collapsed = [h for i, h in enumerate(relevant)
+                     if not (i and h == relevant[i - 1] == "network requests list")]
+        self.assertEqual(collapsed, order)
+        add = calls[0]
+        self.assertEqual(add[add.index("--case") + 1], "slow")
+        updates = [argv for argv in calls if argv[:3] == ("network", "mock", "update")]
+        self.assertEqual(updates, [("network", "mock", "update", "m_1", "--delay", "3"),
+                                   ("network", "mock", "update", "m_1", "--hang")])
+        self.assertEqual(report["delayed_duration_s"], 3.104)
+        self.assertEqual(report["incomplete_requests"], 1)  # only m_1's, only after --hang
+        result = report["check_slow"]
+        self.assertEqual(result["hang_polls"], 3)
+        self.assertEqual(slept, [POLL_SECONDS, POLL_SECONDS])
+        self.assertEqual(result["incomplete_error_kinds"], ["hang_cap"])
+        self.assertEqual((result["delay_flow_run_id"], result["hang_flow_run_id"]),
+                         ("fr_delay", "fr_hang"))
+        self.assertEqual(result["verdict"], "inconclusive")
+        self.assertTrue(result["mock_removed"])
+        self.assertIsNone(state["mock_id"], "a removed mock is not removed again in restore")
+        run = next(argv for argv in calls if argv[:2] == ("flow", "run"))
+        self.assertEqual(run[3:], ("--env", "A=1"))
+
+    def test_slow_check_gives_up_after_the_hang_wait(self) -> None:
+        state = {"mock_id": "m_1", "selected_flow_paths": [str(self.flows / "results.yaml")]}
+        _, report, slept = self.run_slow_check(self.slow_plan(), state, delayed_ms=None,
+                                               incomplete_after=None)
+        self.assertIsNone(report["delayed_duration_s"])
+        self.assertEqual(report["incomplete_requests"], 0)
+        # waited the full HANG_WAIT_SECONDS after the hang replay, in POLL_SECONDS steps
+        self.assertEqual(sum(slept), HANG_WAIT_SECONDS)
+        self.assertEqual(set(slept), {POLL_SECONDS})
+        self.assertEqual(report["check_slow"]["verdict"], "blocked")
+        self.assertIn("delay_not_observed", evaluate({**self.good_report(), **{
+            k: report[k] for k in ("delayed_duration_s", "incomplete_requests")}}))
+
+    def test_slow_check_waits_after_the_replay_for_a_late_held_request(self) -> None:
+        # The held request starts 15 s into the 20 s replay; the proxy caps it 120 s
+        # later, 115 s after the replay returned. The wait must still be running then,
+        # although that is 136 s after the --hang update.
+        state = {"mock_id": "m_1", "selected_flow_paths": [str(self.flows / "results.yaml")]}
+        calls, report, slept = self.run_slow_check(self.slow_plan(), state, delayed_ms=3104,
+                                                   incomplete_after=None,
+                                                   incomplete_after_s=115)
+        self.assertEqual(report["incomplete_requests"], 1)
+        self.assertEqual(sum(slept), 115)
+        self.assertGreater(sum(slept) + 20 + 1, HANG_WAIT_SECONDS,
+                           "the wait outlasts HANG_WAIT_SECONDS from the --hang update")
+        self.assertEqual(report["check_slow"]["verdict"], "inconclusive")
+        heads = [argv[:3] for argv in calls]
+        self.assertLess(max(i for i, h in enumerate(heads) if h[:2] == ("flow", "run")),
+                        heads.index(("network", "mock", "remove")))
+
+    def test_slow_check_ends_the_check_and_removes_the_mock_on_failure(self) -> None:
+        calls: list[tuple[str, ...]] = []
+
+        def fake(*argv: str, timeout: float = CLI_TIMEOUT,
+                 expect_ok: bool = True) -> dict[str, Any]:
+            calls.append(argv)
+            if argv[:3] == ("pretest", "check", "add"):
+                return {"ok": True, "check_id": "chk-3"}
+            if argv[:3] == ("network", "mock", "update"):
+                raise StepFailed("autonom network mock update: invalid_value")
+            return {"ok": True, "verdict": "blocked"}
+
+        state = {"mock_id": "m_1"}
+        report: dict[str, Any] = {"repo": {"path": None}}
+        with self.assertRaises(StepFailed):
+            step_check_slow(fake, report, self.slow_plan(), state, [])
+        self.assertEqual(calls[-2][:3], ("network", "mock", "remove"))
+        self.assertEqual(calls[-1][:3], ("pretest", "check", "end"))
+        self.assertEqual(calls[-1][calls[-1].index("--verdict") + 1], "blocked")
+
+    def test_slow_check_is_skipped_without_a_mock(self) -> None:
+        calls: list[tuple[str, ...]] = []
+        report: dict[str, Any] = {}
+        step_check_slow(lambda *argv, **_: calls.append(argv) or {"ok": True}, report,
+                        {**self.slow_plan(), "mock_glob": None}, {}, [])
+        self.assertEqual(calls, [])
+        self.assertEqual(report["check_slow"]["skipped"], "no mock on --mock-path")
+
+    def test_rule_records_and_measures(self) -> None:
+        listing = {"requests": [
+            {"mock_id": "m_1", "started_at_ms": 10, "completed": True, "duration_ms": 3000},
+            {"mock_id": "m_1", "started_at_ms": 20, "completed": True, "duration_ms": 3300},
+            {"mock_id": "m_1", "started_at_ms": 5, "completed": True, "duration_ms": 9000},
+            {"mock_id": "m_2", "started_at_ms": 30, "completed": False},
+            {"mock_id": "m_1", "started_at_ms": 40, "completed": False, "duration_ms": 120000},
+            {"mock_id": "m_1", "started_at_ms": "50"}, "junk"]}
+        mine = rule_records(listing, "m_1", 10)
+        self.assertEqual(len(mine), 3)
+        self.assertEqual(delayed_duration_s(mine), 3.3)  # incomplete ones are not "delayed"
+        self.assertEqual(incomplete_count(mine), 1)
+        self.assertEqual(rule_records(listing, None, 0), [])
+        self.assertIsNone(delayed_duration_s([]))
 
     def test_make_repo_diff_selects_the_flow(self) -> None:
         if not shutil.which("git"):

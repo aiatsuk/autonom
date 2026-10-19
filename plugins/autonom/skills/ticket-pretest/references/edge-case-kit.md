@@ -30,10 +30,17 @@ cases the diff can plausibly break, not all 18.
 ### `slow` — Slow network
 
 - Risk: spinners never end, taps fire twice, or timeouts are missing on a slow link.
-- Verbs: `simulator network shape --value speed=edge --value delay=edge`, then
+- Verbs (`kit.py`): `simulator network shape --value speed=edge --value delay=edge`, then
   restore with `simulator network shape --value speed=full --value delay=none`.
-- Platform: Android emulator only. Shaping is the only way to slow traffic
-  today; a mock cannot delay its answer.
+  Shaping slows every request and is Android emulator only.
+- One slow request (both platforms): `network start`, `network attach` (both
+  with `--i-understand-mitm`), then
+  `network mock add --match '<url glob>' --json '<body>' --delay 3` (seconds,
+  more than 0 and at most 120, e.g. `2.5`; other requests are not held), do
+  the ticket's action, and undo with `network mock remove <id>`.
+- Proof: the request in `network requests list` with its `duration_ms` (about
+  the delay) and `mocked` true; cite it as `request:<id>`. Screenshots under the
+  mock are flagged as mocked data.
 - Look for: a loading state, buttons disabled while a request runs, no
   duplicate request in `network requests list`.
 
@@ -50,21 +57,29 @@ cases the diff can plausibly break, not all 18.
 ### `timeout` — Request never answers
 
 - Risk: a request that never completes leaves the screen stuck with no retry.
-- Verbs: `network start`, `network attach`,
+- Verbs (`kit.py`): `network start`, `network attach`,
   `simulator network shape --value speed=gsm --value delay=gprs`,
-  `network requests list` (look at `duration_ms` of the slow requests); restore
-  with `simulator network shape --value speed=full --value delay=none`.
-- Platform: the shaping step is Android emulator only; on iOS end the check
-  `not_covered`.
-- Current limits: shaping slows every request, it cannot make one hang. A mock
-  cannot delay or hold its answer, and a request that never completes is not
-  recorded (the capture writes a request when it finishes, so neither
-  `network requests list` nor `pretest health` can show it). Do not build this
-  case on mock delays or on spotting unfinished requests.
-- Look for: a loading state that ends, a timeout message and a way out, in
-  screenshots. When the evidence cannot show a real hang, end the check
-  `inconclusive` with these limits in `--note`. Mock delays and recording of
-  unfinished requests are a planned follow-up.
+  `network requests list`; restore with
+  `simulator network shape --value speed=full --value delay=none`. Shaping
+  slows every request and is Android emulator only; use the held mock below to
+  make one request hang.
+- Setup (both platforms): `network start`, `network attach` (both with
+  `--i-understand-mitm`), then `network mock add --match '<url glob>' --hang`
+  (or `network mock update <id> --hang` on an existing rule; not with
+  `--delay`). The matching request is held until the mock is removed or
+  disabled (it then goes on upstream) or for at most 120 s (then it is killed).
+- Do the ticket's action, then watch the screen while the request is held:
+  screenshots of the loading state and of what the app shows when its own
+  timeout fires.
+- Proof: the held request is recorded with `completed: false` and
+  `error_kind` (`hang_cap` when the 120 s cap killed it, `client_abort` when
+  the app cancelled it itself, `upstream_error` or `other`). It shows in
+  `network requests list` without a status and in the pack's requests per check
+  with `completed: false`; cite it as `request:<id>` next to the screenshot.
+- Undo: `network mock remove <id>` (this also releases a request still held).
+- Look for: a loading state that ends, a timeout message and a way out, no
+  frozen screen. `client_abort` shows the app gave up by itself; `hang_cap`
+  with the screen still spinning is the stuck case.
 
 ## App lifecycle
 
@@ -125,6 +140,11 @@ cases the diff can plausibly break, not all 18.
 - Risk: untranslated strings, wrong number or date formats, or overflow in longer languages.
 - Verbs: `simulator keyboard pin --value locale=<locale>`, `simulator keyboard reset`.
 - Platform: iOS only (`simulator keyboard` is refused on Android).
+- App language (iOS): the keyboard pin does not change the app's language. Set
+  it for one launch with launch arguments:
+  `autonom session launch <app-id> --fresh --arg=-AppleLanguages --arg='(ru)' --arg=-AppleLocale --arg=ru_RU`
+  (the `=` form keeps a value that starts with `-` from being read as a flag).
+  Undo by launching again without them.
 - Look for: untranslated strings, number and date formats, longer text overflowing.
 
 ### `permission-denied` — Permission denied
@@ -171,8 +191,12 @@ cases the diff can plausibly break, not all 18.
   Never double-tap anything that pays or buys; the forbidden-text guard refuses
   it anyway.
 - During a pre-test every point tap reads a fresh UI tree first, so taps can be
-  slower than the race. Pass only with an observed request count; otherwise
-  end the check `inconclusive` with that reason in `--note`.
+  slower than the race. A pass needs the observed request count: count the
+  requests in `network requests list` and end with
+  `pretest check end <id> --verdict pass --observed-count N` (an integer, 0 or
+  more; stored on the check and shown in `summary.md` and `summary.json`).
+  `--verdict pass` without it is refused with `race_needs_count`. When you
+  cannot count, end the check `inconclusive` with that reason in `--note`.
 
 ### `fast-back` — Back while loading
 
