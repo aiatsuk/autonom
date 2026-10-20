@@ -281,7 +281,7 @@ class PretestDocsTests(unittest.TestCase):
 class FollowupDocsTests(unittest.TestCase):
     """The pre-test follow-ups: the new verb and flags are in the CLI block
     (checked both ways above), walked through in USAGE, and each item has a
-    line under CHANGELOG's Unreleased section."""
+    line in the changelog section that shipped them."""
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -289,7 +289,11 @@ class FollowupDocsTests(unittest.TestCase):
         cls.documented = documented_surface()
         cls.usage = (ROOT / "docs/USAGE.md").read_text(encoding="utf-8")
         changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
-        cls.unreleased = changelog.split("## [Unreleased]", 1)[1].split("\n## [", 1)[0]
+        sections = {}
+        for chunk in changelog.split("\n## [")[1:]:
+            name, _, body = chunk.partition("]")
+            sections[name] = body
+        cls.release_notes = sections.get("Unreleased", "") + sections.get("0.36.2", "")
 
     def test_new_flags_exist_and_are_documented(self) -> None:
         expected = {
@@ -311,10 +315,10 @@ class FollowupDocsTests(unittest.TestCase):
                      "race_needs_count", "check_not_ended"):
             self.assertIn(text, self.usage)
 
-    def test_unreleased_names_every_item(self) -> None:
-        self.assertIn("### Added", self.unreleased)
-        self.assertIn("### Changed", self.unreleased)
-        self.assertIn("### Fixed", self.unreleased)
+    def test_release_notes_name_every_item(self) -> None:
+        self.assertIn("### Added", self.release_notes)
+        self.assertIn("### Changed", self.release_notes)
+        self.assertIn("### Fixed", self.release_notes)
         for text in ("--delay SECONDS", "--hang", "completed: false", "check amend",
                      "--observed-count", "stop --force", "verified_reason",
                      "is for <platform>", "connection_strategy=lazy", "Content-Type",
@@ -324,7 +328,7 @@ class FollowupDocsTests(unittest.TestCase):
                      "git_missing", "skipped_untracked", "not UTF-8", "not an object",
                      "--out` can be written", "--ticket <dir>", "--env NAME",
                      "flow-draft --out ''", "--adb <path>"):
-            self.assertIn(text, self.unreleased, text)
+            self.assertIn(text, self.release_notes, text)
 
 
 if __name__ == "__main__":

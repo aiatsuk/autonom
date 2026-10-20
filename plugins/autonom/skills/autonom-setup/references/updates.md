@@ -75,29 +75,25 @@ delete saved options, secrets, and data.
 
 ## Refresh the CLI separately
 
-Inspect the resolved `autonom` executable to find its maintained checkout or
-bundle. If its version is older, update that source and run
-`./scripts/install_cli.sh` from the maintained checkout. Plugin caches contain
-skills only; they are not a CLI installation source.
-
-When no maintained checkout is available, download the configured GitHub ref
-into a new directory (this example follows `main`):
+For a released marketplace plugin, use the helper beside the loaded setup skill:
 
 ```bash
-update_dir="$(mktemp -d)"
-git clone --depth 1 --branch main https://github.com/aiatsuk/autonom.git "$update_dir/autonom"
-cd "$update_dir/autonom"
-./scripts/build_release.sh
-tar xzf dist/autonom-<version>.tgz -C "$update_dir"
-"$update_dir/autonom-<version>/install.sh" --cli-only
-autonom version
+python3 <this-skill-directory>/scripts/install_runtime.py
 ```
 
-Substitute the downloaded manifest version for `<version>`. The bundle
-installer copies the CLI to its stable home (default `~/.local/share/autonom`),
-so it is safe to remove the temporary download after verification. Preserve
-any existing `AUTONOM_PREFIX` and `AUTONOM_BIN_DIR` overrides. `--cli-only`
-does not re-register agent marketplaces or install device tools.
+It installs exactly the manifest version from GitHub Releases and validates the
+checksum before running it. Use the returned absolute `executable` for `version`
+and `doctor`, including from Desktop where PATH may differ from a terminal.
+See the parent skill for custom paths, errors, and active-session deferral.
+A published release is required for this helper, even when the marketplace
+tracks `main`. If it is not published yet, keep the working runtime and report
+the mismatch; do not quietly fall back to the latest available release.
+
+If the user deliberately maintains a source checkout, preserve that workflow:
+update its configured branch without discarding local edits, then run
+`./scripts/install_cli.sh` there. Do not replace a development checkout with a
+release runtime unless the user asks to switch. Plugin caches contain skills
+and the setup helper; they do not contain the CLI itself.
 
 ## Verify and load the update
 

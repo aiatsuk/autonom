@@ -37,6 +37,10 @@ was launched from, and the active session is found from anywhere.
 
 ## First moves
 
+If `autonom` is missing after a marketplace install, use `autonom-setup` to
+install the matching release runtime. Use the absolute executable path it
+returns when Desktop or the shell has a different PATH.
+
 At the start of a new Autonom task, check the installed plugin and CLI versions
 against their configured source once. Use `autonom-setup` and its
 [update procedure](../autonom-setup/references/updates.md) to download and

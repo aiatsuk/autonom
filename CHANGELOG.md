@@ -7,7 +7,14 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
 
 ## [Unreleased]
 
+## [0.36.2] - 2026-10-20
+
 ### Added
+- **Marketplace runtime setup.** The setup skill installs the GitHub Release
+  matching the plugin version, verifies SHA-256 and the CLI version, and
+  returns an absolute launcher path usable from Desktop and CLI. It preserves
+  previous runtimes, refuses unrelated files and active device sessions, and
+  supports repeat installation without a source checkout.
 - **Slow and stuck mocks.** `network mock add|update --delay SECONDS`
   (0 < s ≤ 120) answers late without holding other requests; `--hang` holds
   the request until the rule is removed or disabled (it then goes upstream)
@@ -73,6 +80,12 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
   `pretest check amend … --observed-count N`; other cases are unchanged.
 
 ### Fixed
+- **Directory submission sources** split the Canvas implementation into smaller
+  modules; the iOS companion starts with an isolated environment.
+- **Public listing links** point to the documentation website and published
+  terms of service. The release bundle includes the terms and privacy policy.
+- **Bundles built on macOS** exclude AppleDouble metadata so the same archive
+  validation works on macOS and Linux.
 - **Android `clipboard get`** answers `clipboard_unavailable` ("Android does
   not let a shell read the clipboard (Android 10+)") with a hint: paste into a
   text field and read it with `ui find`.
