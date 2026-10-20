@@ -94,6 +94,17 @@ class BundlePreflightTests(unittest.TestCase):
                 self.assertIsNone(url.username)
                 self.assertIsNone(url.password)
 
+    def test_public_listing_uses_documentation_and_terms_urls(self) -> None:
+        plugin = ROOT / "plugins/autonom"
+        manifest = json.loads((plugin / ".codex-plugin/plugin.json").read_text())
+        interface = manifest["interface"]
+        self.assertEqual(manifest["homepage"], "https://autonom.yatsuk.me/")
+        self.assertEqual(interface["websiteURL"], manifest["homepage"])
+        self.assertEqual(interface["termsOfServiceURL"],
+                         "https://autonom.yatsuk.me/docs/terms/")
+        self.assertTrue((ROOT / "TERMS.md").is_file())
+        self.assertIn("MIT license", (ROOT / "TERMS.md").read_text())
+
 
 if __name__ == "__main__":
     unittest.main()
