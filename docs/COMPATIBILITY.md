@@ -89,6 +89,10 @@ strengthened, never silently weakened.
   `control_generation_stale`, `control_lease_expired` and `control_not_held`,
   and the warning codes `evidence_write_failed` and `session_unreadable`; see
   [Concurrent sessions and shared control](#concurrent-sessions-and-shared-control-unreleased).
+- The ticket pre-test follow-ups (0.36.2) add five codes,
+  `clipboard_unavailable`, `pretest_damaged`, `race_needs_count`,
+  `check_not_ended` and `git_missing`, and change three emissions; see
+  [Ticket pre-test follow-ups](#ticket-pre-test-follow-ups-0362).
 
 ## Response shape
 
@@ -467,6 +471,28 @@ Journal note: a Take over or Hand back sent as a `control` message over
 `/ws/control` writes a `control` journal record; the same change through
 HTTP `POST /control` writes none (only the Canvas command log). Lost and
 idle endings are journaled either way.
+
+### Ticket pre-test follow-ups (0.36.2)
+
+Error codes added (pinned by `tests/test_error_codes_additive.py`):
+
+| Code | Emitted by |
+| --- | --- |
+| `clipboard_unavailable` | Android `simulator clipboard get`: Android does not let a shell read the clipboard (Android 10+); the hint says to paste into a text field and read it with `ui find` |
+| `pretest_damaged` | a guarded device action (a CLI verb, a flow step, a Canvas input of any origin but `human`, a warm-up tap) and the pre-test verbs that need the active record while its `pretest.json` is unreadable; nothing is sent. `pretest status` answers `status: damaged` instead, and `pretest stop --force` recovers the record (also `pretest_damaged` when it cannot) |
+| `race_needs_count` | `pretest check end --verdict pass` of a `double-tap` check without `--observed-count N`; `pretest check amend --verdict pass` of one when neither `--observed-count` nor a count stored at `check end` exists |
+| `check_not_ended` | `pretest check amend` of a check that is added or open, not ended |
+| `git_missing` | `pretest start` when git is not on `PATH` |
+
+**Emitted codes that changed:**
+
+| Situation | Was | Now |
+| --- | --- | --- |
+| Android `simulator clipboard get` | `unsupported_on_platform` | `clipboard_unavailable` (iOS `clipboard get` is unchanged) |
+| `pretest start` git failures | `backend_failed` | `invalid_value` when git fails (a bad ref, not a repository; `reason` is git's first error line) or `--repo` is not a directory; `git_missing` when git is not on `PATH`. A git call that times out is still `backend_failed` |
+| `--env` without `NAME=` on the pre-test verbs (`pretest flows`, `pretest repro`, `pretest rerun`, `pretest warmup`) | `flow_command_invalid` | `invalid_value` (`flag: "--env"`). `flow run` and `proof` keep `flow_command_invalid` |
+
+An agent that matched an old code for these situations should match both.
 
 ### iOS UI recovery and `--session-id` (0.32.0)
 

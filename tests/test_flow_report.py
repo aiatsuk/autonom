@@ -531,6 +531,33 @@ class RenderEscapingTests(unittest.TestCase):
         self.assertIn("&lt;redacted&gt;", text)
         self.assertIn("safe log line", text)
 
+    def test_a_request_that_never_completed_names_its_kind_not_a_status(self) -> None:
+        manifest = {
+            "schema_version": 3, "status": "passed", "flow_name": "evidence",
+            "flow_path": "flow.yaml", "run_id": "fr_x", "app_id": "app",
+            "platform": "android", "target_id": "emulator-1",
+            "reproduction": "autonom flow run flow.yaml",
+            "steps": [{"index": 1, "command": "tapOn", "status": "passed",
+                       "duration_ms": 12, "attempts": 1}],
+            "network": {"available": True, "requests_by_step": [{
+                "step_index": 1, "requests": [
+                    {"method": "GET", "url": "https://api.example.test/held",
+                     "completed": False, "error_kind": "hang_cap", "status": None,
+                     "duration_ms": 120000, "mocked": True},
+                    {"method": "GET", "url": "https://api.example.test/gone",
+                     "completed": False, "error_kind": "<b>x</b>", "status": None},
+                    {"method": "GET", "url": "https://api.example.test/ok",
+                     "completed": True, "status": 204, "duration_ms": 5},
+                ],
+            }]},
+        }
+        text = flow_report.render_run_page(manifest, {}, standalone=True)
+        self.assertIn("never completed (hang_cap)", text)
+        self.assertNotIn("status None", text)
+        self.assertNotIn("status <b>None</b>", text)
+        self.assertIn("never completed (&lt;b&gt;x&lt;/b&gt;)", text)
+        self.assertIn("status <b>204</b>", text)
+
 
 if __name__ == "__main__":
     unittest.main()

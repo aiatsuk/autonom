@@ -1351,6 +1351,19 @@ class KitTests(unittest.TestCase):
         schema = json.loads((ROOT / "schemas/pretest-check-v1.schema.json").read_text())
         self.assertEqual(schema["$defs"]["kit_id"]["enum"], KIT_IDS)
 
+    def test_slow_and_timeout_use_a_delayed_or_held_mock(self) -> None:
+        # One request is slowed or held by a mock on both platforms; emulator
+        # network shaping slowed everything and was Android-only.
+        mock_verbs = {
+            "slow": "network mock add --match '<url glob>' --delay 3",
+            "timeout": "network mock add --match '<url glob>' --hang",
+        }
+        for case_id, mock_verb in mock_verbs.items():
+            with self.subTest(case=case_id):
+                self.assertEqual(kit_mod.get(case_id)["verbs"], [
+                    "network start", "network attach", mock_verb,
+                    "network requests list", "network mock remove <id>"])
+
     def test_tp016_coverage(self) -> None:
         checks = [
             {"check_id": "chk-1", "case": "offline", "state": "ended", "verdict": "pass",

@@ -354,9 +354,9 @@ undo the setup before the next check. Full setup, restore and platform notes:
 | Id | Case | Verbs |
 | --- | --- | --- |
 | `offline` | No network | `simulator network offline`, `simulator network online` |
-| `slow` | Slow network | `simulator network shape --value speed=edge --value delay=edge`, `simulator network shape --value speed=full --value delay=none` |
+| `slow` | Slow network | `network start`, `network attach`, `network mock add --match '<url glob>' --delay 3`, `network requests list`, `network mock remove <id>` |
 | `server-error` | Server error (5xx) | `network start`, `network attach`, `network mock add --match '<url glob>' --status 500`, `network mock remove <id>` |
-| `timeout` | Request never answers | `network start`, `network attach`, `simulator network shape --value speed=gsm --value delay=gprs`, `network requests list`, `simulator network shape --value speed=full --value delay=none` |
+| `timeout` | Request never answers | `network start`, `network attach`, `network mock add --match '<url glob>' --hang`, `network requests list`, `network mock remove <id>` |
 | `background-resume` | Background and resume | `ui key HOME`, `session launch <app-id>` |
 | `process-death` | Process death and restore | `session force-stop <app-id>`, `session launch <app-id>` |
 | `rotation` | Rotation | `flow run (setOrientation: landscape)`, `flow run (setOrientation: portrait)` |
@@ -372,15 +372,15 @@ undo the setup before the next check. Full setup, restore and platform notes:
 | `fast-back` | Back while loading | `ui tap --text '<action>'`, `ui key BACK` |
 | `deep-link` | Deep link | `open '<app link>'`, `session force-stop <app-id>`, `open '<app link>'` |
 
-Platform limits: `simulator network` (offline, slow, timeout) is Android-emulator
-only and refused on iOS (`unsupported_capability`); `simulator keyboard`
+Platform limits: `simulator network` (offline, and shaping every request) is
+Android-emulator only and refused on iOS (`unsupported_capability`); `simulator keyboard`
 (locale) is iOS only; `setOrientation` and `ui key BACK` are Android only. When
 a case cannot be set up on the target, end its check `not_covered` with the
 reason rather than faking it.
 
 Slow and timeout on one request (both platforms, with capture on): the table
-lists emulator network shaping, which slows everything and is Android-emulator
-only. To slow or stall just the request the ticket is about, use a mock:
+slows or stalls just the request the ticket is about with a mock. Answer a
+`--delay` mock with a body (`--json '<body>'`) when the app needs one:
 
 ```bash
 autonom network mock add --match '<url glob>' --json '<body>' --delay 3   # answers after 3 s

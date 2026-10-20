@@ -30,14 +30,15 @@ cases the diff can plausibly break, not all 18.
 ### `slow` — Slow network
 
 - Risk: spinners never end, taps fire twice, or timeouts are missing on a slow link.
-- Verbs (`kit.py`): `simulator network shape --value speed=edge --value delay=edge`, then
-  restore with `simulator network shape --value speed=full --value delay=none`.
-  Shaping slows every request and is Android emulator only.
-- One slow request (both platforms): `network start`, `network attach` (both
-  with `--i-understand-mitm`), then
-  `network mock add --match '<url glob>' --json '<body>' --delay 3` (seconds,
-  more than 0 and at most 120, e.g. `2.5`; other requests are not held), do
-  the ticket's action, and undo with `network mock remove <id>`.
+- Verbs (`kit.py`): `network start`, `network attach`,
+  `network mock add --match '<url glob>' --delay 3`, `network requests list`,
+  then undo with `network mock remove <id>`.
+- Setup (both platforms): `network start`, `network attach` (both with
+  `--i-understand-mitm`), then
+  `network mock add --match '<url glob>' --delay 3` (seconds, more than 0 and
+  at most 120, e.g. `2.5`; add `--json '<body>'` when the app needs a body;
+  other requests are not held), do the ticket's action, and undo with
+  `network mock remove <id>`.
 - Proof: the request in `network requests list` with its `duration_ms` (about
   the delay) and `mocked` true; cite it as `request:<id>`. Screenshots under the
   mock are flagged as mocked data.
@@ -58,11 +59,8 @@ cases the diff can plausibly break, not all 18.
 
 - Risk: a request that never completes leaves the screen stuck with no retry.
 - Verbs (`kit.py`): `network start`, `network attach`,
-  `simulator network shape --value speed=gsm --value delay=gprs`,
-  `network requests list`; restore with
-  `simulator network shape --value speed=full --value delay=none`. Shaping
-  slows every request and is Android emulator only; use the held mock below to
-  make one request hang.
+  `network mock add --match '<url glob>' --hang`, `network requests list`,
+  then undo with `network mock remove <id>`.
 - Setup (both platforms): `network start`, `network attach` (both with
   `--i-understand-mitm`), then `network mock add --match '<url glob>' --hang`
   (or `network mock update <id> --hang` on an existing rule; not with
