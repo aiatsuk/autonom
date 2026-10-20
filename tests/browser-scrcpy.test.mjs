@@ -6145,9 +6145,6 @@ async function iosWorld(t, { env = {}, companion = true } = {}) {
   await chmod(world.xcrun, 0o755);
   world.companion = join(world.directory, "companion-bin", "idb_companion");
   await mkdir(dirname(world.companion));
-  await writeFile(world.companion, `#!${process.execPath}\n${FAKE_IDB_COMPANION}`);
-  await chmod(world.companion, 0o755);
-  if (companion) await symlink(world.companion, join(world.bin, "idb_companion"));
   world.idbEvents = join(world.directory, "idb-events.jsonl");
   await writeFile(world.idbEvents, "");
   world.idbControl = join(world.directory, "idb-control");
@@ -6157,6 +6154,11 @@ async function iosWorld(t, { env = {}, companion = true } = {}) {
     FAKE_IDB_EVENTS: world.idbEvents, FAKE_IDB_CONTROL: world.idbControl, FAKE_SIM_STATE: world.simState,
     FAKE_PASTEBOARD: world.pasteboard,
   });
+  // Embed only the fake's controls: production no longer forwards ambient FAKE_* values.
+  const fixtureEnv = Object.fromEntries(Object.entries(world.env).filter(([key]) => key.startsWith("FAKE_IDB_")));
+  await writeFile(world.companion, `#!${process.execPath}\nconst fixtureEnv = ${JSON.stringify(fixtureEnv)};\n${FAKE_IDB_COMPANION.replaceAll("process.env.FAKE_IDB_", "fixtureEnv.FAKE_IDB_")}`);
+  await chmod(world.companion, 0o755);
+  if (companion) await symlink(world.companion, join(world.bin, "idb_companion"));
   // A companion a failed test left behind goes too, with the Canvas, before the folder is removed.
   world.children.push({
     exitCode: null, signalCode: null,

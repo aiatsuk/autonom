@@ -1168,7 +1168,9 @@ else {
 function fakeCompanion(t, env = {}) {
   const dir = tempDir(t, "idbf-");
   const binary = join(dir, "idb_companion");
-  writeFileSync(binary, `#!${process.execPath}\n${FAKE_COMPANION}`);
+  // The fake's controls are fixture data, not ambient variables inherited by production.
+  const fixtureEnv = { FAKE_EVENTS: join(dir, "events.jsonl"), ...env };
+  writeFileSync(binary, `#!${process.execPath}\nconst fixtureEnv = ${JSON.stringify(fixtureEnv)};\n${FAKE_COMPANION.replaceAll("process.env.FAKE_", "fixtureEnv.FAKE_")}`);
   chmodSync(binary, 0o755);
   const events = join(dir, "events.jsonl");
   writeFileSync(events, "");
