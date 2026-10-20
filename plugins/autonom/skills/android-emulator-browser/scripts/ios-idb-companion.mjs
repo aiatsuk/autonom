@@ -1583,6 +1583,20 @@ export function freeLoopbackPort() {
 
 const UDID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9-]{0,63}$/;
 
+// idb_companion needs the host's tool paths, home, temporary directory and locale,
+// not the coding agent's API keys or dynamic-loader overrides. Keep this an exact
+// allowlist: accepting a whole prefix (including LC_*) could carry unrelated secrets.
+const COMPANION_ENV_KEYS = Object.freeze([
+  "PATH", "HOME", "TMPDIR", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "DEVELOPER_DIR",
+]);
+
+/** A fresh environment for the local companion, including when the caller supplies one. */
+export function companionEnvironment(source = processEnv) {
+  return Object.fromEntries(COMPANION_ENV_KEYS
+    .filter((key) => typeof source[key] === "string")
+    .map((key) => [key, source[key]]));
+}
+
 /**
  * Owns one `idb_companion --udid <udid>` process. Emits `log` (line) and `exit`
  * ({ code, signal, expected }) events.
@@ -1622,7 +1636,7 @@ export class IdbCompanion extends EventEmitter {
       readyTimeoutMs: READY_TIMEOUT_MS,
       stopTimeoutMs: STOP_TIMEOUT_MS,
       spawn: nodeSpawn,
-      env: process.env,
+      env: companionEnvironment(),
       ...options,
       transport,
     };
@@ -1695,7 +1709,7 @@ export class IdbCompanion extends EventEmitter {
     const child = o.spawn(o.binary, args, {
       detached: true,
       stdio: ["ignore", "pipe", "pipe"],
-      env: o.env,
+      env: companionEnvironment(o.env),
     });
     this.#child = child;
     let markExited;
