@@ -229,7 +229,7 @@ class ActionsCase(EnvSandboxMixin, unittest.TestCase):
 
 
 class OpListTests(ActionsCase):
-    def test_the_action_tuples_are_the_contract_and_the_tools_lists_are_unchanged(self) -> None:
+    def test_the_action_tuples_and_tools_lists_match_the_contract(self) -> None:
         self.assertEqual(tools_mod.ACTION_READ_OPS,
                          ("captures.list", "record.status", "apps.candidates", "health"))
         self.assertEqual(tools_mod.ACTION_DEVICE_OPS,
@@ -241,7 +241,7 @@ class OpListTests(ActionsCase):
                          + tools_mod.ACTION_READ_OPS + tools_mod.ACTION_DEVICE_OPS
                          + tools_mod.ACTION_LOCAL_OPS + tools_mod.INTERNAL_OPS)
         self.assertEqual(len(set(tools_mod.OPS)), len(tools_mod.OPS))
-        self.assertEqual(len(tools_mod.READ_OPS), 7)
+        self.assertEqual(len(tools_mod.READ_OPS), 8)
         self.assertEqual(len(tools_mod.MUTATING_OPS), 15)
         self.assertEqual(set(self.tools.handlers), set(tools_mod.OPS))
 
