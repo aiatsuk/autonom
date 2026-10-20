@@ -54,6 +54,16 @@ NEW_CODES.update({
     "CONTROL_NOT_HELD": "control_not_held",
 })
 
+# Ticket pre-test follow-ups (0.36.2).
+FOLLOWUP_CODES = {
+    "CLIPBOARD_UNAVAILABLE": "clipboard_unavailable",
+    "PRETEST_DAMAGED": "pretest_damaged",
+    "RACE_NEEDS_COUNT": "race_needs_count",
+    "CHECK_NOT_ENDED": "check_not_ended",
+    "GIT_MISSING": "git_missing",
+}
+NEW_CODES.update(FOLLOWUP_CODES)
+
 EXISTING_CODES = {
     "FLOW_NOT_FOUND": "flow_not_found",
     "FLOW_FILE_NOT_FOUND": "flow_file_not_found",
@@ -99,6 +109,30 @@ class AdditiveErrorCodeTests(unittest.TestCase):
         for name, value in _code_constants().items():
             with self.subTest(code=name):
                 self.assertEqual(value, name.lower())
+
+    def test_compatibility_records_the_followup_codes_and_changes(self) -> None:
+        text = (ROOT / "docs/COMPATIBILITY.md").read_text(encoding="utf-8")
+        parts = text.split("### Ticket pre-test follow-ups (0.36.2)", 1)
+        self.assertEqual(len(parts), 2, "COMPATIBILITY.md has no 0.36.2 follow-ups section")
+        section = parts[1].split("\n### ", 1)[0]
+        for name, value in FOLLOWUP_CODES.items():
+            with self.subTest(code=name):
+                self.assertIn(f"| `{value}` |", section)
+        # each changed emission: the situation, what it was and what it is now
+        changes = {
+            "Android `simulator clipboard get`": ("`unsupported_on_platform`",
+                                                  "`clipboard_unavailable`"),
+            "`pretest start` git failures": ("`backend_failed`", "`invalid_value`",
+                                             "`git_missing`"),
+            "`--env`": ("`flow_command_invalid`", "`invalid_value`"),
+        }
+        rows = [line for line in section.splitlines() if line.startswith("| ")]
+        for situation, codes in changes.items():
+            with self.subTest(situation=situation):
+                row = next((line for line in rows if line.startswith(f"| {situation}")), None)
+                self.assertIsNotNone(row, situation)
+                for code in codes:
+                    self.assertIn(code, row)
 
 
 if __name__ == "__main__":

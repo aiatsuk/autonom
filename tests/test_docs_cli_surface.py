@@ -331,5 +331,85 @@ class FollowupDocsTests(unittest.TestCase):
             self.assertIn(text, self.release_notes, text)
 
 
+SKILL_DIR = ROOT / "plugins/autonom/skills/ticket-pretest"
+
+
+def _load_kit():
+    spec = importlib.util.spec_from_file_location(
+        "autonom_pretest_kit", ROOT / "scripts/autonom_lib/pretest/kit.py")
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+class KitDocsTests(unittest.TestCase):
+    """The ticket-pretest skill's kit table and kit reference mirror `kit.py`."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.kit = _load_kit().KIT
+        cls.skill = (SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
+        cls.reference = (SKILL_DIR / "references/edge-case-kit.md").read_text(encoding="utf-8")
+
+    def table_rows(self) -> dict[str, tuple[str, list[str]]]:
+        section = self.skill.split("## The edge-case kit", 1)[1].split("\n## ", 1)[0]
+        rows: dict[str, tuple[str, list[str]]] = {}
+        for line in section.splitlines():
+            match = re.match(r"^\| `([a-z-]+)` \| ([^|]+) \| (.+) \|$", line)
+            if match:
+                rows[match.group(1)] = (match.group(2).strip(),
+                                        re.findall(r"`([^`]+)`", match.group(3)))
+        return rows
+
+    def reference_section(self, case_id: str) -> str:
+        parts = self.reference.split(f"### `{case_id}` — ", 1)
+        self.assertEqual(len(parts), 2, f"the kit reference has no section for {case_id}")
+        return parts[1].split("\n### ", 1)[0].split("\n## ", 1)[0]
+
+    def test_the_skill_table_lists_every_case_with_the_kit_verbs(self) -> None:
+        rows = self.table_rows()
+        self.assertEqual(list(rows), [case["id"] for case in self.kit])
+        for case in self.kit:
+            with self.subTest(case=case["id"]):
+                self.assertEqual(rows[case["id"]], (case["title"], case["verbs"]))
+
+    def test_slow_and_timeout_name_the_mock_verbs_and_no_shaping(self) -> None:
+        rows = self.table_rows()
+        for case in self.kit:
+            if case["id"] not in ("slow", "timeout"):
+                continue
+            with self.subTest(case=case["id"]):
+                section = self.reference_section(case["id"])
+                self.assertTrue(section.startswith(case["title"]), section[:80])
+                flat = " ".join(section.split())  # verbs may wrap across lines
+                for verb in case["verbs"]:
+                    self.assertIn(f"`{verb}`", flat, verb)
+                self.assertNotIn("simulator network shape", section)
+                self.assertNotIn("simulator network shape", " ".join(rows[case["id"]][1]))
+                self.assertFalse(any("simulator network shape" in verb
+                                     for verb in case["verbs"]))
+
+
+class UnreleasedNotesTests(unittest.TestCase):
+    """Each follow-up after 0.36.2 has a line in the changelog's Unreleased section."""
+
+    def test_unreleased_names_every_followup(self) -> None:
+        changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        sections = {}
+        for chunk in changelog.split("\n## [")[1:]:
+            name, _, body = chunk.partition("]")
+            sections[name] = body
+        notes = " ".join(sections.get("Unreleased", "").split())
+        for text in ("`slow` and `timeout`", "--delay 3", "`--hang`",
+                     "never completed (<error_kind>)", "status None",
+                     "Canvas", "pretest warmup", "pretest_damaged",
+                     "docs/COMPATIBILITY.md", "clipboard_unavailable",
+                     "race_needs_count", "check_not_ended", "git_missing",
+                     "inline `--json`", "Content-Type: application/json",
+                     "also next to other headers", "header-only `network mock update`"):
+            self.assertIn(text, notes, text)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -544,6 +544,33 @@ class WalkHelperTests(unittest.TestCase):
         self.assertEqual(unread["hints"][0]["status"], "known")
         self.assertIn("backend_failed", unread["hints"][0]["reason"])
 
+    def test_a_damaged_pretest_refusal_stops_the_walk_like_a_spent_budget(self) -> None:
+        tap = json.dumps({"text": "Next", "mode": "contains"})
+        graph = {"screens": {"a": {}, "b": {}, "c": {}},
+                 "transitions": {
+                     "a->b": {"from": "a", "to": "b", "command": "tapOn", "detail": tap,
+                              "success": 1},
+                     "a->c": {"from": "a", "to": "c", "command": "tapOn", "detail": tap,
+                              "success": 1}}}
+        hints = [{"screen_id": sid, "labels": [], "matched_area": "lib", "hint": True}
+                 for sid in ("b", "c")]
+        for code in (errors.BUDGET_EXHAUSTED, errors.PRETEST_DAMAGED):
+            with self.subTest(code=code):
+                refusal = errors.AutonomError(code, f"{code} refused the tap")
+                with mock.patch.object(warmup_mod, "_screen", return_value=("a", [])), \
+                        mock.patch.object(warmup_mod, "_replay_tap",
+                                          side_effect=refusal) as replay:
+                    result = warmup_mod.walk({}, object(), graph, hints)
+                self.assertEqual(replay.call_count, 1)  # the walk stopped at the refusal
+                self.assertEqual(result["refusals"],
+                                 [{"error_code": code, "error": f"{code} refused the tap",
+                                   "screen_id": "b"}])
+                first, second = result["hints"]
+                self.assertEqual((first["status"], first["reason"], first["replayed"]),
+                                 ("known", f"replay stopped: {code}", 0))
+                self.assertEqual((second["status"], second["reason"]),
+                                 ("known", f"walk stopped by {code}"))
+
 
 # --- CLI ------------------------------------------------------------------------------------------
 

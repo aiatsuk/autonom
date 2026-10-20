@@ -30,8 +30,10 @@
 
 No exploration happens beyond recorded transitions. Every flow step and
 every replayed tap goes through the pre-test guard: it counts against the
-budget and forbidden text is refused. A guard refusal stops the walk; the
-hints left are reported ``known`` with the refusal's code as their reason.
+budget and forbidden text is refused. A guard refusal (a damaged pre-test
+record included, ``pretest_damaged``) stops the walk and is listed in
+``refusals``; the hints left are reported ``known`` with the refusal's code
+as their reason.
 Warm-up refuses while a check is open (``check_already_open``): its actions
 would land in that check's window.
 """
@@ -63,7 +65,7 @@ SETTLE_TIMEOUT_MS = 4000
 SETTLE_QUIET_MS = 400
 MAX_PATH = 12
 GUARD_CODES = frozenset({errors.BUDGET_EXHAUSTED, errors.FORBIDDEN_ACTION,
-                         errors.APP_NOT_ALLOWED})
+                         errors.APP_NOT_ALLOWED, errors.PRETEST_DAMAGED})
 # action-detail selector keys (``ui tap``) and flow selector keys (``describe``)
 _DETAIL_FIELDS = ("text", "desc", "resource_id", "class_name", "package", "role",
                   "clickable", "enabled", "focusable", "focused", "scrollable",

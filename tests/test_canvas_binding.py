@@ -253,6 +253,38 @@ class BridgeSessionBindingTests(BindingCase):
         self.assertEqual(len(self.input_calls()), 1)
 
 
+# --- bridge: pre-test guard refusals -----------------------------------------------
+
+
+class BridgeGuardRefusalTests(BindingCase):
+    def test_a_damaged_pretest_refusal_is_journaled_like_a_spent_budget(self) -> None:
+        record = self.start()
+        for code in (errors.BUDGET_EXHAUSTED, errors.PRETEST_DAMAGED):
+            with self.subTest(code=code):
+                self.log.unlink(missing_ok=True)
+                before = len(self.journal(record))
+                refusal = errors.AutonomError(code, f"{code}: no input was sent")
+                with mock.patch("autonom_lib.pretest.guard.before_mutation",
+                                side_effect=refusal):
+                    answer = self.bridge_answer({
+                        "id": 4, "op": "tap", "origin": "agent",
+                        "payload": {"x": 10, "y": 20},
+                        "session_id": record["session_id"]})
+                self.assertFalse(answer["ok"], answer)
+                self.assertEqual(answer["error_code"], code)
+                self.assertEqual(self.input_calls(), [])
+                added = self.journal(record)[before:]
+                self.assertEqual(
+                    [(entry.get("verb"), entry.get("ok"), entry.get("error_code"),
+                      entry.get("origin")) for entry in added],
+                    [("ui tap", False, code, "agent")])
+
+    def test_every_guard_refusal_code_is_journaled(self) -> None:
+        self.assertEqual(set(bridge.GUARD_REFUSALS),
+                         {errors.BUDGET_EXHAUSTED, errors.FORBIDDEN_ACTION,
+                          errors.APP_NOT_ALLOWED, errors.PRETEST_DAMAGED})
+
+
 # --- bridge: control admission -----------------------------------------------------
 
 

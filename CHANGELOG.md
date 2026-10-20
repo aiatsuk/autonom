@@ -7,6 +7,32 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
 
 ## [Unreleased]
 
+### Changed
+- **The edge-case kit's `slow` and `timeout` cases use a mock** instead of
+  `simulator network shape`: `network start`, `network attach`,
+  `network mock add --match '<url glob>' --delay 3` (for `timeout`:
+  `--hang`), `network requests list`, `network mock remove <id>`. One request
+  is slowed or held, on Android and on the iOS Simulator. `pretest kit`, the
+  ticket-pretest skill's kit table and its kit reference list the same verbs.
+- **The flow run evidence page** shows a request that never completed as
+  "never completed (<error_kind>)" instead of "status None"; a completed
+  request still shows its status.
+
+### Fixed
+- **A damaged pre-test record refuses Canvas input and warm-up taps like the
+  other guard refusals:** the Canvas bridge journals the refused input with
+  `pretest_damaged`, and `pretest warmup` lists it in `refusals` and stops the
+  walk instead of trying the next hint.
+- **`docs/COMPATIBILITY.md` lists the 0.36.2 error codes** (`clipboard_unavailable`,
+  `pretest_damaged`, `race_needs_count`, `check_not_ended`, `git_missing`) and
+  the emissions that changed: Android `simulator clipboard get`, pre-test git
+  failures and `--env` on the pre-test verbs.
+- **Missing from the 0.36.2 notes:** an inline `--json` mock body that looks
+  like JSON (starts with `{` or `[`) is served with an implicit
+  `Content-Type: application/json` whenever no Content-Type `--header` is
+  given, also next to other headers; a header-only `network mock update` that
+  names no Content-Type keeps it.
+
 ## [0.36.2] - 2026-10-20
 
 ### Added

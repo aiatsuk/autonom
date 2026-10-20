@@ -21,7 +21,8 @@ While a pre-test is active on this target, input with the `human` origin runs
 inside `pretest.guard.exempt()`: a QA person's own taps are journaled (with the
 pre-test and open check ids) but never counted against the budget or refused.
 Input of every other origin goes through the same guard as the CLI's verbs and
-can be refused (`budget_exhausted`, `forbidden_action`); a refusal is journaled
+can be refused (`budget_exhausted`, `forbidden_action`, `app_not_allowed`, or
+`pretest_damaged` when the active pre-test record is damaged); a refusal is journaled
 with its code and nothing reaches the device. A `record` only journals input
 Canvas already streamed, so it is never counted or refused.
 
@@ -94,8 +95,10 @@ MAX_SCROLL = 1_000_000.0
 MAX_TEXT = 64 * 1024
 # The operations that send input to the device.
 INPUT_OPS = ("tap", "swipe", "key", "text")
-# The pre-test guard's refusals: journaled with their code (tp-006).
-GUARD_REFUSALS = (errors.BUDGET_EXHAUSTED, errors.FORBIDDEN_ACTION, errors.APP_NOT_ALLOWED)
+# The pre-test guard's refusals: journaled with their code (tp-006). A damaged
+# active pre-test record refuses every guarded input the same way.
+GUARD_REFUSALS = (errors.BUDGET_EXHAUSTED, errors.FORBIDDEN_ACTION, errors.APP_NOT_ALLOWED,
+                  errors.PRETEST_DAMAGED)
 # The ops that drive the device and therefore pass the host lease admission.
 LEASED_OPS = ("tap", "swipe", "key", "text")
 # The lease ops of the Canvas (contract 4.3): they use the bridge's own target,

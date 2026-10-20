@@ -355,11 +355,19 @@ def _render_requests(manifest: dict[str, Any], index: int) -> str:
             "response_headers": request.get("response_headers_preview") or {},
             "response_body": request.get("response_body_preview"),
         }
+        if request.get("completed") is False:
+            # A request that never got an answer has no status: name why.
+            kind = request.get("error_kind")
+            kind = kind.strip() if isinstance(kind, str) else ""
+            outcome = (f"<b>never completed ({e(kind)})</b>" if kind
+                       else "<b>never completed</b>")
+        else:
+            outcome = f"status <b>{e(str(request.get('status','')))}</b>"
         rows.append(
             "<article class='request'>"
             f"<p><b>{e(str(request.get('method','')))}</b> "
             f"<code>{e(str(request.get('url','')))}</code><br>"
-            f"status <b>{e(str(request.get('status','')))}</b> · "
+            f"{outcome} · "
             f"{e(str(request.get('duration_ms',0)))} ms{e(mocked)}</p>"
             f"<pre>{e(json.dumps(previews, ensure_ascii=False, indent=2))}</pre>"
             "</article>")
