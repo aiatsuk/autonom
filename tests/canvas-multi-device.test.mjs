@@ -117,6 +117,12 @@ if (verb === "session" && action === "start") {
   console.log(JSON.stringify({ ok: true, avd: flag("--avd"), serial, target_id: serial, already_running: false, port: Number(port) }));
 } else if (verb === "devices" && action === "shutdown") {
   console.log(JSON.stringify({ ok: true }));
+} else if (verb === "devices" && action === undefined) {
+  // The machine listing --discover-bootable reads: FAKE_AVDS names the AVDs; FAKE_AVDS_BROKEN
+  // prints no JSON, FAKE_AVDS_HANG_MS answers late.
+  if (process.env.FAKE_AVDS_BROKEN) { console.log("not json"); process.exit(1); }
+  if (process.env.FAKE_AVDS_HANG_MS) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Number(process.env.FAKE_AVDS_HANG_MS));
+  console.log(JSON.stringify({ ok: true, devices: [], warnings: [], avds: JSON.parse(process.env.FAKE_AVDS ?? "[]") }));
 } else if (verb === "logs") {
   setInterval(() => {}, 1000);
 } else {
@@ -341,10 +347,11 @@ test("two --device on a fake adb: both attach with their own sessions, routes pe
   assert.equal(first.url, `/d/${ID_A}/`);
   assert.deepEqual(first.session, { id: "s_emulator5580", started_by_canvas: true, reused: false });
   assert.equal(first.session_error, null);
-  // The first tab holds one tile: the second device went to a new tab.
+  // The first tab grew to two tiles: both devices sit side by side in it.
   const workspace = (await api(canvas, "GET", "/api/workspace")).json;
-  assert.equal(workspace.tabs.length, 2);
-  assert.notEqual(first.tab, second.tab);
+  assert.equal(workspace.tabs.length, 1);
+  assert.equal(workspace.tabs[0].layout, 2);
+  assert.equal(first.tab, second.tab);
   // Sessions start alongside, with this Canvas as their starter.
   const starts = await autonomCalls(world, "session start");
   assert.equal(starts.length, 2);
@@ -431,7 +438,7 @@ test("two --device on a fake adb: both attach with their own sessions, routes pe
   assert.deepEqual(stops.map((args) => args.slice(-2)), [["--session-id", "s_emulator5582"]]);
   const left = (await api(canvas, "GET", "/api/workspace")).json;
   assert.deepEqual(left.devices.map((device) => device.id), [ID_A]);
-  assert.deepEqual(left.tabs.find((tab) => tab.id === second.tab).slots, [null]);
+  assert.deepEqual(left.tabs.find((tab) => tab.id === second.tab).slots, [{ device: ID_A, present: true }, null]);
   assert.equal((await api(canvas, "GET", `/d/${encodeURIComponent(ID_B)}/status`)).status, 404);
   await canvas.child.kill("SIGTERM");
   assert.equal((await canvas.exited).code, 0);
@@ -567,10 +574,10 @@ test("stop ends the Canvas's own sessions; a restart restores the tabs and re-at
   }, 5000, "the detached session stop");
   assert.deepEqual(stops.map((args) => args.at(-1)), ["s_emulator5582"]);
   const saved = JSON.parse(readFileSync(join(world.home, "canvas", "workspaces", "default.json"), "utf8"));
-  assert.deepEqual(saved.tabs.map((tab) => tab.slots.map((slot) => slot?.target ?? null)), [[A], [B]],
+  assert.deepEqual(saved.tabs.map((tab) => tab.slots.map((slot) => slot?.target ?? null)), [[A, B]],
     "the file holds the devices attached at stop");
 
-  // Restart without --device: both tabs come back with their ids, both devices attach again.
+  // Restart without --device: the tab comes back with its id, both devices attach again.
   const again = await startCanvas(world, ["--workspace", "default"]);
   const restored = await liveDevices(again, 2);
   const restoredTabs = (await api(again, "GET", "/api/workspace")).json.tabs;
@@ -669,7 +676,7 @@ test("absent devices: placed but not running, attached once their target appears
   const workspace = (await api(canvas, "GET", "/api/workspace")).json;
   assert.deepEqual(workspace.absent.map((ref) => [ref.id, ref.bootable]), [[ID_B, null]]);
   const tab = workspace.tabs.find((item) => item.id === workspace.absent[0].tab);
-  assert.deepEqual(tab.slots, [{ device: ID_B, present: false }]);
+  assert.deepEqual(tab.slots, [{ device: ID_A, present: true }, { device: ID_B, present: false }]);
   await writeFile(world.devicesFile, JSON.stringify([A, B]));
   await liveDevices(canvas, 2);
   canvas.child.kill("SIGTERM");
@@ -681,7 +688,7 @@ test("boot jobs: an allowed AVD boots, attaches as booted by the Canvas and is s
   const canvas = await startCanvas(world, ["--split", "--bootable", "avd:Autonom_Split2@5586", "--shutdown-booted"]);
   const targets = (await api(canvas, "GET", "/api/targets")).json;
   assert.deepEqual(targets.bootable, [{ kind: "avd", name: "Autonom_Split2", port: 5586, udid: null,
-    label: "Autonom_Split2", running: false, target: null, job: null }]);
+    label: "Autonom_Split2", runtime: null, running: false, target: null, job: null }]);
   const started = await api(canvas, "POST", "/api/boot", { body: { kind: "avd", name: "Autonom_Split2" } });
   assert.equal(started.status, 202);
   assert.match(started.json.job.id, /^b_[0-9a-f]{8}$/);
@@ -711,6 +718,116 @@ test("boot jobs: an allowed AVD boots, attaches as booted by the Canvas and is s
     return calls.length ? calls : null;
   }, 5000, "the shutdown");
   assert.deepEqual(shutdowns[0].slice(-4), ["--serial", "emulator-5586", "devices", "shutdown"]);
+});
+
+// xcrun simctl: nothing booted; one available iOS Simulator, one watchOS one (never bootable here).
+const SIM_UDID = "45A342A1-AA2F-4F40-8EFD-F0D0C590ECE5";
+const FAKE_XCRUN = String.raw`
+const args = process.argv.slice(2).join(" ");
+if (args === "simctl list devices booted -j") {
+  console.log(JSON.stringify({ devices: {} }));
+} else if (args === "simctl list devices available -j") {
+  console.log(JSON.stringify({ devices: {
+    "com.apple.CoreSimulator.SimRuntime.iOS-27-0": [
+      { udid: "${SIM_UDID}", name: "iPhone 17", state: "Shutdown", isAvailable: true },
+      { udid: "11111111-2222-3333-4444-555555555555", name: "Broken", state: "Shutdown", isAvailable: false }],
+    "com.apple.CoreSimulator.SimRuntime.watchOS-12-0": [
+      { udid: "66666666-7777-8888-9999-000000000000", name: "Watch", state: "Shutdown", isAvailable: true }],
+  } }));
+} else {
+  process.exit(1);
+}
+`;
+
+test("--discover-bootable: every AVD and iOS Simulator of the machine can be booted", async (t) => {
+  const world = await makeWorld(t, { devices: [A], env: {
+    FAKE_AVDS: JSON.stringify(["Autonom_Fast", "Autonom_Split2", "Pixel_9", "bad name"]) } });
+  const fakeXcrun = join(world.directory, "fake-xcrun.mjs");
+  await writeFile(fakeXcrun, `#!${process.execPath}
+${FAKE_XCRUN}`);
+  await chmod(fakeXcrun, 0o755);
+  const canvas = await startCanvas(world, ["--split", "--simctl", fakeXcrun, "--discover-bootable",
+    "--bootable", "avd:Autonom_Split2@5586"]);
+  const targets = (await api(canvas, "GET", "/api/targets")).json;
+  // The --bootable entry first with its port; then the others; a running AVD shows as running.
+  assert.deepEqual(targets.bootable.map((item) => [item.kind, item.label, item.port, item.runtime, item.running]), [
+    ["avd", "Autonom_Split2", 5586, null, false],
+    ["avd", "Autonom_Fast", null, null, true],
+    ["avd", "Pixel_9", null, null, false],
+    ["simulator", "iPhone 17", null, "iOS 27.0", false],
+  ]);
+  assert.equal(targets.bootable[3].udid, SIM_UDID);
+  // A discovered AVD boots without a port: `devices boot` picks one.
+  const started = await api(canvas, "POST", "/api/boot", { body: { kind: "avd", name: "Pixel_9", attach: false } });
+  assert.equal(started.status, 202, JSON.stringify(started.json));
+  const job = await waitFor(async () => {
+    const { json } = await api(canvas, "GET", `/api/boot/${started.json.job.id}`);
+    return json.job.finished_at ? json.job : null;
+  }, 10_000, "the boot job");
+  assert.equal(job.state, "done", JSON.stringify(job));
+  const boots = await autonomCalls(world, "devices boot");
+  assert.deepEqual(boots[0].slice(boots[0].indexOf("devices")), ["devices", "boot", "--avd", "Pixel_9", "--timeout", "180"]);
+  // What the machine does not list stays refused.
+  for (const body of [{ kind: "avd", name: "Nope" }, { kind: "simulator", udid: "66666666-7777-8888-9999-000000000000" }]) {
+    const refused = await api(canvas, "POST", "/api/boot", { body });
+    assert.equal(refused.status, 403);
+    assert.equal(refused.json.error_code, "boot_not_allowed");
+  }
+  canvas.child.kill("SIGTERM");
+  await canvas.exited;
+});
+
+test("an attach with no tab named grows the active tab to the next layout", async (t) => {
+  const world = await makeWorld(t);
+  const canvas = await startCanvas(world, ["--split"]);
+  for (const target of [A, B]) {
+    const attached = await api(canvas, "POST", "/api/devices", { body: { platform: "android", target } });
+    assert.equal(attached.status, 201, JSON.stringify(attached.json));
+  }
+  const workspace = (await api(canvas, "GET", "/api/workspace")).json;
+  assert.equal(workspace.tabs.length, 1);
+  assert.equal(workspace.tabs[0].layout, 2);
+  assert.deepEqual(workspace.tabs[0].slots.map((slot) => slot?.device ?? null), [ID_A, `android~${B}`]);
+  // The same device again stays where it is.
+  const again = await api(canvas, "POST", "/api/devices", { body: { platform: "android", target: A } });
+  assert.equal(again.status, 200);
+  assert.equal(again.json.attached, false);
+  assert.equal((await api(canvas, "GET", "/api/workspace")).json.tabs[0].layout, 2);
+  // A refused attach makes no room: no grown layout, no new tab.
+  const missing = await api(canvas, "POST", "/api/devices", { body: { platform: "android", target: "emulator-5999" } });
+  assert.equal(missing.status, 404);
+  assert.equal(missing.json.error_code, "target_not_found");
+  const after = (await api(canvas, "GET", "/api/workspace")).json;
+  assert.deepEqual(after.tabs.map((tab) => tab.layout), [2]);
+  canvas.child.kill("SIGTERM");
+  await canvas.exited;
+});
+
+test("attaches at the same moment each find room: none is refused tab_full", async (t) => {
+  const world = await makeWorld(t);
+  const canvas = await startCanvas(world, ["--split"]);
+  const answers = await Promise.all([A, B].map((target) =>
+    api(canvas, "POST", "/api/devices", { body: { platform: "android", target } })));
+  assert.deepEqual(answers.map((answer) => answer.status), [201, 201], JSON.stringify(answers.map((a) => a.json)));
+  const workspace = (await api(canvas, "GET", "/api/workspace")).json;
+  assert.deepEqual(workspace.tabs.map((tab) => tab.slots.filter(Boolean).length), [2]);
+  canvas.child.kill("SIGTERM");
+  await canvas.exited;
+});
+
+test("--discover-bootable: a broken or slow machine listing leaves the --bootable list", async (t) => {
+  for (const env of [{ FAKE_AVDS_BROKEN: "1" }, { FAKE_AVDS_HANG_MS: "8000", FAKE_AVDS: JSON.stringify(["Pixel_9"]) }]) {
+    const world = await makeWorld(t, { devices: [], env });
+    const canvas = await startCanvas(world, ["--split", "--discover-bootable", "--bootable", "avd:Autonom_Split2@5586"]);
+    const started = Date.now();
+    const targets = (await api(canvas, "GET", "/api/targets")).json;
+    assert.ok(Date.now() - started < 6000, `GET /api/targets took ${Date.now() - started} ms`);
+    assert.deepEqual(targets.bootable.map((item) => item.label), ["Autonom_Split2"], JSON.stringify(env));
+    const refused = await api(canvas, "POST", "/api/boot", { body: { kind: "avd", name: "Pixel_9" } });
+    assert.equal(refused.json.error_code, "boot_not_allowed");
+    canvas.child.kill("SIGTERM");
+    await canvas.exited;
+  }
 });
 
 test("the single-device Canvas keeps its behaviour and answers the additive routes", async (t) => {

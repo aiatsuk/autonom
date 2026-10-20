@@ -111,6 +111,16 @@ class Handler(BaseHTTPRequestHandler):
             if body.get("target") == "clash-target":
                 return self.answer(409, {"ok": False, "error": "In use", "error_code": "workspace_in_use",
                                          "hint": None, "port": 1, "message": "x", "code": "y"})
+            if body.get("target") == "odd-target":
+                return self.answer(201, {"ok": True, "device": "not an object"})
+            if body.get("target") == "cut-target":
+                self.send_response(201)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", "500")
+                self.end_headers()
+                self.wfile.write(b'{"ok": true')
+                self.wfile.flush()
+                return
             if body.get("target") == "busy-target":
                 return self.answer(409, {"ok": False, "error": "Tab Canvas 1 is full",
                                          "error_code": "tab_full", "hint": "Pick another tab",
@@ -301,24 +311,46 @@ class ModeSelectionTests(CanvasCliCase):
         self.assertIn("--workspace", argv)
         self.assertNotIn("--target", argv)
 
-    def test_a_target_flag_keeps_the_single_canvas_command_byte_for_byte(self) -> None:
-        argv = self.node_run(self.cli("--serial", SERIAL, "canvas", "serve"))["argv"]
+    def test_single_keeps_the_single_canvas_command_byte_for_byte(self) -> None:
+        argv = self.node_run(self.cli("--serial", SERIAL, "canvas", "serve", "--single"))["argv"]
         self.assertEqual(argv, self.legacy_argv())
         self.node_out.unlink()
-        argv_leaf = self.node_run(self.cli("canvas", "serve", "--serial", SERIAL))["argv"]
+        argv_leaf = self.node_run(self.cli("canvas", "serve", "--single", "--serial", SERIAL))["argv"]
         self.assertEqual(argv_leaf, self.legacy_argv())
 
-    def test_one_device_is_the_single_canvas(self) -> None:
-        argv = self.node_run(self.cli("canvas", "serve", "--device", f"android:{SERIAL}"))["argv"]
+    def test_single_with_one_device_is_the_single_canvas(self) -> None:
+        argv = self.node_run(self.cli("canvas", "serve", "--single", "--device", f"android:{SERIAL}"))["argv"]
         self.assertEqual(argv, self.legacy_argv())
         self.node_out.unlink()
-        argv = self.node_run(self.cli("canvas", "serve", "--device", f"ios:{UDID}"))["argv"]
+        argv = self.node_run(self.cli("canvas", "serve", "--single", "--device", f"ios:{UDID}"))["argv"]
         self.assertEqual(argv, self.legacy_argv(platform="ios", target=UDID))
+
+    def test_a_target_flag_or_one_device_is_the_first_device_of_a_workspace(self) -> None:
+        for argv in (("--serial", SERIAL, "canvas", "serve"), ("canvas", "serve", "--serial", SERIAL),
+                     ("canvas", "serve", "--device", f"android:{SERIAL}")):
+            with self.subTest(argv=argv):
+                node_argv = self.node_run(self.cli(*argv))["argv"]
+                self.assertEqual(node_argv[node_argv.index("--workspace") + 1], "default")
+                self.assertEqual([node_argv[i + 1] for i, item in enumerate(node_argv) if item == "--device"],
+                                 [f"android:{SERIAL}"])
+                for absent in ("--target", "--platform"):
+                    self.assertNotIn(absent, node_argv)
+                self.assertIn("--discover-bootable", node_argv)
+                self.node_out.unlink()
+        node_argv = self.node_run(self.cli("canvas", "serve", "--device", f"ios:{UDID}"))["argv"]
+        self.assertEqual(node_argv[node_argv.index("--device") + 1], f"ios:{UDID}")
+
+    def test_bootable_only_turns_the_machine_list_off(self) -> None:
+        argv = self.node_run(self.cli("canvas", "serve", "--bootable-only"))["argv"]
+        self.assertNotIn("--discover-bootable", argv)
+        self.node_out.unlink()
+        argv = self.node_run(self.cli("canvas"))["argv"]
+        self.assertIn("--discover-bootable", argv)
 
     def test_single_canvas_adds_only_the_action_flags_it_was_given(self) -> None:
         build = self.root / "build"
         build.mkdir()
-        argv = self.node_run(self.cli("--serial", SERIAL, "canvas", "serve", "--install-root",
+        argv = self.node_run(self.cli("--serial", SERIAL, "canvas", "serve", "--single", "--install-root",
                                       str(build), "--captures-dir", str(self.root / "caps")))["argv"]
         self.assertEqual(argv, self.legacy_argv() + [
             "--install-root", str(build.absolute()), "--captures-dir", str((self.root / "caps").absolute())])
@@ -385,9 +417,16 @@ class FlagValidationTests(CanvasCliCase):
             (("canvas", "serve", *sum((("--bootable", f"avd:A{i}") for i in range(9)), ())),
              "invalid_value"),
             (("canvas", "serve", "--install-root", missing), "invalid_value"),
-            (("--serial", SERIAL, "canvas", "serve", "--ephemeral"), "invalid_value"),
-            (("--serial", SERIAL, "canvas", "serve", "--shutdown-booted"), "invalid_value"),
-            (("canvas", "serve", "--device", f"android:{SERIAL}", "--bootable", "avd:A"), "invalid_value"),
+            (("--serial", SERIAL, "canvas", "serve", "--single", "--ephemeral"), "invalid_value"),
+            (("--serial", SERIAL, "canvas", "serve", "--single", "--shutdown-booted"), "invalid_value"),
+            (("--serial", SERIAL, "canvas", "serve", "--single", "--bootable-only"), "invalid_value"),
+            (("canvas", "serve", "--single", "--device", f"android:{SERIAL}", "--bootable", "avd:A"),
+             "invalid_value"),
+            (("canvas", "serve", "--single"), "usage_error"),
+            (("--serial", SERIAL, "canvas", "serve", "--single", "--split"), "usage_error"),
+            (("--serial", SERIAL, "canvas", "serve", "--single", "--workspace", "qa"), "usage_error"),
+            (("canvas", "serve", "--single", "--device", f"android:{SERIAL}", "--device", f"ios:{UDID}"),
+             "usage_error"),
             (("--serial", SERIAL, "canvas", "serve", "--device", "android:x"), "usage_error"),
             (("canvas", "serve", "--device", f"android:{SERIAL}", "--device", f"ios:{UDID}",
               "--transport", "screencap"), "invalid_value"),
@@ -395,7 +434,8 @@ class FlagValidationTests(CanvasCliCase):
              "unsupported_on_platform"),
             (("canvas", "serve", "--device", f"ios:{UDID}", "--split", "--transport", "scrcpy"),
              "unsupported_on_platform"),
-            (("--platform", "ios", "canvas", "serve", "--device", f"android:{SERIAL}"), "usage_error"),
+            (("--platform", "ios", "canvas", "serve", "--single", "--device", f"android:{SERIAL}"),
+             "usage_error"),
         ]
         for argv, code in cases:
             with self.subTest(argv=argv):
@@ -450,6 +490,42 @@ class AlreadyRunningTests(CanvasCliCase):
         self.assertEqual(payload["port"], canvas["port"])
         self.assertEqual(payload["pid"], canvas["process"].pid)
         self.assertEqual(payload["url"], f"http://127.0.0.1:{canvas['port']}/#token={TOKEN}")
+
+    def test_a_named_target_joins_the_running_workspace(self) -> None:
+        canvas = self.fake_canvas()
+        payload = self.ok(self.cli("--serial", SERIAL, "canvas", "serve"))
+        self.assertFalse(self.node_out.exists(), "a second server was started")
+        self.assertEqual(payload["already_running"], True)
+        self.assertEqual(payload["devices"], [{"id": f"android~{SERIAL}", "attached": True, "tab": "t_aaaaaaaa"}])
+        posts = [item for item in self.requests(canvas) if item["method"] == "POST"]
+        self.assertEqual([(item["path"], item["body"]) for item in posts],
+                         [("/api/devices", {"platform": "android", "target": SERIAL})])
+        self.assertEqual(posts[0]["authorization"], f"Bearer {TOKEN}")
+
+    def test_every_device_joins_and_a_refusal_is_reported_not_raised(self) -> None:
+        canvas = self.fake_canvas()
+        payload = self.ok(self.cli("canvas", "serve", "--device", f"ios:{UDID}",
+                                   "--device", "android:busy-target"))
+        self.assertEqual(payload["devices"][0], {"id": f"ios~{UDID}", "attached": True, "tab": "t_aaaaaaaa"})
+        self.assertEqual(payload["devices"][1], {
+            "id": "android~busy-target", "attached": False, "error_code": "tab_full",
+            "error": "Tab Canvas 1 is full", "hint": "Pick another tab"})
+        self.assertEqual(len([item for item in self.requests(canvas) if item["method"] == "POST"]), 2)
+
+    def test_a_canvas_that_answers_badly_is_reported_per_device(self) -> None:
+        self.fake_canvas()
+        payload = self.ok(self.cli("canvas", "serve", "--device", "android:odd-target",
+                                   "--device", "android:cut-target", "--device", f"ios:{UDID}"))
+        self.assertEqual(payload["devices"][0], {"id": "android~odd-target", "attached": False, "tab": None})
+        self.assertEqual(payload["devices"][1]["error_code"], "backend_failed")
+        self.assertEqual(payload["devices"][1]["attached"], False)
+        self.assertEqual(payload["devices"][2]["attached"], True, "a bad answer does not stop the others")
+
+    def test_a_bare_start_against_a_running_workspace_attaches_nothing(self) -> None:
+        canvas = self.fake_canvas()
+        payload = self.ok(self.cli("canvas"))
+        self.assertNotIn("devices", payload)
+        self.assertEqual([item for item in self.requests(canvas) if item["method"] == "POST"], [])
 
     def test_another_workspace_or_a_single_canvas_does_not_count(self) -> None:
         self.fake_canvas(workspace="other", name="a")

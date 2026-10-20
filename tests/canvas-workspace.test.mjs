@@ -103,6 +103,47 @@ test("place, move, remove: one tab per device, full tabs and taken slots", async
   assert.equal(workspace.ref(A.id), null, "no absent ref is kept");
 });
 
+test("roomFor: the active tab, grown up to four tiles, then a tab with room, then a new tab", async () => {
+  const workspace = await Workspace.open({ name: "w", newId: ids() });
+  const one = workspace.activeTab();
+  const devices = [0, 1, 2, 3].map((index) => ({ platform: "android", target: `emulator-${5580 + 2 * index}` }));
+  for (const [index, device] of devices.entries()) {
+    const tab = workspace.roomFor().id;
+    assert.equal(tab, one.id);
+    assert.equal(workspace.tab(one.id).layout, Math.max(1, index + 1), "grown one tile at a time");
+    workspace.place(device, { tab });
+  }
+  const two = workspace.createTab({ layout: 2 });
+  workspace.activate(one.id);
+  assert.equal(workspace.roomFor().id, two.id, "a full four-tile tab sends the device to a tab with room");
+  workspace.place({ platform: "android", target: "emulator-5600" }, { tab: two.id });
+  workspace.place({ platform: "android", target: "emulator-5602" }, { tab: two.id });
+  const created = workspace.roomFor();
+  assert.ok(![one.id, two.id].includes(created.id), "no room anywhere makes a new tab");
+  assert.equal(workspace.tabs().length, 3);
+  created.undo();
+  assert.equal(workspace.tabs().length, 2, "undo closes the new tab while it is empty");
+  for (let index = 0; index < 6; index += 1) {
+    const tab = workspace.createTab({});
+    workspace.place({ platform: "android", target: `emulator-${5610 + 2 * index}` }, { tab: tab.id });
+  }
+  assert.throws(() => workspace.roomFor(), { code: "tab_limit", status: 409 });
+});
+
+test("roomFor: undo takes back a grown layout while the new tile is empty", async () => {
+  const workspace = await Workspace.open({ name: "w", newId: ids() });
+  const one = workspace.activeTab();
+  workspace.place(A, { tab: workspace.roomFor().id });
+  const grown = workspace.roomFor();
+  assert.equal(workspace.tab(one.id).layout, 2);
+  grown.undo();
+  assert.equal(workspace.tab(one.id).layout, 1);
+  const again = workspace.roomFor();
+  workspace.place(C, { tab: again.id });
+  again.undo();
+  assert.equal(workspace.tab(one.id).layout, 2, "a filled tile is never taken back");
+});
+
 test("layout changes keep filled slots in order and refuse to drop devices", async () => {
   const workspace = await Workspace.open({ name: "w", newId: ids() });
   const tab = workspace.createTab({ layout: 4 });

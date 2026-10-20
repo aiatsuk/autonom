@@ -269,9 +269,15 @@ Notes:
   `AUTONOM_CAPTURES_DIR`); at 200 files or 2 GB per device the oldest are
   deleted and the gallery says so. Installing a build works only from folders
   named with `--install-root DIR` (repeatable); there is no upload.
-- `--bootable avd:NAME[@PORT]` or `--bootable simulator:UDID` lets the picker
-  boot a device; with `--shutdown-booted` the Canvas shuts down what it booted
-  when it stops. Pass `--port 0` for a free port.
+- The picker can boot every AVD and available iOS Simulator of this machine;
+  `--bootable avd:NAME@PORT` pins a port and lists that device first, and
+  `--bootable-only` limits Boot to the `--bootable` entries. With
+  `--shutdown-booted` the Canvas shuts down what it booted when it stops.
+  Pass `--port 0` for a free port.
+- `autonom canvas serve --serial <serial>` is the same workspace with that
+  device in the first tab; if the workspace already runs, it attaches the
+  device there (growing the tab up to four tiles) and prints the URL.
+  `--single` keeps the one-device page of earlier releases.
 
 ## Share a device between agents and a person
 

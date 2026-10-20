@@ -494,6 +494,23 @@ Error codes added (pinned by `tests/test_error_codes_additive.py`):
 
 An agent that matched an old code for these situations should match both.
 
+### Every Canvas is a workspace (Unreleased)
+
+No `error_code` is added. Scripts that need the one-device page add `--single`.
+
+| Surface | Before | Now |
+| --- | --- | --- |
+| `canvas serve --serial X` / `--udid U` / `--target T` / one `--device` | the single-device Canvas, owned by the session on that target | **intentional change:** a workspace Canvas (`default` unless `--workspace`) with that device in its first tab; no session owner, so `session stop` and `cleanup` for that session leave it running |
+| the same, while that workspace runs | — | no second server: `{"ok", "already_running": true, "port", "pid", "workspace", "url", "devices": [{"id", "attached", "tab"} or {"id", "attached": false, "error_code", "error", "hint"}]}`, exit 0; a Canvas that answers badly is `backend_failed` there. The second start's `--bootable`, `--bootable-only`, `--shutdown-booted` and `--ephemeral` are not applied to the running Canvas |
+| `canvas serve --single` | — | new: the single-device Canvas, node argv byte for byte as before; needs one target (`usage_error` otherwise) and refuses `--split`, `--workspace`, several `--device` (`usage_error`), `--ephemeral`, `--bootable`, `--bootable-only`, `--shutdown-booted` (`invalid_value`) |
+| `canvas serve --split` | a workspace even with one target | accepted, no effect |
+| `canvas serve --bootable-only` | — | new: the page boots only the `--bootable` entries |
+| node argv of a workspace Canvas | — | adds `--discover-bootable` unless `--bootable-only` |
+| `GET /api/targets` `bootable` | the `--bootable` entries, `label` = AVD name or UDID | the `--bootable` entries, then every other AVD and available iOS Simulator (`discovered: true` is not exposed); each entry adds `runtime` (`"iOS 27.0"` or `null`); a Simulator's `label` is its name |
+| `POST /api/boot` | `boot_not_allowed` outside `--bootable` | allowed for every listed entry; `boot_not_allowed` for anything the machine does not list |
+| `POST /api/devices` without `tab` (and `canvas attach` without `--tab`, and a page boot with no tab) | the active tab; `tab_full` when it has no empty tile | the active tab, its layout grown up to 4 tiles, else another tab with room, else a new tab; `tab_limit` (409, existing code) when 8 tabs are full; a device already placed stays in its tab (`attached: false`). The room is made only after the target checks pass, and a grown layout or new tab is taken back when the attach fails |
+| two or more `--device` at start | one tab each when the first tab is full | side by side in the first tab (grown up to 4 tiles) |
+
 ### iOS UI recovery and `--session-id` (0.32.0)
 
 Additive, with two behaviour changes listed at the end. A host that passes

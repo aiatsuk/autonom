@@ -175,6 +175,13 @@ const BOOT_CLI_MS = (BOOT_TIMEOUT_S + 30) * 1000;
 const BOOT_RUNNING_MAX = 2;
 const BOOT_KEEP_MS = 10 * 60_000;
 const BOOT_KEEP_MAX = 16;
+// --discover-bootable: the machine's AVDs and shut-down Simulators, listed again after 30 s.
+const BOOTABLE_DISCOVERY_MS = 30_000;
+const BOOTABLE_DISCOVERY_CLI_MS = 40_000;
+const BOOTABLE_RETRY_MS = 5_000;
+const BOOTABLE_FIRST_WAIT_MS = 3_000;
+const AVD_NAME_PATTERN = /^[A-Za-z0-9._-]{1,100}$/;
+const SIMULATOR_UDID_PATTERN = /^[0-9A-Fa-f-]{36}$/;
 const ROOT_ALIASES = new Set([
   "/status", "/frame", "/stream.mjpeg", "/stream.h264", "/tap", "/swipe", "/key", "/text", "/control", "/display",
 ]);
@@ -786,8 +793,9 @@ async function serveApi(server, request, response, url) {
       const platform = optionalString(body, "platform");
       const target = optionalString(body, "target");
       if (!platform || !target) throw new CanvasError(400, "invalid_value", "platform and target are required");
+      // No tab named: the active tab, grown to the next layout when full (Workspace.roomFor).
       const { entry, attached } = await attachDevice(server, {
-        platform, target, tab: optionalString(body, "tab"), slot: optionalSlot(body), origin,
+        platform, target, tab: optionalString(body, "tab"), slot: optionalSlot(body), origin, autoPlace: true,
       });
       return sendJson(response, attached ? 201 : 200, { ok: true, device: deviceSummary(server, entry), attached });
     }
@@ -808,7 +816,9 @@ async function serveApi(server, request, response, url) {
     }
     if (route("POST", "boot")) {
       requireWorkspace(server);
-      const { status, job } = startBoot(server, await readApiBody(request), origin);
+      const body = await readApiBody(request);
+      await refreshBootable(server);
+      const { status, job } = startBoot(server, body, origin);
       return sendJson(response, status, { ok: true, job });
     }
     if (route("GET", "boot", "*")) {
@@ -1038,11 +1048,96 @@ async function targetsSummary(server) {
       attached, tab, attachable: reason === null, reason,
     };
   });
+  await refreshBootable(server);
   return { running: targets, bootable: bootableList(server, running) };
 }
 
 function bootableList(server, running = []) {
-  return (server.options.bootable ?? []).map((spec) => bootableView(server, spec, running));
+  return bootableSpecs(server).map((spec) => bootableView(server, spec, running));
+}
+
+/**
+ * What the page may boot: the --bootable list first, then (with --discover-bootable) every
+ * other AVD and shut-down iOS Simulator of this machine, from the last discovery.
+ */
+function bootableSpecs(server) {
+  const given = server.options.bootable ?? [];
+  const found = server.bootableFound?.items ?? [];
+  const specs = given.map((spec) => {
+    if (spec.kind !== "simulator") return spec;
+    const known = found.find((item) => item.kind === "simulator" && item.udid.toLowerCase() === spec.udid.toLowerCase());
+    return known ? { ...spec, label: known.label, runtime: known.runtime } : spec;
+  });
+  for (const item of found) {
+    const listed = specs.some((spec) => spec.kind === item.kind && (item.kind === "avd"
+      ? spec.name === item.name : spec.udid.toLowerCase() === item.udid.toLowerCase()));
+    if (!listed) specs.push(item);
+  }
+  return specs;
+}
+
+/**
+ * Discover again when the last list is older than 30 s (5 s after a failed part). The first
+ * call waits at most 3 s, then answers with the --bootable list while discovery goes on.
+ */
+async function refreshBootable(server) {
+  if (!server.options.discoverBootable) return;
+  const last = server.bootableFound;
+  if (last && performance.now() - last.at < last.ttl) return;
+  server.bootableDiscovery ??= discoverBootable(server, last?.items ?? [])
+    .then(({ items, failed }) => {
+      server.bootableFound = { at: performance.now(), items, ttl: failed ? BOOTABLE_RETRY_MS : BOOTABLE_DISCOVERY_MS };
+    })
+    .catch(() => {})
+    .finally(() => { server.bootableDiscovery = null; });
+  if (!last) {
+    let timer;
+    await Promise.race([server.bootableDiscovery,
+      new Promise((resolvePromise) => { timer = setTimeout(resolvePromise, BOOTABLE_FIRST_WAIT_MS); })]);
+    clearTimeout(timer);
+  }
+}
+
+/** The machine's AVDs and iOS Simulators; a part that fails keeps that part of `previous`. */
+async function discoverBootable(server, previous) {
+  const items = [];
+  let failed = false;
+  const keep = (kind) => { failed = true; items.push(...previous.filter((item) => item.kind === kind)); };
+  const adb = await androidTool(server);
+  if (adb) {
+    // The CLI finds the emulator binary as `devices boot` does (AUTONOM_EMULATOR, the SDK of adb, ...).
+    const result = await runCliJson([pythonOf(server), autonomScript(server.options), "--adb", adb, "devices"],
+      { timeoutMs: BOOTABLE_DISCOVERY_CLI_MS, env: server.env });
+    if (result.code !== 0 || !Array.isArray(result.json?.avds)) {
+      keep("avd");
+    } else {
+      for (const name of result.json.avds) {
+        if (typeof name === "string" && AVD_NAME_PATTERN.test(name)) items.push({ kind: "avd", name, discovered: true });
+      }
+    }
+  }
+  const xcrun = await iosTool(server);
+  if (xcrun) {
+    try {
+      const { stdout } = await execFileAsync(xcrun, ["simctl", "list", "devices", "available", "-j"],
+        { timeout: TARGET_LIST_MS * 4, encoding: "utf8", maxBuffer: 8 * 1024 * 1024 });
+      const simulators = [];
+      for (const [runtimeKey, devices] of Object.entries(JSON.parse(stdout).devices ?? {})) {
+        const match = /SimRuntime\.iOS-(\d+)-(\d+)/.exec(runtimeKey);
+        if (!match || !Array.isArray(devices)) continue;
+        for (const device of devices) {
+          if (!SIMULATOR_UDID_PATTERN.test(device?.udid ?? "") || device.isAvailable === false) continue;
+          simulators.push({ kind: "simulator", udid: device.udid, label: String(device.name ?? device.udid).slice(0, 100),
+            runtime: `iOS ${match[1]}.${match[2]}`, discovered: true });
+        }
+      }
+      simulators.sort((a, b) => a.label.localeCompare(b.label) || a.runtime.localeCompare(b.runtime));
+      items.push(...simulators);
+    } catch {
+      keep("simulator");
+    }
+  }
+  return { items, failed };
 }
 
 function bootableView(server, spec, running = []) {
@@ -1058,12 +1153,13 @@ function bootableView(server, spec, running = []) {
   const job = [...server.boots.values()].find((item) => sameBootable(item, spec) && !item.finished_at);
   return {
     kind: spec.kind, name: spec.name ?? null, port: spec.port ?? null, udid: spec.udid ?? null,
-    label: spec.kind === "avd" ? spec.name : spec.udid, running: target !== null, target, job: job?.id ?? null,
+    label: spec.label ?? (spec.kind === "avd" ? spec.name : spec.udid), runtime: spec.runtime ?? null,
+    running: target !== null, target, job: job?.id ?? null,
   };
 }
 
 function bootableFor(server, ref) {
-  const spec = (server.options.bootable ?? []).find((item) => (ref.platform === "ios"
+  const spec = bootableSpecs(server).find((item) => (ref.platform === "ios"
     ? item.kind === "simulator" && item.udid.toLowerCase() === ref.target.toLowerCase()
     : item.kind === "avd" && (item.port ? ref.target === `emulator-${item.port}` : item.name === ref.name)));
   return spec ? bootableView(server, spec) : null;
@@ -1110,15 +1206,20 @@ function checkPlatform(server, devicePlatform) {
  * attached false.
  */
 async function attachDevice(server, { platform: devicePlatform, target, tab, slot, name = null, origin = "human",
-  bootedByCanvas = false, listed = null }) {
+  bootedByCanvas = false, listed = null, autoPlace = false }) {
   if (server.shuttingDown) throw new CanvasError(503, "canvas_stopping", "Canvas is stopping");
   const id = deviceIdFor(devicePlatform, target);
   const workspace = server.workspace;
-  const tabId = tab ?? workspace.activeTab().id;
-  if (!workspace.tab(tabId)) throw new CanvasError(404, "tab_not_found", `No tab ${tabId} in this workspace`);
+  // autoPlace with no tab or slot: a placed device stays where it is; a new one gets room
+  // (Workspace.roomFor) only once every check passed, in the same tick as its place.
+  const auto = autoPlace && tab === undefined && slot === undefined;
+  let tabId = tab ?? (auto ? (workspace.locate(id)?.tab ?? null) : workspace.activeTab().id);
+  if (tabId !== null && !workspace.tab(tabId)) throw new CanvasError(404, "tab_not_found", `No tab ${tabId} in this workspace`);
   const present = server.registry.get(id);
   if (present) {
     const where = workspace.locate(id);
+    if (where) tabId ??= where.tab;
+    if (!where && tabId === null) tabId = workspace.roomFor().id;
     if (where && where.tab !== tabId) {
       const other = workspace.tab(where.tab);
       throw new CanvasError(409, "device_in_other_tab", `Device ${id} is in tab ${other?.name ?? where.tab}`,
@@ -1147,7 +1248,8 @@ async function attachDevice(server, { platform: devicePlatform, target, tab, slo
   }
   const deviceName = name ?? found.name ?? target;
   const wasPlaced = workspace.locate(id);
-  workspace.place({ id, platform: devicePlatform, target, name: deviceName }, { tab: tabId, slot });
+  const room = tabId === null ? workspace.roomFor() : null;
+  workspace.place({ id, platform: devicePlatform, target, name: deviceName }, { tab: room?.id ?? tabId, slot });
   workspace.setPresent(id, true);
   const log = beginLog(server, { device: id, kind: "device", name: "attach", origin, summary: `attach ${id}` });
   let result;
@@ -1158,7 +1260,10 @@ async function attachDevice(server, { platform: devicePlatform, target, tab, slo
     // A concurrent attach of the same device that holds it keeps its slot present.
     if (server.registry.get(id)) workspace.setPresent(id, true);
     else if (wasPlaced) workspace.setPresent(id, false);
-    else workspace.remove(id);
+    else {
+      workspace.remove(id);
+      room?.undo();
+    }
     log.end({ ok: false, errorCode: error.code ?? "backend_failed", error: error.message });
     throw error;
   }
@@ -1437,14 +1542,12 @@ async function restoreWorkspace(server) {
   for (const spec of server.options.devices ?? []) {
     const id = `${spec.platform}~${spec.target}`;
     if (workspace.locate(id)) continue;
-    let tab = workspace.firstTabWithRoom();
-    if (!tab) {
-      try {
-        tab = workspace.createTab({}).id;
-      } catch {
-        console.error(`Canvas workspace has no room for ${id}`);
-        continue;
-      }
+    let tab;
+    try {
+      tab = workspace.roomFor().id;
+    } catch {
+      console.error(`Canvas workspace has no room for ${id}`);
+      continue;
     }
     const listed = running.find((item) => item.platform === spec.platform && item.target === spec.target);
     workspace.place({ id, platform: spec.platform, target: spec.target, name: listed?.name ?? spec.target }, { tab });
@@ -1528,17 +1631,17 @@ function startBoot(server, body, origin) {
   let spec;
   if (kind === "avd") {
     if (typeof body.name !== "string") throw new CanvasError(400, "invalid_value", "name must be an AVD name");
-    spec = (server.options.bootable ?? []).find((item) => item.kind === "avd" && item.name === body.name);
+    spec = bootableSpecs(server).find((item) => item.kind === "avd" && item.name === body.name);
   } else if (kind === "simulator") {
     if (typeof body.udid !== "string") throw new CanvasError(400, "invalid_value", "udid must be a Simulator UDID");
-    spec = (server.options.bootable ?? []).find((item) => item.kind === "simulator" &&
+    spec = bootableSpecs(server).find((item) => item.kind === "simulator" &&
       item.udid.toLowerCase() === body.udid.toLowerCase());
   } else {
     throw new CanvasError(400, "invalid_value", "kind must be avd or simulator");
   }
   if (!spec) {
     throw new CanvasError(403, "boot_not_allowed", "This Canvas may not boot that target",
-      "Start the Canvas with --bootable avd:NAME or --bootable simulator:UDID.");
+      "Pick a device the Canvas lists, or start it with --bootable avd:NAME or --bootable simulator:UDID.");
   }
   const attach = body.attach === undefined ? true : body.attach;
   if (typeof attach !== "boolean") throw new CanvasError(400, "invalid_value", "attach must be true or false");
@@ -1614,11 +1717,15 @@ async function runBoot(server, job, origin) {
   const workspace = server.workspace;
   // The tab and slot asked for, re-checked: a taken slot falls back to the first empty one,
   // a full (or closed) tab to a new tab.
+  // With neither asked, the room rule of POST /api/devices (the active tab grows first).
+  const auto = !job.tab && (job.slot === null || job.slot === undefined);
   let tab = job.tab && workspace.tab(job.tab) ? job.tab : workspace.activeTab().id;
   let slot = job.slot ?? undefined;
   const view = workspace.tab(tab);
   if (slot !== undefined && (slot >= view.layout || view.slots[slot] !== null)) slot = undefined;
-  if (!view.slots.includes(null)) {
+  if (auto) {
+    tab = undefined;
+  } else if (!view.slots.includes(null)) {
     try {
       tab = workspace.createTab({}).id;
     } catch (error) {
@@ -1630,7 +1737,7 @@ async function runBoot(server, job, origin) {
   try {
     const { entry } = await attachDevice(server, {
       platform: platformName, target, tab, slot, origin, bootedByCanvas: !job.already_running,
-      name: job.kind === "avd" ? job.name : null,
+      name: job.kind === "avd" ? job.name : null, autoPlace: auto,
     });
     finish({ state: "done", device: entry.id, tab: workspace.locate(entry.id)?.tab ?? tab });
   } catch (error) {

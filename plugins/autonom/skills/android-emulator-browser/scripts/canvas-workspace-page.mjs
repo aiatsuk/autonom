@@ -788,7 +788,7 @@ function updateRow(tile,row){
   }else{
     const entry=item.bootable;
     setText(row.name,entry.label||entry.name||entry.udid||"Device");
-    setText(row.meta,(entry.kind==="simulator"?"iOS Simulator":"Android emulator")+(count(entry.port)?" · port "+count(entry.port):""));
+    setText(row.meta,(entry.kind==="simulator"?"iOS Simulator"+(typeof entry.runtime==="string"&&entry.runtime?" · "+entry.runtime:""):"Android emulator")+(count(entry.port)?" · port "+count(entry.port):""));
   }
   const plan=rowPlan(row),pending=plan.key&&busy.has(plan.key);
   setText(row.status,plan.status||"");row.status.hidden=!plan.status;

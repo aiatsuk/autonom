@@ -5422,8 +5422,7 @@ CANVAS_WORKSPACE_NAME = re.compile(r"^[A-Za-z0-9._-]{1,40}$")
 CANVAS_BOOTABLE_AVD = re.compile(r"^avd:([A-Za-z0-9._-]{1,100})(?:@([0-9]{4}))?$")
 CANVAS_BOOTABLE_SIMULATOR = re.compile(r"^simulator:[0-9A-Fa-f-]{36}$")
 CANVAS_STOP_WAIT_S = 10.0
-CANVAS_WORKSPACE_FLAGS_HINT = ("Run `autonom canvas` (or `canvas serve --split`) for a workspace, "
-                               "or drop the workspace flags.")
+CANVAS_WORKSPACE_FLAGS_HINT = "Drop --single: every other Canvas is a workspace."
 
 
 def _canvas_device_specs(values: list[str] | None) -> list[tuple[str, str]]:
@@ -5723,11 +5722,22 @@ def cmd_canvas_serve(args: argparse.Namespace) -> int:
         raise errors.AutonomError(
             errors.USAGE_ERROR, "--device cannot be combined with --target, --serial or --udid",
             "Name every device with --device PLATFORM:ID, or one target with the target flags.")
-    workspace_mode = bool(args.split or args.workspace is not None or len(devices) >= 2
-                          or (not explicit and not devices))
+    # Every Canvas is a workspace (tabs, attach, boot, split); a named target is its first
+    # device. `--single` alone keeps the one-device page of before.
+    workspace_mode = not args.single
     install_roots = _canvas_install_roots(args.install_root)
     if not workspace_mode:
+        if args.split or args.workspace is not None or len(devices) >= 2:
+            raise errors.AutonomError(
+                errors.USAGE_ERROR, "--single shows one device; it cannot be combined with "
+                "--split, --workspace or several --device",
+                "Drop --single for a workspace Canvas.")
+        if not explicit and not devices:
+            raise errors.AutonomError(
+                errors.USAGE_ERROR, "--single needs one target",
+                "Name it with --serial, --udid, --target or one --device.")
         for flag, given in (("--ephemeral", args.ephemeral), ("--bootable", bool(bootable)),
+                            ("--bootable-only", args.bootable_only),
                             ("--shutdown-booted", args.shutdown_booted)):
             if given:
                 raise errors.AutonomError(
@@ -5743,7 +5753,7 @@ def cmd_canvas_serve(args: argparse.Namespace) -> int:
             args.platform, args.target = platform, target_id
         return _canvas_serve_single(args, install_roots)
     if explicit:
-        # `--serial X canvas serve --split`: the named target is the workspace's first device.
+        # `canvas serve --serial X`: the named target is the workspace's first device.
         target = _target(args)
         devices = [(target.platform, target.target_id)]
     return _canvas_serve_workspace(args, devices, bootable, install_roots)
@@ -5853,12 +5863,17 @@ def _canvas_serve_workspace(args: argparse.Namespace, devices: list[tuple[str, s
             errors.INVALID_VALUE, f"--idb-companion is not an executable file: {idb['path']}",
             CANVAS_IDB_HINT, path=idb["path"])
     _canvas_require_scrcpy(args, scrcpy_server)
-    # One Canvas per workspace: a second `autonom canvas` prints the running one's URL.
+    # One Canvas per workspace: a second `autonom canvas` prints the running one's URL and
+    # adds the devices it names to that Canvas.
     for document in _canvas_discovery():
         if document.get("mode") == "workspace" and document.get("workspace") == name:
-            return emit({"ok": True, "already_running": True, "port": document["port"],
-                         "pid": document["pid"], "workspace": name, "url": _canvas_url(document)},
-                        as_json=True)
+            result: dict[str, Any] = {"ok": True, "already_running": True, "port": document["port"],
+                                      "pid": document["pid"], "workspace": name,
+                                      "url": _canvas_url(document)}
+            if devices:
+                result["devices"] = [_canvas_join_running(document, platform, target_id)
+                                     for platform, target_id in devices]
+            return emit(result, as_json=True)
     holder = _canvas_workspace_lock(name)
     if holder:
         raise errors.AutonomError(
@@ -5877,6 +5892,9 @@ def _canvas_serve_workspace(args: argparse.Namespace, devices: list[tuple[str, s
         command += ["--bootable", entry]
     if args.shutdown_booted:
         command.append("--shutdown-booted")
+    if not args.bootable_only:
+        # The page lists this machine's other AVDs and shut-down Simulators to boot too.
+        command.append("--discover-bootable")
     command += _canvas_shared_args(args, scrcpy_server)
     # Both tools when found: the page attaches Android and iOS devices alike.
     adb_flag = getattr(args, "adb", None)
@@ -5901,6 +5919,27 @@ def _canvas_serve_workspace(args: argparse.Namespace, devices: list[tuple[str, s
     # No session owner: a session stop never reaps a workspace Canvas (contract 3.4).
     return processes_mod.run_supervised(
         command, kind="canvas", owner=None, artifacts_dir=None, port=args.port, workspace=name)
+
+
+def _canvas_join_running(document: dict[str, Any], platform: str, target_id: str) -> dict[str, Any]:
+    """Attach one device to a running workspace Canvas; a refusal is reported, not raised."""
+    import http.client
+
+    try:
+        answer = _canvas_api(document, "POST", "/api/devices",
+                             {"platform": platform, "target": target_id}, timeout=150)
+    except errors.AutonomError as exc:
+        return {"id": f"{platform}~{target_id}", "attached": False, "error_code": exc.code,
+                "error": exc.message, "hint": exc.hint}
+    except (http.client.HTTPException, OSError, ValueError) as exc:
+        # A Canvas that died mid-answer or sent no JSON: reported like a refusal.
+        return {"id": f"{platform}~{target_id}", "attached": False, "error_code": errors.BACKEND_FAILED,
+                "error": f"the Canvas answered badly: {type(exc).__name__}",
+                "hint": "Check it with `autonom canvas list`, then `autonom canvas attach`."}
+    device = answer.get("device") if isinstance(answer, dict) else None
+    device = device if isinstance(device, dict) else {}
+    return {"id": device.get("id") or f"{platform}~{target_id}", "attached": bool(answer.get("attached")),
+            "tab": device.get("tab")}
 
 
 def _canvas_token_args(token: str) -> list[str]:
@@ -6802,16 +6841,20 @@ def build_parser() -> argparse.ArgumentParser:
     # Workspace and multi-device flags. None may start with --to: the abbreviations
     # --to and --tok must keep reaching --token (journal redaction relies on it).
     p.add_argument("--device", action="append", metavar="PLATFORM:ID",
-                   help="a device to show, android:<serial> or ios:<udid> (repeatable, at most 8); "
-                        "one alone is the single-device Canvas")
+                   help="a device to show, android:<serial> or ios:<udid> (repeatable, at most 8)")
+    p.add_argument("--single", action="store_true",
+                   help="the one-device page (no tabs, attach or boot) for one named target")
     p.add_argument("--split", action="store_true",
-                   help="a workspace Canvas even with one --device or a target flag")
+                   help="kept for older scripts: every Canvas is a workspace now")
     p.add_argument("--workspace", metavar="NAME",
                    help="workspace name (default: default); its tabs persist across restarts")
     p.add_argument("--ephemeral", action="store_true",
                    help="a workspace that neither reads nor saves its tabs")
     p.add_argument("--bootable", action="append", metavar="SPEC",
                    help="avd:NAME[@PORT] or simulator:UDID the page may boot (repeatable, at most 8)")
+    p.add_argument("--bootable-only", action="store_true",
+                   help="the page boots only the --bootable devices, not every AVD and Simulator "
+                        "of this machine")
     p.add_argument("--shutdown-booted", action="store_true",
                    help="shut down the devices this Canvas booted when it stops")
     p.add_argument("--install-root", action="append", metavar="DIR",

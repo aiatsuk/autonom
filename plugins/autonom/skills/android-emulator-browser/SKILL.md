@@ -26,6 +26,14 @@ autonom canvas serve --platform ios --target <simulator-udid> --transport auto
 autonom canvas serve --platform ios --target <simulator-udid> --transport screencap
 ```
 
+Each of these starts a workspace Canvas with that target in its first tab (see
+Workspace below): the page can attach other running devices, boot new ones and
+show up to four side by side. If the workspace is already running, the command
+attaches the target to it and prints its URL instead of starting another
+(`already_running: true`, the attach result under `devices`). Add `--single`
+for the one-device page of before (no tabs, attach or boot), owned by the
+session on that target.
+
 Open the printed fragment-token URL in the agent browser panel. The page
 exchanges it for an HttpOnly cookie and removes the fragment; a reload keeps
 the session through the cookie. The startup lines name the chosen transport
@@ -48,23 +56,32 @@ idb_companion.
 ```bash
 autonom canvas                                   # a workspace with no device, port 3277
 autonom canvas serve --port 0 --workspace qa     # another workspace on a free port
+autonom canvas serve --serial <adb-serial>       # a workspace with that device in tab 1
 autonom canvas serve --device android:emulator-5580 --device ios:<udid>
 autonom canvas serve --bootable avd:Pixel_9@5586 --shutdown-booted --install-root ~/src/app/build
+autonom canvas serve --bootable-only --bootable avd:Pixel_9   # boot only the listed devices
 autonom canvas list
 autonom canvas attach --serial <adb-serial> [--tab <tab id or name>]
 autonom canvas detach --serial <adb-serial>      # or --device-id android~<serial>
 autonom canvas stop [--port N | --workspace NAME | --all]
 ```
 
-Without `--serial`, `--udid`, `--target` or exactly one `--device`, `canvas serve`
-starts a **workspace Canvas**: it holds no device at first, keeps running when the
-last device or tab goes away, and stops only with Ctrl+C or `autonom canvas stop`.
-A second `autonom canvas` for the same workspace prints the running one's URL
-(`already_running: true`). The page has in-page tabs (at most 8), each a split of
-1-4 tiles with its own URL `/c/<tab id>`, so a tab can also be opened in its own
-browser window. An empty tile is a picker: running targets with Attach, devices
-already in another tab with "Move here" (a device lives in one tab), and the
-`--bootable` entries with Boot. At most 8 devices per Canvas.
+Every `canvas serve` without `--single` starts a **workspace Canvas**. Without a
+target it holds no device at first; with `--serial`, `--udid`, `--target` or
+`--device` those devices are placed in the first tab, side by side (the tab grows
+to the next layout, up to four tiles, before a new tab is made). It keeps running
+when the last device or tab goes away, and stops only with Ctrl+C or
+`autonom canvas stop`; a `session stop` does not end it. A second
+`autonom canvas` for the same workspace prints the running one's URL
+(`already_running: true`) and attaches the devices it names (each result under
+`devices`, a refusal with its `error_code` and `hint`). The page has in-page tabs
+(at most 8), each a split of 1-4 tiles with its own URL `/c/<tab id>`, so a tab can
+also be opened in its own browser window. An empty tile is a picker: running
+targets with Attach, devices already in another tab with "Move here" (a device
+lives in one tab), and devices to boot with Boot: the `--bootable` entries first
+(an `@PORT` is kept), then every other AVD and available iOS Simulator of this
+machine (listed again every 30 s); `--bootable-only` keeps the list to the
+`--bootable` entries. At most 8 devices per Canvas.
 
 - **Sessions are automatic.** Attaching starts an Autonom session for that device
   (`session start --alongside`, never written to `current.json`) or reuses the live

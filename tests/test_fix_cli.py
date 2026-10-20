@@ -1189,7 +1189,7 @@ class CanvasSupervisedTests(_Cli):
         code, started = self.android("session", "start", "--app-id", BUNDLE)
         self.assertEqual(code, 0, started)
         completed = self.run_raw("--adb", str(FAKE_ADB), "--serial", SERIAL, "canvas",
-                                 "serve", "--token", "s3cret-token-value", "--port", "3999")
+                                 "serve", "--single", "--token", "s3cret-token-value", "--port", "3999")
         self.assertEqual(completed.returncode, 0, completed.stderr)
         seen = json.loads(out.read_text(encoding="utf-8"))
         self.assertIn("--token", seen["argv"])
