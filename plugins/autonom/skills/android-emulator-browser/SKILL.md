@@ -102,11 +102,11 @@ machine (listed again every 30 s); `--bootable-only` keeps the list to the
 - **Persistence.** Tabs and the devices attached at stop are saved per workspace;
   a restart restores the tabs and attaches the devices that are running.
   `--ephemeral` neither reads nor saves the file.
-- **Actions drawer** (per tile, next to Tools): screenshot, recording (up to 180 s),
+- **Actions drawer** (single-device Canvas and per workspace tile, next to Tools): screenshot, recording (up to 180 s),
   install a build from an `--install-root` folder (no upload; without a root it
   explains the flag), launch, open link, app language, a gallery of the captures in
   `~/Downloads/Autonom/<device>/` (`--captures-dir`, `AUTONOM_CAPTURES_DIR`; at 200
-  files or 2 GB the oldest are deleted and the gallery says so), the command log
+  files or 2 GB the oldest are deleted and the gallery says so). Open in Finder opens only that device folder on macOS. The single-device drawer shows Capture and Gallery; workspace tiles also expose app/install actions. The command log
   (Activity) and tool health.
 - `canvas attach`/`detach` answer with the API's own `error_code` and `hint`
   (`tab_full`, `device_in_other_tab`, `target_not_found`, `device_limit`, …);
@@ -287,33 +287,23 @@ because iOS waits for a possible double press.
 
 ## The page
 
-A slim toolbar holds the Autonom wordmark, the target with a live dot and the
-transport, the Size menu (Android only, see Display size) with the current
-size and density beside it, the control status, the Tools toggle (see Tools
-drawer) and the inspector toggle.
-Below it the device picture sits in a frame whose aspect ratio follows the
-video, with a caption under it (fps, round trip and decoder on scrcpy; the
-transport otherwise) and a floating pill of device buttons: Back, Home,
-Recent apps | Rotate, Volume down, Volume up, Power (on iOS Home, Volume down,
-Volume up and Power, which press the Simulator's buttons; Volume down and up
-only on the idb transport). The inspector beside it
-has Type (text box and Send), Keys (Up, Down, Left, Right, Enter, Delete),
-Device (Wake screen, Notifications, Quick settings, Collapse panels, Copy
-device clipboard), Control (Take control or Release, Pause input or Resume
-input) and Stream (transport, codec, frames, video and display size, clients,
-Reconnect stream, and a Diagnostics panel with the full status text). Every
-pill button, the arrows and Delete are icons named by their tooltip.
+The toolbar holds the Android Size menu, Auto/Light/Dark appearance, Tools,
+Device actions and Inspector. The device frame follows the video's aspect ratio
+without masking its corners. The caption reports rendered fps (including zero
+when no new frames arrive), round-trip time and transport.
 
-Light and dark follow the system setting. At 760 px and narrower the
-inspector moves under the device, the pill stays pinned to the bottom above
-the safe area, and every tap target is at least 44 px. Controls that cannot
-act (paused, another owner) are disabled; the scrcpy-only ones (Rotate,
-Volume down, Volume up, Notifications, Quick settings, Collapse panels, Copy
-device clipboard) are hidden on the other transports. The iOS page has no Size
-menu, Keys or Device section, and its pill shows Home and Power, plus Volume
-down and Volume up on the idb transport. The element ids `video`, `screen`,
-`status`, `text`, `clipboard`, `device` and `refresh` and
-`window.autonomCanvas` are stable for scripts.
+The compact dock offers Back, Home, Recent apps, Screenshot, Start/Stop recording,
+Rotate and Power; iOS keeps its supported subset. Inspector has a text field and
+Send, a volume row, a grid of device actions, collapsed Input control, and Stream
+metrics with technical Details and Diagnostics. Device controls retain accessible
+names and transport/lease availability checks.
+
+At 760 px and narrower, Tools, Device actions and Inspector use the same bounded
+right-hand overlay. Fields and buttons keep desktop density; the Inspector no
+longer moves below the device. Escape and each panel's close button dismiss it.
+Theme choice is browser-local and synchronized across workspace tiles; Auto tracks
+the system. The element ids `video`, `screen`, `status`, `text`, `clipboard`,
+`device` and `refresh`, and `window.autonomCanvas`, remain stable for scripts.
 
 ## Tools drawer
 
@@ -321,15 +311,15 @@ The Tools toggle in the toolbar opens a drawer with five tabs for the
 Canvas's own target. On a desktop-width page it takes the inspector's column
 (wider, about 440-520 px) and never covers the device; the inspector and the
 drawer are never open together, and the inspector toggle closes the drawer.
-At 760 px and narrower it is a full-width sheet. The tabs are a keyboard tab
+At 760 px and narrower it is the shared bounded overlay. The tabs are a keyboard tab
 list (arrow keys, Home, End; Escape closes the drawer), light and dark follow
 the system, and every device or network string is shown as text.
 
 | Tab | What it does | Limits |
 | --- | --- | --- |
-| App | App id (pre-filled from the session on this target or the best-known app, editable); permissions: Android lists the app's requested runtime permissions with granted or denied and grants, revokes or resets one; iOS lists the privacy services with Grant, Revoke and Reset. Location: latitude and longitude (checked: -90..90, -180..180) or a preset; Android reads the position back | iOS cannot read a permission or the location back, so the drawer says so and shows the last value set. The Android emulator has no location reset, so Clear is iOS only; its position moves only once an app subscribes to location updates, and Read back says "delivered" or "requested only" |
-| Simulate | Push (iOS, JSON payload of at most 4 KB), biometrics (iOS enroll, unenroll, match, non-match; Android a matching fingerprint), battery level and reset (iOS also its state), network online/offline (Android), appearance light/dark | Only these controls, and only on an emulator or Simulator; the result says whether the device confirmed the change |
-| Network | Capture status (proxy, device attached yes/no/unknown, recent requests), Start capture after a confirmation that names the effect (it decrypts and records this session's HTTP(S) traffic), Attach device, Detach, Stop capture; a live request list (polled once a second while the tab is visible) with host, method, status and mocked filters; details from the redacted previews; Mock this fills the Mocks form | Needs an Autonom session on this target (`autonom session start` with the Canvas's `--serial`/`--udid`); without one the tab shows that hint and never starts a session. Never `--capture-bodies`, never the system CA: previews only, at most 2 KB, already redacted |
+| App | App id (pre-filled from the session on this target or the best-known app, editable); permissions: Android lists the app's requested runtime permissions with granted or denied and grants, revokes or resets one; iOS lists the privacy services with Grant, Revoke and Reset. App-scoped recent deeplinks, named saved locations with edit/delete. Location: latitude and longitude (checked: -90..90, -180..180) or a preset; Android reads the position back | iOS cannot read a permission or the location back, so the drawer says so and shows the last value set. The Android emulator has no location reset, so Clear is iOS only; its position moves only once an app subscribes to location updates, and Read back says "delivered" or "requested only" |
+| Simulate | Push (iOS, JSON payload of at most 4 KB), biometrics (iOS Face ID/Touch ID enroll, unenroll, success/failure; Android fingerprint readiness, enrollment settings and success/failure with configurable IDs), battery level and reset (iOS also its state), network online/offline (Android), appearance light/dark, text size, Android animation disable/restore | Only these controls, and only on an emulator or Simulator; the result says whether the device confirmed the change |
+| Network | Capture status (proxy, device attached yes/no/unknown, recent requests), Start capture starts the proxy and attaches the device after confirmation; Stop capture restores the previous proxy before stopping. These are the two capture controls. Unknown attachment can only be refreshed; a live request list (polled once a second while the tab is visible) with host, method, status and mocked filters; details from the redacted previews; Mock this fills the Mocks form | Needs an Autonom session on this target (`autonom session start` with the Canvas's `--serial`/`--udid`); without one the tab shows that hint and never starts a session. Never raw `--capture-bodies` or system CA installation. Details show redacted previews of at most 2 KB; Pretty also formats marked incomplete JSON. Copy loads complete redacted UTF-8 text on demand, up to 4 MiB per body. New captures retain it in private session `network/copy-bodies/` files; old truncated captures require recapture. Binary/oversized/unavailable bodies are reported explicitly |
 | Mocks | The mock list with hit counts, add, edit, enable, disable, remove, and Clear all after a confirmation; validation errors are shown with their code | Mocks apply to every Autonom session on this Mac (the drawer says so). Hit counts count only the session on this target (0 without one). Status 100-599, body at most 32 KB |
 | Logs | The live device log, optionally for one app package (iOS: process or bundle), with a level filter, a text filter, Pause (keeps polling, stops drawing), Clear and auto-scroll unless you scrolled up | At most 2000 rows in the page; the Canvas keeps the last 2000 lines (at most 1 MiB) and counts the lines it evicted before the page read them. On iOS the feed follows the current session's log stream, so it starts only when that session is on this Simulator and was started with `--log-stream`; otherwise it says how to start one |
 
@@ -778,3 +768,12 @@ and the display preset, size and density from `/status`, package/activity,
 variant, control owner, and the exact flow replayed. For Tools drawer work,
 the ops called and their results (never mock bodies, push payloads or log
 text).
+
+
+### Desktop presentation
+Canvas supports Auto, Light and Dark themes. The compact device dock includes
+navigation, screenshot, recording, rotation and power; volume and other device
+actions live in Inspector. On narrow windows Tools, Device actions and Inspector
+share one bounded overlay size instead of moving below the device. The display
+preset menu anchors to its trigger, and the device image retains its complete
+aspect ratio without a CSS corner mask.

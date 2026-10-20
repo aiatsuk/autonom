@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import fnmatch
 import json
+import os
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -225,3 +227,30 @@ def require_bodies(record: dict[str, Any]) -> None:
             "Bodies are off by default because they are the densest source of "
             "credentials and personal data.",
         )
+
+
+COPY_BODY_LIMIT = 4 * 1024 * 1024
+
+
+def copy_body(record: dict[str, Any], flow_id: str, which: str) -> dict[str, Any]:
+    """On-demand redacted full text. Never substitute a truncated preview."""
+    flow = find(record, flow_id)
+    copies = flow.get("body_copy")
+    state = copies.get(which) if isinstance(copies, dict) else None
+    if state == "saved" and re.fullmatch(r"f_[0-9]+", flow_id):
+        suffix = "req" if which == "request" else "res"
+        path = Path(record["artifacts_dir"]) / "network" / "copy-bodies" / f"{flow_id}.{suffix}"
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+            with os.fdopen(fd, "rb") as handle:
+                content = handle.read(COPY_BODY_LIMIT + 1)
+            if len(content) > COPY_BODY_LIMIT:
+                return {"complete": False, "reason": "too_large"}
+            return {"complete": True, "body": redact.scrub_body(content.decode("utf-8"))}
+        except (OSError, UnicodeError, ValueError, RecursionError):
+            return {"complete": False, "reason": "unavailable"}
+    # Older captures can still copy complete small bodies, but not lost prefixes.
+    preview = flow.get(f"{which}_body_preview")
+    if isinstance(preview, str) and not preview.endswith(redact.TRUNCATION_MARKER):
+        return {"complete": True, "body": redact.scrub_body(preview)}
+    return {"complete": False, "reason": state or "not_captured"}

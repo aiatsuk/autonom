@@ -341,3 +341,24 @@ exactly which flows were faked.
 - `mobile-session` — sessions and teardown
 - `mobile-screen` — correlate a captured response with on-screen state
 - `android-debugger-agent`, `ios-debugger-agent`
+
+
+## Explicit session fixtures
+An explicitly prepared `<session>/network/session-mocks/registry.json` is read
+before the machine-wide registry, using the same mock schema. It scopes fixture
+responses to one session without editing standing mocks. Network start/status
+reports `session_mocks`; Canvas shows its active rule count. Keep host selectors
+specific. A session `network.preferred_proxy_port` makes Canvas reuse a fixed
+loopback port after Stop/Start (or fail if busy), useful for debug clients bound
+to that port. Flow ids resume after the largest stored id across proxy restarts.
+
+
+## Complete text for Canvas Copy
+The recorder keeps a separate redacted UTF-8 copy of complete bodies, up to 4 MiB
+per body, in session `network/copy-bodies/` files (directory 0700, files 0600).
+These files use the existing credential-field scrubber; they can still contain
+application data and follow the session artifact lifetime. List/detail views
+continue to use 2 KB previews. Canvas loads the full text only for Copy; it never
+substitutes a truncated preview when the full body is unavailable. This does not
+enable the opt-in raw `--capture-bodies` store. Previously truncated records must
+be captured again. Binary or larger bodies are not retained for text copying.

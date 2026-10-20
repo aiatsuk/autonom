@@ -150,7 +150,7 @@ CONTROL_ACTIONS: dict[str, tuple[str, ...]] = {
     "push": ("send",),
     "sms": ("send",),
     "call": ("incoming", "cancel"),
-    "biometric": ("enroll", "unenroll", "match", "nonmatch"),
+    "biometric": ("enroll", "unenroll", "match", "nonmatch", "settings"),
     "clipboard": ("set", "get"),
     "appearance": ("light", "dark"),
     "status-bar": ("override", "pin", "clear"),
@@ -228,7 +228,7 @@ def apply(target: Target, control: str, action: str,
     if control in ("sms", "call"):
         return _telephony(target, control, action, values)
     if control == "biometric":
-        return _biometric(target, action)
+        return _biometric(target, action, values)
     if control == "clipboard":
         return _clipboard(target, action, values)
     if control == "appearance":
@@ -956,7 +956,52 @@ def _ios_biometry(target: Target) -> str | None:
     return None
 
 
-def _biometric(target: Target, action: str) -> dict[str, Any]:
+def biometric_status(target: Target) -> dict[str, Any]:
+    """Read readiness, without inferring that an application authenticated."""
+    _require_simulator(target)
+    if target.platform == IOS:
+        observed, why = ios_simctl.read_notify_state(target.tool, target.target_id,
+                                                    IOS_BIOMETRIC_ENROLLMENT)
+        return {"biometry": _ios_biometry(target) or "unknown",
+                "enrolled": None if observed is None else observed == 1,
+                "operation": "unknown", "detail": why}
+    try:
+        user = _adb(target, ["shell", "am", "get-current-user"]).strip()
+        dump = _adb(target, ["shell", "dumpsys", "fingerprint"])
+    except errors.AutonomError:
+        return {"biometry": "fingerprint", "enrolled": None,
+                "count": None, "operation": "unknown"}
+    counts = []
+    for line in dump.splitlines():
+        try:
+            data = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        entries = data.get("prints")
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if (isinstance(entry, dict) and str(entry.get("id")) == user
+                    and isinstance(entry.get("count"), int) and entry["count"] >= 0):
+                counts.append(entry["count"])
+    operations = re.findall(r"Current operation:\s*([^\n]+)", dump, re.I)
+    operation = ("enroll" if any("enroll" in item.lower() for item in operations)
+                 else "authenticate" if any("authentication" in item.lower() for item in operations)
+                 else "idle" if operations and all(item.strip() == "null" for item in operations)
+                 else "unknown")
+    count = sum(counts) if counts else None
+    return {"biometry": "fingerprint", "enrolled": None if count is None else count > 0,
+            "count": count, "operation": operation}
+
+
+def _biometric(target: Target, action: str, values: dict[str, Any] | None = None) -> dict[str, Any]:
+    values = values or {}
+    if target.platform == IOS and (action == "settings" or values):
+        raise errors.AutonomError(errors.UNSUPPORTED_CAPABILITY,
+                                  "iOS uses Enroll/Unenroll and does not take a fingerprint id")
+
     if target.platform == IOS:
         if action in ("enroll", "unenroll"):
             kind = None
@@ -977,6 +1022,7 @@ def _biometric(target: Target, action: str) -> dict[str, Any]:
         if action in ("match", "nonmatch"):
             result["biometry"] = kind or "unknown"
             # notifyutil posts and returns; nothing reports whether a prompt took it.
+            result["message"] = "Biometric stimulus sent. The app must have an active Face ID or Touch ID prompt; check its result in the app."
             return _unverified(result)
         # Enrollment is the state value of the notification itself, which
         # `notifyutil -g` reads back (the Simulator's Enrolled menu item
@@ -988,12 +1034,44 @@ def _biometric(target: Target, action: str) -> dict[str, Any]:
         if observed is None:
             return _unverified(result, detail=why)
         return _checked(result, observed == expected)
-    if action != "match":
-        raise errors.AutonomError(
-            errors.UNSUPPORTED_CAPABILITY,
-            "Android emulator only exposes a fingerprint touch stimulus")
-    _adb(target, ["emu", "finger", "touch", "1"])
-    return _unverified({"control": "biometric", "action": action})
+    if action == "settings":
+        if values:
+            raise errors.AutonomError(errors.INVALID_VALUE, "Enrollment settings does not take values")
+        output = _adb(target, ["shell", "am", "start", "-a", "android.settings.FINGERPRINT_ENROLL"])
+        if "Error:" in output or "Exception" in output:
+            raise errors.AutonomError(errors.UNSUPPORTED_CAPABILITY,
+                                      "The device could not open fingerprint enrollment settings")
+        return _unverified({"control": "biometric", "action": action,
+                            "message": "Enrollment settings opened. Configure the screen lock yourself if required; then use Successful authentication to send enrollment touches."})
+    if action not in ("match", "nonmatch"):
+        raise errors.AutonomError(errors.UNSUPPORTED_CAPABILITY,
+                                  "Android supports fingerprint match/nonmatch and enrollment settings")
+    finger = str(values.get("finger_id", 1 if action == "match" else 2147483647))
+    if set(values) - {"finger_id"} or not re.fullmatch(r"[1-9][0-9]{0,9}", finger) or int(finger) > 2147483647:
+        raise errors.AutonomError(errors.INVALID_VALUE, "Fingerprint id must be an integer from 1 to 2147483647")
+    readiness = biometric_status(target)
+    if action == "nonmatch" and readiness["operation"] == "enroll":
+        raise errors.AutonomError(errors.INVALID_VALUE,
+                                  "Cannot simulate failed authentication during fingerprint enrollment.",
+                                  hint="Finish enrollment, then open an authentication prompt in your app. This prevents registering the failure id.")
+    if action == "nonmatch" and readiness["operation"] == "unknown":
+        raise errors.AutonomError(errors.INVALID_VALUE,
+                                  "Cannot confirm an active fingerprint authentication prompt.",
+                                  hint="Open your app's biometric prompt and refresh status; failure injection requires a readable authentication state.")
+    if readiness["enrolled"] is False and readiness["operation"] != "enroll":
+        raise errors.AutonomError(errors.INVALID_VALUE,
+                                  "No fingerprints are enrolled for the current Android user.",
+                                  hint=("Open enrollment settings and enroll the success id using Successful authentication. Then open your app's biometric prompt."
+                                        if action == "nonmatch" else
+                                        "Open enrollment settings, then use Successful authentication to send this id while the enrollment screen is waiting for a touch."))
+    if readiness["operation"] == "idle":
+        raise errors.AutonomError(errors.INVALID_VALUE,
+                                  "No fingerprint authentication or enrollment is active.",
+                                  hint="Open the biometric prompt in your app, or the enrollment screen, then touch the fingerprint again.")
+    _adb(target, ["emu", "finger", "touch", finger])
+    return _unverified({"control": "biometric", "action": action, "finger_id": int(finger),
+                        "message": "Fingerprint touch sent. Check the enrollment screen or app prompt for the result.",
+                        "readiness": readiness})
 
 
 def shell_quote(text: str) -> str:

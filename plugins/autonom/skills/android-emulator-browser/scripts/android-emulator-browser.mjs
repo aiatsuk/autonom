@@ -32,6 +32,7 @@ import {
 import { createSessionManager, runCliJson, spawnDetachedCli } from "./canvas-sessions.mjs";
 import { renderWorkspacePage } from "./canvas-workspace-page.mjs";
 import {
+  actionsDock,
   actionsButton,
   actionsMarkup,
   actionsScript,
@@ -140,12 +141,11 @@ function canvasHooks(options) {
     })();
     return facts;
   };
-  // The single-device Canvas keeps its page as it was (contract 7.1): the Actions drawer
-  // joins the device pages of a workspace only.
-  const actionsPage = { button: actionsButton, markup: actionsMarkup, styles: actionsStyles, script: actionsScript };
+  // Captures are available on single-device and workspace Canvases.
+  const actionsPage = { dock: actionsDock, button: actionsButton, markup: actionsMarkup, styles: actionsStyles, script: actionsScript };
   return {
     renderWorkspacePage,
-    pageExtensions: options.mode === "workspace" ? [actionsPage] : [],
+    pageExtensions: [actionsPage],
     apiRoutes: [createActivityApiRoute({ python: options.python ?? env.PYTHON ?? "python3", canvasFacts })],
     commandLog: createCommandLog(),
   };

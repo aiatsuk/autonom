@@ -221,7 +221,7 @@ test("--control-idle: 15 to 3600 seconds, default 120; anything else is a usage 
 });
 
 test("LEASED_TOOLS_OPS is the list of contract 4.3 and the Python tools process's list", () => {
-  const expected = ["permissions.set", "location.set", "location.clear", "simulate", "network.attach",
+  const expected = ["permissions.set", "location.set", "location.clear", "simulate", "network.capture", "network.attach",
     "network.detach", "network.stop", "app.install", "app.launch", "app.open_url", "app.locale"];
   assert.deepEqual([...LEASED_TOOLS_OPS], expected);
   const python = readFileSync(join(ROOT, "scripts/autonom_canvas_tools.py"), "utf8");
@@ -230,7 +230,7 @@ test("LEASED_TOOLS_OPS is the list of contract 4.3 and the Python tools process'
   assert.deepEqual([...block[1].matchAll(/"([^"]+)"/g)].map((match) => match[1]), expected);
   // Observation and host-side ops never need a lease.
   for (const op of ["capture.screenshot", "record.start", "record.stop", "network.start", "mocks.add", "mocks.clear",
-    "captures.delete", "context"]) {
+    "captures.delete", "captures.open_directory", "context"]) {
     assert.equal(isLeasedToolsOp(op), false, op);
   }
   // Every leased op is one the Canvas control rule covers.

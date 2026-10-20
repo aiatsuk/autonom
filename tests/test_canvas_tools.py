@@ -276,11 +276,11 @@ class DispatchTests(ToolsCase):
 
     def test_the_op_list_is_the_contract(self) -> None:
         self.assertEqual(set(tools_mod.READ_OPS), {
-            "context", "permissions.list", "location.get", "network.status",
+            "context", "permissions.list", "location.get", "biometric.status", "network.status",
             "network.requests", "network.request", "mocks.list"})
         self.assertEqual(set(tools_mod.MUTATING_OPS), {
             "permissions.set", "location.set", "location.clear", "simulate",
-            "network.start", "network.attach", "network.detach", "network.stop",
+            "network.start", "network.capture", "network.attach", "network.detach", "network.stop",
             "mocks.add", "mocks.update", "mocks.enable", "mocks.disable",
             "mocks.remove", "mocks.clear"})
 
@@ -348,8 +348,9 @@ class ContextTests(ToolsCase):
         self.assertEqual(result["android_permission_aliases"]["camera"],
                          ["android.permission.CAMERA"])
         self.assertEqual(result["simulate"], {
-            "biometric": ["match"], "battery": ["set", "reset"],
-            "network": ["online", "offline"], "appearance": ["light", "dark"]})
+            "biometric": ["match", "nonmatch", "settings"], "battery": ["set", "reset"],
+            "network": ["online", "offline"], "appearance": ["light", "dark"],
+            "text-size": ["0.85", "1.0", "1.3", "1.5", "2.0"], "animations": ["pin", "reset"]})
         self.assertTrue(result["location_readable"])
         self.assertFalse(result["location_clearable"])
         self.assertTrue(result["permissions_readable"])
@@ -397,7 +398,8 @@ class IosContextTests(ToolsCase):
         self.assertIsNone(result["app_id"])
         self.assertEqual(result["simulate"], {
             "push": ["send"], "biometric": ["enroll", "unenroll", "match", "nonmatch"],
-            "battery": ["set", "reset"], "appearance": ["light", "dark"]})
+            "battery": ["set", "reset"], "appearance": ["light", "dark"],
+            "text-size": ["small", "large", "extra-extra-extra-large", "accessibility-extra-extra-extra-large"]})
 
     def test_ios_session_on_this_simulator(self) -> None:
         record = self.start_session(UDID, platform="ios")
@@ -628,9 +630,14 @@ class IosLocationTests(ToolsCase):
 
 
 class AndroidSimulateTests(ToolsCase):
+    def test_biometric_status_is_read_only_without_control(self):
+        result = self.ok("biometric.status")
+        self.assertEqual(result["biometry"], "fingerprint")
+        self.assertIn("enrolled", result)
+
+
     def test_controls_outside_the_allowlist_never_reach_the_device(self) -> None:
-        for control in ("clipboard", "status-bar", "sms", "call", "keyboard", "animations",
-                        "text-size", None, 3):
+        for control in ("clipboard", "status-bar", "sms", "call", "keyboard", None, 3):
             with self.subTest(control=control):
                 response = self.refused("simulate", {"control": control, "action": "set"},
                                         errors.FLOW_COMMAND_INVALID)
@@ -689,6 +696,13 @@ class AndroidSimulateTests(ToolsCase):
 
 
 class IosSimulateTests(ToolsCase):
+    def test_largest_accessibility_category_and_biometric_status(self):
+        result = self.ok("simulate", {"control": "text-size", "action": "accessibility-extra-extra-extra-large"})
+        self.assertEqual(result["value"], "accessibility-extra-extra-extra-large")
+        status = self.ok("biometric.status")
+        self.assertIn(status["biometry"], ("face", "touch", "unknown"))
+        self.assertIn("enrolled", status)
+
     def target(self) -> Target:
         return ios()
 
@@ -765,7 +779,7 @@ RUNNING = {"running": True, "pid": 4242, "port": 8899, "proxy_host": "127.0.0.1"
 class NetworkScopeTests(ToolsCase):
     """wc-004-S01: no session on this target, no network op."""
 
-    OPS = ("network.status", "network.requests", "network.request", "network.start",
+    OPS = ("network.status", "network.requests", "network.request", "network.start", "network.capture",
            "network.attach", "network.detach", "network.stop")
 
     def assert_all_refused(self) -> None:
@@ -852,6 +866,15 @@ class NetworkTests(ToolsCase):
         self.refused("network.request", {"id": "nope"}, errors.FLOW_NOT_FOUND)
         self.refused("network.request", {}, errors.FLOW_COMMAND_INVALID)
 
+    def test_copy_body_is_on_demand_and_validates_side(self) -> None:
+        self.write_flows(self.record, [{"id": "f_0001", "response_body_preview": "hello"},
+                                      {"id": "f_0002", "response_body_preview": "hello…[truncated]"}])
+        self.assertEqual(self.ok("network.request", {"id": "f_0001", "body": "response"}),
+                         {"complete": True, "body": "hello"})
+        self.assertEqual(self.ok("network.request", {"id": "f_0002", "body": "response"}),
+                         {"complete": False, "reason": "not_captured"})
+        self.refused("network.request", {"id": "f_0001", "body": "../req"}, errors.FLOW_COMMAND_INVALID)
+
     def test_start_without_acknowledged_true_is_the_consent_error(self) -> None:
         with mock.patch.object(proxy, "start", side_effect=AssertionError("started")):
             for payload in ({}, {"acknowledged": False}, {"acknowledged": "true"},
@@ -876,6 +899,13 @@ class NetworkTests(ToolsCase):
         entry = self.journal(self.record)[-1]
         self.assertEqual(entry["argv"], ["canvas", "network.start", "--i-understand-mitm"])
         self.assertEqual(entry["result"], {"port": 8899})
+
+    def test_start_keeps_the_preferred_fixture_port(self) -> None:
+        self.record.setdefault("network", {})["preferred_proxy_port"] = 61093
+        session.save(self.record)
+        with mock.patch.object(proxy, "start", return_value=dict(RUNNING)) as start:
+            self.ok("network.start", {"acknowledged": True})
+        self.assertEqual(start.call_args.kwargs["port"], 61093)
 
     def test_attach_needs_a_running_proxy(self) -> None:
         self.refused("network.attach", {"acknowledged": True}, errors.PROXY_NOT_RUNNING)
@@ -906,6 +936,42 @@ class NetworkTests(ToolsCase):
 
 
 # --- mocks (wc-005) ------------------------------------------------------------------
+
+
+    def test_capture_starts_and_attaches_once_and_reuses_verified_attachment(self) -> None:
+        with mock.patch.object(proxy, "start", return_value=dict(RUNNING)) as start, \
+                mock.patch.object(tools_mod.cli, "network_attach_payload",
+                                  return_value={"ok": True, "mode": "automated"}) as attach, \
+                mock.patch.object(tools_mod.network_attachment, "attachment_evidence",
+                                  side_effect=[{"attached": False}, {"attached": True}]):
+            result = self.ok("network.capture", {"acknowledged": True})
+        self.assertTrue(result["attached"])
+        self.assertFalse(result["attachment_reused"])
+        self.assertEqual(start.call_count, 1)
+        self.assertEqual(attach.call_count, 1)
+        self.assertTrue(attach.call_args.kwargs["acknowledged"])
+        self.assertNotIn("install_ca", attach.call_args.kwargs)
+        self.assertIn("canvas network.capture", " ".join(self.journal(self.record)[-1]["argv"]))
+        with mock.patch.object(proxy, "start", return_value=dict(RUNNING)), \
+                mock.patch.object(tools_mod.cli, "network_attach_payload",
+                                  side_effect=AssertionError("re-attached")), \
+                mock.patch.object(tools_mod.network_attachment, "attachment_evidence",
+                                  return_value={"attached": True, "evidence": "transparent_proxy"}):
+            reused = self.ok("network.capture", {"acknowledged": True})
+        self.assertTrue(reused["attachment_reused"])
+
+    def test_capture_consent_and_partial_failure_do_not_claim_capture(self) -> None:
+        with mock.patch.object(proxy, "start", side_effect=AssertionError("started")):
+            self.refused("network.capture", {}, errors.CONSENT_REQUIRED)
+        with mock.patch.object(proxy, "start", return_value=dict(RUNNING)), \
+                mock.patch.object(tools_mod.network_attachment, "attachment_evidence",
+                                  return_value={"attached": False}), \
+                mock.patch.object(tools_mod.cli, "network_attach_payload",
+                                  side_effect=errors.AutonomError(errors.BACKEND_FAILED, "connection failed")), \
+                mock.patch.object(proxy, "stop", side_effect=AssertionError("stopped existing proxy")):
+            reply = self.refused("network.capture", {"acknowledged": True}, errors.BACKEND_FAILED)
+        self.assertIn("Proxy is running", reply["error"])
+        self.assertFalse(self.journal(self.record)[-1]["ok"])
 
 
 class MockTests(ToolsCase):
@@ -1073,7 +1139,7 @@ class MockTests(ToolsCase):
 class JournalTests(ToolsCase):
     def test_read_ops_are_not_journaled(self) -> None:
         record = self.start_session()
-        for op in ("context", "location.get", "network.status", "network.requests",
+        for op in ("context", "location.get", "biometric.status", "network.status", "network.requests",
                    "mocks.list"):
             self.ok(op)
         self.assertEqual(self.journal(record), [])
@@ -1104,3 +1170,25 @@ class JournalTests(ToolsCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class CaptureFolderTests(ToolsCase):
+    def test_opens_only_the_fixed_device_folder_in_finder(self):
+        with mock.patch.object(tools_mod.sys, "platform", "darwin"), \
+                mock.patch.object(tools_mod.subprocess, "run") as opened:
+            result = self.ok("captures.open_directory")
+            self.assertTrue(result["opened"])
+            self.assertTrue(Path(result["dir"]).is_dir())
+            opened.assert_called_once_with(
+                ["/usr/bin/open", "-a", "Finder", result["dir"]],
+                check=True, capture_output=True, text=True, timeout=10)
+            self.refused("captures.open_directory", {"path": "/private"}, errors.FLOW_COMMAND_INVALID)
+            self.assertEqual(opened.call_count, 1)
+
+    def test_non_macos_and_launch_failure_are_explicit(self):
+        with mock.patch.object(tools_mod.sys, "platform", "linux"), \
+                mock.patch.object(tools_mod.subprocess, "run") as opened:
+            self.refused("captures.open_directory", {}, errors.UNSUPPORTED_CAPABILITY)
+            opened.assert_not_called()
+        with mock.patch.object(tools_mod.sys, "platform", "darwin"), \
+                mock.patch.object(tools_mod.subprocess, "run", side_effect=OSError("unavailable")):
+            self.refused("captures.open_directory", {}, errors.BACKEND_FAILED)

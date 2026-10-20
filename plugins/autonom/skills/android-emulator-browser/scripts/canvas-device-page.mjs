@@ -1,4 +1,5 @@
 /** The device page, rendered as self-contained HTML with inline styles and scripts. */
+import { themeControl, themeHead, themeStyles } from "./canvas-theme-page.mjs";
 import { MAX_CONTROL_MESSAGE_BYTES } from "./browser-lib.mjs";
 import {
   ANDROID_KEYCODES,
@@ -23,6 +24,7 @@ const PAGE_ICONS = Object.freeze({
   chevron: '<path d="m7 10 5 5 5-5"/>',
   check: '<path d="m5 12.5 4.5 4.5L19 7.5"/>',
   people: '<circle cx="9" cy="8" r="3"/><path d="M3.5 19a5.5 5.5 0 0 1 11 0"/><path d="M16 5.5a3 3 0 0 1 0 5.5M18 19a5.5 5.5 0 0 0-2.5-4.6"/>',
+  close: '<path d="m7 7 10 10M17 7 7 17"/>',
   inspector: '<rect x="3" y="4.5" width="18" height="15" rx="3"/><path d="M15 4.5v15"/>',
   back: '<path d="M15 5 8 12l7 7"/>',
   home: '<circle cx="12" cy="12" r="6.5"/>',
@@ -66,11 +68,11 @@ function displayPicker(context) {
     `<button type="button" class="option" role="option" data-preset="${id}" aria-selected="false" tabindex="-1">` +
     `${icon("check", "check")}<span>${escapeHtml(label)}</span>` +
     `<small${id === "default" ? ' id="display-default-size"' : ""}>${width ? `${width} × ${height}` : ""}</small></button>`).join("");
-  return `<button type="button" class="popup" id="display-preset" aria-haspopup="listbox" aria-expanded="false" ` +
+  return `<div class="display-picker"><button type="button" class="popup" id="display-preset" aria-haspopup="listbox" aria-expanded="false" ` +
     `aria-controls="display-list" title="Display size" disabled>${icon("phone", "portrait")}${icon("phoneLandscape", "landscape")}<span class="sr">Display size: </span>` +
     `<span id="display-label">Size</span>${icon("chevron", "chev")}</button>` +
     `<div class="menu" id="display-menu"><div role="listbox" id="display-list" aria-label="Display size">${options}</div>` +
-    `<p class="note">Changes the device's screen size and density. Restored when the Canvas stops.</p></div>`;
+    `<p class="note">Changes the device's screen size and density. Restored when the Canvas stops.</p></div></div>`;
 }
 
 /**
@@ -85,7 +87,7 @@ function renderPage(context, { base = "", embed = false } = {}) {
   // right after the Tools drawer's.
   const extensions = context.server?.hooks?.pageExtensions ?? [];
   const extension = (part, ...args) => extensions.map((item) => item[part]?.(...args) ?? "").join("");
-  const extensionContext = { platform: context.options.platform, id: context.id ?? null, base, embed };
+  const extensionContext = { platform: context.options.platform, id: context.id ?? null, base, embed, captureOnly: context.server?.mode === "single" };
   const android = context.options.platform === "android";
   const platform = android ? "Android" : "iOS";
   // iOS refuses the Android key buttons, so its page keeps them out of sight (PAGE-003);
@@ -94,6 +96,10 @@ function renderPage(context, { base = "", embed = false } = {}) {
   // Volume buttons: scrcpy on Android; on iOS only the idb transport presses them, so they
   // show there (data-idb) and stay out of sight on screencap.
   const volume = android ? " data-scrcpy" : " data-idb hidden";
+  const volumeControls = `<div class="volume-controls" role="group" aria-label="Volume"${android ? "" : " data-idb hidden"}>` +
+    `<span>Volume</span>` +
+    iconButton("volumeDown", "Volume down", `data-system="volume-down"${volume}`, "volume-key") +
+    iconButton("volumeUp", "Volume up", `data-system="volume-up"${volume}`, "volume-key") + `</div>`;
   return `<!doctype html>
 <html lang="en"${embed ? ' data-embed="1"' : ""}>
 <head>
@@ -101,22 +107,9 @@ function renderPage(context, { base = "", embed = false } = {}) {
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>Autonom Canvas · ${serial}</title>
 <link rel="icon" href="data:,">
+${themeHead()}
 <style>
-:root{
-  color-scheme:light dark;
-  --bg:#f5f5f7;--surface:#fff;--raised:#fff;--text:#1d1d1f;--text-2:#6e6e73;--line:rgba(0,0,0,.09);--line-2:rgba(0,0,0,.14);
-  --fill:rgba(0,0,0,.045);--fill-2:rgba(0,0,0,.08);--accent:#0071e3;--accent-fill:#0071e3;--on-accent:#fff;--live:#1f9d55;--warn:#b25000;--idle:#8e8e93;
-  --bezel:#1d1d1f;--shadow:0 1px 1px rgba(0,0,0,.04),0 10px 30px rgba(0,0,0,.08);--device-shadow:0 2px 6px rgba(0,0,0,.08),0 24px 60px rgba(0,0,0,.16);
-  --material:rgba(255,255,255,.96);--r-sm:8px;--video-ratio:.4615;
-  --font:-apple-system,BlinkMacSystemFont,"SF Pro Text","Helvetica Neue",system-ui,sans-serif;
-  --mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,monospace;
-}
-@media (prefers-color-scheme:dark){:root{
-  --bg:#0b0b0c;--surface:#161617;--raised:#1f1f21;--text:#f5f5f7;--text-2:#a1a1a6;--line:rgba(255,255,255,.09);--line-2:rgba(255,255,255,.16);
-  --fill:rgba(255,255,255,.06);--fill-2:rgba(255,255,255,.11);--accent:#0a84ff;--accent-fill:#0068d6;--live:#32d74b;--warn:#ff9f0a;
-  --bezel:#1c1c1e;--shadow:0 1px 1px rgba(0,0,0,.4),0 12px 32px rgba(0,0,0,.45);--device-shadow:0 0 0 1px rgba(255,255,255,.16),0 24px 70px rgba(0,0,0,.7);
-  --material:rgba(36,36,38,.95);
-}}
+${themeStyles()}
 *{box-sizing:border-box}
 html,body{height:100%}
 body{margin:0;background:var(--bg);color:var(--text);font:13px/1.4 var(--font);-webkit-font-smoothing:antialiased;
@@ -133,13 +126,7 @@ svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.6;stroke
 .sr{position:absolute;width:1px;height:1px;margin:-1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
 
 /* toolbar */
-.bar{grid-area:bar;position:relative;z-index:4;display:grid;grid-template-columns:minmax(0,1fr) auto minmax(0,1fr);align-items:center;gap:12px;padding:0 14px;border-bottom:1px solid var(--line);background:var(--surface)}
-.brand{display:flex;align-items:center;gap:10px;min-width:0}
-.mark{width:22px;height:22px;border-radius:6px;background:var(--text);color:var(--bg);display:grid;place-items:center;flex:none}
-.mark svg{width:14px;height:14px;stroke-width:2}
-.brand b{font-weight:600;font-size:14px}
-.target{display:flex;align-items:center;gap:6px;min-width:0;color:var(--text-2);white-space:nowrap;overflow:hidden}
-.target strong{color:var(--text);font-weight:500;overflow:hidden;text-overflow:ellipsis}
+.bar{grid-area:bar;position:relative;z-index:4;display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:12px;padding:0 14px;border-bottom:1px solid var(--line);background:var(--surface)}
 .dot{width:7px;height:7px;border-radius:50%;background:var(--idle);flex:none}
 .dot[data-state=live]{background:var(--live);box-shadow:0 0 0 3px color-mix(in srgb,var(--live) 18%,transparent)}
 .dot[data-state=warn]{background:var(--warn)}
@@ -148,18 +135,16 @@ svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.6;stroke
 .popup .chev{width:12px;height:12px;color:var(--text-2)}
 .popup .landscape,.popup.wide .portrait{display:none}
 .popup.wide .landscape{display:block}
-.dims{color:var(--text-2);font-variant-numeric:tabular-nums;white-space:nowrap}
 .actions{display:flex;justify-content:flex-end;align-items:center;gap:6px;min-width:0}
-.chip{display:flex;align-items:center;gap:6px;height:28px;padding:0 10px;border-radius:999px;background:var(--fill);color:var(--text-2);font-weight:500;white-space:nowrap}
-.chip svg{width:14px;height:14px}
 .icon{width:32px;height:32px;display:grid;place-items:center;border-radius:var(--r-sm);border:0;background:transparent;color:var(--text-2)}
-.icon[aria-pressed=true]{color:var(--accent)}
+.icon[aria-pressed=true]{color:var(--accent);background:color-mix(in srgb,var(--accent) 9%,transparent)}
 
-/* size menu */
-.menu{position:absolute;top:calc(100% + 5px);left:50%;z-index:5;width:288px;padding:6px;border-radius:12px;background:var(--material);
+/* size menu: anchor to the trigger, not the full toolbar column. */
+.display-picker{position:relative;min-width:0;max-width:100%}
+.menu{position:absolute;top:calc(100% + 5px);left:0;z-index:5;width:min(288px,calc(100vw - 28px));max-height:calc(100dvh - 80px);overflow-y:auto;padding:6px;border-radius:12px;background:var(--material);
   -webkit-backdrop-filter:blur(24px) saturate(1.6);backdrop-filter:blur(24px) saturate(1.6);border:1px solid var(--line-2);box-shadow:var(--shadow);
-  opacity:0;visibility:hidden;transform:translateX(-50%) scale(.98);transform-origin:50% 0;transition:opacity .12s ease-out,transform .12s ease-out,visibility 0s linear .12s}
-.menu.open{opacity:1;visibility:visible;transform:translateX(-50%);transition-delay:0s}
+  opacity:0;visibility:hidden;transform:scale(.98);transform-origin:0 0;transition:opacity .12s ease-out,transform .12s ease-out,visibility 0s linear .12s}
+.menu.open{opacity:1;visibility:visible;transform:scale(1);transition-delay:0s}
 .option{display:grid;grid-template-columns:18px minmax(0,1fr) auto;align-items:center;gap:8px;width:100%;height:34px;padding:0 10px 0 8px;border:0;border-radius:7px;background:none;text-align:left;transition:none}
 .menu .option:active{transform:none}
 /* The fill follows the keyboard (focus-visible) and the pointer (hover); a menu opened by pointer
@@ -173,11 +158,11 @@ svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.6;stroke
 .menu hr{border:0;border-top:1px solid var(--line);margin:5px 6px}
 .menu .note{margin:0;padding:6px 10px 4px;color:var(--text-2);font-size:11.5px;line-height:1.35}
 
-/* stage */
+/* stage: the stream already contains the device corners; never mask screen pixels. */
 .stage{grid-area:stage;position:relative;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;min-width:0;min-height:0;padding:28px 24px 96px;overflow:hidden}
-.device{position:relative;flex:none;box-sizing:content-box;aspect-ratio:9/19.5;padding:9px;border-radius:44px;background:var(--bezel);box-shadow:var(--device-shadow);touch-action:none;
+.device{position:relative;flex:none;box-sizing:content-box;aspect-ratio:9/19.5;padding:9px;border-radius:12px;background:var(--bezel);box-shadow:var(--device-shadow);touch-action:none;
   width:min(calc(100% - 18px),calc((100vh - 224px) * var(--video-ratio)));width:min(calc(100% - 18px),calc((100dvh - 224px) * var(--video-ratio)))}
-.surface{position:absolute;inset:9px;display:block;width:calc(100% - 18px);height:calc(100% - 18px);object-fit:contain;border-radius:35px;background:#000;
+.surface{position:absolute;inset:9px;display:block;width:calc(100% - 18px);height:calc(100% - 18px);object-fit:contain;border-radius:0;background:#000;
   user-select:none;-webkit-user-select:none;-webkit-user-drag:none;touch-action:none;cursor:crosshair;outline:none}
 .surface:focus-visible{outline:2px solid var(--accent);outline-offset:4px}
 .caption{margin:0;min-height:17px;color:var(--text-2);font-size:12px;font-variant-numeric:tabular-nums;text-align:center}
@@ -190,10 +175,10 @@ svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.6;stroke
 .dock .div{width:1px;height:20px;margin:0 4px;background:var(--line-2)}
 
 /* inspector */
-.side{grid-area:side;border-left:1px solid var(--line);background:var(--surface);overflow:auto;padding:6px 0 24px}
-.group{padding:14px 16px;border-bottom:1px solid var(--line)}
-.group:last-child{border-bottom:0}
-.group h2{margin:0 0 10px;font-size:12px;font-weight:600;color:var(--text-2);letter-spacing:.01em}
+.side{grid-area:side;border-left:1px solid var(--line);background:var(--surface);overflow:auto;padding:2px 0 16px;scrollbar-width:thin}
+.inspector-head{display:none}
+.group{padding:12px 14px;margin:0;border:0;border-bottom:1px solid var(--line);border-radius:0;background:var(--surface);min-width:0}
+.group h2{margin:0 0 8px;font-size:12px;font-weight:600;color:var(--text);letter-spacing:-.01em}
 .field{display:flex;gap:6px}
 .field input{flex:1;min-width:0;height:32px;padding:0 10px;border-radius:var(--r-sm);border:1px solid var(--line-2);background:var(--bg)}
 .field input::placeholder{color:var(--text-2);opacity:1}
@@ -208,16 +193,30 @@ svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.6;stroke
 .row{display:flex;align-items:center;gap:10px;width:calc(100% + 16px);height:32px;margin:0 -8px;padding:0 8px;border:0;border-radius:var(--r-sm);background:none;text-align:left}
 .row:not(:disabled):active{transform:none;background:var(--fill-2)}
 .row svg{width:16px;height:16px;color:var(--text-2)}
+.volume-controls{display:grid;grid-template-columns:minmax(0,1fr) 32px 32px;align-items:center;gap:4px;padding:0;margin-bottom:8px;border:0;background:none}
+.volume-key{display:grid;place-items:center;width:32px;height:28px;padding:0;border:1px solid var(--line);border-radius:6px;background:var(--surface)}
+.volume-key svg{width:18px;height:18px}
+.device-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:4px}
+.device-tile{display:flex;align-items:center;justify-content:flex-start;gap:6px;min-width:0;min-height:32px;padding:6px;border:0;border-radius:6px;background:var(--fill);font-size:12px;text-align:left;line-height:1.3}
+.device-tile svg{width:16px;height:16px;color:var(--text-2);flex-shrink:0}
+.device-tile:last-child{grid-column:1/-1;flex-direction:row;min-height:32px}
+.input-control summary{cursor:pointer;color:var(--text-2);font-size:12px;font-weight:600;min-height:24px;line-height:24px}
+.input-control .owner{margin-top:12px}
+.volume-controls + .input-control{margin-top:14px}
 .owner{display:flex;align-items:flex-start;gap:8px;margin:0;color:var(--text-2)}
 .owner .dot{margin-top:5px}
 .owner strong{color:var(--text);font-weight:600}
 .pair{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-top:10px}
-dl{margin:0;display:grid;grid-template-columns:auto minmax(0,1fr);gap:7px 12px}
+dl{margin:0;display:grid;grid-template-columns:auto minmax(0,1fr);gap:5px 10px}
 dt{color:var(--text-2)}
 dd{margin:0;text-align:right;font-variant-numeric:tabular-nums;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 dd code{font:12px var(--mono)}
 .linkbtn{margin-top:12px;padding:0;border:0;background:none;color:var(--accent);font-weight:500}
-.diag{margin-top:12px}
+.inspector-stream{position:relative}
+.inspector-stream h2{min-height:24px;padding-right:32px;display:flex;align-items:center}
+.inspector-reconnect{position:absolute;top:8px;right:10px}
+#stream-details>dl{margin-top:8px}
+.diag{margin-top:8px}
 .diag summary{width:max-content;cursor:pointer;color:var(--text-2);font-size:12px}
 .status{margin:8px 0 0;font:11.5px/1.45 var(--mono);color:var(--text-2);white-space:pre-wrap;overflow-wrap:anywhere}
 
@@ -226,31 +225,30 @@ dd code{font:12px var(--mono)}
   .option:hover small{color:inherit}
   .popup:not(:disabled):hover,.icon:hover,.btn:not(.primary):not(:disabled):hover,.row:not(:disabled):hover{background:var(--fill)}
   .icon:hover{color:var(--text)}
-  .key:not(:disabled):hover,.dock button:not(:disabled):hover{background:var(--fill-2)}
+  .volume-key:not(:disabled):hover,.device-tile:not(:disabled):hover,.key:not(:disabled):hover,.dock button:not(:disabled):hover{background:var(--fill-2)}
 }
 @supports not ((backdrop-filter:blur(1px)) or (-webkit-backdrop-filter:blur(1px))){:root{--material:var(--raised)}}
 @media (forced-colors:active){.option:focus-visible{outline:2px solid CanvasText}}
-@media (max-width:900px){.dims{display:none}}
 
-/* phone: the inspector moves under the device, the pill stays above the safe area, 44 px targets */
+/* Narrow desktop window: overlay panels retain the same compact controls. */
 @media (max-width:760px){
   body{display:block;height:auto;min-height:100%}
-  .bar{position:sticky;top:0;grid-template-columns:auto minmax(0,1fr) auto;min-height:calc(52px + env(safe-area-inset-top));padding:env(safe-area-inset-top) 12px 0}
-  .target,.chip,.brand b,.actions .icon{display:none}
-  .center{justify-content:center}
-  .menu{position:fixed;top:calc(56px + env(safe-area-inset-top));width:min(320px,calc(100vw - 24px))}
+  .bar{position:sticky;top:0;grid-template-columns:minmax(0,1fr) auto;min-height:calc(52px + env(safe-area-inset-top));padding:env(safe-area-inset-top) 12px 0}
+  .actions .icon{display:none}
+  .actions #inspector-toggle{display:grid}
+  .center{justify-content:flex-start}
+  .center .popup{min-width:0;max-width:100%}
+  #display-label{min-width:0;overflow:hidden;text-overflow:ellipsis}
+  .menu{width:min(320px,calc(100vw - 24px))}
   .stage{padding:16px 16px 92px;overflow:visible}
-  .device{padding:7px;border-radius:36px;width:min(calc(100% - 14px),calc((100svh - 208px) * var(--video-ratio)))}
-  .surface{inset:7px;width:calc(100% - 14px);height:calc(100% - 14px);border-radius:29px}
+  .device{padding:7px;border-radius:10px;width:min(calc(100% - 14px),calc((100svh - 208px) * var(--video-ratio)))}
+  .surface{inset:7px;width:calc(100% - 14px);height:calc(100% - 14px);border-radius:0}
   .notice{position:fixed;top:calc(60px + env(safe-area-inset-top))}
   .dock{position:fixed;bottom:calc(14px + env(safe-area-inset-bottom));z-index:4}
-  .dock button{width:44px;height:44px}
-  .side{border-left:0;border-top:1px solid var(--line);padding-bottom:calc(110px + env(safe-area-inset-bottom))}
-  .popup,.option,.key,.btn,.field input,.row{height:44px}
-  body.no-inspector .side{display:block}
-  .linkbtn{min-height:44px}
-  .diag summary{line-height:44px}
-  .field input{font-size:16px}
+  .side{position:fixed;inset:60px 8px 8px auto;width:var(--canvas-panel-width);z-index:6;border:1px solid var(--line-2);border-radius:12px;padding:0 0 8px;overflow:auto;overscroll-behavior:contain;box-shadow:var(--sheet-shadow)}
+  .inspector-head{position:sticky;top:0;z-index:1;min-height:55px;display:flex;align-items:center;justify-content:space-between;padding:8px 12px 8px 16px;background:var(--surface);border-bottom:1px solid var(--line)}
+  body:not(.no-inspector){overflow:hidden}
+  body.no-inspector .side{display:none}
 }
 @media (max-width:360px){.dock{gap:0;padding:2px}.dock .div{display:none}}
 @media (prefers-reduced-motion:reduce){*,*::before,*::after{transition:none!important;animation:none!important}button:active{transform:none!important}}
@@ -259,18 +257,11 @@ ${toolsStyles()}${extension("styles")}${embed ? EMBED_STYLES : ""}
 </head>
 <body>
 <header class="bar">
-  <div class="brand">
-    <span class="mark" aria-hidden="true">${icon("mark")}</span>
-    <b>Autonom</b>
-    <span class="target"><i class="dot" id="live-dot" aria-hidden="true"></i><strong>${serial}</strong><span id="target-detail">${platform} · connecting</span></span>
-  </div>
   <div class="center">
     ${displayPicker(context)}
-    <span class="dims" id="display-dims"></span>
   </div>
   <div class="actions">
-    <span class="chip" title="Who controls the device">${icon("people")}<span id="control-chip">Shared</span></span>
-    ${toolsButton()}${extension("button")}
+    ${embed ? "" : themeControl()}${toolsButton()}${extension("button")}
     ${iconButton("inspector", "Inspector", 'id="inspector-toggle" aria-pressed="true" aria-controls="inspector"', "icon")}
   </div>
 </header>
@@ -283,53 +274,53 @@ ${toolsStyles()}${extension("styles")}${embed ? EMBED_STYLES : ""}
     ${iconButton("home", "Home", 'data-key="KEYCODE_HOME" data-system="home"')}
     ${iconButton("recent", "Recent apps", `data-key="KEYCODE_APP_SWITCH" data-system="app-switch"${androidOnly}`)}
     <span class="div" aria-hidden="true"${androidOnly}></span>
+    ${extension("dock", extensionContext)}
     ${iconButton("rotate", "Rotate", `data-system="rotate" data-scrcpy${androidOnly}`)}
-    ${iconButton("volumeDown", "Volume down", `data-system="volume-down"${volume}`)}
-    ${iconButton("volumeUp", "Volume up", `data-system="volume-up"${volume}`)}
+    ${embed ? iconButton("volumeDown", "Volume down", `data-system="volume-down"${volume}`) + iconButton("volumeUp", "Volume up", `data-system="volume-up"${volume}`) : ""}
     ${iconButton("power", "Power", 'data-key="KEYCODE_POWER" data-system="power"')}
   </nav>
 </main>
 <aside class="side" id="inspector" aria-label="Inspector">
+  <div class="inspector-head"><strong>Inspector</strong>${iconButton("close", "Close inspector", 'id="inspector-close"', "icon")}</div>
   <section class="group">
-    <h2>Type</h2>
     <div class="field"><input id="text" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Text to type" aria-label="Text to type"><button type="button" id="sendText" class="btn primary">Send</button></div>
-    <p class="hint" id="text-hint">Any language. Longer text is pasted through the device clipboard.</p>
-  </section>
-  <section class="group"${androidOnly}>
-    <h2>Keys</h2>
-    <div class="keys">
-      <span></span>${iconButton("up", "Up", 'data-key="KEYCODE_DPAD_UP" data-code="19"', "key")}<span></span>
-      ${iconButton("left", "Left", 'data-key="KEYCODE_DPAD_LEFT" data-code="21"', "key")}<button type="button" class="key" data-key="KEYCODE_ENTER" data-code="66">Enter</button>${iconButton("right", "Right", 'data-key="KEYCODE_DPAD_RIGHT" data-code="22"', "key")}
-      <span></span>${iconButton("down", "Down", 'data-key="KEYCODE_DPAD_DOWN" data-code="20"', "key")}${iconButton("delete", "Delete", 'data-key="KEYCODE_DEL" data-code="67"', "key")}
-    </div>
+    <p class="hint" id="text-hint" hidden>Any language. Longer text is pasted through the device clipboard.</p>
   </section>
   <section class="group"${androidOnly}>
     <h2>Device</h2>
-    <div class="list">
-      <button type="button" class="row" data-key="KEYCODE_WAKEUP" data-system="wake">${icon("wake")}Wake screen</button>
-      <button type="button" class="row" data-system="notifications" data-scrcpy>${icon("notifications")}Notifications</button>
-      <button type="button" class="row" data-system="quick-settings" data-scrcpy>${icon("quickSettings")}Quick settings</button>
-      <button type="button" class="row" data-system="collapse" data-scrcpy>${icon("collapse")}Collapse panels</button>
-      <button type="button" class="row" id="clipboard" data-scrcpy>${icon("clipboard")}Copy device clipboard</button>
+    ${android && !embed ? volumeControls : ""}
+    <div class="device-grid">
+      <button type="button" class="device-tile" data-key="KEYCODE_WAKEUP" data-system="wake">${icon("wake")}Wake screen</button>
+      <button type="button" class="device-tile" data-system="notifications" data-scrcpy>${icon("notifications")}Notifications</button>
+      <button type="button" class="device-tile" data-system="quick-settings" data-scrcpy>${icon("quickSettings")}Quick settings</button>
+      <button type="button" class="device-tile" data-system="collapse" data-scrcpy>${icon("collapse")}Collapse panels</button>
+      <button type="button" class="device-tile" id="clipboard" data-scrcpy aria-label="Copy device clipboard" title="Copy device clipboard">${icon("clipboard")}Copy clipboard</button>
     </div>
   </section>
   <section class="group">
-    <h2>Control</h2>
+    ${!android && !embed ? volumeControls : ""}
+    <details class="input-control">
+    <summary>Input control</summary>
     <p class="owner"><i class="dot" id="owner-dot" aria-hidden="true"></i><span><strong id="owner-name">Shared</strong> <span id="owner-detail">· people and agents can send input</span></span></p>
     <div class="pair"><button type="button" class="btn" id="control-take" disabled>Take control</button><button type="button" class="btn" id="control-pause" disabled>Pause input</button></div>
+    </details>
   </section>
-  <section class="group">
+  <section class="group inspector-stream">
     <h2>Stream</h2>
+    ${iconButton("rotate", "Reconnect stream", 'id="refresh"', "icon inspector-reconnect")}
     <dl>
-      <dt>Transport</dt><dd id="stream-transport">connecting</dd>
-      <dt>Codec</dt><dd><code id="stream-codec">—</code></dd>
       <dt>Frames</dt><dd id="stream-frames">—</dd>
       <dt>Video</dt><dd id="stream-video">—</dd>
-      <dt>Display</dt><dd id="stream-display">—</dd>
-      <dt>Clients</dt><dd id="stream-clients">—</dd>
     </dl>
-    <button type="button" class="linkbtn" id="refresh">Reconnect stream</button>
-    <details class="diag"><summary>Diagnostics</summary><pre class="status" id="status">Connecting…</pre></details>
+    <details class="diag" id="stream-details"><summary>Details</summary>
+      <dl>
+        <dt>Transport</dt><dd id="stream-transport">connecting</dd>
+        <dt>Codec</dt><dd><code id="stream-codec">—</code></dd>
+        <dt>Display</dt><dd id="stream-display">—</dd>
+        <dt>Clients</dt><dd id="stream-clients">—</dd>
+      </dl>
+      <details class="diag"><summary>Diagnostics</summary><pre class="status" id="status">Connecting…</pre></details>
+    </details>
   </section>
 </aside>
 ${toolsMarkup({ platform: context.options.platform })}${extension("markup", extensionContext)}
@@ -360,7 +351,7 @@ ${keyInputFor.toString()}
 const $=id=>document.getElementById(id);
 const image=$("screen"),video=$("video"),device=$("device"),statusEl=$("status"),textInput=$("text"),sizePicker=$("display-preset");
 const sizeMenu=$("display-menu"),sizeLabel=$("display-label"),defaultSize=$("display-default-size"),sendButton=$("sendText");
-const ui={liveDot:$("live-dot"),target:$("target-detail"),dims:$("display-dims"),chip:$("control-chip"),inspector:$("inspector-toggle"),caption:$("caption"),notice:$("notice"),hint:$("text-hint"),ownerDot:$("owner-dot"),ownerName:$("owner-name"),ownerDetail:$("owner-detail"),take:$("control-take"),pause:$("control-pause"),transport:$("stream-transport"),codec:$("stream-codec"),frames:$("stream-frames"),videoSize:$("stream-video"),display:$("stream-display"),clients:$("stream-clients")};
+const ui={inspector:$("inspector-toggle"),caption:$("caption"),notice:$("notice"),hint:$("text-hint"),ownerDot:$("owner-dot"),ownerName:$("owner-name"),ownerDetail:$("owner-detail"),take:$("control-take"),pause:$("control-pause"),transport:$("stream-transport"),codec:$("stream-codec"),frames:$("stream-frames"),videoSize:$("stream-video"),display:$("stream-display"),clients:$("stream-clients")};
 const PRESET_LABELS=${JSON.stringify(Object.fromEntries(DISPLAY_PRESETS.map(({ id, label }) => [id, label])))};
 const WIDE_PRESETS=${JSON.stringify(DISPLAY_PRESETS.filter(({ width, height }) => width > height).map(({ id }) => id))};
 const OWNERS={shared:["Shared","people and agents can send input"],human:["People","agents cannot send input"],agent:["Agent","this page cannot send input"]};
@@ -437,7 +428,7 @@ function onControlMessage(message){if(message.t==="state")applyState(message);el
 function sendControl(message){if(!controlSocket||controlSocket.readyState!==1)return false;controlSocket.send(JSON.stringify(message));return true}
 function applyLease(data){if("lease" in data)view.lease=data.lease&&typeof data.lease==="object"?data.lease:null;if("session_stopped" in data)view.sessionStopped=data.session_stopped===true}
 function applyState(message){view.owner=message.owner;view.paused=message.paused;view.session=message.session;view.clients=message.clients;applyLease(message);if("clipboard" in message){view.clipboard=message.clipboard===true;if(iosFast())applyHint()}if("preset" in message){view.preset=message.preset;view.density=message.density}syncPicker();if("rotation" in message)setRotation(message.rotation);if(view.mode==="webcodecs"&&message.width&&message.height)setVideoSize(message.width,message.height);if(message.transport&&message.transport!==view.transport){view.transport=message.transport;applyTransport()}}
-function applyHint(){setText(ui.hint,iosFast()?(view.clipboard?"Plain ASCII up to 300 bytes is typed into the Simulator; longer or other text is set on its clipboard: touch and hold, then Paste.":"Typed into the Simulator, up to 300 bytes at a time."):scrcpyActive()?"Any language. Longer text is pasted through the device clipboard.":"Letters, digits and punctuation of plain ASCII on this transport.")}
+function applyHint(){setText(ui.hint,iosFast()?(view.clipboard?"Plain ASCII up to 300 bytes is typed into the Simulator; longer or other text is set on its clipboard: touch and hold, then Paste.":"Typed into the Simulator, up to 300 bytes at a time."):scrcpyActive()?"Any language. Longer text is pasted through the device clipboard.":"Letters, digits and punctuation of plain ASCII on this transport.");textInput.title=ui.hint.textContent}
 function applyTransport(){textInput.placeholder=fastActive()?"Text to type":"ASCII text to type";applyHint();for(const button of document.querySelectorAll("[data-scrcpy]"))button.hidden=!scrcpyActive();for(const button of document.querySelectorAll("[data-idb]"))button.hidden=!iosFast();if(fastActive()){connectControl();if(view.mode!=="webcodecs"&&!fallbackKept){if(typeof VideoDecoder==="function"&&typeof EncodedVideoChunk==="function")startWebCodecs();else startMultipart("VideoDecoder is not available in this browser",true)}}else{closeControlSocket();if(view.mode!=="multipart")startMultipart("")}}
 // Size picker (Android): the preset in effect is selected; a choice goes the way other input goes.
 function leaseMine(){return Boolean(view.lease&&view.lease.mine)}
@@ -474,11 +465,16 @@ if(sizePicker){
 // Controls that cannot act look and are disabled (PAGE-004); handoff goes the way input goes.
 function leaseOwner(){const lease=view.lease,owner=OWNERS[view.owner]||[String(view.owner),"holds control"];if(view.sessionStopped)return["Session stopped","this device's Autonom session has stopped"];if(!lease)return owner;if(foreignHeld()){const holder=lease.holder||{};return[(holder.kind==="agent"?"Agent":"Someone else")+" '"+(holder.label||"")+"' has control","Take over to use the screen"]}if(leaseMine()){const from=lease.took_over_from,idle="eleased after "+idleText(lease.idle_s)+" idle";return["You have control",from?"took over from "+(from.kind==="agent"?"agent":"someone")+" '"+(from.label||from.id||"")+"' · r"+idle:"R"+idle]}if(lease.ended_by==="idle")return[owner[0],"your control ended after "+idleText(lease.idle_s)+" idle"];if(lease.ended_by==="lost")return[owner[0],"control moved to "+(lease.holder&&lease.holder.label?lease.holder.label:"another holder")];return owner}
 function takeLabel(){if(foreignHeld())return"Take over";if(leaseMine())return view.lease.took_over_from?"Hand back":"Release";return view.owner==="human"?"Release":"Take control"}
-function syncControls(){const ready=Boolean(view.status)&&canSendInput(),owner=leaseOwner();for(const control of inputControls){const disabled=!ready||(control.dataset.system==="rotate"&&view.rotateBusy);if(control.disabled!==disabled)control.disabled=disabled}setText(ui.ownerName,owner[0]);setText(ui.ownerDetail,"· "+(view.paused?"input is paused":owner[1]));setText(ui.chip,owner[0]+(view.paused?" · Paused":""));setState(ui.ownerDot,ready?"live":"warn");setText(ui.take,takeLabel());setText(ui.pause,view.paused?"Resume input":"Pause input");for(const button of [ui.take,ui.pause])if(button.disabled===Boolean(view.status))button.disabled=!view.status}
+function syncControls(){const ready=Boolean(view.status)&&canSendInput(),owner=leaseOwner();for(const control of inputControls){const disabled=!ready||(control.dataset.system==="rotate"&&view.rotateBusy);if(control.disabled!==disabled)control.disabled=disabled}setText(ui.ownerName,owner[0]);setText(ui.ownerDetail,"· "+(view.paused?"input is paused":owner[1]));setState(ui.ownerDot,ready?"live":"warn");setText(ui.take,takeLabel());setText(ui.pause,view.paused?"Resume input":"Pause input");for(const button of [ui.take,ui.pause])if(button.disabled===Boolean(view.status))button.disabled=!view.status}
 function setControl(mode){if(fastActive()&&sendControl({t:"control",mode}))return;post("/control",{mode}).then(result=>{view.owner=result.control_owner;view.paused=result.input_paused;applyLease(result);syncPicker()}).catch(error=>note(error.message))}
 ui.take.addEventListener("click",()=>setControl(foreignHeld()?"takeover":(leaseMine()||view.owner==="human")?"release":"takeover"));
 ui.pause.addEventListener("click",()=>setControl(view.paused?"resume":"pause"));
-ui.inspector.addEventListener("click",()=>{const hidden=document.body.classList.toggle("no-inspector");ui.inspector.setAttribute("aria-pressed",String(!hidden));ui.inspector.title=hidden?"Show inspector":"Hide inspector"});
+function setInspector(open,returnFocus=false){document.body.classList.toggle("no-inspector",!open);ui.inspector.setAttribute("aria-pressed",String(open));ui.inspector.title=open?"Hide inspector":"Show inspector";if(returnFocus)ui.inspector.focus()}
+ui.inspector.addEventListener("click",()=>setInspector(document.body.classList.contains("no-inspector")));
+$("inspector-close").addEventListener("click",()=>setInspector(false,true));
+const inspectorNarrow=typeof matchMedia==="function"?matchMedia("(max-width:760px)"):null;
+if(inspectorNarrow){if(inspectorNarrow.matches)setInspector(false);const resized=event=>{if(event.matches)setInspector(false)};if(inspectorNarrow.addEventListener)inspectorNarrow.addEventListener("change",resized);else if(inspectorNarrow.addListener)inspectorNarrow.addListener(resized)}
+document.addEventListener("keydown",event=>{if(event.key==="Escape"&&!event.defaultPrevented&&inspectorNarrow&&inspectorNarrow.matches&&!document.body.classList.contains("no-inspector")&&!document.body.classList.contains("tools-open")&&!document.body.classList.contains("actions-open")){event.preventDefault();setInspector(false,true)}});
 // iOS Safari shows :active press feedback only while the document has a touch listener.
 document.addEventListener("touchstart",()=>{},{passive:true});
 function clamp01(value){return Math.min(1,Math.max(0,value))}
@@ -525,15 +521,17 @@ $("refresh").onclick=()=>{if(view.mode==="webcodecs"){closeVideoSocket();waiting
 async function sendText(){const value=textInput.value;if(!value)return;if(iosFast()&&!view.clipboard){if(utf8Length(value)>300){note("the iOS Simulator takes at most 300 bytes of text at a time; nothing was sent");return}if(sendControl({t:"text",text:value}))textInput.value="";return}if(fastActive()){const message=utf8Length(value)<=300&&(!iosFast()||iosTypeable(value))?{t:"text",text:value}:{t:"paste",text:value};if(!fitsControl(message,"the text"))return;const ok=sendControl(message);if(ok)textInput.value="";return}try{await post("/text",{text:value});textInput.value=""}catch(error){note(error.message)}}
 $("sendText").onclick=sendText;textInput.addEventListener("keydown",event=>{if(event.key==="Enter")sendText()});
 function transportLabel(){if(!view.transport)return"connecting";if(!fastActive())return view.transport;if(view.mode==="webcodecs")return scrcpyActive()?"scrcpy (webcodecs)":view.transport+" (webcodecs)";return view.transport+" (multipart"+(view.reason?": "+view.reason:"")+")"}
-function render(){const data=view.status||{},lines=["platform: "+(data.platform||"unknown"),"transport: "+transportLabel()];if(data.fallback_reason)lines.push("fallback: "+data.fallback_reason);if(view.mode==="webcodecs"){lines.push("decoder: "+(stats.codec||"waiting for config"));lines.push("fps: "+stats.renderTimes.length+" rendered, "+stats.framesDecoded+" decoded, "+stats.framesDropped+" dropped, queue "+(decoder?decoder.decodeQueueSize:0));lines.push("video: "+(view.width?view.width+"x"+view.height:"waiting")+", session "+view.session)}else{lines.push("frames: "+(data.frames_sent??0)+"\\nstream clients: "+(data.stream_clients??0))}if(view.clients)lines.push("clients: video "+view.clients.video+", control "+view.clients.control);lines.push("display: "+(data.display&&data.display.width?data.display.width+"x"+data.display.height+(view.density?" @ "+view.density:"")+(sizePicker?" ("+(view.preset||"other")+")":""):"unknown"));lines.push("control: "+view.owner+(view.paused?" (paused)":""));if(data.last_error)lines.push("last error: "+data.last_error);if(view.note)lines.push("note: "+view.note);setStatus(lines.join("\\n"));syncPicker();renderChrome()}
+function currentFps(){const now=performance.now();while(stats.renderTimes.length&&now-stats.renderTimes[0]>1000)stats.renderTimes.shift();return stats.renderTimes.length}
+function render(){currentFps();const data=view.status||{},lines=["platform: "+(data.platform||"unknown"),"transport: "+transportLabel()];if(data.fallback_reason)lines.push("fallback: "+data.fallback_reason);if(view.mode==="webcodecs"){lines.push("decoder: "+(stats.codec||"waiting for config"));lines.push("fps: "+stats.renderTimes.length+" rendered, "+stats.framesDecoded+" decoded, "+stats.framesDropped+" dropped, queue "+(decoder?decoder.decodeQueueSize:0));lines.push("video: "+(view.width?view.width+"x"+view.height:"waiting")+", session "+view.session)}else{lines.push("frames: "+(data.frames_sent??0)+"\\nstream clients: "+(data.stream_clients??0))}if(view.clients)lines.push("clients: video "+view.clients.video+", control "+view.clients.control);lines.push("display: "+(data.display&&data.display.width?data.display.width+"x"+data.display.height+(view.density?" @ "+view.density:"")+(sizePicker?" ("+(view.preset||"other")+")":""):"unknown"));lines.push("control: "+view.owner+(view.paused?" (paused)":""));if(data.last_error)lines.push("last error: "+data.last_error);if(view.note)lines.push("note: "+view.note);setStatus(lines.join("\\n"));syncPicker();renderChrome()}
 // The toolbar, caption, notice and Stream details; every string reaches the page as text.
 function sizeText(width,height){return width&&height?width+" × "+height:""}
 function displayText(){const display=logicalDisplay||{},size=sizeText(display.width,display.height);return size&&view.density?size+" · "+view.density+" dpi":size}
 function liveState(){if(!view.status)return"idle";if(view.paused)return"warn";if(view.mode==="webcodecs")return view.session==="streaming"&&stats.framesRendered?"live":"idle";return view.mode==="multipart"&&image.naturalWidth?"live":"idle"}
-function captionText(){if(view.mode==="webcodecs")return stats.renderTimes.length+" fps"+(view.rtt!=null?" · "+view.rtt+" ms":"")+" · WebCodecs";if(view.mode==="multipart")return(view.transport?view.transport+" · ":"")+"multipart stream";return"Connecting…"}
-function renderChrome(){const data=view.status||{},webcodecs=view.mode==="webcodecs";if(view.status)setText(ui.target,(data.platform==="ios"?"iOS":"Android")+" · "+(view.transport||"connecting"));setState(ui.liveDot,liveState());setText(ui.dims,displayText());setText(ui.caption,captionText());setText(ui.notice,view.note&&Date.now()-noteAt<NOTICE_MS?view.note:"");setText(ui.transport,fastActive()?view.transport+" · "+(webcodecs?"WebCodecs":"multipart"):view.transport||"connecting");setText(ui.codec,webcodecs?stats.codec||"waiting":"—");setText(ui.frames,webcodecs?stats.renderTimes.length+" fps · "+stats.framesDropped+" dropped":(data.frames_sent??0)+" sent");setText(ui.videoSize,(webcodecs?sizeText(view.width,view.height):sizeText(image.naturalWidth,image.naturalHeight))||"waiting");setText(ui.display,displayText()||"unknown");setText(ui.clients,view.clients?view.clients.video+" video · "+view.clients.control+" control":(data.stream_clients??0)+" stream");if(view.mode==="multipart"&&image.naturalWidth)fitFrame(image.naturalWidth,image.naturalHeight)}
-async function poll(){try{const response=await fetch(url("/status")),data=await response.json();if(!response.ok)throw new Error(data.error||response.statusText);view.status=data;logicalDisplay=data.display;view.owner=data.control_owner;view.paused=data.input_paused;applyLease(data);if(data.display&&"preset" in data.display){view.preset=data.display.preset;view.density=data.display.density}rememberDefaultSize(data.display);syncPicker();if(data.transport!==view.transport){view.transport=data.transport;applyTransport()}}catch(error){note(error.message);if(!view.mode)startMultipart("status unavailable")}finally{setTimeout(poll,1200)}}
-function snapshot(){return{transport:view.transport,mode:view.mode,decoder:stats.decoder,fallbackReason:view.reason||null,codec:stats.codec,framesDecoded:stats.framesDecoded,framesRendered:stats.framesRendered,framesDropped:stats.framesDropped,decodeQueueSize:decoder?decoder.decodeQueueSize:0,fps:stats.renderTimes.length,packets:stats.packets,bytes:stats.bytes,errors:stats.errors,lastFrameAt:stats.lastFrameAt,width:view.width,height:view.height,rotation,session:view.session,owner:view.owner,paused:view.paused,clients:view.clients,control:controlSocket?controlSocket.readyState:-1,video:videoSocket?videoSocket.readyState:-1,rtt:view.rtt,note:view.note,display:{preset:view.preset,density:view.density,picker:sizePicker?sizePicker.value:null,pickerDisabled:sizePicker?sizePicker.disabled:null},status:statusEl.textContent}}
+function frameRateText(){const fps=currentFps();return !fps&&stats.framesRendered&&view.session==="streaming"?"0 fps · no new frames":fps+" fps"}
+function captionText(){if(view.mode==="webcodecs")return frameRateText()+(view.rtt!=null?" · "+view.rtt+" ms":"")+" · WebCodecs";if(view.mode==="multipart")return(view.transport?view.transport+" · ":"")+"multipart stream";return"Connecting…"}
+function renderChrome(){const data=view.status||{},webcodecs=view.mode==="webcodecs";setText(ui.caption,captionText());setText(ui.notice,view.note&&Date.now()-noteAt<NOTICE_MS?view.note:"");setText(ui.transport,fastActive()?view.transport+" · "+(webcodecs?"WebCodecs":"multipart"):view.transport||"connecting");setText(ui.codec,webcodecs?stats.codec||"waiting":"—");setText(ui.frames,webcodecs?currentFps()+" fps"+(stats.framesDropped?" · "+stats.framesDropped+" dropped":""):(data.frames_sent??0)+" sent");setText(ui.videoSize,(webcodecs?sizeText(view.width,view.height):sizeText(image.naturalWidth,image.naturalHeight))||"waiting");setText(ui.display,displayText()||"unknown");setText(ui.clients,view.clients?view.clients.video+" video · "+view.clients.control+" control":(data.stream_clients??0)+" stream");if(view.mode==="multipart"&&image.naturalWidth)fitFrame(image.naturalWidth,image.naturalHeight)}
+async function poll(){try{let response=await fetch(url("/status"));if(response.status===401&&bootstrapToken){await authenticate();videoRefusals=0;videoRetry=500;closeVideoSocket();if(fastActive()&&typeof VideoDecoder!=="undefined")startWebCodecs();else if(view.mode==="multipart")restart();}if(response.status===401){response=await fetch(url("/status"));}const data=await response.json();if(!response.ok)throw new Error(data.error||response.statusText);view.status=data;logicalDisplay=data.display;view.owner=data.control_owner;view.paused=data.input_paused;applyLease(data);if(data.display&&"preset" in data.display){view.preset=data.display.preset;view.density=data.display.density}rememberDefaultSize(data.display);syncPicker();if(data.transport!==view.transport){view.transport=data.transport;applyTransport()}}catch(error){note(error.message);if(!view.mode)startMultipart("status unavailable")}finally{setTimeout(poll,1200)}}
+function snapshot(){return{transport:view.transport,mode:view.mode,decoder:stats.decoder,fallbackReason:view.reason||null,codec:stats.codec,framesDecoded:stats.framesDecoded,framesRendered:stats.framesRendered,framesDropped:stats.framesDropped,decodeQueueSize:decoder?decoder.decodeQueueSize:0,fps:currentFps(),packets:stats.packets,bytes:stats.bytes,errors:stats.errors,lastFrameAt:stats.lastFrameAt,width:view.width,height:view.height,rotation,session:view.session,owner:view.owner,paused:view.paused,clients:view.clients,control:controlSocket?controlSocket.readyState:-1,video:videoSocket?videoSocket.readyState:-1,rtt:view.rtt,note:view.note,display:{preset:view.preset,density:view.density,picker:sizePicker?sizePicker.value:null,pickerDisabled:sizePicker?sizePicker.disabled:null},status:statusEl.textContent}}
 window.autonomCanvas=Object.freeze({stats:snapshot,send:sendControl});
 async function authenticate(){const body=bootstrapToken?{token:bootstrapToken}:{};const response=await fetch("/auth",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});const payload=await response.json().catch(()=>({}));if(response.ok){csrf=payload.csrf;return}if(bootstrapToken)throw new Error(payload.error||"Authentication failed");note("open the Canvas URL with its #token to sign in")}
 async function bootstrap(){await authenticate();setInterval(render,500);await poll()}

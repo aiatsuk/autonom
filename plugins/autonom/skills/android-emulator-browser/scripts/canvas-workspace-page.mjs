@@ -1,3 +1,5 @@
+import { themeControl, themeHead, themeStyles } from "./canvas-theme-page.mjs";
+
 // The workspace page of the Mobile Canvas (contract section 4 of run canvas-multi-device): the
 // in-page tab bar (each tab a split of 1-4 tiles with its own /c/<tabId> URL), the tiles (each a
 // same-origin iframe of the device page in embed mode), the tile headers, the empty-tile picker
@@ -106,19 +108,8 @@ export function normalizeModel(model) {
 
 /** The page's styles; the tokens are the device page's, so tiles and shell match in both themes. */
 export function workspaceStyles() {
-  return `:root{
-  color-scheme:light dark;
-  --bg:#f5f5f7;--surface:#fff;--raised:#fff;--text:#1d1d1f;--text-2:#6e6e73;--line:rgba(0,0,0,.09);--line-2:rgba(0,0,0,.14);
-  --fill:rgba(0,0,0,.045);--fill-2:rgba(0,0,0,.08);--accent:#0071e3;--accent-fill:#0071e3;--on-accent:#fff;--live:#1f9d55;--warn:#b25000;--idle:#8e8e93;--danger:#d70015;
-  --shadow:0 1px 1px rgba(0,0,0,.04),0 10px 30px rgba(0,0,0,.08);--material:rgba(255,255,255,.96);--r-sm:8px;--r-md:12px;
-  --font:-apple-system,BlinkMacSystemFont,"SF Pro Text","Helvetica Neue",system-ui,sans-serif;
-  --mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,monospace;
-}
-@media (prefers-color-scheme:dark){:root{
-  --bg:#0b0b0c;--surface:#161617;--raised:#1f1f21;--text:#f5f5f7;--text-2:#a1a1a6;--line:rgba(255,255,255,.09);--line-2:rgba(255,255,255,.16);
-  --fill:rgba(255,255,255,.06);--fill-2:rgba(255,255,255,.11);--accent:#0a84ff;--accent-fill:#0068d6;--live:#32d74b;--warn:#ff9f0a;--danger:#ff453a;
-  --shadow:0 1px 1px rgba(0,0,0,.4),0 12px 32px rgba(0,0,0,.45);--material:rgba(36,36,38,.95);
-}}
+  return `${themeStyles()}
+:root{--r-md:12px}
 *{box-sizing:border-box}
 html,body{height:100%}
 body{margin:0;background:var(--bg);color:var(--text);font:13px/1.4 var(--font);-webkit-font-smoothing:antialiased;
@@ -165,7 +156,7 @@ svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.6;stroke
 .ws-layouts{grid-area:layout;display:flex;align-items:center;gap:2px;padding:2px;border-radius:var(--r-sm);background:var(--fill)}
 .ws-layouts .ws-icon{width:30px;height:26px;border-radius:6px}
 .ws-layouts .ws-icon[aria-pressed=true]{background:var(--raised);color:var(--text);box-shadow:0 1px 2px rgba(0,0,0,.12)}
-.ws-menu-wrap{grid-area:menu;position:relative}
+.ws-menu-wrap{grid-area:menu;position:relative;display:flex;align-items:center;gap:6px}
 .ws-menu{position:absolute;top:calc(100% + 6px);right:0;z-index:6;min-width:200px;padding:6px;border-radius:var(--r-md);background:var(--material);
   -webkit-backdrop-filter:blur(24px) saturate(1.6);backdrop-filter:blur(24px) saturate(1.6);border:1px solid var(--line-2);box-shadow:var(--shadow)}
 .ws-menu-item{display:flex;align-items:center;width:100%;height:32px;padding:0 10px;border:0;border-radius:7px;background:none;text-align:left;text-decoration:none;font-weight:400;transition:none}
@@ -279,7 +270,7 @@ export function workspaceMarkup(model) {
     <button type="button" class="ws-icon" id="ws-new-tab" aria-label="New tab" title="New tab">${svg("plus")}</button>
   </div>
   <div class="ws-layouts" id="ws-layouts" role="group" aria-label="Layout">${layouts}</div>
-  <div class="ws-menu-wrap">
+  <div class="ws-menu-wrap">${themeControl()}
     <button type="button" class="ws-icon" id="ws-menu-button" aria-haspopup="menu" aria-expanded="false" aria-controls="ws-menu" aria-label="Tab menu" title="Tab menu">${svg("more")}</button>
     <div class="ws-menu" id="ws-menu" role="menu" aria-label="Tab" hidden>
       <button type="button" class="ws-menu-item" role="menuitem" id="ws-menu-rename" tabindex="-1">Rename…</button>
@@ -904,6 +895,7 @@ export function renderWorkspacePage(model) {
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>${escapeHtml(normalized.title)}</title>
 <link rel="icon" href="data:,">
+${themeHead()}
 <style>
 ${workspaceStyles()}
 </style>

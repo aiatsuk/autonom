@@ -662,3 +662,65 @@ class TraceHintTests(SweepBase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class FingerprintReadinessTests(unittest.TestCase):
+    def setUp(self):
+        from autonom_lib.platform import Target
+        self.target = Target("android", "emulator-5554", "/fake/adb", {})
+
+    def run_touch(self, count, operation, finger=7, action="match"):
+        from unittest.mock import patch
+        from autonom_lib import simulator
+        dump = json.dumps({"prints": [{"id": 10, "count": count}, {"id": 0, "count": 5}]}) + "\nCurrent operation: " + operation
+        calls = []
+        def adb(target, args):
+            calls.append(args)
+            return "10" if args == ["shell", "am", "get-current-user"] else dump if args == ["shell", "dumpsys", "fingerprint"] else "OK"
+        with patch.object(simulator, "_adb", side_effect=adb):
+            try:
+                return simulator.apply(self.target, "biometric", action, {"finger_id": finger}), calls
+            except errors.AutonomError as exc:
+                return exc, calls
+
+    def test_unenrolled_current_user_is_not_masked_by_another_user(self):
+        result, calls = self.run_touch(0, "null")
+        self.assertIsInstance(result, errors.AutonomError)
+        self.assertIn("No fingerprints", str(result))
+        self.assertFalse(any("emu" in call for call in calls))
+
+    def test_enrollment_accepts_touches_before_any_fingerprint_is_saved(self):
+        result, calls = self.run_touch(0, "[FingerprintEnrollClient]")
+        self.assertFalse(result["verified"])
+        self.assertEqual(calls[-1], ["emu", "finger", "touch", "7"])
+
+    def test_idle_authentication_is_refused(self):
+        result, calls = self.run_touch(1, "null")
+        self.assertIsInstance(result, errors.AutonomError)
+        self.assertIn("No fingerprint authentication", str(result))
+        self.assertFalse(any("emu" in call for call in calls))
+
+    def test_authentication_accepts_configured_id_but_does_not_claim_success(self):
+        result, calls = self.run_touch(1, "[FingerprintAuthenticationClient]")
+        self.assertFalse(result["verified"])
+        self.assertEqual(calls[-1][-1], "7")
+
+    def test_invalid_id_is_rejected_before_any_device_call(self):
+        result, calls = self.run_touch(1, "null", "1;bad")
+        self.assertIsInstance(result, errors.AutonomError)
+        self.assertEqual(calls, [])
+
+    def test_nonmatch_uses_the_separate_unenrolled_id(self):
+        result, calls = self.run_touch(1, "[FingerprintAuthenticationClient]", 2147483647, "nonmatch")
+        self.assertEqual(result["action"], "nonmatch")
+        self.assertFalse(result["verified"])
+        self.assertEqual(calls[-1], ["emu", "finger", "touch", "2147483647"])
+
+    def test_nonmatch_cannot_accidentally_enroll_the_failure_id(self):
+        result, calls = self.run_touch(0, "[FingerprintEnrollClient]", 2147483647, "nonmatch")
+        self.assertIsInstance(result, errors.AutonomError)
+        self.assertFalse(any("emu" in call for call in calls))
+
+    def test_nonmatch_refuses_an_unknown_operation(self):
+        result, calls = self.run_touch(1, "[UnknownClient]", 2147483647, "nonmatch")
+        self.assertIsInstance(result, errors.AutonomError)
+        self.assertFalse(any("emu" in call for call in calls))

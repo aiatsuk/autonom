@@ -2353,7 +2353,7 @@ _VIEW_ACTION = "android.intent.action.VIEW"
 _CHOOSER_MARKERS = ("ResolverActivity", "ChooserActivity", "intentresolver")
 
 
-def _open_android(target: Target, url: str) -> dict[str, Any]:
+def _open_android(target: Target, url: str, *, app_id: str | None = None) -> dict[str, Any]:
     """The VIEW intent through `am start -W`, which names the activity that
     took the URL: a deep link that lands in Chrome or the chooser instead of
     the app used to be reported exactly like one that reached the app."""
@@ -2366,7 +2366,8 @@ def _open_android(target: Target, url: str) -> dict[str, Any]:
     pretest_guard.before_mutation("open", target=target, url=url)
     completed = adb_mod.run_adb(
         target.tool,
-        ["shell", "am", "start", "-W", "-a", _VIEW_ACTION, "-d", shlex.quote(url)],
+        ["shell", "am", "start", "-W", "-a", _VIEW_ACTION, "-d", shlex.quote(url),
+         *(["-p", app_id] if app_id else [])],
         serial=target.target_id, timeout=60, check=True,
     )
     output = completed.stdout if isinstance(completed.stdout, str) else ""
@@ -2376,7 +2377,8 @@ def _open_android(target: Target, url: str) -> dict[str, Any]:
     if report is not None:
         detail["launch"] = report
     warnings: list[dict[str, Any]] = []
-    unresolved = next((line.strip() for line in output.splitlines()
+    diagnostics = output + "\n" + (completed.stderr if isinstance(completed.stderr, str) else "")
+    unresolved = next((line.strip() for line in diagnostics.splitlines()
                        if line.strip().startswith("Error")), None)
     if unresolved:
         warnings.append({
@@ -2706,6 +2708,9 @@ def network_start_payload(record: dict[str, Any], *, port: int | None,
     # again the moment the proxy starts. Say so before it can mislead anyone.
     mocks_state = mocks_mod.summary()
     payload["mocks"] = mocks_state
+    session_registry = Path(record["artifacts_dir"]) / "network" / "session-mocks"
+    if (session_registry / "registry.json").is_file():
+        payload["session_mocks"] = mocks_mod.summary(session_registry)
     persistent = mocks_mod.persistent_mocks_warning(mocks_state)
     if persistent:
         warnings.append(persistent)
@@ -2839,6 +2844,9 @@ def network_status_payload(record: dict[str, Any], target: Any,
     mocks_state = mocks_mod.summary()
     idle = mocks_mod.annotate_hits(mocks_mod.active(), hit_counts())
     payload["mocks"] = mocks_state
+    session_registry = Path(record["artifacts_dir"]) / "network" / "session-mocks"
+    if (session_registry / "registry.json").is_file():
+        payload["session_mocks"] = mocks_mod.summary(session_registry)
     if idle:
         payload.setdefault("warnings", []).extend(idle)
     # the verb re-run while judging evidence says so too, as start and doctor do

@@ -363,10 +363,10 @@ async function canvasWorld(t, { env = {}, platform = "android" } = {}) {
 // --- The contract tables --------------------------------------------------------------
 
 test("ops: the allowlist is the read and mutating ops of the contract, with no overlap", () => {
-  assert.deepEqual(TOOLS_READ_OPS, ["context", "permissions.list", "location.get", "network.status",
+  assert.deepEqual(TOOLS_READ_OPS, ["context", "permissions.list", "location.get", "biometric.status", "network.status",
     "network.requests", "network.request", "mocks.list"]);
   assert.deepEqual(TOOLS_MUTATING_OPS, ["permissions.set", "location.set", "location.clear", "simulate",
-    "network.start", "network.attach", "network.detach", "network.stop", "mocks.add", "mocks.update",
+    "network.start", "network.capture", "network.attach", "network.detach", "network.stop", "mocks.add", "mocks.update",
     "mocks.enable", "mocks.disable", "mocks.remove", "mocks.clear"]);
   assert.equal(new Set(TOOLS_OPS).size, TOOLS_READ_OPS.length + TOOLS_MUTATING_OPS.length);
 });

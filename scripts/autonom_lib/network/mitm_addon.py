@@ -175,6 +175,35 @@ def preview(body, limit: int = PREVIEW_LIMIT):
     return text[:limit] + TRUNCATION_MARKER
 
 
+COPY_BODY_LIMIT = 4 * 1024 * 1024
+
+
+def save_copy_body(directory, identifier, which, content):
+    """Store complete UTF-8 text after redaction; never save a truncated prefix."""
+    content = content or b""
+    if len(content) > COPY_BODY_LIMIT:
+        return "too_large"
+    try:
+        text = content.decode("utf-8") if isinstance(content, bytes) else content
+        if "\x00" in text:
+            return "binary"
+        text = scrub_body(text)
+        encoded = text.encode("utf-8")
+        if len(encoded) > COPY_BODY_LIMIT:
+            return "too_large"
+        folder = os.path.join(directory, "copy-bodies")
+        os.makedirs(folder, mode=0o700, exist_ok=True)
+        path = os.path.join(folder, "%s.%s" % (identifier, which))
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(encoded)
+        return "saved"
+    except UnicodeError:
+        return "binary"
+    except (OSError, ValueError, TypeError, RecursionError):
+        return "unavailable"
+
+
 def glob_match(pattern: str, value: str) -> bool:
     import fnmatch
 
@@ -216,6 +245,26 @@ def select_rule(rules, method: str, url: str, host: str):
 
 def flow_id(counter: int) -> str:
     return "f_%04d" % counter
+
+
+def last_flow_counter(directory: str) -> int:
+    """Resume ids across proxy restarts; duplicate ids hide rows and overwrite bodies."""
+    largest = 0
+    try:
+        with open(os.path.join(directory, "flows.jsonl"), encoding="utf-8",
+                  errors="replace") as handle:
+            for line in handle:
+                try:
+                    record = json.loads(line)
+                    identifier = record.get("id") if isinstance(record, dict) else None
+                    match = re.fullmatch(r"f_([0-9]+)", identifier or "")
+                    if match:
+                        largest = max(largest, int(match.group(1)))
+                except (ValueError, RecursionError, TypeError):
+                    continue
+    except FileNotFoundError:
+        pass
+    return largest
 
 
 def client_ip(flow):
@@ -386,6 +435,7 @@ class AutonomRecorder:
         self.mocks_path = ""
         self.capture_bodies = False
         self.counter = 0
+        self._session_reader = None
         self._rules: list = []
         self._rules_mtime: float | None = None
         self._rules_warned = False
@@ -419,6 +469,7 @@ class AutonomRecorder:
             self.directory = ctx.options.autonom_dir or ""
             if self.directory:
                 os.makedirs(self.directory, mode=0o700, exist_ok=True)
+                self.counter = max(self.counter, last_flow_counter(self.directory))
         if "autonom_mocks" in updates:
             self.mocks_path = ctx.options.autonom_mocks or ""
         if "autonom_capture_bodies" in updates:
@@ -619,6 +670,11 @@ class AutonomRecorder:
             if record[key].get(header):
                 record[key][header] = scrub_url(record[key][header])
 
+        record["body_copy"] = {
+            "request": save_copy_body(self.directory, identifier, "req", flow.request.content),
+            "response": save_copy_body(self.directory, identifier, "res", flow.response.content),
+        }
+
         if self.capture_bodies:
             bodies = os.path.join(self.directory, "bodies")
             os.makedirs(bodies, mode=0o700, exist_ok=True)
@@ -650,6 +706,17 @@ class AutonomRecorder:
         return os.path.join(self.directory, "mocks.json")
 
     def _load_rules(self) -> list:
+        """Explicit session fixtures precede standing machine-wide mocks."""
+        rules = self._load_registry()
+        if not self.directory or not self.mocks_path:
+            return rules
+        path = os.path.join(self.directory, "session-mocks", "registry.json")
+        if self._session_reader is None or self._session_reader.mocks_path != path:
+            self._session_reader = AutonomRecorder()
+            self._session_reader.mocks_path = path
+        return self._session_reader._load_registry() + rules
+
+    def _load_registry(self) -> list:
         """Reload the rules file when its mtime changes; keep the last good set."""
         path = self._rules_file()
         if not path:
