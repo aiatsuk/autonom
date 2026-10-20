@@ -15,6 +15,7 @@ import test, { describe } from "node:test";
 import { promisify } from "node:util";
 import { Script, createContext } from "node:vm";
 
+import { renderPage } from "../plugins/autonom/skills/android-emulator-browser/scripts/canvas-device-page.mjs";
 import {
   toolsButton,
   toolsMarkup,
@@ -3420,6 +3421,105 @@ test("input: the page sends the characters of other keyboard layouts as text and
     ["KeyT", "\u0435"], ["KeyN", "\u0442"]];
   assert.deepEqual(privet.flatMap(([code, key]) => press(code, key)), privet.map(([, key]) => `text ${key}`));
   assert.deepEqual(press("KeyC", "\u0441", { ctrlKey: true }), ["key down 31 12288", "key up 31 12288"]);
+});
+
+/**
+ * A workspace tile of the iOS Canvas page (embed mode) in a node:vm sandbox: sign-in answers,
+ * each /status poll answers with the next of `statuses` (an Error is a failed request), timers
+ * never fire on their own (`run("poll()")` polls again), and WebSockets are recorded by path.
+ */
+async function runIosTile({ statuses, decoder = true }) {
+  const id = "ios~45A342A1-AA2F-4F40-8EFD-F0D0C590ECE5";
+  const html = renderPage({ serial: "45A342A1-AA2F-4F40-8EFD-F0D0C590ECE5", id, options: { platform: "ios" } },
+    { base: `/d/${id}`, embed: true });
+  const document = fakeDocument(html);
+  for (const element of document.elements) element.removeAttribute = (name) => element.attributes.delete(name);
+  const sockets = [];
+  class FakeWebSocket {
+    constructor(url) {
+      this.url = url;
+      this.readyState = 0;
+      sockets.push(new URL(url).pathname.slice(`/d/${id}`.length));
+    }
+    send() {}
+    close() { this.readyState = 3; }
+  }
+  const queue = [...statuses];
+  const json = (status, body) => Promise.resolve({ ok: status < 400, status, statusText: "", json: async () => body });
+  const sandbox = {
+    location: { hash: "", pathname: `/d/${id}/`, search: "?embed=1", protocol: "http:", host: "127.0.0.1:1",
+      origin: "http://127.0.0.1:1" },
+    history: { replaceState() {} },
+    document,
+    navigator: {},
+    performance,
+    fetch: (url) => {
+      if (String(url) === "/auth") return json(200, { csrf: "csrf" });
+      if (!String(url).includes("/status")) return new Promise(() => {});
+      const next = queue.shift();
+      if (!next) return new Promise(() => {});
+      return next instanceof Error ? Promise.reject(next) : json(200, next);
+    },
+    WebSocket: FakeWebSocket,
+    URL, URLSearchParams, TextEncoder,
+    setTimeout: () => 0, clearTimeout() {}, setInterval: () => 0, clearInterval() {},
+    requestAnimationFrame: () => 0,
+    ...(decoder ? { VideoDecoder: function VideoDecoder() {}, EncodedVideoChunk: function EncodedVideoChunk() {} } : {}),
+  };
+  sandbox.window = sandbox;
+  sandbox.parent = { postMessage() {} };
+  sandbox.addEventListener = () => {};
+  const page = createContext(sandbox);
+  const script = html.match(/<script>([\s\S]*)<\/script>/)[1];
+  new Script(script).runInContext(page);
+  const run = (code) => new Script(code).runInContext(page);
+  const settle = async () => {
+    for (let i = 0; i < 10; i += 1) await new Promise((resolvePromise) => setImmediate(resolvePromise));
+  };
+  await settle();
+  return { run, settle, sockets, image: document.getElementById("screen") };
+}
+
+const IOS_TILE_STATUS = {
+  platform: "ios", transport: "idb", display: { width: 402, height: 874 }, control_owner: "shared",
+  input_paused: false, frames_sent: 0, stream_clients: 0,
+};
+
+test("video: a background iOS tile whose first status poll failed opens its video WebSocket once the transport is idb", async () => {
+  // The first poll fails (a Simulator still booting answers /status late or not at all), so the
+  // tile starts the multipart stream; the next poll reports idb, and the tile must switch to
+  // WebCodecs and open /ws/video, not only /ws/control.
+  const tile = await runIosTile({ statuses: [new Error("status unavailable"), IOS_TILE_STATUS] });
+  assert.equal(tile.run("view.mode"), "multipart");
+  assert.deepEqual(tile.sockets, []);
+  tile.run("poll()");
+  await tile.settle();
+  assert.equal(tile.run("view.transport"), "idb");
+  assert.equal(tile.run("view.mode"), "webcodecs");
+  assert.equal(tile.run("view.reason"), "");
+  assert.deepEqual([...tile.sockets].sort(), ["/ws/control", "/ws/video"]);
+  assert.equal(tile.image.hidden, true, "the multipart picture gives way to the decoded video");
+});
+
+test("video: an iOS tile that reports idb on its first poll opens its video WebSocket", async () => {
+  const tile = await runIosTile({ statuses: [IOS_TILE_STATUS] });
+  assert.equal(tile.run("view.mode"), "webcodecs");
+  assert.deepEqual([...tile.sockets].sort(), ["/ws/control", "/ws/video"]);
+});
+
+test("video: a tile keeps a multipart fallback it chose for good (no VideoDecoder, or the video WebSocket refused)", async () => {
+  const tile = await runIosTile({ statuses: [new Error("status unavailable"), IOS_TILE_STATUS], decoder: false });
+  tile.run("poll()");
+  await tile.settle();
+  assert.equal(tile.run("view.mode"), "multipart");
+  assert.equal(tile.run("view.reason"), "VideoDecoder is not available in this browser");
+  assert.deepEqual(tile.sockets, ["/ws/control"]);
+  // A refused video WebSocket falls back for good too: a later transport change keeps multipart.
+  const refused = await runIosTile({ statuses: [IOS_TILE_STATUS] });
+  refused.run("fallback(\"the video WebSocket was refused\")");
+  refused.run("view.transport=null;applyTransport();view.transport=\"idb\";applyTransport()");
+  assert.equal(refused.run("view.mode"), "multipart");
+  assert.equal(refused.run("view.reason"), "the video WebSocket was refused");
 });
 
 test("input: the page refuses a paste or text box entry too large for one control message after JSON escaping, keeps the text and says why", async (t) => {
