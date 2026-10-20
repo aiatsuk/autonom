@@ -287,3 +287,8 @@ benchmark. Use a physical device plus native profilers for frame-rate review.
 ## License
 
 MIT. See `LICENSE`.
+
+## Terms and privacy
+
+See the [terms of service](https://autonom.yatsuk.me/docs/terms/)
+([repository copy](TERMS.md)) and [privacy policy](PRIVACY.md).

@@ -6,7 +6,7 @@
     "name": "Andrei Iatsuk",
     "url": "https://github.com/aiatsuk"
   },
-  "homepage": "https://github.com/aiatsuk/autonom",
+  "homepage": "https://autonom.yatsuk.me/",
   "repository": "https://github.com/aiatsuk/autonom",
   "license": "MIT",
   "keywords": [
@@ -49,7 +49,7 @@
       "Read",
       "Write"
     ],
-    "websiteURL": "https://github.com/aiatsuk/autonom",
+    "websiteURL": "https://autonom.yatsuk.me/",
     "supportURL": "https://github.com/aiatsuk/autonom/issues",
     "privacyPolicyURL": "https://github.com/aiatsuk/autonom/blob/main/PRIVACY.md",
     "defaultPrompt": [
@@ -58,6 +58,7 @@
     "brandColor": "#00C2A8",
     "composerIcon": "./assets/autonom.png",
     "logo": "./assets/autonom.png",
-    "screenshots": []
+    "screenshots": [],
+    "termsOfServiceURL": "https://autonom.yatsuk.me/docs/terms/"
   }
 }
