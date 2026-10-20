@@ -235,14 +235,14 @@ class OpListTests(ActionsCase):
         self.assertEqual(tools_mod.ACTION_DEVICE_OPS,
                          ("capture.screenshot", "record.start", "record.stop", "app.install",
                           "app.launch", "app.open_url", "app.locale"))
-        self.assertEqual(tools_mod.ACTION_LOCAL_OPS, ("captures.delete",))
+        self.assertEqual(tools_mod.ACTION_LOCAL_OPS, ("captures.delete", "captures.open_directory"))
         self.assertEqual(tools_mod.INTERNAL_OPS, ("captures.file",))
         self.assertEqual(tools_mod.OPS, tools_mod.READ_OPS + tools_mod.MUTATING_OPS
                          + tools_mod.ACTION_READ_OPS + tools_mod.ACTION_DEVICE_OPS
                          + tools_mod.ACTION_LOCAL_OPS + tools_mod.INTERNAL_OPS)
         self.assertEqual(len(set(tools_mod.OPS)), len(tools_mod.OPS))
         self.assertEqual(len(tools_mod.READ_OPS), 7)
-        self.assertEqual(len(tools_mod.MUTATING_OPS), 14)
+        self.assertEqual(len(tools_mod.MUTATING_OPS), 15)
         self.assertEqual(set(self.tools.handlers), set(tools_mod.OPS))
 
     def test_the_new_process_arguments_parse_and_default_to_nothing(self) -> None:
@@ -877,6 +877,19 @@ class AppOpsTests(ActionsCase):
         for value in ("", "no scheme", "https://a b", "x" * 2049, "https://x\n", 7, "/path"):
             with self.subTest(url=value if isinstance(value, int) else value[:20]):
                 self.refused("app.open_url", {"url": value}, errors.INVALID_VALUE)
+
+    def test_open_url_can_target_one_android_app(self) -> None:
+        self.ok("app.open_url", {"url": "myapp://profile/42", "app_id": APP})
+        calls = [argv for argv in self.calls() if "android.intent.action.VIEW" in argv]
+        self.assertEqual(calls[-1][-2:], ["-p", APP])
+        self.refused("app.open_url", {"url": "myapp://x", "app_id": "bad;package"}, errors.INVALID_VALUE)
+        self.fake_state(am_start_output="Error: Activity not started, unable to resolve Intent")
+        self.refused("app.open_url", {"url": "myapp://missing", "app_id": APP}, errors.BACKEND_FAILED)
+
+    def test_targeted_open_rejects_errors_reported_on_stderr(self) -> None:
+        with mock.patch.object(tools_mod.cli.adb_mod, "run_adb", return_value=subprocess.CompletedProcess(
+                [], 0, "Starting: Intent", "Error: Activity not started, unable to resolve Intent")):
+            self.refused("app.open_url", {"url": "myapp://missing", "app_id": APP}, errors.BACKEND_FAILED)
 
     def test_url_origin_keeps_only_scheme_and_host(self) -> None:
         self.assertEqual(tools_mod.url_origin("https://u:p@Example.com:8443/a?b=c#d"),

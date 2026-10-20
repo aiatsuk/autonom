@@ -36,6 +36,40 @@ def make_record(root: Path) -> dict:
             "artifacts_dir": str(artifacts), "network": {}}
 
 
+class CopyBodyTests(unittest.TestCase):
+    def test_complete_redacted_body_is_separate_from_preview(self):
+        with tempfile.TemporaryDirectory() as directory:
+            record = make_record(Path(directory))
+            network = Path(record["artifacts_dir"]) / "network"
+            raw = json.dumps({"items": ["value"] * 500, "password": "never-store-me"}).encode()
+            state = mitm_addon.save_copy_body(str(network), "f_0001", "res", raw)
+            self.assertEqual(state, "saved")
+            path = network / "copy-bodies/f_0001.res"
+            self.assertNotIn("never-store-me", path.read_text())
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            flow = {"id": "f_0001", "body_copy": {"response": state},
+                    "response_body_preview": mitm_addon.preview(raw)}
+            store.flows_path(record).write_text(json.dumps(flow) + "\n")
+            listed = store.listing(record)["requests"][0]
+            self.assertTrue(listed["response_body_preview"].endswith("…[truncated]"))
+            result = store.copy_body(record, "f_0001", "response")
+            self.assertTrue(result["complete"])
+            self.assertEqual(len(json.loads(result["body"])["items"]), 500)
+            self.assertNotIn("never-store-me", result["body"])
+            path.unlink()
+            self.assertFalse(store.copy_body(record, "f_0001", "response")["complete"])
+
+    def test_legacy_truncation_size_and_binary_are_explicit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            record = make_record(Path(directory))
+            network = Path(record["artifacts_dir"]) / "network"
+            store.flows_path(record).write_text(json.dumps({"id": "f_0001", "response_body_preview": '{"cut":…[truncated]'}) + "\n")
+            self.assertEqual(store.copy_body(record, "f_0001", "response"), {"complete": False, "reason": "not_captured"})
+            self.assertEqual(mitm_addon.save_copy_body(str(network), "f_0002", "res", b"x" * (mitm_addon.COPY_BODY_LIMIT + 1)), "too_large")
+            self.assertEqual(mitm_addon.save_copy_body(str(network), "f_0003", "res", b"\x00\xff"), "binary")
+            self.assertFalse((network / "copy-bodies").exists())
+
+
 class AddonBoundaryTests(unittest.TestCase):
     """CAP-NET-002 / RISK-007 — the addon runs in mitmproxy's own interpreter."""
 
@@ -674,7 +708,7 @@ class AddonResponseRecordTests(unittest.TestCase):
                 request=SimpleNamespace(method="GET", pretty_url="https://h.example/x",
                                         host="h.example", path="/x", headers=headers,
                                         content=b"", timestamp_start=1.0),
-                response=SimpleNamespace(status_code=200, content=b"", timestamp_end=1.1,
+                response=SimpleNamespace(status_code=200, content=json.dumps({"data": "x" * 5000, "token": "private-value"}).encode(), timestamp_end=1.1,
                                          headers=headers),
                 error=SimpleNamespace(msg="Client disconnected.", timestamp=1.2),
                 metadata={},
@@ -682,8 +716,70 @@ class AddonResponseRecordTests(unittest.TestCase):
             recorder.response(flow)
             recorder.error(flow)  # an error after the response adds nothing
             lines = (Path(tmp) / "flows.jsonl").read_text("utf-8").splitlines()
+            saved = json.loads((Path(tmp) / "copy-bodies/f_0001.res").read_text())
+            self.assertEqual(len(saved["data"]), 5000)
+            self.assertEqual(saved["token"], mitm_addon.PLACEHOLDER)
+            self.assertEqual(json.loads(lines[0])["body_copy"]["response"], "saved")
+            self.assertNotIn("private-value", lines[0])
         self.assertEqual(len(lines), 1)
         self.assertIs(json.loads(lines[0])["completed"], True)
+
+
+class AddonRestartAndSessionTests(unittest.TestCase):
+    def test_restart_resumes_ids_and_keeps_the_existing_store(self) -> None:
+        from types import SimpleNamespace
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "flows.jsonl"
+            original = '{"id":"f_0007"}\n{"id":"f_0002"}\ninvalid\n[]\n'
+            path.write_text(original)
+            module = SimpleNamespace(ctx=SimpleNamespace(
+                options=SimpleNamespace(autonom_dir=tmp)))
+            headers = SimpleNamespace(items=lambda: [])
+            def flow():
+                return SimpleNamespace(
+                    request=SimpleNamespace(method="GET", pretty_url="https://a.test/",
+                                            host="a.test", path="/", headers=headers,
+                                            content=b"", timestamp_start=1.0),
+                    response=SimpleNamespace(status_code=200, content=b"",
+                                             timestamp_end=1.1, headers=headers),
+                    metadata={})
+            with mock.patch.dict(sys.modules, {"mitmproxy": module}):
+                first = mitm_addon.AutonomRecorder()
+                first.configure({"autonom_dir"})
+                first.response(flow())
+                second = mitm_addon.AutonomRecorder()
+                second.configure({"autonom_dir"})
+                second.response(flow())
+            lines = path.read_text().splitlines()
+            self.assertEqual(path.read_text()[:len(original)], original)
+            self.assertEqual([json.loads(x)["id"] for x in lines[-2:]],
+                             ["f_0008", "f_0009"])
+
+    def test_session_fixtures_precede_global_fallback_without_changing_it(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            global_path = directory / "global.json"
+            global_text = json.dumps({"mocks": [
+                {"id": "global", "match": {"url_glob": "*"}}]})
+            global_path.write_text(global_text)
+            session_dir = directory / "session-mocks"
+            session_dir.mkdir()
+            session_path = session_dir / "registry.json"
+            session_path.write_text(json.dumps({"mocks": [
+                {"id": "fixture", "match": {"host": "sandbox.test"}}]}))
+            reader = mitm_addon.AutonomRecorder()
+            reader.directory = tmp
+            reader.mocks_path = str(global_path)
+            rules = reader._load_rules()
+            self.assertEqual(mitm_addon.select_rule(
+                rules, "GET", "https://sandbox.test/a", "sandbox.test")["id"], "fixture")
+            self.assertEqual(mitm_addon.select_rule(
+                rules, "GET", "https://other.test/a", "other.test")["id"], "global")
+            self.assertEqual(global_path.read_text(), global_text)
+            session_path.unlink()
+            self.assertEqual([x["id"] for x in reader._load_rules()], ["global"])
 
 
 class UrlSugarTests(unittest.TestCase):

@@ -45,6 +45,7 @@ import {
 } from "../plugins/autonom/skills/android-emulator-browser/scripts/canvas-activity.mjs";
 import {
   ACTIONS_TABS,
+  actionsDock,
   actionsButton,
   actionsMarkup,
   actionsScript,
@@ -72,7 +73,7 @@ describe("action ops", () => {
     assert.deepEqual(ACTION_READ_OPS, ["captures.list", "record.status", "apps.candidates", "health"]);
     assert.deepEqual(ACTION_DEVICE_OPS, ["capture.screenshot", "record.start", "record.stop", "app.install",
       "app.launch", "app.open_url", "app.locale"]);
-    assert.deepEqual(ACTION_LOCAL_OPS, ["captures.delete"]);
+    assert.deepEqual(ACTION_LOCAL_OPS, ["captures.delete", "captures.open_directory"]);
     const python = JSON.parse(execFileSync(process.env.PYTHON ?? "python3", ["-c",
       "import json, autonom_canvas_tools as t; print(json.dumps([t.ACTION_READ_OPS, t.ACTION_DEVICE_OPS, " +
       "t.ACTION_LOCAL_OPS, t.INTERNAL_OPS, t.READ_OPS, t.MUTATING_OPS]))"],
@@ -783,11 +784,11 @@ function defaultReply(op) {
   }
 }
 
-function bootPage({ platform = "android", reply = () => null, canSend = () => true, deviceId = DEVICE, withTools = true } = {}) {
+function bootPage({ withDock = false, platform = "android", reply = () => null, canSend = () => true, deviceId = DEVICE, withTools = true } = {}) {
   const html = `<body><div class="actions">${withTools ? toolsButton() : ""}${actionsButton()}` +
     `<button type="button" class="icon" id="inspector-toggle" aria-pressed="true" aria-controls="inspector">I</button></div>` +
     `<aside class="side" id="inspector" aria-label="Inspector"></aside>${withTools ? toolsMarkup({ platform }) : ""}` +
-    `${actionsMarkup({ platform })}</body>`;
+    `${withDock ? actionsDock() : ""}${actionsMarkup({ platform })}</body>`;
   const document = parseMarkup(html);
   document.body = document.documentElement.children[0];
   const timers = fakeTimers();
@@ -855,7 +856,8 @@ describe("actions page markup and styles", () => {
   test("styles: page tokens, dark mode, the 760 px sheet and nothing wider than 320 px", () => {
     const styles = actionsStyles();
     assert.match(styles, /var\(--surface\)/);
-    assert.match(styles, /prefers-color-scheme:dark/);
+    assert.match(styles, /--a-danger:var\(--danger\)/);
+    assert.match(styles, /box-shadow:var\(--tab-shadow\)/);
     assert.match(styles, /@media \(max-width:760px\)/);
     assert.match(styles, /\.actions \.icon\.actions-toggle\{display:grid/);
     assert.match(styles, /body\.actions-open aside\.side\{display:none\}/);
@@ -887,7 +889,8 @@ describe("actions page script", () => {
     const image = items[1].querySelector("img");
     assert.equal(image.getAttribute("src"), `/tools/captures/${encodeURIComponent(SHOT.name)}`);
     assert.match(items[0].textContent, /Open video \(0:05\)/);
-    assert.match($("actions-gallery-dir").textContent, /\/tmp\/caps\/Pixel 8/);
+    assert.match($("actions-open-folder").title, /\/tmp\/caps\/Pixel 8/);
+    assert.match($("actions-gallery-dir").textContent, /2 captures/);
     assert.match($("actions-candidates").textContent, /app-debug\.apk/);
 
     $("actions-shot").click();
@@ -917,6 +920,74 @@ describe("actions page script", () => {
     assert.match(page.$("actions-install-hint").textContent, /--install-root <folder>/);
     assert.equal(page.$("actions-prune").textContent, "Deleted 1 oldest capture to stay under 200 files / 2 GB");
     assert.equal(page.$("actions-gallery-empty").hidden, false);
+  });
+
+  test("dock captures without opening drawer, shares recording state and notices limit stop", async () => {
+    let recording = false;
+    const page = bootPage({ withDock: true, reply: ({ op }) => {
+      if (op === "capture.screenshot") return ok({ capture: SHOT, pruned: [] });
+      if (op === "record.start") { recording = true; return ok({ recording: { started_at: new Date().toISOString() } }); }
+      if (op === "record.stop") { recording = false; return ok({ capture: VIDEO, duration_ms: 2000 }); }
+      if (op === "record.status") return ok({ recording, elapsed_ms: 1000, last: recording ? null : { capture: VIDEO } });
+      return null;
+    }});
+    const { $, timers, ops } = page;
+    await timers.tick(2000);
+    $("dock-shot").click();
+    await flush();
+    assert.equal(ops("capture.screenshot").length, 1);
+    assert.equal($("actions").hidden, true);
+    $("dock-record").click();
+    await flush();
+    assert.equal($("dock-record").getAttribute("aria-label"), "Stop recording");
+    assert.equal($("actions-record").textContent, "Stop recording");
+    $("dock-record").click();
+    await flush();
+    assert.equal(ops("record.stop").length, 1);
+    assert.equal($("dock-record").getAttribute("aria-pressed"), "false");
+    $("dock-record").click();
+    await flush();
+    recording = false;
+    await timers.tick(2000);
+    assert.equal($("dock-record").getAttribute("aria-label"), "Start recording");
+    assert.equal($("actions-record").textContent, "Record");
+    assert.equal($("actions").hidden, true);
+  });
+
+  test("a delayed idle status cannot erase a newer recording start", async () => {
+    let delay = false, finish;
+    const page = bootPage({ withDock: true, reply: ({ op }) => {
+      if (op === "record.status" && delay) return new Promise(resolve => { finish = () => resolve(ok({ recording: false })); });
+      if (op === "record.start") return ok({ recording: { started_at: new Date().toISOString() } });
+      return null;
+    }});
+    await page.timers.tick(2000);
+    delay = true;
+    await page.timers.tick(2000);
+    page.$("dock-record").click();
+    await flush();
+    finish();
+    await flush();
+    assert.equal(page.$("dock-record").getAttribute("aria-pressed"), "true");
+    assert.equal(page.$("actions-record").textContent, "Stop recording");
+  });
+
+  test("dock and drawer cannot duplicate a pending recording start", async () => {
+    let finish;
+    const page = bootPage({ withDock: true, reply: ({ op }) => op === "record.start"
+      ? new Promise(resolve => { finish = () => resolve(ok({ recording: { started_at: new Date().toISOString() } })); }) : null });
+    await page.timers.tick(2000);
+    page.$("dock-record").click();
+    await flush();
+    assert.equal(page.$("dock-record").disabled, true);
+    assert.equal(page.$("actions-record").disabled, true);
+    page.$("actions-record").click();
+    await flush();
+    assert.equal(page.ops("record.start").length, 1);
+    finish();
+    await flush();
+    assert.equal(page.$("dock-record").disabled, false);
+    assert.equal(page.$("dock-record").getAttribute("aria-pressed"), "true");
   });
 
   test("record start and stop, with the elapsed time and the limit ending noticed by the status poll", async () => {
@@ -1156,4 +1227,15 @@ describe("actions page script", () => {
     assert.match(box.textContent, /<img src=x> \(recording_already_active\)Stop <it>/);
     assert.equal(box.querySelectorAll("img").length, 0);
   });
+});
+
+test("actions page: Finder reveal has no client-selected path and reports success or failure", async () => {
+  let fail=false;
+  const page=bootPage({reply:({op})=>op==="captures.open_directory"?fail?{status:502,body:{ok:false,error:"Finder unavailable",error_code:"backend_failed"}}:ok({opened:true,dir:"/tmp/caps/Pixel 8"}):null});
+  page.$("actions-toggle").click();await flush();
+  page.$("actions-open-folder").click();await flush();
+  assert.deepEqual(page.ops("captures.open_directory")[0].body.payload,{});
+  assert.match(page.$("actions-msg-capture").textContent,/Opened the captures folder/);
+  fail=true;page.$("actions-open-folder").click();await flush();
+  assert.match(page.$("actions-msg-capture").textContent,/Finder unavailable/);
 });

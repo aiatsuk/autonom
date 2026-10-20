@@ -38,6 +38,8 @@ class FakeElement {
     this.clientHeight = 160;
     this.state = {};
   }
+  showModal() { this.setAttribute("open", ""); }
+  close() { this.removeAttribute("open"); }
   get localName() { return this.tagName.toLowerCase(); }
   getAttribute(name) { return this.attributes.has(name) ? this.attributes.get(name) : null; }
   setAttribute(name, value) { this.attributes.set(name, String(value)); }
@@ -259,14 +261,14 @@ const ANDROID_CONTEXT = {
   platform: "android", target_id: "emulator-5580", emulator: true,
   session: { id: "s1", app_id: "com.example.app" }, app_id: "com.example.app",
   privacy_services: null, android_permission_aliases: { camera: ["android.permission.CAMERA"] },
-  simulate: { biometric: ["match"], battery: ["set", "reset"], network: ["online", "offline"], appearance: ["light", "dark"] },
+  simulate: { biometric: ["match", "nonmatch", "settings"], battery: ["set", "reset"], network: ["online", "offline"], appearance: ["light", "dark"], "text-size": ["0.85", "1.0", "1.3", "1.5", "2.0"], animations: ["pin", "reset"] },
   location_readable: true, location_clearable: false, network_available: true, permissions_readable: true,
 };
 
 const IOS_CONTEXT = {
   platform: "ios", target_id: "3760A5A8-E59D-4AE6-B1AF-A626908D7B61", emulator: true,
   session: null, app_id: "com.example.App", privacy_services: ["camera", "photos"], android_permission_aliases: null,
-  simulate: { push: ["send"], biometric: ["enroll", "unenroll", "match", "nonmatch"], battery: ["set", "reset"], appearance: ["light", "dark"] },
+  simulate: { push: ["send"], biometric: ["enroll", "unenroll", "match", "nonmatch"], battery: ["set", "reset"], appearance: ["light", "dark"], "text-size": ["small", "large", "extra-extra-extra-large", "accessibility-extra-extra-extra-large"] },
   location_readable: false, location_clearable: true, network_available: false, permissions_readable: false,
 };
 
@@ -292,7 +294,7 @@ function defaultReply(platform, op, payload) {
   }
 }
 
-function boot({ platform = "android", reply = () => null, canSend = () => true, view = { owner: "shared", paused: false, status: {} } } = {}) {
+function boot({ storage = { getItem: () => null, setItem: () => {} }, platform = "android", reply = () => null, clipboard = { writeText: async () => {} }, canSend = () => true, view = { owner: "shared", paused: false, status: {} } } = {}) {
   const html = `<body>${toolsButton()}<button type="button" class="icon" id="inspector-toggle" aria-pressed="true" aria-controls="inspector">I</button>` +
     `<aside class="side" id="inspector" aria-label="Inspector"></aside>${toolsMarkup({ platform })}</body>`;
   const document = parseMarkup(html);
@@ -307,7 +309,7 @@ function boot({ platform = "android", reply = () => null, canSend = () => true, 
     return { ok: answer.status < 400, status: answer.status, statusText: "", json: async () => answer.body };
   };
   const sandbox = {
-    document, fetch, view, csrf: "csrf-123", TextEncoder, console,
+    document, fetch, view, localStorage: storage, navigator: { clipboard }, csrf: "csrf-123", TextEncoder, console,
     $: (id) => document.getElementById(id),
     url: (path) => path,
     note: () => {},
@@ -393,7 +395,7 @@ describe("toolsButton and toolsMarkup", () => {
     assert.ok(document.getElementById("tools-battery-state"));
     assert.deepEqual(document.querySelectorAll("[data-sim=biometric]").map((button) => button.getAttribute("data-action")),
       ["match", "nonmatch", "enroll", "unenroll"]);
-    assert.match(document.getElementById("tools-panel-app").textContent, /cannot report its location/);
+    assert.match(document.getElementById("tools-loc-readout").title, /cannot report its location/);
   });
 
   test("Android hides push and Clear, and shows read-back and network simulation", () => {
@@ -405,7 +407,7 @@ describe("toolsButton and toolsMarkup", () => {
     assert.ok(document.getElementById("tools-loc-get"));
     assert.ok(document.querySelector("[data-sim-group=network]"));
     assert.equal(document.getElementById("tools-battery-state"), null);
-    assert.deepEqual(document.querySelectorAll("[data-sim=biometric]").map((button) => button.getAttribute("data-action")), ["match"]);
+    assert.deepEqual(document.querySelectorAll("[data-sim=biometric]").map((button) => button.getAttribute("data-action")), ["match", "nonmatch", "settings"]);
   });
 
   test("the platform also comes from context.options and defaults to Android", () => {
@@ -417,7 +419,7 @@ describe("toolsButton and toolsMarkup", () => {
   test("the mocks note and the network confirmation name their effect", () => {
     const document = parseMarkup(toolsMarkup({ platform: "android" }));
     assert.equal(document.getElementById("tools-mocks-note").textContent, "Mocks apply to every Autonom session on this Mac.");
-    assert.match(document.getElementById("tools-net-confirm-text").textContent, /decrypts and records this session's HTTP\(S\) traffic/);
+    assert.match(document.getElementById("tools-net-confirm-text").textContent, /decrypts and records the device's HTTP\(S\) traffic/);
     assert.ok(document.getElementById("tools-net-confirm").hidden);
     assert.ok(document.getElementById("tools-mock-confirm").hidden);
   });
@@ -447,16 +449,15 @@ describe("toolsScript and toolsStyles as text", () => {
     assert.equal(inner.trim(), script.trim());
   });
 
-  test("the styles use the page tokens, have dark-mode rules and a phone sheet from the page's 760 px breakpoint", () => {
+  test("the styles use the page tokens, have dark-mode rules and a compact overlay from the page's 760 px breakpoint", () => {
     const css = toolsStyles();
-    assert.match(css, /@media \(prefers-color-scheme:dark\)\{/);
-    // The page switches to its one-column layout (and hides the inspector toggle) at 760 px, so
-    // the sheet starts at the same width: no band between 721 and 760 px where the drawer would
-    // render in flow below the stage. This also covers the contract's 720 px phone range.
+    assert.match(css, /--t-danger:var\(--danger\)/);
+    assert.match(css, /box-shadow:var\(--tab-shadow\)/);
+    // Overlay starts at the same breakpoint as the main page.
     const phone = css.indexOf("@media (max-width:760px){");
     assert.ok(phone >= 0, "a 760 px phone block");
     const block = css.slice(phone, css.indexOf("\n}\n", phone));
-    assert.match(block, /\.tools\{position:fixed;left:0;right:0;bottom:0;/, "the drawer is a fixed full-width sheet in that block");
+    assert.match(block, /\.tools\{position:fixed;left:auto;right:8px;bottom:8px;/, "the drawer is a bounded overlay");
     assert.match(block, /\.actions \.icon\.tools-toggle\{display:grid/, "the toggle stays visible in the same block");
     assert.match(block, /body\.tools-open\{overflow:hidden\}/);
     assert.doesNotMatch(css, /max-width:7[0-5][0-9]px/, "no second, narrower sheet breakpoint");
@@ -551,7 +552,7 @@ describe("toolsScript in the page context", () => {
         }
         if (op === "mocks.disable") { enabled = false; return timeout(); }
         if (op === "mocks.enable") return timeout();
-        if (op === "permissions.set" || op === "network.start" || op === "simulate") return timeout();
+        if (op === "permissions.set" || op === "network.capture" || op === "simulate") return timeout();
         return null;
       },
     });
@@ -600,7 +601,7 @@ describe("toolsScript in the page context", () => {
     click($("tools-net-start"));
     click($("tools-net-confirm-go"));
     await flush();
-    assert.equal(ops("network.start").length, 1);
+    assert.equal(ops("network.capture").length, 1);
     assert.equal(ops("network.status").length, statusBefore + 1, "network.status is read again");
     assert.match($("tools-msg-network").textContent, /outcome is unknown/);
 
@@ -709,7 +710,7 @@ describe("toolsScript in the page context", () => {
     await flush();
     const visible = (page) => page.document.querySelectorAll("[data-sim]").filter((button) => !button.hidden && !button.closest("[hidden]"))
       .map((button) => `${button.getAttribute("data-sim")}:${button.getAttribute("data-action")}`);
-    assert.deepEqual(visible(android), ["biometric:match", "battery:set", "battery:reset", "network:online", "network:offline", "appearance:light", "appearance:dark"]);
+    assert.deepEqual(visible(android), ["biometric:match", "biometric:nonmatch", "biometric:settings", "battery:set", "battery:reset", "network:online", "network:offline", "appearance:light", "appearance:dark", "text-size:0.85", "text-size:1.0", "text-size:1.3", "text-size:1.5", "text-size:2.0", "animations:pin", "animations:reset"]);
     click(android.document.querySelector("[data-sim=appearance][data-action=dark]"));
     await flush();
     assert.deepEqual(android.ops("simulate").map((call) => call.body.payload), [{ control: "appearance", action: "dark", values: {} }]);
@@ -720,7 +721,7 @@ describe("toolsScript in the page context", () => {
     click(ios.$("tools-tab-simulate"));
     await flush();
     assert.deepEqual(visible(ios), ["push:send", "biometric:match", "biometric:nonmatch", "biometric:enroll", "biometric:unenroll",
-      "battery:set", "battery:reset", "appearance:light", "appearance:dark"]);
+      "battery:set", "battery:reset", "appearance:light", "appearance:dark", "text-size:small", "text-size:large", "text-size:extra-extra-extra-large", "text-size:accessibility-extra-extra-extra-large"]);
     click(ios.document.querySelector("[data-sim=push]"));
     await flush();
     const [push] = ios.ops("simulate");
@@ -764,8 +765,8 @@ describe("toolsScript in the page context", () => {
     assert.deepEqual(ops("location.set").map((call) => call.body.payload), [{ latitude: 52.3702, longitude: 4.8952 }]);
     click($("tools-loc-get"));
     await flush();
-    assert.equal(ops("location.get").length, 1);
-    assert.match($("tools-loc-readout").textContent, /^Requested only .*52\.3702, 4\.8952$/);
+    assert.equal(ops("location.get").length, 2, "initial location and explicit refresh");
+    assert.match($("tools-loc-readout").textContent, /^Pending: 52\.3702, 4\.8952$/);
   });
 
   test("iOS location: Clear is offered, read-back is not, and the permission state is never shown", async () => {
@@ -792,8 +793,8 @@ describe("toolsScript in the page context", () => {
     const page = boot({
       platform: "android",
       reply: ({ op }) => {
-        if (op === "network.start") { running = true; return ok({ running: true, port: 8080 }); }
-        if (op === "network.status") return ok({ proxy: { running, port: running ? 8080 : null }, attached: false, recent_flow_count: 0 });
+        if (op === "network.capture") { running = true; return ok({ proxy: {running: true, port: 8080}, attached: true }); }
+        if (op === "network.status") return ok({ proxy: { running, port: running ? 8080 : null }, attached: running, recent_flow_count: 0 });
         return null;
       },
     });
@@ -806,23 +807,25 @@ describe("toolsScript in the page context", () => {
     assert.equal($("tools-net-proxy").textContent, "Stopped");
     click($("tools-net-start"));
     assert.equal($("tools-net-confirm").hidden, false);
-    assert.match($("tools-net-confirm-text").textContent, /decrypts and records this session's HTTP\(S\) traffic/);
+    assert.match($("tools-net-confirm-text").textContent, /decrypts and records the device's HTTP\(S\) traffic/);
     assert.equal(page.document.activeElement, $("tools-net-cancel"));
     click($("tools-net-cancel"));
     await flush();
     assert.ok($("tools-net-confirm").hidden);
-    assert.equal(ops("network.start").length, 0, "cancel sends nothing");
+    assert.equal(ops("network.capture").length, 0, "cancel sends nothing");
     click($("tools-net-start"));
     click($("tools-net-confirm-go"));
     await flush();
-    assert.deepEqual(ops("network.start").map((call) => call.body.payload), [{ acknowledged: true }]);
+    assert.deepEqual(ops("network.capture").map((call) => call.body.payload), [{ acknowledged: true }]);
     assert.equal($("tools-net-proxy").textContent, "Running on port 8080");
     assert.ok($("tools-net-start").hidden);
-    assert.equal($("tools-net-attach").hidden, false);
-    click($("tools-net-attach"));
-    await flush();
-    assert.deepEqual(ops("network.attach").map((call) => call.body.payload), [{ acknowledged: true }],
-      "attach after the confirmed start needs no second confirmation");
+    assert.equal($("tools-net-stop").hidden, false);
+    assert.equal(ops("network.start").length, 0);
+    assert.equal(ops("network.attach").length, 0);
+    assert.match($("tools-msg-network").textContent, /Requests appear below as the app sends them/);
+    assert.doesNotMatch($("tools-msg-network").textContent, /Capturing this device/);
+    assert.equal($("tools-net-attach"), null);
+    assert.equal($("tools-net-detach"), null);
   });
 
   test("Network without a session on this device shows the hint and never polls", async () => {
@@ -841,7 +844,7 @@ describe("toolsScript in the page context", () => {
     assert.equal($("tools-net-body").hidden, true);
     assert.equal($("tools-net-nosession-hint").textContent, hint);
     assert.equal(ops("network.requests").length, 0);
-    assert.equal(ops("network.start").length, 0);
+    assert.equal(ops("network.capture").length, 0);
   });
 
   test("requests poll with since_id every second only while the Network tab is visible, one at a time", async () => {
@@ -987,6 +990,7 @@ describe("toolsScript in the page context", () => {
     click($("tools-mocks").querySelector("[data-mock-action=edit]"));
     assert.equal($("tools-mock-form-title").textContent, "Edit mock 1");
     assert.equal($("tools-mock-headers").value, "X-A: 1");
+    assert.equal($("tools-mock-options").hasAttribute("open"), true);
     $("tools-mock-status").value = "600";
     fire($("tools-mock-form"), "submit");
     await flush();
@@ -1051,7 +1055,8 @@ describe("toolsScript in the page context", () => {
     assert.equal(reads()[0].path, "/tools/logs?after=0&limit=500");
     assert.equal($("tools-log").children.length, 4);
     assert.equal($("tools-log").children[3].getAttribute("data-level"), "E");
-    assert.match($("tools-log-state").textContent, /Following the device log/);
+    assert.equal($("tools-log-state").textContent, "Live");
+    assert.match($("tools-log-state").title, /Following the device log/);
 
     pending = lines(2100);
     await page.timers.tick(700);
@@ -1343,7 +1348,7 @@ describe("toolsScript in the page context", () => {
             ? ok({ proxy: { running: false, port: null }, attached: false, recent_flow_count: 0 })
             : refused(409, "no_active_session", "No Autonom session is on this device", "autonom session start --serial emulator-5580");
         }
-        if (op === "network.start") { session = false; return { status: 504, body: { ok: false, error: "the tools call took longer than 60 s", error_code: "timeout" } }; }
+        if (op === "network.capture") { session = false; return { status: 504, body: { ok: false, error: "the tools call took longer than 60 s", error_code: "timeout" } }; }
         return null;
       },
     });
@@ -1355,7 +1360,7 @@ describe("toolsScript in the page context", () => {
     click($("tools-net-start"));
     click($("tools-net-confirm-go"));
     await flush();
-    assert.equal(ops("network.start").length, 1);
+    assert.equal(ops("network.capture").length, 1);
     assert.equal(ops("network.status").length, 2, "network.status is read again once");
     const box = $("tools-msg-network");
     assert.match(box.textContent, /outcome is unknown/);
@@ -1379,7 +1384,7 @@ describe("toolsScript in the page context", () => {
     click(android.document.querySelector("[data-loc-preset=Amsterdam]"));
     await flush();
     assert.equal(android.ops("location.set").length, 1, "the change is sent once and never retried");
-    assert.equal(android.ops("location.get").length, 1, "the location is read back");
+    assert.equal(android.ops("location.get").length, 2, "initial location plus timeout read-back");
     assert.equal(android.ops("permissions.list").length, permsBefore, "the permission list is not what a location change touches");
     assert.match(android.$("tools-loc-readout").textContent, /^Delivered: 52\.3702, 4\.8952$/);
     assert.match(android.$("tools-msg-app").textContent, /outcome is unknown/);
@@ -1411,4 +1416,384 @@ describe("toolsScript in the page context", () => {
     assert.doesNotMatch(ios.$("tools-msg-app").textContent, /current state was re-read/);
     assert.match(ios.$("tools-loc-readout").textContent, /^Unknown/);
   });
+});
+
+test("Network partial failure and unknown attachment never claim capture or blindly reattach", async () => {
+  let status = {proxy:{running:true,port:8080},attached:"unknown"};
+  const page = boot({reply:({op})=>op==="network.status"?ok(status):op==="network.capture"?refused(502,"backend_failed","connection failed"):null});
+  const {$,ops}=page;
+  click($("tools-toggle"));await flush();click($("tools-tab-network"));await flush();
+  assert.equal($("tools-net-start").textContent,"Refresh connection");
+  click($("tools-net-start"));await flush();
+  assert.equal(ops("network.capture").length,0);
+  assert.equal($("tools-net-confirm").hidden,true);
+  status={proxy:{running:true,port:8080},attached:false};
+  click($("tools-net-refresh"));await flush();
+  assert.equal($("tools-net-start").textContent,"Connect and capture");
+  click($("tools-net-start"));click($("tools-net-confirm-go"));await flush();
+  assert.equal(ops("network.capture").length,1);
+  assert.equal($("tools-net-attached").textContent,"No");
+  assert.equal($("tools-net-start").hidden,false);
+});
+
+async function openNetworkFixture(options = {}) {
+  const page = boot(options);
+  click(page.$("tools-toggle"));
+  await flush();
+  click(page.$("tools-tab-network"));
+  await flush();
+  const row = page.$("tools-req-list").querySelector("[data-req]");
+  click(row);
+  await flush();
+  return { ...page, row };
+}
+
+function fixtureReply(item) {
+  return ({ op, body }) => {
+    if (op === "network.requests") return ok({ requests: [{ id: "f1", method: "POST", status: 200, ...item }] });
+    if (op !== "network.request") return null;
+    if (body.payload.body) {
+      const which = body.payload.body;
+      const full = item[which + "_body_full"] ?? item[which + "_body_preview"];
+      return ok(typeof full === "string" && !full.endsWith("…[truncated]")
+        ? { complete: true, body: full } : { complete: false, reason: "not_captured" });
+    }
+    return ok({ request: { id: "f1", method: "POST", status: 200, ...item } });
+  };
+}
+
+test("JSON defaults to Pretty, preserves tokens and Copy follows each body's visible view", async () => {
+  const raw = '{"id":900719925474099312345,"text":"a \\\"quoted\\\" \\n line","empty":{},"items":[true,null,1e+100]}';
+  const copied = [];
+  const page = await openNetworkFixture({
+    reply: fixtureReply({ request_body_preview: raw, response_body_preview: '{"secret":"[REDACTED]"}' }),
+    clipboard: { writeText: async (value) => copied.push(value) },
+  });
+  const { $ } = page;
+  const detail = $("tools-req-detail-body"), bodies = detail.querySelectorAll("pre");
+  const pretty = detail.querySelector('[aria-label="Raw request body"]');
+  const copyRequest = detail.querySelector('[aria-label="Copy request body"]');
+  assert.equal(pretty.getAttribute("aria-pressed"), "true");
+  assert.equal(pretty.textContent, "Raw");
+  assert.ok(bodies[0].textContent.includes('\n  "id": 900719925474099312345,'));
+  assert.ok(bodies[0].textContent.includes('"empty": {}'));
+  assert.ok(bodies[0].textContent.includes('1e+100'));
+  assert.deepEqual(JSON.parse(bodies[0].textContent), JSON.parse(raw));
+  click(copyRequest);
+  await flush();
+  assert.equal(copied[0], bodies[0].textContent);
+  assert.equal(detail.querySelectorAll('[role="status"]')[0].textContent, "Full body copied.");
+  click(pretty);
+  assert.equal(bodies[0].textContent, raw, "Raw restores exact bytes");
+  click(copyRequest);
+  await flush();
+  assert.equal(copied[1], raw);
+  assert.equal(detail.querySelector('[aria-label="Raw response body"]').getAttribute("aria-pressed"), "true");
+  click(detail.querySelector('[aria-label="Copy response body"]'));
+  await flush();
+  assert.equal(copied[2], '{\n  "secret": "[REDACTED]"\n}');
+  assert.equal(bodies[0].textContent, raw, "the body toggles are independent");
+});
+
+test("truncated JSON is pretty by default without completing missing data; Raw and Copy preserve the selected view", async () => {
+  const marker = "…[truncated]";
+  const fragments = [
+    '{"items":[{"id":900719925474099312345,"text":"unfinished',
+    '{"text":"escaped \\" quote, { [ and trailing ' + '\\',
+    '{"items":[true,null,1e+',
+    '{"next":',
+    '[{"empty":{}},',
+    '"root string fragment',
+  ];
+  for (const fragment of fragments) {
+    const copied = [], raw = fragment + marker;
+    const page = await openNetworkFixture({
+      reply: fixtureReply({ response_body_preview: raw, response_headers_preview: { "Content-Type": "application/problem+json; charset=utf-8" } }),
+      clipboard: { writeText: async value => copied.push(value) },
+    });
+    const detail = page.$("tools-req-detail-body"), body = detail.querySelector("pre");
+    const toggle = detail.querySelector('[aria-label="Raw response body"]');
+    assert.ok(toggle, fragment);
+    assert.equal(toggle.disabled, false);
+    assert.match(detail.textContent, /Response body · Incomplete/);
+    const formatted = body.textContent;
+    assert.ok(formatted.endsWith('\n' + marker));
+    // Ignore only whitespace outside strings: formatting may not invent quotes,
+    // closing brackets, values or round large numbers in the captured prefix.
+    const tokens = value => value.match(/"(?:\\.|[^"\\])*(?:"|$)|[^\s]/g).join('');
+    assert.equal(tokens(formatted.slice(0, -(marker.length + 1))), tokens(fragment));
+    click(detail.querySelector('[aria-label="Copy response body"]')); await flush();
+    assert.equal(copied.length, 0);
+    assert.match(detail.textContent, /Full body was not saved/);
+    click(toggle);
+    assert.equal(body.textContent, raw);
+    assert.match(detail.textContent, /Response body · Incomplete/);
+    click(detail.querySelector('[aria-label="Copy response body"]')); await flush();
+    assert.equal(copied.length, 0);
+    click(toggle);
+    assert.equal(body.textContent, formatted);
+  }
+  const page = await openNetworkFixture({ reply: fixtureReply({ response_body_preview: '<html>partial' + marker }) });
+  const detail = page.$('tools-req-detail-body');
+  assert.equal(detail.querySelector('[aria-label="Pretty response body"]').disabled, true);
+  assert.match(detail.textContent, /Response body · Incomplete/);
+});
+
+test("Copy fetches the complete body on demand and honors Pretty/Raw independently of the preview", async () => {
+  const full = JSON.stringify({items: Array.from({length: 300}, (_, id) => ({id, text: "test value"}))});
+  const copied = [];
+  const page = await openNetworkFixture({
+    reply: fixtureReply({response_body_preview: full.slice(0, 2048) + "…[truncated]", response_body_full: full}),
+    clipboard: {writeText: async value => copied.push(value)},
+  });
+  const detail = page.$("tools-req-detail-body");
+  const copy = detail.querySelector('[aria-label="Copy response body"]');
+  click(copy); await flush();
+  assert.deepEqual(JSON.parse(copied[0]), JSON.parse(full));
+  assert.ok(copied[0].includes("\n"));
+  assert.equal(copied[0].includes("[truncated]"), false);
+  click(detail.querySelector('[aria-label="Raw response body"]'));
+  click(copy); await flush();
+  assert.equal(copied[1], full);
+  assert.ok(detail.querySelector("pre").textContent.endsWith("…[truncated]"));
+  assert.match(detail.textContent, /Full body copied/);
+});
+
+test("unmarked invalid JSON and non-JSON previews remain raw; empty bodies and clipboard failure give usable feedback", async () => {
+  const page = await openNetworkFixture({
+    reply: fixtureReply({ request_body_preview: '{"cut":', response_body_preview: '<script>raw</script>' }),
+    clipboard: { writeText: async () => { throw new Error("denied"); } },
+  });
+  const detail = page.$("tools-req-detail-body");
+  assert.equal(detail.querySelector('[aria-label="Pretty request body"]').disabled, true);
+  assert.equal(detail.querySelector('[aria-label="Pretty response body"]').disabled, true);
+  assert.equal(detail.querySelectorAll("pre")[1].textContent, '<script>raw</script>');
+  click(detail.querySelector('[aria-label="Copy response body"]'));
+  await flush();
+  assert.match(detail.querySelectorAll('[role="status"]')[1].textContent, /Could not copy/);
+  assert.equal(detail.querySelector('[aria-label="Copy response body"]').disabled, false);
+  assert.equal(detail.querySelectorAll("script").length, 0);
+  const empty = await openNetworkFixture({ reply: fixtureReply({ request_body_preview: null, response_body_preview: "" }) });
+  assert.equal(empty.$("tools-req-detail-body").querySelector('[aria-label="Copy request body"]').disabled, true);
+});
+
+test("request dialog closes with Escape/backdrop and ignores late detail responses", async () => {
+  let resolveDetail;
+  const page = await openNetworkFixture({ reply: ({ op }) => op === "network.requests"
+    ? ok({ requests: [{ id: "f1", method: "POST", status: 200 }] })
+    : op === "network.request" ? new Promise((resolve) => { resolveDetail = resolve; }) : null });
+  const { $, row } = page, dialog = $("tools-req-detail");
+  assert.equal(dialog.localName, "dialog");
+  assert.equal(dialog.hasAttribute("open"), true);
+  assert.match($("tools-req-detail-body").textContent, /Loading/);
+  fire($("tools-req-close"), "keydown", { key: "Escape" });
+  assert.equal(dialog.hidden, true);
+  assert.equal($("tools").hidden, false, "Escape closes detail before the Tools drawer");
+  assert.equal(page.document.activeElement, row);
+  click(row);
+  await flush();
+  click(dialog);
+  assert.equal(dialog.hidden, true);
+  resolveDetail(ok({ request: { id: "f1", request_body_preview: "{}" } }));
+  await flush();
+  assert.equal(dialog.hidden, true, "late completion cannot reopen closed details");
+  click(row);
+  await flush();
+  click($("tools-tab-logs"));
+  assert.equal(dialog.hidden, true, "switching tabs closes details");
+});
+
+
+describe("App deeplinks", () => {
+  const storage = () => { const values = new Map(); return { getItem: key => values.get(key) || null, setItem: (key, value) => values.set(key, value) }; };
+  const open = async (page, link) => { page.$("tools-deeplink").value = link; click(page.$("tools-deeplink-open")); await flush(); };
+  const selectApp = (page, id) => { page.$("tools-app-id").value = id; fire(page.$("tools-app-id"), "input"); };
+  test("history is per app, bounded, deduplicated, persisted and replayable", async () => {
+    const saved = storage();
+    const reply = ({ op }) => op === "app.open_url" ? ok({ opened: true, handled_by: "com.example.app/Main" }) : null;
+    const page = boot({ storage: saved, reply });
+    click(page.$("tools-toggle")); await flush();
+    for (let i = 0; i < 6; i++) await open(page, "myapp://screen/" + i);
+    assert.equal(page.$("tools-deeplinks").children.length, 5);
+    assert.deepEqual(page.ops("app.open_url")[0].body.payload, { url: "myapp://screen/0", app_id: "com.example.app" });
+    await open(page, "myapp://screen/3");
+    assert.equal(page.$("tools-deeplinks").children.length, 5);
+    assert.equal(page.$("tools-deeplinks").children[0].textContent, "myapp://screen/3");
+    selectApp(page, "com.other.app");
+    assert.equal(page.$("tools-deeplinks").children.length, 0);
+    await open(page, "other://home");
+    selectApp(page, "com.example.app");
+    assert.equal(page.$("tools-deeplinks").children.length, 5);
+    click(page.$("tools-deeplinks").querySelector("button")); await flush();
+    assert.equal(page.ops("app.open_url").at(-1).body.payload.url, "myapp://screen/3");
+    const reload = boot({ storage: saved, reply });
+    click(reload.$("tools-toggle")); await flush();
+    assert.equal(reload.$("tools-deeplinks").children.length, 5);
+    click(reload.$("tools-deeplinks-clear"));
+    assert.equal(reload.$("tools-deeplinks").children.length, 0);
+    selectApp(reload, "com.other.app");
+    assert.equal(reload.$("tools-deeplinks").children[0].textContent, "other://home");
+  });
+  test("invalid links, failures and unresolved URLs do not enter recent history", async () => {
+    let warn = false;
+    const page = boot({ reply: ({ op }) => op === "app.open_url" ? warn ? ok({ opened: true, warnings: [{error:"No handler"}] }) : refused(502,"backend_failed","No handler") : null });
+    click(page.$("tools-toggle")); await flush();
+    await open(page, "not a url");
+    assert.equal(page.ops("app.open_url").length, 0);
+    await open(page, "myapp://missing");
+    assert.equal(page.$("tools-deeplinks").children.length, 0);
+    warn = true;
+    await open(page, "myapp://missing");
+    assert.equal(page.$("tools-deeplinks").children.length, 0);
+    assert.match(page.$("tools-msg-app").textContent, /No handler/);
+  });
+  test("a pending open remains bound to the original app and cannot be duplicated", async () => {
+    let finish;
+    const page = boot({ reply: ({ op }) => op === "app.open_url" ? new Promise(resolve => { finish = () => resolve(ok({ opened:true })); }) : null });
+    click(page.$("tools-toggle")); await flush();
+    await open(page, "myapp://one");
+    selectApp(page, "com.other.app");
+    await open(page, "other://two");
+    assert.equal(page.ops("app.open_url").length, 1);
+    finish(); await flush();
+    assert.equal(page.$("tools-deeplinks").children.length, 0);
+    selectApp(page, "com.example.app");
+    assert.equal(page.$("tools-deeplinks").children[0].textContent, "myapp://one");
+  });
+  test("blocked storage still allows opening and keeping in-page history; iOS uses OS routing", async () => {
+    const page = boot({ platform:"ios", storage:{ getItem(){throw Error("blocked")}, setItem(){throw Error("blocked")} }, reply:({op})=>op==="app.open_url"?ok({opened:true}):null });
+    click(page.$("tools-toggle")); await flush();
+    await open(page,"myapp://home");
+    assert.deepEqual(page.ops("app.open_url")[0].body.payload,{url:"myapp://home"});
+    assert.equal(page.$("tools-deeplinks").children.length,1);
+  });
+});
+
+
+describe("Named locations", () => {
+  const storage = () => { const map = new Map(); return {getItem:key=>map.get(key)||null,setItem:(key,value)=>map.set(key,value)}; };
+  test("current location loads on open and saved names persist without setting the device", async () => {
+    const saved = storage();
+    const reply = ({op}) => op === "location.get" ? ok({latitude:55.75,longitude:37.61,delivered:true}) : null;
+    const page = boot({storage:saved,reply});
+    click(page.$("tools-toggle")); await flush();
+    assert.match(page.$("tools-loc-readout").textContent,/Current: 55.7500, 37.6100/);
+    assert.equal(page.$("tools-location-form").hidden,true);
+    click(page.$("tools-location-add"));
+    assert.equal(page.$("tools-location-form").hidden,false);
+    assert.equal(page.$("tools-location-add").getAttribute("aria-expanded"),"true");
+    assert.equal(page.document.activeElement,page.$("tools-location-name"));
+    assert.equal(page.$("tools-lat").value,"55.75");
+    page.$("tools-location-name").value="Office";
+    click(page.$("tools-location-save")); await flush();
+    assert.equal(page.ops("location.set").length,0);
+    assert.equal(page.$("tools-locations-custom").children.length,1);
+    assert.match(page.$("tools-location-save-status").textContent,/Saved Office/);
+    page.$("tools-lat").value="55.76";
+    click(page.$("tools-location-save")); await flush();
+    assert.equal(page.$("tools-locations-custom").children.length,1);
+    const reload=boot({storage:saved,reply});
+    click(reload.$("tools-toggle")); await flush();
+    assert.match(reload.$("tools-locations-custom").textContent,/Office55.7600, 37.6100/);
+    click(reload.$("tools-locations-custom").querySelector("button")); await flush();
+    assert.deepEqual(reload.ops("location.set")[0].body.payload,{latitude:55.76,longitude:37.61});
+    assert.equal(reload.$("tools-locations-custom").querySelector("button").getAttribute("aria-pressed"),"true");
+  });
+  test("invalid points are not saved and blocked storage is reported honestly", async () => {
+    const page=boot({storage:{getItem(){throw Error("blocked")},setItem(){throw Error("blocked")}}});
+    click(page.$("tools-toggle")); await flush();
+    page.$("tools-location-name").value="Office";page.$("tools-lat").value="91";page.$("tools-lon").value="0";
+    click(page.$("tools-location-save"));
+    assert.equal(page.$("tools-locations-custom").children.length,0);
+    page.$("tools-lat").value="0";click(page.$("tools-location-save"));
+    assert.equal(page.$("tools-locations-custom").children.length,1);
+    assert.match(page.$("tools-location-save-status").textContent,/this page only/);
+    assert.equal(page.ops("location.set").length,0);
+  });
+  test("saved location menu edits in place, validates collisions, cancels and never applies to device", async () => {
+    const saved=storage(), original=[{name:"Office",latitude:55,longitude:37},{name:"Home",latitude:1,longitude:2}];
+    saved.setItem("autonom.canvas.locations.v1",JSON.stringify(original));
+    const page=boot({storage:saved});click(page.$("tools-toggle"));await flush();
+    const menu=()=>page.$("tools-locations-custom").querySelector(".tools-location-more");
+    click(menu());assert.equal(menu().getAttribute("aria-expanded"),"true");
+    fire(page.document.activeElement,"keydown",{key:"Escape"});assert.equal(menu().getAttribute("aria-expanded"),"false");assert.equal(page.document.activeElement,menu());assert.equal(page.$("tools").hidden,false,"Escape closes only the menu");
+    click(menu());click(page.$("tools-location-add"));assert.equal(menu().getAttribute("aria-expanded"),"false");
+    click(menu());click(page.document.querySelector("[data-location-edit]"));
+    assert.equal(page.$("tools-location-edit-lat").value,"55");assert.equal(page.$("tools-location-edit-lon").value,"37");
+    page.$("tools-location-name").value="Changed";click(page.$("tools-location-edit-cancel"));
+    assert.deepEqual(JSON.parse(saved.getItem("autonom.canvas.locations.v1")),original);
+    click(menu());click(page.document.querySelector("[data-location-edit]"));
+    page.$("tools-location-name").value="home";click(page.$("tools-location-save"));assert.match(page.$("tools-location-save-status").textContent,/already uses/);
+    page.$("tools-location-name").value="New office";page.$("tools-location-edit-lat").value="91";click(page.$("tools-location-save"));assert.match(page.$("tools-location-save-status").textContent,/Latitude/);
+    page.$("tools-location-edit-lat").value="56.123456";page.$("tools-location-edit-lon").value="38.654321";
+    const main=[page.$("tools-lat").value,page.$("tools-lon").value];click(page.$("tools-location-save"));
+    assert.deepEqual(JSON.parse(saved.getItem("autonom.canvas.locations.v1")),[{name:"New office",latitude:56.123456,longitude:38.654321},original[1]]);
+    assert.deepEqual([page.$("tools-lat").value,page.$("tools-lon").value],main);assert.equal(page.$("tools-location-form").hidden,true);assert.equal(page.ops("location.set").length,0);
+    const reload=boot({storage:saved});click(reload.$("tools-toggle"));await flush();assert.match(reload.$("tools-locations-custom").textContent,/New office/);
+  });
+  test("delete persists, Undo restores original order and no device request is sent", async () => {
+    const saved=storage(),original=[{name:"Office",latitude:55,longitude:37},{name:"Home",latitude:1,longitude:2}];saved.setItem("autonom.canvas.locations.v1",JSON.stringify(original));
+    const page=boot({storage:saved});click(page.$("tools-toggle"));await flush();
+    click(page.document.querySelector(".tools-location-more"));click(page.document.querySelector("[data-location-delete]"));
+    assert.deepEqual(JSON.parse(saved.getItem("autonom.canvas.locations.v1")),[original[1]]);assert.equal(page.$("tools-locations-custom").children.length,1);
+    click(page.$("tools-location-feedback").querySelector("button"));assert.deepEqual(JSON.parse(saved.getItem("autonom.canvas.locations.v1")),original);assert.equal(page.ops("location.set").length,0);
+    click(page.document.querySelector(".tools-location-more"));click(page.document.querySelector("[data-location-delete]"));
+    const reload=boot({storage:saved});click(reload.$("tools-toggle"));await flush();assert.equal(reload.$("tools-locations-custom").children.length,1);assert.doesNotMatch(reload.$("tools-locations-custom").textContent,/Office/);
+  });
+  test("equal coordinates highlight only one row and successful explicit selection wins", async () => {
+    const saved=storage();saved.setItem("autonom.canvas.locations.v1",JSON.stringify([{name:"Current point",latitude:37.422,longitude:-122.084}]));
+    let fail=false,latitude=37.422;
+    const page=boot({storage:saved,reply:({op})=>op==="location.get"?ok({latitude,longitude:-122.084}):op==="location.set"&&fail?refused(502,"backend_failed","Failed"):null});
+    click(page.$("tools-toggle"));await flush();
+    const selected=()=>page.document.querySelectorAll('[data-lat][aria-pressed="true"]');
+    assert.equal(selected().length,1);assert.equal(selected()[0].getAttribute("data-location-key"),"saved:Current point");
+    click(page.document.querySelector('[data-loc-preset="Mountain View"]'));await flush();
+    assert.equal(selected().length,1);assert.equal(selected()[0].getAttribute("data-location-key"),"preset:Mountain View");
+    click(page.$("tools-loc-get"));await flush();assert.equal(selected()[0].getAttribute("data-location-key"),"preset:Mountain View");
+    fail=true;click(page.document.querySelector('[data-location-key="saved:Current point"]'));await flush();assert.equal(selected()[0].getAttribute("data-location-key"),"preset:Mountain View");
+    fail=false;click(page.document.querySelector('[data-location-key="saved:Current point"]'));await flush();assert.equal(selected().length,1);assert.equal(selected()[0].getAttribute("data-location-key"),"saved:Current point");
+    latitude=50;click(page.$("tools-loc-get"));await flush();assert.equal(selected().length,0);
+  });
+  test("late read-back cannot replace a newer location set", async () => {
+    let finish;
+    const page=boot({reply:({op})=>op==="location.get"?new Promise(resolve=>{finish=()=>resolve(ok({latitude:1,longitude:2}))}):null});
+    click(page.$("tools-toggle"));await flush();
+    page.$("tools-lat").value="55";page.$("tools-lon").value="37";
+    click(page.$("tools-loc-set"));await flush();
+    finish();await flush();
+    assert.match(page.$("tools-loc-readout").textContent,/Requested: 55.0000, 37.0000/);
+  });
+});
+
+ test("biometric readiness, custom finger id and action feedback", async () => {
+  const page=boot({platform:"android",reply:({op})=>op==="biometric.status"?ok({biometry:"fingerprint",enrolled:false,count:0,operation:"idle"}):op==="simulate"?ok({message:"Fingerprint touch sent. Check the app prompt."}):null});
+  click(page.$("tools-toggle")); await flush(); click(page.$("tools-tab-simulate")); await flush();
+  assert.match(page.$("tools-biometry-status").textContent,/Not enrolled.*No active prompt/);
+  page.$("tools-finger-id").value="7";
+  click(page.document.querySelector('[data-sim=biometric][data-action=match]')); await flush();
+  assert.deepEqual(page.ops("simulate")[0].body.payload,{control:"biometric",action:"match",values:{finger_id:7}});
+  assert.match(page.$("tools-msg-simulate").textContent,/Check the app prompt/);
+  page.$("tools-finger-id").value="0";
+  click(page.document.querySelector('[data-sim=biometric][data-action=match]')); await flush();
+  assert.equal(page.ops("simulate").length,1);
+ });
+ test("iOS readiness labels Face ID and sends accessibility text size", async () => {
+  const page=boot({platform:"ios",reply:({op})=>op==="biometric.status"?ok({biometry:"face",enrolled:true,operation:"unknown"}):op==="simulate"?ok({verified:true}):null});
+  click(page.$("tools-toggle")); await flush(); click(page.$("tools-tab-simulate")); await flush();
+  assert.equal(page.$("tools-biometry-title").textContent,"Face ID");
+  assert.equal(page.document.querySelector('[data-sim=biometric][data-action=match]').textContent,"Success");
+  click(page.document.querySelector('[data-sim=text-size][data-action=accessibility-extra-extra-extra-large]')); await flush();
+  assert.equal(page.ops("simulate")[0].body.payload.action,"accessibility-extra-extra-extra-large");
+ });
+
+test("Android failure uses a distinct configurable fingerprint id", async () => {
+ const page=boot({platform:"android",reply:({op})=>op==="simulate"?ok({verified:false}):null});
+ click(page.$("tools-toggle"));await flush();click(page.$("tools-tab-simulate"));await flush();
+ const fail=page.document.querySelector('[data-sim=biometric][data-action=nonmatch]');
+ assert.equal(fail.textContent,"Failure");
+ click(fail);await flush();
+ assert.deepEqual(page.ops("simulate")[0].body.payload,{control:"biometric",action:"nonmatch",values:{finger_id:2147483647}});
+ page.$("tools-finger-failure-id").value="1";click(fail);await flush();
+ assert.equal(page.ops("simulate").length,1);
+ assert.match(page.$("tools-msg-simulate").textContent,/different, unenrolled/);
 });

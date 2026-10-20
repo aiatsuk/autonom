@@ -79,20 +79,22 @@ from autonom_lib import screenshot, session, simulator  # noqa: E402
 from autonom_lib.network import device_proxy_ios  # noqa: E402
 from autonom_lib.network import mocks as mocks_mod  # noqa: E402
 from autonom_lib.network import redact, store  # noqa: E402
+from autonom_lib.network import attachment as network_attachment  # noqa: E402
 from autonom_lib.platform import ANDROID, IOS, Target  # noqa: E402
 
 ORIGINS = bridge.ORIGINS
-READ_OPS = ("context", "permissions.list", "location.get", "network.status",
+READ_OPS = ("context", "permissions.list", "location.get", "biometric.status", "network.status",
             "network.requests", "network.request", "mocks.list")
 MUTATING_OPS = ("permissions.set", "location.set", "location.clear", "simulate",
-                "network.start", "network.attach", "network.detach", "network.stop",
+                "network.start", "network.capture", "network.attach", "network.detach", "network.stop",
                 "mocks.add", "mocks.update", "mocks.enable", "mocks.disable",
                 "mocks.remove", "mocks.clear")
 # The Actions drawer (contract section 5.1): separate tuples, so the Tools lists stay pinned.
 ACTION_READ_OPS = ("captures.list", "record.status", "apps.candidates", "health")
 ACTION_DEVICE_OPS = ("capture.screenshot", "record.start", "record.stop", "app.install",
                      "app.launch", "app.open_url", "app.locale")
-ACTION_LOCAL_OPS = ("captures.delete",)     # writes, but not a device mutation
+# Host-only operations never mutate the device.
+ACTION_LOCAL_OPS = ("captures.delete", "captures.open_directory")
 INTERNAL_OPS = ("captures.file",)           # only for the Node file route
 OPS = (READ_OPS + MUTATING_OPS + ACTION_READ_OPS + ACTION_DEVICE_OPS + ACTION_LOCAL_OPS
        + INTERNAL_OPS)
@@ -103,7 +105,7 @@ UNJOURNALED_OPS = READ_OPS + ACTION_READ_OPS + ACTION_LOCAL_OPS + INTERNAL_OPS
 # Reads, host-side work (`network.start`, `mocks.*`) and observation
 # (`capture.screenshot`, `record.*`, `captures.*`) never need a lease.
 LEASED_TOOLS_OPS = ("permissions.set", "location.set", "location.clear", "simulate",
-                    "network.attach", "network.detach", "network.stop", "app.install",
+                    "network.capture", "network.attach", "network.detach", "network.stop", "app.install",
                     "app.launch", "app.open_url", "app.locale")
 
 RECORD_LIMIT_S = 180
@@ -132,22 +134,27 @@ APP_LOCALES_MIN_SDK = 33
 # The device simulations the drawer may run, and the values each one takes.
 SIMULATE_VALUES: dict[str, tuple[str, ...]] = {
     "push": ("app_id", "payload"),
-    "biometric": (),
+    "biometric": ("finger_id",),
     "battery": ("level", "state"),
     "network": ("speed", "delay"),
     "appearance": (),
+    "text-size": (),
+    "animations": (),
 }
 SIMULATE_CONTROLS = tuple(SIMULATE_VALUES)
 # What `context.simulate` offers on each platform (the library refuses the rest).
 SIMULATE_SUPPORT: dict[str, dict[str, tuple[str, ...]]] = {
     IOS: {"push": ("send",),
-          "biometric": simulator.CONTROL_ACTIONS["biometric"],
+          "biometric": ("enroll", "unenroll", "match", "nonmatch"),
           "battery": simulator.CONTROL_ACTIONS["battery"],
-          "appearance": simulator.CONTROL_ACTIONS["appearance"]},
-    ANDROID: {"biometric": ("match",),
+          "appearance": simulator.CONTROL_ACTIONS["appearance"],
+          "text-size": ("small", "large", "extra-extra-extra-large", "accessibility-extra-extra-extra-large")},
+    ANDROID: {"biometric": ("match", "nonmatch", "settings"),
               "battery": simulator.CONTROL_ACTIONS["battery"],
               "network": ("online", "offline"),
-              "appearance": simulator.CONTROL_ACTIONS["appearance"]},
+              "appearance": simulator.CONTROL_ACTIONS["appearance"],
+              "text-size": ("0.85", "1.0", "1.3", "1.5", "2.0"),
+              "animations": ("pin", "reset")},
 }
 PERMISSION_ACTIONS = ("grant", "revoke", "reset")
 MAX_PUSH_PAYLOAD = 4 * 1024
@@ -248,6 +255,7 @@ class Tools:
             "context": self.context,
             "permissions.list": self.permissions_list,
             "location.get": self.location_get,
+            "biometric.status": lambda payload: simulator.biometric_status(self.target),
             "network.status": self.network_status,
             "network.requests": self.network_requests,
             "network.request": self.network_request,
@@ -257,6 +265,7 @@ class Tools:
             "location.clear": self.location_clear,
             "simulate": self.simulate,
             "network.start": self.network_start,
+            "network.capture": self.network_capture,
             "network.attach": self.network_attach,
             "network.detach": self.network_detach,
             "network.stop": self.network_stop,
@@ -278,6 +287,7 @@ class Tools:
             "app.open_url": self.app_open_url,
             "app.locale": self.app_locale,
             "captures.delete": self.captures_delete,
+            "captures.open_directory": self.captures_open_directory,
             "captures.file": self.captures_file,
         }
 
@@ -442,8 +452,13 @@ class Tools:
 
     def network_request(self, payload: dict[str, Any]) -> dict[str, Any]:
         record = self.require_session()
-        # The previews only: full bodies are never served to the drawer.
-        return {"request": store.find(record, _required_text(payload, "id", 128))}
+        identifier = _required_text(payload, "id", 128)
+        if "body" in payload:
+            which = payload["body"]
+            if which not in ("request", "response"):
+                raise _invalid("body must be request or response")
+            return store.copy_body(record, identifier, which)
+        return {"request": store.find(record, identifier)}
 
     def mocks_list(self, payload: dict[str, Any]) -> dict[str, Any]:
         record = self.session()
@@ -535,7 +550,7 @@ class Tools:
             raise _invalid(f"simulate control {control!r} is not allowed here",
                            "Allowed controls: " + ", ".join(SIMULATE_CONTROLS) + ".")
         action = payload.get("action")
-        if not isinstance(action, str) or not action or len(action) > 32:
+        if not isinstance(action, str) or not action or len(action) > 64:
             raise _invalid("simulate action must be a non-empty string")
         values, words = self._simulate_values(control, payload.get("values"))
         # `session` is where push takes its default app id: only this target's.
@@ -550,11 +565,40 @@ class Tools:
     def network_start(self, payload: dict[str, Any], record: dict[str, Any] | None):
         record = self.require_session(record)
         # Never --capture-bodies, and consent only from an explicit `true`.
+        preferred = (record.get("network") or {}).get("preferred_proxy_port")
+        if preferred is not None and (type(preferred) is not int or not 1 <= preferred <= 65535):
+            raise _invalid("preferred_proxy_port must be a port from 1 to 65535")
         result = cli.network_start_payload(
-            record, port=None, capture_bodies=False,
+            record, port=preferred, capture_bodies=False,
             acknowledged=payload.get("acknowledged") is True)
         result.pop("ok", None)
         return result, ["--i-understand-mitm"], {"port": result.get("port")}
+
+    def network_capture(self, payload: dict[str, Any], record: dict[str, Any] | None):
+        record = self.require_session(record)
+        # Reuse the idempotent start and existing consent/attachment helpers.
+        started, words, summary = self.network_start(payload, record)
+        evidence = network_attachment.attachment_evidence(
+            record, platform=self.target.platform, flows=[],
+            observe_setting=(lambda: cli.device_proxy_android.read_setting(self.target))
+            if self.target.platform == ANDROID else None,
+        )
+        if evidence["attached"] is True:
+            return {"proxy": started, **evidence, "attachment_reused": True}, words, summary
+        try:
+            attached, _words, _summary = self.network_attach(payload, record)
+        except errors.AutonomError as exc:
+            raise errors.AutonomError(
+                exc.code, f"Proxy is running, but the device could not be connected: {exc}",
+                exc.hint or "Retry Start capturing after resolving the device connection.",
+            ) from exc
+        confirmed = network_attachment.attachment_evidence(
+            record, platform=self.target.platform, flows=[],
+            observe_setting=(lambda: cli.device_proxy_android.read_setting(self.target))
+            if self.target.platform == ANDROID else None,
+        )
+        return {"proxy": started, "attachment": attached, **confirmed,
+                "attachment_reused": False}, words, summary
 
     def network_attach(self, payload: dict[str, Any], record: dict[str, Any] | None):
         record = self.require_session(record)
@@ -731,6 +775,23 @@ class Tools:
         name = self._capture_name(payload)
         captures.delete(self._captures_path(), name)
         return {"removed": name}
+
+    def captures_open_directory(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if payload:
+            raise _invalid("Open folder does not accept a path or arguments")
+        if sys.platform != "darwin":
+            raise errors.AutonomError(
+                errors.UNSUPPORTED_CAPABILITY, "Open in Finder is available on macOS only",
+                capability="captures.open_directory")
+        directory = self._captures_dir()
+        try:
+            subprocess.run(["/usr/bin/open", "-a", "Finder", str(directory)],
+                           check=True, capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise errors.AutonomError(
+                errors.BACKEND_FAILED, "Finder could not open the captures folder",
+                "Open the folder shown in the gallery manually.") from exc
+        return {"opened": True, "dir": str(directory)}
 
     def captures_file(self, payload: dict[str, Any]) -> dict[str, Any]:
         return captures.entry(self._captures_path(), self._capture_name(payload))
@@ -1147,8 +1208,13 @@ class Tools:
             raise errors.AutonomError(
                 errors.INVALID_VALUE, "url must be a URL with a scheme, at most 2048 characters, "
                 "without spaces", "For example myapp://profile/42 or https://example.com/x.")
+        app_id = self._action_app_id(payload) if "app_id" in payload else None
         if self.target.platform == ANDROID:
-            detail = cli._open_android(self.target, url)  # noqa: SLF001 - the CLI's `open`
+            detail = (cli._open_android(self.target, url, app_id=app_id) if app_id
+                      else cli._open_android(self.target, url))  # noqa: SLF001
+            if app_id and detail.get("warnings"):
+                warning = detail["warnings"][0]
+                raise errors.AutonomError(errors.BACKEND_FAILED, warning["error"], warning.get("hint"))
         else:
             device_state.open_url(self.target, url)
             detail = {"handled_by": "unknown"}

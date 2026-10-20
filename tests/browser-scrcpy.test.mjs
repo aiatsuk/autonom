@@ -14,6 +14,7 @@ import { dirname, join, resolve } from "node:path";
 import test, { describe } from "node:test";
 import { promisify } from "node:util";
 import { Script, createContext } from "node:vm";
+import { renderPage } from "../plugins/autonom/skills/android-emulator-browser/scripts/android-emulator-browser.mjs";
 
 import { renderPage } from "../plugins/autonom/skills/android-emulator-browser/scripts/canvas-device-page.mjs";
 import {
@@ -3271,6 +3272,11 @@ function fakeDocument(html) {
         add: (name) => names.add(name), remove: (name) => names.delete(name), contains: (name) => names.has(name),
         toggle: (name, force = !names.has(name)) => (force ? names.add(name) : names.delete(name), force),
       },
+      replaceChildren: (...children) => {
+        for (const child of elements) if (child.parent === element) child.parent = null;
+        for (const child of children) child.parent = element;
+        element.textContent = "";
+      },
       getContext: () => ({}),
       getAttribute: (name) => element.attributes.get(name) ?? null,
       setAttribute: (name, value) => element.attributes.set(name, String(value)),
@@ -3334,16 +3340,17 @@ function attributeMatcher(selector) {
  * page (its sign-in never answers), on the scrcpy transport with an open control socket.
  * `sent` collects the control messages it sends; `run` evaluates code inside the page.
  */
-function runPage(html) {
+function runPage(html, { hash = "" } = {}) {
   const script = html.match(/<script>([\s\S]*)<\/script>/)[1];
   const document = fakeDocument(html);
   const sent = [];
   const sandbox = {
-    location: { hash: "", pathname: "/", search: "", protocol: "http:", host: "127.0.0.1:1" },
+    location: { hash, pathname: "/", search: "", protocol: "http:", host: "127.0.0.1:1" },
     history: { replaceState() {} },
     document,
     fetch: () => new Promise(() => {}),
-    URLSearchParams, TextEncoder, setTimeout, clearTimeout, setInterval, clearInterval,
+    URLSearchParams, TextEncoder, performance, setTimeout, clearTimeout,
+    setInterval: (...args) => { const timer = setInterval(...args); timer.unref(); return timer; }, clearInterval,
     record: (text) => sent.push(JSON.parse(text)),
   };
   sandbox.window = sandbox;
@@ -5652,12 +5659,6 @@ const FORMER_CONTROLS = [
   ["Back", { "data-key": "KEYCODE_BACK", "data-system": "back" }],
   ["Home", { "data-key": "KEYCODE_HOME", "data-system": "home" }],
   ["Recent apps", { "data-key": "KEYCODE_APP_SWITCH", "data-system": "app-switch" }],
-  ["Up", { "data-key": "KEYCODE_DPAD_UP", "data-code": "19" }],
-  ["Enter", { "data-key": "KEYCODE_ENTER", "data-code": "66" }],
-  ["Down", { "data-key": "KEYCODE_DPAD_DOWN", "data-code": "20" }],
-  ["Left", { "data-key": "KEYCODE_DPAD_LEFT", "data-code": "21" }],
-  ["Delete", { "data-key": "KEYCODE_DEL", "data-code": "67" }],
-  ["Right", { "data-key": "KEYCODE_DPAD_RIGHT", "data-code": "22" }],
   ["Wake screen", { "data-key": "KEYCODE_WAKEUP", "data-system": "wake" }],
   ["Power", { "data-key": "KEYCODE_POWER", "data-system": "power" }],
   ["Rotate", { "data-system": "rotate", "data-scrcpy": "" }],
@@ -5672,7 +5673,7 @@ const FORMER_CONTROLS = [
 ];
 const PAGE_IDS = ["video", "screen", "status", "text", "clipboard", "device", "refresh", "sendText"];
 
-test("page: the Android page keeps its element ids, window.autonomCanvas and every former control with the attributes its handlers read, names every button, and marks the scrcpy-only ones", async (t) => {
+test("page: the Android page keeps its element ids, window.autonomCanvas and remaining controls with the attributes its handlers read, names every button, and marks the scrcpy-only ones", async (t) => {
   const { html } = await loadPage(t);
   for (const id of [...PAGE_IDS, "display-preset", "display-menu", "control-take", "control-pause", "inspector-toggle"]) {
     assert.equal(html.split(`id="${id}"`).length - 1, 1, `id ${id}`);
@@ -5689,40 +5690,46 @@ test("page: the Android page keeps its element ids, window.autonomCanvas and eve
     assert.deepEqual(Object.keys(found[0].attributes).filter((key) => key.startsWith("data-")).sort(),
       Object.keys(attributes).filter((key) => key.startsWith("data-")).sort(), `${name} keeps exactly its data attributes`);
   }
-  // Every button has a name; one without text is named by aria-label and shows it as its tooltip.
+  // Every button has a name; an icon has an accessible label and a tooltip (which may be shorter).
   for (const button of buttons) {
     assert.ok(button.name, JSON.stringify(button.attributes));
     // The one submit button is the Tools drawer's mock form (Enter in its fields submits it too).
     assert.equal(button.attributes.type, button.attributes.id === "tools-mock-save" ? "submit" : "button", button.name);
-    if (!button.text) assert.equal(button.attributes.title, button.attributes["aria-label"], button.name);
+    if (!button.text) assert.ok(button.attributes.title, `${button.name} has a tooltip`);
   }
   assert.deepEqual(buttons.filter((button) => "data-scrcpy" in button.attributes).map((button) => button.name),
     ["Rotate", "Volume down", "Volume up", "Notifications", "Quick settings", "Collapse panels", "Copy device clipboard"]);
-  // The toolbar: wordmark, target with its live dot, the size menu with dimensions, control chip, inspector toggle.
-  assert.match(html, /<b>Autonom<\/b>/);
-  assert.match(html, /<i class="dot" id="live-dot" aria-hidden="true"><\/i><strong>fake-device-1<\/strong><span id="target-detail">Android · connecting<\/span>/);
-  assert.match(html, /<span class="dims" id="display-dims"><\/span>/);
-  assert.match(html, /<span class="chip" title="Who controls the device">[\s\S]*?<span id="control-chip">Shared<\/span>/);
+  // The compact toolbar keeps display/theme/panel controls, with diagnostics in Settings.
+  const toolbar = html.match(/<header class="bar">([\s\S]*?)<\/header>/)[1];
+  assert.doesNotMatch(toolbar, /class="brand"|live-dot|target-detail|display-dims|control-chip|class="chip"/);
+  assert.match(toolbar, /id="display-preset"/);
+  assert.match(toolbar, /id="canvas-theme"/);
   assert.match(html, /id="inspector-toggle" aria-pressed="true" aria-controls="inspector" title="Inspector" aria-label="Inspector"/);
   assert.match(html, /<div role="listbox" id="display-list" aria-label="Display size">/);
   assert.equal(presetOptions(html).length, 5);
-  // The pill under the device: Back, Home, Recent apps | Rotate, Volume down, Volume up, Power.
+  // The pill keeps navigation, Rotate and Power; volume lives in device settings.
   const dock = html.match(/<nav class="dock" aria-label="Device buttons">([\s\S]*?)<\/nav>/);
   assert.ok(dock, "the Android page has no pill of device buttons");
   assert.deepEqual(pageButtons(dock[1]).map((button) => button.name),
-    ["Back", "Home", "Recent apps", "Rotate", "Volume down", "Volume up", "Power"]);
+    ["Back", "Home", "Recent apps", "Take screenshot", "Start recording", "Rotate", "Power"]);
+  const deviceSettings = html.match(/<h2>Device<\/h2>([\s\S]*?)<\/section>/)[1];
+  for (const direction of ["down", "up"]) assert.match(deviceSettings, new RegExp('data-system="volume-' + direction + '" data-scrcpy'));
+
   // The inspector sections, in order.
-  assert.deepEqual([...html.matchAll(/<section class="group"[^>]*>\s*<h2>([^<]+)<\/h2>/g)].map((match) => match[1]),
-    ["Type", "Keys", "Device", "Control", "Stream"]);
+  assert.deepEqual([...html.matchAll(/<section class="group(?: inspector-stream)?"[^>]*>\s*<h2>([^<]+)<\/h2>/g)].map((match) => match[1]),
+    ["Device", "Stream"]);
   assert.doesNotMatch(html, /<section class="group" hidden>/, "an Android inspector section is hidden");
 });
 
-test("page: the page loads nothing from outside, has light and dark tokens with the approved accents, a phone layout with 44 px targets and the pill above the safe area, reduced motion, visible focus, and never builds DOM from strings", async (t) => {
+test("page: the page loads nothing from outside, has light and dark tokens with the approved accents, a compact narrow-window layout and the pill above the safe area, reduced motion, visible focus, and never builds DOM from strings", async (t) => {
   const { html } = await loadPage(t);
   const script = html.match(/<script>([\s\S]*)<\/script>/)[1];
   assert.doesNotMatch(html, /https?:\/\//, "an absolute URL is on the page");
   assert.doesNotMatch(html, /<script[^>]*\ssrc=|<link[^>]*stylesheet/i);
-  assert.doesNotMatch(html.match(/<style>([\s\S]*)<\/style>/)[1], /@import|url\(/);
+  const css = html.match(/<style>([\s\S]*)<\/style>/)[1];
+  // Encoded inline SVG icons are self-contained; all external CSS loads remain forbidden.
+  const cssWithoutInlineIcons = css.replace(/url\("data:image\/svg\+xml,[^"\s]*"\)/g, "");
+  assert.doesNotMatch(cssWithoutInlineIcons, /@import|url\(/i);
   for (const [, value] of html.matchAll(/\s(?:src|href)="([^"]*)"/g)) assert.match(value, /^data:/);
   assert.doesNotMatch(script, /innerHTML|outerHTML|insertAdjacentHTML|document\.write/);
   assert.match(html, /<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">/);
@@ -5736,11 +5743,11 @@ test("page: the page loads nothing from outside, has light and dark tokens with 
   assert.match(html, /:focus-visible\{outline:2px solid var\(--accent\)/);
   const phone = html.match(/@media \(max-width:760px\)\{([\s\S]*?)\n\}/);
   assert.ok(phone, "no phone layout");
-  for (const rule of [".dock{position:fixed;bottom:calc(14px + env(safe-area-inset-bottom))", ".dock button{width:44px;height:44px}",
-    ".popup,.option,.key,.btn,.field input,.row{height:44px}", ".linkbtn{min-height:44px}", ".diag summary{line-height:44px}",
-    ".field input{font-size:16px}", "body{display:block;", "body.no-inspector .side{display:block}"]) {
+  for (const rule of [".dock{position:fixed;bottom:calc(14px + env(safe-area-inset-bottom))",
+    "body{display:block;", "body.no-inspector .side{display:none}", ".side{position:fixed;", ".actions #inspector-toggle{display:grid}", "width:var(--canvas-panel-width)"]) {
     assert.ok(phone[1].includes(rule), rule);
   }
+  assert.doesNotMatch(phone[1], /height:44px|font-size:16px/, "narrow windows retain desktop density");
   const reduced = html.match(/@media \(prefers-reduced-motion:reduce\)\{(.*)\}/);
   assert.ok(reduced, "no reduced motion rule");
   for (const rule of ["transition:none!important", "animation:none!important", "button:active{transform:none!important}"]) {
@@ -5872,7 +5879,7 @@ test("page: the size menu is a keyboard listbox: Enter opens it on the first pre
   assert.equal(focused(), "display-preset", "the focus did not come back to the size button after the answer");
   assert.deepEqual(selected(), ["pixel-fold"]);
   run("render()");
-  assert.equal(document.getElementById("display-dims").textContent, "2208 × 1840 · 420 dpi");
+  assert.equal(document.getElementById("stream-display").textContent, "2208 × 1840 · 420 dpi");
 
   // Escape closes without a change and gives the focus back.
   press("Enter");
@@ -5941,14 +5948,14 @@ test("page: controls that cannot act are disabled, the Control buttons hand cont
   run("view.status={platform:\"android\",display:{width:1080,height:2400,density:420,preset:\"default\"}};logicalDisplay=view.status.display");
   state({});
   assert.deepEqual(disabled(), [false]);
-  assert.deepEqual([text("owner-name"), text("owner-detail"), text("control-chip")],
-    ["Shared", "· people and agents can send input", "Shared"]);
+  assert.deepEqual([text("owner-name"), text("owner-detail")],
+    ["Shared", "· people and agents can send input"]);
   assert.equal(byId("owner-dot").dataset.state, "live");
   // Another owner: input is disabled, handoff and the device clipboard still act.
   state({ owner: "agent" });
   assert.deepEqual(disabled(), [true]);
   assert.deepEqual([byId("clipboard").disabled, byId("refresh").disabled, byId("control-take").disabled], [false, false, false]);
-  assert.deepEqual([text("owner-name"), text("control-chip"), text("control-take")], ["Agent", "Agent", "Take control"]);
+  assert.deepEqual([text("owner-name"), text("control-take")], ["Agent", "Take control"]);
   assert.equal(byId("owner-dot").dataset.state, "warn");
   byId("control-take").click();
   assert.deepEqual(sent.at(-1), { t: "control", mode: "takeover" });
@@ -5961,8 +5968,8 @@ test("page: controls that cannot act are disabled, the Control buttons hand cont
   assert.deepEqual(sent.at(-1), { t: "control", mode: "pause" });
   state({ paused: true });
   assert.deepEqual(disabled(), [true]);
-  assert.deepEqual([text("control-pause"), text("owner-detail"), text("control-chip")],
-    ["Resume input", "· input is paused", "Shared · Paused"]);
+  assert.deepEqual([text("control-pause"), text("owner-detail")],
+    ["Resume input", "· input is paused"]);
   byId("control-pause").click();
   assert.deepEqual(sent.at(-1), { t: "control", mode: "resume" });
   // Without scrcpy the handoff goes to POST /control as the human page, and the answer is shown.
@@ -5979,12 +5986,11 @@ test("page: controls that cannot act are disabled, the Control buttons hand cont
 
   // The toolbar, caption and Stream details on scrcpy with WebCodecs.
   run("view.transport=\"scrcpy\";view.mode=\"webcodecs\";view.width=570;view.height=1280;stats.codec=\"avc1.42C029\";" +
-    "stats.renderTimes=[1,2,3];stats.framesRendered=3;view.rtt=12;render()");
-  assert.deepEqual(["target-detail", "display-dims", "caption", "stream-transport", "stream-codec", "stream-frames",
+    "stats.renderTimes=[performance.now()-300,performance.now()-200,performance.now()-100];stats.framesRendered=3;view.rtt=12;render()");
+  assert.deepEqual(["caption", "stream-transport", "stream-codec", "stream-frames",
     "stream-video", "stream-display", "stream-clients"].map(text),
-  ["Android · scrcpy", "1080 × 2400 · 420 dpi", "3 fps · 12 ms · WebCodecs", "scrcpy · WebCodecs", "avc1.42C029",
-    "3 fps · 0 dropped", "570 × 1280", "1080 × 2400 · 420 dpi", "1 video · 1 control"]);
-  assert.equal(byId("live-dot").dataset.state, "live");
+  ["3 fps · 12 ms · WebCodecs", "scrcpy · WebCodecs", "avc1.42C029",
+    "3 fps", "570 × 1280", "1080 × 2400 · 420 dpi", "1 video · 1 control"]);
   assert.match(text("status"), /transport: scrcpy \(webcodecs\)/);
   assert.equal(text("display-default-size"), "", "the device default size was shown before it was read");
   run("rememberDefaultSize(view.status.display)");
@@ -6002,6 +6008,9 @@ test("page: controls that cannot act are disabled, the Control buttons hand cont
   byId("inspector-toggle").click();
   assert.equal(document.body.classList.contains("no-inspector"), false);
   assert.equal(byId("inspector-toggle").getAttribute("aria-pressed"), "true");
+  byId("inspector-close").click();
+  assert.equal(document.body.classList.contains("no-inspector"), true);
+  assert.equal(document.activeElement, byId("inspector-toggle"));
 });
 
 test("page: the iOS page runs without the Size menu, keeps every element id, shows Home and Power, and keeps the Android buttons iOS refuses out of sight", async (t) => {
@@ -6020,15 +6029,14 @@ test("page: the iOS page runs without the Size menu, keeps every element id, sho
   const dock = html.match(/<nav class="dock"[^>]*>([\s\S]*?)<\/nav>/)[1];
   const shown = [...dock.matchAll(/<button [^>]*aria-label="([^"]+)"[^>]*>/g)]
     .filter((match) => !/ hidden[ >]/.test(match[0])).map((match) => match[1]);
-  assert.deepEqual(shown, ["Home", "Power"]);
-  assert.deepEqual([...html.matchAll(/<section class="group"( hidden)?>\s*<h2>([^<]+)<\/h2>/g)].map((match) => [match[2], Boolean(match[1])]),
-    [["Type", false], ["Keys", true], ["Device", true], ["Control", false], ["Stream", false]]);
+  assert.deepEqual(shown, ["Home", "Take screenshot", "Start recording", "Power"]);
+  assert.deepEqual([...html.matchAll(/<section class="group(?: inspector-stream)?"( hidden)?>\s*<h2>([^<]+)<\/h2>/g)].map((match) => [match[2], Boolean(match[1])]),
+    [["Device", true], ["Stream", false]]);
   const { run, document } = runPage(html);
   assert.equal(run("sizePicker"), null);
   run("view.transport=\"screencap\";controlSocket=null;view.status={platform:\"ios\",display:{width:1179,height:2556}};" +
     "logicalDisplay=view.status.display;render()");
-  assert.equal(document.getElementById("target-detail").textContent, "iOS · screencap");
-  assert.equal(document.getElementById("display-dims").textContent, "1179 × 2556");
+  assert.equal(document.getElementById("stream-display").textContent, "1179 × 2556");
   assert.equal(document.getElementById("sendText").disabled, false);
   // The Tools drawer is the iOS one: push, Clear and the permissions note, no read-back.
   assert.equal(html.split('<aside class="tools" id="tools" hidden aria-label="Tools" data-platform="ios">').length - 1, 1);
@@ -6052,8 +6060,9 @@ test("page: the served page carries the Tools drawer after the inspector, its to
   const markup = html.replace(/<script>[\s\S]*?<\/script>|<style>[\s\S]*?<\/style>/g, "");
   const ids = [...markup.matchAll(/\sid="([^"]+)"/g)].map((match) => match[1]);
   assert.deepEqual(ids.filter((id, index) => ids.indexOf(id) !== index), [], "no id is used twice");
-  assert.deepEqual([...markup.matchAll(/role="tab"[^>]*>([^<]+)</g)].map((match) => match[1]), ["App", "Simulate", "Network", "Mocks", "Logs"]);
-  assert.equal((markup.match(/role="tabpanel"/g) || []).length, 5);
+  const drawerMarkup = toolsMarkup({ platform: "android" });
+  assert.deepEqual([...drawerMarkup.matchAll(/role="tab"[^>]*>([^<]+)</g)].map((match) => match[1]), ["App", "Simulate", "Network", "Mocks", "Logs"]);
+  assert.equal((drawerMarkup.match(/role="tabpanel"/g) || []).length, 5);
   // The location presets do not join the page's display-size options.
   assert.equal(run("sizeOptions.length"), 5);
   // Styles and script: inlined whole, after the page's own; the script parses as one.
@@ -7535,8 +7544,8 @@ test("ios: the page uses WebCodecs and the control socket on idb, turns the canv
   run("applyTransport()");
   assert.match(document.getElementById("text-hint").textContent, /Typed into the Simulator/);
   // Home and Power go over the control socket as system actions.
-  const dock = document.elements.filter((element) => element.parent?.tagName === "NAV" && element.tagName === "BUTTON");
-  const byLabel = (label) => dock.find((element) => element.getAttribute("aria-label") === label);
+  const controls = document.elements.filter((element) => element.tagName === "BUTTON");
+  const byLabel = (label) => controls.find((element) => element.getAttribute("aria-label") === label);
   for (const label of ["Home", "Power", "Volume down", "Volume up"]) assert.equal(byLabel(label).hidden, false, `${label} is hidden`);
   for (const label of ["Back", "Recent apps", "Rotate"]) assert.equal(byLabel(label).hidden, true, `${label} shows`);
   byLabel("Home").click();
@@ -7709,4 +7718,57 @@ test("page: the Android page shows decoded scrcpy frames in order with at most t
 
 describe("tests that wait on Canvas timers, run side by side", { concurrency: true }, () => {
   for (const [name, fn] of waitingTests) test(name, fn);
+});
+
+test("page: frame rate expires on a still screen and resumes from recent frames", () => {
+  const html = renderPage({ serial: "fake-device", options: { platform: "android" } });
+  const { sandbox, run, document } = runPage(html);
+  let now = 5000;
+  sandbox.performance = { now: () => now };
+  run('view.mode="webcodecs";view.session="streaming";stats.framesRendered=3;stats.renderTimes=[4000,4500,4990];render()');
+  const text = (id) => document.getElementById(id).textContent;
+  assert.equal(text("caption"), "3 fps · WebCodecs");
+  now = 5501;
+  run("render()");
+  assert.equal(text("caption"), "1 fps · WebCodecs");
+  assert.equal(run("window.autonomCanvas.stats().fps"), 1);
+  now = 6000;
+  run("render()");
+  assert.equal(text("caption"), "0 fps · no new frames · WebCodecs");
+  assert.equal(text("stream-frames"), "0 fps");
+  assert.match(text("status"), /fps: 0 rendered/);
+  assert.equal(run("window.autonomCanvas.stats().fps"), 0);
+  run("stats.renderTimes.push(performance.now());stats.framesRendered++;render()");
+  assert.equal(text("caption"), "1 fps · WebCodecs");
+  now = 7101;
+  assert.equal(run("window.autonomCanvas.stats().fps"), 0, "stats expire without another render");
+  run('view.session="restarting";render()');
+  assert.equal(text("caption"), "0 fps · WebCodecs", "a disconnected stream is never called still");
+});
+
+test("page: a restarted server reauthenticates and recovers WebCodecs from multipart", async () => {
+  const {sandbox,run}=runPage(renderPage({serial:"fake-device",options:{platform:"android"}}),{hash:"#token=fixture-token"});
+  const calls=[];
+  sandbox.setTimeout=()=>0;
+  sandbox.VideoDecoder=function(){};
+  sandbox.fetch=async(path,init)=>{
+    calls.push([path,init?.method||"GET"]);
+    if(path==="/auth")return{ok:true,status:200,json:async()=>({csrf:"fresh-csrf"})};
+    if(calls.filter(([p])=>p.startsWith("/status")).length===1)return{ok:false,status:401,json:async()=>({error:"Unauthorized"})};
+    return{ok:true,status:200,json:async()=>({transport:"scrcpy",control_owner:"shared",input_paused:false})};
+  };
+  run('view.transport="scrcpy";view.mode="multipart";startWebCodecs=()=>{view.mode="webcodecs"}');
+  await run("poll()");
+  assert.deepEqual(calls,[["/status","GET"],["/auth","POST"],["/status","GET"]]);
+  assert.equal(run("csrf"),"fresh-csrf");
+  assert.equal(run("view.mode"),"webcodecs");
+});
+
+// Embedded pages hide the standalone Inspector; their workspace dock remains usable.
+test("page: embedded devices retain accessible volume controls in their dock", () => {
+  const html = renderPage({serial:"fixture",options:{platform:"android"}},{embed:true});
+  const dock = html.match(/<nav class="dock"[^>]*>([\s\S]*?)<\/nav>/)[1];
+  assert.match(dock, /data-system="volume-down"/);
+  assert.match(dock, /data-system="volume-up"/);
+  assert.equal((html.match(/data-system="volume-down"/g)||[]).length,1);
 });

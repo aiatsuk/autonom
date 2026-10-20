@@ -52,6 +52,7 @@ export const TOOLS_READ_OPS = Object.freeze([
   "context",
   "permissions.list",
   "location.get",
+  "biometric.status",
   "network.status",
   "network.requests",
   "network.request",
@@ -63,6 +64,7 @@ export const TOOLS_MUTATING_OPS = Object.freeze([
   "location.clear",
   "simulate",
   "network.start",
+  "network.capture",
   "network.attach",
   "network.detach",
   "network.stop",
@@ -78,7 +80,7 @@ export const TOOLS_OPS = Object.freeze([...TOOLS_READ_OPS, ...TOOLS_MUTATING_OPS
 export const ACTION_READ_OPS = Object.freeze(["captures.list", "record.status", "apps.candidates", "health"]);
 export const ACTION_DEVICE_OPS = Object.freeze(["capture.screenshot", "record.start", "record.stop", "app.install",
   "app.launch", "app.open_url", "app.locale"]);
-export const ACTION_LOCAL_OPS = Object.freeze(["captures.delete"]);
+export const ACTION_LOCAL_OPS = Object.freeze(["captures.delete", "captures.open_directory"]);
 // `captures.file` is internal: only the file route asks it, /tools/call refuses it.
 const CALLABLE_OPS = Object.freeze([...TOOLS_OPS, ...ACTION_READ_OPS, ...ACTION_DEVICE_OPS, ...ACTION_LOCAL_OPS]);
 
@@ -87,7 +89,7 @@ const CALLABLE_OPS = Object.freeze([...TOOLS_OPS, ...ACTION_READ_OPS, ...ACTION_
 // (`network.start`, `mocks.*`) and observation (`capture.screenshot`, `record.*`,
 // `captures.*`) never need a lease and never take one.
 export const LEASED_TOOLS_OPS = Object.freeze(["permissions.set", "location.set", "location.clear", "simulate",
-  "network.attach", "network.detach", "network.stop", "app.install", "app.launch", "app.open_url", "app.locale"]);
+  "network.capture", "network.attach", "network.detach", "network.stop", "app.install", "app.launch", "app.open_url", "app.locale"]);
 
 const READ_OPS = new Set(TOOLS_READ_OPS);
 const LEASED = new Set(LEASED_TOOLS_OPS);
