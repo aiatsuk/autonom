@@ -61,7 +61,7 @@ class VersionResolverTests(unittest.TestCase):
 class BundlePreflightTests(unittest.TestCase):
     def test_required_release_files_exist(self) -> None:
         """build_release.sh pre-flights these; keep them present in the repo."""
-        for name in ("LICENSE", "CHANGELOG.md", "README.md", "install.sh"):
+        for name in ("LICENSE", "TERMS.md", "PRIVACY.md", "CHANGELOG.md", "README.md", "install.sh"):
             with self.subTest(file=name):
                 self.assertTrue((ROOT / name).exists(), f"{name} is required by build_release.sh")
 

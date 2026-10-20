@@ -32,7 +32,7 @@ done
 # Pre-flight: the bundle must carry these; failing here beats failing after
 # staging (or, worse, shipping without them — CHANGELOG.md did exactly that
 # while it did not exist and the `[ -e ] &&` loop stayed silent).
-for required in LICENSE CHANGELOG.md README.md install.sh; do
+for required in LICENSE TERMS.md PRIVACY.md CHANGELOG.md README.md install.sh; do
   [ -e "$required" ] || { echo "missing required release file: $required" >&2; exit 1; }
 done
 
@@ -58,7 +58,7 @@ cp -R native "$stage/native"
 cp -R examples "$stage/examples"
 cp -R .agents "$stage/.agents"
 cp -R .claude-plugin "$stage/.claude-plugin"
-cp README.md CHANGELOG.md LICENSE "$stage/"
+cp README.md CHANGELOG.md LICENSE TERMS.md PRIVACY.md "$stage/"
 find "$stage" -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true
 find "$stage" -name '*.pyc' -delete 2>/dev/null || true
 
@@ -69,7 +69,9 @@ cp install.sh "$stage/install.sh"
 chmod +x "$stage/install.sh"
 
 tarball="dist/${name}.tgz"
-tar czf "$tarball" -C dist "$name"
+# macOS otherwise injects AppleDouble ._* entries outside the bundle root.
+# They are not runtime files and the setup helper correctly rejects them.
+COPYFILE_DISABLE=1 tar czf "$tarball" -C dist "$name"
 rm -rf "$stage"
 
 (cd dist && if command -v sha256sum >/dev/null 2>&1; then

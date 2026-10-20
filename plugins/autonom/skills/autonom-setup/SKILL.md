@@ -5,7 +5,7 @@ description: Install, update, or hand off the Autonom harness — the CLI plus a
 
 # Autonom Setup
 
-Autonom is a plugin: 24 skills plus a dependency-free CLI they drive. This skill
+Autonom is a plugin: 25 skills plus a dependency-free CLI they drive. This skill
 checks and installs updates, or packages the whole thing into one file you can
 carry to another machine and install with one command.
 
@@ -13,6 +13,40 @@ Not a compiled binary, on purpose: the CLI is stdlib-only Python (nothing to
 compile), and the network addon must be a real file on disk because `mitmdump`
 loads it by path. So the transferable artifact is a **tarball** — one file to
 copy, one command to install.
+
+## Install the runtime after a marketplace install
+
+The plugin carries skills; the runtime is downloaded separately. For a released
+plugin, run the helper bundled **beside this SKILL.md**, using its actual loaded
+skill directory (never assume a cache version or use an older curated copy):
+
+```bash
+python3 <this-skill-directory>/scripts/install_runtime.py
+```
+
+Use Python 3.11+. The helper reads the plugin manifest, downloads only the
+matching release from `aiatsuk/autonom`, verifies `SHA256SUMS`, validates the
+archive and runtime version, and checks for active device sessions. On success
+its JSON gives `version`, `runtime`, `executable`, `sha256`, `on_path` and `next`.
+Run the returned absolute `executable` with `version` and `doctor`; use that path
+for later commands if `on_path` is false or PATH resolves an older installation.
+A missing device tool in `doctor` is a separate prerequisite, not an install
+failure. Report it accurately; do not install SDKs unless requested.
+
+Defaults: runtimes under `~/.local/share/autonom-runtimes/`, launcher at
+`~/.local/bin/autonom`. Options: `--runtime-dir <dir>`, `--bin-dir <dir>`;
+`AUTONOM_BIN_DIR` also sets the launcher directory. Honor existing custom paths;
+this helper does not use the standalone bundle installer's `AUTONOM_PREFIX`.
+Old runtimes remain available for existing processes. A repeated installation
+verifies and reuses the same runtime. Never delete a runtime still in use.
+
+Errors are JSON on stderr, exit 2. `release_unavailable` means the exact version
+is not downloadable yet: retry after publication or select a published plugin
+tag. Do not silently install a different version. `active_session` means defer
+until the user's device work ends. An uncertain session store also blocks the
+switch. `destination_exists` preserves unrelated files or a modified runtime;
+report the path and use a separate install directory rather than deleting it.
+The launcher changes only after all checks pass.
 
 ## Check and install updates
 
@@ -29,11 +63,11 @@ source, and defer changes during an active device session.
 
 ```bash
 ./scripts/build_release.sh
-# -> dist/autonom-<version>.tgz  (~200 KB: CLI + library + all skills + manifest)
+# -> dist/autonom-<version>.tgz  (CLI + library + all skills + manifest)
 ```
 
 The bundle carries its own `install.sh`, so the target needs nothing but
-`python3` (already present on macOS and Linux) and, for real device work, the
+`python3` 3.11 or newer and, for real device work, the
 device tools (`adb`, `xcrun`, `idb`, `mitmdump`) that `doctor` checks.
 
 ## Install on another machine

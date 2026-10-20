@@ -223,10 +223,43 @@ autonom doctor
 
 ## Codex
 
+Install from the GitHub-backed marketplace in Codex Desktop or CLI:
+
 ```bash
-codex plugin marketplace add aiatsuk/autonom
-codex plugin add autonom@autonom
-codex plugin list
+codex plugin marketplace add aiatsuk/autonom --json
+codex plugin add autonom@autonom --json
+codex plugin list --marketplace autonom --json
+```
+
+In Desktop, you can also add `aiatsuk/autonom` in the plugin marketplace UI
+and install **Autonom**. This is a GitHub marketplace source, not a GitHub
+Actions Marketplace listing or an update to the OpenAI curated store.
+
+Start a **new chat/session** and ask:
+
+> Use autonom-setup to install the runtime matching this plugin, then run
+> version and doctor. Report the plugin version and runtime version.
+
+The setup skill downloads the matching GitHub Release, checks its SHA-256,
+and installs the CLI without cloning the repository. Python 3.11+ is required.
+It returns an absolute executable path for Desktop environments where
+`~/.local/bin` is not on PATH. Device SDKs remain a separate setup step.
+The plugin contains skills only; no MCP server is required.
+
+For updates, refresh the marketplace and reinstall the plugin, then run setup
+in a new session. The default source follows the repository's default branch.
+Its matching release may not yet exist, in which case setup reports that and
+leaves the CLI intact until publication.
+
+For a reproducible **fresh** install, add `--ref v0.36.2` to the marketplace
+registration command. A pinned tag stays pinned on upgrade. Changing an
+existing ref requires replacing the marketplace registration; adding the same
+marketplace with another ref is refused. Preserve installed options and scope
+before deliberately changing that source; do not remove it for routine updates.
+
+```bash
+codex plugin marketplace upgrade autonom --json
+codex plugin add autonom@autonom --json
 ```
 
 Local checkout:
