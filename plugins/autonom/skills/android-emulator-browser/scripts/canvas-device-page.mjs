@@ -1,3 +1,5 @@
+import { canvasIcon as icon, canvasIconButton as iconButton } from "./canvas-ui.mjs";
+import { CanvasDropdown } from "./canvas-dropdown.mjs";
 /** The device page, rendered as self-contained HTML with inline styles and scripts. */
 import { themeControl, themeHead, themeStyles } from "./canvas-theme-page.mjs";
 import { MAX_CONTROL_MESSAGE_BYTES } from "./browser-lib.mjs";
@@ -17,46 +19,6 @@ import {
 import { DISPLAY_PRESETS, escapeHtml, scriptString } from "./canvas-runtime.mjs";
 
 // Inline SVG paths of the page's icons, on a 24 px grid; stroke and size come from the CSS.
-const PAGE_ICONS = Object.freeze({
-  mark: '<path d="M12 3 4 20h4l4-9 4 9h4z"/>',
-  settings: '<path d="m9 3-.5 2-2 .8-1.8-.5-2 3.4 1.4 1.5v2.3L2.7 14l2 3.4 2-.5 1.8 1L9 20h4l.5-2 2-1 1.8.5 2-3.4-1.4-1.5v-2.3l1.4-1.5-2-3.4-2 .5-1.8-.8L13 3z"/><circle cx="11" cy="11.5" r="3"/>',
-  phone: '<rect x="7" y="2.5" width="10" height="19" rx="2.5"/><path d="M11 18.5h2"/>',
-  phoneLandscape: '<rect x="2.5" y="7" width="19" height="10" rx="2.5"/><path d="M18.5 11v2"/>',
-  chevron: '<path d="m7 10 5 5 5-5"/>',
-  check: '<path d="m5 12.5 4.5 4.5L19 7.5"/>',
-  people: '<circle cx="9" cy="8" r="3"/><path d="M3.5 19a5.5 5.5 0 0 1 11 0"/><path d="M16 5.5a3 3 0 0 1 0 5.5M18 19a5.5 5.5 0 0 0-2.5-4.6"/>',
-  close: '<path d="m7 7 10 10M17 7 7 17"/>',
-  inspector: '<rect x="3" y="4.5" width="18" height="15" rx="3"/><path d="M15 4.5v15"/>',
-  back: '<path d="M15 5 8 12l7 7"/>',
-  home: '<circle cx="12" cy="12" r="6.5"/>',
-  recent: '<rect x="6" y="6" width="12" height="12" rx="2.5"/>',
-  rotate: '<path d="M4.5 12a7.5 7.5 0 0 1 13-5.1L20 9.5M20 4.5v5h-5"/><path d="M19.5 12a7.5 7.5 0 0 1-13 5.1L4 14.5M4 19.5v-5h5"/>',
-  volumeDown: '<path d="M4 9.5h3l4.5-4v13L7 14.5H4z"/><path d="M16 12h4"/>',
-  volumeUp: '<path d="M4 9.5h3l4.5-4v13L7 14.5H4z"/><path d="M16 12h4M18 10v4"/>',
-  power: '<path d="M12 3.5v8"/><path d="M7 6.8a7 7 0 1 0 10 0"/>',
-  up: '<path d="m6 14 6-6 6 6"/>',
-  left: '<path d="m14 6-6 6 6 6"/>',
-  right: '<path d="m10 6 6 6-6 6"/>',
-  down: '<path d="m6 10 6 6 6-6"/>',
-  delete: '<path d="M9 6h10a1.5 1.5 0 0 1 1.5 1.5v9A1.5 1.5 0 0 1 19 18H9l-5.5-6z"/><path d="m11.5 9.5 5 5M16.5 9.5l-5 5"/>',
-  wake: '<path d="M12 4v2M12 18v2M4 12h2M18 12h2M6.3 6.3l1.4 1.4M16.3 16.3l1.4 1.4M6.3 17.7l1.4-1.4M16.3 7.7l1.4-1.4"/><circle cx="12" cy="12" r="3"/>',
-  notifications: '<path d="M6 15V10a6 6 0 0 1 12 0v5l1.5 2.5h-15z"/><path d="M10 20a2 2 0 0 0 4 0"/>',
-  quickSettings: '<rect x="4" y="4" width="7" height="7" rx="2"/><rect x="13" y="4" width="7" height="7" rx="2"/><rect x="4" y="13" width="7" height="7" rx="2"/><rect x="13" y="13" width="7" height="7" rx="2"/>',
-  collapse: '<path d="m7 14 5-5 5 5"/><path d="M5 19h14"/>',
-  clipboard: '<rect x="7" y="4" width="10" height="16" rx="2"/><path d="M10 4V3h4v1"/>',
-});
-
-/** A decorative icon: the control around it carries the accessible name. */
-function icon(name, className = "") {
-  const classes = className ? ` class="${className}"` : "";
-  return `<svg${classes} viewBox="0 0 24 24" aria-hidden="true" focusable="false">${PAGE_ICONS[name]}</svg>`;
-}
-
-/** An icon-only button, named for assistive technology and in its tooltip alike (PAGE-004). */
-function iconButton(name, label, attributes, className = "") {
-  const classes = className ? ` class="${className}"` : "";
-  return `<button type="button"${classes} ${attributes} title="${label}" aria-label="${label}">${icon(name)}</button>`;
-}
 
 /**
  * The Size menu of an Android page (DISPLAY-004, PAGE-001): a popup button over a listbox of
@@ -117,53 +79,31 @@ body{margin:0;background:var(--bg);color:var(--text);font:13px/1.4 var(--font);-
   display:grid;grid-template-rows:52px minmax(0,1fr);grid-template-columns:minmax(0,1fr) 300px;grid-template-areas:"bar bar" "stage side"}
 body.no-inspector{grid-template-columns:minmax(0,1fr);grid-template-areas:"bar" "stage"}
 body.no-inspector .side{display:none}
-[hidden]{display:none!important}
-button,input{font:inherit;color:inherit}
-button{cursor:pointer;-webkit-tap-highlight-color:transparent;touch-action:manipulation;transition:transform .1s ease-out,background-color .12s ease-out}
-button:not(:disabled):active{transform:scale(.96)}
-button:disabled,input:disabled{cursor:default;opacity:.4}
-:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
-svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round;flex:none}
-.sr{position:absolute;width:1px;height:1px;margin:-1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
 
 /* toolbar */
-.bar{grid-area:bar;position:relative;z-index:4;display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:12px;padding:0 14px;border-bottom:1px solid var(--line);background:var(--surface)}
-.dot{width:7px;height:7px;border-radius:50%;background:var(--idle);flex:none}
-.dot[data-state=live]{background:var(--live);box-shadow:0 0 0 3px color-mix(in srgb,var(--live) 18%,transparent)}
-.dot[data-state=warn]{background:var(--warn)}
+.bar{grid-area:bar;position:relative;z-index:7;display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:12px;padding:0 14px;border-bottom:1px solid var(--line);background:var(--bg)}
 .center{position:relative;display:flex;align-items:center;gap:10px;min-width:0}
-.popup{display:flex;align-items:center;gap:7px;height:30px;padding:0 10px 0 9px;border-radius:var(--r-sm);border:1px solid var(--line-2);background:var(--raised);font-weight:500;white-space:nowrap;box-shadow:0 1px 1px rgba(0,0,0,.04)}
+.popup{display:flex;align-items:center;gap:7px;white-space:nowrap}
 .popup .chev{width:12px;height:12px;color:var(--text-2)}
 .popup .landscape,.popup.wide .portrait{display:none}
 .popup.wide .landscape{display:block}
-.actions{display:flex;justify-content:flex-end;align-items:center;gap:6px;min-width:0}
-.icon{width:32px;height:32px;display:grid;place-items:center;border-radius:var(--r-sm);border:0;background:transparent;color:var(--text-2)}
-.icon[aria-pressed=true]{color:var(--accent);background:color-mix(in srgb,var(--accent) 9%,transparent)}
+.actions{display:flex;justify-content:flex-end;align-items:center;gap:2px;min-width:0;padding:2px;border:1px solid var(--line);border-radius:11px;background:var(--raised)}
 
 /* General preferences stay in a compact popover below the left toolbar button. */
-.canvas-settings{position:fixed;top:calc(60px + env(safe-area-inset-top));left:8px;z-index:8;width:min(360px,calc(100vw - 16px));padding:0 12px 8px;background:var(--surface);border:1px solid var(--line-2);border-radius:12px;box-shadow:var(--shadow)}
+.canvas-settings{position:fixed;top:calc(60px + env(safe-area-inset-top));left:8px;z-index:8;width:min(360px,calc(100vw - 16px));padding:0 12px 8px;background:var(--raised);border:1px solid var(--line-2);border-radius:12px;box-shadow:var(--shadow)}
 .canvas-settings-head{display:flex;align-items:center;justify-content:space-between;min-height:40px;border-bottom:1px solid var(--line);margin-bottom:4px}
 .canvas-settings-head h2{font-size:13px;font-weight:600;margin:0}
 .canvas-setting{display:flex;align-items:center;justify-content:space-between;gap:12px;min-height:44px}
 .canvas-setting>span{flex:none}
-.canvas-setting .popup{height:32px;font-size:12px;max-width:190px}
-.canvas-setting .canvas-theme{width:120px}
+.canvas-setting+.canvas-setting{border-top:1px solid var(--line)}
+.canvas-setting .display-picker,.canvas-setting .canvas-theme-control{width:180px;max-width:60%;min-width:0}
+.canvas-setting .popup,.canvas-setting .canvas-theme{width:100%;max-width:none}
+.canvas-setting .popup #display-label{overflow:hidden;text-overflow:ellipsis}
 .canvas-settings .menu{left:auto;right:0;max-width:calc(100vw - 42px);max-height:calc(100dvh - 210px)}
 
 /* size menu: anchor to the trigger, not the full toolbar column. */
 .display-picker{position:relative;min-width:0;max-width:100%}
-.menu{position:absolute;top:calc(100% + 5px);left:0;z-index:5;width:min(288px,calc(100vw - 28px));max-height:calc(100dvh - 80px);overflow-y:auto;padding:6px;border-radius:12px;background:var(--material);
-  -webkit-backdrop-filter:blur(24px) saturate(1.6);backdrop-filter:blur(24px) saturate(1.6);border:1px solid var(--line-2);box-shadow:var(--shadow);
-  opacity:0;visibility:hidden;transform:scale(.98);transform-origin:0 0;transition:opacity .12s ease-out,transform .12s ease-out,visibility 0s linear .12s}
-.menu.open{opacity:1;visibility:visible;transform:scale(1);transition-delay:0s}
-.option{display:grid;grid-template-columns:18px minmax(0,1fr) auto;align-items:center;gap:8px;width:100%;height:34px;padding:0 10px 0 8px;border:0;border-radius:7px;background:none;text-align:left;transition:none}
-.menu .option:active{transform:none}
-/* The fill follows the keyboard (focus-visible) and the pointer (hover); a menu opened by pointer
-   or touch focuses the selected row without it, and the check mark alone shows the selection. */
-.option:focus{outline:none}
-.option:focus-visible{background:var(--accent-fill);color:var(--on-accent)}
 .option small{color:var(--text-2);font-size:12px;font-variant-numeric:tabular-nums}
-.option:focus-visible small{color:inherit}
 .check{width:14px;height:14px;stroke-width:2.2;visibility:hidden}
 .option[aria-selected=true] .check{visibility:visible}
 .menu hr{border:0;border-top:1px solid var(--line);margin:5px 6px}
@@ -180,22 +120,14 @@ svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.6;stroke
 .notice{position:absolute;top:12px;left:50%;z-index:3;transform:translateX(-50%);width:max-content;max-width:calc(100% - 32px);margin:0;padding:6px 12px;border-radius:12px;
   background:var(--material);border:1px solid var(--line);box-shadow:var(--shadow);font-size:12px;text-align:center;overflow-wrap:anywhere}
 .notice:empty{display:none}
-.dock{position:absolute;left:50%;bottom:22px;z-index:3;transform:translateX(-50%);display:flex;align-items:center;gap:2px;padding:5px;border-radius:999px;background:var(--material);
+.dock{position:absolute;left:50%;bottom:22px;z-index:3;transform:translateX(-50%);display:flex;align-items:center;gap:2px;padding:5px;border-radius:16px;background:var(--material);
   -webkit-backdrop-filter:blur(24px) saturate(1.6);backdrop-filter:blur(24px) saturate(1.6);border:1px solid var(--line);box-shadow:var(--shadow)}
-.dock button{width:40px;height:40px;display:grid;place-items:center;border:0;border-radius:999px;background:transparent;color:var(--text)}
+.dock button{width:36px;height:36px;display:grid;place-items:center;border:0;border-radius:11px;background:transparent;color:var(--text)}
 .dock .div{width:1px;height:20px;margin:0 4px;background:var(--line-2)}
 
 /* inspector */
-.side{grid-area:side;border-left:1px solid var(--line);background:var(--surface);overflow:auto;padding:2px 0 16px;scrollbar-width:thin}
+.side{grid-area:side;border-left:1px solid var(--line);overflow:auto;padding:2px 0 16px;scrollbar-width:thin}
 .inspector-head{display:none}
-.group{padding:12px 14px;margin:0;border:0;border-bottom:1px solid var(--line);border-radius:0;background:var(--surface);min-width:0}
-.group h2{margin:0 0 8px;font-size:12px;font-weight:600;color:var(--text);letter-spacing:-.01em}
-.field{display:flex;gap:6px}
-.field input{flex:1;min-width:0;height:32px;padding:0 10px;border-radius:var(--r-sm);border:1px solid var(--line-2);background:var(--bg)}
-.field input::placeholder{color:var(--text-2);opacity:1}
-.btn{height:32px;padding:0 12px;border-radius:var(--r-sm);border:1px solid var(--line-2);background:var(--raised);font-weight:500}
-.btn.primary{background:var(--accent-fill);border-color:transparent;color:var(--on-accent)}
-.btn.primary:focus-visible{outline-color:var(--text)}
 .hint{margin:8px 0 0;color:var(--text-2);font-size:12px}
 .keys{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px}
 .key{height:34px;display:flex;align-items:center;justify-content:center;gap:6px;border-radius:var(--r-sm);border:0;background:var(--fill);font-weight:500}
@@ -204,11 +136,11 @@ svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.6;stroke
 .row{display:flex;align-items:center;gap:10px;width:calc(100% + 16px);height:32px;margin:0 -8px;padding:0 8px;border:0;border-radius:var(--r-sm);background:none;text-align:left}
 .row:not(:disabled):active{transform:none;background:var(--fill-2)}
 .row svg{width:16px;height:16px;color:var(--text-2)}
-.volume-controls{display:grid;grid-template-columns:minmax(0,1fr) 32px 32px;align-items:center;gap:4px;padding:0;margin-bottom:8px;border:0;background:none}
+.volume-controls{display:grid;grid-template-columns:minmax(0,1fr) 32px 32px;align-items:center;gap:4px;padding:0 0 8px;margin-bottom:4px;border:0;border-bottom:1px solid var(--line);background:none}
 .volume-key{display:grid;place-items:center;width:32px;height:28px;padding:0;border:1px solid var(--line);border-radius:6px;background:var(--surface)}
 .volume-key svg{width:18px;height:18px}
 .device-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:4px}
-.device-tile{display:flex;align-items:center;justify-content:flex-start;gap:6px;min-width:0;min-height:32px;padding:6px;border:0;border-radius:6px;background:var(--fill);font-size:12px;text-align:left;line-height:1.3}
+.device-tile{display:flex;align-items:center;justify-content:flex-start;gap:6px;min-width:0;min-height:32px;padding:6px;border:0;border-bottom:1px solid var(--line);border-radius:0;background:none;font-size:12px;text-align:left;line-height:1.3}
 .device-tile svg{width:16px;height:16px;color:var(--text-2);flex-shrink:0}
 .device-tile:last-child{grid-column:1/-1;flex-direction:row;min-height:32px}
 .input-control summary{cursor:pointer;color:var(--text-2);font-size:12px;font-weight:600;min-height:24px;line-height:24px}
@@ -231,15 +163,7 @@ dd code{font:12px var(--mono)}
 .diag summary{width:max-content;cursor:pointer;color:var(--text-2);font-size:12px}
 .status{margin:8px 0 0;font:11.5px/1.45 var(--mono);color:var(--text-2);white-space:pre-wrap;overflow-wrap:anywhere}
 
-@media (hover:hover){
-  .option:hover{background:var(--accent-fill);color:var(--on-accent)}
-  .option:hover small{color:inherit}
-  .popup:not(:disabled):hover,.icon:hover,.btn:not(.primary):not(:disabled):hover,.row:not(:disabled):hover{background:var(--fill)}
-  .icon:hover{color:var(--text)}
-  .volume-key:not(:disabled):hover,.device-tile:not(:disabled):hover,.key:not(:disabled):hover,.dock button:not(:disabled):hover{background:var(--fill-2)}
-}
 @supports not ((backdrop-filter:blur(1px)) or (-webkit-backdrop-filter:blur(1px))){:root{--material:var(--raised)}}
-@media (forced-colors:active){.option:focus-visible{outline:2px solid CanvasText}}
 
 /* Narrow desktop window: overlay panels retain the same compact controls. */
 @media (max-width:760px){
@@ -256,13 +180,12 @@ dd code{font:12px var(--mono)}
   .surface{inset:7px;width:calc(100% - 14px);height:calc(100% - 14px);border-radius:0}
   .notice{position:fixed;top:calc(60px + env(safe-area-inset-top))}
   .dock{position:fixed;bottom:calc(14px + env(safe-area-inset-bottom));z-index:4}
-  .side{position:fixed;inset:60px 8px 8px auto;width:var(--canvas-panel-width);z-index:6;border:1px solid var(--line-2);border-radius:12px;padding:0 0 8px;overflow:auto;overscroll-behavior:contain;box-shadow:var(--sheet-shadow)}
+  .side{padding:0 0 8px;overflow:auto;overscroll-behavior:contain}
   .inspector-head{position:sticky;top:0;z-index:1;min-height:55px;display:flex;align-items:center;justify-content:space-between;padding:8px 12px 8px 16px;background:var(--surface);border-bottom:1px solid var(--line)}
   body:not(.no-inspector){overflow:hidden}
   body.no-inspector .side{display:none}
 }
 @media (max-width:360px){.dock{gap:0;padding:2px}.dock .div{display:none}}
-@media (prefers-reduced-motion:reduce){*,*::before,*::after{transition:none!important;animation:none!important}button:active{transform:none!important}}
 ${toolsStyles()}${extension("styles")}${embed ? EMBED_STYLES : ""}
 </style>
 </head>
@@ -465,19 +388,9 @@ async function chooseDisplay(preset){if(!preset)return;displayBusy=true;refocusP
 // The Size menu is a popup listbox (PAGE-004): a click or Enter opens it, the keyboard on its
 // first option (ArrowUp: the last), a pointer on the preset in effect; arrows, Home and End
 // move, Enter or a click chooses, Escape, Tab or a click elsewhere closes it unchanged.
-function openMenu(start){if(!sizePicker||sizePicker.disabled||menuOpen)return;menuOpen=true;sizeMenu.classList.add("open");sizePicker.setAttribute("aria-expanded","true");const selected=sizeOptions.findIndex(option=>option.dataset.preset===sizePicker.value),index=start==="last"?sizeOptions.length-1:start==="selected"&&selected>=0?selected:0;if(sizeOptions[index])sizeOptions[index].focus()}
-function closeMenu(refocus){if(!menuOpen)return;menuOpen=false;sizeMenu.classList.remove("open");sizePicker.setAttribute("aria-expanded","false");if(refocus)sizePicker.focus()}
-function optionOf(target){return sizeOptions.find(option=>option.contains(target))||null}
-function chooseFromMenu(preset){closeMenu(true);if(!preset||preset===view.preset)return;sizePicker.value=preset;chooseDisplay(preset)}
-function onMenuKey(event){const index=sizeOptions.indexOf(event.target),moves={ArrowDown:index+1,ArrowUp:index-1,Home:0,End:sizeOptions.length-1},next=moves[event.key];if(next!==undefined){event.preventDefault();sizeOptions[Math.min(sizeOptions.length-1,Math.max(0,next))].focus()}else if(event.key==="Escape"){event.preventDefault();closeMenu(true)}else if(event.key==="Tab")closeMenu(false)}
-if(sizePicker){
-  sizePicker.addEventListener("click",event=>{if(menuOpen)closeMenu(false);else openMenu(event.detail===0?"first":"selected")});
-  sizePicker.addEventListener("keydown",event=>{if(event.key==="ArrowDown"||event.key==="ArrowUp"){event.preventDefault();openMenu(event.key==="ArrowUp"?"last":"first")}else if(event.key==="Escape")closeMenu(true)});
-  sizeMenu.addEventListener("keydown",onMenuKey);
-  sizeMenu.addEventListener("click",event=>{const option=optionOf(event.target);if(option)chooseFromMenu(option.dataset.preset)});
-  sizeMenu.addEventListener("pointermove",event=>{const option=optionOf(event.target);if(option&&document.activeElement!==option)option.focus({preventScroll:true})});
-  document.addEventListener("pointerdown",event=>{if(menuOpen&&!sizeMenu.contains(event.target)&&!sizePicker.contains(event.target))closeMenu(false)});
-}
+const sizeDropdown=sizePicker?new (${CanvasDropdown.toString()})({trigger:sizePicker,menu:sizeMenu,items:()=>sizeOptions.map(node=>({node,value:node.dataset.preset})),value:()=>view.preset,choose:preset=>{sizePicker.value=preset;chooseDisplay(preset)},onToggle:open=>{menuOpen=open}}):null;
+function openMenu(start){if(sizeDropdown)sizeDropdown.open(start)}
+function closeMenu(refocus){if(sizeDropdown)sizeDropdown.close(refocus)}
 const settingsToggle=$("canvas-settings-toggle"),settingsPanel=$("canvas-settings");
 function setSettings(open,refocus=false){
   if(!settingsPanel)return;

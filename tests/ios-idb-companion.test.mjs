@@ -1259,22 +1259,57 @@ test("restart() replaces the companion process", async (t) => {
   assert.equal(await second.getOrientation(), "LANDSCAPE_LEFT");
 });
 
-test("start fails cleanly when the companion exits early, never gets ready, or is missing", async (t) => {
+test("start fails cleanly when the companion exits early or is missing", async (t) => {
   const crash = fakeCompanion(t, { FAKE_MODE: "crash" });
   const crashing = makeCompanion(t, crash);
   await assert.rejects(crashing.start(), /exited before it was ready \(code 3.*cannot find target/);
   assert.equal(crashing.running, false);
 
-  const silent = fakeCompanion(t, { FAKE_MODE: "silent" });
-  const hanging = makeCompanion(t, silent, { readyTimeoutMs: 300, stopTimeoutMs: 300 });
-  await assert.rejects(hanging.start(), /not ready within 300 ms/);
-  const pid = silent.events().find((e) => e.type === "spawn").pid;
-  assert.equal(alive(pid), false);
-  assert.ok(silent.events().some((e) => e.type === "term"));
-
   const missing = new IdbCompanion({ udid: UDID, binary: join(crash.dir, "no-such-companion") });
   await assert.rejects(missing.start(), (error) => error.message === IDB_INSTALL_HINT);
   assert.equal(missing.running, false);
+});
+
+test("readiness timeout terminates the process group and removes its socket directory", async (t) => {
+  // A real Node fixture may not execute its first line within 300 ms. Exercise
+  // the deadline independently of host startup speed, including a silent child.
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const child = new EventEmitter();
+  child.pid = 4_000_000;
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  const kill = t.mock.method(process, "kill", (pid, signal) => {
+    assert.equal(pid, -child.pid);
+    if (signal === "SIGTERM") child.emit("exit", null, signal);
+    return true;
+  });
+  let socketDirectory;
+  const companion = new IdbCompanion({
+    udid: UDID,
+    socketDir: tempDir(t),
+    readyTimeoutMs: 300,
+    stopTimeoutMs: 300,
+    spawn: (_binary, args) => {
+      const socketPath = args[args.indexOf("--grpc-domain-sock") + 1];
+      socketDirectory = join(socketPath, "..");
+      return child;
+    },
+  });
+  t.after(() => companion.stop());
+  const rejected = assert.rejects(companion.start(), /not ready within 300 ms/);
+  t.mock.timers.tick(299);
+  assert.equal(kill.mock.callCount(), 0, "no signal before the readiness deadline");
+  assert.ok(existsSync(socketDirectory));
+  t.mock.timers.tick(1);
+  await rejected;
+  assert.equal(companion.running, false);
+  assert.equal(existsSync(socketDirectory), false);
+  assert.deepEqual(kill.mock.calls.map((call) => call.arguments), [
+    [-child.pid, "SIGTERM"],
+    [-child.pid, "SIGKILL"], // reap any helpers remaining in the process group
+  ]);
+  await companion.stop();
+  assert.equal(kill.mock.callCount(), 2, "stop must not signal a reaped group again");
 });
 
 test("an unexpected companion exit is reported and the next start spawns a new one", async (t) => {

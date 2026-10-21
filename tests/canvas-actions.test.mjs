@@ -1,3 +1,4 @@
+import { themeStyles } from "../plugins/autonom/skills/android-emulator-browser/scripts/canvas-theme-page.mjs";
 // Unit tests of the Canvas Actions parts (contract sections 5.4 and 5.5): the action op
 // allowlists and control classes of the tools route, per-op timeouts, the capture file route
 // (headers and Range), the command log (bounds, cursors, redaction), the activity and health
@@ -854,14 +855,14 @@ describe("actions page markup and styles", () => {
   });
 
   test("styles: page tokens, dark mode, the 760 px sheet and nothing wider than 320 px", () => {
-    const styles = actionsStyles();
-    assert.match(styles, /var\(--surface\)/);
+    const styles = themeStyles() + actionsStyles();
+    assert.match(styles, /var\(--raised\)/);
     assert.match(styles, /--a-danger:var\(--danger\)/);
-    assert.match(styles, /box-shadow:var\(--tab-shadow\)/);
+    assert.match(styles, /\.act-tab\)\[aria-selected=true\].*background:var\(--fill-2\)/);
     assert.match(styles, /@media \(max-width:760px\)/);
     assert.match(styles, /\.actions \.icon\.actions-toggle\{display:grid/);
     assert.match(styles, /body\.actions-open aside\.side\{display:none\}/);
-    assert.match(styles, /overflow-x:hidden/);
+    assert.match(styles, /overflow:auto/);
     assert.match(styles, /minmax\(min\(132px,100%\),1fr\)/);
     assert.doesNotMatch(styles, /min-width:\s*[3-9]\d\dpx/);
   });

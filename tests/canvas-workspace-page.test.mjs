@@ -585,17 +585,11 @@ describe("renderWorkspacePage and markup", () => {
     assert.match(styles, /\.ws-tabs\{[^}]*overflow-x:auto/);
     assert.match(styles, /@media \(prefers-reduced-motion:reduce\)/);
     assert.match(styles, /body\{[^}]*background:var\(--bg\)/);
-    // Phone tap targets are at least 44 px high: tabs, their close button, icons, buttons and the control chip.
-    const phone = styles.slice(styles.indexOf("@media (max-width:760px){"));
-    for (const rule of [/\.ws-tab-button\{height:44px/, /\.ws-tab-close\{[^}]*height:44px/, /\.ws-icon\{width:44px;height:44px\}/,
-      /\.btn,\.btn\.small,\.tile-pop-item,\.ws-menu-item\{height:44px\}/, /\.tile-chip\{height:44px\}/]) {
-      assert.match(phone, rule);
-    }
-    // The layout buttons keep 44 px too: their more specific rule must not shrink them.
-    assert.match(phone, /\.ws-layouts \.ws-icon\{width:44px;height:44px\}/);
-    const phoneOnly = phone.slice(0, phone.indexOf("@media (prefers-reduced-motion"));
-    for (const [, size] of phoneOnly.matchAll(/[{;]height:(\d+)px/g)) assert.ok(Number(size) >= 44, "phone height " + size + "px is below 44 px");
-    assert.match(styles, /\.btn\.danger:focus-visible\{outline-color:var\(--text\)\}/);
+    // Narrow desktop windows keep the same primitive sizes as wide windows.
+    assert.match(styles, /--control-height:32px/);
+    assert.match(styles, /--control-small:28px/);
+    assert.doesNotMatch(styles, /\.ws-(?:icon|tab-button|tab-input)\{[^}]*height:44px/);
+    assert.match(styles, /:focus-visible\{outline:2px solid var\(--accent\)/);
   });
 
   test("the script is plain JavaScript: it compiles, has no backticks and never uses innerHTML", () => {

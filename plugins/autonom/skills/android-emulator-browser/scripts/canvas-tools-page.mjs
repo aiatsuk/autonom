@@ -1,3 +1,4 @@
+import { canvasIcon as svg, canvasIconData, canvasTabList, canvasTabPanel, canvasDomScript } from "./canvas-ui.mjs";
 // The Tools drawer of the Mobile Canvas page (contract section 3 of run canvas-web-controls):
 // permissions and location (App), device simulations, network capture, network mocks and the
 // live device log. Four pure functions return strings that renderPage inlines: the header
@@ -18,11 +19,6 @@ export const TOOLS_TABS = Object.freeze([
 ]);
 
 // Inline SVG paths on the page's 24 px grid; stroke and size come from the page CSS.
-const TOOLS_ICONS = Object.freeze({
-  tools: '<path d="M4 7h9M17 7h3M4 17h3M11 17h9"/><circle cx="15" cy="7" r="2"/><circle cx="9" cy="17" r="2"/>',
-  close: '<path d="m7 7 10 10M17 7 7 17"/>',
-  refresh: '<path d="M19.5 12a7.5 7.5 0 1 1-2.2-5.3L19.5 9"/><path d="M19.5 4.5v4.5H15"/>',
-});
 
 // Location presets: name, latitude, longitude (Mountain View is the emulator's default fix).
 const LOCATION_PRESETS = Object.freeze([
@@ -42,9 +38,7 @@ function platformOf(context) {
   return value === "ios" ? "ios" : "android";
 }
 
-function svg(name) {
-  return `<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">${TOOLS_ICONS[name]}</svg>`;
-}
+
 
 function methodOptions(anyLabel) {
   return `<option value="">${anyLabel}</option>` + HTTP_METHODS.map((method) => `<option value="${method}">${method}</option>`).join("");
@@ -56,17 +50,8 @@ export function toolsButton() {
     `title="Tools" aria-label="Tools">${svg("tools")}</button>`;
 }
 
-function tabList() {
-  return TOOLS_TABS.map(({ id, label }, index) =>
-    `<button type="button" role="tab" class="tools-tab" id="tools-tab-${id}" aria-controls="tools-panel-${id}" ` +
-    `aria-selected="${index === 0}" tabindex="${index === 0 ? 0 : -1}">${label}</button>`).join("");
-}
-
-function panel(id, body) {
-  const first = id === TOOLS_TABS[0].id;
-  return `<section class="tools-panel" role="tabpanel" id="tools-panel-${id}" aria-labelledby="tools-tab-${id}" tabindex="0"${first ? "" : " hidden"}>` +
-    `<div class="tools-msg" id="tools-msg-${id}" role="status" aria-live="polite" hidden></div>${body}</section>`;
-}
+function tabList() { return canvasTabList(TOOLS_TABS, "tools", "tools-tab"); }
+function panel(id, body) { return canvasTabPanel(id, body, "tools", "tools", id === TOOLS_TABS[0].id); }
 
 function appPanel(ios) {
   const presets = LOCATION_PRESETS.map(([name, latitude, longitude]) =>
@@ -76,7 +61,7 @@ function appPanel(ios) {
     : "";
   const locationActions = ios
     ? `<button type="button" class="btn" id="tools-loc-clear" data-mutate data-location-action>Clear</button>`
-    : `<button type="button" class="icon tools-icon" id="tools-loc-get" aria-label="Refresh location" title="Refresh location"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 7v5h-5M4 17v-5h5M6.1 7a7 7 0 0 1 11.5-1L20 9M4 15l2.4 3A7 7 0 0 0 17.9 17"/></svg></button>`;
+    : `<button type="button" class="icon tools-icon" id="tools-loc-get" aria-label="Refresh location" title="Refresh location">${svg("refresh")}</button>`;
   const locationHint = ios
     ? "The Simulator cannot report its location; this is the last value set here."
     : "Requested coordinates are delivered once an app subscribes to location updates. Refresh checks delivery.";
@@ -86,8 +71,7 @@ function appPanel(ios) {
       `<div class="tools-field"><input id="tools-app-id" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="${ios ? "com.example.App" : "com.example.app"}">` +
       `<button type="button" class="btn" id="tools-perms-load">Load</button></div></div>` +
       `<p class="tools-hint" id="tools-app-source" hidden>Loading the device context…</p>` +
-    `</div>` +
-    `<div class="tools-group">` +
+    `<hr class="tools-divider">` +
       `<h3>Deeplinks</h3>` +
       `<div class="tools-form-row"><label class="tools-label" for="tools-deeplink">URL</label>` +
       `<div class="tools-field"><input id="tools-deeplink" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="myapp://screen" title="${ios ? "iOS chooses the app that handles the URL." : "Opens in the selected app."} Recent links are saved for this app in this browser.">` +
@@ -109,7 +93,7 @@ function appPanel(ios) {
         `<input id="tools-lon" type="text" inputmode="decimal" autocomplete="off" aria-label="Longitude" title="Longitude" placeholder="Longitude">` +
         `<button type="button" class="btn primary" id="tools-loc-set" aria-label="Set location" data-mutate data-location-action>Set</button>` +
       `</div>` +
-      `<div class="tools-group-head"><h4>Saved</h4><button type="button" class="icon tools-icon tools-location-add" id="tools-location-add" aria-label="Add saved location" title="Add saved location" aria-controls="tools-location-form" aria-expanded="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg></button></div>` +
+      `<div class="tools-group-head"><h4>Saved</h4><button type="button" class="icon tools-icon tools-location-add" id="tools-location-add" aria-label="Add saved location" title="Add saved location" aria-controls="tools-location-form" aria-expanded="false">${svg("plus")}</button></div>` +
       `<div id="tools-location-form" hidden>` +
       `<input id="tools-location-name" aria-label="Location name" title="Location name" type="text" maxlength="80" placeholder="Location name" autocomplete="off">` +
       `<div id="tools-location-edit-coordinates" hidden>` +
@@ -292,30 +276,13 @@ export function toolsStyles() {
 :root{--t-danger:var(--danger);--t-sheet-shadow:var(--sheet-shadow)}
 body.tools-open,body.tools-open.no-inspector{grid-template-columns:minmax(0,1fr) clamp(440px,34vw,520px);grid-template-areas:"bar bar" "stage side"}
 body.tools-open aside.side{display:none}
-.tools{grid-area:side;display:flex;flex-direction:column;min-width:0;min-height:0;border-left:1px solid var(--line);background:var(--surface)}
-.tools-head{display:flex;align-items:center;gap:8px;padding:10px 10px 10px 14px;border-bottom:1px solid var(--line)}
-.tools-tabs{display:flex;flex:1;min-width:0;gap:2px;padding:3px;border-radius:10px;background:var(--fill);overflow-x:auto;scrollbar-width:none}
-.tools-tabs::-webkit-scrollbar{display:none}
-.tools-tab{flex:1 0 auto;height:32px;padding:0 10px;border:0;border-radius:7px;background:transparent;color:var(--text-2);font-weight:500;white-space:nowrap}
-.tools-tab[aria-selected=true]{background:var(--tab-selected-bg);color:var(--text);box-shadow:var(--tab-shadow)}
-.tools-tab:not([aria-selected=true]):active{transform:none;background:var(--fill-2)}
-.tools-icon{flex:none}
-.tools-body{flex:1;min-height:0;overflow:auto;overscroll-behavior:contain;background:var(--surface);scrollbar-width:thin}
-.tools-panel{padding:2px 0 16px;outline:none}
-.tools-panel:focus-visible{box-shadow:inset 0 0 0 2px var(--accent)}
-.tools-group{padding:12px 14px;margin:0;border:0;border-bottom:1px solid var(--line);border-radius:0;background:var(--surface);min-width:0}
-.tools-group h3{margin:0 0 8px;font-size:12px;font-weight:600;color:var(--text);letter-spacing:-.01em}
-.tools-label{display:block;margin:8px 0 4px;font-size:12px;color:var(--text-2)}
 .tools-group>.tools-label:first-child,.tools-pair .tools-label,.tools-filters .tools-label{margin-top:0}
-.tools input:not([type=checkbox]),.tools select,.tools textarea{display:block;width:100%;min-width:0;height:32px;padding:0 10px;border-radius:var(--r-sm);border:1px solid var(--line-2);background:var(--bg);color:var(--text);font:inherit}
-.tools select{padding-right:6px}
+.tools input:not([type=checkbox]),.tools select,.tools textarea{display:block;width:100%}
 .tools textarea{height:auto;min-height:64px;padding:8px 10px;font:12px/1.45 var(--mono);resize:vertical}
 .tools input::placeholder,.tools textarea::placeholder{color:var(--text-2);opacity:1}
 .tools-form-row{display:grid;grid-template-columns:76px minmax(0,1fr);align-items:center;gap:8px;margin-top:8px}
 .tools-form-row:first-child{margin-top:0}
 .tools-form-row .tools-label{margin:0}
-.tools-field{display:flex;gap:6px;min-width:0}
-.tools-field input{flex:1}
 .tools-pair{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin-top:10px}
 .tools-group>.tools-pair:first-of-type{margin-top:0}
 .tools-section-bar{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px}
@@ -338,9 +305,12 @@ body.tools-open aside.side{display:none}
 .tools-fingerprint-setup{width:100%;margin-top:8px}.tools-fingerprint-setup summary{cursor:pointer;color:var(--text-2);padding:8px 0}.tools-fingerprint-setup .btn{margin-top:10px}
 .tools-actions{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-top:10px}
 .tools-actions:first-child{margin-top:0}
+/* Related settings stay in a single outlined group with inset row separators. */
+.tools-divider{border:0;border-top:1px solid var(--line);margin:12px 0}
 /* Simulate is a compact preference list, not a stack of cards. */
-#tools-panel-simulate{background:var(--surface);min-height:100%}
-#tools-panel-simulate .tools-sim-setting{margin:0;padding:10px 14px;border:0;border-bottom:1px solid var(--line);border-radius:0;background:none}
+#tools-panel-simulate{margin:10px;padding:0;border:1px solid var(--line-2);border-radius:12px;background:var(--raised);overflow:hidden}
+html:root #tools-panel-simulate .tools-sim-setting:last-child{border-bottom:0}
+html:root #tools-panel-simulate .tools-sim-setting{margin:0;padding:10px 12px;border:0;border-bottom:1px solid var(--line);border-radius:0;background:none}
 .tools-sim-row{display:flex;align-items:center;justify-content:space-between;gap:12px;min-height:32px}
 .tools-sim-row h3{margin:0;flex-shrink:0;font-size:12px;font-weight:500}
 .tools-sim-controls{display:flex;align-items:center;justify-content:flex-end;gap:4px;min-width:0}
@@ -357,8 +327,6 @@ body.tools-open aside.side{display:none}
 .tools-sim-details .tools-sim-controls{justify-content:flex-start;margin-top:8px}
 .tools-fingerprint-setup>.btn{margin-top:8px}
 @media (max-width:400px){.tools-sim-row{gap:6px}.tools-sim-controls{gap:3px}.tools-sim-controls .btn{padding:0 5px;font-size:11px}.tools-sim-controls select{width:88px}.tools-sim-controls input:not([type=checkbox]){width:48px}}
-.tools .btn.small{height:28px;padding:0 10px;font-size:12px}
-.tools .btn.danger{background:var(--t-danger);border-color:transparent;color:#fff}
 .tools-hint,.tools-note,.tools-empty{margin:8px 0 0;color:var(--text-2);font-size:12px;line-height:1.5}
 .tools-empty{margin-top:4px;padding:4px 0;border:0;text-align:left}
 .tools-check{display:flex;align-items:center;gap:8px;margin-top:10px;font-size:12.5px}
@@ -367,8 +335,6 @@ body.tools-open aside.side{display:none}
 .tools-chip{height:28px;padding:0 11px;border:0;border-radius:999px;background:var(--fill);color:var(--text);font-size:12px;font-weight:500}
 .tools-readout{margin:6px 0 0;font-size:12px;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
 .tools-readout:empty{display:none}
-.tools-msg{margin:12px 16px 0;padding:9px 12px;border-radius:10px;background:var(--fill);font-size:12.5px;overflow-wrap:anywhere}
-.tools-msg[data-kind=error]{background:color-mix(in srgb,var(--t-danger) 10%,transparent);box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--t-danger) 22%,transparent)}
 .tools-msg p{margin:0}
 .tools-msg-hint{margin-top:3px!important;color:var(--text-2)}
 .tools-lock{margin:10px 14px 0;padding:8px 12px;border-radius:10px;background:color-mix(in srgb,var(--warn) 12%,transparent);font-size:12.5px}
@@ -389,13 +355,14 @@ body.tools-open aside.side{display:none}
 .tools-locations{margin-top:4px}
 .tools-location-entry{position:relative;display:flex;align-items:center;border-bottom:1px solid var(--line)}
 .tools-location-entry>.tools-location-row{flex:1;min-width:0;border-bottom:0}
-.tools-location-entry:has(>.tools-location-row[aria-pressed="true"]){background:color-mix(in srgb,var(--accent) 8%,transparent)}
+.tools-location-entry:has(>.tools-location-row[aria-pressed="true"]){background:var(--fill-2)}
 .tools-location-entry>.tools-location-row[aria-pressed="true"]{background:transparent}
 .tools-location-row[data-loc-preset]{padding-right:32px}
 .tools-location-more{flex:none;width:28px;height:28px;font-size:20px;line-height:1}
-.tools-location-menu{position:absolute;right:0;top:30px;z-index:5;min-width:128px;padding:4px;border:1px solid var(--line);border-radius:8px;background:var(--surface);box-shadow:0 6px 20px #0002}
-.tools-location-menu button{display:block;width:100%;text-align:left;border:0;background:transparent;padding:6px 10px;font-size:12px}
-.tools-location-menu button:hover{background:var(--fill)}
+.tools-location-menu{position:absolute;right:0;top:calc(100% + 4px);z-index:5;min-width:144px;padding:5px;border:1px solid var(--line-2);border-radius:14px;background:var(--raised);box-shadow:var(--shadow)}
+.tools-location-menu button{display:block;width:100%;text-align:left;border:0;background:transparent;min-height:30px;padding:5px 10px;border-radius:9px;font-size:12px}
+@media (hover:hover){.tools-location-menu button:not(:disabled):hover{background:var(--fill-2)}}
+.tools-location-menu button:focus-visible{background:var(--fill-2)}
 .tools-location-menu button:last-child{color:var(--danger)}
 #tools-location-edit-coordinates{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:6px;margin-top:6px}
 #tools-location-edit-coordinates[hidden]{display:none}
@@ -405,8 +372,8 @@ body.tools-open aside.side{display:none}
 .tools-location-row[aria-pressed="true"]::before{content:"✓"}
 .tools-location-row span{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .tools-location-row small{font-size:12px;color:var(--text-2);font-variant-numeric:tabular-nums;text-align:right;overflow-wrap:anywhere}
-.tools-location-row[aria-pressed="true"]{background:color-mix(in srgb,var(--accent) 8%,transparent);color:var(--accent)}
-.tools-location-row:not(:disabled):not([aria-pressed="true"]):hover{background:color-mix(in srgb,var(--text) 3%,transparent)}
+.tools-location-row[aria-pressed="true"]{background:var(--fill-2);color:var(--text)}
+.tools-location-row:not(:disabled):not([aria-pressed="true"]):hover{background:var(--fill-2)}
 .tools-deeplink-row{display:block;width:100%;text-align:left;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:4px}
 .tools-list{list-style:none;margin:0;padding:0}
 .tools-item{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:6px 10px;padding:9px 0;border-top:1px solid var(--line)}
@@ -421,8 +388,8 @@ body.tools-open aside.side{display:none}
 #tools-mocks .tools-mock-icon{width:28px;padding:0;font-size:18px;line-height:1}
 #tools-mocks [data-mock-action=remove]{color:var(--t-danger)}
 #tools-mocks .tools-mock-icon::before{content:"";display:block;width:14px;height:14px;margin:auto;background:currentColor;mask:var(--mock-icon) center/contain no-repeat;-webkit-mask:var(--mock-icon) center/contain no-repeat}
-#tools-mocks .tools-mock-edit{--mock-icon:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22black%22%20stroke-width%3D%221.8%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Cpath%20d%3D%22m15%205%204%204M4%2020l4-1L20%207a2.8%202.8%200%200%200-4-4L4%2015z%22%2F%3E%3C%2Fsvg%3E")}
-#tools-mocks .tools-mock-remove{--mock-icon:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22black%22%20stroke-width%3D%221.8%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Cpath%20d%3D%22M4%207h16M9%207V4h6v3M6%207l1%2013h10l1-13M10%2010v7M14%2010v7%22%2F%3E%3C%2Fsvg%3E")}
+#tools-mocks .tools-mock-edit{--mock-icon:url("${canvasIconData("edit")}")}
+#tools-mocks .tools-mock-remove{--mock-icon:url("${canvasIconData("trash")}")}
 
 .tools-badge{padding:2px 8px;border-radius:999px;background:var(--fill);color:var(--text-2);font-size:11.5px;font-weight:500;white-space:nowrap}
 .tools-badge[data-state=on]{color:var(--live)}
@@ -437,7 +404,7 @@ body.tools-open aside.side{display:none}
 #tools-panel-network:not([hidden]){display:flex;flex-direction:column;height:100%;min-height:360px;padding:0;box-sizing:border-box}
 #tools-net-body:not([hidden]){display:flex;flex-direction:column;flex:1;min-height:0}
 #tools-net-body>.tools-group{flex:none}
-#tools-net-body>.tools-requests-group{display:flex;flex-direction:column;flex:1;min-height:120px;padding-bottom:0;border-bottom:0}
+html:root #tools-net-body>.tools-requests-group{display:flex;flex-direction:column;flex:1;min-height:120px;margin-top:0;margin-bottom:0;padding-bottom:0;border-bottom:0;border-radius:12px 12px 0 0}
 .tools-requests-group>h3,.tools-requests-group>.tools-filters,.tools-requests-group>.tools-empty{flex:none}
 .tools-reqs{display:grid;align-content:start;gap:1px;flex:1;min-height:0;overflow:auto;overscroll-behavior:contain;margin:0 -8px;padding-bottom:8px;scrollbar-width:thin}
 .tools-reqs:empty{display:none}
@@ -475,23 +442,18 @@ body.tools-open aside.side{display:none}
 .tools-log-row[data-kind=warning]{color:var(--warn);font-style:italic}
 .tools-logfoot{display:flex;align-items:center;justify-content:space-between;gap:8px;min-height:28px;margin-top:6px;color:var(--text-2);font-size:12px;font-variant-numeric:tabular-nums}
 @media (hover:hover){
-  .tools-tab:not([aria-selected=true]):hover{color:var(--text)}
-  .tools-chip:not(:disabled):hover,.tools-req:hover{background:var(--fill-2)}
+  .tools-chip:not(:disabled):hover,.tools-req:not(:disabled):hover{background:var(--fill-2)}
 }
 /* Narrow windows use an overlay without increasing desktop control sizes. */
 @media (max-width:760px){
   .actions .icon.tools-toggle{display:grid}
-  .tools{position:fixed;left:auto;right:8px;bottom:8px;top:60px;z-index:6;width:var(--canvas-panel-width);border:1px solid var(--line-2);border-radius:12px;
-    box-shadow:var(--t-sheet-shadow);padding-bottom:env(safe-area-inset-bottom)}
   body.tools-open{overflow:hidden}
-  .tools-head{padding:8px 8px 8px 12px}
   .tools-filters{grid-template-columns:repeat(2,minmax(0,1fr))}
   .tools-req{grid-template-columns:48px 34px minmax(0,1fr)}
   .tools-req-meta{display:none}
   .tools-log{height:52vh}
 }
 @media (max-width:360px){.tools-pair{grid-template-columns:minmax(0,1fr)}.tools-tab{padding:0 7px}}
-@media (prefers-reduced-motion:reduce){.tools{animation:none}}
 `;
 }
 
@@ -518,8 +480,7 @@ const state={open:false,tab:"app",context:null,contextBusy:false,lockTimer:null,
   logs:{timer:null,busy:false,after:0,buffer:[],paused:false,feed:false,pkg:null,dropped:0,unseen:0,generation:0,starting:false}};
 
 function text(id,value){const node=$(id);if(node&&node.textContent!==value)node.textContent=value}
-function el(tag,className,value){const node=document.createElement(tag);if(className)node.className=className;if(value!==undefined&&value!==null)node.textContent=String(value);return node}
-function makeButton(label,className,attributes){const node=el("button",className||"btn small",label);node.setAttribute("type","button");if(attributes)for(const key of Object.keys(attributes))node.setAttribute(key,attributes[key]);return node}
+${canvasDomScript()}
 function capital(value){return value.charAt(0).toUpperCase()+value.slice(1)}
 function utf8(value){return new TextEncoder().encode(value).length}
 function hasCsrf(){return typeof csrf!=="undefined"&&csrf}
@@ -552,15 +513,14 @@ async function unknownOutcome(panel,op){const reread=rereadFor(panel,op),locatio
 async function mutate(panel,control,op,payload){if(!allowed()){syncLock();return null}message(panel);if(control){control.setAttribute("data-busy","1");control.setAttribute("aria-busy","true")}syncLock();try{return await call(op,payload)}catch(error){if(isTimeout(error))await unknownOutcome(panel,op);else showError(panel,error);return null}finally{if(control){control.removeAttribute("data-busy");control.removeAttribute("aria-busy")}syncLock()}}
 
 // Drawer and tabs (automatic activation; arrows, Home and End move between tabs).
-function selectTab(name,focus){const index=TABS.indexOf(name);if(index<0)return;if(name!=="network")closeRequest(false);state.tab=name;tabs.forEach((tab,i)=>{const on=i===index;tab.setAttribute("aria-selected",String(on));tab.setAttribute("tabindex",on?"0":"-1");panels[i].hidden=!on});if(focus)tabs[index].focus();onTabShown(name);syncActivity()}
+function selectTab(name,focus){const index=TABS.indexOf(name);if(index<0)return;if(name!=="network")closeRequest(false);state.tab=name;canvasSelectTab(tabs,panels,index,focus);onTabShown(name);syncActivity()}
 function onTabShown(name){if(!state.open)return;if(name==="network"&&!state.net.checked)refreshStatus();if(name==="mocks")loadMocks();if(name==="simulate"&&state.context)refreshBiometry();if(name==="app"){renderSavedLocations();if(state.context)refreshLocation()}}
 function setOpen(open,returnFocus){if(state.open===open)return;state.open=open;drawer.hidden=!open;document.body.classList.toggle("tools-open",open);toggle.setAttribute("aria-pressed",String(open));toggle.title=open?"Hide tools":"Show tools";if(inspectorToggle)inspectorToggle.setAttribute("aria-pressed",String(!open&&!document.body.classList.contains("no-inspector")));if(open){syncLock();state.lockTimer=setInterval(syncLock,500);loadContext();const tab=tabs[TABS.indexOf(state.tab)];if(tab)tab.focus();onTabShown(state.tab)}else{clearInterval(state.lockTimer);state.lockTimer=null;state.net.checked=false;state.net.ready=false;closeRequest(false);hideConfirms();deactivateFeed();if(returnFocus)toggle.focus()}syncActivity()}
 function syncActivity(){syncNetworkPolling();syncLogPolling()}
 toggle.addEventListener("click",()=>setOpen(!state.open,false));
 $("tools-close").addEventListener("click",()=>setOpen(false,true));
 if(inspectorToggle)inspectorToggle.addEventListener("click",()=>{if(!state.open)return;setOpen(false,false);document.body.classList.remove("no-inspector");inspectorToggle.setAttribute("aria-pressed","true");inspectorToggle.title="Hide inspector"});
-tabs.forEach((tab,i)=>tab.addEventListener("click",()=>selectTab(TABS[i],false)));
-$("tools-tablist").addEventListener("keydown",event=>{const index=TABS.indexOf(state.tab),moves={ArrowRight:index+1,ArrowLeft:index-1,Home:0,End:TABS.length-1},next=moves[event.key];if(next===undefined)return;event.preventDefault();selectTab(TABS[(next+TABS.length)%TABS.length],true)});
+bindCanvasTabs($("tools-tablist"),tabs,()=>TABS.indexOf(state.tab),(index,focus)=>selectTab(TABS[index],focus));
 drawer.addEventListener("keydown",event=>{if(event.key!=="Escape")return;event.preventDefault();if(!$("tools-req-detail").hidden){event.stopPropagation();closeRequest(true);return}if(hideConfirms())return;setOpen(false,true)});
 
 // Context: fetched when the drawer first opens; it fills the app id and narrows the controls.
@@ -611,7 +571,8 @@ function savedLocations(){if(state.savedLocations!==null)return state.savedLocat
 let locationEditing=null,locationMenu=null;
 function closeLocationMenu(focus=false){if(!locationMenu)return;const {menu,button}=locationMenu;menu.hidden=true;button.setAttribute("aria-expanded","false");locationMenu=null;if(focus)button.focus()}
 document.body.addEventListener("click",event=>{if(locationMenu&&!locationMenu.entry.contains(event.target))closeLocationMenu()});
-$("tools-locations-custom").addEventListener("keydown",event=>{if(event.key==="Escape"&&locationMenu){event.preventDefault();event.stopPropagation();closeLocationMenu(true)}});
+$("tools-locations-custom").addEventListener("keydown",event=>{if(!locationMenu)return;if(event.key==="Escape"){event.preventDefault();event.stopPropagation();closeLocationMenu(true);return}if(event.key==="Tab"){closeLocationMenu(true);return}const items=[...locationMenu.menu.querySelectorAll("button")],index=items.indexOf(document.activeElement),moves={ArrowDown:Math.min(index+1,items.length-1),ArrowUp:Math.max(index-1,0),Home:0,End:items.length-1};if(moves[event.key]!==undefined){event.preventDefault();items[moves[event.key]].focus()}});
+$("tools-locations-custom").addEventListener("focusout",event=>{if(locationMenu&&event.relatedTarget&&!locationMenu.entry.contains(event.relatedTarget))closeLocationMenu()});
 function persistLocations(items){state.savedLocations=items;try{localStorage.setItem(LOCATIONS_KEY,JSON.stringify(items));return true}catch{return false}}
 function locationFeedback(value,stored){text("tools-location-feedback",value+(stored?"":" For this page only: browser storage is unavailable."))}
 function editLocation(point){closeLocationMenu();locationEditing=point;$("tools-location-name").value=point.name;$("tools-location-edit-lat").value=String(point.latitude);$("tools-location-edit-lon").value=String(point.longitude);$("tools-location-edit-coordinates").hidden=false;showLocationForm(true);text("tools-location-save-status","")}
@@ -619,9 +580,9 @@ function deleteLocation(point){closeLocationMenu();const index=savedLocations().
 function renderSavedLocations(){closeLocationMenu();const list=$("tools-locations-custom");list.replaceChildren();for(const point of savedLocations()){
  const entry=el("div","tools-location-entry"),button=makeButton("","tools-location-row",{"data-mutate":"","data-location-action":"","data-location-key":"saved:"+point.name,"data-lat":String(point.latitude),"data-lon":String(point.longitude),"aria-label":"Set location "+point.name});
  button.appendChild(el("span",null,point.name));button.appendChild(el("small",null,formatCoordinate(point.latitude)+", "+formatCoordinate(point.longitude)));button.addEventListener("click",()=>{$("tools-lat").value=String(point.latitude);$("tools-lon").value=String(point.longitude);if(!locationEditing)$("tools-location-name").value=point.name;setLocation(button)});entry.appendChild(button);
- const more=makeButton("⋯","icon tools-location-more",{"aria-label":"Options for "+point.name,"aria-expanded":"false"}),menu=el("div","tools-location-menu");menu.hidden=true;
- const edit=makeButton("Edit","btn",{"data-location-edit":""}),remove=makeButton("Delete","btn",{"data-location-delete":""});menu.appendChild(edit);menu.appendChild(remove);entry.appendChild(more);entry.appendChild(menu);list.appendChild(entry);
- more.addEventListener("click",()=>{const open=menu.hidden;closeLocationMenu();if(open){menu.hidden=false;more.setAttribute("aria-expanded","true");locationMenu={menu,button:more,entry};edit.focus()}});edit.addEventListener("click",()=>editLocation(point));remove.addEventListener("click",()=>deleteLocation(point));
+ const more=makeButton("⋯","icon tools-location-more",{"aria-label":"Options for "+point.name,"aria-expanded":"false","aria-haspopup":"menu"}),menu=el("div","tools-location-menu");menu.setAttribute("role","menu");menu.setAttribute("aria-label","Options for "+point.name);menu.hidden=true;
+ const edit=makeButton("Edit","btn",{"data-location-edit":"","role":"menuitem","tabindex":"-1"}),remove=makeButton("Delete","btn",{"data-location-delete":"","role":"menuitem","tabindex":"-1"});menu.appendChild(edit);menu.appendChild(remove);entry.appendChild(more);entry.appendChild(menu);list.appendChild(entry);
+ more.addEventListener("click",()=>{const open=menu.hidden;closeLocationMenu();if(open){menu.hidden=false;more.setAttribute("aria-expanded","true");locationMenu={menu,button:more,entry};edit.focus()}});more.addEventListener("keydown",event=>{if(event.key!=="ArrowDown"&&event.key!=="ArrowUp")return;event.preventDefault();event.stopPropagation();if(menu.hidden)more.click();(event.key==="ArrowUp"?remove:edit).focus()});edit.addEventListener("click",()=>editLocation(point));remove.addEventListener("click",()=>deleteLocation(point));
  }const buttons=[...drawer.querySelectorAll("[data-lat]")],point=state.lastLocation;
  const matches=buttons.filter(button=>point&&Math.abs(Number(button.getAttribute("data-lat"))-point.latitude)<0.000001&&Math.abs(Number(button.getAttribute("data-lon"))-point.longitude)<0.000001);
  // Prefer the successfully applied row; on initial read-back prefer the first saved match.

@@ -3349,6 +3349,7 @@ function runPage(html, { hash = "" } = {}) {
     history: { replaceState() {} },
     document,
     fetch: () => new Promise(() => {}),
+    addEventListener: (type, listener) => document.addEventListener(type, listener),
     URLSearchParams, TextEncoder, performance, setTimeout, clearTimeout,
     setInterval: (...args) => { const timer = setInterval(...args); timer.unref(); return timer; }, clearInterval,
     record: (text) => sent.push(JSON.parse(text)),
@@ -5742,36 +5743,28 @@ test("page: the page loads nothing from outside, has light and dark tokens with 
   assert.match(dark[1], /--accent-fill:#0068d6/);
   assert.match(light, /--font:-apple-system,BlinkMacSystemFont/);
   assert.match(html, /:focus-visible\{outline:2px solid var\(--accent\)/);
-  const phone = html.match(/@media \(max-width:760px\)\{([\s\S]*?)\n\}/);
+  const phone = [...html.matchAll(/@media \(max-width:760px\)\{([\s\S]*?)\n\}/g)].find(block => block[1].includes(".dock{"));
   assert.ok(phone, "no phone layout");
+  assert.match(html, /:is\(\.side,\.tools,\.act\)\{[^}]*width:var\(--canvas-panel-width\)/);
   for (const rule of [".dock{position:fixed;bottom:calc(14px + env(safe-area-inset-bottom))",
-    "body{display:block;", "body.no-inspector .side{display:none}", ".side{position:fixed;", ".actions #inspector-toggle{display:grid}", "width:var(--canvas-panel-width)"]) {
+    "body{display:block;", "body.no-inspector .side{display:none}", ".side{padding:0 0 8px;", ".actions #inspector-toggle{display:grid}"]) {
     assert.ok(phone[1].includes(rule), rule);
   }
   assert.doesNotMatch(phone[1], /height:44px|font-size:16px/, "narrow windows retain desktop density");
-  const reduced = html.match(/@media \(prefers-reduced-motion:reduce\)\{(.*)\}/);
+  const reduced = [...html.matchAll(/@media \(prefers-reduced-motion:reduce\)\{(.*)\}/g)].find(block => block[1].includes("transition:none!important"));
   assert.ok(reduced, "no reduced motion rule");
   for (const rule of ["transition:none!important", "animation:none!important", "button:active{transform:none!important}"]) {
     assert.ok(reduced[1].includes(rule), rule);
   }
 });
 
-test("page: the size menu fills an option only for keyboard focus (:focus-visible) and pointer hover, so a menu opened by pointer or touch shows the selection by its check mark alone", async (t) => {
+test("page: all dropdowns use shared focus, pointer, animation and reduced-motion styles", async (t) => {
   const { html } = await loadPage(t);
-  const css = html.match(/<style>([\s\S]*)<\/style>/)[1];
-  assert.match(css, /\n\.option:focus\{outline:none\}\n/);
-  assert.match(css, /\n\.option:focus-visible\{background:var\(--accent-fill\);color:var\(--on-accent\)\}\n/);
-  assert.match(css, /\n\.option:focus-visible small\{color:inherit\}\n/);
-  // No rule for plain :focus, which the selected row has as soon as a pointer opens the menu, fills it.
-  assert.doesNotMatch(css, /\.option:focus(?!-visible)[^{]*\{[^}]*(background|color)/);
-  const hover = css.match(/@media \(hover:hover\)\{([\s\S]*?)\n\}/);
-  assert.ok(hover, "no hover block");
-  assert.ok(hover[1].includes(".option:hover{background:var(--accent-fill);color:var(--on-accent)}"));
-  assert.ok(hover[1].includes(".option:hover small{color:inherit}"));
-  // Hover fills only where a pointer hovers; elsewhere no option rule fills on hover.
-  assert.doesNotMatch(css.replace(hover[0], ""), /\.option:hover/);
-  assert.match(css, /\n\.option\[aria-selected=true\] \.check\{visibility:visible\}\n/);
-  assert.match(css, /@media \(forced-colors:active\)\{\.option:focus-visible\{outline:2px solid CanvasText\}\}/);
+  assert.match(html, /html:root \.canvas-dropdown-option:focus-visible\{background:var\(--fill-2\)\}/);
+  assert.match(html, /@media \(hover:hover\)\{html:root \.canvas-dropdown-option:not\(:disabled\):hover/);
+  assert.match(html, /html:root \.canvas-dropdown-menu\.open\{opacity:1;visibility:visible;transform:none/);
+  assert.match(html, /prefers-reduced-motion:reduce/);
+  assert.doesNotMatch(html, /function onMenuKey|function chooseFromMenu/);
 });
 
 test("page: the Size button shows a landscape device for Tablet and Pixel Fold, a portrait one for the phone presets, and the orientation of the size in effect for the device default or another size", async (t) => {
@@ -5827,7 +5820,7 @@ test("page: text, secondary text, links and filled-button text reach 4.5:1 again
   // [text, background, what a translucent background lies on]: the menu, notice and pill
   // material may lie over a black or a white device screen as well as the page.
   const pairs = [["text", "bg"], ["text", "surface"], ["text", "raised"], ["text", "fill-2", "surface"],
-    ["text-2", "bg"], ["text-2", "surface"], ["text-2", "fill", "surface"], ["on-accent", "accent-fill"],
+    ["text-2", "bg"], ["text-2", "surface"], ["text-2", "fill", "surface"], ["on-accent", "accent-fill"], ["action-text", "action-fill"],
     ["accent", "surface"], ...["bg", "#000", "#fff"].flatMap((base) => [["text", "material", base], ["text-2", "material", base]])];
   for (const [theme, values] of Object.entries(themes)) {
     for (const [foreground, background, base] of pairs) {

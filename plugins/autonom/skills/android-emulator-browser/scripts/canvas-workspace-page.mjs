@@ -1,3 +1,4 @@
+import { CANVAS_ICONS, canvasIcon, canvasDomScript } from "./canvas-ui.mjs";
 import { themeControl, themeHead, themeStyles } from "./canvas-theme-page.mjs";
 
 // The workspace page of the Mobile Canvas (contract section 4 of run canvas-multi-device): the
@@ -33,24 +34,8 @@ const LAYOUT_LABELS = Object.freeze({
 
 // Inline SVG on a 24 px grid; stroke and size come from the page CSS. The script clones these
 // from the hidden #ws-icons set, so it never builds markup from strings.
-const ICONS = Object.freeze({
-  mark: '<path d="M7 4h10a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2Z"/><path d="M10 17h4"/>',
-  plus: '<path d="M12 5v14M5 12h14"/>',
-  more: '<circle cx="6" cy="12" r="1.2"/><circle cx="12" cy="12" r="1.2"/><circle cx="18" cy="12" r="1.2"/>',
-  close: '<path d="m7 7 10 10M17 7 7 17"/>',
-  chevron: '<path d="m7 10 5 5 5-5"/>',
-  tools: '<path d="M4 7h9M17 7h3M4 17h3M11 17h9"/><circle cx="15" cy="7" r="2"/><circle cx="9" cy="17" r="2"/>',
-  actions: '<rect x="4" y="6" width="16" height="13" rx="2.5"/><path d="M9 6l1.2-2h3.6L15 6"/><circle cx="12" cy="12.5" r="3"/>',
-  detach: '<path d="M14 5h4a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2h-4"/><path d="M10 8l-4 4 4 4M6 12h9"/>',
-  layout1: '<rect x="4" y="5" width="16" height="14" rx="2"/>',
-  layout2: '<rect x="4" y="5" width="16" height="14" rx="2"/><path d="M12 5v14"/>',
-  layout3: '<rect x="4" y="5" width="16" height="14" rx="2"/><path d="M9.3 5v14M14.7 5v14"/>',
-  layout4: '<rect x="4" y="5" width="16" height="14" rx="2"/><path d="M12 5v14M4 12h16"/>',
-});
 
-function svg(name, attributes = "") {
-  return `<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"${attributes}>${ICONS[name]}</svg>`;
-}
+function svg(name, attributes = "") { return canvasIcon(name, "", attributes); }
 
 function escapeHtml(value) {
   return String(value).replace(/[&<>"']/g, (character) => ({
@@ -114,25 +99,7 @@ export function workspaceStyles() {
 html,body{height:100%}
 body{margin:0;background:var(--bg);color:var(--text);font:13px/1.4 var(--font);-webkit-font-smoothing:antialiased;
   display:grid;grid-template-rows:auto minmax(0,1fr);overflow:hidden}
-[hidden]{display:none!important}
-button,input{font:inherit;color:inherit}
-button{cursor:pointer;-webkit-tap-highlight-color:transparent;touch-action:manipulation;transition:transform .1s ease-out,background-color .12s ease-out}
-button:not(:disabled):active{transform:scale(.96)}
-button:disabled{cursor:default;opacity:.4}
 a{color:inherit}
-:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
-svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round;flex:none}
-.sr{position:absolute;width:1px;height:1px;margin:-1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
-.ws-icon{width:32px;height:32px;display:grid;place-items:center;border-radius:var(--r-sm);border:0;background:transparent;color:var(--text-2);padding:0}
-.ws-icon[aria-pressed=true]{color:var(--accent)}
-.btn{height:30px;padding:0 12px;border-radius:var(--r-sm);border:1px solid var(--line-2);background:var(--raised);font-weight:500;white-space:nowrap}
-.btn.primary{background:var(--accent-fill);border-color:transparent;color:var(--on-accent)}
-.btn.primary:focus-visible{outline-color:var(--text)}
-.btn.small{height:28px;padding:0 10px;font-size:12px}
-.dot{width:7px;height:7px;border-radius:50%;background:var(--idle);flex:none}
-.dot[data-state=live]{background:var(--live);box-shadow:0 0 0 3px color-mix(in srgb,var(--live) 18%,transparent)}
-.dot[data-state=warn]{background:var(--warn)}
-.dot[data-state=error]{background:var(--danger)}
 
 /* header: brand, tab bar, layout, tab menu */
 .ws-bar{position:relative;z-index:4;display:grid;grid-template-columns:auto minmax(0,1fr) auto auto;grid-template-areas:"brand tabs layout menu";
@@ -157,12 +124,12 @@ svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.6;stroke
 .ws-layouts .ws-icon{width:30px;height:26px;border-radius:6px}
 .ws-layouts .ws-icon[aria-pressed=true]{background:var(--raised);color:var(--text);box-shadow:0 1px 2px rgba(0,0,0,.12)}
 .ws-menu-wrap{grid-area:menu;position:relative;display:flex;align-items:center;gap:6px}
-.ws-menu{position:absolute;top:calc(100% + 6px);right:0;z-index:6;min-width:200px;padding:6px;border-radius:var(--r-md);background:var(--material);
+.ws-menu{position:absolute;top:calc(100% + 6px);right:0;z-index:6;min-width:200px;padding:6px;border-radius:var(--r-md);background:var(--raised);
   -webkit-backdrop-filter:blur(24px) saturate(1.6);backdrop-filter:blur(24px) saturate(1.6);border:1px solid var(--line-2);box-shadow:var(--shadow)}
-.ws-menu-item{display:flex;align-items:center;width:100%;height:32px;padding:0 10px;border:0;border-radius:7px;background:none;text-align:left;text-decoration:none;font-weight:400;transition:none}
+.ws-menu-item{display:flex;align-items:center;width:100%;height:32px;padding:0 10px;border:0;border-radius:7px;background:none;text-align:left;text-decoration:none;font-weight:400}
 .ws-menu-item:active{transform:none}
 .ws-menu-item:focus{outline:none}
-.ws-menu-item:focus-visible{background:var(--accent-fill);color:var(--on-accent)}
+.ws-menu-item:focus-visible{background:var(--fill-2);color:var(--text)}
 .ws-menu-item.danger{color:var(--danger)}
 .ws-menu hr{border:0;border-top:1px solid var(--line);margin:5px 6px}
 
@@ -184,9 +151,9 @@ svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.6;stroke
 .tile-control{position:relative;flex:none}
 .tile-chip{display:flex;align-items:center;gap:4px;height:26px;padding:0 6px 0 10px;border:0;border-radius:999px;background:var(--fill);color:var(--text-2);font-weight:500;font-size:12px;white-space:nowrap}
 .tile-chip svg{width:12px;height:12px}
-.tile-pop{position:absolute;top:calc(100% + 4px);right:0;z-index:3;display:grid;gap:2px;min-width:150px;padding:5px;border-radius:10px;background:var(--material);
+.tile-pop{position:absolute;top:calc(100% + 4px);right:0;z-index:3;display:grid;gap:2px;min-width:150px;padding:5px;border-radius:10px;background:var(--raised);
   -webkit-backdrop-filter:blur(24px) saturate(1.6);backdrop-filter:blur(24px) saturate(1.6);border:1px solid var(--line-2);box-shadow:var(--shadow)}
-.tile-pop-item{height:30px;padding:0 10px;border:0;border-radius:6px;background:none;text-align:left;white-space:nowrap;transition:none}
+.tile-pop-item{height:30px;padding:0 10px;border:0;border-radius:6px;background:none;text-align:left;white-space:nowrap}
 .tile-pop-item:active{transform:none}
 .tile-alert{display:flex;align-items:center;gap:10px;padding:6px 8px 6px 12px;border-bottom:1px solid var(--line);background:color-mix(in srgb,var(--warn) 10%,var(--surface));font-size:12px;flex:none}
 .tile-alert[data-kind=error]{background:color-mix(in srgb,var(--danger) 10%,var(--surface))}
@@ -210,51 +177,39 @@ svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.6;stroke
 .absent-actions{display:flex;justify-content:center;align-items:center;gap:8px;flex-wrap:wrap}
 .absent-status{color:var(--text-2);font-size:12px;font-variant-numeric:tabular-nums}
 .ws-notice{position:fixed;top:64px;left:50%;z-index:8;transform:translateX(-50%);width:max-content;max-width:calc(100% - 32px);margin:0;padding:7px 14px;border-radius:var(--r-md);
-  background:var(--material);border:1px solid var(--line-2);box-shadow:var(--shadow);font-size:12.5px;text-align:center;overflow-wrap:anywhere}
+  background:var(--raised);border:1px solid var(--line-2);box-shadow:var(--shadow);font-size:12.5px;text-align:center;overflow-wrap:anywhere}
 .ws-notice[data-kind=error]{border-color:color-mix(in srgb,var(--danger) 45%,transparent)}
-.ws-confirm{position:fixed;top:64px;left:50%;z-index:9;transform:translateX(-50%);width:min(360px,calc(100% - 32px));padding:16px;border-radius:14px;background:var(--material);
+.ws-confirm{position:fixed;top:64px;left:50%;z-index:9;transform:translateX(-50%);width:min(360px,calc(100% - 32px));padding:16px;border-radius:14px;background:var(--raised);
   -webkit-backdrop-filter:blur(24px) saturate(1.6);backdrop-filter:blur(24px) saturate(1.6);border:1px solid var(--line-2);box-shadow:var(--shadow)}
 .ws-confirm-title{margin:0;font-weight:600;font-size:14px}
 .ws-confirm-text{margin:6px 0 14px;color:var(--text-2)}
 .ws-confirm-actions{display:flex;justify-content:flex-end;gap:8px}
-.btn.danger{background:var(--danger);border-color:transparent;color:#fff}
-.btn.danger:focus-visible{outline-color:var(--text)}
 @container (max-width:460px){.tile-stats{display:none}}
 @container (max-width:360px){.badge{display:none}.tile-chip{padding:0 6px}}
 
 @media (hover:hover){
-  .ws-icon:not(:disabled):hover{background:var(--fill);color:var(--text)}
   .ws-layouts .ws-icon:not(:disabled):hover{background:var(--fill-2)}
   .ws-tab-button:not([aria-selected=true]):hover{background:var(--fill);color:var(--text)}
   .ws-tab-close:hover{background:var(--fill-2);color:var(--text)}
-  .btn:not(.primary):not(.danger):not(:disabled):hover,.tile-chip:hover,.tile-pop-item:hover{background:var(--fill-2)}
-  .ws-menu-item:hover{background:var(--accent-fill);color:var(--on-accent)}
-  .ws-menu-item.danger:hover{background:var(--danger);color:#fff}
 }
 @supports not ((backdrop-filter:blur(1px)) or (-webkit-backdrop-filter:blur(1px))){:root{--material:var(--raised)}}
 
-/* phone: the tab bar scrolls inside itself, tiles stack, 16 px gutters, 44 px targets */
+/* Narrow desktop: stack tiles while preserving shared control density. */
 @media (max-width:760px){
   body{display:block;height:auto;min-height:100%;overflow-x:hidden;overflow-y:auto}
   .ws-bar{position:sticky;top:0;grid-template-columns:auto minmax(0,1fr) auto;grid-template-areas:"brand tabs menu" "layout layout layout";
     gap:8px 10px;padding:env(safe-area-inset-top) 16px 8px;min-height:calc(52px + env(safe-area-inset-top))}
   .ws-brand b,.ws-name{display:none}
   .ws-layouts{justify-self:end}
-  .ws-layouts .ws-icon{width:44px;height:44px}
-  .ws-tab-button{height:44px;padding-right:46px}
-  .ws-tab-close{opacity:1;width:44px;height:44px;margin-top:-22px;right:0}
-  .ws-icon{width:44px;height:44px}
+  .ws-tab-close{opacity:1}
   .ws-stage{display:block;padding:16px;overflow:visible}
   .ws-lead{margin-bottom:16px}
   .ws-grid,.ws-grid[data-layout]{display:flex;flex-direction:column;gap:16px}
   .tile{height:max(460px,calc(100svh - 150px))}
   .tile-head{height:48px}
-  .btn,.btn.small,.tile-pop-item,.ws-menu-item{height:44px}
-  .tile-chip{height:44px}
-  .ws-tab-input{font-size:16px;height:44px}
   .ws-notice,.ws-confirm{top:calc(108px + env(safe-area-inset-top))}
 }
-@media (prefers-reduced-motion:reduce){*,*::before,*::after{transition:none!important;animation:none!important}button:active{transform:none!important}}`;
+`;
 }
 
 /** The page body: header, stage, notice, confirmation and the hidden icon set. No device data. */
@@ -262,7 +217,7 @@ export function workspaceMarkup(model) {
   const { workspace, limits } = normalizeModel(model);
   const layouts = Object.keys(LAYOUTS).filter((value) => Number(value) <= limits.max_tiles).map((value) =>
     `<button type="button" class="ws-icon" data-layout-choice="${value}" aria-pressed="false" aria-label="${LAYOUT_LABELS[value]}" title="${LAYOUT_LABELS[value]}">${svg(`layout${value}`)}</button>`).join("");
-  const icons = Object.keys(ICONS).map((name) => svg(name, ` data-icon="${name}"`)).join("");
+  const icons = Object.keys(CANVAS_ICONS).map((name) => svg(name, ` data-icon="${name}"`)).join("");
   return `<header class="ws-bar">
   <div class="ws-brand"><span class="ws-mark" aria-hidden="true">${svg("mark")}</span><b>Autonom</b><span class="ws-name" id="ws-name" title="Workspace">${escapeHtml(workspace)}</span></div>
   <div class="ws-tabbar">
@@ -330,8 +285,8 @@ const busy=new Set();
 const closingTo=new Map();
 
 // --- small helpers -----------------------------------------------------------------------
-function el(tag,className,text){const node=document.createElement(tag);if(className)node.className=className;if(text!==undefined&&text!==null)node.textContent=String(text);return node}
-function button(className,text,label){const node=el("button",className,text);node.setAttribute("type","button");if(label){node.setAttribute("aria-label",label);node.title=label}return node}
+${canvasDomScript()}
+function button(className,text,label){return makeButton(text,className,label?{"aria-label":label,title:label}:undefined)}
 function icon(name){const source=ui.icons.querySelector('[data-icon="'+name+'"]');const copy=source.cloneNode(true);copy.removeAttribute("data-icon");return copy}
 function iconButton(name,label){const node=button("ws-icon",null,label);node.appendChild(icon(name));return node}
 function setText(node,value){const text=String(value);if(node&&node.textContent!==text)node.textContent=text}
@@ -477,14 +432,12 @@ function renderTabs(){
   if(tab){setAttr(ui.stage,"aria-labelledby","ws-tab-"+tab.id);ui.open.setAttribute("href",tabPath(tab.id));document.title=tab.name+" · "+MODEL.title}
 }
 function onTabKey(event,id){
-  const tabs=tabsList(),index=tabs.findIndex(tab=>tab.id===id);let next=null;
-  if(event.key==="ArrowLeft")next=tabs[(index-1+tabs.length)%tabs.length];
-  else if(event.key==="ArrowRight")next=tabs[(index+1)%tabs.length];
-  else if(event.key==="Home")next=tabs[0];
-  else if(event.key==="End")next=tabs[tabs.length-1];
-  else if(event.key==="F2"){event.preventDefault();startRename(id);return}
-  if(!next||hotkey(event))return;
-  event.preventDefault();selectTab(next.id,true);const entry=tabEls.get(next.id);if(entry)entry.tab.focus();
+  if(event.key==="F2"){event.preventDefault();startRename(id);return}
+  if(hotkey(event))return;
+  const tabs=tabsList(),index=tabs.findIndex(tab=>tab.id===id);
+  const next=canvasTabKey(event,tabs,index);
+  if(next===null)return;
+  selectTab(tabs[next].id,true);const entry=tabEls.get(tabs[next].id);if(entry)entry.tab.focus();
 }
 function selectTab(id,push){
   if(!findTab(id)){
