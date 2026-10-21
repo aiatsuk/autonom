@@ -126,8 +126,9 @@ body.no-inspector .side{display:none}
 .dock .div{width:1px;height:20px;margin:0 4px;background:var(--line-2)}
 
 /* inspector */
-.side{grid-area:side;border-left:1px solid var(--line);overflow:auto;padding:2px 0 16px;scrollbar-width:thin}
-.inspector-head{display:none}
+.side{grid-area:side;display:flex;flex-direction:column;min-height:0;border-left:1px solid var(--line);overflow:hidden}
+.inspector-head{justify-content:space-between;background:var(--bg)}
+.inspector-head strong{font-size:13px;font-weight:600}
 .hint{margin:8px 0 0;color:var(--text-2);font-size:12px}
 .keys{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px}
 .key{height:34px;display:flex;align-items:center;justify-content:center;gap:6px;border-radius:var(--r-sm);border:0;background:var(--fill);font-weight:500}
@@ -136,28 +137,21 @@ body.no-inspector .side{display:none}
 .row{display:flex;align-items:center;gap:10px;width:calc(100% + 16px);height:32px;margin:0 -8px;padding:0 8px;border:0;border-radius:var(--r-sm);background:none;text-align:left}
 .row:not(:disabled):active{transform:none;background:var(--fill-2)}
 .row svg{width:16px;height:16px;color:var(--text-2)}
-.volume-controls{display:grid;grid-template-columns:minmax(0,1fr) 32px 32px;align-items:center;gap:4px;padding:0 0 8px;margin-bottom:4px;border:0;border-bottom:1px solid var(--line);background:none}
-.volume-key{display:grid;place-items:center;width:32px;height:28px;padding:0;border:1px solid var(--line);border-radius:6px;background:var(--surface)}
+.volume-controls{display:grid;grid-template-columns:minmax(0,1fr) 32px 32px;align-items:center;gap:4px;padding:0 0 10px;margin-bottom:10px;border:0;border-bottom:1px solid var(--line);background:none}
+.volume-key{display:grid;place-items:center;width:32px;height:28px;padding:0;border:1px solid var(--line-2);border-radius:var(--r-sm);background:var(--raised)}
 .volume-key svg{width:18px;height:18px}
-.device-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:4px}
-.device-tile{display:flex;align-items:center;justify-content:flex-start;gap:6px;min-width:0;min-height:32px;padding:6px;border:0;border-bottom:1px solid var(--line);border-radius:0;background:none;font-size:12px;text-align:left;line-height:1.3}
+.device-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px}
+.device-tile{display:flex;align-items:center;justify-content:flex-start;gap:6px;min-width:0;min-height:32px;padding:7px 8px;border:0;border-radius:var(--r-sm);background:var(--fill);font-size:12px;text-align:left;line-height:1.3}
 .device-tile svg{width:16px;height:16px;color:var(--text-2);flex-shrink:0}
-.device-tile:last-child{grid-column:1/-1;flex-direction:row;min-height:32px}
-.input-control summary{cursor:pointer;color:var(--text-2);font-size:12px;font-weight:600;min-height:24px;line-height:24px}
-.input-control .owner{margin-top:12px}
-.volume-controls + .input-control{margin-top:14px}
-.owner{display:flex;align-items:flex-start;gap:8px;margin:0;color:var(--text-2)}
-.owner .dot{margin-top:5px}
-.owner strong{color:var(--text);font-weight:600}
-.pair{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-top:10px}
 dl{margin:0;display:grid;grid-template-columns:auto minmax(0,1fr);gap:5px 10px}
 dt{color:var(--text-2)}
 dd{margin:0;text-align:right;font-variant-numeric:tabular-nums;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 dd code{font:12px var(--mono)}
 .linkbtn{margin-top:12px;padding:0;border:0;background:none;color:var(--accent);font-weight:500}
-.inspector-stream{position:relative}
-.inspector-stream h2{min-height:24px;padding-right:32px;display:flex;align-items:center}
-.inspector-reconnect{position:absolute;top:8px;right:10px}
+.inspector-group-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px}
+.inspector-group-head h2{margin:0}
+.inspector-stream dl{row-gap:8px}
+.inspector-stream>.diag{margin-top:10px;padding-top:10px;border-top:1px solid var(--line)}
 #stream-details>dl{margin-top:8px}
 .diag{margin-top:8px}
 .diag summary{width:max-content;cursor:pointer;color:var(--text-2);font-size:12px}
@@ -180,8 +174,6 @@ dd code{font:12px var(--mono)}
   .surface{inset:7px;width:calc(100% - 14px);height:calc(100% - 14px);border-radius:0}
   .notice{position:fixed;top:calc(60px + env(safe-area-inset-top))}
   .dock{position:fixed;bottom:calc(14px + env(safe-area-inset-bottom));z-index:4}
-  .side{padding:0 0 8px;overflow:auto;overscroll-behavior:contain}
-  .inspector-head{position:sticky;top:0;z-index:1;min-height:55px;display:flex;align-items:center;justify-content:space-between;padding:8px 12px 8px 16px;background:var(--surface);border-bottom:1px solid var(--line)}
   body:not(.no-inspector){overflow:hidden}
   body.no-inspector .side{display:none}
 }
@@ -221,9 +213,11 @@ ${!embed || android ? `<section class="canvas-settings" id="canvas-settings" rol
 </main>
 <aside class="side" id="inspector" aria-label="Inspector">
   <div class="inspector-head"><strong>Inspector</strong>${iconButton("close", "Close inspector", 'id="inspector-close"', "icon")}</div>
+  <div class="inspector-body">
   <section class="group">
     <div class="field"><input id="text" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Text to type" aria-label="Text to type"><button type="button" id="sendText" class="btn primary">Send</button></div>
     <p class="hint" id="text-hint" hidden>Any language. Longer text is pasted through the device clipboard.</p>
+    ${!android && !embed ? volumeControls : ""}
   </section>
   <section class="group"${androidOnly}>
     <h2>Device</h2>
@@ -234,19 +228,12 @@ ${!embed || android ? `<section class="canvas-settings" id="canvas-settings" rol
       <button type="button" class="device-tile" data-system="quick-settings" data-scrcpy>${icon("quickSettings")}Quick settings</button>
       <button type="button" class="device-tile" data-system="collapse" data-scrcpy>${icon("collapse")}Collapse panels</button>
       <button type="button" class="device-tile" id="clipboard" data-scrcpy aria-label="Copy device clipboard" title="Copy device clipboard">${icon("clipboard")}Copy clipboard</button>
+      <button type="button" class="device-tile" id="clipboard-paste" data-scrcpy aria-label="Paste to emulator" title="Paste computer clipboard into the active field">${icon("paste")}Paste to emulator</button>
     </div>
   </section>
-  <section class="group">
-    ${!android && !embed ? volumeControls : ""}
-    <details class="input-control">
-    <summary>Input control</summary>
-    <p class="owner"><i class="dot" id="owner-dot" aria-hidden="true"></i><span><strong id="owner-name">Shared</strong> <span id="owner-detail">· people and agents can send input</span></span></p>
-    <div class="pair"><button type="button" class="btn" id="control-take" disabled>Take control</button><button type="button" class="btn" id="control-pause" disabled>Pause input</button></div>
-    </details>
-  </section>
   <section class="group inspector-stream">
-    <h2>Stream</h2>
-    ${iconButton("rotate", "Reconnect stream", 'id="refresh"', "icon inspector-reconnect")}
+    <div class="inspector-group-head"><h2>Stream</h2>
+    ${iconButton("refresh", "Reconnect stream", 'id="refresh"', "icon")}</div>
     <dl>
       <dt>Frames</dt><dd id="stream-frames">—</dd>
       <dt>Video</dt><dd id="stream-video">—</dd>
@@ -261,6 +248,7 @@ ${!embed || android ? `<section class="canvas-settings" id="canvas-settings" rol
       <details class="diag"><summary>Diagnostics</summary><pre class="status" id="status">Connecting…</pre></details>
     </details>
   </section>
+  </div>
 </aside>
 ${toolsMarkup({ platform: context.options.platform })}${extension("markup", extensionContext)}
 <script>
@@ -290,17 +278,16 @@ ${keyInputFor.toString()}
 const $=id=>document.getElementById(id);
 const image=$("screen"),video=$("video"),device=$("device"),statusEl=$("status"),textInput=$("text"),sizePicker=$("display-preset");
 const sizeMenu=$("display-menu"),sizeLabel=$("display-label"),defaultSize=$("display-default-size"),sendButton=$("sendText");
-const ui={inspector:$("inspector-toggle"),caption:$("caption"),notice:$("notice"),hint:$("text-hint"),ownerDot:$("owner-dot"),ownerName:$("owner-name"),ownerDetail:$("owner-detail"),take:$("control-take"),pause:$("control-pause"),transport:$("stream-transport"),codec:$("stream-codec"),frames:$("stream-frames"),videoSize:$("stream-video"),display:$("stream-display"),clients:$("stream-clients")};
+const ui={inspector:$("inspector-toggle"),caption:$("caption"),notice:$("notice"),hint:$("text-hint"),transport:$("stream-transport"),codec:$("stream-codec"),frames:$("stream-frames"),videoSize:$("stream-video"),display:$("stream-display"),clients:$("stream-clients")};
 const PRESET_LABELS=${JSON.stringify(Object.fromEntries(DISPLAY_PRESETS.map(({ id, label }) => [id, label])))};
 const WIDE_PRESETS=${JSON.stringify(DISPLAY_PRESETS.filter(({ width, height }) => width > height).map(({ id }) => id))};
-const OWNERS={shared:["Shared","people and agents can send input"],human:["People","agents cannot send input"],agent:["Agent","this page cannot send input"]};
 const NOTICE_MS=8000;
 const sizeOptions=[...document.querySelectorAll("[data-preset]")];
 // Every device input control; the clipboard read, handoff and Reconnect act for anyone.
-const inputControls=[...document.querySelectorAll("[data-system],[data-code],[data-key]"),textInput,sendButton];
+const inputControls=[...document.querySelectorAll("[data-system],[data-code],[data-key]"),textInput,sendButton,$("clipboard-paste")];
 const ctx=video.getContext("2d");
 let csrf=null,logicalDisplay=null,reconnectTimer=null,pointer=null,displayBusy=false,refocusPicker=false,menuOpen=false,noteAt=0,frameRatio=0,rotation=0;
-const view={transport:null,mode:null,reason:"",status:null,owner:"shared",paused:false,session:"idle",clients:null,width:0,height:0,note:"",rtt:null,preset:null,density:null,clipboard:false,rotateBusy:false,lease:null,sessionStopped:false};
+const view={transport:null,mode:null,reason:"",status:null,owner:"shared",paused:false,session:"idle",clients:null,width:0,height:0,note:"",rtt:null,preset:null,density:null,clipboard:false,pasteBusy:false,rotateBusy:false,lease:null,sessionStopped:false};
 const stats={decoder:"none",codec:null,framesDecoded:0,framesRendered:0,framesDropped:0,packets:0,bytes:0,errors:0,renderTimes:[],lastFrameAt:0};
 let videoSocket=null,controlSocket=null,decoder=null,config=null,waitingKey=true,drawScheduled=false,configuring=false,pendingChunks=[];
 const MAX_QUEUED_FRAMES=2,frameQueue=[];
@@ -370,9 +357,7 @@ function applyState(message){view.owner=message.owner;view.paused=message.paused
 function applyHint(){setText(ui.hint,iosFast()?(view.clipboard?"Plain ASCII up to 300 bytes is typed into the Simulator; longer or other text is set on its clipboard: touch and hold, then Paste.":"Typed into the Simulator, up to 300 bytes at a time."):scrcpyActive()?"Any language. Longer text is pasted through the device clipboard.":"Letters, digits and punctuation of plain ASCII on this transport.");textInput.title=ui.hint.textContent}
 function applyTransport(){textInput.placeholder=fastActive()?"Text to type":"ASCII text to type";applyHint();for(const button of document.querySelectorAll("[data-scrcpy]"))button.hidden=!scrcpyActive();for(const button of document.querySelectorAll("[data-idb]"))button.hidden=!iosFast();if(fastActive()){connectControl();if(view.mode!=="webcodecs"&&!fallbackKept){if(typeof VideoDecoder==="function"&&typeof EncodedVideoChunk==="function")startWebCodecs();else startMultipart("VideoDecoder is not available in this browser",true)}}else{closeControlSocket();if(view.mode!=="multipart")startMultipart("")}}
 // Size picker (Android): the preset in effect is selected; a choice goes the way other input goes.
-function leaseMine(){return Boolean(view.lease&&view.lease.mine)}
 function foreignHeld(){const lease=view.lease;return Boolean(lease&&lease.state==="held"&&!lease.mine)}
-function idleText(seconds){const value=Number(seconds)||0;return value%60===0?value/60+" min":value+" s"}
 function canSendInput(){return !view.paused&&(view.owner==="shared"||view.owner==="human")&&!foreignHeld()&&!view.sessionStopped}
 // Called every render too: nothing already shown is set again, so an open menu stays as it is.
 // A button disabled while focused drops the focus to the page; when a change chosen from it
@@ -406,12 +391,7 @@ if(settingsToggle){
   for(const id of ["tools-toggle","actions-toggle","inspector-toggle"]){const toggle=$(id);if(toggle)toggle.addEventListener("click",()=>setSettings(false))}
 }
 // Controls that cannot act look and are disabled (PAGE-004); handoff goes the way input goes.
-function leaseOwner(){const lease=view.lease,owner=OWNERS[view.owner]||[String(view.owner),"holds control"];if(view.sessionStopped)return["Session stopped","this device's Autonom session has stopped"];if(!lease)return owner;if(foreignHeld()){const holder=lease.holder||{};return[(holder.kind==="agent"?"Agent":"Someone else")+" '"+(holder.label||"")+"' has control","Take over to use the screen"]}if(leaseMine()){const from=lease.took_over_from,idle="eleased after "+idleText(lease.idle_s)+" idle";return["You have control",from?"took over from "+(from.kind==="agent"?"agent":"someone")+" '"+(from.label||from.id||"")+"' · r"+idle:"R"+idle]}if(lease.ended_by==="idle")return[owner[0],"your control ended after "+idleText(lease.idle_s)+" idle"];if(lease.ended_by==="lost")return[owner[0],"control moved to "+(lease.holder&&lease.holder.label?lease.holder.label:"another holder")];return owner}
-function takeLabel(){if(foreignHeld())return"Take over";if(leaseMine())return view.lease.took_over_from?"Hand back":"Release";return view.owner==="human"?"Release":"Take control"}
-function syncControls(){const ready=Boolean(view.status)&&canSendInput(),owner=leaseOwner();for(const control of inputControls){const disabled=!ready||(control.dataset.system==="rotate"&&view.rotateBusy);if(control.disabled!==disabled)control.disabled=disabled}setText(ui.ownerName,owner[0]);setText(ui.ownerDetail,"· "+(view.paused?"input is paused":owner[1]));setState(ui.ownerDot,ready?"live":"warn");setText(ui.take,takeLabel());setText(ui.pause,view.paused?"Resume input":"Pause input");for(const button of [ui.take,ui.pause])if(button.disabled===Boolean(view.status))button.disabled=!view.status}
-function setControl(mode){if(fastActive()&&sendControl({t:"control",mode}))return;post("/control",{mode}).then(result=>{view.owner=result.control_owner;view.paused=result.input_paused;applyLease(result);syncPicker()}).catch(error=>note(error.message))}
-ui.take.addEventListener("click",()=>setControl(foreignHeld()?"takeover":(leaseMine()||view.owner==="human")?"release":"takeover"));
-ui.pause.addEventListener("click",()=>setControl(view.paused?"resume":"pause"));
+function syncControls(){const ready=Boolean(view.status)&&canSendInput();for(const control of inputControls){const disabled=!ready||(control.id==="clipboard-paste"&&(view.pasteBusy||!scrcpyActive()))||(control.dataset.system==="rotate"&&view.rotateBusy);if(control.disabled!==disabled)control.disabled=disabled}}
 function setInspector(open,returnFocus=false){document.body.classList.toggle("no-inspector",!open);ui.inspector.setAttribute("aria-pressed",String(open));ui.inspector.title=open?"Hide inspector":"Show inspector";if(returnFocus)ui.inspector.focus()}
 ui.inspector.addEventListener("click",()=>setInspector(document.body.classList.contains("no-inspector")));
 $("inspector-close").addEventListener("click",()=>setInspector(false,true));
@@ -460,6 +440,20 @@ function iosTypeable(text){return /^[\\n\\x20-\\x7e]*$/.test(text)}
 function fitsControl(message,what){const size=utf8Length(JSON.stringify(message));if(size<=MAX_CONTROL_BYTES)return true;note(what+" is too large: "+size+" bytes as a control message after JSON escaping, at most "+MAX_CONTROL_BYTES+"; nothing was sent");return false}
 for(const button of document.querySelectorAll("[data-system],[data-code],[data-key]")){button.addEventListener("click",()=>{if(fastActive()){if(button.dataset.system){const sent=sendControl({t:"system",op:button.dataset.system});if(button.dataset.system==="rotate"&&sent){view.rotateBusy=true;syncControls();note("Rotating device…")}}else if(button.dataset.code){const code=Number(button.dataset.code);sendControl({t:"key",a:"down",code,meta:0,repeat:0});sendControl({t:"key",a:"up",code,meta:0,repeat:0})}return}if(button.dataset.key)post("/key",{key:button.dataset.key}).catch(error=>note(error.message))})}
 $("clipboard").onclick=()=>sendControl({t:"clipboard-get"});
+async function pasteFromClipboard(){
+  if(view.pasteBusy||!view.status||!canSendInput()||!scrcpyActive())return;
+  if(!navigator.clipboard||!navigator.clipboard.readText){note("Clipboard access is unavailable. Paste into Text to type, then Send.");return}
+  view.pasteBusy=true;syncControls();
+  try{
+    const text=await navigator.clipboard.readText();
+    if(!view.status||!canSendInput()||!scrcpyActive()){note("Input is unavailable; nothing was pasted.");return}
+    if(!text){note("The computer clipboard has no text.");return}
+    const message={t:"paste",text};if(!fitsControl(message,"clipboard text"))return;
+    note(sendControl(message)?"Paste sent to emulator.":"Device disconnected; nothing was pasted.");
+  }catch{note("Could not read the computer clipboard. Allow clipboard access, or paste into Text to type and Send.")}
+  finally{view.pasteBusy=false;syncControls()}
+}
+$("clipboard-paste").onclick=pasteFromClipboard;
 $("refresh").onclick=()=>{if(view.mode==="webcodecs"){closeVideoSocket();waitingKey=true;videoRetry=500;connectVideo()}else restart()};
 async function sendText(){const value=textInput.value;if(!value)return;if(iosFast()&&!view.clipboard){if(utf8Length(value)>300){note("the iOS Simulator takes at most 300 bytes of text at a time; nothing was sent");return}if(sendControl({t:"text",text:value}))textInput.value="";return}if(fastActive()){const message=utf8Length(value)<=300&&(!iosFast()||iosTypeable(value))?{t:"text",text:value}:{t:"paste",text:value};if(!fitsControl(message,"the text"))return;const ok=sendControl(message);if(ok)textInput.value="";return}try{await post("/text",{text:value});textInput.value=""}catch(error){note(error.message)}}
 $("sendText").onclick=sendText;textInput.addEventListener("keydown",event=>{if(event.key==="Enter")sendText()});
