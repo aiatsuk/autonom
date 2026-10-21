@@ -287,7 +287,7 @@ because iOS waits for a possible double press.
 
 ## The page
 
-The toolbar holds the Android Size menu, Auto/Light/Dark appearance, Tools,
+The toolbar holds Canvas settings on the left, with Tools,
 Device actions and Inspector. The device frame follows the video's aspect ratio
 without masking its corners. The caption reports rendered fps (including zero
 when no new frames arrive), round-trip time and transport.
@@ -301,6 +301,8 @@ names and transport/lease availability checks.
 At 760 px and narrower, Tools, Device actions and Inspector use the same bounded
 right-hand overlay. Fields and buttons keep desktop density; the Inspector no
 longer moves below the device. Escape and each panel's close button dismiss it.
+Canvas settings groups Theme (Auto/Light/Dark) and Android Device dimensions in compact rows. It closes with Escape, its close button, or a click outside.
+
 Theme choice is browser-local and synchronized across workspace tiles; Auto tracks
 the system. The element ids `video`, `screen`, `status`, `text`, `clipboard`,
 `device` and `refresh`, and `window.autonomCanvas`, remain stable for scripts.

@@ -19,6 +19,7 @@ import { DISPLAY_PRESETS, escapeHtml, scriptString } from "./canvas-runtime.mjs"
 // Inline SVG paths of the page's icons, on a 24 px grid; stroke and size come from the CSS.
 const PAGE_ICONS = Object.freeze({
   mark: '<path d="M12 3 4 20h4l4-9 4 9h4z"/>',
+  settings: '<path d="m9 3-.5 2-2 .8-1.8-.5-2 3.4 1.4 1.5v2.3L2.7 14l2 3.4 2-.5 1.8 1L9 20h4l.5-2 2-1 1.8.5 2-3.4-1.4-1.5v-2.3l1.4-1.5-2-3.4-2 .5-1.8-.8L13 3z"/><circle cx="11" cy="11.5" r="3"/>',
   phone: '<rect x="7" y="2.5" width="10" height="19" rx="2.5"/><path d="M11 18.5h2"/>',
   phoneLandscape: '<rect x="2.5" y="7" width="19" height="10" rx="2.5"/><path d="M18.5 11v2"/>',
   chevron: '<path d="m7 10 5 5 5-5"/>',
@@ -139,6 +140,16 @@ svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.6;stroke
 .icon{width:32px;height:32px;display:grid;place-items:center;border-radius:var(--r-sm);border:0;background:transparent;color:var(--text-2)}
 .icon[aria-pressed=true]{color:var(--accent);background:color-mix(in srgb,var(--accent) 9%,transparent)}
 
+/* General preferences stay in a compact popover below the left toolbar button. */
+.canvas-settings{position:fixed;top:calc(60px + env(safe-area-inset-top));left:8px;z-index:8;width:min(360px,calc(100vw - 16px));padding:0 12px 8px;background:var(--surface);border:1px solid var(--line-2);border-radius:12px;box-shadow:var(--shadow)}
+.canvas-settings-head{display:flex;align-items:center;justify-content:space-between;min-height:40px;border-bottom:1px solid var(--line);margin-bottom:4px}
+.canvas-settings-head h2{font-size:13px;font-weight:600;margin:0}
+.canvas-setting{display:flex;align-items:center;justify-content:space-between;gap:12px;min-height:44px}
+.canvas-setting>span{flex:none}
+.canvas-setting .popup{height:32px;font-size:12px;max-width:190px}
+.canvas-setting .canvas-theme{width:120px}
+.canvas-settings .menu{left:auto;right:0;max-width:calc(100vw - 42px);max-height:calc(100dvh - 210px)}
+
 /* size menu: anchor to the trigger, not the full toolbar column. */
 .display-picker{position:relative;min-width:0;max-width:100%}
 .menu{position:absolute;top:calc(100% + 5px);left:0;z-index:5;width:min(288px,calc(100vw - 28px));max-height:calc(100dvh - 80px);overflow-y:auto;padding:6px;border-radius:12px;background:var(--material);
@@ -258,13 +269,18 @@ ${toolsStyles()}${extension("styles")}${embed ? EMBED_STYLES : ""}
 <body>
 <header class="bar">
   <div class="center">
-    ${displayPicker(context)}
+    ${!embed || android ? iconButton("settings", "Canvas settings", 'id="canvas-settings-toggle" aria-expanded="false" aria-controls="canvas-settings"', "icon") : ""}
   </div>
   <div class="actions">
-    ${embed ? "" : themeControl()}${toolsButton()}${extension("button")}
+    ${toolsButton()}${extension("button")}
     ${iconButton("inspector", "Inspector", 'id="inspector-toggle" aria-pressed="true" aria-controls="inspector"', "icon")}
   </div>
 </header>
+${!embed || android ? `<section class="canvas-settings" id="canvas-settings" role="dialog" aria-labelledby="canvas-settings-title" hidden>
+  <div class="canvas-settings-head"><h2 id="canvas-settings-title">Canvas settings</h2>${iconButton("close", "Close Canvas settings", 'id="canvas-settings-close"', "icon")}</div>
+  ${embed ? "" : `<div class="canvas-setting"><span>Theme</span>${themeControl()}</div>`}
+  ${android ? `<div class="canvas-setting"><span>Device dimensions</span>${displayPicker(context)}</div>` : ""}
+</section>` : ""}
 <main class="stage">
   <p class="notice" id="notice" role="status" aria-live="polite"></p>
   <div class="device" id="device"><canvas id="video" class="surface" tabindex="0" aria-label="${platform} device screen" hidden></canvas><img id="screen" class="surface" tabindex="0" alt="${platform} device screen"></div>
@@ -461,6 +477,20 @@ if(sizePicker){
   sizeMenu.addEventListener("click",event=>{const option=optionOf(event.target);if(option)chooseFromMenu(option.dataset.preset)});
   sizeMenu.addEventListener("pointermove",event=>{const option=optionOf(event.target);if(option&&document.activeElement!==option)option.focus({preventScroll:true})});
   document.addEventListener("pointerdown",event=>{if(menuOpen&&!sizeMenu.contains(event.target)&&!sizePicker.contains(event.target))closeMenu(false)});
+}
+const settingsToggle=$("canvas-settings-toggle"),settingsPanel=$("canvas-settings");
+function setSettings(open,refocus=false){
+  if(!settingsPanel)return;
+  if(open){if(document.body.classList.contains("tools-open"))$("tools-toggle").click();if(document.body.classList.contains("actions-open"))$("actions-toggle").click();if(inspectorNarrow&&inspectorNarrow.matches)setInspector(false)}
+  settingsPanel.hidden=!open;settingsToggle.setAttribute("aria-expanded",String(open));settingsToggle.setAttribute("aria-pressed",String(open));
+  if(open)($("canvas-theme")||$("canvas-settings-close")).focus();else{closeMenu(false);if(refocus)settingsToggle.focus()}
+}
+if(settingsToggle){
+  settingsToggle.addEventListener("click",()=>setSettings(settingsPanel.hidden));
+  $("canvas-settings-close").addEventListener("click",()=>setSettings(false,true));
+  document.addEventListener("pointerdown",event=>{if(!settingsPanel.hidden&&!settingsPanel.contains(event.target)&&!settingsToggle.contains(event.target))setSettings(false)});
+  document.addEventListener("keydown",event=>{if(event.key==="Escape"&&!event.defaultPrevented&&!settingsPanel.hidden){event.preventDefault();if(menuOpen)closeMenu(true);else setSettings(false,true)}});
+  for(const id of ["tools-toggle","actions-toggle","inspector-toggle"]){const toggle=$(id);if(toggle)toggle.addEventListener("click",()=>setSettings(false))}
 }
 // Controls that cannot act look and are disabled (PAGE-004); handoff goes the way input goes.
 function leaseOwner(){const lease=view.lease,owner=OWNERS[view.owner]||[String(view.owner),"holds control"];if(view.sessionStopped)return["Session stopped","this device's Autonom session has stopped"];if(!lease)return owner;if(foreignHeld()){const holder=lease.holder||{};return[(holder.kind==="agent"?"Agent":"Someone else")+" '"+(holder.label||"")+"' has control","Take over to use the screen"]}if(leaseMine()){const from=lease.took_over_from,idle="eleased after "+idleText(lease.idle_s)+" idle";return["You have control",from?"took over from "+(from.kind==="agent"?"agent":"someone")+" '"+(from.label||from.id||"")+"' · r"+idle:"R"+idle]}if(lease.ended_by==="idle")return[owner[0],"your control ended after "+idleText(lease.idle_s)+" idle"];if(lease.ended_by==="lost")return[owner[0],"control moved to "+(lease.holder&&lease.holder.label?lease.holder.label:"another holder")];return owner}

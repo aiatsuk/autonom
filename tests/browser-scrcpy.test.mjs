@@ -5699,11 +5699,12 @@ test("page: the Android page keeps its element ids, window.autonomCanvas and rem
   }
   assert.deepEqual(buttons.filter((button) => "data-scrcpy" in button.attributes).map((button) => button.name),
     ["Rotate", "Volume down", "Volume up", "Notifications", "Quick settings", "Collapse panels", "Copy device clipboard"]);
-  // The compact toolbar keeps display/theme/panel controls, with diagnostics in Settings.
+  // The compact toolbar keeps settings/panel buttons; preferences live in Settings.
   const toolbar = html.match(/<header class="bar">([\s\S]*?)<\/header>/)[1];
   assert.doesNotMatch(toolbar, /class="brand"|live-dot|target-detail|display-dims|control-chip|class="chip"/);
-  assert.match(toolbar, /id="display-preset"/);
-  assert.match(toolbar, /id="canvas-theme"/);
+  assert.match(toolbar, /id="canvas-settings-toggle"/);
+  assert.doesNotMatch(toolbar, /id="display-preset"|id="canvas-theme"/);
+  assert.match(html, /id="canvas-settings" role="dialog"[^>]*hidden>/);
   assert.match(html, /id="inspector-toggle" aria-pressed="true" aria-controls="inspector" title="Inspector" aria-label="Inspector"/);
   assert.match(html, /<div role="listbox" id="display-list" aria-label="Display size">/);
   assert.equal(presetOptions(html).length, 5);
@@ -5843,6 +5844,16 @@ test("page: the size menu is a keyboard listbox: Enter opens it on the first pre
   const { sent, run, document } = await loadPage(t);
   const button = document.getElementById("display-preset");
   const menu = document.getElementById("display-menu");
+  const settings = document.getElementById("canvas-settings");
+  const settingsToggle = document.getElementById("canvas-settings-toggle");
+  assert.equal(settings.hidden, true);
+  settingsToggle.click();
+  assert.equal(settings.hidden, false);
+  assert.equal(document.activeElement.id, "canvas-theme");
+  document.dispatch("keydown", {key: "Escape"});
+  assert.equal(settings.hidden, true);
+  assert.equal(document.activeElement, settingsToggle);
+  settingsToggle.click();
   // A focused button is clicked by Enter and Space unless a handler took the key.
   const press = (key) => {
     const target = document.activeElement;
