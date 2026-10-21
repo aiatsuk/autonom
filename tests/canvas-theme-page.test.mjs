@@ -18,7 +18,7 @@ function boot({dark=false,saved=null,blocked=false,loading=false,hasMedia=true}=
   }};
   if(hasMedia)context.matchMedia=()=>media;
   runInNewContext(themeScript(),context);
-  return {attributes,control,written,ready:()=>documentEvents.get('DOMContentLoaded')?.(),
+  return {attributes,control,written,key: event=>documentEvents.get("keydown")?.(event),ready:()=>documentEvents.get('DOMContentLoaded')?.(),
     os(value){media.matches=value;mediaChange?.()},
     choose(value){control.value=value;controlEvents.get('change')()},
     storage(key,newValue){events.get('storage')({key,newValue})}};

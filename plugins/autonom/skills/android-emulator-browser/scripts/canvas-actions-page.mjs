@@ -1,3 +1,4 @@
+import { canvasIcon as svg, canvasTabList, canvasTabPanel, canvasDomScript } from "./canvas-ui.mjs";
 // The Actions drawer of the Mobile Canvas device page (contract section 5.5): screenshot,
 // screen recording, install from the Canvas's --install-root folders, launch, open link, app
 // language and the captures gallery (Capture tab), and the command log with tool health
@@ -20,26 +21,19 @@ export const ACTIONS_TABS = Object.freeze([
 ]);
 
 // Inline SVG paths on the page's 24 px grid; stroke and size come from the page CSS.
-const ACTIONS_ICONS = Object.freeze({
-  actions: '<path d="M4 8.5A2.5 2.5 0 0 1 6.5 6h1.8l1.4-2h4.6l1.4 2h1.8A2.5 2.5 0 0 1 20 8.5v8a2.5 2.5 0 0 1-2.5 2.5h-11A2.5 2.5 0 0 1 4 16.5z"/><circle cx="12" cy="12.5" r="3.5"/>',
-  close: '<path d="m7 7 10 10M17 7 7 17"/>',
-  refresh: '<path d="M19.5 12a7.5 7.5 0 1 1-2.2-5.3L19.5 9"/><path d="M19.5 4.5v4.5H15"/>',
-});
 
 function platformOf(context) {
   const value = context && (context.platform || (context.options && context.options.platform));
   return value === "ios" ? "ios" : "android";
 }
 
-function svg(name) {
-  return `<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">${ACTIONS_ICONS[name]}</svg>`;
-}
+
 
 /** Quick capture controls share the drawer's operations and state. */
 export function actionsDock() {
   return `<button type="button" id="dock-shot" data-mutate aria-label="Take screenshot" title="Take screenshot">${svg("actions")}</button>` +
     `<button type="button" id="dock-record" data-mutate aria-pressed="false" aria-label="Start recording" title="Start recording" disabled>` +
-    `<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><g class="record-start"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="4" fill="currentColor" stroke="none"/></g><rect class="record-stop" x="6" y="6" width="12" height="12" rx="2"/></svg></button>`;
+    `${svg("record")}</button>`;
 }
 
 export function actionsButton() {
@@ -47,17 +41,8 @@ export function actionsButton() {
     `title="Device actions" aria-label="Device actions">${svg("actions")}</button>`;
 }
 
-function tabList() {
-  return ACTIONS_TABS.map(({ id, label }, index) =>
-    `<button type="button" role="tab" class="act-tab" id="actions-tab-${id}" aria-controls="actions-panel-${id}" ` +
-    `aria-selected="${index === 0}" tabindex="${index === 0 ? 0 : -1}">${label}</button>`).join("");
-}
-
-function panel(id, body) {
-  const first = id === ACTIONS_TABS[0].id;
-  return `<section class="act-panel" role="tabpanel" id="actions-panel-${id}" aria-labelledby="actions-tab-${id}" tabindex="0"${first ? "" : " hidden"}>` +
-    `<div class="act-msg" id="actions-msg-${id}" role="status" aria-live="polite" hidden></div>${body}</section>`;
-}
+function tabList() { return canvasTabList(ACTIONS_TABS, "actions", "act-tab"); }
+function panel(id, body) { return canvasTabPanel(id, body, "actions", "act", id === ACTIONS_TABS[0].id); }
 
 function capturePanel(ios) {
   const installPlaceholder = ios ? "/path/to/build/Runner.app" : "/path/to/build/app-debug.apk";
@@ -65,7 +50,7 @@ function capturePanel(ios) {
     ? ""
     : `<label class="act-check"><input id="actions-downgrade" type="checkbox"> Allow downgrade</label>`;
   return panel("capture",
-    `<div class="act-group act-capture-summary">` +
+    `<div class="act-group act-capture-summary"><h3>Capture</h3>` +
       `<div class="act-row">` +
         `<button type="button" class="btn primary" id="actions-shot" title="Save a screenshot on this computer" data-mutate>Screenshot</button>` +
         `<button type="button" class="btn" id="actions-record" title="Record video on this computer, up to 3 minutes" data-mutate aria-pressed="false">Record</button>` +
@@ -160,33 +145,19 @@ export function actionsStyles() {
 :root{--a-danger:var(--danger);--a-ok:var(--success);--a-sheet-shadow:var(--sheet-shadow)}
 body.actions-open,body.actions-open.no-inspector{grid-template-columns:minmax(0,1fr) clamp(400px,32vw,500px);grid-template-areas:"bar bar" "stage side"}
 body.actions-open aside.side{display:none}
-.act{grid-area:side;display:flex;flex-direction:column;min-width:0;min-height:0;border-left:1px solid var(--line);background:var(--surface)}
 .act[hidden]{display:none}
-.act-head{display:flex;align-items:center;gap:8px;padding:10px 10px 10px 14px;border-bottom:1px solid var(--line)}
-.act-tabs{display:flex;flex:1;min-width:0;gap:2px;padding:3px;border-radius:10px;background:var(--fill)}
-.act-tab{flex:1 0 auto;height:32px;padding:0 10px;border:0;border-radius:7px;background:transparent;color:var(--text-2);font-weight:500;white-space:nowrap}
-.act-tab[aria-selected=true]{background:var(--tab-selected-bg);color:var(--text);box-shadow:var(--tab-shadow)}
-.act-icon{flex:none}
 .act-lock{margin:0;padding:8px 14px;border-bottom:1px solid var(--line);background:var(--fill);color:var(--text-2);font-size:12px}
-.act-body{flex:1;min-height:0;overflow-x:hidden;overflow-y:auto;overscroll-behavior:contain;background:var(--surface);scrollbar-width:thin}
-.act-panel{padding:0 0 28px;outline:none;min-width:0}
-.act-panel:focus-visible{box-shadow:inset 0 0 0 2px var(--accent)}
-.act-group{padding:12px 14px;margin:0;border:0;border-bottom:1px solid var(--line);border-radius:0;background:var(--surface);min-width:0}
-.act-group h3{margin:0 0 8px;font-size:12px;font-weight:600;color:var(--text);letter-spacing:-.01em}
-.act-capture-summary{display:flex;align-items:center}
+.act-capture-summary{display:flex;align-items:center;justify-content:space-between;gap:12px}
 .act-capture-summary h3{margin:0}
-.act-capture-summary .act-row{margin:0;gap:6px;width:100%;flex-wrap:nowrap}
-.act-capture-summary .act-row>.btn{flex:1}
+.act-capture-summary .act-row{margin:0;gap:6px;flex-wrap:nowrap;justify-content:flex-end}
+.act-capture-summary .act-row>.btn{flex:none}
 .act-time:empty{display:none}
 .act-link-field{margin-top:8px}
 .act-capture-summary .act-note{grid-column:1/-1;margin:0}
 .act-group-head{display:flex;align-items:center;gap:8px;margin-bottom:6px}
 .act-group-head h3{flex:1;margin:0}
-.act-label{display:block;margin:8px 0 4px;font-size:12px;color:var(--text-2)}
 .act-group>h3+.act-label{margin-top:0}
-.act input[type=text]{display:block;width:100%;min-width:0;height:32px;padding:0 10px;border-radius:var(--r-sm);border:1px solid var(--line-2);background:var(--bg);color:var(--text);font:inherit}
-.act-field{display:flex;gap:8px;min-width:0}
-.act-field input{flex:1}
+.act input[type=text]{display:block;width:100%}
 .act-row{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-top:8px;min-width:0}
 .act-group>h3+.act-row{margin-top:0}
 .act-check{display:inline-flex;align-items:center;gap:6px;color:var(--text-2);font-size:13px}
@@ -194,8 +165,6 @@ body.actions-open aside.side{display:none}
 .act-note,.act-hint,.act-empty{margin:8px 0 0;color:var(--text-2);font-size:12px;line-height:1.4;overflow-wrap:anywhere}
 .act-path{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px}
 .act-notice{margin:8px 0 0;padding:8px 10px;border-radius:var(--r-sm);background:var(--fill);color:var(--text);font-size:12px}
-.act-msg{margin:12px 16px 0;padding:8px 10px;border-radius:var(--r-sm);background:var(--fill);font-size:13px;overflow-wrap:anywhere}
-.act-msg[data-kind=error]{color:var(--a-danger)}
 .act-msg p{margin:0}.act-msg p+p{margin-top:4px;color:var(--text-2);font-size:12px}
 .act-callout{padding:10px 12px;border-radius:var(--r-sm);background:var(--fill)}
 .act-callout p{margin:0;font-size:13px}.act-callout-hint{margin-top:4px!important;color:var(--text-2);font-size:12px!important;overflow-wrap:anywhere}
@@ -219,17 +188,12 @@ body.actions-open aside.side{display:none}
 .act-log-result{white-space:nowrap;font-variant-numeric:tabular-nums}
 .act-log li[data-ok=false] .act-log-result{color:var(--a-danger)}
 .act-log-detail{grid-column:2/-1;color:var(--text-2);overflow-wrap:anywhere}
-@media (hover:hover){.act-tab:not([aria-selected=true]):hover{color:var(--text)}}
 /* Narrow windows retain desktop density in a bounded overlay. */
 @media (max-width:760px){
   .actions .icon.actions-toggle{display:grid}
-  .act{position:fixed;left:auto;right:8px;bottom:8px;top:60px;z-index:6;width:var(--canvas-panel-width);max-width:100vw;border:1px solid var(--line-2);border-radius:12px;
-    box-shadow:var(--a-sheet-shadow);padding-bottom:env(safe-area-inset-bottom)}
   body.actions-open{overflow:hidden}
-  .act-head{padding:8px 8px 8px 12px}
 }
 
-@media (prefers-reduced-motion:reduce){.act{animation:none}}
 `;
 }
 
@@ -257,8 +221,7 @@ const state={open:false,tab:"capture",lockTimer:null,
   health:{loaded:false,busy:false}};
 
 function text(id,value){const node=$(id);if(node&&node.textContent!==value)node.textContent=value}
-function el(tag,className,value){const node=document.createElement(tag);if(className)node.className=className;if(value!==undefined&&value!==null)node.textContent=String(value);return node}
-function makeButton(label,className,attributes){const node=el("button",className||"btn small",label);node.setAttribute("type","button");if(attributes)for(const key of Object.keys(attributes))node.setAttribute(key,attributes[key]);return node}
+${canvasDomScript()}
 function hasCsrf(){return typeof csrf!=="undefined"&&csrf}
 function toolsPath(path){return typeof url==="function"?url(path):path}
 
@@ -283,7 +246,7 @@ function syncLock(){const ok=allowed();if(lock){lock.hidden=ok;if(!ok)text("acti
 async function mutate(control,op,payload){if(!allowed()){syncLock();return null}const peers=op==="capture.screenshot"?[$("actions-shot"),dockShot]:op==="record.start"||op==="record.stop"?[$("actions-record"),dockRecord]:[control];const controls=peers.filter(Boolean);if(controls.some(button=>button.getAttribute("data-busy")==="1"))return null;message("capture");for(const button of controls){button.setAttribute("data-busy","1");button.setAttribute("aria-busy","true")}syncLock();try{return await call(op,payload)}catch(error){showError("capture",error);return null}finally{for(const button of controls){button.removeAttribute("data-busy");button.removeAttribute("aria-busy")}syncLock()}}
 
 // Drawer and tabs (arrows, Home and End move between tabs; Escape closes).
-function selectTab(name,focus){const index=TABS.indexOf(name);if(index<0)return;state.tab=name;tabs.forEach((tab,i)=>{const on=i===index;tab.setAttribute("aria-selected",String(on));tab.setAttribute("tabindex",on?"0":"-1");panels[i].hidden=!on});if(focus)tabs[index].focus();onTabShown(name);syncPolling()}
+function selectTab(name,focus){const index=TABS.indexOf(name);if(index<0)return;state.tab=name;canvasSelectTab(tabs,panels,index,focus);onTabShown(name);syncPolling()}
 function onTabShown(name){if(!state.open)return;if(name==="capture"){loadRecordStatus();loadCandidates();loadGallery()}else{pollActivity();if(!state.health.loaded)loadHealth(false)}}
 function closeTools(){if(!document.body.classList.contains("tools-open"))return;const close=$("tools-close");if(close&&typeof close.click==="function")close.click()}
 function setOpen(open,returnFocus){open=Boolean(open);if(state.open===open)return;if(open)closeTools();state.open=open;drawer.hidden=!open;document.body.classList.toggle("actions-open",open);toggle.setAttribute("aria-pressed",String(open));toggle.title=open?"Hide device actions":"Device actions";if(inspectorToggle)inspectorToggle.setAttribute("aria-pressed",String(!open&&!document.body.classList.contains("no-inspector")&&!document.body.classList.contains("tools-open")));if(open){syncLock();state.lockTimer=setInterval(syncLock,500);state.install.loaded=false;const tab=tabs[TABS.indexOf(state.tab)];if(tab)tab.focus();onTabShown(state.tab)}else{clearInterval(state.lockTimer);state.lockTimer=null;if(returnFocus)toggle.focus()}syncPolling()}
@@ -293,8 +256,7 @@ $("actions-close").addEventListener("click",()=>setOpen(false,true));
 // The Tools drawer and the inspector take the same column: opening either closes this one.
 if(toolsToggle)toolsToggle.addEventListener("click",()=>{if(state.open&&document.body.classList.contains("tools-open"))setOpen(false,false)});
 if(inspectorToggle)inspectorToggle.addEventListener("click",()=>{if(!state.open)return;setOpen(false,false);document.body.classList.remove("no-inspector");inspectorToggle.setAttribute("aria-pressed","true");inspectorToggle.title="Hide inspector"});
-tabs.forEach((tab,i)=>tab.addEventListener("click",()=>selectTab(TABS[i],false)));
-$("actions-tablist").addEventListener("keydown",event=>{const index=TABS.indexOf(state.tab),moves={ArrowRight:index+1,ArrowLeft:index-1,Home:0,End:TABS.length-1},next=moves[event.key];if(next===undefined)return;event.preventDefault();selectTab(TABS[(next+TABS.length)%TABS.length],true)});
+bindCanvasTabs($("actions-tablist"),tabs,()=>TABS.indexOf(state.tab),(index,focus)=>selectTab(TABS[index],focus));
 drawer.addEventListener("keydown",event=>{if(event.key!=="Escape")return;event.preventDefault();setOpen(false,true)});
 // The workspace shell opens and closes this drawer in a tile: {type: "autonom:panel", name: "actions", open}.
 if(typeof window!=="undefined"&&typeof window.addEventListener==="function")window.addEventListener("message",event=>{const data=event&&event.data;if(!data||data.type!=="autonom:panel"||data.name!=="actions")return;if(typeof location!=="undefined"&&event.origin!==location.origin)return;if(typeof window.parent!=="undefined"&&window.parent!==window&&event.source!==window.parent)return;setOpen(Boolean(data.open),false)});

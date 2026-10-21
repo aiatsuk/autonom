@@ -1,3 +1,4 @@
+import { themeStyles } from "../plugins/autonom/skills/android-emulator-browser/scripts/canvas-theme-page.mjs";
 // Unit tests of the Canvas Tools drawer page module (contract section 3): markup, styles and
 // the script run in node:vm against a small fake DOM built from the real markup, with stubs
 // for the page globals and a fake fetch. No browser, Canvas, device or network is involved.
@@ -38,6 +39,7 @@ class FakeElement {
     this.clientHeight = 160;
     this.state = {};
   }
+  click() { return click(this); }
   showModal() { this.setAttribute("open", ""); }
   close() { this.removeAttribute("open"); }
   get localName() { return this.tagName.toLowerCase(); }
@@ -450,14 +452,14 @@ describe("toolsScript and toolsStyles as text", () => {
   });
 
   test("the styles use the page tokens, have dark-mode rules and a compact overlay from the page's 760 px breakpoint", () => {
-    const css = toolsStyles();
+    const css = themeStyles() + toolsStyles();
     assert.match(css, /--t-danger:var\(--danger\)/);
-    assert.match(css, /box-shadow:var\(--tab-shadow\)/);
+    assert.match(css, /\.act-tab\)\[aria-selected=true\].*background:var\(--fill-2\)/);
     // Overlay starts at the same breakpoint as the main page.
-    const phone = css.indexOf("@media (max-width:760px){");
+    const phone = css.lastIndexOf("@media (max-width:760px){");
     assert.ok(phone >= 0, "a 760 px phone block");
     const block = css.slice(phone, css.indexOf("\n}\n", phone));
-    assert.match(block, /\.tools\{position:fixed;left:auto;right:8px;bottom:8px;/, "the drawer is a bounded overlay");
+    assert.match(css, /:is\(\.side,\.tools,\.act\)\{position:fixed;inset:60px 8px 8px auto;/, "drawers share one overlay geometry");
     assert.match(block, /\.actions \.icon\.tools-toggle\{display:grid/, "the toggle stays visible in the same block");
     assert.match(block, /body\.tools-open\{overflow:hidden\}/);
     assert.doesNotMatch(css, /max-width:7[0-5][0-9]px/, "no second, narrower sheet breakpoint");
@@ -1716,6 +1718,15 @@ describe("Named locations", () => {
     const page=boot({storage:saved});click(page.$("tools-toggle"));await flush();
     const menu=()=>page.$("tools-locations-custom").querySelector(".tools-location-more");
     click(menu());assert.equal(menu().getAttribute("aria-expanded"),"true");
+    const edit=page.document.querySelector("[data-location-edit]"),remove=page.document.querySelector("[data-location-delete]");
+    assert.equal(page.document.activeElement,edit);
+    fire(edit,"keydown",{key:"ArrowDown"});assert.equal(page.document.activeElement,remove);
+    fire(remove,"keydown",{key:"Home"});assert.equal(page.document.activeElement,edit);
+    fire(edit,"keydown",{key:"End"});assert.equal(page.document.activeElement,remove);
+    fire(remove,"keydown",{key:"ArrowUp"});assert.equal(page.document.activeElement,edit);
+    const tab=fire(edit,"keydown",{key:"Tab"});assert.equal(tab.defaultPrevented,false);assert.equal(menu().getAttribute("aria-expanded"),"false");
+    fire(menu(),"keydown",{key:"ArrowUp"});assert.equal(page.document.activeElement,remove);
+
     fire(page.document.activeElement,"keydown",{key:"Escape"});assert.equal(menu().getAttribute("aria-expanded"),"false");assert.equal(page.document.activeElement,menu());assert.equal(page.$("tools").hidden,false,"Escape closes only the menu");
     click(menu());click(page.$("tools-location-add"));assert.equal(menu().getAttribute("aria-expanded"),"false");
     click(menu());click(page.document.querySelector("[data-location-edit]"));
