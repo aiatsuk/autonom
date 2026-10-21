@@ -54,6 +54,14 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
   `Content-Type: application/json` whenever no Content-Type `--header` is
   given, also next to other headers; a header-only `network mock update` that
   names no Content-Type keeps it.
+- **A Canvas tile whose first status poll failed now opens its fast video.**
+  A tile whose first `/status` failed (an iOS Simulator booted from the
+  Canvas, still starting up) started the multipart stream; once the next poll reported `idb` it opened
+  only `/ws/control`, so the tile stayed on the slow multipart picture
+  with no `/ws/video` client. The page now switches to
+  WebCodecs whenever the transport is fast, and keeps multipart only for a
+  fallback that stays (no `VideoDecoder`, a rejected codec, the video
+  WebSocket refused).
 
 ## [0.36.2] - 2026-10-20
 
