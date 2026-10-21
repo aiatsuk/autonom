@@ -930,7 +930,7 @@ describe("probe-page.html", () => {
   test("copies the Canvas tokens verbatim (light and dark) plus the four probe tokens", () => {
     const props = (block) => Object.fromEntries([...block.matchAll(/(--[a-z0-9-]+):([^;]+);/g)].map((m) => [m[1], m[2].trim()]));
     const styles = workspaceStyles();
-    const canvasLight = props(styles.match(/^:root\{([\s\S]*?)\n\}/m)[1]);
+    const canvasLight = Object.assign({}, ...[...styles.matchAll(/^:root\{([^}]+)\}/gm)].map((match) => props(match[1] + ";")));
     const canvasDark = props(styles.match(/@media \(prefers-color-scheme:dark\)\{:root\{([\s\S]*?)\n\}\}/)[1]);
     assert.ok(Object.keys(canvasLight).length >= 20 && Object.keys(canvasDark).length >= 15);
     const pageLight = props(PAGE.match(/^:root\{([\s\S]*?)\n\}/m)[1]);
