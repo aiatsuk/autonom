@@ -893,14 +893,14 @@ class CanvasControlIdleTests(EnvSandboxMixin, unittest.TestCase):
                 "--adb", str(FAKE_ADB)]
 
     def workspace_argv(self) -> list[str]:
-        """The workspace node argv of 9acc89c for these flags."""
+        """The workspace node argv of 9acc89c for these flags, plus the machine's boot list."""
         return ["/fake/node", str(self.cli.CANVAS_SCRIPT), "--workspace", "ctltest",
-                "--port", "3999", "--transport", "screencap", "--adb", str(FAKE_ADB),
+                "--port", "3999", "--transport", "screencap", "--discover-bootable", "--adb", str(FAKE_ADB),
                 "--simctl", str(FAKE_SIMCTL), "--python", sys.executable,
                 "--autonom", str(CLI.resolve())]
 
     def test_without_the_flag_the_node_argv_is_the_one_of_before(self) -> None:
-        code, err = self.serve("--serial", SERIAL, "canvas", "serve", "--port", "3999",
+        code, err = self.serve("--serial", SERIAL, "canvas", "serve", "--single", "--port", "3999",
                                "--transport", "screencap")
         self.assertEqual(code, 0, err)
         self.assertEqual(self.commands[-1], self.single_argv())
@@ -910,7 +910,7 @@ class CanvasControlIdleTests(EnvSandboxMixin, unittest.TestCase):
         self.assertEqual(self.commands[-1], self.workspace_argv())
 
     def test_the_flag_is_passed_in_both_modes(self) -> None:
-        code, err = self.serve("--serial", SERIAL, "canvas", "serve", "--port", "3999",
+        code, err = self.serve("--serial", SERIAL, "canvas", "serve", "--single", "--port", "3999",
                                "--transport", "screencap", "--control-idle", "30")
         self.assertEqual(code, 0, err)
         self.assertEqual(self.commands[-1], self.single_argv() + ["--control-idle", "30"])

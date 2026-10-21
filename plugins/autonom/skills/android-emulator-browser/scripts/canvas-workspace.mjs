@@ -394,6 +394,40 @@ export class Workspace {
   }
 
   /** The first tab with an empty slot, from the active tab on, or null. */
+  /**
+   * The tab a device goes to when none is named: the active tab, its layout grown up to
+   * four tiles when it is full, else another tab with an empty tile, else a new tab
+   * (`tab_limit` when 8 tabs are full). Place the device in the same tick: the room is
+   * not reserved. `undo()` takes back a grown layout or a new tab that is still empty.
+   */
+  roomFor() {
+    const active = this.#find(this.#active);
+    if (active && active.slots.includes(null)) return { id: active.id, undo() {} };
+    if (active && active.layout < MAX_TILES) {
+      const before = active.layout;
+      const id = this.updateTab(active.id, { layout: before + 1 }).id;
+      return {
+        id,
+        undo: () => {
+          const tab = this.#find(id);
+          if (tab && tab.layout === before + 1 && tab.slots.filter(Boolean).length <= before) {
+            this.updateTab(id, { layout: before });
+          }
+        },
+      };
+    }
+    const other = this.firstTabWithRoom();
+    if (other) return { id: other, undo() {} };
+    const id = this.createTab({}).id;
+    return {
+      id,
+      undo: () => {
+        const tab = this.#find(id);
+        if (tab && tab.slots.every((slot) => slot === null) && this.#tabs.length > 1) this.closeTab(id);
+      },
+    };
+  }
+
   firstTabWithRoom() {
     const ordered = [this.#find(this.#active), ...this.#tabs.filter((tab) => tab.id !== this.#active)];
     return ordered.find((tab) => tab && tab.slots.some((slot) => slot === null))?.id ?? null;

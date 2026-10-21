@@ -7,6 +7,13 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
 
 ## [Unreleased]
 
+### Added
+- **Boot any device from the page.** The picker lists every AVD and available
+  iOS Simulator of this machine with Boot, after the `--bootable` entries
+  (which keep their `@PORT`); the list is read again every 30 s.
+  `--bootable-only` keeps it to the `--bootable` entries. Simulators show their
+  name and iOS version.
+
 ### Changed
 - **The edge-case kit's `slow` and `timeout` cases use a mock** instead of
   `simulator network shape`: `network start`, `network attach`,
@@ -17,6 +24,21 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
 - **The flow run evidence page** shows a request that never completed as
   "never completed (<error_kind>)" instead of "status None"; a completed
   request still shows its status.
+- **Every Canvas is a workspace.** `canvas serve --serial X` (also `--udid`,
+  `--target` or one `--device`) now starts a workspace Canvas with that device
+  in its first tab, so the page always offers tabs, Attach, Boot and the 1-4
+  tile split. When that workspace is already running, the command attaches the
+  device to it and prints its URL (`already_running: true`, each attach result
+  under `devices`; a refusal there carries its `error_code` and `hint` and does
+  not fail the command). The one-device page of before stays behind the new
+  `--single` flag. A workspace Canvas is not owned by a session, so
+  `session stop` no longer ends a Canvas started with `--serial`; stop it with
+  `autonom canvas stop`.
+- **Devices find room side by side.** A device attached without a tab (the
+  `--serial`/`--device` devices at start, `canvas attach` without `--tab`,
+  `POST /api/devices` without `tab`) goes to the active tab and grows its
+  layout up to four tiles before another tab with room, or a new tab, is used.
+  Two `--device` at start now share one two-tile tab instead of two tabs.
 
 ### Fixed
 - **A damaged pre-test record refuses Canvas input and warm-up taps like the

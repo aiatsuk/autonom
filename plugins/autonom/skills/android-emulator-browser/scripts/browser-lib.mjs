@@ -291,6 +291,9 @@ export function parseArgs(argv) {
       case "--shutdown-booted":
         options.shutdownBooted = true;
         break;
+      case "--discover-bootable":
+        options.discoverBootable = true;
+        break;
       case "--install-root":
         options.installRoots.push(requireFlagValue(argv, ++i, flag));
         break;
@@ -365,8 +368,9 @@ function checkCanvasMode(options) {
     throw new Error("--serial and --target select the single-device Canvas; use --device in a workspace.");
   }
   if (!workspace) {
-    for (const flag of ["ephemeral", "shutdownBooted"]) {
-      if (options[flag]) throw new Error(`--${flag === "ephemeral" ? "ephemeral" : "shutdown-booted"} needs a workspace Canvas (--workspace, --split or two --device).`);
+    for (const [flag, name] of [["ephemeral", "ephemeral"], ["shutdownBooted", "shutdown-booted"],
+      ["discoverBootable", "discover-bootable"]]) {
+      if (options[flag]) throw new Error(`--${name} needs a workspace Canvas (--workspace, --split or two --device).`);
     }
     if (options.bootable.length) throw new Error("--bootable needs a workspace Canvas (--workspace, --split or two --device).");
   }

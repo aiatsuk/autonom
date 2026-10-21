@@ -705,7 +705,8 @@ class CanvasServeFlagsTests(EnvSandboxMixin, unittest.TestCase):
         target = (["--simctl", str(self.simctl), "--udid", UDID] if ios
                   else ["--adb", str(self.adb), "--serial", SERIAL])
         completed = subprocess.run(
-            [sys.executable, str(CLI), *target, "canvas", "serve", *argv],
+            # The one-device Canvas whose node argv these tests pin.
+            [sys.executable, str(CLI), *target, "canvas", "serve", "--single", *argv],
             cwd=self.root, env=self.env, text=True, stdin=subprocess.DEVNULL,
             capture_output=True, check=False, timeout=60)
         self.assertNotIn("Traceback", completed.stdout + completed.stderr)
