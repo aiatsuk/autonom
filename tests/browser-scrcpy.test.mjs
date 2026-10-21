@@ -14,7 +14,6 @@ import { dirname, join, resolve } from "node:path";
 import test, { describe } from "node:test";
 import { promisify } from "node:util";
 import { Script, createContext } from "node:vm";
-import { renderPage } from "../plugins/autonom/skills/android-emulator-browser/scripts/android-emulator-browser.mjs";
 
 import { renderPage } from "../plugins/autonom/skills/android-emulator-browser/scripts/canvas-device-page.mjs";
 import {
@@ -5676,7 +5675,7 @@ const PAGE_IDS = ["video", "screen", "status", "text", "clipboard", "device", "r
 
 test("page: the Android page keeps its element ids, window.autonomCanvas and remaining controls with the attributes its handlers read, names every button, and marks the scrcpy-only ones", async (t) => {
   const { html } = await loadPage(t);
-  for (const id of [...PAGE_IDS, "display-preset", "display-menu", "control-take", "control-pause", "inspector-toggle"]) {
+  for (const id of [...PAGE_IDS, "display-preset", "display-menu", "inspector-toggle"]) {
     assert.equal(html.split(`id="${id}"`).length - 1, 1, `id ${id}`);
   }
   assert.match(html, /window\.autonomCanvas=Object\.freeze\(\{stats:snapshot,send:sendControl\}\)/);
@@ -5699,7 +5698,7 @@ test("page: the Android page keeps its element ids, window.autonomCanvas and rem
     if (!button.text) assert.ok(button.attributes.title, `${button.name} has a tooltip`);
   }
   assert.deepEqual(buttons.filter((button) => "data-scrcpy" in button.attributes).map((button) => button.name),
-    ["Rotate", "Volume down", "Volume up", "Notifications", "Quick settings", "Collapse panels", "Copy device clipboard"]);
+    ["Rotate", "Volume down", "Volume up", "Notifications", "Quick settings", "Collapse panels", "Copy device clipboard", "Paste to emulator"]);
   // The compact toolbar keeps settings/panel buttons; preferences live in Settings.
   const toolbar = html.match(/<header class="bar">([\s\S]*?)<\/header>/)[1];
   assert.doesNotMatch(toolbar, /class="brand"|live-dot|target-detail|display-dims|control-chip|class="chip"/);
@@ -5718,7 +5717,7 @@ test("page: the Android page keeps its element ids, window.autonomCanvas and rem
   for (const direction of ["down", "up"]) assert.match(deviceSettings, new RegExp('data-system="volume-' + direction + '" data-scrcpy'));
 
   // The inspector sections, in order.
-  assert.deepEqual([...html.matchAll(/<section class="group(?: inspector-stream)?"[^>]*>\s*<h2>([^<]+)<\/h2>/g)].map((match) => match[1]),
+  assert.deepEqual([...html.matchAll(/<section class="group(?: inspector-stream)?"[^>]*>\s*(?:<div class="inspector-group-head">)?<h2>([^<]+)<\/h2>/g)].map((match) => match[1]),
     ["Device", "Stream"]);
   assert.doesNotMatch(html, /<section class="group" hidden>/, "an Android inspector section is hidden");
 });
@@ -5747,7 +5746,7 @@ test("page: the page loads nothing from outside, has light and dark tokens with 
   assert.ok(phone, "no phone layout");
   assert.match(html, /:is\(\.side,\.tools,\.act\)\{[^}]*width:var\(--canvas-panel-width\)/);
   for (const rule of [".dock{position:fixed;bottom:calc(14px + env(safe-area-inset-bottom))",
-    "body{display:block;", "body.no-inspector .side{display:none}", ".side{padding:0 0 8px;", ".actions #inspector-toggle{display:grid}"]) {
+    "body{display:block;", "body.no-inspector .side{display:none}", ".actions #inspector-toggle{display:grid}"]) {
     assert.ok(phone[1].includes(rule), rule);
   }
   assert.doesNotMatch(phone[1], /height:44px|font-size:16px/, "narrow windows retain desktop density");
@@ -5937,7 +5936,7 @@ test("page: the size menu is a keyboard listbox: Enter opens it on the first pre
   assert.deepEqual(displays(), ["pixel-fold", "tablet"]);
 });
 
-test("page: controls that cannot act are disabled, the Control buttons hand control over through the control socket or POST /control, and the toolbar, caption, notice and Stream details are filled as text", async (t) => {
+test("page: Inspector omits Input control, preserves input ownership guards and renders Stream details as text", async (t) => {
   const { sandbox, sent, run, document } = await loadPage(t);
   const byId = (id) => document.getElementById(id);
   const text = (id) => byId(id).textContent;
@@ -5948,44 +5947,19 @@ test("page: controls that cannot act are disabled, the Control buttons hand cont
   // Until the page knows the status nothing can act.
   run("syncPicker()");
   assert.deepEqual(disabled(), [true]);
-  assert.deepEqual([byId("control-take").disabled, byId("control-pause").disabled], [true, true]);
+  assert.equal(byId("control-take"), null);
+  assert.equal(byId("control-pause"), null);
   run("view.status={platform:\"android\",display:{width:1080,height:2400,density:420,preset:\"default\"}};logicalDisplay=view.status.display");
   state({});
   assert.deepEqual(disabled(), [false]);
-  assert.deepEqual([text("owner-name"), text("owner-detail")],
-    ["Shared", "· people and agents can send input"]);
-  assert.equal(byId("owner-dot").dataset.state, "live");
-  // Another owner: input is disabled, handoff and the device clipboard still act.
-  state({ owner: "agent" });
+  state({owner:"agent"});
   assert.deepEqual(disabled(), [true]);
-  assert.deepEqual([byId("clipboard").disabled, byId("refresh").disabled, byId("control-take").disabled], [false, false, false]);
-  assert.deepEqual([text("owner-name"), text("control-take")], ["Agent", "Take control"]);
-  assert.equal(byId("owner-dot").dataset.state, "warn");
-  byId("control-take").click();
-  assert.deepEqual(sent.at(-1), { t: "control", mode: "takeover" });
-  state({ owner: "human" });
+  assert.equal(byId("refresh").disabled, false);
+  state({owner:"human"});
   assert.deepEqual(disabled(), [false]);
-  assert.equal(text("control-take"), "Release");
-  byId("control-take").click();
-  assert.deepEqual(sent.at(-1), { t: "control", mode: "release" });
-  byId("control-pause").click();
-  assert.deepEqual(sent.at(-1), { t: "control", mode: "pause" });
-  state({ paused: true });
+  state({paused:true});
   assert.deepEqual(disabled(), [true]);
-  assert.deepEqual([text("control-pause"), text("owner-detail")],
-    ["Resume input", "· input is paused"]);
-  byId("control-pause").click();
-  assert.deepEqual(sent.at(-1), { t: "control", mode: "resume" });
-  // Without scrcpy the handoff goes to POST /control as the human page, and the answer is shown.
-  const posts = [];
-  sandbox.fetch = async (path, init) => {
-    posts.push([path, JSON.parse(init.body), init.headers["X-Autonom-Origin"]]);
-    return { ok: true, json: async () => ({ ok: true, control_owner: "human", input_paused: false }) };
-  };
-  run("view.transport=\"screencap\";controlSocket=null");
-  byId("control-take").click();
-  await waitFor(() => text("owner-name") === "People", 2000, "the POST /control answer");
-  assert.deepEqual(posts, [["/control", { mode: "takeover" }, "human"]]);
+  state({});
   assert.deepEqual(disabled(), [false]);
 
   // The toolbar, caption and Stream details on scrcpy with WebCodecs.
@@ -6034,7 +6008,7 @@ test("page: the iOS page runs without the Size menu, keeps every element id, sho
   const shown = [...dock.matchAll(/<button [^>]*aria-label="([^"]+)"[^>]*>/g)]
     .filter((match) => !/ hidden[ >]/.test(match[0])).map((match) => match[1]);
   assert.deepEqual(shown, ["Home", "Take screenshot", "Start recording", "Power"]);
-  assert.deepEqual([...html.matchAll(/<section class="group(?: inspector-stream)?"( hidden)?>\s*<h2>([^<]+)<\/h2>/g)].map((match) => [match[2], Boolean(match[1])]),
+  assert.deepEqual([...html.matchAll(/<section class="group(?: inspector-stream)?"( hidden)?>\s*(?:<div class="inspector-group-head">)?<h2>([^<]+)<\/h2>/g)].map((match) => [match[2], Boolean(match[1])]),
     [["Device", true], ["Stream", false]]);
   const { run, document } = runPage(html);
   assert.equal(run("sizePicker"), null);
@@ -7775,4 +7749,48 @@ test("page: embedded devices retain accessible volume controls in their dock", (
   assert.match(dock, /data-system="volume-down"/);
   assert.match(dock, /data-system="volume-up"/);
   assert.equal((html.match(/data-system="volume-down"/g)||[]).length,1);
+});
+
+
+test("page: Paste to emulator sends clipboard text once and handles empty, denied, oversized and interrupted reads", async (t) => {
+  const { sandbox, sent, run, document } = await loadPage(t);
+  const button = document.getElementById("clipboard-paste");
+  let value = "Привет 👋\nsecond line", reads = 0;
+  sandbox.navigator = { clipboard: { readText: async () => { reads++; return value; } } };
+  run('view.status={platform:"android"};syncControls()');
+  assert.equal(button.disabled, false);
+  await sandbox.pasteFromClipboard();
+  assert.deepEqual(sent, [{ t: "paste", text: value }]);
+  sent.length = 0;
+  value = "";
+  await sandbox.pasteFromClipboard();
+  assert.equal(sent.length, 0);
+  assert.match(run("view.note"), /no text/);
+  value = "x".repeat(run("MAX_CONTROL_BYTES"));
+  await sandbox.pasteFromClipboard();
+  assert.equal(sent.length, 0);
+  assert.match(run("view.note"), /too large/);
+  sandbox.navigator.clipboard.readText = async () => { throw new Error("denied"); };
+  await sandbox.pasteFromClipboard();
+  assert.match(run("view.note"), /Could not read/);
+  assert.equal(button.disabled, false);
+  let resolveRead;
+  sandbox.navigator.clipboard.readText = () => { reads++; return new Promise(resolve => { resolveRead = resolve; }); };
+  const pending = sandbox.pasteFromClipboard(), count = reads;
+  assert.equal(button.disabled, true);
+  await sandbox.pasteFromClipboard();
+  assert.equal(reads, count, "a pending read cannot be repeated");
+  run('view.owner="agent";syncControls()');
+  resolveRead("must not be sent");
+  await pending;
+  assert.equal(sent.length, 0);
+  assert.equal(button.disabled, true);
+  assert.match(run("view.note"), /Input is unavailable/);
+  run('view.owner="shared";controlSocket=null;syncControls()');
+  sandbox.navigator.clipboard.readText = async () => "text";
+  await sandbox.pasteFromClipboard();
+  assert.match(run("view.note"), /disconnected/);
+  sandbox.navigator.clipboard = undefined;
+  await sandbox.pasteFromClipboard();
+  assert.match(run("view.note"), /Clipboard access is unavailable/);
 });

@@ -24,7 +24,7 @@ HTML pages use standard HTML controls and serialized JavaScript, with no framewo
 | Icon button | canvasIconButton, .icon / .ws-icon | label + tooltip; 32px |
 | Icon | CANVAS_ICONS, canvasIcon, canvasIconData | one path registry, 24px viewbox |
 | Field row | .field / .tools-field / .act-field | shared geometry and 6px gap |
-| Group | .group / .tools-group / .act-group | 12px inset/radius, 10px outer gap |
+| Group | .group / .tools-group / .act-group | 12px inset/gap, 10px radius |
 | Tabs | canvasTabList, canvasTabPanel, bindCanvasTabs, canvasSelectTab | one panel, roving focus, arrows/Home/End |
 | Workspace tabs | canvasTabKey | shared navigation; host retains rename/close |
 | Dropdown | CanvasDropdown, installCanvasSelects | shared trigger/menu behavior |

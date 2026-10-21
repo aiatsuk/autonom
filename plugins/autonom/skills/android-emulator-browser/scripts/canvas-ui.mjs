@@ -29,6 +29,7 @@ export const CANVAS_ICONS = Object.freeze({
   quickSettings: '<rect x="4" y="4" width="7" height="7" rx="2"/><rect x="13" y="4" width="7" height="7" rx="2"/><rect x="4" y="13" width="7" height="7" rx="2"/><rect x="13" y="13" width="7" height="7" rx="2"/>',
   collapse: '<path d="m7 14 5-5 5 5"/><path d="M5 19h14"/>',
   clipboard: '<rect x="7" y="4" width="10" height="16" rx="2"/><path d="M10 4V3h4v1"/>',
+  paste: '<rect x="9" y="3" width="11" height="18" rx="2"/><path d="M3 12h11m-4-4 4 4-4 4"/>',
   tools: '<path d="M4 7h9M17 7h3M4 17h3M11 17h9"/><circle cx="15" cy="7" r="2"/><circle cx="9" cy="17" r="2"/>',
   refresh: '<path d="M19.5 12a7.5 7.5 0 1 1-2.2-5.3L19.5 9"/><path d="M19.5 4.5v4.5H15"/>',
   actions: '<path d="M4 8.5A2.5 2.5 0 0 1 6.5 6h1.8l1.4-2h4.6l1.4 2h1.8A2.5 2.5 0 0 1 20 8.5v8a2.5 2.5 0 0 1-2.5 2.5h-11A2.5 2.5 0 0 1 4 16.5z"/><circle cx="12" cy="12.5" r="3.5"/>',
@@ -125,7 +126,7 @@ export function canvasDomScript() {
 
 export function canvasUiStyles() {
 return `
-:root{--control-height:32px;--control-small:28px;--icon-size:18px;--group-radius:12px;--motion-duration:120ms;--motion-easing:ease-out}
+:root{--control-height:32px;--control-small:28px;--icon-size:18px;--group-radius:10px;--motion-duration:120ms;--motion-easing:ease-out}
 .canvas-theme-control{display:inline-flex;align-items:center;flex:none}
 .canvas-theme{width:84px}
 /* Desktop preferences share surfaces, control geometry and disclosure icons. */
@@ -153,7 +154,7 @@ svg{width:var(--icon-size);height:var(--icon-size);fill:none;stroke:currentColor
 input:not([type=checkbox]):not([type=radio]):not([type=range]),select,textarea{min-width:0;height:var(--control-height);padding:0 10px;border:1px solid var(--line-2);border-radius:var(--r-sm);background-color:var(--raised)}
 input::placeholder,textarea::placeholder{color:var(--text-2);opacity:1}
 input:is([type=checkbox],[type=radio]){accent-color:var(--accent)}
-:is(.group,.tools-group,.act-group){padding:12px;margin:10px;min-width:0;border:1px solid var(--line-2);border-radius:var(--group-radius);background:var(--raised)}
+:is(.group,.tools-group,.act-group){padding:12px;margin:12px;min-width:0;border:1px solid var(--line-2);border-radius:var(--group-radius);background:var(--raised)}
 :is(.group h2,.tools-group h3,.act-group h3){margin:0 0 8px;font-size:13px;font-weight:600;color:var(--text);letter-spacing:normal}
 :is(.tools-label,.act-label){display:block;margin:8px 0 4px;font-size:12px;color:var(--text-2)}
 :is(.tools-tabs,.act-tabs){display:flex;flex:1;min-width:0;gap:3px;padding:0;background:transparent;overflow-x:auto;scrollbar-width:none}
@@ -161,14 +162,14 @@ input:is([type=checkbox],[type=radio]){accent-color:var(--accent)}
 :is(.tools-tab,.act-tab){flex:1 0 auto;height:var(--control-small);padding:0 10px;border:0;border-radius:var(--r-sm);background:transparent;color:var(--text-2);font-weight:500;white-space:nowrap}
 :is(.tools-tab,.act-tab):focus-visible{outline-offset:-2px}
 :is(.tools-tab,.act-tab)[aria-selected=true]{background:var(--fill-2);color:var(--text);box-shadow:none}
-:is(.tools-head,.act-head){display:flex;align-items:center;gap:8px;padding:8px;border-bottom:1px solid var(--line)}
-:is(.tools-panel,.act-panel){padding:2px 0 16px;min-width:0;outline:none}
+:is(.tools-head,.act-head,.inspector-head){display:flex;align-items:center;flex:none;min-height:48px;box-sizing:border-box;gap:8px;padding:8px 12px;border-bottom:1px solid var(--line)}
+:is(.tools-panel,.act-panel){padding:0;min-width:0;outline:none}
 :is(.tools-panel,.act-panel):focus-visible{box-shadow:inset 0 0 0 2px var(--accent)}
 :is(.tools-msg,.act-msg){margin:10px;padding:8px 10px;border-radius:var(--r-sm);background:var(--fill);font-size:13px;overflow-wrap:anywhere}
 :is(.tools-msg,.act-msg)[data-kind=error]{color:var(--danger);background:color-mix(in srgb,var(--danger) 9%,var(--raised))}
 :is(.side,.tools,.tools-body,.act,.act-body){background:var(--bg)}
 :is(.tools,.act){grid-area:side;display:flex;flex-direction:column;min-width:0;min-height:0;border-left:1px solid var(--line)}
-:is(.tools-body,.act-body){flex:1;min-height:0;overflow:auto;overscroll-behavior:contain;scrollbar-width:thin}
+:is(.tools-body,.act-body,.inspector-body){flex:1;min-height:0;overflow:auto;overscroll-behavior:contain;scrollbar-width:thin}
 :is(.tools-icon,.act-icon){flex:none}
 .dot{width:7px;height:7px;border-radius:50%;background:var(--idle);flex:none}
 .dot[data-state=live]{background:var(--live);box-shadow:0 0 0 3px color-mix(in srgb,var(--live) 18%,transparent)}
@@ -176,9 +177,11 @@ input:is([type=checkbox],[type=radio]){accent-color:var(--accent)}
 .dot[data-state=error]{background:var(--danger)}
 [role=menuitem]:focus-visible{outline:none;background:var(--fill-2)}
 @media (max-width:760px){
-  :is(.side,.tools,.act){position:fixed;inset:60px 8px 8px auto;width:var(--canvas-panel-width);z-index:6;border:1px solid var(--line-2);border-radius:var(--group-radius);box-shadow:var(--sheet-shadow)}
-  :is(.tools,.act){padding-bottom:env(safe-area-inset-bottom)}
-  :is(.tools-head,.act-head){padding:8px 8px 8px 12px}
+  :is(.side,.tools,.act){position:fixed;inset:60px 8px 8px auto;width:var(--canvas-panel-width);z-index:6;border:1px solid var(--line-2);border-radius:14px;overflow:hidden;box-shadow:var(--sheet-shadow)}
+  /* Keep the scrolling layer and its scrollbar clear of the rounded bottom edge. */
+  :is(.tools-body,.act-body,.inspector-body){margin-bottom:max(12px,env(safe-area-inset-bottom))}
+  html:root :is(.tools-panel,.act-panel,.inspector-body)>:is(.group,.tools-group,.act-group):last-child{margin-bottom:0}
+  html:root #tools-panel-simulate{margin-bottom:0}
 }
 @media (hover:hover){
   :is(.btn,.popup,.canvas-dropdown-trigger,.icon,.ws-icon,.row,.key,.volume-key,.device-tile,.dock button,.tools-chip,.tile-chip,.ws-menu-item,.tile-pop-item):not(:disabled):not(.primary):not(.danger):hover{background-color:var(--fill-2)}

@@ -308,7 +308,7 @@ body.tools-open aside.side{display:none}
 /* Related settings stay in a single outlined group with inset row separators. */
 .tools-divider{border:0;border-top:1px solid var(--line);margin:12px 0}
 /* Simulate is a compact preference list, not a stack of cards. */
-#tools-panel-simulate{margin:10px;padding:0;border:1px solid var(--line-2);border-radius:12px;background:var(--raised);overflow:hidden}
+#tools-panel-simulate{margin:12px;padding:0;border:1px solid var(--line-2);border-radius:var(--group-radius);background:var(--raised);overflow:hidden}
 html:root #tools-panel-simulate .tools-sim-setting:last-child{border-bottom:0}
 html:root #tools-panel-simulate .tools-sim-setting{margin:0;padding:10px 12px;border:0;border-bottom:1px solid var(--line);border-radius:0;background:none}
 .tools-sim-row{display:flex;align-items:center;justify-content:space-between;gap:12px;min-height:32px}
@@ -404,7 +404,7 @@ html:root #tools-panel-simulate .tools-sim-setting{margin:0;padding:10px 12px;bo
 #tools-panel-network:not([hidden]){display:flex;flex-direction:column;height:100%;min-height:360px;padding:0;box-sizing:border-box}
 #tools-net-body:not([hidden]){display:flex;flex-direction:column;flex:1;min-height:0}
 #tools-net-body>.tools-group{flex:none}
-html:root #tools-net-body>.tools-requests-group{display:flex;flex-direction:column;flex:1;min-height:120px;margin-top:0;margin-bottom:0;padding-bottom:0;border-bottom:0;border-radius:12px 12px 0 0}
+html:root #tools-net-body>.tools-requests-group{display:flex;flex-direction:column;flex:1;min-height:120px;margin-top:0;margin-bottom:12px;padding-bottom:0;border-radius:var(--group-radius)}
 .tools-requests-group>h3,.tools-requests-group>.tools-filters,.tools-requests-group>.tools-empty{flex:none}
 .tools-reqs{display:grid;align-content:start;gap:1px;flex:1;min-height:0;overflow:auto;overscroll-behavior:contain;margin:0 -8px;padding-bottom:8px;scrollbar-width:thin}
 .tools-reqs:empty{display:none}
@@ -448,6 +448,7 @@ html:root #tools-net-body>.tools-requests-group{display:flex;flex-direction:colu
 @media (max-width:760px){
   .actions .icon.tools-toggle{display:grid}
   body.tools-open{overflow:hidden}
+  html:root #tools-net-body>.tools-requests-group{margin-bottom:0}
   .tools-filters{grid-template-columns:repeat(2,minmax(0,1fr))}
   .tools-req{grid-template-columns:48px 34px minmax(0,1fr)}
   .tools-req-meta{display:none}
