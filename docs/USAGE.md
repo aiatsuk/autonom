@@ -212,12 +212,11 @@ stop the Canvas with SIGTERM and check that no idb_companion is left running.
 ```text
 Start `autonom canvas serve --platform android --serial <serial>` and read the
 `Stream size:` line it prints, or `/status` `scrcpy.max_size` and
-`scrcpy.encoder`: an emulator (software H.264 encoder only) streams 2048 on
-the long side, a phone with a hardware encoder streams native size, and 1280
-means the encoders could not be read. For a pixel-exact picture on the
+`scrcpy.encoder`: an emulator (software H.264 encoder only) streams 1280 on
+the long side at up to 30 fps, a phone with a hardware encoder streams native size at up to 60 fps, and an unreadable encoder list also falls back to 1280. For a pixel-exact picture on the
 emulator start it again with `--max-size 0` (native, more host CPU); for a
-busy Mac try `--max-size 1600`. Report the size and encoder with any fps
-numbers.
+larger preview try `--max-size 1600` or `--max-size 2048`. Report the size and encoder with any fps
+numbers. An explicit `--fps` overrides the encoder default; `scrcpy.max_fps` reports the applied cap.
 ```
 
 ## Change device state from the Canvas Tools drawer
@@ -652,3 +651,21 @@ hypotheses.
 See [UI recovery](IOS_UI_RECOVERY.md) for `--ui-backend auto|idb|xcuitest` (and how
 it sits above `--ios-hid`), `--session-id`, measured `capabilities --probe`, and
 repeatable Reader fixture flows.
+
+
+### Android emulator scheduling on macOS
+
+`autonom devices boot --avd <name>` (including the Canvas device picker)
+launches Android on macOS through a per-user, single-run `launchd` job with
+`ProcessType=Interactive`. This avoids inheriting a background agent's CPU/I/O
+throttling. It uses `-no-window -no-snapshot -gpu host`: interact through
+Canvas, cold-boot without restoring/saving Quick Boot snapshots, and use the
+host GPU. App data is retained. The job is not installed at login and never
+automatically respawns; `devices shutdown` removes it.
+
+Linux retains the direct emulator launch and existing AVD settings. On macOS,
+a launchd error fails explicitly instead of silently returning to a throttled
+launch. An intentional compatibility escape hatch is
+`AUTONOM_EMULATOR_LAUNCH_MODE=direct` (for example, an environment without a
+logged-in macOS GUI session); it keeps the original emulator argv and may
+inherit the caller's background policy.

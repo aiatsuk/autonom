@@ -14,8 +14,9 @@ const BRIDGE = join(
 // The Android display presets /status lists, in order (DISPLAY-001).
 const DISPLAY_PRESETS = [
   { id: "small", label: "Small phone", width: 720, height: 1280, density: 320 },
-  { id: "pixel-11", label: "Pixel 11", width: 1080, height: 2424, density: 420 },
+  { id: "pixel-10", label: "Pixel 10", width: 1080, height: 2424, density: 420 },
   { id: "pixel-fold", label: "Pixel Fold (open)", width: 2208, height: 1840, density: 420 },
+  { id: "pixel-fold-closed", label: "Pixel Fold (folded)", width: 1080, height: 2092, density: 420 },
   { id: "tablet", label: "Tablet", width: 2560, height: 1600, density: 320 },
   { id: "default", label: "Device default" },
 ];

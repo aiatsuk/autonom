@@ -71,9 +71,9 @@ async function tempDir(t) {
 
 describe("action ops", () => {
   test("the action tuples are the contract's and the same as the Python process's", () => {
-    assert.deepEqual(ACTION_READ_OPS, ["captures.list", "record.status", "apps.candidates", "health"]);
+    assert.deepEqual(ACTION_READ_OPS, ["captures.list", "record.status", "apps.candidates", "health", "frame.describe", "device.language.get"]);
     assert.deepEqual(ACTION_DEVICE_OPS, ["capture.screenshot", "record.start", "record.stop", "app.install",
-      "app.launch", "app.open_url", "app.locale"]);
+      "app.launch", "app.open_url", "app.locale", "device.language.set"]);
     assert.deepEqual(ACTION_LOCAL_OPS, ["captures.delete", "captures.open_directory"]);
     const python = JSON.parse(execFileSync(process.env.PYTHON ?? "python3", ["-c",
       "import json, autonom_canvas_tools as t; print(json.dumps([t.ACTION_READ_OPS, t.ACTION_DEVICE_OPS, " +
@@ -149,7 +149,7 @@ function silentChild() {
 
 test("timeouts: install, recording and health have their own limits; other ops keep the default", async (t) => {
   assert.deepEqual(OP_TIMEOUT_MS, { "app.install": 300000, "record.start": 180000, "record.status": 180000,
-    "record.stop": 180000, health: 30000 });
+    "record.stop": 180000, health: 30000, "device.language.set": 300000 });
   const client = new ToolsClient({ spawnTools: silentChild, timeoutMs: 20, opTimeoutsMs: { "app.install": 120 } });
   t.after(() => client.close());
   assert.equal(client.timeoutFor("app.install"), 120);
@@ -785,7 +785,7 @@ function defaultReply(op) {
   }
 }
 
-function bootPage({ withDock = false, platform = "android", reply = () => null, canSend = () => true, deviceId = DEVICE, withTools = true } = {}) {
+function bootPage({ withDock = false, platform = "android", reply = () => null, canSend = () => true, deviceId = DEVICE, withTools = true, captureFrameOptions } = {}) {
   const html = `<body><div class="actions">${withTools ? toolsButton() : ""}${actionsButton()}` +
     `<button type="button" class="icon" id="inspector-toggle" aria-pressed="true" aria-controls="inspector">I</button></div>` +
     `<aside class="side" id="inspector" aria-label="Inspector"></aside>${withTools ? toolsMarkup({ platform }) : ""}` +
@@ -809,7 +809,7 @@ function bootPage({ withDock = false, platform = "android", reply = () => null, 
   };
   const messageListeners = [];
   const sandbox = {
-    document, fetch, view: { owner: "shared", paused: false, status: {} }, csrf: "csrf-123", TextEncoder, console,
+    document, fetch, captureFrameOptions, view: { owner: "shared", paused: false, status: {} }, csrf: "csrf-123", TextEncoder, console,
     $: (id) => document.getElementById(id),
     url: (path) => path,
     note: () => {},
@@ -838,9 +838,13 @@ describe("actions page markup and styles", () => {
     assert.match(markup, /^<aside class="act" id="actions" hidden aria-label="Device actions"/);
     assert.match(markup, /role="tablist"/);
     for (const id of markup.matchAll(/ id="([^"]+)"/g)) assert.ok(id[1] === "actions" || id[1].startsWith("actions-"), id[1]);
-    assert.match(markup, /--install-root/);
-    assert.match(markup, /id="actions-downgrade"/);
-    assert.doesNotMatch(actionsMarkup({ platform: "ios" }), /actions-downgrade/);
+    for (const context of [{}, {platform:"android"}, {platform:"ios"}, {embed:true}, {embed:false}]) {
+      const capture = actionsMarkup(context);
+      assert.doesNotMatch(capture, /actions-(install|app|launch|fresh|locale|url|downgrade)|Fresh start|Set language/);
+      assert.match(capture, /id="actions-shot"/);
+      assert.match(capture, /id="actions-record"/);
+      assert.match(capture, /id="actions-gallery"/);
+    }
     assert.match(actionsMarkup({ options: { platform: "ios" } }), /data-platform="ios"/);
     assert.doesNotMatch(markup, /<script|\son[a-z]+=/i);
   });
@@ -869,7 +873,7 @@ describe("actions page markup and styles", () => {
 });
 
 describe("actions page script", () => {
-  test("opening loads status, builds and the gallery; a screenshot saves and refreshes it", async () => {
+  test("opening loads only recording status and the gallery; a screenshot saves and refreshes it", async () => {
     const page = bootPage({
       reply: ({ op }) => op === "capture.screenshot" ? ok({ capture: SHOT, pruned: ["old.png", "older.png"] }) : null,
     });
@@ -882,7 +886,7 @@ describe("actions page script", () => {
     assert.ok(page.document.body.classList.contains("actions-open"));
     assert.equal($("actions-toggle").getAttribute("aria-pressed"), "true");
     assert.equal(ops("record.status").length, 1);
-    assert.equal(ops("apps.candidates").length, 1);
+    assert.equal(ops("apps.candidates").length, 0);
     assert.deepEqual(ops("captures.list")[0].body.payload, { limit: 200 });
     assert.equal(ops("captures.list")[0].headers["X-Autonom-CSRF"], "csrf-123");
     const items = $("actions-gallery").children;
@@ -892,7 +896,6 @@ describe("actions page script", () => {
     assert.match(items[0].textContent, /Open video \(0:05\)/);
     assert.match($("actions-open-folder").title, /\/tmp\/caps\/Pixel 8/);
     assert.match($("actions-gallery-dir").textContent, /2 captures/);
-    assert.match($("actions-candidates").textContent, /app-debug\.apk/);
 
     $("actions-shot").click();
     await flush();
@@ -907,18 +910,13 @@ describe("actions page script", () => {
     assert.deepEqual(ops("captures.delete")[0].body.payload, { name: SHOT.name });
   });
 
-  test("a gallery whose last commit pruned shows the notice; no install roots shows the explanation", async () => {
+  test("a gallery whose last commit pruned shows the notice", async () => {
     const page = bootPage({
-      reply: ({ op }) => op === "apps.candidates" ? ok({ configured: false, roots: [], candidates: [], truncated: false,
-        hint: "Start the Canvas with --install-root <folder>, for example `autonom canvas --install-root ~/src/app/build`" })
-        : op === "captures.list" ? ok({ captures: [], count: 0, total_bytes: 0, dir: "/c", last_pruned: { at: "x", count: 1 } })
+      reply: ({ op }) => op === "captures.list" ? ok({ captures: [], count: 0, total_bytes: 0, dir: "/c", last_pruned: { at: "x", count: 1 } })
           : null,
     });
     page.$("actions-toggle").click();
     await flush();
-    assert.equal(page.$("actions-install-off").hidden, false);
-    assert.equal(page.$("actions-install-on").hidden, true);
-    assert.match(page.$("actions-install-hint").textContent, /--install-root <folder>/);
     assert.equal(page.$("actions-prune").textContent, "Deleted 1 oldest capture to stay under 200 files / 2 GB");
     assert.equal(page.$("actions-gallery-empty").hidden, false);
   });
@@ -1062,45 +1060,15 @@ describe("actions page script", () => {
     assert.match($("actions-rec-time").textContent, /^Recording 0:0\d \/ 3:00$/);
   });
 
-  test("install, launch, open link and language send their payloads; device controls follow the control rule", async () => {
+  test("capture controls follow the control rule", async () => {
     let canSend = true;
-    const page = bootPage({
-      canSend: () => canSend,
-      reply: ({ op }) => op === "app.install" ? ok({ installed: "/src/app/build/app-debug.apk", app_id: null, size: 1, duration_ms: 1200 })
-        : op === "app.install" ? null : null,
-    });
+    const page = bootPage({canSend: () => canSend});
     const { $, ops, timers } = page;
     $("actions-toggle").click();
     await flush();
-    $("actions-candidates").querySelector("button").click();
-    assert.equal($("actions-install-path").value, "/src/app/build/app-debug.apk");
-    $("actions-downgrade").checked = true;
-    $("actions-install-go").click();
-    await flush();
-    assert.deepEqual(ops("app.install")[0].body.payload, { path: "/src/app/build/app-debug.apk", allow_downgrade: true });
-    assert.match($("actions-msg-capture").textContent, /Installed app-debug\.apk/);
-
-    $("actions-launch").click();
-    await flush();
-    assert.equal(ops("app.launch").length, 0, "no app id, no call");
-    assert.match($("actions-msg-capture").textContent, /package or bundle id/);
-    $("actions-app-id").value = "com.example.app";
-    $("actions-fresh").checked = true;
-    $("actions-launch").click();
-    await flush();
-    assert.deepEqual(ops("app.launch")[0].body.payload, { app_id: "com.example.app", fresh: true });
-    $("actions-url").value = "myapp://profile/42";
-    $("actions-url-go").click();
-    await flush();
-    assert.deepEqual(ops("app.open_url")[0].body.payload, { url: "myapp://profile/42" });
-    $("actions-locale").value = "de-DE";
-    $("actions-locale-go").click();
-    await flush();
-    assert.deepEqual(ops("app.locale")[0].body.payload, { app_id: "com.example.app", locale: "de-DE" });
-
     canSend = false;
     await timers.tick(600);
-    for (const id of ["actions-shot", "actions-record", "actions-install-go", "actions-launch", "actions-url-go", "actions-locale-go"]) {
+    for (const id of ["actions-shot", "actions-record"]) {
       assert.equal($(id).disabled, true, id);
     }
     assert.equal($("actions-lock").hidden, false);
@@ -1239,4 +1207,24 @@ test("actions page: Finder reveal has no client-selected path and reports succes
   assert.match(page.$("actions-msg-capture").textContent,/Opened the captures folder/);
   fail=true;page.$("actions-open-folder").click();await flush();
   assert.match(page.$("actions-msg-capture").textContent,/Finder unavailable/);
+});
+
+test("dock and drawer capture snapshot the shared frame; Stop never re-reads it", async () => {
+  let framed=true;let recording=false;
+  const page=bootPage({withDock:true,captureFrameOptions:()=>framed?{frame:{corner:.12,inset:.025}}:{},reply:({op})=>{
+    if(op==="record.start"){recording=true;return ok({recording:{started_at:new Date().toISOString()}})}
+    if(op==="record.stop"){recording=false;return ok({capture:VIDEO,duration_ms:1000})}
+    if(op==="record.status")return ok({recording});
+    return null;
+  }});
+  await page.timers.tick(2000);
+  page.$("dock-shot").click();await flush();
+  assert.deepEqual(page.ops("capture.screenshot")[0].body.payload,{frame:{corner:.12,inset:.025}});
+  page.$("dock-record").click();await flush();
+  assert.deepEqual(page.ops("record.start")[0].body.payload,{frame:{corner:.12,inset:.025}});
+  framed=false;
+  page.$("dock-record").click();await flush();
+  assert.deepEqual(page.ops("record.stop")[0].body.payload,{});
+  page.$("actions-shot").click();await flush();
+  assert.deepEqual(page.ops("capture.screenshot")[1].body.payload,{});
 });

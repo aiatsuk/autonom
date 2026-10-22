@@ -24,6 +24,7 @@ from typing import Any, Callable, Iterator
 
 from . import adb as adb_mod
 from . import errors
+from . import emulator_launch
 from . import processes
 
 try:  # POSIX (macOS, Linux: every platform Autonom runs on); absent on Windows
@@ -344,9 +345,11 @@ def _launching_on(port: int) -> int | None:
     return None
 
 
-def _discard_child(child: subprocess.Popen) -> None:
+def _discard_child(child: subprocess.Popen | emulator_launch.LaunchdChild) -> None:
     """Stop and reap an emulator this boot launched that cannot be its own."""
-    if child.poll() is None:
+    if isinstance(child, emulator_launch.LaunchdChild):
+        child.close()
+    elif child.poll() is None:
         processes.terminate_group(child.pid, timeout=5.0)
     with contextlib.suppress(subprocess.TimeoutExpired, OSError):
         child.wait(timeout=5)
@@ -445,13 +448,7 @@ def _boot_locked(emulator_bin: str, adb_path: str, name: str, *, wait: bool,
         # change. It cannot be injected into a running emulator.
         routed_hostport = _proxy_hostport(http_proxy)
         argv += ["-http-proxy", _emulator_proxy_url(http_proxy)]
-    child = subprocess.Popen(
-        argv,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
+    child = emulator_launch.start(argv)
     # Owned by the harness, not by a session: `devices boot` has no session
     # directory to point at, and an entry without one used to be classified
     # an orphan — so `cleanup` would have killed an emulator a session was
@@ -460,6 +457,7 @@ def _boot_locked(emulator_bin: str, adb_path: str, name: str, *, wait: bool,
     # the transparent path is available before touching the device.
     processes.register("emulator", child.pid, avd=name, owner=processes.HARNESS_OWNER,
                        http_proxy=routed_hostport,
+                       launchd_service=getattr(child, "service", None),
                        serial=f"emulator-{port}" if port is not None else None)
     if port is not None:
         # The serial is fixed by the port: nothing is left to pick.
@@ -511,11 +509,13 @@ def _boot_locked(emulator_bin: str, adb_path: str, name: str, *, wait: bool,
                 # A pin recorded for an earlier emulator on this port must
                 # never be replayed onto the one just booted.
                 dropped = _forget_device_state(serial)
+                child.poll()  # Reap a launch job that exited just after reporting ready.
                 return {**detail, "booted": True, "waited": True,
                         "serial": serial, "target_id": serial,
                         "stale_pin_dropped": dropped, "already_running": False,
                         "port": _port_of(serial)}
         if child.poll() is not None and serial is None and time.monotonic() - started > 3:
+            processes.deregister(child.pid)
             raise errors.AutonomError(
                 errors.BACKEND_FAILED,
                 f"emulator exited with code {child.returncode} before a device appeared",
@@ -602,6 +602,8 @@ def forget_emulator(serial: str, avd: str | None = None) -> list[int]:
             continue
         if entry.get("serial") == serial or (
                 avd and not entry.get("serial") and entry.get("avd") == avd):
+            if entry.get("launchd_service"):
+                emulator_launch.remove_service(entry["launchd_service"])
             processes.deregister(int(entry["pid"]))
             released.append(int(entry["pid"]))
     return released

@@ -154,6 +154,13 @@ svg{width:var(--icon-size);height:var(--icon-size);fill:none;stroke:currentColor
 input:not([type=checkbox]):not([type=radio]):not([type=range]),select,textarea{min-width:0;height:var(--control-height);padding:0 10px;border:1px solid var(--line-2);border-radius:var(--r-sm);background-color:var(--raised)}
 input::placeholder,textarea::placeholder{color:var(--text-2);opacity:1}
 input:is([type=checkbox],[type=radio]){accent-color:var(--accent)}
+input.ui-switch{appearance:none;position:relative;flex:none;width:30px;height:18px;margin:0;border:0;border-radius:999px;background:var(--line-2);cursor:pointer;transition:background-color 140ms ease}
+input.ui-switch:before{content:"";position:absolute;left:2px;top:2px;width:14px;height:14px;border-radius:50%;background:#fff;box-shadow:0 1px 2px #0002;transition:transform 140ms ease}
+input.ui-switch:checked{background:var(--accent)}
+input.ui-switch:checked:before{transform:translateX(12px)}
+input.ui-switch:disabled{opacity:.45;cursor:default}
+@media(prefers-reduced-motion:reduce){input.ui-switch,input.ui-switch:before{transition:none}}
+
 :is(.group,.tools-group,.act-group){padding:12px;margin:12px;min-width:0;border:1px solid var(--line-2);border-radius:var(--group-radius);background:var(--raised)}
 :is(.group h2,.tools-group h3,.act-group h3){margin:0 0 8px;font-size:13px;font-weight:600;color:var(--text);letter-spacing:normal}
 :is(.tools-label,.act-label){display:block;margin:8px 0 4px;font-size:12px;color:var(--text-2)}

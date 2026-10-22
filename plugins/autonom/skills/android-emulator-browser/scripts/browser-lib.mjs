@@ -14,13 +14,14 @@ export const DEFAULT_FPS = 15;
 // scrcpy only sends frames when the screen changes, so its cap can be higher than
 // the multipart default; an explicit --fps still applies to it.
 export const DEFAULT_SCRCPY_MAX_FPS = 60;
+export const SOFTWARE_ENCODER_MAX_FPS = 30;
 // The stream size without --max-size (DEC-005): scrcpy follows the device's H.264
-// encoder, SOFTWARE_ENCODER_MAX_SIZE on the long side for a software-only one (60 fps on
-// the emulator at a third less host CPU than native), native size (0) for a hardware one,
+// encoder, SOFTWARE_ENCODER_MAX_SIZE on the long side for a software-only one
+// (compact desktop preview), native size (0) for a hardware one,
 // and DEFAULT_MAX_SIZE when the encoders cannot be read. screenrecord always uses
 // DEFAULT_MAX_SIZE unless --max-size says otherwise.
 export const DEFAULT_MAX_SIZE = 1280;
-export const SOFTWARE_ENCODER_MAX_SIZE = 2048;
+export const SOFTWARE_ENCODER_MAX_SIZE = 1280;
 export const NATIVE_MAX_SIZE = 0;
 export const MIN_MAX_SIZE = 320;
 export const MAX_MAX_SIZE = 4096;
@@ -388,6 +389,14 @@ function checkCanvasMode(options) {
     options.platform = only.platform;
     options.target = only.target;
   }
+}
+
+/** Keep software encoding from competing with app input/rendering at 60 fps. */
+export function streamMaxFps(options, probe, cap = DEFAULT_SCRCPY_MAX_FPS) {
+  const requested = options.fpsExplicit ? options.fps : DEFAULT_SCRCPY_MAX_FPS;
+  const encoderCap = !options.fpsExplicit && probe?.encoder === "software"
+    ? SOFTWARE_ENCODER_MAX_FPS : requested;
+  return Math.min(requested, encoderCap, cap);
 }
 
 /**

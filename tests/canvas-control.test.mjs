@@ -222,7 +222,7 @@ test("--control-idle: 15 to 3600 seconds, default 120; anything else is a usage 
 
 test("LEASED_TOOLS_OPS is the list of contract 4.3 and the Python tools process's list", () => {
   const expected = ["permissions.set", "location.set", "location.clear", "simulate", "network.capture", "network.attach",
-    "network.detach", "network.stop", "app.install", "app.launch", "app.open_url", "app.locale"];
+    "network.detach", "network.stop", "app.install", "app.launch", "app.open_url", "app.locale", "device.language.set"];
   assert.deepEqual([...LEASED_TOOLS_OPS], expected);
   const python = readFileSync(join(ROOT, "scripts/autonom_canvas_tools.py"), "utf8");
   const block = /^LEASED_TOOLS_OPS = \(([^)]*)\)/m.exec(python);

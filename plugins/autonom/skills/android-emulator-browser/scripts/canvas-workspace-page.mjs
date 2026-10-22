@@ -101,6 +101,11 @@ body{margin:0;background:var(--bg);color:var(--text);font:13px/1.4 var(--font);-
   display:grid;grid-template-rows:auto minmax(0,1fr);overflow:hidden}
 a{color:inherit}
 
+.ws-settings{position:fixed;top:60px;left:8px;z-index:7;width:min(320px,calc(100vw - 16px));padding:4px 12px 8px;border:1px solid var(--line-2);border-radius:12px;background:var(--raised);box-shadow:var(--shadow)}
+.ws-settings-head,.ws-setting{display:flex;align-items:center;justify-content:space-between;min-height:40px;gap:12px}
+.ws-settings-head{border-bottom:1px solid var(--line)}
+.ws-setting .canvas-theme-control{width:160px}
+.ws-setting .canvas-theme{width:100%}
 /* header: brand, tab bar, layout, tab menu */
 .ws-bar{position:relative;z-index:4;display:grid;grid-template-columns:auto minmax(0,1fr) auto auto;grid-template-areas:"brand tabs layout menu";
   align-items:center;gap:12px;min-height:52px;padding:0 14px;border-bottom:1px solid var(--line);background:var(--surface)}
@@ -143,14 +148,12 @@ a{color:inherit}
 .tile{position:relative;display:flex;flex-direction:column;min-width:0;min-height:0;border-radius:var(--r-md);background:var(--surface);border:1px solid var(--line);overflow:hidden;container-type:inline-size;
   transition:box-shadow .15s ease-out,border-color .15s ease-out}
 .tile[data-focused=true]{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent)}
-.tile-head{display:flex;align-items:center;gap:8px;height:40px;padding:0 4px 0 12px;border-bottom:1px solid var(--line);flex:none;min-width:0}
+.tile-head{display:flex;align-items:center;gap:6px;height:44px;padding:0 6px;border-bottom:1px solid var(--line);flex:none;min-width:0}
 .tile-name{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
 .badge{flex:none;height:18px;padding:0 6px;border-radius:5px;background:var(--fill);color:var(--text-2);font-size:11px;font-weight:500;line-height:18px}
 .tile-stats{flex:none;color:var(--text-2);font-size:12px;font-variant-numeric:tabular-nums;white-space:nowrap}
 .tile-spacer{flex:1;min-width:0}
 .tile-control{position:relative;flex:none}
-.tile-chip{display:flex;align-items:center;gap:4px;height:26px;padding:0 6px 0 10px;border:0;border-radius:999px;background:var(--fill);color:var(--text-2);font-weight:500;font-size:12px;white-space:nowrap}
-.tile-chip svg{width:12px;height:12px}
 .tile-pop{position:absolute;top:calc(100% + 4px);right:0;z-index:3;display:grid;gap:2px;min-width:150px;padding:5px;border-radius:10px;background:var(--raised);
   -webkit-backdrop-filter:blur(24px) saturate(1.6);backdrop-filter:blur(24px) saturate(1.6);border:1px solid var(--line-2);box-shadow:var(--shadow)}
 .tile-pop-item{height:30px;padding:0 10px;border:0;border-radius:6px;background:none;text-align:left;white-space:nowrap}
@@ -159,6 +162,7 @@ a{color:inherit}
 .tile-alert[data-kind=error]{background:color-mix(in srgb,var(--danger) 10%,var(--surface))}
 .tile-alert span{flex:1;min-width:0;overflow-wrap:anywhere}
 .tile-body{position:relative;flex:1;min-height:0;display:flex}
+@container (max-width:520px){.tile-head{gap:4px;padding-left:8px}.tile-head .badge,.tile-stats{display:none}.tile-name{flex:1}.tile-spacer{display:none}}
 .tile-frame{flex:1;width:100%;height:100%;border:0;background:var(--bg)}
 .tile-wait{margin:auto;color:var(--text-2)}
 .picker,.absent{margin:auto;width:min(420px,100%);padding:20px 16px;overflow:auto;max-height:100%}
@@ -185,7 +189,7 @@ a{color:inherit}
 .ws-confirm-text{margin:6px 0 14px;color:var(--text-2)}
 .ws-confirm-actions{display:flex;justify-content:flex-end;gap:8px}
 @container (max-width:460px){.tile-stats{display:none}}
-@container (max-width:360px){.badge{display:none}.tile-chip{padding:0 6px}}
+@container (max-width:360px){.badge{display:none}}
 
 @media (hover:hover){
   .ws-layouts .ws-icon:not(:disabled):hover{background:var(--fill-2)}
@@ -219,13 +223,13 @@ export function workspaceMarkup(model) {
     `<button type="button" class="ws-icon" data-layout-choice="${value}" aria-pressed="false" aria-label="${LAYOUT_LABELS[value]}" title="${LAYOUT_LABELS[value]}">${svg(`layout${value}`)}</button>`).join("");
   const icons = Object.keys(CANVAS_ICONS).map((name) => svg(name, ` data-icon="${name}"`)).join("");
   return `<header class="ws-bar">
-  <div class="ws-brand"><span class="ws-mark" aria-hidden="true">${svg("mark")}</span><b>Autonom</b><span class="ws-name" id="ws-name" title="Workspace">${escapeHtml(workspace)}</span></div>
+  <div class="ws-brand"><button type="button" class="ws-icon" id="ws-settings-toggle" aria-label="Canvas settings" aria-expanded="false" aria-controls="ws-settings" title="Canvas settings">${svg("settings")}</button><b>Autonom</b><span class="ws-name" id="ws-name" title="Workspace">${escapeHtml(workspace)}</span></div>
   <div class="ws-tabbar">
     <div class="ws-tabs" id="ws-tabs" role="tablist" aria-label="Canvas tabs"></div>
     <button type="button" class="ws-icon" id="ws-new-tab" aria-label="New tab" title="New tab">${svg("plus")}</button>
   </div>
   <div class="ws-layouts" id="ws-layouts" role="group" aria-label="Layout">${layouts}</div>
-  <div class="ws-menu-wrap">${themeControl()}
+  <div class="ws-menu-wrap">
     <button type="button" class="ws-icon" id="ws-menu-button" aria-haspopup="menu" aria-expanded="false" aria-controls="ws-menu" aria-label="Tab menu" title="Tab menu">${svg("more")}</button>
     <div class="ws-menu" id="ws-menu" role="menu" aria-label="Tab" hidden>
       <button type="button" class="ws-menu-item" role="menuitem" id="ws-menu-rename" tabindex="-1">Rename…</button>
@@ -235,6 +239,10 @@ export function workspaceMarkup(model) {
     </div>
   </div>
 </header>
+<section class="ws-settings" id="ws-settings" role="dialog" aria-label="Canvas settings" hidden>
+  <div class="ws-settings-head"><strong>Canvas settings</strong><button type="button" class="ws-icon" id="ws-settings-close" aria-label="Close Canvas settings">${svg("close")}</button></div>
+  <div class="ws-setting"><span>Theme</span>${themeControl()}</div>
+</section>
 <main class="ws-stage" id="ws-stage" role="tabpanel" tabindex="-1">
   <p class="ws-lead" id="ws-empty" hidden>${escapeHtml(EMPTY_WORKSPACE_TEXT)}</p>
   <div class="ws-grid" id="ws-grid" data-layout="1"></div>
@@ -256,7 +264,6 @@ export function workspaceScript(model) {
   return `"use strict";
 const MODEL=${data};
 const LAYOUTS=${JSON.stringify(LAYOUTS)};
-const OWNERS={shared:"Shared",human:"People",agent:"Agent",replay:"Replay",system:"System"};
 const STATE_LABELS={attaching:"Attaching",live:"Live",offline:"Offline",failed:"Failed",detaching:"Detaching"};
 const FRAME_STATES=["live","offline","failed"];
 ${tabPath.toString()}
@@ -560,35 +567,31 @@ function updateTile(tile,want){
 function buildDevice(tile){
   const head=el("div","tile-head");
   const dot=el("i","dot");dot.setAttribute("aria-hidden","true");
-  const name=el("span","tile-name"),state=el("span","sr"),badge=el("span","badge"),stats=el("span","tile-stats"),spacer=el("span","tile-spacer");
+  const name=el("span","tile-name"),state=el("span","sr"),badge=el("span","badge sr"),stats=el("span","tile-stats sr"),spacer=el("span","tile-spacer");
   const control=el("div","tile-control");
-  const chip=button("tile-chip");chip.setAttribute("aria-haspopup","true");chip.setAttribute("aria-expanded","false");
-  const chipText=el("span");chip.appendChild(chipText);chip.appendChild(icon("chevron"));
-  const pop=el("div","tile-pop");pop.setAttribute("role","group");pop.setAttribute("aria-label","Control");pop.hidden=true;
-  const pause=button("tile-pop-item"),take=button("tile-pop-item");
-  pop.appendChild(pause);pop.appendChild(take);control.appendChild(chip);control.appendChild(pop);
+  const chip=iconButton("more","Device menu");chip.setAttribute("aria-haspopup","true");chip.setAttribute("aria-expanded","false");
+  const pop=el("div","tile-pop");pop.setAttribute("role","group");pop.setAttribute("aria-label","Device menu");pop.hidden=true;
+  control.appendChild(chip);control.appendChild(pop);
   const tools=iconButton("tools","Tools");tools.setAttribute("aria-pressed","false");
   const actions=iconButton("actions","Actions");actions.setAttribute("aria-pressed","false");
-  const detach=iconButton("detach","Detach");
-  for(const node of [dot,name,state,badge,stats,spacer,control,tools,actions,detach])head.appendChild(node);
+  const settings=iconButton("settings","Device settings"),inspector=iconButton("inspector","Inspector");
+  for(const node of [settings,inspector])node.setAttribute("aria-pressed","false");
+  const detach=button("tile-pop-item","Detach device","Detach");pop.appendChild(detach);
+  for(const node of [settings,dot,name,state,badge,stats,spacer,tools,actions,inspector,control])head.appendChild(node);
   const alert=el("div","tile-alert");alert.setAttribute("role","status");alert.hidden=true;
   const alertText=el("span"),reconnect=button("btn small","Reconnect");
   alert.appendChild(alertText);alert.appendChild(reconnect);
   const wait=el("p","tile-wait");
   tile.body.appendChild(wait);
   tile.el.appendChild(head);tile.el.appendChild(alert);
-  tile.parts={dot,name,state,badge,stats,chip,chipText,pop,pause,take,tools,actions,detach,alert,alertText,reconnect,wait};
-  chip.addEventListener("click",()=>{const open=pop.hidden;closePops();if(open){pop.hidden=false;chip.setAttribute("aria-expanded","true");pause.focus()}});
-  pause.addEventListener("click",()=>setControl(tile,controlState(tile).paused?"resume":"pause"));
-  take.addEventListener("click",()=>setControl(tile,controlState(tile).owner==="human"?"release":"takeover"));
+  tile.parts={dot,name,state,badge,stats,chip,pop,tools,actions,settings,inspector,detach,alert,alertText,reconnect,wait};
+  chip.addEventListener("click",()=>{const open=pop.hidden;closePops();if(open){pop.hidden=false;chip.setAttribute("aria-expanded","true");detach.focus()}});
+  settings.addEventListener("click",()=>togglePanel(tile,"settings"));
+  inspector.addEventListener("click",()=>togglePanel(tile,"inspector"));
   tools.addEventListener("click",()=>togglePanel(tile,"tools"));
   actions.addEventListener("click",()=>togglePanel(tile,"actions"));
   detach.addEventListener("click",()=>act("detach:"+tile.id,api("POST",deviceApi(tile.id)+"/detach",{})));
   reconnect.addEventListener("click",()=>act("reconnect:"+tile.id,api("POST",deviceApi(tile.id)+"/reconnect",{}),()=>notice("Reconnecting "+(tile.want.device.name||tile.id)+"…",false)));
-}
-function controlState(tile){
-  const device=tile.want.device||{},state=live.get(tile.id)||{};
-  return{owner:typeof state.owner==="string"?state.owner:(device.control_owner||"shared"),paused:typeof state.paused==="boolean"?state.paused:Boolean(device.input_paused)};
 }
 function updateDevice(tile,device){
   const parts=tile.parts,state=String(device.state||"attaching"),name=String(device.name||device.target||tile.id);
@@ -603,16 +606,11 @@ function updateDevice(tile,device){
   else if(count(device.fps_cap))stats=count(device.fps_cap)+" fps max";
   setText(parts.stats,stats);parts.stats.hidden=!stats;
   parts.stats.title=device.profile==="background"?"Background profile: lower frame rate and size":"Focused profile";
-  const control=controlState(tile);
-  setText(parts.chipText,(OWNERS[control.owner]||control.owner)+(control.paused?" · Paused":""));
-  setAttr(parts.chip,"aria-label","Control: "+(OWNERS[control.owner]||control.owner)+(control.paused?", input paused":""));
-  setText(parts.pause,control.paused?"Resume input":"Pause input");
-  setText(parts.take,control.owner==="human"?"Release":"Take over");
   const ready=state==="live";
-  for(const node of [parts.chip,parts.pause,parts.take,parts.tools,parts.actions])if(node.disabled===ready)node.disabled=!ready;
+  for(const node of [parts.tools,parts.actions,parts.settings,parts.inspector])if(node.disabled===ready)node.disabled=!ready;
   if(!ready)closePop(tile);
   const panel=panels.get(tile.id)||{};
-  setAttr(parts.tools,"aria-pressed",Boolean(panel.tools));setAttr(parts.actions,"aria-pressed",Boolean(panel.actions));
+  for(const name of ["tools","actions","settings","inspector"])setAttr(parts[name],"aria-pressed",Boolean(panel[name]));
   parts.detach.disabled=state==="detaching"||busy.has("detach:"+tile.id);
   let alert="",kind="warn";
   if(state==="failed"){alert="Device failed"+(device.error?": "+errorText(device.error):".");kind="error"}
@@ -632,20 +630,11 @@ function updateDevice(tile,device){
 }
 function closePop(tile){if(tile.parts&&!tile.parts.pop.hidden){tile.parts.pop.hidden=true;tile.parts.chip.setAttribute("aria-expanded","false")}}
 function closePops(){for(const tile of tiles)if(tile&&tile.kind==="device")closePop(tile)}
-function setControl(tile,mode){
-  closePops();
-  act("control:"+tile.id,api("POST",devicePath(tile.id)+"/control",{mode}),result=>{
-    const state=live.get(tile.id)||{};
-    if(typeof result.control_owner==="string")state.owner=result.control_owner;
-    if(typeof result.input_paused==="boolean")state.paused=result.input_paused;
-    live.set(tile.id,state);
-  });
-}
 function send(tile,message){try{const target=tile.iframe&&tile.iframe.contentWindow;if(target)target.postMessage(message,location.origin)}catch(error){}}
 function togglePanel(tile,name){
   const panel=panels.get(tile.id)||{tools:false,actions:false},open=!panel[name];
-  panel.tools=false;panel.actions=false;panel[name]=open;panels.set(tile.id,panel);
-  if(name==="tools")send(tile,{type:"autonom:tools",open});else send(tile,{type:"autonom:panel",name:"actions",open});
+  panel.tools=false;panel.actions=false;panel.settings=false;panel.inspector=false;panel[name]=open;panels.set(tile.id,panel);
+  if(name==="tools")send(tile,{type:"autonom:tools",open});else send(tile,{type:"autonom:panel",name,open});
   updateTile(tile,tile.want);
 }
 
@@ -828,12 +817,19 @@ window.addEventListener("message",event=>{
   const data=event.data;if(!data||typeof data!=="object"||typeof data.type!=="string")return;
   const tile=tiles.find(item=>item&&item.iframe&&item.iframe.contentWindow===event.source);if(!tile)return;
   if(data.id!==undefined&&data.id!==tile.id)return;
-  if(data.type==="autonom:ready"){send(tile,{type:"autonom:focus",focused:tile.id===focusedId});const panel=panels.get(tile.id);if(panel&&panel.tools)send(tile,{type:"autonom:tools",open:true});if(panel&&panel.actions)send(tile,{type:"autonom:panel",name:"actions",open:true})}
+  if(data.type==="autonom:ready"){send(tile,{type:"autonom:focus",focused:tile.id===focusedId});const panel=panels.get(tile.id);if(panel&&panel.tools)send(tile,{type:"autonom:tools",open:true});for(const name of ["actions","settings","inspector"])if(panel&&panel[name])send(tile,{type:"autonom:panel",name,open:true})}
+  else if(data.type==="autonom:panels"){const panel={};for(const name of ["tools","actions","settings","inspector"])panel[name]=data[name]===true;panels.set(tile.id,panel);updateTile(tile,tile.want)}
   else if(data.type==="autonom:focus-request")focusDevice(tile.id,false);
   else if(data.type==="autonom:state"){live.set(tile.id,{live:Boolean(data.live),session:typeof data.session==="string"?data.session:null,transport:typeof data.transport==="string"?data.transport:null,owner:typeof data.owner==="string"?data.owner:undefined,paused:typeof data.paused==="boolean"?data.paused:undefined,fps:count(data.fps),width:count(data.width),height:count(data.height)});updateTile(tile,tile.want)}
   else if(data.type==="autonom:hotkey"){const key=String(data.key);runHotkey(/^[1-4]$/.test(key)?{tile:Number(key)}:key==="ArrowLeft"?{tab:-1}:key==="ArrowRight"?{tab:1}:null)}
 });
 
+const settingsButton=$("ws-settings-toggle"),settingsPanel=$("ws-settings");
+function showSettings(open,focus=false){settingsPanel.hidden=!open;settingsButton.setAttribute("aria-expanded",String(open));settingsButton.setAttribute("aria-pressed",String(open));if(open)$("ws-settings-close").focus();else if(focus)settingsButton.focus()}
+settingsButton.addEventListener("click",()=>showSettings(settingsPanel.hidden));
+$("ws-settings-close").addEventListener("click",()=>showSettings(false,true));
+document.addEventListener("pointerdown",event=>{if(!settingsPanel.hidden&&!settingsPanel.contains(event.target)&&!settingsButton.contains(event.target))showSettings(false)});
+document.addEventListener("keydown",event=>{if(event.key==="Escape"&&!event.defaultPrevented&&!settingsPanel.hidden){event.preventDefault();showSettings(false,true)}});
 async function bootstrap(){if(!(await authenticate()))return;await refresh();syncTimers()}
 bootstrap().catch(showError);`;
 }

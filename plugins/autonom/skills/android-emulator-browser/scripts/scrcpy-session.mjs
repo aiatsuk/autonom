@@ -258,6 +258,7 @@ function codecProblem(codec) {
  * States: idle → starting → streaming ↔ restarting → stopped.
  * With `chooseMaxSize`, each attempt asks probeVideoEncoders (once per serial) after the
  * push and streams at chooseMaxSize(result), instead of at `maxSize`.
+ * chooseMaxFps uses that same cached probe to select the encoder frame-rate cap.
  * Events: state(name), session({width, height}), config(Buffer),
  * packet({keyFrame, pts, data}), device-message(message), control-drain(),
  * error(Error), exit({code, signal}).
@@ -284,6 +285,7 @@ export class ScrcpySession extends EventEmitter {
   #size = null;
   #deviceName = null;
   #maxSize = null;
+  #maxFps = null;
 
   constructor({
     adbPath,
@@ -292,6 +294,7 @@ export class ScrcpySession extends EventEmitter {
     version = SCRCPY_PROTOCOL_VERSION,
     maxSize,
     chooseMaxSize = null,
+    chooseMaxFps = null,
     bitRate,
     maxFps,
     exec = defaultExec,
@@ -299,7 +302,7 @@ export class ScrcpySession extends EventEmitter {
     connect = nodeConnect,
   }) {
     super();
-    this.#options = { adbPath, serial, serverPath, version, maxSize, chooseMaxSize, bitRate, maxFps };
+    this.#options = { adbPath, serial, serverPath, version, maxSize, chooseMaxSize, chooseMaxFps, bitRate, maxFps };
     this.#exec = exec;
     this.#spawn = spawn;
     this.#connect = connect;
@@ -322,6 +325,7 @@ export class ScrcpySession extends EventEmitter {
     return {
       state: this.#state,
       maxSize: this.#maxSize,
+      maxFps: this.#maxFps,
       width: this.#size?.width ?? null,
       height: this.#size?.height ?? null,
       deviceName: this.#deviceName,
@@ -435,17 +439,19 @@ export class ScrcpySession extends EventEmitter {
   }
 
   async #open(attempt) {
-    const { serverPath, version, chooseMaxSize, bitRate, maxFps } = this.#options;
+    const { serverPath, version, chooseMaxSize, chooseMaxFps, bitRate } = this.#options;
     await this.#adb(["push", serverPath, REMOTE_SERVER_PATH], PUSH_TIMEOUT_MS);
     this.#checkAttempt(attempt);
-    let { maxSize } = this.#options;
-    if (chooseMaxSize) {
+    let { maxSize, maxFps } = this.#options;
+    if (chooseMaxSize || chooseMaxFps) {
       const { adbPath, serial } = this.#options;
       const encoders = await probeVideoEncoders({ adbPath, serial, version, exec: this.#exec });
       this.#checkAttempt(attempt);
-      maxSize = chooseMaxSize(encoders);
+      if (chooseMaxSize) maxSize = chooseMaxSize(encoders);
+      if (chooseMaxFps) maxFps = chooseMaxFps(encoders);
     }
     this.#maxSize = maxSize;
+    this.#maxFps = maxFps;
     // A teardown that starts while adb is still answering waits for this to remove the forward.
     attempt.forwarding = this.#forward(attempt);
     await attempt.forwarding;

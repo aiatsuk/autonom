@@ -78,7 +78,7 @@ RECORD_TRANSPORTS = ("scrcpy", "idb")
 DISPLAY_TRANSPORTS = ("scrcpy", "screenrecord", "screencap")
 # The presets Canvas applies, `default` (the device's own size) and `restore`
 # (the stop-time return to what the device had before the first change).
-DISPLAY_PRESETS = ("small", "pixel-11", "pixel-fold", "tablet", "default", "restore")
+DISPLAY_PRESETS = ("small", "pixel-10", "pixel-fold", "pixel-fold-closed", "tablet", "default", "restore")
 MAX_DISPLAY_SIDE = 10_000
 MAX_DENSITY = 1_000
 SYSTEM_OPS = ("back", "home", "app-switch", "power", "volume-up", "volume-down", "wake",
