@@ -5879,7 +5879,7 @@ test("page: the size menu is a keyboard listbox: Enter opens it on the first pre
   run("view.status={platform:\"android\"};view.preset=\"default\";syncPicker()");
   assert.equal(button.disabled, false);
   assert.equal(document.getElementById("display-label").textContent, "Device default");
-  assert.deepEqual(selected(), []);
+  assert.deepEqual(selected(), ["default"]);
 
   button.focus();
   press("Enter");
@@ -5911,13 +5911,13 @@ test("page: the size menu is a keyboard listbox: Enter opens it on the first pre
   assert.equal(focused(), "display-preset");
   // ArrowUp opens on the last option; Home and End move; Tab closes.
   press("ArrowUp");
-  assert.equal(focused(), "pixel-fold-closed");
+  assert.equal(focused(), "default");
   press("Home");
   assert.equal(focused(), "small");
   press("End");
-  assert.equal(focused(), "pixel-fold-closed");
+  assert.equal(focused(), "default");
   press("ArrowDown");
-  assert.equal(focused(), "pixel-fold-closed", "the focus left the menu past its last option");
+  assert.equal(focused(), "default", "the focus left the menu past its last option");
   press("Tab");
   assert.equal(isOpen(), false);
   // A pointer opens it on the preset in effect and follows the pointer; a click elsewhere closes it.
