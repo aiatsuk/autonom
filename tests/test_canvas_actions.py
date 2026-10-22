@@ -231,10 +231,10 @@ class ActionsCase(EnvSandboxMixin, unittest.TestCase):
 class OpListTests(ActionsCase):
     def test_the_action_tuples_and_tools_lists_match_the_contract(self) -> None:
         self.assertEqual(tools_mod.ACTION_READ_OPS,
-                         ("captures.list", "record.status", "apps.candidates", "health"))
+                         ("captures.list", "record.status", "apps.candidates", "health", "frame.describe", "device.language.get"))
         self.assertEqual(tools_mod.ACTION_DEVICE_OPS,
                          ("capture.screenshot", "record.start", "record.stop", "app.install",
-                          "app.launch", "app.open_url", "app.locale"))
+                          "app.launch", "app.open_url", "app.locale", "device.language.set"))
         self.assertEqual(tools_mod.ACTION_LOCAL_OPS, ("captures.delete", "captures.open_directory"))
         self.assertEqual(tools_mod.INTERNAL_OPS, ("captures.file",))
         self.assertEqual(tools_mod.OPS, tools_mod.READ_OPS + tools_mod.MUTATING_OPS
@@ -477,6 +477,46 @@ class ScreenshotOpTests(ActionsCase):
         self.assertEqual(entries[1]["argv"], ["canvas", "app.open_url", "https://example.com"])
         self.assertNotIn("SECRET", text)
         self.assertEqual(entries[2]["error_code"], errors.INVALID_VALUE)
+
+
+class FramedCaptureTests(ActionsCase):
+    def test_screenshot_uses_the_frame_before_committing(self):
+        geometry = {"mode": "auto", "rotation": 0}
+        self.tools.frames.source = {"source":"generic","model":"Fixture","fallbackReason":"fixture"}
+        with mock.patch.object(tools_mod.canvas_capture_frame.shutil, "which", return_value="tool"), \
+                mock.patch.object(tools_mod.canvas_capture_frame, "render") as render:
+            result = self.ok("capture.screenshot", {"frame": geometry})
+        self.assertEqual(render.call_args.args[1]["rotation"], 0)
+        self.assertEqual(render.call_args.args[1]["source"]["model"], "Fixture")
+        self.assertEqual(self.visible(), [result["capture"]["name"]])
+
+    def test_failed_screenshot_composition_preserves_original_and_reports_warning(self):
+        self.tools.frames.source = {"source":"generic","model":"Fixture","fallbackReason":"fixture"}
+        with mock.patch.object(tools_mod.canvas_capture_frame.shutil, "which", return_value="tool"), \
+                mock.patch.object(tools_mod.canvas_capture_frame, "render",
+                                  side_effect=errors.AutonomError(errors.BACKEND_FAILED, "render failed")):
+            result = self.ok("capture.screenshot", {"frame": {"mode":"auto","rotation":0}})
+        self.assertIn("original screenshot", result["warning"])
+        self.assertEqual(self.visible(), [result["capture"]["name"]])
+        self.assertEqual(self.hidden(), [])
+
+    def test_auto_finished_video_uses_start_snapshot_and_preserves_video_on_failure(self):
+        geometry = {"mode": "auto", "rotation": 0}
+        self.tools.frames.source = {"source":"generic","model":"Fixture","fallbackReason":"fixture"}
+        with mock.patch.object(tools_mod.canvas_capture_frame.shutil, "which", return_value="tool"):
+            self.ok("record.start", {"frame": geometry})
+        geometry["rotation"] = 90
+        self.tools.frames.source["model"] = "Changed"
+        self.tools.recording["process"].wait(timeout=10)
+        with mock.patch.object(tools_mod.canvas_capture_frame, "render",
+                               side_effect=errors.AutonomError(errors.BACKEND_FAILED, "render failed")) as render:
+            result = self.ok("record.status")
+        self.assertEqual(render.call_args.args[1]["rotation"], 0)
+        self.assertEqual(render.call_args.args[1]["source"]["model"], "Fixture")
+        self.assertEqual(render.call_args.kwargs, {"video": True, "repository": self.tools.frames})
+        self.assertIn("without a frame", result["last"]["warning"])
+        self.assertEqual(self.visible(), [result["last"]["capture"]["name"]])
+        self.assertEqual(self.hidden(), [])
 
 
 class IosScreenshotTests(ActionsCase):

@@ -20,6 +20,7 @@ import {
   parseWmSize,
   screenrecordMaxSize,
   streamMaxSize,
+  streamMaxFps,
 } from "../plugins/autonom/skills/android-emulator-browser/scripts/browser-lib.mjs";
 
 test("parseArgs returns secure defaults and explicit overrides", () => {
@@ -102,9 +103,9 @@ test("streamMaxSize follows the encoder only without --max-size", () => {
   const software = { encoder: "software", name: "c2.android.avc.encoder" };
   const hardware = { encoder: "hardware", name: "c2.qti.avc.encoder" };
   const defaults = parseArgs([]);
-  assert.equal(SOFTWARE_ENCODER_MAX_SIZE, 2048);
+  assert.equal(SOFTWARE_ENCODER_MAX_SIZE, 1280);
   assert.deepEqual(streamMaxSize(defaults, software),
-    { maxSize: 2048, source: "encoder", encoder: "software", encoderName: "c2.android.avc.encoder" });
+    { maxSize: 1280, source: "encoder", encoder: "software", encoderName: "c2.android.avc.encoder" });
   assert.deepEqual(streamMaxSize(defaults, hardware),
     { maxSize: 0, source: "encoder", encoder: "hardware", encoderName: "c2.qti.avc.encoder" });
   // A failed probe, or one whose answer says nothing usable, keeps the old default.
@@ -311,4 +312,13 @@ test("parseArgs: --control-idle takes 15 to 3600 seconds, default 120 (the idle 
   }
   assert.throws(() => parseArgs(["--control-idle"]), /Pass a value after --control-idle/);
   assert.throws(() => parseArgs(["--control-idle", "--no-auth"]), /Pass a value after --control-idle/);
+});
+
+test("software fps cap preserves explicit rates, hardware and stricter profiles", () => {
+  assert.equal(streamMaxFps({}, {encoder: "software"}), 30);
+  assert.equal(streamMaxFps({}, {encoder: "hardware"}), 60);
+  assert.equal(streamMaxFps({}, null), 60);
+  assert.equal(streamMaxFps({}, {encoder: "software"}, 15), 15);
+  assert.equal(streamMaxFps({fpsExplicit: true, fps: 60}, {encoder: "software"}), 60);
+  assert.equal(streamMaxFps({fpsExplicit: true, fps: 20}, {encoder: "software"}), 20);
 });

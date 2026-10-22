@@ -5337,7 +5337,7 @@ CANVAS_IDB_HINT = ("Install it with `brew install facebook/fb/idb-companion`, se
                    "AUTONOM_IDB_COMPANION_BIN to its path, or pass --idb-companion PATH.")
 # The same bounds as parseArgs in browser-lib.mjs, which also takes 0 (native size).
 CANVAS_MAX_SIZE = (320, 4096)
-CANVAS_MAX_SIZE_HINT = ("Without --max-size scrcpy follows the device's H.264 encoder (2048 when "
+CANVAS_MAX_SIZE_HINT = ("Without --max-size scrcpy follows the device's H.264 encoder (1280 when "
                         "software only, native with a hardware one, 1280 when it cannot tell); "
                         "screenrecord uses 1280.")
 CANVAS_BIT_RATE = (100_000, 100_000_000)
@@ -5640,7 +5640,7 @@ def _canvas_check_values(args: argparse.Namespace) -> None:
     if args.fps is not None and not 1 <= args.fps <= 60:
         raise errors.AutonomError(
             errors.INVALID_VALUE, f"--fps must be 1..60, got {args.fps}",
-            "The default is 15, and 60 on the scrcpy and idb transports.")
+            "The default is 15 for multipart, 30 for software scrcpy encoders, and 60 for hardware/unknown scrcpy encoders and idb.")
     if args.max_size not in (None, 0) and not (
             CANVAS_MAX_SIZE[0] <= args.max_size <= CANVAS_MAX_SIZE[1]):
         raise errors.AutonomError(
@@ -5677,7 +5677,7 @@ def _canvas_shared_args(args: argparse.Namespace, scrcpy_server: str | None) -> 
     """Video and auth flags of both modes, in the order of the single-device command."""
     command: list[str] = []
     # Only explicit values are forwarded: an explicit --fps also caps scrcpy,
-    # which otherwise streams at up to 60 fps while multipart keeps 15.
+    # which otherwise caps software encoders at 30 fps and others at 60; multipart keeps 15.
     for flag, value in (("--fps", args.fps), ("--max-size", args.max_size),
                         ("--bit-rate", args.bit_rate)):
         if value is not None:
@@ -6829,10 +6829,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="auto prefers scrcpy on Android when a 4.1 server is found, "
                         "and idb on the iOS Simulator when idb_companion is found")
     p.add_argument("--fps", type=int,
-                   help="frame rate cap (default 15; 60 on the scrcpy and idb transports)")
+                   help="frame rate cap (default 15 multipart; 30 software scrcpy; 60 other scrcpy and idb)")
     p.add_argument("--max-size", type=int, metavar="PX",
                    help="longest video side in pixels on scrcpy (video width on screenrecord), "
-                        "0 for native size; default on scrcpy: 2048 with a software-only "
+                        "0 for native size; default on scrcpy: 1280 with a software-only "
                         "H.264 encoder, native with a hardware one, 1280 when the encoders "
                         "cannot be read; 1280 otherwise")
     p.add_argument("--bit-rate", type=int, metavar="BPS",

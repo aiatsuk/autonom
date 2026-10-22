@@ -47,6 +47,9 @@ class EnvSandboxMixin:
         The pre-existing value of each key is captured once per test and
         restored automatically, no matter how the test exits.
         """
+        # Fake device processes must not register real macOS launch jobs.
+        if pairs.get("AUTONOM_FAKE_STATE"):
+            pairs.setdefault("AUTONOM_EMULATOR_LAUNCH_MODE", "direct")
         saved = getattr(self, "_env_sandbox_saved", None)
         if saved is None:
             saved = set()

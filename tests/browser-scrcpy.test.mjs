@@ -1847,28 +1847,30 @@ async function sizedCanvas(t, { env = {}, args = [] } = {}) {
   return { ...setup, control, viewer, calls, start, options };
 }
 
-test("encoders: without --max-size a software-only device streams 2048 on the long side", async (t) => {
+test("encoders: without --max-size a software-only device streams 1280 on the long side", async (t) => {
   const { canvas, control, calls, options } = await sizedCanvas(t, { env: { FAKE_ENCODERS: SOFTWARE_ENCODERS } });
-  assert.equal(options.max_size, "2048");
+  assert.equal(options.max_size, "1280");
+  assert.equal(options.max_fps, "30");
   // The probe ran after the push and before the server.
   const order = calls.map((args) => isEncoderProbe(args) ? "probe" : isServerStart(args) ? "server"
     : args[2] === "push" ? "push" : null).filter(Boolean);
   assert.deepEqual(order, ["push", "probe", "server"]);
   const body = await status(canvas);
-  assert.equal(body.scrcpy.max_size, 2048);
+  assert.equal(body.scrcpy.max_size, 1280);
   assert.equal(body.scrcpy.max_size_source, "encoder");
   assert.equal(body.scrcpy.encoder, "software");
   assert.equal(body.scrcpy.encoder_name, "c2.android.avc.encoder");
   const state = await control.next((message) => message.json?.t === "state" && message.json.max_size !== null);
-  assert.equal(state.json.max_size, 2048);
+  assert.equal(state.json.max_size, 1280);
   assert.equal(state.json.encoder, "software");
-  assert.match(canvas.output(), /Stream size: 2048 on the long side \(software H\.264 encoder c2\.android\.avc\.encoder\)/);
+  assert.match(canvas.output(), /Stream size: 1280 on the long side \(software H\.264 encoder c2\.android\.avc\.encoder\)/);
   await stopCanvas(canvas);
 });
 
 test("encoders: without --max-size a hardware H.264 encoder streams native size", async (t) => {
   const { canvas, options } = await sizedCanvas(t, { env: { FAKE_ENCODERS: HARDWARE_ENCODERS } });
   assert.equal(options.max_size, "0");
+  assert.equal(options.max_fps, "60");
   const body = await status(canvas);
   assert.deepEqual([body.scrcpy.max_size, body.scrcpy.max_size_source, body.scrcpy.encoder, body.scrcpy.encoder_name],
     [0, "encoder", "hardware", "c2.qti.avc.encoder"]);
@@ -1889,10 +1891,10 @@ test("encoders: a failed or empty encoder list keeps 1280", async (t) => {
   }
 });
 
-test("encoders: an explicit --max-size wins without a probe, and 0 is native", async (t) => {
+test("encoders: explicit size and fps skip the probe, and 0 is native", async (t) => {
   for (const [value, word] of [["1024", "1024 on the long side"], ["0", "native"]]) {
     const { canvas, calls, options } = await sizedCanvas(t, {
-      env: { FAKE_ENCODERS: HARDWARE_ENCODERS }, args: ["--max-size", value],
+      env: { FAKE_ENCODERS: HARDWARE_ENCODERS }, args: ["--max-size", value, "--fps", "60"],
     });
     assert.equal(options.max_size, value);
     assert.equal(calls.filter(isEncoderProbe).length, 0, "a probe ran despite --max-size");
@@ -1900,6 +1902,22 @@ test("encoders: an explicit --max-size wins without a probe, and 0 is native", a
     assert.deepEqual([body.scrcpy.max_size, body.scrcpy.max_size_source, body.scrcpy.encoder],
       [Number(value), "explicit", null]);
     assert.match(canvas.output(), new RegExp(`Stream size: ${word} \\(--max-size\\)`));
+    await stopCanvas(canvas);
+  }
+});
+
+test("encoders: software fps cap applies with explicit size but explicit fps wins", async (t) => {
+  for (const [args, fps, probes] of [
+    [["--max-size", "1024"], "30", 1],
+    [["--fps", "60"], "60", 1],
+    [["--max-size", "0", "--fps", "20"], "20", 0],
+  ]) {
+    const { canvas, calls, options } = await sizedCanvas(t, {
+      env: { FAKE_ENCODERS: SOFTWARE_ENCODERS }, args,
+    });
+    assert.equal(options.max_fps, fps);
+    assert.equal((await status(canvas)).scrcpy.max_fps, Number(fps));
+    assert.equal(calls.filter(isEncoderProbe).length, probes);
     await stopCanvas(canvas);
   }
 });
@@ -1915,7 +1933,7 @@ test("encoders: before any session the status names no size", async (t) => {
 
 test("encoders: once auto falls back from scrcpy, state and /status report the size of the transport in use, not the size chosen for scrcpy", async (t) => {
   for (const withFfmpeg of [true, false]) {
-    // A software-only device whose scrcpy-server cannot stream H.264: scrcpy chooses 2048, then fails.
+    // A software-only device whose scrcpy-server cannot stream H.264: scrcpy chooses 1280, then fails.
     const world = await makeWorld(t, {
       env: { FAKE_ENCODERS: SOFTWARE_ENCODERS, FAKE_SCREENRECORD: "h264" }, device: { codec: 0x68323635 },
     });
@@ -1933,7 +1951,7 @@ test("encoders: once auto falls back from scrcpy, state and /status report the s
     await pageSocket(canvas, auth, "/ws/video");
     const fallen = await control.next((message) => message.json?.t === "state" && message.json.transport !== "scrcpy",
       10_000);
-    assert.match(canvas.output(), /Stream size: 2048 on the long side/, "scrcpy did not choose its own size first");
+    assert.match(canvas.output(), /Stream size: 1280 on the long side/, "scrcpy did not choose its own size first");
     const body = await status(canvas);
     assert.deepEqual([body.scrcpy.max_size, body.scrcpy.max_size_source, body.scrcpy.encoder, body.scrcpy.encoder_name],
       [null, null, null, null], "the status names a scrcpy size that is not streaming");
@@ -1953,7 +1971,7 @@ test("encoders: once auto falls back from scrcpy, state and /status report the s
 test("encoders: while scrcpy streams, /status names no screenrecord size", async (t) => {
   const { canvas } = await sizedCanvas(t, { env: { FAKE_ENCODERS: SOFTWARE_ENCODERS } });
   const body = await status(canvas);
-  assert.deepEqual([body.transport, body.scrcpy.max_size, body.screenrecord_max_size], ["scrcpy", 2048, null]);
+  assert.deepEqual([body.transport, body.scrcpy.max_size, body.screenrecord_max_size], ["scrcpy", 1280, null]);
   await stopCanvas(canvas);
 });
 
@@ -4513,12 +4531,13 @@ test("fanout: restart backoff doubles from 1 s to 10 s and resets after 30 s of 
 
 const PRESETS = [
   { id: "small", label: "Small phone", width: 720, height: 1280, density: 320 },
-  { id: "pixel-11", label: "Pixel 11", width: 1080, height: 2424, density: 420 },
+  { id: "pixel-10", label: "Pixel 10", width: 1080, height: 2424, density: 420 },
   { id: "pixel-fold", label: "Pixel Fold (open)", width: 2208, height: 1840, density: 420 },
+  { id: "pixel-fold-closed", label: "Pixel Fold (folded)", width: 1080, height: 2092, density: 420 },
   { id: "tablet", label: "Tablet", width: 2560, height: 1600, density: 320 },
   { id: "default", label: "Device default" },
 ];
-const PRESET_IDS = "small, pixel-11, pixel-fold, tablet, default";
+const PRESET_IDS = "small, pixel-10, pixel-fold, pixel-fold-closed, tablet, default";
 
 /** The fake device's display overrides now, null where there is none. */
 async function wmNow(world) {
@@ -4678,7 +4697,7 @@ function supersededAnswer(preset) {
     message: `The display change to ${preset} was superseded by a later one` };
 }
 
-test("display: /status lists the five presets in order and reports the device default with its physical size and density", async (t) => {
+test("display: /status lists the six presets in order and reports the device default with its physical size and density", async (t) => {
   const { world, canvas, control } = await connectedControl(t);
   // A page's state messages carry the preset, read when it connected, without asking /status.
   const state = (await control.next((message) => message.json?.t === "state" && message.json.preset === "default")).json;
@@ -4862,18 +4881,18 @@ test("display: the owner switches to Tablet and back to the default over /ws/con
   await stopCanvas(canvas);
 });
 
-test("display: an agent switches to Pixel 11 over POST /display, gets the size and density in effect, and the change is journaled as the agent's", async (t) => {
+test("display: an agent switches to Pixel 10 over POST /display, gets the size and density in effect, and the change is journaled as the agent's", async (t) => {
   const { world, canvas } = await streamingCanvas(t);
-  const answer = await postDisplay(canvas, "pixel-11");
-  assert.deepEqual(answer, { status: 200, body: { ok: true, display: { preset: "pixel-11", width: 1080, height: 2424, density: 420 } } });
+  const answer = await postDisplay(canvas, "pixel-10");
+  assert.deepEqual(answer, { status: 200, body: { ok: true, display: { preset: "pixel-10", width: 1080, height: 2424, density: 420 } } });
   // 420 is the physical density, so Android keeps no density override.
   assert.deepEqual(await wmNow(world), { size: "1080x2424", density: null });
-  assert.deepEqual(displayValues((await status(canvas)).display), [1080, 2424, 420, "pixel-11"]);
+  assert.deepEqual(displayValues((await status(canvas)).display), [1080, 2424, 420, "pixel-10"]);
   const records = await waitFor(async () => {
     const found = await displayRecords(world);
     return found.length === 1 && found;
   }, 5000, "the display record");
-  assert.deepEqual(records, ["agent pixel-11 1080x2424@420"]);
+  assert.deepEqual(records, ["agent pixel-10 1080x2424@420"]);
   await stopCanvas(canvas);
 });
 
@@ -4891,7 +4910,7 @@ test("display: refused requests run no wm command and are not journaled: another
   // The agent holds control: an unknown preset is refused naming the valid ids.
   const huge = await postDisplay(canvas, "huge");
   assert.deepEqual(huge, { status: 400, body: { error: `Unknown display preset; expected one of: ${PRESET_IDS}` } });
-  for (const preset of [undefined, null, "", 3, true, "Tablet", "TABLET", "pixel_11", "restore", ["tablet"], { id: "tablet" }]) {
+  for (const preset of [undefined, null, "", 3, true, "Tablet", "TABLET", "pixel_10", "restore", ["tablet"], { id: "tablet" }]) {
     assert.equal((await postDisplay(canvas, preset)).status, 400, JSON.stringify(preset));
   }
   const opened = await openSocket(canvas.port, `/ws/control?token=${TOKEN}&origin=agent`);
@@ -5051,7 +5070,7 @@ test("display: when wm cannot read the display a change is refused before any wm
   const canvas = await startCanvas(world, ["--transport", "scrcpy", "--scrcpy-server", world.serverFile]);
   const unread = await status(canvas);
   assert.deepEqual(displayValues(unread.display), [1080, 2400, null, null]);
-  assert.equal(unread.display.presets.length, 5);
+  assert.equal(unread.display.presets.length, 6);
   assert.equal(unread.last_error, "display: wm could not read the display: Error: could not read the density");
   assert.deepEqual(await postDisplay(canvas, "tablet"), { status: 502, body: {
     error: "wm could not read the display before changing it: Error: could not read the density" } });
@@ -5139,7 +5158,7 @@ test("display: of 12 POST /display sent at once one runs, one waits, and each of
   for (const answer of superseded) {
     assert.equal(answer.status, 409);
     assert.equal(answer.body.superseded, true);
-    assert.match(answer.body.error, /^The display change to (small|pixel-11|pixel-fold|tablet) was superseded by a later one$/);
+    assert.match(answer.body.error, /^The display change to (small|pixel-10|pixel-fold|pixel-fold-closed|tablet) was superseded by a later one$/);
   }
   // The commands of exactly the two applied changes, one change after the other.
   const commandsOf = (preset) => [`size ${preset.width}x${preset.height}`, `density ${preset.density}`];
@@ -5584,12 +5603,12 @@ test("display: journal: when no second bridge can start for the restore record b
   await swiping;
 });
 
-test("display: the Android page shows a Size picker with the five presets, sends a choice over the control socket or POST /display, and disables it without control", async (t) => {
+test("display: the Android page shows a Size picker with four models and Device default, sends a choice over the control socket or POST /display, and disables it without control", async (t) => {
   const { sandbox, sent, run, html } = await loadPage(t);
   assert.match(html, /<button type="button" class="popup" id="display-preset" aria-haspopup="listbox"[^>]* disabled>/,
     "the Android page has no Size picker");
-  assert.deepEqual(presetOptions(html), [["small", "Small phone", "720 × 1280"], ["pixel-11", "Pixel 11", "1080 × 2424"],
-    ["pixel-fold", "Pixel Fold (open)", "2208 × 1840"], ["tablet", "Tablet", "2560 × 1600"], ["default", "Device default", ""]]);
+  assert.deepEqual(presetOptions(html), [["small", "Small phone", "720 × 1280"], ["pixel-10", "Pixel 10", "1080 × 2424"],
+    ["pixel-fold", "Pixel Fold (open)", "2208 × 1840"], ["pixel-fold-closed", "Pixel Fold (folded)", "1080 × 2092"], ["default", "Device default", ""]]);
   const picker = () => JSON.parse(run("JSON.stringify([sizePicker.value,sizePicker.disabled])"));
 
   // Shown once the page knows the status; the preset in effect is selected.
@@ -5698,7 +5717,7 @@ test("page: the Android page keeps its element ids, window.autonomCanvas and rem
     if (!button.text) assert.ok(button.attributes.title, `${button.name} has a tooltip`);
   }
   assert.deepEqual(buttons.filter((button) => "data-scrcpy" in button.attributes).map((button) => button.name),
-    ["Rotate", "Volume down", "Volume up", "Notifications", "Quick settings", "Collapse panels", "Copy device clipboard", "Paste to emulator"]);
+    ["Rotate", "Copy device clipboard", "Paste to emulator", "Volume down", "Volume up", "Notifications", "Quick settings", "Collapse panels"]);
   // The compact toolbar keeps settings/panel buttons; preferences live in Settings.
   const toolbar = html.match(/<header class="bar">([\s\S]*?)<\/header>/)[1];
   assert.doesNotMatch(toolbar, /class="brand"|live-dot|target-detail|display-dims|control-chip|class="chip"/);
@@ -5717,8 +5736,8 @@ test("page: the Android page keeps its element ids, window.autonomCanvas and rem
   for (const direction of ["down", "up"]) assert.match(deviceSettings, new RegExp('data-system="volume-' + direction + '" data-scrcpy'));
 
   // The inspector sections, in order.
-  assert.deepEqual([...html.matchAll(/<section class="group(?: inspector-stream)?"[^>]*>\s*(?:<div class="inspector-group-head">)?<h2>([^<]+)<\/h2>/g)].map((match) => match[1]),
-    ["Device", "Stream"]);
+  assert.deepEqual([...html.matchAll(/<section class="group(?: inspector-(?:input|device|stream))?"[^>]*>\s*(?:<div class="inspector-group-head">)?<h2>([^<]+)<\/h2>/g)].map((match) => match[1]),
+    ["Input", "Device", "Stream"]);
   assert.doesNotMatch(html, /<section class="group" hidden>/, "an Android inspector section is hidden");
 });
 
@@ -5777,7 +5796,7 @@ test("page: the Size button shows a landscape device for Tablet and Pixel Fold, 
   const wide = (preset, display = null) => run(`view.status={platform:"android"};view.preset=${JSON.stringify(preset)};` +
     `logicalDisplay=${JSON.stringify(display)};syncPicker();sizePicker.classList.contains("wide")`);
   assert.equal(wide("small"), false);
-  assert.equal(wide("pixel-11", { width: 2560, height: 1600 }), false);
+  assert.equal(wide("pixel-10", { width: 2560, height: 1600 }), false);
   assert.equal(wide("pixel-fold"), true);
   assert.equal(wide("tablet", { width: 1080, height: 2400 }), true);
   assert.equal(wide("default", { width: 1080, height: 2400 }), false);
@@ -5860,7 +5879,7 @@ test("page: the size menu is a keyboard listbox: Enter opens it on the first pre
   run("view.status={platform:\"android\"};view.preset=\"default\";syncPicker()");
   assert.equal(button.disabled, false);
   assert.equal(document.getElementById("display-label").textContent, "Device default");
-  assert.deepEqual(selected(), ["default"]);
+  assert.deepEqual(selected(), []);
 
   button.focus();
   press("Enter");
@@ -5892,13 +5911,13 @@ test("page: the size menu is a keyboard listbox: Enter opens it on the first pre
   assert.equal(focused(), "display-preset");
   // ArrowUp opens on the last option; Home and End move; Tab closes.
   press("ArrowUp");
-  assert.equal(focused(), "default");
+  assert.equal(focused(), "pixel-fold-closed");
   press("Home");
   assert.equal(focused(), "small");
   press("End");
-  assert.equal(focused(), "default");
+  assert.equal(focused(), "pixel-fold-closed");
   press("ArrowDown");
-  assert.equal(focused(), "default", "the focus left the menu past its last option");
+  assert.equal(focused(), "pixel-fold-closed", "the focus left the menu past its last option");
   press("Tab");
   assert.equal(isOpen(), false);
   // A pointer opens it on the preset in effect and follows the pointer; a click elsewhere closes it.
@@ -5913,27 +5932,27 @@ test("page: the size menu is a keyboard listbox: Enter opens it on the first pre
   assert.deepEqual(displays(), ["pixel-fold"]);
   // A click on a preset's label chooses it; choosing the preset in effect sends nothing.
   button.dispatch("click", { detail: 1 });
-  document.elements.find((element) => element.parent === option("tablet") && element.tagName === "SPAN").dispatch("click", { detail: 1 });
-  assert.deepEqual(displays(), ["pixel-fold", "tablet"]);
+  document.elements.find((element) => element.parent === option("pixel-fold-closed") && element.tagName === "SPAN").dispatch("click", { detail: 1 });
+  assert.deepEqual(displays(), ["pixel-fold", "pixel-fold-closed"]);
   // Focus that moved on while the change ran stays where it went.
   document.getElementById("text").focus();
-  run("onControlMessage({t:\"display\",ok:true,display:{preset:\"tablet\",width:2560,height:1600,density:320}})");
+  run("onControlMessage({t:\"display\",ok:true,display:{preset:\"pixel-fold-closed\",width:1080,height:2092,density:420}})");
   assert.equal(focused(), "text", "the answer took the focus back from the text box");
   button.dispatch("click", { detail: 1 });
-  option("tablet").dispatch("click", { detail: 1 });
+  option("pixel-fold-closed").dispatch("click", { detail: 1 });
   assert.equal(isOpen(), false);
-  assert.deepEqual(displays(), ["pixel-fold", "tablet"]);
+  assert.deepEqual(displays(), ["pixel-fold", "pixel-fold-closed"]);
   // Losing control closes the menu, which then cannot open.
   button.dispatch("click", { detail: 1 });
   run(`applyState(${JSON.stringify({ t: "state", owner: "agent", paused: false, session: "streaming", clients: null,
-    preset: "tablet", density: 320 })})`);
+    preset: "pixel-fold-closed", density: 420 })})`);
   assert.equal(isOpen(), false);
   assert.equal(button.disabled, true);
   button.focus();
   press("Enter");
   press("ArrowDown");
   assert.equal(isOpen(), false);
-  assert.deepEqual(displays(), ["pixel-fold", "tablet"]);
+  assert.deepEqual(displays(), ["pixel-fold", "pixel-fold-closed"]);
 });
 
 test("page: Inspector omits Input control, preserves input ownership guards and renders Stream details as text", async (t) => {
@@ -5970,7 +5989,7 @@ test("page: Inspector omits Input control, preserves input ownership guards and 
   ["3 fps · 12 ms · WebCodecs", "scrcpy · WebCodecs", "avc1.42C029",
     "3 fps", "570 × 1280", "1080 × 2400 · 420 dpi", "1 video · 1 control"]);
   assert.match(text("status"), /transport: scrcpy \(webcodecs\)/);
-  assert.equal(text("display-default-size"), "", "the device default size was shown before it was read");
+  assert.equal(text("display-default-size"), "", "the device default size is empty until read");
   run("rememberDefaultSize(view.status.display)");
   assert.equal(text("display-default-size"), "1080 × 2400");
   // A note with markup is shown as text, then leaves.
@@ -6008,8 +6027,8 @@ test("page: the iOS page runs without the Size menu, keeps every element id, sho
   const shown = [...dock.matchAll(/<button [^>]*aria-label="([^"]+)"[^>]*>/g)]
     .filter((match) => !/ hidden[ >]/.test(match[0])).map((match) => match[1]);
   assert.deepEqual(shown, ["Home", "Take screenshot", "Start recording", "Power"]);
-  assert.deepEqual([...html.matchAll(/<section class="group(?: inspector-stream)?"( hidden)?>\s*(?:<div class="inspector-group-head">)?<h2>([^<]+)<\/h2>/g)].map((match) => [match[2], Boolean(match[1])]),
-    [["Device", true], ["Stream", false]]);
+  assert.deepEqual([...html.matchAll(/<section class="group(?: inspector-(?:input|device|stream))?"(?: data-idb)?( hidden)?>\s*(?:<div class="inspector-group-head">)?<h2>([^<]+)<\/h2>/g)].map((match) => [match[2], Boolean(match[1])]),
+    [["Input", false], ["Device", true], ["Stream", false]]);
   const { run, document } = runPage(html);
   assert.equal(run("sizePicker"), null);
   run("view.transport=\"screencap\";controlSocket=null;view.status={platform:\"ios\",display:{width:1179,height:2556}};" +
@@ -7742,12 +7761,22 @@ test("page: a restarted server reauthenticates and recovers WebCodecs from multi
   assert.equal(run("view.mode"),"webcodecs");
 });
 
-// Embedded pages hide the standalone Inspector; their workspace dock remains usable.
-test("page: embedded devices retain accessible volume controls in their dock", () => {
+// Embedded pages retain both the compact dock and the restored Inspector.
+test("page: Capture has the same compact scope in standalone and workspace on both platforms", () => {
+  for (const platform of ["android", "ios"]) for (const embed of [false, true]) {
+    let context;
+    const html = renderPage({serial:"fixture",options:{platform},server:{mode:embed?"workspace":"single",hooks:{pageExtensions:[{markup:value=>{context=value;return ""}}]}}},{embed});
+    assert.doesNotMatch(html, /id="control-take"|id="control-pause"|Input control/);
+    assert.match(html, /id="canvas-settings"/);
+    assert.match(html, /id="inspector"/);
+  }
+});
+
+test("page: embedded devices keep volume in Inspector without duplicate dock controls", () => {
   const html = renderPage({serial:"fixture",options:{platform:"android"}},{embed:true});
   const dock = html.match(/<nav class="dock"[^>]*>([\s\S]*?)<\/nav>/)[1];
-  assert.match(dock, /data-system="volume-down"/);
-  assert.match(dock, /data-system="volume-up"/);
+  assert.doesNotMatch(dock, /data-system="volume-down"/);
+  assert.doesNotMatch(dock, /data-system="volume-up"/);
   assert.equal((html.match(/data-system="volume-down"/g)||[]).length,1);
 });
 
@@ -7793,4 +7822,35 @@ test("page: Paste to emulator sends clipboard text once and handles empty, denie
   sandbox.navigator.clipboard = undefined;
   await sandbox.pasteFromClipboard();
   assert.match(run("view.note"), /Clipboard access is unavailable/);
+});
+
+test("video: keyframe recovery retries a lost control request and stops after a keyframe", () => {
+  const { sandbox, sent, run } = runPage(renderPage({ serial: "emulator-5554", options: {} }));
+  let now = 0;
+  sandbox.performance = { now: () => now };
+  sandbox.EncodedVideoChunk = class { constructor(value) { Object.assign(this, value); } };
+  const decoded = [];
+  sandbox.recordChunk = (chunk) => decoded.push(chunk);
+  run('view.mode="webcodecs";waitingKey=false;decoder={state:"configured",decodeQueueSize:31,decode:recordChunk};controlSocket.readyState=0');
+  run('decode(false,1,new Uint8Array([1]))');
+  assert.equal(run("waitingKey"), true);
+  assert.equal(sent.length, 0);
+  run('controlSocket.readyState=1;decoder.decodeQueueSize=0;decode(false,2,new Uint8Array([2]))');
+  assert.deepEqual(sent, [{ t: "system", op: "keyframe" }], "a lost recovery request must be retried");
+  for (let i = 0; i < 100; i++) run('decode(false,3,new Uint8Array([3]))');
+  assert.equal(sent.length, 1, "do not flood control while waiting");
+  now = 1100;
+  run('decode(false,4,new Uint8Array([4]))');
+  assert.equal(sent.length, 2, "retry if no keyframe arrives");
+  run('decode(true,5,new Uint8Array([5]));decode(false,6,new Uint8Array([6]))');
+  assert.equal(decoded.length, 2);
+  assert.equal(run("waitingKey"), false);
+  now = 2200;
+  run('decode(false,7,new Uint8Array([7]))');
+  assert.equal(sent.length, 2, "recovered playback must stop requesting keyframes");
+  // A static screen produces no next delta: reconnect itself must recover it.
+  run('waitingKey=true;config=new Uint8Array([0,0,1,7]);controlSocket=null');
+  sandbox.WebSocket = class { constructor() { this.readyState = 1; } send(text) { sent.push(JSON.parse(text)); } };
+  run('connectControl();controlSocket.onopen()');
+  assert.equal(sent.length, 3, "control reconnect must request a keyframe without another delta");
 });

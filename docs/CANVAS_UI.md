@@ -60,3 +60,70 @@ polling, validation and destructive confirmation remain domain behavior.
 
 Inspect both themes, narrow/wide panels, tabs, dropdown dismissal and disabled
 controls. Presentation checks do not need device/network mutation.
+
+## Workspace parity
+
+The standalone device page and its embedded Workspace view use the same panel
+markup and controls. Capture contains capture/gallery and Activity in either
+host; app/deeplink controls belong to Tools. Volume stays in Inspector, and
+input ownership controls are not part of the desktop UI. Workspace adds only
+tabs, layouts, device identity and attachment/detachment. Device panels report
+their actual open state to the shell so closing with Escape or a close button
+does not leave the toolbar selected. Panel layout follows the tile viewport:
+a side column above 760px and matching bounded overlays below it.
+
+### Model-resolved device frames and exports
+
+Device settings offer a Device frame on/off switch. Enabled frames resolve the
+explicit Android display model's installed SDK skin; Device default and custom
+sizes resolve the running AVD model. The same selected model is retained by captures.
+Pixel Fold (open) uses 2208 × 1840 and its `default` skin; Pixel Fold (folded)
+uses 1080 × 2092 and its `closed` skin. Both use 420 dpi. These presets change
+screen dimensions and artwork; they do not emulate physical hinge/posture sensors.
+On Android emulators, selecting Fold temporarily disables the originally active
+Pixel model framework/SystemUI overlays so the host phone camera inset cannot
+letterbox the Fold display after rotation. Selecting another preset (including
+Device default) or stopping Canvas restores those exact overlays. Application
+overlays and physical devices are not modified.
+Missing skins, unsupported layouts, unavailable orientation and incompatible
+proportions leave the screen unframed and show "Frame unavailable for <model>".
+There is no Generic visual fallback and no model is inferred from aspect ratio.
+The Device dimensions menu contains only Small phone, Pixel 10, Pixel Fold (open),
+Pixel Fold (folded), and Device default. Pixel 10 uses 1080 × 2424 at 420 dpi and reports unavailable
+when its original artwork is missing. Device default restores the native screen size and density. The legacy tablet
+command remains an internal API option, outside the menu. Explicit model artwork requires no AVD query.
+iOS resolves the Simulator device type and its installed DeviceKit body/mask.
+Camera content already present in the framebuffer is not drawn a second time.
+
+`autonom_lib/device_frames.py` owns `DeviceFrameDescriptor`: id, model, source,
+bodySize, screenRect, layers, screenMask, orientations and fallbackReason.
+The browser component and PNG/MP4 compositor consume that same geometry. Local
+SDK artwork is not bundled: normalized variants are content-versioned under
+`$XDG_CACHE_HOME/autonom/device-frames` (default `~/.cache`). The browser receives
+image data, never local paths. Geometry changes request a descriptor once; tile
+resizing and video frames do not add rendering operations to the stream.
+
+Screenshot and Record snapshot the selected mode/model. Off leaves native captures
+untouched. The compositor does not resize the captured screen; PNG has transparent
+surrounds and H.264 MP4 has a white surround. `ffmpeg` and `ffprobe` are required.
+Composition failures preserve the original capture and show a warning.
+
+Verified: real Pixel 6 Pro portrait/landscape PNGs, asymmetric screen positioning,
+rotated camera mask, on/off and incompatible proportions. Synthetic original-skin
+video preserves 60 fps, frame count and duration. iPhone 17 Pro uses the exact
+phone11.devicechrome identified by its Simulator profile, plus that profile's PDF
+screen mask. Live Canvas, PNG and MP4 were inspected; the 1368x2730 body contains
+the unchanged 1206x2622 screen at (81,54). DeviceKit PDF assets are rasterized with
+system CoreGraphics once per source version; they are never bundled or distributed.
+
+Open acceptance items: the existing native recorders are not rotation-safe during
+an active recording. Android's codec can reject the device's resolution and its
+`screenrecord` fallback changes the capture aspect ratio, which leaves capture unframed.
+Replacing or extending that recording backend is needed before claiming full video
+parity across rotations. A controlled browser FPS/latency/CPU comparison is also
+still required; unit tests establish absence of per-frame frame-component work,
+not a measured compositor performance result.
+
+### Device language
+
+Device settings uses the shared dropdown for the system language. Opening settings reads the current language from the selected device; an unlisted current language is retained in the options. Android applies changes through the shell configuration API and verifies them. iOS asks before restarting Simulator, preserves the region and other preferences, and refuses a restart during recording. This is independent of per-app language overrides.

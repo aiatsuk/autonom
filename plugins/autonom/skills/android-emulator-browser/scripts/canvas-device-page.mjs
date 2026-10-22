@@ -1,3 +1,5 @@
+import { deviceLanguageMarkup, deviceLanguageScript } from "./canvas-device-language.mjs";
+import { deviceFrameStyles, deviceFrameScript } from "./canvas-device-frame.mjs";
 import { canvasIcon as icon, canvasIconButton as iconButton } from "./canvas-ui.mjs";
 import { CanvasDropdown } from "./canvas-dropdown.mjs";
 /** The device page, rendered as self-contained HTML with inline styles and scripts. */
@@ -16,7 +18,7 @@ import {
   toolsScript,
   toolsStyles,
 } from "./canvas-tools-page.mjs";
-import { DISPLAY_PRESETS, escapeHtml, scriptString } from "./canvas-runtime.mjs";
+import { DISPLAY_MENU_PRESETS, DISPLAY_PRESETS, escapeHtml, scriptString } from "./canvas-runtime.mjs";
 
 // Inline SVG paths of the page's icons, on a 24 px grid; stroke and size come from the CSS.
 
@@ -26,7 +28,7 @@ import { DISPLAY_PRESETS, escapeHtml, scriptString } from "./canvas-runtime.mjs"
  */
 function displayPicker(context) {
   if (context.options.platform !== "android") return "";
-  const options = DISPLAY_PRESETS.map(({ id, label, width, height }) =>
+  const options = DISPLAY_MENU_PRESETS.map(({ id, label, width, height }) =>
     `${id === "default" ? '<hr aria-hidden="true">' : ""}` +
     `<button type="button" class="option" role="option" data-preset="${id}" aria-selected="false" tabindex="-1">` +
     `${icon("check", "check")}<span>${escapeHtml(label)}</span>` +
@@ -50,7 +52,7 @@ function renderPage(context, { base = "", embed = false } = {}) {
   // right after the Tools drawer's.
   const extensions = context.server?.hooks?.pageExtensions ?? [];
   const extension = (part, ...args) => extensions.map((item) => item[part]?.(...args) ?? "").join("");
-  const extensionContext = { platform: context.options.platform, id: context.id ?? null, base, embed, captureOnly: context.server?.mode === "single" };
+  const extensionContext = { platform: context.options.platform, id: context.id ?? null, base, embed };
   const android = context.options.platform === "android";
   const platform = android ? "Android" : "iOS";
   // iOS refuses the Android key buttons, so its page keeps them out of sight (PAGE-003);
@@ -94,7 +96,8 @@ body.no-inspector .side{display:none}
 .canvas-settings-head{display:flex;align-items:center;justify-content:space-between;min-height:40px;border-bottom:1px solid var(--line);margin-bottom:4px}
 .canvas-settings-head h2{font-size:13px;font-weight:600;margin:0}
 .canvas-setting{display:flex;align-items:center;justify-content:space-between;gap:12px;min-height:44px}
-.canvas-setting>span{flex:none}
+.canvas-setting>span,.canvas-setting>label{flex:none}
+.canvas-setting>select{width:180px;max-width:60%}
 .canvas-setting+.canvas-setting{border-top:1px solid var(--line)}
 .canvas-setting .display-picker,.canvas-setting .canvas-theme-control{width:180px;max-width:60%;min-width:0}
 .canvas-setting .popup,.canvas-setting .canvas-theme{width:100%;max-width:none}
@@ -109,11 +112,11 @@ body.no-inspector .side{display:none}
 .menu hr{border:0;border-top:1px solid var(--line);margin:5px 6px}
 .menu .note{margin:0;padding:6px 10px 4px;color:var(--text-2);font-size:11.5px;line-height:1.35}
 
-/* stage: the stream already contains the device corners; never mask screen pixels. */
+/* Stage geometry stays independent of the optional hardware frame. */
 .stage{grid-area:stage;position:relative;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;min-width:0;min-height:0;padding:28px 24px 96px;overflow:hidden}
-.device{position:relative;flex:none;box-sizing:content-box;aspect-ratio:9/19.5;padding:9px;border-radius:12px;background:var(--bezel);box-shadow:var(--device-shadow);touch-action:none;
+.device{position:relative;flex:none;box-sizing:content-box;aspect-ratio:9/19.5;touch-action:none;
   width:min(calc(100% - 18px),calc((100vh - 224px) * var(--video-ratio)));width:min(calc(100% - 18px),calc((100dvh - 224px) * var(--video-ratio)))}
-.surface{position:absolute;inset:9px;display:block;width:calc(100% - 18px);height:calc(100% - 18px);object-fit:contain;border-radius:0;background:#000;
+.surface{position:absolute;display:block;object-fit:contain;background:#000;
   user-select:none;-webkit-user-select:none;-webkit-user-drag:none;touch-action:none;cursor:crosshair;outline:none}
 .surface:focus-visible{outline:2px solid var(--accent);outline-offset:4px}
 .caption{margin:0;min-height:17px;color:var(--text-2);font-size:12px;font-variant-numeric:tabular-nums;text-align:center}
@@ -137,9 +140,10 @@ body.no-inspector .side{display:none}
 .row{display:flex;align-items:center;gap:10px;width:calc(100% + 16px);height:32px;margin:0 -8px;padding:0 8px;border:0;border-radius:var(--r-sm);background:none;text-align:left}
 .row:not(:disabled):active{transform:none;background:var(--fill-2)}
 .row svg{width:16px;height:16px;color:var(--text-2)}
-.volume-controls{display:grid;grid-template-columns:minmax(0,1fr) 32px 32px;align-items:center;gap:4px;padding:0 0 10px;margin-bottom:10px;border:0;border-bottom:1px solid var(--line);background:none}
-.volume-key{display:grid;place-items:center;width:32px;height:28px;padding:0;border:1px solid var(--line-2);border-radius:var(--r-sm);background:var(--raised)}
+.volume-controls{display:grid;grid-template-columns:minmax(0,1fr) var(--control-height) var(--control-height);align-items:center;gap:6px}
+.volume-key{display:grid;place-items:center;width:var(--control-height);height:var(--control-height);padding:0;border:1px solid var(--line-2);border-radius:var(--r-sm);background:var(--raised)}
 .volume-key svg{width:18px;height:18px}
+.inspector-input .device-grid,.inspector-device .device-grid{margin-top:12px;padding-top:12px;border-top:1px solid var(--line)}
 .device-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px}
 .device-tile{display:flex;align-items:center;justify-content:flex-start;gap:6px;min-width:0;min-height:32px;padding:7px 8px;border:0;border-radius:var(--r-sm);background:var(--fill);font-size:12px;text-align:left;line-height:1.3}
 .device-tile svg{width:16px;height:16px;color:var(--text-2);flex-shrink:0}
@@ -170,35 +174,36 @@ dd code{font:12px var(--mono)}
   #display-label{min-width:0;overflow:hidden;text-overflow:ellipsis}
   .menu{width:min(320px,calc(100vw - 24px))}
   .stage{padding:16px 16px 92px;overflow:visible}
-  .device{padding:7px;border-radius:10px;width:min(calc(100% - 14px),calc((100svh - 208px) * var(--video-ratio)))}
-  .surface{inset:7px;width:calc(100% - 14px);height:calc(100% - 14px);border-radius:0}
+  .device{width:min(calc(100% - 14px),calc((100svh - 208px) * var(--video-ratio)))}
   .notice{position:fixed;top:calc(60px + env(safe-area-inset-top))}
   .dock{position:fixed;bottom:calc(14px + env(safe-area-inset-bottom));z-index:4}
   body:not(.no-inspector){overflow:hidden}
   body.no-inspector .side{display:none}
 }
 @media (max-width:360px){.dock{gap:0;padding:2px}.dock .div{display:none}}
-${toolsStyles()}${extension("styles")}${embed ? EMBED_STYLES : ""}
+${toolsStyles()}${extension("styles")}${embed ? EMBED_STYLES : ""}${deviceFrameStyles()}
 </style>
 </head>
 <body>
 <header class="bar">
   <div class="center">
-    ${!embed || android ? iconButton("settings", "Canvas settings", 'id="canvas-settings-toggle" aria-expanded="false" aria-controls="canvas-settings"', "icon") : ""}
+    ${iconButton("settings", embed ? "Device settings" : "Canvas settings", 'id="canvas-settings-toggle" aria-expanded="false" aria-controls="canvas-settings"', "icon")}
   </div>
   <div class="actions">
     ${toolsButton()}${extension("button")}
     ${iconButton("inspector", "Inspector", 'id="inspector-toggle" aria-pressed="true" aria-controls="inspector"', "icon")}
   </div>
 </header>
-${!embed || android ? `<section class="canvas-settings" id="canvas-settings" role="dialog" aria-labelledby="canvas-settings-title" hidden>
-  <div class="canvas-settings-head"><h2 id="canvas-settings-title">Canvas settings</h2>${iconButton("close", "Close Canvas settings", 'id="canvas-settings-close"', "icon")}</div>
+${`<section class="canvas-settings" id="canvas-settings" role="dialog" aria-labelledby="canvas-settings-title" hidden>
+  <div class="canvas-settings-head"><h2 id="canvas-settings-title">${embed ? "Device settings" : "Canvas settings"}</h2>${iconButton("close", "Close Canvas settings", 'id="canvas-settings-close"', "icon")}</div>
   ${embed ? "" : `<div class="canvas-setting"><span>Theme</span>${themeControl()}</div>`}
   ${android ? `<div class="canvas-setting"><span>Device dimensions</span>${displayPicker(context)}</div>` : ""}
-</section>` : ""}
+  ${deviceLanguageMarkup()}
+  <div class="canvas-setting"><label for="device-frame-style">Device frame</label><input type="checkbox" role="switch" class="ui-switch" id="device-frame-style" aria-label="Device frame" checked></div><div id="device-frame-source" class="frame-source" role="status"></div>
+</section>`}
 <main class="stage">
   <p class="notice" id="notice" role="status" aria-live="polite"></p>
-  <div class="device" id="device"><canvas id="video" class="surface" tabindex="0" aria-label="${platform} device screen" hidden></canvas><img id="screen" class="surface" tabindex="0" alt="${platform} device screen"></div>
+  <div class="device" id="device"><canvas id="video" class="surface" tabindex="0" aria-label="${platform} device screen" hidden></canvas><img id="screen" class="surface" tabindex="0" alt="${platform} device screen"><img id="device-frame-layer" class="device-frame-layer" alt="" aria-hidden="true" hidden></div>
   <p class="caption" id="caption">Connecting…</p>
   <nav class="dock" aria-label="Device buttons">
     ${iconButton("back", "Back", `data-key="KEYCODE_BACK" data-system="back"${androidOnly}`)}
@@ -207,28 +212,29 @@ ${!embed || android ? `<section class="canvas-settings" id="canvas-settings" rol
     <span class="div" aria-hidden="true"${androidOnly}></span>
     ${extension("dock", extensionContext)}
     ${iconButton("rotate", "Rotate", `data-system="rotate" data-scrcpy${androidOnly}`)}
-    ${embed ? iconButton("volumeDown", "Volume down", `data-system="volume-down"${volume}`) + iconButton("volumeUp", "Volume up", `data-system="volume-up"${volume}`) : ""}
     ${iconButton("power", "Power", 'data-key="KEYCODE_POWER" data-system="power"')}
   </nav>
 </main>
 <aside class="side" id="inspector" aria-label="Inspector">
   <div class="inspector-head"><strong>Inspector</strong>${iconButton("close", "Close inspector", 'id="inspector-close"', "icon")}</div>
   <div class="inspector-body">
-  <section class="group">
+  <section class="group inspector-input">
+    <h2>Input</h2>
     <div class="field"><input id="text" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Text to type" aria-label="Text to type"><button type="button" id="sendText" class="btn primary">Send</button></div>
     <p class="hint" id="text-hint" hidden>Any language. Longer text is pasted through the device clipboard.</p>
-    ${!android && !embed ? volumeControls : ""}
+    <div class="device-grid" data-scrcpy${androidOnly}>
+      <button type="button" class="device-tile" id="clipboard" data-scrcpy aria-label="Copy device clipboard" title="Copy device clipboard">${icon("clipboard")}Copy clipboard</button>
+      <button type="button" class="device-tile" id="clipboard-paste" data-scrcpy aria-label="Paste to emulator" title="Paste computer clipboard into the active field">${icon("paste")}Paste to emulator</button>
+    </div>
   </section>
-  <section class="group"${androidOnly}>
+  <section class="group inspector-device"${android ? "" : " data-idb hidden"}>
     <h2>Device</h2>
-    ${android && !embed ? volumeControls : ""}
-    <div class="device-grid">
+    ${volumeControls}
+    <div class="device-grid"${androidOnly}>
       <button type="button" class="device-tile" data-key="KEYCODE_WAKEUP" data-system="wake">${icon("wake")}Wake screen</button>
       <button type="button" class="device-tile" data-system="notifications" data-scrcpy>${icon("notifications")}Notifications</button>
       <button type="button" class="device-tile" data-system="quick-settings" data-scrcpy>${icon("quickSettings")}Quick settings</button>
       <button type="button" class="device-tile" data-system="collapse" data-scrcpy>${icon("collapse")}Collapse panels</button>
-      <button type="button" class="device-tile" id="clipboard" data-scrcpy aria-label="Copy device clipboard" title="Copy device clipboard">${icon("clipboard")}Copy clipboard</button>
-      <button type="button" class="device-tile" id="clipboard-paste" data-scrcpy aria-label="Paste to emulator" title="Paste computer clipboard into the active field">${icon("paste")}Paste to emulator</button>
     </div>
   </section>
   <section class="group inspector-stream">
@@ -252,7 +258,7 @@ ${!embed || android ? `<section class="canvas-settings" id="canvas-settings" rol
 </aside>
 ${toolsMarkup({ platform: context.options.platform })}${extension("markup", extensionContext)}
 <script>
-${pageScript({ base, embed, deviceId: context.id ?? null })}
+${pageScript({ base, embed, deviceId: context.id ?? null, platform: context.options.platform })}
 ${toolsScript()}${extension("script")}
 </script>
 </body>
@@ -263,8 +269,9 @@ ${toolsScript()}${extension("script")}
  * The page's own code. It is plain JavaScript inside this template literal, so it
  * avoids backticks, and escapes such as newlines are written with a doubled backslash.
  */
-function pageScript({ base = "", embed = false, deviceId = null } = {}) {
+function pageScript({ base = "", embed = false, deviceId = null, platform = "android" } = {}) {
   return `"use strict";
+const PLATFORM=${scriptString(platform)};
 const BASE=${scriptString(base)},EMBED=${embed ? "true" : "false"},DEVICE_ID=${scriptString(deviceId)};
 const fragmentParams=new URLSearchParams(location.hash.slice(1));
 const bootstrapToken=fragmentParams.get("token")||"";
@@ -291,7 +298,7 @@ const view={transport:null,mode:null,reason:"",status:null,owner:"shared",paused
 const stats={decoder:"none",codec:null,framesDecoded:0,framesRendered:0,framesDropped:0,packets:0,bytes:0,errors:0,renderTimes:[],lastFrameAt:0};
 let videoSocket=null,controlSocket=null,decoder=null,config=null,waitingKey=true,drawScheduled=false,configuring=false,pendingChunks=[];
 const MAX_QUEUED_FRAMES=2,frameQueue=[];
-let videoRetry=500,controlRetry=500,videoRefusals=0;
+let videoRetry=500,controlRetry=500,videoRefusals=0,lastKeyFrameRequest=-Infinity;
 // A fallback the page keeps (no VideoDecoder, a codec it rejects, the video WebSocket refused).
 // Any other multipart start (a /status that failed, a transport not fast yet) gives way to
 // WebCodecs once the transport is fast: a tile whose first poll failed while its Simulator
@@ -331,12 +338,15 @@ function setVideoSize(width,height){if(!width||!height)return;view.width=width;v
 function upright(width,height){return rotation%180?{width:height,height:width}:{width,height}}
 function setRotation(value){const next=[0,90,180,270].includes(value)?value:0;if(next===rotation)return;rotation=next;if(view.width)setVideoSize(view.width,view.height)}
 // The device frame takes the picture's aspect; its width comes from the ratio and the room left.
-function fitFrame(width,height){const ratio=width/height;if(!ratio||ratio===frameRatio)return;frameRatio=ratio;device.style.aspectRatio=width+" / "+height;device.style.setProperty("--video-ratio",String(ratio))}
+function fitFrame(width,height){if(typeof refreshDeviceFrame==="function")refreshDeviceFrame(width,height);const ratio=width/height;if(!ratio||ratio===frameRatio)return;frameRatio=ratio;device.style.aspectRatio=width+" / "+height;device.style.setProperty("--video-ratio",String(ratio));if(typeof frameGeometry!=="undefined"&&frameGeometry)applyFrameGeometry(frameGeometry,width,height)}
 function codecFromSps(data){for(let i=0;i+3<data.length;i++){if(data[i]===0&&data[i+1]===0&&data[i+2]===1&&(data[i+3]&31)===7){const out=[];let zeros=0;for(let j=i+3;j<data.length&&out.length<4;j++){const b=data[j];if(zeros>=2&&b===3){zeros=0;continue}zeros=b===0?zeros+1:0;out.push(b)}if(out.length<4)return null;return"avc1."+[out[1],out[2],out[3]].map(b=>b.toString(16).toUpperCase().padStart(2,"0")).join("")}}return null}
 function fallback(reason){note(reason);startMultipart(reason,true)}
 function configure(data){config=data;waitingKey=true;const codec=codecFromSps(data);if(!codec){fallback("the stream has no H.264 SPS");return}stats.codec=codec;const known=supportedCodecs.get(codec);if(known===true){applyDecoderConfig(codec);return}if(known===false){fallback("VideoDecoder rejects "+codec);return}configuring=true;VideoDecoder.isConfigSupported({codec,optimizeForLatency:true}).then(result=>{configuring=false;supportedCodecs.set(codec,Boolean(result.supported));if(!result.supported){pendingChunks=[];fallback("VideoDecoder rejects "+codec);return}applyDecoderConfig(codec);const queued=pendingChunks;pendingChunks=[];for(const item of queued)decode(item[0],item[1],item[2])}).catch(error=>{configuring=false;pendingChunks=[];fallback("VideoDecoder check failed: "+error.message)})}
 function applyDecoderConfig(codec){if(view.mode!=="webcodecs")return;if(!decoder||decoder.state==="closed")decoder=new VideoDecoder({output:onFrame,error:onDecoderError});decoder.configure({codec,optimizeForLatency:true});waitingKey=true}
-function decode(key,pts,data){if(configuring){if(pendingChunks.length<300)pendingChunks.push([key,pts,data]);else{pendingChunks=[];waitingKey=true}return}if(!decoder||decoder.state!=="configured"){stats.framesDropped+=1;waitingKey=true;return}if(waitingKey&&!key){stats.framesDropped+=1;return}if(!key&&decoder.decodeQueueSize>30){waitingKey=true;stats.framesDropped+=1;sendControl({t:"system",op:"keyframe"});return}let chunk=data;if(key&&config){chunk=new Uint8Array(config.length+data.length);chunk.set(config);chunk.set(data,config.length)}try{decoder.decode(new EncodedVideoChunk({type:key?"key":"delta",timestamp:pts,data:chunk}));waitingKey=false}catch(error){onDecoderError(error)}}
+// A busy decoder may lose a delta frame before the control socket is ready.
+// Retry while waiting, including after control reconnects; never flood the encoder.
+function requestVideoKeyFrame(){const now=performance.now();if(now-lastKeyFrameRequest<1000)return;if(sendControl({t:"system",op:"keyframe"}))lastKeyFrameRequest=now}
+function decode(key,pts,data){if(configuring){if(pendingChunks.length<300)pendingChunks.push([key,pts,data]);else{pendingChunks=[];waitingKey=true}return}if(!decoder||decoder.state!=="configured"){stats.framesDropped+=1;waitingKey=true;return}if(waitingKey&&!key){stats.framesDropped+=1;requestVideoKeyFrame();return}if(!key&&decoder.decodeQueueSize>30){waitingKey=true;stats.framesDropped+=1;requestVideoKeyFrame();return}let chunk=data;if(key&&config){chunk=new Uint8Array(config.length+data.length);chunk.set(config);chunk.set(data,config.length)}try{decoder.decode(new EncodedVideoChunk({type:key?"key":"delta",timestamp:pts,data:chunk}));waitingKey=false;if(key)lastKeyFrameRequest=-Infinity}catch(error){onDecoderError(error)}}
 // Decoded frames waiting for an animation frame, on every fast transport (scrcpy and idb). They
 // are shown in order: at most MAX_QUEUED_FRAMES wait, one is drawn per animation frame and another
 // is asked for while frames remain, and the oldest beyond that is closed and counted as dropped.
@@ -345,12 +355,12 @@ function scheduleDraw(){if(!drawScheduled){drawScheduled=true;requestAnimationFr
 function dropQueuedFrames(){while(frameQueue.length)frameQueue.shift().close()}
 function onFrame(frame){stats.framesDecoded+=1;frameQueue.push(frame);while(frameQueue.length>MAX_QUEUED_FRAMES){frameQueue.shift().close();stats.framesDropped+=1}scheduleDraw()}
 function draw(){drawScheduled=false;const frame=frameQueue.shift();if(!frame)return;if(frameQueue.length)scheduleDraw();const size=upright(frame.displayWidth,frame.displayHeight);if(video.width!==size.width||video.height!==size.height){video.width=size.width;video.height=size.height;fitFrame(size.width,size.height)}if(rotation){ctx.setTransform(1,0,0,1,video.width/2,video.height/2);ctx.rotate(rotation*Math.PI/180);ctx.drawImage(frame,-frame.displayWidth/2,-frame.displayHeight/2,frame.displayWidth,frame.displayHeight);ctx.setTransform(1,0,0,1,0,0)}else ctx.drawImage(frame,0,0,video.width,video.height);frame.close();const now=performance.now();stats.framesRendered+=1;stats.lastFrameAt=now;stats.renderTimes.push(now);while(stats.renderTimes.length&&now-stats.renderTimes[0]>1000)stats.renderTimes.shift()}
-function onDecoderError(error){stats.errors+=1;note("decoder: "+(error&&error.message||error));try{if(decoder&&decoder.state!=="closed")decoder.close()}catch{}decoder=null;waitingKey=true;if(stats.codec&&supportedCodecs.get(stats.codec))applyDecoderConfig(stats.codec);sendControl({t:"system",op:"keyframe"})}
+function onDecoderError(error){stats.errors+=1;note("decoder: "+(error&&error.message||error));try{if(decoder&&decoder.state!=="closed")decoder.close()}catch{}decoder=null;waitingKey=true;if(stats.codec&&supportedCodecs.get(stats.codec))applyDecoderConfig(stats.codec);requestVideoKeyFrame()}
 
 // scrcpy control: one WebSocket carrying touch, wheel, keys, text and system actions.
-function connectControl(){if(controlSocket||!fastActive())return;const socket=new WebSocket(wsUrl("/ws/control"));controlSocket=socket;socket.onopen=()=>{controlRetry=500};socket.onmessage=event=>{let message;try{message=JSON.parse(event.data)}catch{return}onControlMessage(message)};socket.onclose=()=>{if(controlSocket!==socket)return;controlSocket=null;activePointers.clear();displayBusy=false;view.rotateBusy=false;syncControls();if(fastActive()){setTimeout(connectControl,controlRetry);controlRetry=Math.min(5000,controlRetry*2)}}}
+function connectControl(){if(controlSocket||!fastActive())return;const socket=new WebSocket(wsUrl("/ws/control"));controlSocket=socket;socket.onopen=()=>{controlRetry=500;if(waitingKey&&config&&view.mode==="webcodecs")requestVideoKeyFrame()};socket.onmessage=event=>{let message;try{message=JSON.parse(event.data)}catch{return}onControlMessage(message)};socket.onclose=()=>{if(controlSocket!==socket)return;controlSocket=null;activePointers.clear();displayBusy=false;view.rotateBusy=false;syncControls();if(fastActive()){setTimeout(connectControl,controlRetry);controlRetry=Math.min(5000,controlRetry*2)}}}
 function closeControlSocket(){const socket=controlSocket;controlSocket=null;if(socket)socket.close()}
-function onControlMessage(message){if(message.t==="state")applyState(message);else if(message.t==="display")onDisplay(message.display);else if(message.t==="rotation"){view.rotateBusy=false;syncControls();note(message.legacy?"Rotation requested through scrcpy":"Device rotated")}else if(message.t==="error"){stats.errors+=1;note(message.message);if(message.for==="rotate"){view.rotateBusy=false;syncControls()}if(message.for==="display"){displayBusy=false;syncPicker()}}else if(message.t==="clipboard"){if(typeof message.text!=="string"){note("the device clipboard has no text");return}textInput.value=message.text;if(navigator.clipboard&&navigator.clipboard.writeText)navigator.clipboard.writeText(message.text).catch(()=>{});note("device clipboard copied")}else if(message.t==="paste"){if(message.message)note(message.message)}else if(message.t==="pong"){view.rtt=Math.round(performance.now()-message.ts)}}
+function onControlMessage(message){if(message.t==="state")applyState(message);else if(message.t==="display")onDisplay(message.display);else if(message.t==="rotation"){if(typeof invalidateDeviceFrame==="function")invalidateDeviceFrame();view.rotateBusy=false;syncControls();note(message.legacy?"Rotation requested through scrcpy":"Device rotated")}else if(message.t==="error"){stats.errors+=1;note(message.message);if(message.for==="rotate"){view.rotateBusy=false;syncControls()}if(message.for==="display"){displayBusy=false;syncPicker()}}else if(message.t==="clipboard"){if(typeof message.text!=="string"){note("the device clipboard has no text");return}textInput.value=message.text;if(navigator.clipboard&&navigator.clipboard.writeText)navigator.clipboard.writeText(message.text).catch(()=>{});note("device clipboard copied")}else if(message.t==="paste"){if(message.message)note(message.message)}else if(message.t==="pong"){view.rtt=Math.round(performance.now()-message.ts)}}
 function sendControl(message){if(!controlSocket||controlSocket.readyState!==1)return false;controlSocket.send(JSON.stringify(message));return true}
 function applyLease(data){if("lease" in data)view.lease=data.lease&&typeof data.lease==="object"?data.lease:null;if("session_stopped" in data)view.sessionStopped=data.session_stopped===true}
 function applyState(message){view.owner=message.owner;view.paused=message.paused;view.session=message.session;view.clients=message.clients;applyLease(message);if("clipboard" in message){view.clipboard=message.clipboard===true;if(iosFast())applyHint()}if("preset" in message){view.preset=message.preset;view.density=message.density}syncPicker();if("rotation" in message)setRotation(message.rotation);if(view.mode==="webcodecs"&&message.width&&message.height)setVideoSize(message.width,message.height);if(message.transport&&message.transport!==view.transport){view.transport=message.transport;applyTransport()}}
@@ -379,8 +389,9 @@ function closeMenu(refocus){if(sizeDropdown)sizeDropdown.close(refocus)}
 const settingsToggle=$("canvas-settings-toggle"),settingsPanel=$("canvas-settings");
 function setSettings(open,refocus=false){
   if(!settingsPanel)return;
-  if(open){if(document.body.classList.contains("tools-open"))$("tools-toggle").click();if(document.body.classList.contains("actions-open"))$("actions-toggle").click();if(inspectorNarrow&&inspectorNarrow.matches)setInspector(false)}
+  if(open){if(document.body.classList.contains("tools-open"))$("tools-toggle").click();if(document.body.classList.contains("actions-open"))$("actions-toggle").click();if(EMBED||(inspectorNarrow&&inspectorNarrow.matches))setInspector(false)}
   settingsPanel.hidden=!open;settingsToggle.setAttribute("aria-expanded",String(open));settingsToggle.setAttribute("aria-pressed",String(open));
+  if(open)refreshDeviceLanguage();else cancelDeviceLanguage();
   if(open)($("canvas-theme")||$("canvas-settings-close")).focus();else{closeMenu(false);if(refocus)settingsToggle.focus()}
 }
 if(settingsToggle){
@@ -388,16 +399,17 @@ if(settingsToggle){
   $("canvas-settings-close").addEventListener("click",()=>setSettings(false,true));
   document.addEventListener("pointerdown",event=>{if(!settingsPanel.hidden&&!settingsPanel.contains(event.target)&&!settingsToggle.contains(event.target))setSettings(false)});
   document.addEventListener("keydown",event=>{if(event.key==="Escape"&&!event.defaultPrevented&&!settingsPanel.hidden){event.preventDefault();if(menuOpen)closeMenu(true);else setSettings(false,true)}});
-  for(const id of ["tools-toggle","actions-toggle","inspector-toggle"]){const toggle=$(id);if(toggle)toggle.addEventListener("click",()=>setSettings(false))}
+  for(const id of ["tools-toggle","actions-toggle","inspector-toggle"]){const toggle=$(id);if(toggle)toggle.addEventListener("click",()=>{setSettings(false);if(EMBED&&id!=="inspector-toggle")setInspector(false)})}
 }
 // Controls that cannot act look and are disabled (PAGE-004); handoff goes the way input goes.
-function syncControls(){const ready=Boolean(view.status)&&canSendInput();for(const control of inputControls){const disabled=!ready||(control.id==="clipboard-paste"&&(view.pasteBusy||!scrcpyActive()))||(control.dataset.system==="rotate"&&view.rotateBusy);if(control.disabled!==disabled)control.disabled=disabled}}
+function syncControls(){if(typeof syncLanguageControl==="function")syncLanguageControl();const ready=Boolean(view.status)&&canSendInput();for(const control of inputControls){const disabled=!ready||(control.id==="clipboard-paste"&&(view.pasteBusy||!scrcpyActive()))||(control.dataset.system==="rotate"&&view.rotateBusy);if(control.disabled!==disabled)control.disabled=disabled}}
 function setInspector(open,returnFocus=false){document.body.classList.toggle("no-inspector",!open);ui.inspector.setAttribute("aria-pressed",String(open));ui.inspector.title=open?"Hide inspector":"Show inspector";if(returnFocus)ui.inspector.focus()}
 ui.inspector.addEventListener("click",()=>setInspector(document.body.classList.contains("no-inspector")));
 $("inspector-close").addEventListener("click",()=>setInspector(false,true));
 const inspectorNarrow=typeof matchMedia==="function"?matchMedia("(max-width:760px)"):null;
+if(EMBED)setInspector(false);
 if(inspectorNarrow){if(inspectorNarrow.matches)setInspector(false);const resized=event=>{if(event.matches)setInspector(false)};if(inspectorNarrow.addEventListener)inspectorNarrow.addEventListener("change",resized);else if(inspectorNarrow.addListener)inspectorNarrow.addListener(resized)}
-document.addEventListener("keydown",event=>{if(event.key==="Escape"&&!event.defaultPrevented&&inspectorNarrow&&inspectorNarrow.matches&&!document.body.classList.contains("no-inspector")&&!document.body.classList.contains("tools-open")&&!document.body.classList.contains("actions-open")){event.preventDefault();setInspector(false,true)}});
+document.addEventListener("keydown",event=>{if(event.key==="Escape"&&!event.defaultPrevented&&(EMBED||(inspectorNarrow&&inspectorNarrow.matches))&&!document.body.classList.contains("no-inspector")&&!document.body.classList.contains("tools-open")&&!document.body.classList.contains("actions-open")){event.preventDefault();setInspector(false,true)}});
 // iOS Safari shows :active press feedback only while the document has a touch listener.
 document.addEventListener("touchstart",()=>{},{passive:true});
 function clamp01(value){return Math.min(1,Math.max(0,value))}
@@ -459,7 +471,7 @@ async function sendText(){const value=textInput.value;if(!value)return;if(iosFas
 $("sendText").onclick=sendText;textInput.addEventListener("keydown",event=>{if(event.key==="Enter")sendText()});
 function transportLabel(){if(!view.transport)return"connecting";if(!fastActive())return view.transport;if(view.mode==="webcodecs")return scrcpyActive()?"scrcpy (webcodecs)":view.transport+" (webcodecs)";return view.transport+" (multipart"+(view.reason?": "+view.reason:"")+")"}
 function currentFps(){const now=performance.now();while(stats.renderTimes.length&&now-stats.renderTimes[0]>1000)stats.renderTimes.shift();return stats.renderTimes.length}
-function render(){currentFps();const data=view.status||{},lines=["platform: "+(data.platform||"unknown"),"transport: "+transportLabel()];if(data.fallback_reason)lines.push("fallback: "+data.fallback_reason);if(view.mode==="webcodecs"){lines.push("decoder: "+(stats.codec||"waiting for config"));lines.push("fps: "+stats.renderTimes.length+" rendered, "+stats.framesDecoded+" decoded, "+stats.framesDropped+" dropped, queue "+(decoder?decoder.decodeQueueSize:0));lines.push("video: "+(view.width?view.width+"x"+view.height:"waiting")+", session "+view.session)}else{lines.push("frames: "+(data.frames_sent??0)+"\\nstream clients: "+(data.stream_clients??0))}if(view.clients)lines.push("clients: video "+view.clients.video+", control "+view.clients.control);lines.push("display: "+(data.display&&data.display.width?data.display.width+"x"+data.display.height+(view.density?" @ "+view.density:"")+(sizePicker?" ("+(view.preset||"other")+")":""):"unknown"));lines.push("control: "+view.owner+(view.paused?" (paused)":""));if(data.last_error)lines.push("last error: "+data.last_error);if(view.note)lines.push("note: "+view.note);setStatus(lines.join("\\n"));syncPicker();renderChrome()}
+function render(){if(view.width&&view.height)refreshDeviceFrame(view.width,view.height);currentFps();const data=view.status||{},lines=["platform: "+(data.platform||"unknown"),"transport: "+transportLabel()];if(data.fallback_reason)lines.push("fallback: "+data.fallback_reason);if(view.mode==="webcodecs"){lines.push("decoder: "+(stats.codec||"waiting for config"));lines.push("fps: "+stats.renderTimes.length+" rendered, "+stats.framesDecoded+" decoded, "+stats.framesDropped+" dropped, queue "+(decoder?decoder.decodeQueueSize:0));lines.push("video: "+(view.width?view.width+"x"+view.height:"waiting")+", session "+view.session)}else{lines.push("frames: "+(data.frames_sent??0)+"\\nstream clients: "+(data.stream_clients??0))}if(view.clients)lines.push("clients: video "+view.clients.video+", control "+view.clients.control);lines.push("display: "+(data.display&&data.display.width?data.display.width+"x"+data.display.height+(view.density?" @ "+view.density:"")+(sizePicker?" ("+(view.preset||"other")+")":""):"unknown"));lines.push("control: "+view.owner+(view.paused?" (paused)":""));if(data.last_error)lines.push("last error: "+data.last_error);if(view.note)lines.push("note: "+view.note);setStatus(lines.join("\\n"));syncPicker();renderChrome()}
 // The toolbar, caption, notice and Stream details; every string reaches the page as text.
 function sizeText(width,height){return width&&height?width+" × "+height:""}
 function displayText(){const display=logicalDisplay||{},size=sizeText(display.width,display.height);return size&&view.density?size+" · "+view.density+" dpi":size}
@@ -473,13 +485,28 @@ window.autonomCanvas=Object.freeze({stats:snapshot,send:sendControl});
 async function authenticate(){const body=bootstrapToken?{token:bootstrapToken}:{};const response=await fetch("/auth",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});const payload=await response.json().catch(()=>({}));if(response.ok){csrf=payload.csrf;return}if(bootstrapToken)throw new Error(payload.error||"Authentication failed");note("open the Canvas URL with its #token to sign in")}
 async function bootstrap(){await authenticate();setInterval(render,500);await poll()}
 bootstrap().catch(error=>{setStatus(error.message);setText(ui.notice,error.message)});
+${deviceFrameScript()}
+${deviceLanguageScript()}
 ${EMBED_SCRIPT}`;
 }
 
-// A tile of the workspace page (embed mode): header and inspector hidden; the surface, the
-// button row, notices and the drawers stay.
-const EMBED_STYLES = "html[data-embed=\"1\"] .bar,html[data-embed=\"1\"] #inspector{display:none!important}" +
-  "html[data-embed=\"1\"] body{min-height:0}";
+// Embedded pages use the shell toolbar; all panels remain available as overlays.
+const EMBED_STYLES = `
+html[data-embed="1"] .bar{display:none}
+html[data-embed="1"] body{height:100dvh;min-height:0;overflow:hidden;grid-template-rows:minmax(0,1fr);grid-template-areas:"stage side"}
+html[data-embed="1"] body.no-inspector:not(.tools-open):not(.actions-open){grid-template-areas:"stage"}
+html[data-embed="1"] .stage{height:100dvh;padding:16px 16px 80px;overflow:hidden}
+html[data-embed="1"] .device{width:min(calc(100% - 18px),calc((100dvh - 136px) * var(--video-ratio)))}
+html[data-embed="1"] .dock{position:absolute;bottom:12px;max-width:calc(100% - 16px);gap:0;padding:4px}
+html[data-embed="1"] .dock button{width:30px;height:32px;flex:none}
+@media(max-width:760px){
+html[data-embed="1"] :is(.side,.tools,.act){position:fixed;inset:8px 8px 8px auto;width:var(--canvas-panel-width);z-index:6;border:1px solid var(--line-2);border-radius:14px;overflow:hidden;box-shadow:var(--sheet-shadow)}
+html[data-embed="1"] :is(.tools-body,.act-body,.inspector-body){margin-bottom:12px}
+}
+@media(min-width:761px){html[data-embed="1"] body:is(.tools-open,.actions-open){grid-template-areas:"stage side"}}
+html[data-embed="1"] .canvas-settings{top:8px;left:8px;right:auto}
+html[data-embed="1"] .notice{position:absolute;top:8px}
+`;
 
 // The tile side of the workspace messages (contract 3.7). Both sides check the origin, a tile
 // also that the message comes from its parent; unknown types are ignored. Ctrl+Alt+1..4 and
@@ -495,9 +522,11 @@ const EMBED_SCRIPT = [
   "window.addEventListener(\"message\",event=>{if(event.origin!==location.origin||event.source!==window.parent)return;const data=event.data;if(!data||typeof data!==\"object\")return;",
   "if(data.type===\"autonom:focus\"){document.documentElement.toggleAttribute(\"data-focused\",Boolean(data.focused));if(data.focused)(document.getElementById(\"video\").hidden?document.getElementById(\"screen\"):document.getElementById(\"video\")).focus({preventScroll:true})}",
   "else if(data.type===\"autonom:tools\"){const toggle=document.getElementById(\"tools-toggle\");if(toggle&&(toggle.getAttribute(\"aria-pressed\")===\"true\")!==Boolean(data.open))toggle.click()}",
-  "else if(data.type===\"autonom:panel\"){window.dispatchEvent(new CustomEvent(\"autonom:panel\",{detail:{name:String(data.name||\"\"),open:Boolean(data.open)}}))}});",
+  "else if(data.type===\"autonom:panel\"&&(data.name===\"inspector\"||data.name===\"settings\"||data.name===\"actions\")){const toggle=$(data.name===\"inspector\"?\"inspector-toggle\":data.name===\"actions\"?\"actions-toggle\":\"canvas-settings-toggle\");const attr=data.name===\"settings\"?\"aria-expanded\":\"aria-pressed\";if(toggle&&(toggle.getAttribute(attr)===\"true\")!==Boolean(data.open))toggle.click()}\nelse if(data.type===\"autonom:panel\"){window.dispatchEvent(new CustomEvent(\"autonom:panel\",{detail:{name:String(data.name||\"\"),open:Boolean(data.open)}}))}});",
   "document.addEventListener(\"pointerdown\",()=>toShell({type:\"autonom:focus-request\",id:DEVICE_ID}),true);",
   "document.addEventListener(\"keyup\",event=>{embedHotkey(event)},true);",
+  "function reportPanels(){toShell({type:\"autonom:panels\",id:DEVICE_ID,tools:$(\"tools-toggle\").getAttribute(\"aria-pressed\")===\"true\",actions:Boolean($(\"actions-toggle\")&&$(\"actions-toggle\").getAttribute(\"aria-pressed\")===\"true\"),inspector:ui.inspector.getAttribute(\"aria-pressed\")===\"true\",settings:Boolean(settingsPanel&&!settingsPanel.hidden)})}",
+  "if(typeof MutationObserver!==\"undefined\"){const panelObserver=new MutationObserver(reportPanels);for(const id of [\"tools-toggle\",\"actions-toggle\",\"inspector-toggle\",\"canvas-settings-toggle\"]){const node=$(id);if(node)panelObserver.observe(node,{attributes:true,attributeFilter:[\"aria-pressed\",\"aria-expanded\"]})}}",
   "setInterval(queueTileState,500);",
   "toShell({type:\"autonom:ready\",id:DEVICE_ID});",
   "}",

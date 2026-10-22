@@ -630,8 +630,8 @@ class ToolsBindingTests(BindingCase):
         self.assertEqual(set(tools_mod.LEASED_TOOLS_OPS), {
             "permissions.set", "location.set", "location.clear", "simulate",
             "network.capture", "network.attach", "network.detach", "network.stop", "app.install",
-            "app.launch", "app.open_url", "app.locale"})
-        self.assertEqual(len(tools_mod.LEASED_TOOLS_OPS), 12)
+            "app.launch", "app.open_url", "app.locale", "device.language.set"})
+        self.assertEqual(len(tools_mod.LEASED_TOOLS_OPS), 13)
         self.assertTrue(set(tools_mod.LEASED_TOOLS_OPS) <= set(tools_mod.OPS))
         never = {"network.start", "capture.screenshot", "record.start", "record.stop",
                  *tools_mod.READ_OPS, *tools_mod.ACTION_READ_OPS,

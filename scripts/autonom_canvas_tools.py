@@ -73,7 +73,7 @@ if str(ROOT) not in sys.path:
 import autonom as cli  # noqa: E402  (the shared network helpers)
 import autonom_canvas_bridge as bridge  # noqa: E402
 from autonom_lib import adb as adb_mod  # noqa: E402
-from autonom_lib import captures, tool_health  # noqa: E402
+from autonom_lib import canvas_capture_frame, device_frames, device_language, captures, tool_health  # noqa: E402
 from autonom_lib import device_state, errors, ios_simctl, journal  # noqa: E402
 from autonom_lib import screenshot, session, simulator  # noqa: E402
 from autonom_lib.network import device_proxy_ios  # noqa: E402
@@ -90,9 +90,9 @@ MUTATING_OPS = ("permissions.set", "location.set", "location.clear", "simulate",
                 "mocks.add", "mocks.update", "mocks.enable", "mocks.disable",
                 "mocks.remove", "mocks.clear")
 # The Actions drawer (contract section 5.1): separate tuples, so the Tools lists stay pinned.
-ACTION_READ_OPS = ("captures.list", "record.status", "apps.candidates", "health")
+ACTION_READ_OPS = ("captures.list", "record.status", "apps.candidates", "health", "frame.describe", "device.language.get")
 ACTION_DEVICE_OPS = ("capture.screenshot", "record.start", "record.stop", "app.install",
-                     "app.launch", "app.open_url", "app.locale")
+                     "app.launch", "app.open_url", "app.locale", "device.language.set")
 # Host-only operations never mutate the device.
 ACTION_LOCAL_OPS = ("captures.delete", "captures.open_directory")
 INTERNAL_OPS = ("captures.file",)           # only for the Node file route
@@ -106,7 +106,7 @@ UNJOURNALED_OPS = READ_OPS + ACTION_READ_OPS + ACTION_LOCAL_OPS + INTERNAL_OPS
 # (`capture.screenshot`, `record.*`, `captures.*`) never need a lease.
 LEASED_TOOLS_OPS = ("permissions.set", "location.set", "location.clear", "simulate",
                     "network.capture", "network.attach", "network.detach", "network.stop", "app.install",
-                    "app.launch", "app.open_url", "app.locale")
+                    "app.launch", "app.open_url", "app.locale", "device.language.set")
 
 RECORD_LIMIT_S = 180
 RECORD_STOP_WAIT_S = 10.0
@@ -242,6 +242,7 @@ class Tools:
     def __init__(self, target: Target, *, install_roots: tuple[str, ...] | list[str] = (),
                  captures_dir: str | None = None, device_name: str | None = None) -> None:
         self.target = target
+        self.frames = device_frames.FrameRepository(target)
         self.install_roots = [str(root) for root in install_roots if root]
         self.captures_dir = captures_dir
         self.device_name = device_name
@@ -253,6 +254,9 @@ class Tools:
         self.bound_session_id: str | None = None
         self.handlers: dict[str, Callable[..., Any]] = {
             "context": self.context,
+            "frame.describe": self.frames.describe,
+            "device.language.get": lambda payload: device_language.current(self.target),
+            "device.language.set": self.device_language_set,
             "permissions.list": self.permissions_list,
             "location.get": self.location_get,
             "biometric.status": lambda payload: simulator.biometric_status(self.target),
@@ -797,17 +801,25 @@ class Tools:
         return captures.entry(self._captures_path(), self._capture_name(payload))
 
     def capture_screenshot(self, payload: dict[str, Any], record: dict[str, Any] | None):
+        frame = canvas_capture_frame.options(payload.get("frame"), self.frames)
         directory = self._captures_dir()
         temp = captures.temp_path(directory, "png")
         created = time.time()
         try:
             screenshot.capture_target(self.target, temp)
+            warning = None
+            try:
+                canvas_capture_frame.render(temp, frame, repository=self.frames)
+            except errors.AutonomError:
+                warning = "Frame rendering failed; the original screenshot was saved without a frame."
         except BaseException:
             _unlink(temp)
             raise
         capture, pruned = captures.commit(temp, directory, "screenshot",
                                           meta=self._meta(created=created, duration_ms=None))
         result: dict[str, Any] = {"capture": capture, "pruned": pruned}
+        if warning:
+            result["warning"] = warning
         if record is not None:
             self._file_in_session(result, directory / capture["name"], record, created)
         return (result, [capture["name"]],
@@ -848,6 +860,7 @@ class Tools:
             raise errors.AutonomError(
                 errors.RECORDING_ALREADY_ACTIVE, "a recording is already running on this device",
                 "Stop it first; one recording runs per device.")
+        frame = canvas_capture_frame.options(payload.get("frame"), self.frames)
         directory = self._captures_dir()
         temp = captures.temp_path(directory, "mp4")
         if self.target.platform == ANDROID:
@@ -871,7 +884,7 @@ class Tools:
             "process": process, "remote": remote, "temp": temp, "directory": directory,
             "started": started, "started_mono": time.monotonic(),
             "started_at": captures._now_iso(started),  # noqa: SLF001 - one ISO format
-            "limit_hit": False, "finalized": False, "timer": None,
+            "limit_hit": False, "finalized": False, "timer": None, "frame": frame,
         }
         if self.target.platform == IOS:
             # simctl records until told to stop: a timer stops it at the limit.
@@ -945,12 +958,17 @@ class Tools:
             raise
         finally:
             self._remove_remote(state, 30)
+        warning = None
+        try:
+            canvas_capture_frame.render(temp, state.get("frame"), video=True, repository=self.frames)
+        except errors.AutonomError:
+            warning = "Frame rendering failed; the original recording was saved without a frame."
         capture, pruned = captures.commit(
             temp, state["directory"], "video",
             meta=self._meta(created=state["started"], duration_ms=duration_ms))
         result = {"capture": capture, "pruned": pruned, "duration_ms": duration_ms,
-                  "ended_early": ended_early}
-        self.last_recording = {"capture": capture, "ended_early": ended_early}
+                  "ended_early": ended_early, "warning": warning}
+        self.last_recording = {"capture": capture, "ended_early": ended_early, "warning": warning}
         return result
 
     def _settle_recording(self) -> dict[str, Any] | None:
@@ -1222,6 +1240,13 @@ class Tools:
                   "handled_by": detail.get("handled_by") or "unknown", **self.target.identity()}
         origin = url_origin(url)
         return result, [origin], {"url": origin}
+
+    def device_language_set(self, payload: dict[str, Any], record: dict[str, Any] | None):
+        if self.target.platform == IOS and self._recording_active():
+            raise errors.AutonomError(errors.INVALID_VALUE, "Stop recording before changing the device language")
+        result = device_language.set_language(self.target, payload.get("language"),
+                                              restart=payload.get("restart", False))
+        return result, [result["language"]], {"language": result["language"]}
 
     def app_locale(self, payload: dict[str, Any], record: dict[str, Any] | None):
         app_id = self._action_app_id(payload)

@@ -15,6 +15,7 @@ import { EventEmitter } from "node:events";
 import { createInterface } from "node:readline";
 import {
   DEFAULT_SCRCPY_MAX_FPS,
+  SOFTWARE_ENCODER_MAX_FPS,
   MAX_BODY_BYTES,
   MAX_CONTROL_MESSAGE_BYTES,
   MAX_POINTERS,
@@ -30,6 +31,7 @@ import {
   parseCookies,
   screenrecordMaxSize,
   streamMaxSize,
+  streamMaxFps,
 } from "./browser-lib.mjs";
 import {
   COPY_KEY,
@@ -57,6 +59,7 @@ import {
   acceptWebSocket,
   rejectUpgrade,
 } from "./ws.mjs";
+import { DisplayChrome } from "./canvas-display-chrome.mjs";
 import { createCanvasTools, handleToolsRoute } from "./canvas-tools-server.mjs";
 import { profileVideo, splitDevicePath } from "./canvas-devices.mjs";
 import {
@@ -348,6 +351,7 @@ export function createDeviceContext(server, device) {
     // The size and density overrides found before the first change, and whether a `wm`
     // command may have changed the display since, so the stop puts them back.
     displayOriginal: null,
+    displayChrome: null,
     displayWritten: false,
     // The change waiting in the input queue, at most one, and the `wm` commands of the one
     // running, which are all the restore at stop waits for.
@@ -456,10 +460,10 @@ Options:
   --transport MODE            auto, scrcpy, idb, screenrecord, or screencap (default: auto).
                               auto prefers scrcpy on Android when a ${SCRCPY_PROTOCOL_VERSION} server is found,
                               and idb on the iOS Simulator when idb_companion is found.
-  --fps FPS                   Frame rate cap (default: 15; ${DEFAULT_SCRCPY_MAX_FPS} on scrcpy and idb).
+  --fps FPS                   Frame rate cap (default: 15; ${SOFTWARE_ENCODER_MAX_FPS} on software scrcpy, ${DEFAULT_SCRCPY_MAX_FPS} on hardware/idb).
   --max-size PX               Longest video side on scrcpy, video width on screenrecord;
                               0 is native size. Default on scrcpy: follows the device's
-                              H.264 encoder (2048 when software only, native with a
+                              H.264 encoder (1280 when software only, native with a
                               hardware one, 1280 when it cannot tell); otherwise 1280.
   --bit-rate BPS              H.264 bitrate (default: 12000000).
   --scrcpy-server PATH        scrcpy-server file to push (default: AUTONOM_SCRCPY_SERVER,
@@ -964,6 +968,7 @@ function scrcpyStatus(context) {
     // "encoder" (the encoder named) or "default" (the encoders could not be read); all
     // null until the first session has chosen, and while scrcpy is not the transport.
     max_size: scrcpySize?.maxSize ?? null,
+    max_fps: stats?.maxFps ?? null,
     max_size_source: scrcpySize?.source ?? null,
     encoder: scrcpySize?.encoder ?? null,
     encoder_name: scrcpySize?.encoderName ?? null,
@@ -1879,13 +1884,15 @@ function ensureSession(context) {
         logStreamSize(context);
         return context.state.streamSize.maxSize;
       },
+      chooseMaxFps: options.fpsExplicit || maxFps <= SOFTWARE_ENCODER_MAX_FPS ? null
+        : (probe) => streamMaxFps(options, probe, maxFps),
       bitRate: options.bitRate,
       maxFps,
     });
   if (transport === "scrcpy") logStreamSize(context);
   if (context.server?.mode === "workspace") {
     logEvent(context.server, { device: context.id, kind: "stream", name: "start", origin: "system",
-      summary: `${transport} ${maxFps} fps` }, { ok: true });
+      summary: `${transport} up to ${maxFps} fps` }, { ok: true });
   }
   context.session = session;
   session.on("orientation", () => {
@@ -4590,7 +4597,22 @@ async function changeDisplay(context, preset, origin, client) {
   }
   // From here on the stop has something to put back.
   context.displayWritten = true;
-  const commands = runWm(context, presetCommands(preset), { change: true });
+  const commands = (async () => {
+    context.displayChrome ??= new DisplayChrome(
+      (argv) => runAdb(context, argv, { timeout: WM_TIMEOUT_MS }),
+      /^emulator-\d+$/.test(context.serial));
+    try {
+      await context.displayChrome.apply(preset.id, () => {
+        if (context.shuttingDown) throw new Error("Canvas is stopping");
+      });
+    } catch (error) {
+      const failures = [`Display artwork: ${adbFailure(error)}`];
+      try { await context.displayChrome.restore(); }
+      catch (restoreError) { failures.push(restoreError.message); }
+      return failures;
+    }
+    return runWm(context, presetCommands(preset), { change: true });
+  })();
   context.displayRunning = commands;
   const [failure] = await commands;
   if (context.displayRunning === commands) context.displayRunning = null;
@@ -4850,6 +4872,8 @@ async function restoreDisplay(context) {
   if (!context.displayWritten || !original) return;
   try {
     const failures = await runWm(context, restoreCommands(original), { change: false });
+    try { await context.displayChrome?.restore(); }
+    catch (error) { failures.push(error.message); }
     const wm = await readWm(context).catch(() => null);
     console.log(failures.length
       ? `Display restore failed: ${failures.join("; ")}; in effect: ${describeDisplay(wm)}`

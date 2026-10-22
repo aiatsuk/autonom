@@ -597,3 +597,7 @@ Behaviour changes:
   `flow run` (following the `doctor --strict` precedent). Both changes are
   **additive** — existing envelope keys, codes, and exit semantics are
   unchanged.
+
+### Compact Android software-encoder preview
+
+Without an explicit `--max-size`, software H.264 encoders now use 1280 px on the longer side instead of 2048. Hardware encoders still use native resolution; an unreadable encoder list still falls back to 1280. Software encoders now default to a 30 fps cap; hardware or unknown encoders retain 60 fps. Explicit `--fps` overrides either default. Bitrate, background profile, device display size and capture resolution are unchanged. `--max-size 2048` or `--max-size 0` remains available for larger previews. This reduces encoded pixels by about 61% at the same aspect ratio; it is not a measured CPU improvement. The earlier benchmark table above is historical.

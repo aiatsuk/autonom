@@ -1004,30 +1004,17 @@ describe("tiles", () => {
     assert.ok(page.button(page.tile(1).querySelector(".tile-alert"), "Reconnect"));
   });
 
-  test("the control chip pauses, resumes, takes over and releases through /d/<id>/control", async () => {
+  test("device menu keeps detach without resurrecting removed input controls", async () => {
     const page = await started({ server: twoTabServer() });
-    const tile = page.tile(0);
-    const chip = tile.querySelector(".tile-chip");
-    assert.equal(chip.textContent, "Shared");
-    click(chip);
+    const tile = page.tile(0), menu = page.button(tile, "Device menu");
+    assert.doesNotMatch(tile.textContent, /Shared|Take over|Pause input|Release/);
+    click(menu);
+    assert.equal(menu.getAttribute("aria-expanded"), "true");
     assert.equal(tile.querySelector(".tile-pop").hidden, false);
-    assert.equal(chip.getAttribute("aria-expanded"), "true");
-    click(page.button(tile, "Pause input"));
-    await flush();
-    assert.deepEqual(page.posts("/d/android~emulator-5580/control").map((call) => call.body), [{ mode: "pause" }]);
-    assert.equal(tile.querySelector(".tile-pop").hidden, true);
-    assert.equal(chip.textContent, "Shared · Paused");
-    click(chip);
-    click(page.button(tile, "Take over"));
-    await flush();
-    assert.equal(chip.textContent, "People · Paused");
-    click(chip);
-    click(page.button(tile, "Resume input"));
-    click(chip);
-    click(page.button(tile, "Release"));
-    await flush();
-    assert.deepEqual(page.posts("/d/android~emulator-5580/control").map((call) => call.body.mode), ["pause", "takeover", "resume", "release"]);
-    assert.equal(chip.textContent, "Shared");
+    assert.equal(page.document.activeElement, page.button(tile, "Detach"));
+    click(menu);
+    assert.equal(menu.getAttribute("aria-expanded"), "false");
+    assert.equal(page.posts("/d/android~emulator-5580/control").length, 0);
   });
 
   test("Tools and Actions toggle their drawers in the tile by message; Detach posts", async () => {
@@ -1056,7 +1043,7 @@ describe("tiles", () => {
     assert.equal(page.tile(0).querySelector(".picker-title").textContent, "Add a device", "the slot is empty after detach");
   });
 
-  test("autonom:state from a tile updates its badge and chip; other origins, sources and ids are ignored", async () => {
+  test("autonom:state from a tile updates its diagnostics; other origins, sources and ids are ignored", async () => {
     const page = await started({ server: twoTabServer() });
     const [first, second] = page.iframes();
     const stats = () => page.tile(0).querySelector(".tile-stats").textContent;
@@ -1066,7 +1053,7 @@ describe("tiles", () => {
     assert.equal(stats(), "30 fps max");
     page.message(first, { type: "autonom:state", id: ANDROID, live: true, session: "s_1", transport: "scrcpy", owner: "agent", paused: true, fps: 59.6, width: 1080, height: 2400 });
     assert.equal(stats(), "1080×2400 · 60 fps");
-    assert.equal(page.tile(0).querySelector(".tile-chip").textContent, "Agent · Paused");
+    assert.doesNotMatch(page.tile(0).textContent, /Agent|Paused|Take over/);
     page.message(second, { type: "autonom:state", id: IOS, fps: "lots", width: -3, height: 10 });
     assert.equal(page.tile(1).querySelector(".tile-stats").textContent, "30 fps max", "bad numbers are dropped");
   });
@@ -1368,4 +1355,25 @@ describe("absent devices", () => {
     assert.equal(page.posts("/api/tabs/" + TAB_1 + "/slots/1/clear").length, 1);
     assert.equal(page.tile(1).querySelector(".picker-title").textContent, "Add a device");
   });
+});
+
+
+test("Workspace settings and Inspector stay synchronized with embedded panel closes", async () => {
+  const page=await started({server:twoTabServer()});
+  const tile=page.tile(0),frame=tile.querySelector("iframe");
+  const inspector=page.button(tile,"Inspector"),settings=page.button(tile,"Device settings");
+  click(inspector);
+  assert.equal(inspector.getAttribute("aria-pressed"),"true");
+  assert.deepEqual(page.sent(frame).at(-1),{type:"autonom:panel",name:"inspector",open:true});
+  page.message(frame,{type:"autonom:panels",id:ANDROID,inspector:false});
+  assert.equal(inspector.getAttribute("aria-pressed"),"false");
+  click(inspector);
+  assert.deepEqual(page.sent(frame).at(-1),{type:"autonom:panel",name:"inspector",open:true},"first click reopens after close in frame");
+  click(settings);
+  assert.equal(inspector.getAttribute("aria-pressed"),"false");
+  assert.equal(settings.getAttribute("aria-pressed"),"true");
+  page.message(frame,{type:"autonom:panels",id:ANDROID,settings:false},"https://foreign.test");
+  assert.equal(settings.getAttribute("aria-pressed"),"true","foreign messages cannot change panel state");
+  page.message(frame,{type:"autonom:panels",id:ANDROID,settings:false});
+  assert.equal(settings.getAttribute("aria-pressed"),"false");
 });

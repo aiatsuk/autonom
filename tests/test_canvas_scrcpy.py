@@ -321,7 +321,7 @@ class BridgeRecordTests(EnvSandboxMixin, unittest.TestCase):
                                    origin)
                 self.assertEqual((result["recorded"], result["via"]), ("display", transport))
         self.assertEqual(bridge.DISPLAY_PRESETS,
-                         ("small", "pixel-11", "pixel-fold", "tablet", "default", "restore"))
+                         ("small", "pixel-10", "pixel-fold", "pixel-fold-closed", "tablet", "default", "restore"))
         self.assertEqual([(entry["verb"], entry["origin"]) for entry in self.journal()],
                          [("ui display", origin) for _preset, _transport, origin in sent])
         self.assertEqual([(detail["preset"], detail["transport"], detail["origin"])
@@ -364,7 +364,7 @@ class BridgeRecordTests(EnvSandboxMixin, unittest.TestCase):
         bad = [{"kind": "display"},
                {**DISPLAY, "preset": None}]
         bad += [{**DISPLAY, "preset": preset} for preset in (
-            "huge", "", "Tablet", "TABLET", "pixel_11", "pixel11", "custom", "null", 3,
+            "huge", "", "Tablet", "TABLET", "pixel_10", "pixel11", "custom", "null", 3,
             True, ["tablet"], {"id": "tablet"})]
         for name, maximum in (("width", 10_000), ("height", 10_000), ("density", 1_000)):
             bad += [{**DISPLAY, name: value} for value in (
@@ -647,7 +647,7 @@ class BridgeProcessTests(EnvSandboxMixin, unittest.TestCase):
         for refused in (3, 5):
             self.assertEqual((replies[refused]["ok"], replies[refused]["error_code"]),
                              (False, errors.FLOW_COMMAND_INVALID))
-        self.assertIn("small, pixel-11, pixel-fold, tablet, default, restore",
+        self.assertIn("small, pixel-10, pixel-fold, pixel-fold-closed, tablet, default, restore",
                       replies[5]["error"])
         self.assertFalse(trace.exists(), "the record op reached the device tool")
         journal = Path(record["artifacts_dir"]) / "journal.ndjson"
@@ -788,8 +788,8 @@ class CanvasServeFlagsTests(EnvSandboxMixin, unittest.TestCase):
         payload = self.refused(self.serve("--max-size", "100"))
         self.assertEqual(payload["error_code"], errors.INVALID_VALUE)
         self.assertIn("0 (native size) or 320..4096", payload["error"])
-        self.assertIn("2048", payload["hint"])
-        self.assertIn("1280", payload["hint"])
+        self.assertIn("1280 when software only", payload["hint"])
+        self.assertIn("native with a hardware one", payload["hint"])
 
     def test_bad_values_fail_before_node_starts(self) -> None:
         cases = [

@@ -102,15 +102,19 @@ export const SYSTEM_PANELS = Object.freeze({
   rotate: CONTROL_MESSAGE_TYPE.ROTATE_DEVICE,
 });
 // Android display presets (DISPLAY-001), from the SDK device profiles small_phone,
-// pixel_fold and pixel_tablet and the published Pixel 11 display. `default` resets the
+// pixel_fold and pixel_tablet and the published Pixel 10 display. `default` resets the
 // target to its own size and density. The order is the order pages and /status show.
 export const DISPLAY_PRESETS = Object.freeze([
   { id: "small", label: "Small phone", width: 720, height: 1280, density: 320 },
-  { id: "pixel-11", label: "Pixel 11", width: 1080, height: 2424, density: 420 },
+  { id: "pixel-10", label: "Pixel 10", width: 1080, height: 2424, density: 420 },
   { id: "pixel-fold", label: "Pixel Fold (open)", width: 2208, height: 1840, density: 420 },
+  { id: "pixel-fold-closed", label: "Pixel Fold (folded)", width: 1080, height: 2092, density: 420 },
   { id: "tablet", label: "Tablet", width: 2560, height: 1600, density: 320 },
   { id: "default", label: "Device default" },
 ].map((preset) => Object.freeze(preset)));
+// Keep the device-native size alongside the four requested models.
+// The legacy tablet preset remains available only to API clients.
+export const DISPLAY_MENU_PRESETS = Object.freeze(DISPLAY_PRESETS.filter(({id}) => id !== "tablet"));
 export const DISPLAY_PRESET_IDS = Object.freeze(DISPLAY_PRESETS.map((preset) => preset.id));
 // The presets as every state message carries them, serialized once: a flood of handoff
 // changes sends one state message per change to every client.

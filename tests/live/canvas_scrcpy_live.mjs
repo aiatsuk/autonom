@@ -130,9 +130,9 @@ const NO_TOUCH = "TouchStatesByDisplay: <no displays touched>";
 // must read back as (DISPLAY-001); `default` reads back as the physical display.
 const DISPLAY_PRESETS = [
   { id: "small", width: 720, height: 1280, density: 320 },
-  { id: "pixel-11", width: 1080, height: 2424, density: 420 },
+  { id: "pixel-10", width: 1080, height: 2424, density: 420 },
   { id: "pixel-fold", width: 2208, height: 1840, density: 420 },
-  { id: "tablet", width: 2560, height: 1600, density: 320 },
+  { id: "pixel-fold-closed", width: 1080, height: 2092, density: 420 },
   { id: "default" },
 ];
 // The override a second Canvas finds already set, and must put back at its stop.
@@ -1117,11 +1117,11 @@ const cases = {
           presets.push(step);
           await displayThroughPicker(session, preset, original, step);
         }
-        const http = await canvas.display("pixel-11");
+        const http = await canvas.display("pixel-10");
         const afterHttp = await readDisplay();
         steps.http = {
           status: http.status, body: http.body, wm: briefDisplay(afterHttp),
-          ok: http.status === 200 && http.body.display?.preset === "pixel-11" &&
+          ok: http.status === 200 && http.body.display?.preset === "pixel-10" &&
             showsValues(afterHttp, DISPLAY_PRESETS[1]),
         };
         steps.refused = await refusedDisplayStep(session, canvas);

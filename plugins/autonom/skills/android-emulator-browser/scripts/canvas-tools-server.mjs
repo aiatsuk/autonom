@@ -30,7 +30,7 @@ export const TOOLS_CALL_TIMEOUT_MS = 60_000;
 // record.start and record.status may first save a recording that ended at its limit
 // (settle, pull, device cleanup), so they get the same room as record.stop.
 export const OP_TIMEOUT_MS = Object.freeze({ "app.install": 300_000, "record.start": 180_000, "record.status": 180_000,
-  "record.stop": 180_000, "health": 30_000 });
+  "record.stop": 180_000, "health": 30_000, "device.language.set": 300_000 });
 // A tools process that is told to stop gets this long to remove a recording's device file.
 export const TOOLS_CLOSE_GRACE_MS = 6000;
 export const TOOLS_RESTART_INTERVAL_MS = 10_000;
@@ -77,9 +77,9 @@ export const TOOLS_MUTATING_OPS = Object.freeze([
 ]);
 export const TOOLS_OPS = Object.freeze([...TOOLS_READ_OPS, ...TOOLS_MUTATING_OPS]);
 // The Actions drawer (same values as ACTION_*_OPS in scripts/autonom_canvas_tools.py).
-export const ACTION_READ_OPS = Object.freeze(["captures.list", "record.status", "apps.candidates", "health"]);
+export const ACTION_READ_OPS = Object.freeze(["captures.list", "record.status", "apps.candidates", "health", "frame.describe", "device.language.get"]);
 export const ACTION_DEVICE_OPS = Object.freeze(["capture.screenshot", "record.start", "record.stop", "app.install",
-  "app.launch", "app.open_url", "app.locale"]);
+  "app.launch", "app.open_url", "app.locale", "device.language.set"]);
 export const ACTION_LOCAL_OPS = Object.freeze(["captures.delete", "captures.open_directory"]);
 // `captures.file` is internal: only the file route asks it, /tools/call refuses it.
 const CALLABLE_OPS = Object.freeze([...TOOLS_OPS, ...ACTION_READ_OPS, ...ACTION_DEVICE_OPS, ...ACTION_LOCAL_OPS]);
@@ -89,7 +89,7 @@ const CALLABLE_OPS = Object.freeze([...TOOLS_OPS, ...ACTION_READ_OPS, ...ACTION_
 // (`network.start`, `mocks.*`) and observation (`capture.screenshot`, `record.*`,
 // `captures.*`) never need a lease and never take one.
 export const LEASED_TOOLS_OPS = Object.freeze(["permissions.set", "location.set", "location.clear", "simulate",
-  "network.capture", "network.attach", "network.detach", "network.stop", "app.install", "app.launch", "app.open_url", "app.locale"]);
+  "network.capture", "network.attach", "network.detach", "network.stop", "app.install", "app.launch", "app.open_url", "app.locale", "device.language.set"]);
 
 const READ_OPS = new Set(TOOLS_READ_OPS);
 const LEASED = new Set(LEASED_TOOLS_OPS);

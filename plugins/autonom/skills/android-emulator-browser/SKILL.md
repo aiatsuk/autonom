@@ -131,17 +131,17 @@ handled by the Canvas status channel. All multipart pages of one Canvas share
 one capture loop.
 
 `--fps` caps the multipart stream (default 15) and, only when given, scrcpy
-and idb (otherwise up to 60; scrcpy sends frames only when the screen
-changes). `--max-size` is the longer side of the scrcpy video and the width
+and idb (otherwise 30 for software scrcpy encoders, 60 for hardware or unknown
+encoders and idb; scrcpy sends frames only when the screen changes). `--max-size` is the longer side of the scrcpy video and the width
 of the MJPEG stream, and `--max-size 0` is native size; idb always streams at
 full resolution. Without `--max-size`, scrcpy follows the device's H.264
 encoder: before its first stream the Canvas runs the pushed scrcpy-server once
 per device with `list_encoders=true` (at most 3 s, the answer kept for
 restarts); only software encoders (`(sw)`, as on every emulator) cap the
-longer side at 2048, a hardware encoder (`(hw)`, as on phones) streams native
+longer side at 1280, a hardware encoder (`(hw)`, as on phones) streams native
 size, and a list that fails or says neither keeps 1280. The screenrecord
 stream keeps 1280 unless `--max-size` says otherwise (0 there is 4096 wide).
-The Canvas prints the choice (`Stream size: 2048 on the long side (software
+The Canvas prints the choice (`Stream size: 1280 on the long side (software
 H.264 encoder c2.android.avc.encoder)`), `/status` `scrcpy` reports
 `max_size` (0 is native), `max_size_source` (`explicit`, `encoder` or
 `default`), `encoder` and `encoder_name`, and the Android `state` message
@@ -543,7 +543,7 @@ ws://127.0.0.1:<port>/ws/control?token=<token>&origin=agent   JSON text, at most
 {"t":"paste","text":"..."}            {"t":"clipboard-get"}
 {"t":"system","op":"back|home|app-switch|power|volume-up|volume-down|wake|notifications|quick-settings|collapse|rotate|keyframe"}
 {"t":"control","mode":"pause|resume|takeover|release"}      {"t":"ping","ts":<number>}
-{"t":"display","preset":"small|pixel-11|pixel-fold|tablet|default"}
+{"t":"display","preset":"small|pixel-10|pixel-fold|pixel-fold-closed|tablet|default"}
 ```
 
 Coordinates are normalized to the current video. Replies are `state`,
@@ -559,9 +559,10 @@ emulator, the Canvas, its device server and open pages keep running.
 | Preset | Label | Size | Density |
 | --- | --- | --- | --- |
 | `small` | Small phone | 720x1280 | 320 |
-| `pixel-11` | Pixel 11 | 1080x2424 | 420 |
+| `pixel-10` | Pixel 10 | 1080x2424 | 420 |
 | `pixel-fold` | Pixel Fold (open) | 2208x1840 | 420 |
-| `tablet` | Tablet | 2560x1600 | 320 |
+| `pixel-fold-closed` | Pixel Fold (folded) | 1080x2092 | 420 |
+| `tablet` | Tablet (API only) | 2560x1600 | 320 |
 | `default` | Device default | the target's own | the target's own |
 
 A preset runs `wm size <W>x<H>` then `wm density <D>`; `default` runs
@@ -723,8 +724,12 @@ when the encoders cannot be read): 59.4 frames/s produced by the device, 58.9 de
 99 ms median and 117 ms p95 from touch to picture, 0.67 ms of Canvas and adb
 CPU per frame, host load average about 3.4 on 10 cores.
 
+The following measurements describe the earlier 2048 px default. The current
+software-encoder default is 1280 px; explicit `--max-size 2048` restores the
+previous resolution. Re-measure CPU and visual quality on the target host.
+
 Every video encoder of the API 36 emulator is software (`c2.android.avc`, no
-host-accelerated one in any `-gpu` mode), which is why the default there is
+host-accelerated one in any `-gpu` mode). The earlier default there was
 2048. Measured on that emulator (`-gpu host -cores 8 -memory 4096`, 1080x2424,
 live bench and the encoder's own rate, ranges over several runs on a quiet
 host, SSIM of the decoded picture against a native screenshot):
@@ -732,15 +737,15 @@ host, SSIM of the decoded picture against a native screenshot):
 | `--max-size` | Video | Device fps (median) | Presented fps (median) | Host CPU busy | SSIM |
 |---|---|---|---|---|---|
 | 0 (native) | 1080x2424 | 55.8-58.5 | 55.5-58 | 39-53% | 0.9993 |
-| 2048 (default with a software encoder) | 912x2048 | 57.9-58.0 | 57.5-58 | 33-34% | 0.981 |
+| 2048 (previous software default) | 912x2048 | 57.9-58.0 | 57.5-58 | 33-34% | 0.981 |
 | 1920 | 854x1920 | 56-59 | 56-59 | 32-34% | 0.959 |
 | 1600 | 712x1600 | 58.7-59.5 | 58.5-59 | 32-33% | 0.973 |
-| 1280 (default when the encoders cannot be read) | 570x1280 | 57.6-58.8 | 57.5-58 | 28-30% | 0.977 |
+| 1280 (current software and probe-failure default) | 570x1280 | 57.6-58.8 | 57.5-58 | 28-30% | 0.977 |
 
 Touch-to-picture latency was 83-101 ms median at every size. Native is the
 first size to drop frames when the Mac is busy and costs 40-50% more host CPU
 than 2048; the earlier 52-54 fps at native came from 4 vCPUs and a loaded
-host. With the encoder-chosen default (2048, 912x2048 video) on a host at load
+host. With the earlier encoder-chosen default (2048, 912x2048 video) on a host at load
 average 4-5, the bench presented a median of 57 fps (runs 52, 59, 57), 84.5 ms
 median and 117 ms p95 latency. 1920 scales unevenly on the device (lowest
 SSIM); 1600 leaves the most headroom. Phones encode in hardware and stream
@@ -778,4 +783,7 @@ navigation, screenshot, recording, rotation and power; volume and other device
 actions live in Inspector. On narrow windows Tools, Device actions and Inspector
 share one bounded overlay size instead of moving below the device. The display
 preset menu anchors to its trigger, and the device image retains its complete
-aspect ratio without a CSS corner mask.
+aspect ratio. Device settings offer a frame on/off switch tied to the selected model.
+Missing original assets are reported explicitly; no generic frame is substituted. Workspace exposes Device settings and Inspector per
+tile; its general settings contain the shared theme preference. Panel buttons
+track closes from inside the embedded page, including Escape.

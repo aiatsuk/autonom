@@ -1,9 +1,7 @@
 import { canvasIcon as svg, canvasTabList, canvasTabPanel, canvasDomScript } from "./canvas-ui.mjs";
-// The Actions drawer of the Mobile Canvas device page (contract section 5.5): screenshot,
-// screen recording, install from the Canvas's --install-root folders, launch, open link, app
-// language and the captures gallery (Capture tab), and the command log with tool health
-// (Activity tab). Four pure functions return strings that the page inlines through
-// `hooks.pageExtensions`: the header toggle, the drawer markup, its styles and its script.
+// The Actions drawer contains capture controls and gallery (Capture tab), plus the
+// command log and tool health (Activity tab). App management belongs outside Capture.
+// Four functions provide markup, styles and behavior through hooks.pageExtensions.
 // The markup holds no device data; the script renders everything with textContent, never
 // innerHTML. Actions, Tools and the inspector share one column and are mutually exclusive.
 
@@ -44,11 +42,7 @@ export function actionsButton() {
 function tabList() { return canvasTabList(ACTIONS_TABS, "actions", "act-tab"); }
 function panel(id, body) { return canvasTabPanel(id, body, "actions", "act", id === ACTIONS_TABS[0].id); }
 
-function capturePanel(ios) {
-  const installPlaceholder = ios ? "/path/to/build/Runner.app" : "/path/to/build/app-debug.apk";
-  const downgrade = ios
-    ? ""
-    : `<label class="act-check"><input id="actions-downgrade" type="checkbox"> Allow downgrade</label>`;
+function capturePanel() {
   return panel("capture",
     `<div class="act-group act-capture-summary"><h3>Capture</h3>` +
       `<div class="act-row">` +
@@ -56,33 +50,6 @@ function capturePanel(ios) {
         `<button type="button" class="btn" id="actions-record" title="Record video on this computer, up to 3 minutes" data-mutate aria-pressed="false">Record</button>` +
         `<span class="act-time" id="actions-rec-time" aria-live="off"></span>` +
       `</div>` +
-    `</div>` +
-    `<div class="act-group" id="actions-install">` +
-      `<h3>Install</h3>` +
-      `<div class="act-callout" id="actions-install-off" hidden>` +
-        `<p class="act-callout-title">Installing is off for this Canvas.</p>` +
-        `<p class="act-callout-hint" id="actions-install-hint">Start the Canvas with --install-root &lt;folder&gt;, for example autonom canvas --install-root ~/src/app/build. Builds are installed only from those folders.</p>` +
-      `</div>` +
-      `<div id="actions-install-on">` +
-          `<div class="act-field"><input aria-label="Build path" title="Build path inside an allowed install folder" id="actions-install-path" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="${installPlaceholder}">` +
-        `<button type="button" class="btn" id="actions-install-go" data-mutate>Install</button></div>` +
-        downgrade +
-        `<p class="act-hint" id="actions-roots"></p>` +
-        `<ul class="act-list" id="actions-candidates" aria-label="Recent builds"></ul>` +
-        `<p class="act-empty" id="actions-candidates-empty" hidden>No builds found in the install folders yet.</p>` +
-      `</div>` +
-    `</div>` +
-    `<div class="act-group" id="actions-app">` +
-      `<h3>App</h3>` +
-      `<div class="act-field"><input id="actions-app-id" aria-label="${ios ? "Bundle id" : "Package"}" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="${ios ? "com.example.App" : "com.example.app"}">` +
-        `<button type="button" class="btn" id="actions-launch" data-mutate>Launch</button></div><div class="act-row">` +
-        `<label class="act-check"><input id="actions-fresh" type="checkbox"> Fresh start</label>` +
-      `</div>` +
-      `<label class="act-label" for="actions-locale">Language</label>` +
-      `<div class="act-field"><input title="${ios ? "The app restarts in this language." : "Per-app language requires Android 13 or later."}" id="actions-locale" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="de-DE">` +
-      `<button type="button" class="btn" id="actions-locale-go" data-mutate>Set language</button></div>` +
-      `<div class="act-field act-link-field"><input aria-label="Open link" title="Open a deeplink" id="actions-url" type="text" inputmode="url" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="myapp://profile/42">` +
-      `<button type="button" class="btn" id="actions-url-go" data-mutate>Open</button></div>` +
     `</div>` +
     `<div class="act-group">` +
       `<div class="act-group-head"><h3 id="actions-gallery-title">Gallery</h3>` +
@@ -116,14 +83,13 @@ function activityPanel() {
 /** The drawer: Capture and Activity tabs. Only static, platform-specific markup. */
 export function actionsMarkup(context = {}) {
   const platform = platformOf(context);
-  const ios = platform === "ios";
-  return `<aside class="act" id="actions" hidden aria-label="Device actions" data-platform="${platform}" data-capture-only="${context.captureOnly===true}">` +
+  return `<aside class="act" id="actions" hidden aria-label="Device actions" data-platform="${platform}">` +
     `<div class="act-head">` +
       `<div class="act-tabs" id="actions-tablist" role="tablist" aria-label="Device actions">${tabList()}</div>` +
       `<button type="button" class="icon act-icon" id="actions-close" title="Close device actions" aria-label="Close device actions">${svg("close")}</button>` +
     `</div>` +
     `<p class="act-lock" id="actions-lock" role="status" aria-live="polite" hidden></p>` +
-    `<div class="act-body">${capturePanel(ios)}${activityPanel()}</div>` +
+    `<div class="act-body">${capturePanel()}${activityPanel()}</div>` +
   `</aside>`;
 }
 
@@ -134,7 +100,6 @@ export function actionsMarkup(context = {}) {
  */
 export function actionsStyles() {
   return `
-.act[data-capture-only="true"] #actions-install,.act[data-capture-only="true"] #actions-app{display:none}
 
 #dock-record .record-stop{display:none}
 #dock-record[aria-pressed="true"]{color:var(--danger);background:var(--fill-2)}
@@ -216,7 +181,7 @@ const lock=$("actions-lock"),inspectorToggle=$("inspector-toggle"),toolsToggle=$
 const deviceId=(typeof DEVICE_ID!=="undefined"&&DEVICE_ID)?String(DEVICE_ID):null;
 const state={open:false,tab:"capture",lockTimer:null,
   record:{active:false,known:false,revision:0,started:0,tick:null,poll:null,busy:false,unsure:0,retry:null},
-  install:{loaded:false},gallery:{seq:0},
+  gallery:{seq:0},
   activity:{timer:null,busy:false,after:0,seen:0,rows:new Map(),dropped:0,generation:0},
   health:{loaded:false,busy:false}};
 
@@ -233,7 +198,7 @@ async function call(op,payload){const answer=await request("POST","/tools/call",
 function message(panel,kind,value,hint){const box=$("actions-msg-"+panel);if(!box)return;box.replaceChildren();if(!value){box.hidden=true;box.removeAttribute("data-kind");return}box.setAttribute("data-kind",kind);box.appendChild(el("p","act-msg-text",value));if(hint)box.appendChild(el("p","act-msg-hint",hint));box.hidden=false}
 function errorText(error){return(error&&error.message||String(error))+(error&&error.code?" ("+error.code+")":"")}
 function showError(panel,error){message(panel,"error",errorText(error),error&&error.hint||"");if(panel==="capture"&&!state.open&&typeof note==="function")note(errorText(error))}
-function showOk(panel,value,hint){message(panel,"ok",value,hint||"");if(panel==="capture"&&!state.open&&typeof note==="function")note(value)}
+function showOk(panel,value,hint){message(panel,"ok",value,hint||"");if(panel==="capture"&&!state.open&&typeof note==="function")note(hint?value+" "+hint:value)}
 function bytes(value){const n=Number(value)||0;if(n<1024)return n+" B";if(n<1048576)return(n/1024).toFixed(0)+" KB";if(n<1073741824)return(n/1048576).toFixed(1)+" MB";return(n/1073741824).toFixed(2)+" GB"}
 function clock(ms){const s=Math.max(0,Math.floor(ms/1000));return Math.floor(s/60)+":"+String(s%60).padStart(2,"0")}
 function timeOf(iso){const d=new Date(iso);return isNaN(d)?"":d.toLocaleTimeString([],{hour:"2-digit",minute:"2-digit",second:"2-digit"})}
@@ -247,9 +212,9 @@ async function mutate(control,op,payload){if(!allowed()){syncLock();return null}
 
 // Drawer and tabs (arrows, Home and End move between tabs; Escape closes).
 function selectTab(name,focus){const index=TABS.indexOf(name);if(index<0)return;state.tab=name;canvasSelectTab(tabs,panels,index,focus);onTabShown(name);syncPolling()}
-function onTabShown(name){if(!state.open)return;if(name==="capture"){loadRecordStatus();loadCandidates();loadGallery()}else{pollActivity();if(!state.health.loaded)loadHealth(false)}}
+function onTabShown(name){if(!state.open)return;if(name==="capture"){loadRecordStatus();loadGallery()}else{pollActivity();if(!state.health.loaded)loadHealth(false)}}
 function closeTools(){if(!document.body.classList.contains("tools-open"))return;const close=$("tools-close");if(close&&typeof close.click==="function")close.click()}
-function setOpen(open,returnFocus){open=Boolean(open);if(state.open===open)return;if(open)closeTools();state.open=open;drawer.hidden=!open;document.body.classList.toggle("actions-open",open);toggle.setAttribute("aria-pressed",String(open));toggle.title=open?"Hide device actions":"Device actions";if(inspectorToggle)inspectorToggle.setAttribute("aria-pressed",String(!open&&!document.body.classList.contains("no-inspector")&&!document.body.classList.contains("tools-open")));if(open){syncLock();state.lockTimer=setInterval(syncLock,500);state.install.loaded=false;const tab=tabs[TABS.indexOf(state.tab)];if(tab)tab.focus();onTabShown(state.tab)}else{clearInterval(state.lockTimer);state.lockTimer=null;if(returnFocus)toggle.focus()}syncPolling()}
+function setOpen(open,returnFocus){open=Boolean(open);if(state.open===open)return;if(open)closeTools();state.open=open;drawer.hidden=!open;document.body.classList.toggle("actions-open",open);toggle.setAttribute("aria-pressed",String(open));toggle.title=open?"Hide device actions":"Device actions";if(inspectorToggle)inspectorToggle.setAttribute("aria-pressed",String(!open&&!document.body.classList.contains("no-inspector")&&!document.body.classList.contains("tools-open")));if(open){syncLock();state.lockTimer=setInterval(syncLock,500);const tab=tabs[TABS.indexOf(state.tab)];if(tab)tab.focus();onTabShown(state.tab)}else{clearInterval(state.lockTimer);state.lockTimer=null;if(returnFocus)toggle.focus()}syncPolling()}
 function syncPolling(){const activity=state.open&&state.tab==="activity";if(activity&&!state.activity.timer)state.activity.timer=setInterval(pollActivity,ACTIVITY_MS);if(!activity&&state.activity.timer){clearInterval(state.activity.timer);state.activity.timer=null}syncRecordTimers()}
 toggle.addEventListener("click",()=>setOpen(!state.open,false));
 $("actions-close").addEventListener("click",()=>setOpen(false,true));
@@ -265,7 +230,7 @@ if(typeof window!=="undefined"&&typeof window.addEventListener==="function")wind
 function savedText(capture){return"Saved "+capture.name}
 function pruneText(count){return"Deleted "+count+" oldest capture"+(count===1?"":"s")+" to stay under 200 files / 2 GB"}
 function showPrune(count){const box=$("actions-prune");if(!box)return;if(!count){box.hidden=true;return}box.textContent=pruneText(count);box.hidden=false}
-async function takeScreenshot(){const result=await mutate($("actions-shot"),"capture.screenshot",{});if(!result||!result.capture)return;showOk("capture",savedText(result.capture));if(result.pruned&&result.pruned.length)showPrune(result.pruned.length);loadGallery()}
+async function takeScreenshot(){const result=await mutate($("actions-shot"),"capture.screenshot",typeof captureFrameOptions==="function"?captureFrameOptions():{});if(!result||!result.capture)return;showOk("capture",savedText(result.capture),result.warning||"");if(result.pruned&&result.pruned.length)showPrune(result.pruned.length);loadGallery()}
 $("actions-shot").addEventListener("click",takeScreenshot);
 if(dockShot)dockShot.addEventListener("click",takeScreenshot);
 
@@ -274,24 +239,14 @@ function syncRecordButton(){const button=$("actions-record");button.textContent=
 function renderElapsed(){if(!state.record.active)return;text("actions-rec-time","Recording "+clock(Date.now()-state.record.started)+" / "+clock(RECORD_LIMIT*1000))}
 function syncRecordTimers(){const on=(state.open||Boolean(dockRecord))&&state.record.active;if(on&&!state.record.tick){state.record.tick=setInterval(renderElapsed,1000);state.record.poll=setInterval(loadRecordStatus,RECORD_MS)}if(!on&&state.record.tick){clearInterval(state.record.tick);clearInterval(state.record.poll);state.record.tick=null;state.record.poll=null}}
 function setRecording(active,startedAt,elapsed){state.record.known=true;state.record.active=active;if(active){const parsed=Date.parse(startedAt||"");state.record.started=typeof elapsed==="number"?Date.now()-elapsed:(isNaN(parsed)?Date.now():parsed)}syncRecordButton();renderElapsed();syncRecordTimers();syncLock()}
-async function loadRecordStatus(){if(state.record.busy||$("actions-record").getAttribute("data-busy")==="1")return;state.record.busy=true;const revision=state.record.revision;try{const status=await call("record.status",{});if(revision!==state.record.revision)return;state.record.unsure=0;const was=state.record.active;setRecording(Boolean(status.recording),status.started_at,status.elapsed_ms);if(was&&!status.recording&&status.last){if(status.last.capture)showOk("capture","The recording reached "+clock(RECORD_LIMIT*1000)+" and was saved as "+status.last.capture.name);else if(status.last.error)message("capture","error","The recording ended and could not be saved: "+status.last.error,"");loadGallery()}}catch(error){showError("capture",error)}finally{state.record.busy=false;retryRecordStatus()}}
+async function loadRecordStatus(){if(state.record.busy||$("actions-record").getAttribute("data-busy")==="1")return;state.record.busy=true;const revision=state.record.revision;try{const status=await call("record.status",{});if(revision!==state.record.revision)return;state.record.unsure=0;const was=state.record.active;setRecording(Boolean(status.recording),status.started_at,status.elapsed_ms);if(was&&!status.recording&&status.last){if(status.last.capture)showOk("capture","The recording reached "+clock(RECORD_LIMIT*1000)+" and was saved as "+status.last.capture.name,status.last.warning||"");else if(status.last.error)message("capture","error","The recording ended and could not be saved: "+status.last.error,"");loadGallery()}}catch(error){showError("capture",error)}finally{state.record.busy=false;retryRecordStatus()}}
 function retryRecordStatus(){if(state.record.unsure<=0||state.record.retry)return;state.record.unsure-=1;state.record.retry=setTimeout(()=>{state.record.retry=null;loadRecordStatus()},RECORD_MS)}
 // After a failed start or stop the tools process may still run the call (it was only
 // queued): re-read the status until one read succeeds, at most RECORD_RECHECKS times.
 function confirmRecordState(){state.record.unsure=RECORD_RECHECKS;loadRecordStatus()}
-async function toggleRecording(){const button=$("actions-record");if(button.getAttribute("data-busy")==="1"||(dockRecord&&!state.record.known))return;state.record.revision+=1;if(!state.record.active){const result=await mutate(button,"record.start",{});if(result&&result.recording){setRecording(true,result.recording.started_at);showOk("capture","Recording. Press Stop recording to save it.")}else if(!result){confirmRecordState()}return}const result=await mutate(button,"record.stop",{});if(!result){confirmRecordState();return}setRecording(false);if(result.capture)showOk("capture",savedText(result.capture)+" ("+clock(result.duration_ms||0)+")",result.ended_early?"The recording reached its 3 minute limit before you stopped it.":"");if(result.pruned&&result.pruned.length)showPrune(result.pruned.length);loadGallery()}
+async function toggleRecording(){const button=$("actions-record");if(button.getAttribute("data-busy")==="1"||(dockRecord&&!state.record.known))return;state.record.revision+=1;if(!state.record.active){const result=await mutate(button,"record.start",typeof captureFrameOptions==="function"?captureFrameOptions():{});if(result&&result.recording){setRecording(true,result.recording.started_at);showOk("capture","Recording. Press Stop recording to save it.")}else if(!result){confirmRecordState()}return}const result=await mutate(button,"record.stop",{});if(!result){confirmRecordState();return}setRecording(false);if(result.capture)showOk("capture",savedText(result.capture)+" ("+clock(result.duration_ms||0)+")",result.warning||(result.ended_early?"The recording reached its 3 minute limit before you stopped it.":""));if(result.pruned&&result.pruned.length)showPrune(result.pruned.length);loadGallery()}
 $("actions-record").addEventListener("click",toggleRecording);
 if(dockRecord){dockRecord.addEventListener("click",toggleRecording);setInterval(()=>{syncLock();if(hasCsrf()&&!state.record.active)loadRecordStatus()},RECORD_MS)}
-
-// Install: a path inside the Canvas's --install-root folders, or one of the builds listed there.
-async function loadCandidates(){if(state.install.loaded)return;state.install.loaded=true;let result;try{result=await call("apps.candidates",{})}catch(error){state.install.loaded=false;showError("capture",error);return}const off=!result.configured;$("actions-install-off").hidden=!off;$("actions-install-on").hidden=off;if(off){if(result.hint)text("actions-install-hint",result.hint+". Builds are installed only from those folders.");return}text("actions-roots","Install folders: "+(result.roots||[]).join(", ")+(result.truncated?" (not every folder was searched)":""));const list=$("actions-candidates");list.replaceChildren();for(const item of result.candidates||[]){const row=el("li");const title=el("span","act-item-title",baseName(item.path));const pick=makeButton("Use","btn small");pick.addEventListener("click",()=>{$("actions-install-path").value=item.path;$("actions-install-path").focus()});row.appendChild(title);row.appendChild(pick);row.appendChild(el("span","act-item-meta",item.path+" · "+bytes(item.size)+" · "+timeOf(item.modified_at)));list.appendChild(row)}$("actions-candidates-empty").hidden=Boolean((result.candidates||[]).length)}
-$("actions-install-go").addEventListener("click",async()=>{const path=$("actions-install-path").value.trim();if(!path){message("capture","error","Enter the path of a build to install.","");return}const downgrade=$("actions-downgrade");const payload={path};if(downgrade&&downgrade.checked)payload.allow_downgrade=true;const result=await mutate($("actions-install-go"),"app.install",payload);if(!result)return;if(result.app_id)$("actions-app-id").value=result.app_id;showOk("capture","Installed "+baseName(result.installed)+" in "+clock(result.duration_ms||0),result.app_id?"App id: "+result.app_id:"")});
-
-// Launch, open link, app language.
-function appId(){const value=$("actions-app-id").value.trim();if(!value)message("capture","error","Enter the app's package or bundle id first.","");return value}
-$("actions-launch").addEventListener("click",async()=>{const id=appId();if(!id)return;const fresh=$("actions-fresh").checked;const result=await mutate($("actions-launch"),"app.launch",fresh?{app_id:id,fresh:true}:{app_id:id});if(result)showOk("capture","Launched "+id+(result.mode==="fresh"?" (fresh start)":""))});
-$("actions-url-go").addEventListener("click",async()=>{const link=$("actions-url").value.trim();if(!link){message("capture","error","Enter a link with a scheme, such as myapp://profile/42.","");return}const result=await mutate($("actions-url-go"),"app.open_url",{url:link});if(result)showOk("capture","Opened the link"+(result.handled_by&&result.handled_by!=="unknown"?" in "+result.handled_by:""))});
-$("actions-locale-go").addEventListener("click",async()=>{const id=appId();if(!id)return;const locale=$("actions-locale").value.trim();if(!locale){message("capture","error","Enter a language tag such as de-DE.","");return}const result=await mutate($("actions-locale-go"),"app.locale",{app_id:id,locale});if(result)showOk("capture",id+" now uses "+locale+(result.restarted?"; the app was restarted":""))});
 
 $("actions-open-folder").addEventListener("click",async()=>{message("capture");try{const result=await call("captures.open_directory",{});if(result.opened)showOk("capture","Opened the captures folder in Finder.");else message("capture","error","The folder was not opened.","")}catch(error){showError("capture",error)}});
 // Gallery: the device's captures, newest first; files are served by /tools/captures/<name>.
