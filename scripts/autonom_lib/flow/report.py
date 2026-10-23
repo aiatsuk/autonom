@@ -19,7 +19,6 @@ import os
 import re
 from pathlib import Path
 from typing import Any
-from xml.sax.saxutils import escape as xml_escape, quoteattr
 
 _MAX_INLINE_IMAGE = 2_000_000  # bytes of PNG we are willing to inline
 # A run stopped because the device's control lease moved (contract 5.5): its
@@ -867,6 +866,11 @@ def render_suite_junit(manifests: list[dict[str, Any]]) -> str:
 
 
 def render_junit(manifest: dict[str, Any]) -> str:
+    # Loaded here, not at module level: xml.sax.saxutils imports
+    # urllib.request (and with it http.client and ssl), which every CLI call
+    # that merely imports this module would otherwise pay for.
+    from xml.sax.saxutils import escape as xml_escape, quoteattr
+
     suite_name = manifest.get("flow_id") or manifest.get("flow_name") or "flow"
     steps = manifest.get("steps", [])
     prefix_replay = manifest.get("status") == "replayed"

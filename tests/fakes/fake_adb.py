@@ -20,6 +20,11 @@ State keys (all optional):
                     a fixed default id otherwise
 ``run_as_refused``  text run-as prints instead of a listing (system / release app)
 ``ui_dump_incomplete`` number of truncated dumps to return before a complete one
+``ui_dump_not_idle`` number of dumps that print uiautomator's never-idle refusal
+                    (``ERROR: could not get idle state.``, exit 0) first; counted
+                    before ``ui_dump_incomplete``
+``ui_dump_delay_s`` seconds every ``uiautomator dump`` takes before it answers
+                    (an emulator dump takes about 2 s; default 0)
 ``battery_level``   level ``dumpsys battery`` reports (``set level`` updates it)
 ``battery_overridden`` true while ``dumpsys battery set``/``unplug`` overrides are live
 ``battery_ac``      "true"/"false" for ``AC powered`` (``set ac`` updates it)
@@ -243,6 +248,19 @@ def main(argv: list[str]) -> int:
     if args[:3] == ["exec-out", "uiautomator", "dump"]:
         dump = state.get("ui_dump")
         text = Path(dump).read_text(encoding="utf-8") if dump else ""
+        # `ui_dump_delay_s`: a real dump is slow (about 2 s on an emulator)
+        delay = float(state.get("ui_dump_delay_s", 0) or 0)
+        if delay > 0:
+            time.sleep(delay)
+        # `ui_dump_not_idle`: N dumps meet a screen that never goes idle (an
+        # animation, a video): uiautomator prints this and exits 0, no XML
+        # (seen on an emulator's Settings > About emulated device).
+        not_idle = int(state.get("ui_dump_not_idle", 0) or 0)
+        if not_idle > 0:
+            state["ui_dump_not_idle"] = not_idle - 1
+            write_state(state)
+            sys.stdout.write("ERROR: could not get idle state.\n")
+            return 0
         # `ui_dump_incomplete`: N dumps come back truncated (a screen
         # mid-transition) before a complete one — what a real emulator did.
         pending = int(state.get("ui_dump_incomplete", 0) or 0)

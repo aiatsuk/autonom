@@ -8,6 +8,99 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
 ## [Unreleased]
 
 ### Added
+- **Agent profile.** `autonom session start --profile agent` stores the
+  profile in the session record (`session show` reports it; `session list`
+  adds `profile` to the entry of a non-default session). In that session
+  `ui tree` prints the compact outline unless `--format json` is given, and
+  the action verbs return the new screen (below) unless `--no-observe` is
+  given. `--profile default`, no `--profile`, and sessions started by older
+  versions behave as before; the profile applies only to its own target.
+- **The screen after an action.** `ui tap` (long press included), `ui type`,
+  `ui swipe` and `ui key` take `--observe` / `--no-observe` and
+  `--observe-timeout-ms` (default 3000). With observe on, the screen is
+  given time to settle after the input (idb `ui quiet` then one read on the
+  iOS idb route, polling elsewhere, as `ui wait --settled`), and the reply
+  adds `screen` (`outline`, `count`, `truncated`, `saved`), `changes`
+  (`added`, `removed`, `changed` and up to 20 outline lines marked `+`, `-`
+  or `~`), `changes_baseline` and `foreground` (`app` and, when known,
+  `screen`: the Android package and resumed activity, the iOS app label
+  and first heading). The baseline of `changes` is never an extra read:
+  the command's own full read before the input (`pre_read`: a selector
+  tap's read, `ui type`'s focus read, or on the iOS idb route the
+  `describe-all` the coordinate guard looked the screen size up with);
+  else the session's latest saved tree of the target (`saved_tree`), but
+  only when it was read the way observe reads (no `--all`,
+  `--interactable` or `--max-depth`, `--max-nodes` 200, not cut); else
+  none: `changes` is null, `changes_baseline: none`, and the additive
+  `changes_baseline_reason` says why (for example `saved tree read with
+  --interactable`, or a tree saved by an older version or another command,
+  which does not record how it was read). Trees read differently are
+  never compared, so an unchanged screen no longer shows nodes as gone or
+  new. The read is saved to the session's tree history like `ui tree`;
+  every tree `ui tree` or observe saves now records how it was read
+  (additive `read_shape`: `source`, `filter`, `max_depth`, `max_nodes`,
+  `truncated`; the `ui tree` reply itself is unchanged).
+  Observe only reads, so the input is still sent once, and its failure
+  never fails the action: the reply keeps `ok: true` and adds
+  `observe_error` (`code`, `message`). An interrupt (Ctrl-C) while
+  observing stops it: the input was already sent, so the reply still says
+  `ok: true`, with `observe_error` `interrupted` (run `autonom ui tree`, do
+  not send the input again) and whatever was already read (`screen`,
+  `changes`, `screen.saved`), and the action is journaled ok; the command
+  then exits 130 as any interrupt does, so `&&` chains and `set -e` scripts
+  stop. After `ui type --sensitive` the value is kept out of
+  everything observe reports or saves, also when the field reformats,
+  splits or cuts it: the text and description of every editable or
+  focused node, and of any node that may show the value or a part of it
+  (the whole value however spaced, a run of 4 or more of its letters and
+  digits, any one-character text), read `<N chars>`.
+- **`ui do`: several steps in one call.** `autonom ui do` reads Flow v1
+  steps from stdin, as a JSON array of step objects
+  (`[{"tapOn":{"text":"General"}},{"assertVisible":{"text":"About"}}]`) or
+  as a YAML step list (the `- command` lines of a flow file, without its
+  header), and runs them in the active session through the flow executor:
+  exact selectors, polling assertions, single-fire mutations, and the
+  session's app id for steps that act on the app. Selector fields may be
+  written directly under the command as the short form of `selector:`. It
+  stops at the first failing step and prints one reply with `ok`,
+  `status`, `run_id`, the step results (`index`, `step`, `command`,
+  `status`, `duration_ms`, `error_code`), `failure` (`step`, `index`,
+  `command`, `code`, `message`, `failure_class`) and the final screen as an
+  observed action returns it (`screen`, `changes`, `foreground`; settled
+  within `--observe-timeout-ms`, default 3000). Sensitive values read
+  `<N chars>` there, as after `ui type --sensitive`, each value matched on
+  its own and N its own length. Two kinds of value are masked: the value an
+  `inputText` or `setClipboard` step types or sets when the step says
+  `sensitive: true` or that value names a sensitive variable, exactly as
+  sent, with its `${NAME}` filled in as at that step (a `runFlow` `env:`
+  value included; a value written out in a `sensitive: true` step is known
+  before any step runs); and the value of every sensitive variable (stored
+  by a `sensitive: true` `copyTextFrom` or `setClipboard`, or by a
+  `setClipboard` whose value names one; `COPIED_TEXT`, which `pasteText`
+  types, included), recorded after each step, so it stays masked after a
+  later step sets the same variable again. A step that only uses a
+  sensitive variable inside a longer string (an `openLink` URL, an
+  `assertVisible` text, a selector) masks that variable's value, not the
+  whole string. With several values, an editable or focused node that shows
+  none of them reads its own length. It exits 0 when every step
+  passed and 1 when one failed, as `flow run`; a backend failure inside a
+  step is the error envelope (exit 2), as in `flow run`, and adds `step`,
+  the input step it came from. A problem with the input (not
+  JSON or a step list, an unknown command, a wrong argument, `runFlow
+  file:`, an app step without a session app id, an Android-only step on
+  iOS, an item line with nothing after its `- `) is `invalid_value` naming
+  the step and the problem, before any step runs. It is a flow verb under
+  the control lease. A `ui do` run has no flow file, so `replay` of it is
+  refused (`replay_manifest_invalid`, whose hint says to send the steps
+  again or save them as a flow file; no file of the steps is written, so a
+  sensitive value never sits on disk), and `flow create --from-session`,
+  `teach compile` and `pretest flow-draft` skip it with a
+  `ui_do_not_compilable` warning instead of leaving it out silently.
+- **Compact nodes say whether a field takes text and hides it.** Additive
+  `editable` (Android: an EditText or one of its subclasses, or a node with a
+  hint; iOS: text fields, secure fields, text views and search fields) and
+  `password` (UI Automator's `password` on Android; secure fields on iOS), on
+  both platforms.
 - **Boot any device from the page.** The picker lists every AVD and available
   iOS Simulator of this machine with Boot, after the `--bootable` entries
   (which keep their `@PORT`); the list is read again every 30 s.
@@ -15,6 +108,72 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
   name and iOS version.
 
 ### Changed
+- **The interrupt envelope has a code and a hint.** A command cut by Ctrl-C
+  or SIGINT still exits 130 with `"error": "interrupted"` on stderr, and the
+  envelope now also carries `error_code: interrupted` (a new code) and a
+  hint (it may have stopped partway; read the screen before running it
+  again), like every other failure; the journal entry carries the code.
+- **Every JSON reply is one line.** The CLI prints each JSON reply on stdout
+  as one compact line (`{"ok":true,...}`) instead of indented over many
+  lines, for every caller and profile, with the same keys, values and key
+  order; error envelopes on stderr were already one line. Parse replies as
+  JSON (`python3 -m json.tool` shows one indented).
+- **`ui wait --settled` on iOS asks idb whether the app is quiet, then reads
+  once.** On the idb route, when the installed idb has `ui quiet`, idb waits
+  up to `--timeout-ms` for the frontmost app to hold quiet for `--quiet-ms`
+  and the tree is read a single time (`method: idb-quiet`, `snapshots: 1`,
+  `quiet_state`, `busy_signals`); an app still busy at the deadline is
+  `settled: false` with that read made. An idb without the command, or a
+  failed call, polls the tree as before within what is left of the budget
+  (`method: poll`, `quiet_fallback`). A dead companion is pruned and idb
+  asked once more with only what is left of the budget, never the whole
+  budget again. Every `ui wait --settled` reply now
+  carries `method`; Android, the XCUITest route and Flow's `waitForSettled`
+  keep polling.
+- **The outline shows on/off state.** `ui tree --format outline` prints
+  `checked` or `unchecked` on every checkable node (an off switch printed no
+  state word, so "off" and "not a switch" read the same), and `editable` and
+  `password` on text fields; `selected`, `focused`, `disabled`, `clickable`,
+  `scrollable` and `offscreen` are kept.
+- **An Android dump read gets at most one more read.** A dump without
+  `</hierarchy>` (cut off mid-transition, or uiautomator's "could not get idle
+  state") is read again after 0.5 s as before, and that second read always
+  happens; one more read follows only when it can start within 2 s of the end
+  of the first bad read. A dump that takes about 2 s, as on an emulator, gets
+  the two reads it always had.
+- **An iOS tap or swipe reads the screen once.** On the idb and AXe routes
+  the coordinate guard of `ui tap` (long press and double tap included) and
+  `ui swipe` takes the screen size from the accessibility read the command
+  already made (a selector tap's own read), else from the size recorded for
+  the simulator by an earlier `ui tree` or lookup, instead of a second full
+  `describe-all`. A point refused on such a size is checked again on one
+  fresh lookup before it is refused, so a stale size never refuses a valid
+  point; with nothing known the size is looked up once per command (once for
+  both ends of a swipe). The XCUITest route still refuses input when no
+  geometry is known.
+- **An iOS idb call no longer lists every process on the Mac when the
+  simulator's companion is already running.** When idb's registry
+  (`/tmp/idb/state`, or `AUTONOM_IDB_STATE_FILE`) lists a local companion for
+  the UDID whose process is alive, idb uses it and starts none, so the `ps`
+  scans that look for a new companion are skipped. Otherwise a companion the
+  call starts is still registered to the session, as before.
+- **Faster CLI start.** The launcher `autonom-setup` writes runs the runtime
+  without `python -B`, and the installer precompiles the runtime with the
+  same interpreter (also a runtime that was already in place), so each call
+  loads bytecode instead of compiling the library again; the runtime digest
+  still ignores `__pycache__`. A launcher written by an older version keeps
+  `-B` until the runtime is installed again. Report, campaign, metrics,
+  network and atlas modules are imported only by the commands that use them,
+  so `ui tree` and the other quick verbs no longer load `ssl`, `http.client`,
+  `urllib.request`, `xml.sax`, `zipfile` or `statistics`.
+- **The skills teach the agent loop.** `mobile-screen` teaches
+  `session start --profile agent`, reading the new screen from an action's
+  `screen`, `changes` and `foreground` instead of a separate `ui tree`, and
+  `ui do` for a path whose steps are known; the `autonom` start-here skill
+  names the agent profile and `ui do` in its loop and verb catalog.
+  On a `screen_not_settled` warning `mobile-screen` says to carry on when the
+  returned `screen` already shows what was expected and to re-read only when
+  it does not (common on Android, where one read takes about 2 s).
 - **The edge-case kit's `slow` and `timeout` cases use a mock** instead of
   `simulator network shape`: `network start`, `network attach`,
   `network mock add --match '<url glob>' --delay 3` (for `timeout`:
@@ -41,6 +200,40 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
   Two `--device` at start now share one two-tile tab instead of two tabs.
 
 ### Fixed
+- **A screen that never goes idle is named, not called mid-transition.**
+  When the last read of an Android tree read prints "could not get idle
+  state" (an animation, a video, a timer or a spinner keeps the screen
+  changing), it fails with the new `ui_not_idle` code instead of
+  `backend_failed` "incomplete hierarchy (… mid-transition)"; the hint says
+  `autonom screenshot` still reads the screen and `ui wait --settled` does not
+  help. The reads are the same as before, plus at most one more within 2 s.
+  Flow treats `ui_not_idle` exactly like `backend_failed`: the `inputText`
+  focus poll reads again after either until its timeout, no other step reads
+  again after either, and both are infrastructure failures, so Flow files
+  behave as before.
+- **AXe taps land.** The AXe fallback sends a tap (and each tap of a double
+  tap) as a touch held for 0.12 s (`axe touch -x X -y Y --down --up --delay
+  0.12`) instead of `axe tap`, which lifted at once and missed every tap of a
+  live A/B run (15 of 15). A long press keeps its own duration.
+- **A dead idb companion is recovered inside the failing call.** An idb call
+  that fails before it reaches the companion (its socket is gone, `[Errno 2]
+  No such file or directory`, as after the companion was killed, or the
+  connection is refused) prunes idb's registry (`idb list-targets`) and is
+  sent once more, whatever the command, since nothing reached the simulator.
+  Before, only a refused connection was retried, and only when the prune
+  dropped an entry, so a killed companion failed every verb until something
+  else ran `idb list-targets`. A failure after the connection was made
+  (`Connection reset`, a terminated stream, `StatusCode.UNAVAILABLE`) is sent
+  once more only for a read (`ui describe-all`, `ui describe-point`,
+  `screenshot`, `list-apps`, `crash list`, `ui quiet`); an input (`ui tap`,
+  `ui swipe`, `ui text`, `ui key`, `ui button`) is never sent again and fails
+  `idb_companion_unavailable`, whose hint now says the input may or may not
+  have been delivered and to read the screen before repeating it. A remote
+  companion (`--idb-host`) gets the same single retry but is never pruned.
+  Only what idb prints on stderr is read for these signs: a failure with
+  nothing on stderr says `idb ui text failed (1)` (the command words, never
+  the typed text or other values) and is `backend_failed`, sent once, so
+  typed text such as "errno 61" can no longer send `ui text` again.
 - **A damaged pre-test record refuses Canvas input and warm-up taps like the
   other guard refusals:** the Canvas bridge journals the refused input with
   `pretest_damaged`, and `pretest warmup` lists it in `refusals` and stops the

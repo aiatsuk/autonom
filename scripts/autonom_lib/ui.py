@@ -353,6 +353,63 @@ def _ios():
 # selector-resolved node's surroundings (its enclosing control, the labels
 # inside it) in the very tree the node came from, without a second read.
 _LAST_SNAPSHOT = threading.local()
+# The raw read behind that snapshot (the UI Automator XML, the idb payload),
+# so the compact tree `ui tree` prints can be built from the same read
+# without asking the device again (the diff baseline of observe, AL-11).
+_LAST_PAYLOAD = threading.local()
+
+
+def read_payload(target: Target) -> Any:
+    """One read of the raw tree from the device: the UI Automator XML on
+    Android, the idb (or XCUITest runner) payload on iOS."""
+    if target.platform == ANDROID:
+        return ui_android.dump_hierarchy(target.tool, target.target_id)
+    if target.platform == IOS:
+        return _ios().describe_all(target)
+    raise errors.AutonomError(errors.UNKNOWN_PLATFORM,
+                              f"unknown platform: {target.platform}")
+
+
+def nodes_from_payload(platform: str, payload: Any) -> list[dict[str, Any]]:
+    """Every node of a raw read, unfiltered, as ``snapshot`` returns them."""
+    if platform == ANDROID:
+        return selector.mark_visibility(annotate_parents(ui_android.parse_all(payload)))
+    if platform == IOS:
+        return selector.mark_visibility(annotate_parents(_ios().parse_all(payload)))
+    raise errors.AutonomError(errors.UNKNOWN_PLATFORM, f"unknown platform: {platform}")
+
+
+def compact_from_payload(
+    platform: str,
+    payload: Any,
+    *,
+    meaningful_only: bool = True,
+    max_depth: int | None = None,
+    max_nodes: int | None = 200,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """The compact tree ``tree`` returns, built from a read already made
+    (no device call)."""
+    if platform == ANDROID:
+        nodes = ui_android.parse_tree(
+            payload,
+            meaningful_only=meaningful_only,
+            max_depth=max_depth,
+            max_nodes=max_nodes,
+        )
+        return selector.mark_visibility(nodes), []
+    if platform != IOS:
+        raise errors.AutonomError(errors.UNKNOWN_PLATFORM, f"unknown platform: {platform}")
+    ios = _ios()
+    nodes, warnings = ios.parse_tree(
+        payload,
+        meaningful_only=meaningful_only,
+        max_depth=max_depth,
+        max_nodes=max_nodes,
+    )
+    # the meaningful filter drops an unlabelled application root; the screen
+    # rectangle then comes from the same payload (a re-parse, no device call)
+    view = selector.viewport(nodes) or selector.viewport(ios.parse_all(payload))
+    return selector.mark_visibility(nodes, view), warnings
 
 
 def snapshot(target: Target) -> list[dict[str, Any]]:
@@ -361,17 +418,17 @@ def snapshot(target: Target) -> list[dict[str, Any]]:
     Nodes that cannot be on screen stay in the list and carry
     ``visible: false`` (see ``selector.mark_visibility``).
     """
-    if target.platform == ANDROID:
-        nodes = selector.mark_visibility(annotate_parents(
-            ui_android.parse_all(ui_android.dump_hierarchy(target.tool, target.target_id))))
-    elif target.platform == IOS:
-        nodes = selector.mark_visibility(
-            annotate_parents(_ios().parse_all(_ios().describe_all(target))))
-    else:
-        raise errors.AutonomError(errors.UNKNOWN_PLATFORM,
-                                  f"unknown platform: {target.platform}")
-    _LAST_SNAPSHOT.value = (target.platform, target.target_id, nodes)
+    payload = read_payload(target)
+    nodes = nodes_from_payload(target.platform, payload)
+    _keep_read(target, nodes, payload)
     return nodes
+
+
+def _keep_read(target: Target, nodes: list[dict[str, Any]], payload: Any) -> None:
+    """Hold ``nodes`` (and the raw read they came from) as this thread's
+    last snapshot of ``target``."""
+    _LAST_SNAPSHOT.value = (target.platform, target.target_id, nodes)
+    _LAST_PAYLOAD.value = (target.platform, target.target_id, nodes, payload)
 
 
 def last_snapshot(target: Target) -> list[dict[str, Any]] | None:
@@ -381,6 +438,53 @@ def last_snapshot(target: Target) -> list[dict[str, Any]] | None:
     if not held or (held[0], held[1]) != (target.platform, target.target_id):
         return None
     return held[2]
+
+
+def last_payload(target: Target) -> Any:
+    """The raw read behind ``last_snapshot(target)``: None when this thread
+    has not read that target's tree through ``snapshot`` (or the snapshot
+    held was set some other way). Never touches the device."""
+    nodes = last_snapshot(target)
+    held = getattr(_LAST_PAYLOAD, "value", None)
+    if nodes is None or not held or held[2] is not nodes:
+        return None
+    return held[3]
+
+
+# What this thread held when it last sent an input: the number of that input
+# among the thread's inputs, its target, and the read of that target held at
+# that moment (``last_snapshot`` and its raw read). Set after every guard,
+# right before the input goes out, so the read is one made before the input
+# (observe's baseline, AL-11), whatever the command does after it.
+_AT_INPUT = threading.local()
+
+
+def _sending(target: Target) -> None:
+    """Note, right before an input to ``target`` goes out, which read of it
+    this thread holds. Never touches the device."""
+    held = getattr(_AT_INPUT, "value", None)
+    number = (held[0] if held else 0) + 1
+    _AT_INPUT.value = (number, target.platform, target.target_id,
+                       last_snapshot(target), last_payload(target))
+
+
+def inputs_sent() -> int:
+    """How many inputs this thread has sent so far, to any target: a mark a
+    command takes at its start for ``read_at_input``."""
+    held = getattr(_AT_INPUT, "value", None)
+    return held[0] if held else 0
+
+
+def read_at_input(target: Target, *,
+                  after: int = 0) -> tuple[list[dict[str, Any]] | None, Any] | None:
+    """``(nodes, raw read)`` this thread held of ``target`` when it sent its
+    latest input, if that input went to ``target`` and came after input
+    number ``after`` (an ``inputs_sent()`` mark); None otherwise. Either
+    part is None when no such read was held. Never touches the device."""
+    held = getattr(_AT_INPUT, "value", None)
+    if not held or held[0] <= after or (held[1], held[2]) != (target.platform, target.target_id):
+        return None
+    return held[3], held[4]
 
 
 def tree(
@@ -394,26 +498,9 @@ def tree(
 
     Off-screen nodes are kept — and counted — with ``visible: false``.
     """
-    if target.platform == ANDROID:
-        nodes = ui_android.parse_tree(
-            ui_android.dump_hierarchy(target.tool, target.target_id),
-            meaningful_only=meaningful_only,
-            max_depth=max_depth,
-            max_nodes=max_nodes,
-        )
-        return selector.mark_visibility(nodes), []
-    ios = _ios()
-    payload = ios.describe_all(target)
-    nodes, warnings = ios.parse_tree(
-        payload,
-        meaningful_only=meaningful_only,
-        max_depth=max_depth,
-        max_nodes=max_nodes,
-    )
-    # the meaningful filter drops an unlabelled application root; the screen
-    # rectangle then comes from the same payload (a re-parse, no device call)
-    view = selector.viewport(nodes) or selector.viewport(ios.parse_all(payload))
-    return selector.mark_visibility(nodes, view), warnings
+    return compact_from_payload(target.platform, read_payload(target),
+                                meaningful_only=meaningful_only, max_depth=max_depth,
+                                max_nodes=max_nodes)
 
 
 def tree_clipped(
@@ -444,6 +531,20 @@ def tree_signature(nodes: list[dict[str, Any]]) -> tuple:
     )
 
 
+def _asks_quiet(target: Target | None, timeout_ms: int,
+                snapshot_fn: Callable[[], list[dict[str, Any]]] | None,
+                quiet_signal: bool | None) -> bool:
+    """Does `settle` ask idb for the quiet signal first (AL-08)? Only for an
+    iOS target on the idb route with a budget to send (idb reads 0 s as "no
+    limit"), and only when the caller reads through the default snapshot or
+    asked for the signal explicitly."""
+    if quiet_signal is False or target is None or target.platform != IOS:
+        return False
+    if timeout_ms <= 0 or (snapshot_fn is not None and quiet_signal is not True):
+        return False
+    return _ios().quiet_route(target)
+
+
 def settle(
     target: Target | None,
     timeout_ms: int = 5000,
@@ -453,11 +554,30 @@ def settle(
     snapshot_fn: Callable[[], list[dict[str, Any]]] | None = None,
     clock: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
+    quiet_signal: bool | None = None,
 ) -> dict[str, Any]:
-    """Poll the tree until it stops changing, bounded by `timeout_ms`.
+    """Wait until the screen stops changing, bounded by `timeout_ms`.
 
-    Settled means two consecutive snapshots carry the same signature and that
-    signature has held for at least `quiet_ms` (the same idea as a
+    On the iOS idb route (AL-08) idb is asked first whether the frontmost
+    app goes quiet within the budget (`idb ui quiet`), and the tree is then
+    read exactly once: ``method: "idb-quiet"``, ``snapshots: 1``, and
+    ``settled`` is idb's answer — false, with the read made, when idb still
+    saw the app busy or settling at the deadline (``quiet_state`` and
+    ``busy_signals`` say what it saw). A dead companion is pruned and idb
+    asked once more (AL-04) with only what is left of the budget, and not
+    at all when nothing is left. When this idb has no such command or
+    the call fails, the tree is polled as below within what is left of the
+    budget: ``method: "poll"`` and ``quiet_fallback`` (``code``, ``error``).
+    Android, the XCUITest route and a zero budget always poll. The quiet
+    signal is used when the caller reads through the default ``snapshot``
+    (``ui wait --settled``, observe); a caller with its own `snapshot_fn`
+    (the Flow engine, tests) keeps polling unless it passes
+    ``quiet_signal=True``, and ``quiet_signal=False`` always polls. The
+    nodes of the last read stay in ``last_snapshot(target)`` when the
+    default reader was used.
+
+    Polling: settled means two consecutive snapshots carry the same
+    signature and that signature has held for at least `quiet_ms` (the same idea as a
     wait-for-app-to-settle step, a "settled" predicate, or a stable bounding
     box). An animation, a spinner or a list still loading keeps changing the
     signature; a timeout returns `settled: false` rather than raising, so the
@@ -477,6 +597,33 @@ def settle(
     take = snapshot_fn or (lambda: snapshot(target))  # type: ignore[arg-type]
     started = clock()
     deadline = started + max(timeout_ms, 0) / 1000
+    fallback: dict[str, Any] | None = None
+    if _asks_quiet(target, timeout_ms, snapshot_fn, quiet_signal):
+        try:
+            # a retry after a dead companion sends only what is left before
+            # this deadline, so the budget holds (RISK-012)
+            answer = _ios().wait_quiet(target, timeout_ms, quiet_ms, clock=clock,
+                                       deadline=deadline)
+        except errors.AutonomError as exc:
+            # unsupported, a dead companion past its one retry, the app
+            # exiting, a hung call: poll with whatever budget is left
+            fallback = {"code": exc.code, "error": exc.message}
+        else:
+            began = clock()
+            take()
+            now = clock()
+            quiet = bool(answer.get("quiet"))
+            result: dict[str, Any] = {
+                "settled": quiet, "method": "idb-quiet", "snapshots": 1, "changes": 0,
+                "elapsed_ms": int((now - started) * 1000),
+                "dump_ms": int((now - began) * 1000),
+                # idb counts the app quiet only after the whole quiet window
+                "stable_ms": max(int(quiet_ms), 0) if quiet else 0,
+                "quiet_state": answer.get("state"),
+            }
+            if answer.get("signals"):
+                result["busy_signals"] = list(answer["signals"])
+            return result
     interval = max(interval_ms, 10) / 1000
     previous: tuple | None = None
     stable_since = started
@@ -490,10 +637,13 @@ def settle(
         # whether the budget ever had room for two
         slowest = max([first, *recent]) if snapshots else 0.0
         # `stable_ms`: how long the last tree had held still when it ended
-        return {"settled": settled, "snapshots": snapshots, "changes": changes,
-                "elapsed_ms": int((now - started) * 1000),
-                "dump_ms": int(slowest * 1000),
-                "stable_ms": int((now - stable_since) * 1000) if snapshots else 0}
+        result = {"settled": settled, "method": "poll", "snapshots": snapshots,
+                  "changes": changes, "elapsed_ms": int((now - started) * 1000),
+                  "dump_ms": int(slowest * 1000),
+                  "stable_ms": int((now - stable_since) * 1000) if snapshots else 0}
+        if fallback:
+            result["quiet_fallback"] = fallback
+        return result
 
     while True:
         began = clock()
@@ -522,6 +672,25 @@ def settle(
         sleep(pause)
 
 
+def _unquiet_message(result: Mapping[str, Any], timeout_ms: int, quiet_ms: int,
+                     timeout_name: str, node_wait: str) -> tuple[str, str]:
+    """``unsettled_message`` for idb's answer: the app was still busy (some
+    signal unanswered: an animation, the run loop), or settling (answered,
+    but not yet for the whole quiet window), when the budget ran out."""
+    state = result.get("quiet_state")
+    signals = [str(name) for name in result.get("busy_signals") or ()]
+    if state == "settling":
+        return (f"idb reported the app settling, not yet quiet for the {quiet_ms} ms "
+                f"quiet window, when {timeout_ms} ms ran out",
+                f"It may have just settled: raise {timeout_name} by at least ~{quiet_ms} ms "
+                f"so the quiet window fits.")
+    seen = (f"still busy ({', '.join(signals)})" if signals
+            else "still busy" if state == "busy" else "not quiet")
+    return (f"idb reported the app {seen} after {timeout_ms} ms",
+            f"An animation, a timer or work on the main thread keeps it busy: raise "
+            f"{timeout_name}, or {node_wait}.")
+
+
 def unsettled_message(result: Mapping[str, Any], timeout_ms: int, quiet_ms: int, *,
                       timeout_name: str = "--timeout-ms",
                       node_wait: str = "wait for a specific node with 'ui find'",
@@ -536,8 +705,10 @@ def unsettled_message(result: Mapping[str, Any], timeout_ms: int, quiet_ms: int,
     seconds, so a 3 s budget fits one) — settling could not be confirmed.
     `timeout_name` spells the budget the caller has (`--timeout-ms` on the
     CLI, `timeoutMs` in a flow); `node_wait` is how that caller waits for a
-    node instead.
+    node instead. An ``idb-quiet`` result says what idb last saw instead.
     """
+    if result.get("method") == "idb-quiet":
+        return _unquiet_message(result, timeout_ms, quiet_ms, timeout_name, node_wait)
     snapshots = int(result.get("snapshots") or 0)
     changes = int(result.get("changes") or 0)
     dump_ms = int(result.get("dump_ms") or 0)
@@ -597,8 +768,33 @@ def interactable(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [node for node in nodes if is_interactable(node)]
 
 
-_OUTLINE_FLAGS = ("clickable", "scrollable", "focused", "selected", "checked")
+_OUTLINE_FLAGS = ("clickable", "scrollable", "focused", "selected")
 _OUTLINE_LABEL_MAX = 80
+
+
+def outline_flags(node: Mapping[str, Any]) -> list[str]:
+    """The state words of one outline line, in a fixed order.
+
+    ``clickable scrollable focused selected`` when true; then the check
+    state — ``checked`` or ``unchecked`` on every checkable node (an off
+    switch used to print nothing, so "off" and "not a switch" read the
+    same), ``checked`` alone on a checked node that is not checkable;
+    ``editable`` and ``password`` when true; ``disabled``; ``offscreen``.
+    """
+    flags = [flag for flag in _OUTLINE_FLAGS if node.get(flag)]
+    if node.get("checkable"):
+        flags.append("checked" if node.get("checked") else "unchecked")
+    elif node.get("checked"):
+        flags.append("checked")
+    if is_editable(node):
+        flags.append("editable")
+    if node.get("password"):
+        flags.append("password")
+    if node.get("enabled") is False:
+        flags.append("disabled")
+    if node.get("visible") is False:
+        flags.append("offscreen")  # listed by the tree, but not on screen
+    return flags
 
 
 def outline_line(node: Mapping[str, Any], indent: int = 0) -> str:
@@ -616,11 +812,7 @@ def outline_line(node: Mapping[str, Any], indent: int = 0) -> str:
     if bounds and len(bounds) == 4:
         left, top, right, bottom = bounds
         parts.append(f"@{left},{top} {right - left}x{bottom - top}")
-    flags = [flag for flag in _OUTLINE_FLAGS if node.get(flag)]
-    if node.get("enabled") is False:
-        flags.append("disabled")
-    if node.get("visible") is False:
-        flags.append("offscreen")  # listed by the tree, but not on screen
+    flags = outline_flags(node)
     if flags:
         parts.append("[" + " ".join(flags) + "]")
     return "  " * max(indent, 0) + " ".join(parts)
@@ -643,7 +835,42 @@ def outline(nodes: list[dict[str, Any]], *, interactable_only: bool = False) -> 
 def screen_size(target: Target) -> tuple[int, int] | None:
     if target.platform == ANDROID:
         return ui_android.screen_size(target.tool, target.target_id)
-    return _ios().screen_size(target)
+    if _ios().selected_backend(target) == "xcuitest":
+        return _ios().screen_size(target)
+    return _idb_screen_size(target)
+
+
+def _idb_screen_size(target: Target) -> tuple[int, int] | None:
+    """`ui_ios.screen_size` on the iOS idb/AXe route, step for step, except
+    that its accessibility read is kept.
+
+    There a lookup is a whole `idb ui describe-all`, and the size is the
+    root frame of that read; without a usable one the screen is measured
+    another way. The read is held as this thread's last snapshot of
+    ``target``, as ``snapshot`` holds one, so the command that made it does
+    not read again: a later guard takes the size from it (AL-01), and the
+    screen before the input is the baseline observe compares the screen
+    after it with (AL-11). The XCUITest route asks its runner for the
+    geometry, not for a tree, and keeps `ui_ios.screen_size` as it is."""
+    from . import ios_geometry, ios_idb
+
+    ios = _ios()
+    try:
+        payload = ios_idb.describe_all(target)
+        nodes = nodes_from_payload(IOS, payload)
+        _keep_read(target, nodes, payload)
+        size = ios.screen_size_from_nodes(nodes)
+        if size:
+            ios._record(target, ios.selected_backend(target),  # noqa: SLF001
+                        geometry=ios._idb_geometry(size))  # noqa: SLF001
+            return size
+    except errors.AutonomError:
+        pass
+    measured = ios_geometry.measure(target)
+    if measured:
+        ios._record(target, ios.selected_backend(target), geometry=measured)  # noqa: SLF001
+        return measured["width"], measured["height"]
+    return None
 
 
 # The actuation verbs return the backend that delivered the input: "adb" on
@@ -666,6 +893,7 @@ def tap(target: Target, x: int, y: int, *, screen: tuple[int, int] | None = None
         node: dict | None = None) -> str:
     _guard_point(target, x, y, screen=screen)
     _pretest_guard("tap", target, node=node, point=(x, y))
+    _sending(target)
     if target.platform == ANDROID:
         ui_android.tap(target.tool, target.target_id, x, y)
         return ANDROID_BACKEND
@@ -677,6 +905,7 @@ def long_press(target: Target, x: int, y: int, duration_ms: int = 600,
                *, screen: tuple[int, int] | None = None, node: dict | None = None) -> str:
     _guard_point(target, x, y, screen=screen)
     _pretest_guard("long-press", target, node=node, point=(x, y))
+    _sending(target)
     if target.platform == ANDROID:
         ui_android.long_press(target.tool, target.target_id, x, y, duration_ms)
         return ANDROID_BACKEND
@@ -689,6 +918,7 @@ def double_tap(target: Target, x: int, y: int,
     _guard_point(target, x, y, screen=screen)
     # one action: the pair is a single gesture to the app
     _pretest_guard("double-tap", target, node=node, point=(x, y))
+    _sending(target)
     # Guard once, dispatch twice — the platform helpers skip the guard.
     if target.platform == ANDROID:
         ui_android.tap(target.tool, target.target_id, x, y)
@@ -702,9 +932,10 @@ def double_tap(target: Target, x: int, y: int,
 
 def swipe(target: Target, x1: int, y1: int, x2: int, y2: int, duration: float,
           *, screen: tuple[int, int] | None = None) -> str:
-    for point in ((x1, y1), (x2, y2)):
-        _guard_point(target, *point, screen=screen)
+    # both endpoints against one screen size: one lookup at most, not two
+    _guard_points(target, ((x1, y1), (x2, y2)), screen=screen)
     _pretest_guard("swipe", target)
+    _sending(target)
     if target.platform == ANDROID:
         ui_android.swipe(target.tool, target.target_id, x1, y1, x2, y2, duration)
         return ANDROID_BACKEND
@@ -713,6 +944,7 @@ def swipe(target: Target, x1: int, y1: int, x2: int, y2: int, duration: float,
 
 def type_text(target: Target, text: str) -> str:
     _pretest_guard("type", target)
+    _sending(target)
     if target.platform == ANDROID:
         ui_android.type_text(target.tool, target.target_id, text)
         return ANDROID_BACKEND
@@ -721,6 +953,7 @@ def type_text(target: Target, text: str) -> str:
 
 def press_key(target: Target, key: str) -> str:
     _pretest_guard("key", target)
+    _sending(target)
     if target.platform == ANDROID:
         ui_android.press_key(target.tool, target.target_id, key)
         return ANDROID_BACKEND
@@ -736,22 +969,78 @@ def gesture(target: Target, name: str, **kwargs: Any) -> None:
             "Android input supports tap, swipe, text, and keyevent only.",
         )
     _pretest_guard("gesture", target)
+    _sending(target)
     _ios().gesture(target, name, **kwargs)
 
 
 def _guard_point(target: Target, x: int, y: int,
                  *, screen: tuple[int, int] | None = None) -> None:
+    """INV-06 — refuse a point outside the screen rather than tapping blind."""
+    _guard_points(target, ((x, y),), screen=screen)
+
+
+def _guard_points(target: Target, points: tuple[tuple[int, int], ...],
+                  *, screen: tuple[int, int] | None = None) -> None:
     """INV-06 — refuse a point outside the screen rather than tapping blind.
 
     A point/pixel mix-up on Retina simulators produces coordinates ~3x too
     large. Dispatching them would 'succeed' while landing nowhere, so the agent
     would report a defect that does not exist (RISK-005).
 
-    ``screen`` lets a caller that already knows the size (the flow executor
-    caches it once per run) skip the lookup — on iOS ``screen_size`` re-runs a
-    full accessibility dump, so the default path costs one extra dump per tap.
+    Where the size comes from, first hit wins:
+
+    1. ``screen``, from a caller that already knows it (the flow executor
+       caches it once per run);
+    2. on the iOS idb/AXe route, a size known without a device call — the
+       root frame of the tree this thread just read (a selector tap's own
+       read), else the geometry recorded for the target (``ui tree``, an
+       earlier lookup). On iOS a lookup is a whole accessibility dump, so
+       this is what keeps a tap at one read (AL-01). A point refused on such
+       a size is decided again on one fresh lookup, so a stale size (a
+       rotation, another app) never refuses a valid point (INV-2);
+    3. one lookup (``screen_size``) — always on Android and on the XCUITest
+       route, whose runner reports the screen it maps coordinates in. On
+       the iOS idb/AXe route that lookup is a whole accessibility read and
+       is kept as this thread's last snapshot (``_idb_screen_size``).
+
+    All ``points`` (a swipe's two ends) are checked against the same size.
     """
-    size = screen if screen is not None else screen_size(target)
+    if screen is None:
+        known = _known_screen(target)
+        if known is not None:
+            if _outside(points, known) is None:
+                return
+            # refused on a size nobody re-measured: measure once, then decide
+        screen = screen_size(target)
+    _check_points(target, points, screen)
+
+
+def _known_screen(target: Target) -> tuple[int, int] | None:
+    """The iOS screen size this process already has, without a device call:
+    the depth-0 application node of this thread's last read of ``target``,
+    else the geometry recorded for it. None on Android and on the XCUITest
+    route (they always look it up)."""
+    if target.platform != IOS:
+        return None
+    ios = _ios()
+    if ios.selected_backend(target) == "xcuitest":
+        return None
+    nodes = last_snapshot(target)
+    return (ios.screen_size_from_nodes(nodes) if nodes else None) or ios.recorded_screen_size(target)
+
+
+def _outside(points: tuple[tuple[int, int], ...],
+             size: tuple[int, int]) -> tuple[int, int] | None:
+    """The first point outside the ``size`` screen, else None."""
+    width, height = size
+    for x, y in points:
+        if not (0 <= x <= width and 0 <= y <= height):
+            return x, y
+    return None
+
+
+def _check_points(target: Target, points: tuple[tuple[int, int], ...],
+                  size: tuple[int, int] | None) -> None:
     if not size or min(size) <= 0:
         # No known screen: the idb/AXe route sends the input unguarded, as it
         # always has (Canvas taps, sessions without --app-id, a zero root
@@ -766,8 +1055,10 @@ def _guard_point(target: Target, x: int, y: int,
                 "no input was sent.")
         return
     width, height = size
-    if 0 <= x <= width and 0 <= y <= height:
+    point = _outside(points, size)
+    if point is None:
         return
+    x, y = point
     if target.platform == ANDROID:
         hint = ("Android coordinates are pixels of the reported screen size; a screenshot "
                 "of this target has the same size. Re-dump the tree and use the reported "
@@ -797,18 +1088,16 @@ def screen_from_nodes(nodes: list[dict[str, Any]]) -> tuple[int, int] | None:
 
 
 _TEXT_ROLES = ("textfield", "searchfield", "textview", "edittext", "textarea", "securetextfield")
-# Android classes that take typed text. Compose and Flutter text fields both
-# report android.widget.EditText; the rest are its framework subclasses.
-_EDITABLE_CLASSES = ("EditText", "AutoCompleteTextView", "MultiAutoCompleteTextView",
-                     "ExtractEditText", "SearchAutoComplete")
+# Android classes that take typed text; one list, shared with the parser that
+# sets the compact node's `editable`.
+_EDITABLE_CLASSES = ui_android.EDITABLE_CLASSES
 
 
 def is_editable(node: Mapping[str, Any]) -> bool:
     """Does this node accept typed text, as far as the tree can tell?"""
     if node.get("editable"):
         return True
-    short = str(node.get("class") or "").rsplit(".", 1)[-1]
-    if short.endswith(_EDITABLE_CLASSES):
+    if ui_android.is_editable_class(node.get("class")):
         return True
     role = str(node.get("role") or "").lower()
     return role in {"textfield", "searchfield", "securetextfield", "textarea", "edittext"}

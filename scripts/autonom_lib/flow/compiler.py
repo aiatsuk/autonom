@@ -58,7 +58,7 @@ _VERB_OPTIONS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "session force-stop": ((), ()),
     "session clear": (("--strategy",), ()),
     "session uninstall": ((), ()),
-    "ui key": ((), ()),
+    "ui key": (("--observe-timeout-ms",), ("--observe", "--no-observe")),
     "location set": ((), ()),
     "permissions": ((), ()),
 }
@@ -368,6 +368,14 @@ def compile_session(session: dict[str, Any], *, name: str | None = None,
             warn("swipe_not_compilable",
                  "point-to-point swipes do not compile; use directional "
                  "swipes in the flow by hand", seq=entry.get("seq"))
+        elif verb == "ui do":
+            # its steps came on stdin and the journal keeps only the verb;
+            # the run's events name them, but not in a form to compile back
+            extra = {"run_id": result["run_id"]} if result.get("run_id") else {}
+            warn("ui_do_not_compilable",
+                 "the steps of a 'ui do' are not in the journal, so they were not "
+                 "compiled; add them to the flow by hand (they are Flow v1 steps "
+                 "already)", seq=entry.get("seq"), **extra)
         elif any(verb == noise or verb.startswith(noise + " ")
                  or verb.split(" ")[0] == noise for noise in _NOISE_VERBS):
             continue

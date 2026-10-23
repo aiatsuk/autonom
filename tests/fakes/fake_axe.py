@@ -42,6 +42,43 @@ def record(argv: list[str], stdin: str | None) -> None:
         handle.write(json.dumps(entry) + "\n")
 
 
+def _number(value: str | None) -> bool:
+    try:
+        float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def check_touch(args: list[str]) -> str | None:
+    """`axe touch -x <x> -y <y> [--down] [--up] [--delay <delay>] --udid <udid>`
+    (`axe touch --help`, AXe 1.8.0): an error message, or None when valid.
+    A touch that neither goes down nor comes up does nothing on a device."""
+    values = {}
+    flags = set()
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg in ("-x", "-y", "--delay", "--udid"):
+            if index + 1 >= len(args):
+                return f"Error: Missing value for '{arg}'"
+            values[arg] = args[index + 1]
+            index += 2
+        elif arg in ("--down", "--up"):
+            flags.add(arg)
+            index += 1
+        else:
+            return f"Error: Unknown option '{arg}'"
+    for option in ("-x", "-y"):
+        if not _number(values.get(option)):
+            return f"Error: Missing expected argument '{option} <{option[1]}>'"
+    if not flags:
+        return "Error: Specify --down, --up, or both"
+    if "--delay" in values and not _number(values["--delay"]):
+        return "Error: The value for '--delay' is not a number"
+    return None
+
+
 def main(argv: list[str]) -> int:
     stdin = sys.stdin.read() if "--stdin" in argv else None
     record(argv, stdin)
@@ -57,6 +94,11 @@ def main(argv: list[str]) -> int:
     if argv[0] == "button" and (len(argv) < 2 or argv[1] not in BUTTONS):
         sys.stderr.write("Error: The value is not a valid button type\n")
         return 64
+    if argv[0] == "touch":
+        refusal = check_touch(argv[1:])
+        if refusal:
+            sys.stderr.write(refusal + "\n")
+            return 64
     for prefix, outcome in (load_state().get("axe_fail") or {}).items():
         if " ".join(argv).startswith(prefix):
             code, message = outcome

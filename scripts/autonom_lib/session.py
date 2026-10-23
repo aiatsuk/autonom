@@ -30,6 +30,13 @@ except ImportError:  # pragma: no cover
     fcntl = None  # type: ignore[assignment]
 
 SCHEMA_VERSION = 2
+# The per-session profile (`session start --profile`, AL-09). `default` keeps
+# every reply as it always was; `agent` makes `ui tree` print the outline and
+# the action verbs report the screen they lead to (observe, AL-11). A record
+# without the key (written by an older version) is a `default` session.
+PROFILES = ("default", "agent")
+DEFAULT_PROFILE = "default"
+AGENT_PROFILE = "agent"
 # The session one CLI invocation is bound to: None follows `current.json`,
 # a session id is that session (`--session-id`).
 _SELECTED: ContextVar[str | None] = ContextVar("autonom_session", default=None)
@@ -116,6 +123,7 @@ def new_record(
     tooling: dict[str, Any] | None = None,
     started_by: dict[str, Any] | None = None,
     label: str | None = None,
+    profile: str | None = None,
 ) -> dict[str, Any]:
     record: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
@@ -146,6 +154,8 @@ def new_record(
         # A free-text name a person gave the session (`session start
         # --label`), shown by `session list`; null when none was given.
         "label": label,
+        # `session start --profile` (AL-09): `default` or `agent`.
+        "profile": validate_profile(profile),
     }
     if platform == "android":
         # DEC-004: `serial` and `adb` are permanent for Android callers.
@@ -223,6 +233,7 @@ def start_session(
     started_by: dict[str, Any] | None = None,
     exclusive: bool = False,
     label: str | None = None,
+    profile: str | None = None,
 ) -> dict[str, Any]:
     """Create the artifact tree and the session record.
 
@@ -275,6 +286,7 @@ def start_session(
             tooling=resolved_tooling,
             started_by=started_by,
             label=label,
+            profile=profile,
         )
         if alongside:
             # Bound to the new session for its own save: `save` then leaves
@@ -556,13 +568,36 @@ def validate_label(label: str | None) -> str | None:
     return label
 
 
-# The keys of one `session list` entry, in this order.
+def validate_profile(profile: str | None) -> str:
+    """A profile as given to `session start --profile`; None is `default`.
+    Anything else is `invalid_value` (the parser's choices refuse it first)."""
+    if profile is None:
+        return DEFAULT_PROFILE
+    if profile not in PROFILES:
+        raise errors.AutonomError(
+            errors.INVALID_VALUE,
+            f"--profile must be one of {', '.join(PROFILES)}, got {profile!r}",
+            "Pass --profile agent for compact replies, or omit it.")
+    return profile
+
+
+def profile_of(record: dict[str, Any] | None) -> str:
+    """The profile a session runs with: what its record stores, `default`
+    for a record without one (an older version wrote it) or with a value
+    this version does not know."""
+    value = (record or {}).get("profile")
+    return value if value in PROFILES else DEFAULT_PROFILE
+
+
+# The keys of one `session list` entry, in this order. `profile` follows
+# `live` only for a session whose profile is not `default`, so the entry of
+# every other session keeps exactly the keys it always had.
 LIST_KEYS = ("session_id", "platform", "target_id", "label", "started_at",
              "stopped_at", "started_by", "current", "live")
 
 
 def _list_entry(record: dict[str, Any], *, current: bool, live: bool) -> dict[str, Any]:
-    return {
+    entry: dict[str, Any] = {
         "session_id": record.get("session_id"),
         "platform": record.get("platform") or "android",
         "target_id": record.get("target_id") or record.get("serial"),
@@ -573,6 +608,10 @@ def _list_entry(record: dict[str, Any], *, current: bool, live: bool) -> dict[st
         "current": current,
         "live": live,
     }
+    profile = profile_of(record)
+    if profile != DEFAULT_PROFILE:
+        entry["profile"] = profile
+    return entry
 
 
 def list_sessions(*, include_stopped: bool = False,

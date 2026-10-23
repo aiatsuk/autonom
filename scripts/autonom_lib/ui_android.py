@@ -8,7 +8,8 @@ from __future__ import annotations
 
 import re
 import subprocess
-from typing import Any
+import time
+from typing import Any, Callable
 
 from . import adb as adb_mod
 from . import errors
@@ -42,6 +43,30 @@ def role_for_class(class_name: str) -> str:
     return ROLE_BY_CLASS.get(short, short.lower() or "node")
 
 
+# Android classes that take typed text. Compose and Flutter text fields both
+# report android.widget.EditText; the rest are its framework subclasses
+# (AppCompatEditText and TextInputEditText end in "EditText" too).
+EDITABLE_CLASSES = ("EditText", "AutoCompleteTextView", "MultiAutoCompleteTextView",
+                    "ExtractEditText", "SearchAutoComplete")
+
+
+def is_editable_class(class_name: str | None) -> bool:
+    """Is this an EditText or one of its subclasses, by its short name?"""
+    short = str(class_name or "").rsplit(".", 1)[-1]
+    return bool(short) and short.endswith(EDITABLE_CLASSES)
+
+
+def _editable(node: Any) -> bool:
+    """Takes typed text: an EditText (or a subclass), or a node with a hint.
+
+    The class is what decides on a stock dump; a `hint` attribute (a field
+    showing its placeholder) counts too, and so does an `editable` attribute
+    where a dump carries one (``is_meaningful`` reads the same attribute).
+    """
+    return (node.bool_attr("editable") or is_editable_class(node.class_name)
+            or bool((node.attributes.get("hint") or "").strip()))
+
+
 def compact_node(node: Any, ref: str) -> dict[str, Any]:
     bounds = None
     if node.bounds is not None:
@@ -67,6 +92,10 @@ def compact_node(node: Any, ref: str) -> dict[str, Any]:
         "selected": node.bool_attr("selected"),
         "checkable": node.bool_attr("checkable"),
         "checked": node.bool_attr("checked"),
+        # Additive: whether typed text lands here, and whether the field
+        # hides it (UI Automator's `password`) — the outline prints both.
+        "editable": _editable(node),
+        "password": node.bool_attr("password"),
         "depth": node.depth,
     }
 
@@ -74,9 +103,9 @@ def compact_node(node: Any, ref: str) -> dict[str, Any]:
 def is_meaningful(node: Any) -> bool:
     """Unchanged from 0.4.0 — operates on the raw UiNode.
 
-    It reads `checkable` and `editable`, which are UI Automator attributes that
-    the compact schema does not carry, so the filter must run before compaction
-    or its result would silently change.
+    It reads the raw `checkable` and `editable` attributes (the compact
+    `editable` is derived differently, see ``_editable``), so the filter must
+    run before compaction or its result would silently change.
     """
     return bool(
         node.text
@@ -119,31 +148,93 @@ def parse_tree(
 # --- actuation ---------------------------------------------------------------
 
 
-def dump_hierarchy(adb: str, serial: str, *, retries: int = 1) -> str:
+# What `uiautomator dump` prints (exit 0, no XML) when the screen never went
+# idle: it waits for a quiet moment to read the tree, and an animation, a
+# video, a ticking timer or a spinner never gives it one. Seen 2026-10-21 on
+# an emulator's Settings > About emulated device.
+NOT_IDLE_TEXT = "could not get idle state"
+# A bad read (output without `</hierarchy>`: a document cut off while an
+# activity switches in, or the idle-state refusal above) is read again the
+# way it always was: a pause of DUMP_RETRY_PAUSE_S, then a second read, which
+# always happens, however long the first read took. A third read (DUMP_READS
+# at most) is made only when it can start within DUMP_RETRY_WINDOW_S of the
+# end of the first bad read; one dump takes about 2 s on an emulator, so a
+# slow device gets the two reads it always had.
+DUMP_READS = 3
+DUMP_RETRY_PAUSE_S = 0.5
+DUMP_RETRY_WINDOW_S = 2.0
+
+
+def is_not_idle_output(text: str) -> bool:
+    """Is this uiautomator's never-idle refusal rather than a (cut) document?
+
+    Only output without a closing `</hierarchy>` counts, so a complete
+    dump whose node text happens to say the same words is still a tree.
+    """
+    return "</hierarchy>" not in text and NOT_IDLE_TEXT in text.lower()
+
+
+def not_idle_error() -> errors.AutonomError:
+    return errors.AutonomError(
+        errors.UI_NOT_IDLE,
+        "UIAutomator could not read this screen: it never went idle, because "
+        "something on it keeps changing (an animation, a video, a timer or a "
+        "spinner)",
+        "Run 'autonom screenshot' to see this screen; it reads the pixels, not the "
+        "tree. 'autonom ui wait --settled' does not help, since this screen does not "
+        "stop changing. Read the tree again once the app shows a still screen.",
+    )
+
+
+def dump_hierarchy(adb: str, serial: str, *, reads: int = DUMP_READS,
+                   pause_s: float = DUMP_RETRY_PAUSE_S,
+                   window_s: float = DUMP_RETRY_WINDOW_S,
+                   sleep: Callable[[float], None] | None = None,
+                   clock: Callable[[], float] | None = None) -> str:
     """One UIAutomator dump, complete or refused by name.
 
-    Mid-transition (an activity switching in), `uiautomator dump` returns a
-    truncated document; that used to surface as a bare ValueError with no
-    `error_code`. Retry once after a short settle, then fail as the backend
-    failure it is.
+    A read without `</hierarchy>` (cut off mid-transition, or uiautomator's
+    "could not get idle state") is read again after ``pause_s``: the second
+    read always happens, as it always did. One more read (``reads`` in all)
+    happens only when it can start within ``window_s`` of the end of the
+    first bad read. When the last read is bad too, it fails as
+    ``ui_not_idle`` if that read said "could not get idle state", else as
+    ``backend_failed`` (incomplete hierarchy), as before.
     """
-    import time as _time
-
+    sleep = sleep or time.sleep
+    clock = clock or time.monotonic
+    reads = max(reads, 2)  # never fewer than the read and re-read it always made
+    first_bad_end: float | None = None
     last = ""
-    for attempt in range(retries + 1):
-        completed = adb_mod.run_adb(
-            adb,
-            ["exec-out", "uiautomator", "dump", "/dev/tty"],
-            serial=serial,
-            timeout=20,
-            check=True,
-        )
+    for attempt in range(1, reads + 1):
+        try:
+            completed = adb_mod.run_adb(
+                adb,
+                ["exec-out", "uiautomator", "dump", "/dev/tty"],
+                serial=serial,
+                timeout=20,
+                check=True,
+            )
+        except adb_mod.AdbError as exc:
+            # A failing exit status is raised at once, as before; when it
+            # carries the idle-state words (exit 0 is what was seen) it is
+            # named for what it is.
+            if is_not_idle_output(exc.message):
+                raise not_idle_error() from exc
+            raise
         assert isinstance(completed.stdout, str)
         last = completed.stdout
         if "</hierarchy>" in last:
             return last
-        if attempt < retries:
-            _time.sleep(0.5)
+        if first_bad_end is None:
+            first_bad_end = clock()
+        if attempt >= reads:
+            break
+        if attempt >= 2 and clock() + pause_s - first_bad_end > window_s:
+            break  # a further read could not start inside the window
+        sleep(pause_s)
+    if is_not_idle_output(last):
+        raise not_idle_error()
     raise errors.AutonomError(
         errors.BACKEND_FAILED,
         "UIAutomator returned an incomplete hierarchy (the screen was probably "

@@ -233,7 +233,8 @@ class AxeBackendTests(IosBackendBase):
         self.assertEqual(code, 0, payload)
         # General's bounds are [16, 380, 386, 432]; the centre is in points.
         self.assertEqual(self.argv_log("axe"),
-                         [["tap", "-x", "201", "-y", "406", "--udid", UDID]])
+                         [["touch", "-x", "201", "-y", "406", "--down", "--up",
+                           "--delay", "0.12", "--udid", UDID]])
         self.assertEqual(self.idb_verbs().count(["ui", "tap"]), 1)
         self.assertIn(["ui", "describe-all"], self.idb_verbs(), "the tree stays on idb")
 
@@ -248,7 +249,8 @@ class AxeBackendTests(IosBackendBase):
         self.assertEqual(self.ios("ui", "key", "SIDE_BUTTON", **env)[0], 0)
         self.assertEqual(self.ios("ui", "key", "40", **env)[0], 0)
         self.assertEqual(self.argv_log("axe"), [
-            ["tap", "-x", "20", "-y", "30", "--udid", UDID],
+            ["touch", "-x", "20", "-y", "30", "--down", "--up", "--delay", "0.12",
+             "--udid", UDID],
             ["swipe", "--start-x", "100", "--start-y", "600", "--end-x", "100",
              "--end-y", "200", "--duration", "0.4", "--udid", UDID],
             ["type", "--stdin", "--udid", UDID],
@@ -407,12 +409,15 @@ class SingleFireRetryTests(IosBackendBase):
         self.assertEqual(self.idb_verbs().count(["ui", "text"]), 1)
         self.assertNotIn(["list-targets"], [verb[:1] for verb in self.idb_verbs()])
 
-    def test_refused_with_nothing_to_prune_is_not_retried(self) -> None:
+    def test_refused_with_nothing_to_prune_is_still_retried_once(self) -> None:
+        # AL-04: a refused connection reached nothing, so the single retry
+        # happens whether or not the prune dropped an entry (it used to need one).
         self.state_file([{"udid": UDID, "pid": os.getpid(), "is_local": True}])
         self.set_state(idb_fail={"ui text": [1, self.REFUSED]})
         code, payload = self.ios("ui", "type", "hello")
         self.assertEqual(payload["error_code"], errors.IDB_COMPANION_UNAVAILABLE)
-        self.assertEqual(self.idb_verbs().count(["ui", "text"]), 1)
+        self.assertEqual(self.idb_verbs().count(["ui", "text"]), 2, "exactly one retry")
+        self.assertEqual([verb[:1] for verb in self.idb_verbs()].count(["list-targets"]), 1)
 
     def test_refused_with_an_unknown_registry_is_retried_once(self) -> None:
         # No readable state file: whether anything was pruned is unknown, and
@@ -438,11 +443,11 @@ class SingleFireRetryTests(IosBackendBase):
         self.assertEqual(self.idb_verbs().count(["ui", "text"]), 2)
         self.assertEqual(json.loads(path.read_text(encoding="utf-8")), [])
 
-    def test_prune_reports_false_when_nothing_disappeared(self) -> None:
-        self.state_file([{"udid": UDID, "pid": os.getpid(), "is_local": True}])
-        self.assertFalse(ios_idb._prune_companions(str(FAKE_IDB)))  # noqa: SLF001
-        self.state_file([{"udid": UDID, "pid": _dead_pid(), "is_local": True}])
-        self.assertTrue(ios_idb._prune_companions(str(FAKE_IDB)))  # noqa: SLF001
+    def test_prune_drops_only_the_dead_registration(self) -> None:
+        live = {"udid": UDID, "pid": os.getpid(), "is_local": True}
+        path = self.state_file([live, {"udid": "OTHER", "pid": _dead_pid(), "is_local": True}])
+        ios_idb._prune_companions(str(FAKE_IDB))  # noqa: SLF001
+        self.assertEqual(json.loads(path.read_text(encoding="utf-8")), [live])
 
 
 class CompanionOutputTests(unittest.TestCase):

@@ -153,7 +153,8 @@ class UnknownGeometryInputTests(unittest.TestCase):
         with patch.object(ui_ios, "run_axe") as run_axe:
             self.assertEqual(ui.tap(TARGET, 200, 278), "axe")
         run_axe.assert_called_once()
-        self.assertEqual(run_axe.call_args.args[:2], ("/fake/axe", ["tap", "-x", "200", "-y", "278"]))
+        self.assertEqual(run_axe.call_args.args[:2], ("/fake/axe", [
+            "touch", "-x", "200", "-y", "278", "--down", "--up", "--delay", "0.12"]))
 
     def test_xcuitest_route_refuses_and_sends_nothing(self):
         ui_ios.set_preference("xcuitest")

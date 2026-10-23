@@ -64,28 +64,15 @@ from autonom_lib.flow import canonical as flow_canonical  # noqa: E402
 from autonom_lib.flow import compiler as flow_compiler  # noqa: E402
 from autonom_lib.flow import executor as flow_executor  # noqa: E402
 from autonom_lib.flow import maestro as flow_maestro  # noqa: E402
-from autonom_lib.flow import report as flow_report  # noqa: E402
 from autonom_lib.flow import repair as flow_repair  # noqa: E402
 from autonom_lib.flow import validator as flow_validator  # noqa: E402
 from autonom_lib import journal as journal_mod  # noqa: E402
+from autonom_lib import observe as observe_mod  # noqa: E402
 from autonom_lib import providers as providers_mod  # noqa: E402
-from autonom_lib import report_model as report_model_mod  # noqa: E402
-from autonom_lib import report_bundle as report_bundle_mod  # noqa: E402
-from autonom_lib import report_export as report_export_mod  # noqa: E402
-from autonom_lib import gates as gates_mod  # noqa: E402
-from autonom_lib import campaign as campaign_mod  # noqa: E402
 from autonom_lib import teach as teach_mod  # noqa: E402
 from autonom_lib import app_skills as app_skills_mod  # noqa: E402
 from autonom_lib import simulator as simulator_mod  # noqa: E402
-from autonom_lib import tour as tour_mod  # noqa: E402
 from autonom_lib import ios_simctl  # noqa: E402
-from autonom_lib.metrics import android_memory as metrics_memory  # noqa: E402
-from autonom_lib.metrics import artifacts as metrics_artifacts  # noqa: E402
-from autonom_lib.metrics import frames as metrics_frames  # noqa: E402
-from autonom_lib.metrics import presets as metrics_presets  # noqa: E402
-from autonom_lib.metrics import series as metrics_series  # noqa: E402
-from autonom_lib.metrics import snapshot as metrics_snapshot  # noqa: E402
-from autonom_lib.metrics import trace as metrics_trace  # noqa: E402
 from autonom_lib import logs as logs_mod  # noqa: E402
 from autonom_lib import platform as platform_mod  # noqa: E402
 from autonom_lib import proof as proof_mod  # noqa: E402
@@ -95,15 +82,56 @@ from autonom_lib import selector as selector_mod  # noqa: E402
 from autonom_lib import session as session_mod  # noqa: E402
 from autonom_lib import ui as ui_mod  # noqa: E402
 from autonom_lib.platform import ANDROID, IOS, Target  # noqa: E402
-from autonom_lib.network import device_proxy_android, har as har_mod  # noqa: E402
-from autonom_lib.network import mocks as mocks_mod  # noqa: E402
-from autonom_lib.network import proxy as proxy_mod, store as store_mod  # noqa: E402
-from autonom_lib.network import redact as redact_mod  # noqa: E402
-from autonom_lib.atlas import fingerprint as atlas_fingerprint  # noqa: E402
-from autonom_lib.atlas import graph as atlas_graph  # noqa: E402
+
+# Report, campaign, metrics, network and atlas modules are imported inside the
+# commands that use them: a quick verb such as `ui tree` must not pay for
+# urllib/ssl, zipfile or statistics on every call. Their old module-level names
+# still resolve (module __getattr__) to the very module object the commands
+# import, so patching an attribute through them, as in
+# `patch.object(cli.proxy_mod, "stop")`, still reaches the commands; rebinding
+# the name itself on this module does not.
+_LAZY_MODULES = {
+    "atlas_fingerprint": "autonom_lib.atlas.fingerprint",
+    "atlas_graph": "autonom_lib.atlas.graph",
+    "campaign_mod": "autonom_lib.campaign",
+    "device_proxy_android": "autonom_lib.network.device_proxy_android",
+    "flow_report": "autonom_lib.flow.report",
+    "gates_mod": "autonom_lib.gates",
+    "har_mod": "autonom_lib.network.har",
+    "metrics_artifacts": "autonom_lib.metrics.artifacts",
+    "metrics_frames": "autonom_lib.metrics.frames",
+    "metrics_memory": "autonom_lib.metrics.android_memory",
+    "metrics_presets": "autonom_lib.metrics.presets",
+    "metrics_series": "autonom_lib.metrics.series",
+    "metrics_snapshot": "autonom_lib.metrics.snapshot",
+    "metrics_trace": "autonom_lib.metrics.trace",
+    "mocks_mod": "autonom_lib.network.mocks",
+    "proxy_mod": "autonom_lib.network.proxy",
+    "redact_mod": "autonom_lib.network.redact",
+    "report_bundle_mod": "autonom_lib.report_bundle",
+    "report_export_mod": "autonom_lib.report_export",
+    "report_model_mod": "autonom_lib.report_model",
+    "store_mod": "autonom_lib.network.store",
+    "tour_mod": "autonom_lib.tour",
+}
+
+
+def __getattr__(name: str) -> Any:
+    module = _LAZY_MODULES.get(name)
+    if module is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    import importlib
+
+    return importlib.import_module(module)
 
 
 _LAST_EMIT: dict[str, Any] | None = None
+# The exit status of an interrupt (SIGINT, Ctrl-C), the shell's convention.
+EXIT_INTERRUPTED = 130
+# Set when an interrupt ended the observe step of an action whose input was
+# already sent (AL-11): the reply is printed and journaled ok as usual, then
+# `main` exits EXIT_INTERRUPTED so `&&` chains and `set -e` scripts stop.
+_OBSERVE_INTERRUPTED = False
 # The root parser of the running invocation: the journal resolves argv through
 # it (abbreviations, --flag=value, value positions) before scrubbing (SEC-002).
 _ROOT_PARSER: argparse.ArgumentParser | None = None
@@ -148,6 +176,10 @@ def _unique_warnings(warnings: list[Any]) -> list[Any]:
     return out
 
 
+# How every JSON reply is printed on stdout (AL-10): one line, no spaces.
+JSON_SEPARATORS = (",", ":")
+
+
 def emit(data: Any, *, as_json: bool) -> int:
     global _LAST_EMIT
     _with_control(data)
@@ -165,15 +197,24 @@ def emit(data: Any, *, as_json: bool) -> int:
                 data.setdefault(key, observed[key])
     _LAST_EMIT = data if isinstance(data, dict) else None
     if as_json or isinstance(data, (dict, list)):
-        print(json.dumps(data, indent=2, ensure_ascii=False))
+        # One line for every caller and profile (AL-10): the same keys and
+        # values the indented form had, compact, so an agent reads a reply
+        # in one line and a script splits replies on newlines.
+        print(json.dumps(data, ensure_ascii=False, separators=JSON_SEPARATORS))
     else:
         print(data)
     return 0
 
 
-def fail(message: str, code: int = 2) -> int:
-    print(json.dumps({"ok": False, "error": message}, ensure_ascii=False), file=sys.stderr)
-    return code
+def _interrupted_error() -> errors.AutonomError:
+    """The exit-130 envelope of an interrupt (Ctrl-C, SIGINT). `error` keeps
+    the word it always carried; `error_code` and `hint` make it an envelope
+    like every other failure (docs/COMPATIBILITY.md)."""
+    return errors.AutonomError(
+        errors.INTERRUPTED, "interrupted",
+        "The command was cancelled (Ctrl-C or SIGINT) and may have stopped partway. "
+        "If it was driving a device, read the screen (autonom ui tree) before running "
+        "it again: an input it was sending may already have arrived.")
 
 
 def fail_error(exc: errors.AutonomError, code: int = 2) -> int:
@@ -476,6 +517,7 @@ def _already_active(record: dict[str, Any], *, gone: bool = False,
 def cmd_session_start(args: argparse.Namespace) -> int:
     started_by = _started_by(args)
     label = session_mod.validate_label(getattr(args, "label", None))
+    profile = session_mod.validate_profile(getattr(args, "profile", None))
     alongside_flag = bool(getattr(args, "alongside", False))
     explicit = _explicit_target_flags(args)
     # One session per target. `current.json` keeps naming the machine's
@@ -541,6 +583,7 @@ def cmd_session_start(args: argparse.Namespace) -> int:
             started_by=started_by,
             exclusive=True,
             label=label,
+            profile=profile,
         )
     except errors.AutonomError as exc:
         # Lost a race on this target under the store lock: like the refusal
@@ -699,6 +742,8 @@ def _session_stop_marked(args: argparse.Namespace, record: dict[str, Any]) -> in
                  "previous_proxy_settings": None, "capture_mode": None})
             return {"was_attached": True, "skipped": "stale_target"}
         if target.platform == ANDROID:
+            from autonom_lib.network import device_proxy_android
+
             return device_proxy_android.detach(target, record)
         from autonom_lib.network import device_proxy_ios
 
@@ -749,6 +794,7 @@ def _session_stop_marked(args: argparse.Namespace, record: dict[str, Any]) -> in
     # Use the same route guard as CLI/Canvas Stop. No generic process reaping
     # may kill a proxy still needed by the target.
     from autonom_lib.network import attachment as attachment_mod
+    from autonom_lib.network import proxy as proxy_mod
 
     if not gone and attachment_mod.transparent_route_live(record):
         network_stop_payload(record)  # raises the transparent-route refusal
@@ -1200,25 +1246,34 @@ def cmd_ui_tree(args: argparse.Namespace) -> int:
             payload.update(attribution)
             if attribution.get("check_id"):
                 payload["task"] = attribution["check_id"]
-        blob = json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
         # Keep the full history, not just the latest: a run's trees are evidence
         # of how the screen changed. `latest.json` stays as a stable pointer.
-        stamp = time.strftime("%H%M%S", time.gmtime())
-        existing = sorted(session_mod.artifact_path(current, "trees").glob("[0-9]*.json"))
-        seq = len(existing) + 1
-        history = session_mod.artifact_path(current, "trees", f"{seq:04d}_{stamp}.json")
-        history.write_text(blob, encoding="utf-8")
-        session_mod.artifact_path(current, "trees", "latest.json").write_text(
-            blob, encoding="utf-8"
-        )
-        payload["saved"] = str(history)
-    if getattr(args, "format", "json") == "outline":
+        # The saved tree records how it was read (the reply does not change):
+        # observe compares only with a tree read the way it reads (AL-11).
+        shape = observe_mod.read_shape(
+            observe_mod.SHAPE_UI_TREE, all_nodes=bool(args.all),
+            interactable=bool(getattr(args, "interactable", False)),
+            max_depth=args.max_depth, max_nodes=args.max_nodes, truncated=truncated)
+        payload["saved"] = observe_mod.save_tree(current, {**payload, "read_shape": shape})
+    # the profile of the session this read belongs to (for a dump, the
+    # invocation's session: there is no target to match)
+    owner = current if dump or observe_mod.owns(current, target) else None
+    if _tree_format(args, owner) == "outline":
         # One line per node for a token-cheap read; the saved history above
         # keeps the full nodes, the printed envelope carries the outline.
         payload["format"] = "outline"
         payload["outline"] = ui_mod.outline(nodes)
         payload.pop("nodes", None)
     return emit(payload, as_json=True)
+
+
+def _tree_format(args: argparse.Namespace, record: dict[str, Any] | None) -> str:
+    """`ui tree --format`: as given; without it `outline` in an agent-profile
+    session (AL-09), `json` otherwise (and for every older session)."""
+    chosen = getattr(args, "format", None)
+    if chosen:
+        return chosen
+    return "outline" if session_mod.profile_of(record) == session_mod.AGENT_PROFILE else "json"
 
 
 def cmd_ui_accessibility(args: argparse.Namespace) -> int:
@@ -1237,8 +1292,11 @@ def cmd_ui_accessibility(args: argparse.Namespace) -> int:
 
 
 def cmd_ui_wait(args: argparse.Namespace) -> int:
-    """`ui wait --settled`: poll until the tree stops changing, bounded.
+    """`ui wait --settled`: wait until the screen stops changing, bounded.
 
+    On the iOS idb route idb is asked whether the app is quiet, then the tree
+    is read once (`method: idb-quiet`); elsewhere, or when idb cannot answer,
+    the tree is polled until two consecutive reads match (`method: poll`).
     Mirrors the other bounded checks (`flow fmt --check`, `doctor --strict`):
     the report is on stdout either way, and a screen that never settled
     within --timeout-ms exits 1 with `settled: false`.
@@ -1246,7 +1304,7 @@ def cmd_ui_wait(args: argparse.Namespace) -> int:
     if not args.settled:
         raise errors.AutonomError(
             errors.USAGE_ERROR, "ui wait needs a condition",
-            "Pass --settled (wait until two consecutive trees match).")
+            "Pass --settled (wait until the screen holds still for --quiet-ms).")
     for flag, value in (("--timeout-ms", args.timeout_ms), ("--quiet-ms", args.quiet_ms)):
         if value < 0:
             raise errors.AutonomError(
@@ -1555,6 +1613,51 @@ def _backend(returned: Any) -> str | None:
     return ui_ios.last_backend()
 
 
+class _ObservePlan:
+    """Whether an action verb reports the screen it leads to (AL-11), and
+    how: ``--observe`` / ``--no-observe`` win, else the session's profile
+    decides; the budget is checked before any input is sent."""
+
+    def __init__(self, args: argparse.Namespace) -> None:
+        self.timeout_ms = observe_mod.check_timeout(getattr(args, "observe_timeout_ms", None))
+        self.flag = getattr(args, "observe", None)
+        self.record: dict[str, Any] | None = None
+        self.on = False
+        self.mark: Any = None
+
+    def resolve(self, target: Target) -> "_ObservePlan":
+        """Bind to the session of ``target`` once the target is known, and
+        mark where this thread stands, so the read this command holds when
+        its input goes out can be told from an earlier command's."""
+        self.record = observe_mod.session_for(target)
+        self.on = observe_mod.wanted(self.flag, self.record)
+        self.mark = observe_mod.read_mark(target)
+        return self
+
+    def into(self, payload: dict[str, Any], target: Target, verb: str,
+             secret: str | None = None) -> dict[str, Any]:
+        """Add what observe saw to ``payload`` (nothing when observe is off).
+        The baseline of the diff is the read this command held when its
+        input went out (a selector tap's read, `ui type`'s focus read, the
+        iOS guard's `describe-all` lookup), noted right before it was sent;
+        no read is made for it. An interrupt that ended observing is
+        remembered for `main`, which exits 130 once this reply is printed
+        and journaled."""
+        global _OBSERVE_INTERRUPTED
+        if not self.on:
+            return payload
+        keys, warnings = observe_mod.after_action(
+            target, self.record, verb=verb,
+            baseline_payload=observe_mod.own_read(target, since=self.mark),
+            timeout_ms=self.timeout_ms, secret=secret)
+        if observe_mod.interrupted(keys):
+            _OBSERVE_INTERRUPTED = True
+        payload.update(keys)
+        if warnings:
+            payload.setdefault("warnings", []).extend(warnings)
+        return payload
+
+
 def cmd_ui_tap(args: argparse.Namespace) -> int:
     has_selector = any(value is not None for value in _selectors(args).values())
     has_x, has_y = args.x is not None, args.y is not None
@@ -1571,7 +1674,9 @@ def cmd_ui_tap(args: argparse.Namespace) -> int:
             "Pass both --x and --y for a point, or a selector for a node.",
         )
     _check_selector_regex(args)
+    plan = _ObservePlan(args)
     target = _target(args)
+    plan.resolve(target)
     ref = None
     node = None
     nodes: list[dict[str, Any]] = []
@@ -1633,6 +1738,7 @@ def cmd_ui_tap(args: argparse.Namespace) -> int:
         payload["detail"] = detail
     if evidence_warning:
         payload.setdefault("warnings", []).append(evidence_warning)
+    plan.into(payload, target, "ui tap")
     return emit({**payload, **target.identity()}, as_json=True)
 
 
@@ -1660,12 +1766,15 @@ def cmd_ui_swipe(args: argparse.Namespace) -> int:
     _swipe_duration(args.duration)
     x1, y1 = _point(args.start, "--from")
     x2, y2 = _point(args.end, "--to")
+    plan = _ObservePlan(args)
     target = _target(args)
+    plan.resolve(target)
     backend = _backend(ui_mod.swipe(target, x1, y1, x2, y2, args.duration))
     payload: dict[str, Any] = {"ok": True, "from": [x1, y1], "to": [x2, y2],
                                "duration": args.duration}
     if backend:
         payload["backend"] = backend
+    plan.into(payload, target, "ui swipe")
     return emit({**payload, **target.identity()}, as_json=True)
 
 
@@ -1684,7 +1793,9 @@ def cmd_ui_gesture(args: argparse.Namespace) -> int:
 
 
 def cmd_ui_type(args: argparse.Namespace) -> int:
+    plan = _ObservePlan(args)
     target = _target(args)
+    plan.resolve(target)
     # Typing with nothing focused "succeeds" on both platforms while every
     # character lands nowhere (seen on an iOS Settings screen with no field).
     # The CLI is exploratory, so it still types — but says what it saw.
@@ -1703,8 +1814,8 @@ def cmd_ui_type(args: argparse.Namespace) -> int:
                 "hint": "Tap the field first (ui tap), wait for it to appear, then "
                         "type; confirm with ui find on the typed text.",
             }
-    backend = _backend(ui_mod.type_text(target, args.text))
     sensitive = bool(getattr(args, "sensitive", False))
+    backend = _backend(ui_mod.type_text(target, args.text))
     detail, evidence_warning = actions_mod.record_detail_checked(
         session_mod.load_current(), "type", {
         "kind": "type",
@@ -1733,16 +1844,61 @@ def cmd_ui_type(args: argparse.Namespace) -> int:
         payload["warnings"] = [focus_warning]
     if evidence_warning:
         payload.setdefault("warnings", []).append(evidence_warning)
+    # a sensitive value never reaches the observed screen or its saved tree
+    plan.into(payload, target, "ui type", secret=args.text if sensitive else None)
     return emit({**payload, **target.identity()}, as_json=True)
 
 
 def cmd_ui_key(args: argparse.Namespace) -> int:
+    plan = _ObservePlan(args)
     target = _target(args)
+    plan.resolve(target)
     backend = _backend(ui_mod.press_key(target, args.keycode))
     payload: dict[str, Any] = {"ok": True, "keycode": args.keycode}
     if backend:
         payload["backend"] = backend
+    plan.into(payload, target, "ui key")
     return emit({**payload, **target.identity()}, as_json=True)
+
+
+def cmd_ui_do(args: argparse.Namespace) -> int:
+    """`ui do` (AL-12): Flow v1 steps from stdin, run in the active session
+    through the flow executor in one call. It stops at the first failing
+    step and replies with the step results, `failure` and the final screen
+    (`screen`, `changes`, `foreground` as observe gives them after an
+    action). A problem with the input is `invalid_value` before any step;
+    exit 0 when every step passed, 1 when the run failed, as `flow run`."""
+    global _OBSERVE_INTERRUPTED
+    from autonom_lib.flow import inline as flow_inline
+
+    timeout_ms = observe_mod.check_timeout(getattr(args, "observe_timeout_ms", None))
+    inline = flow_inline.load(flow_inline.read(sys.stdin))
+    record = session_mod.load_current()
+    if not record:
+        raise errors.AutonomError(
+            errors.NO_ACTIVE_SESSION, "ui do needs an active session",
+            "Start one with 'autonom session start'.")
+    flow_inline.bind_app(inline, record.get("app_id"))
+    target = _target(args)
+    runner = flow_executor.Executor(target, record, flow_executor.RunConfig())
+    # every sensitive value as the run typed, set or read it, step by step
+    sensitive = flow_inline.watch(runner, inline)
+    result = flow_inline.run(runner, inline)
+    payload = flow_inline.reply(inline, result)
+    # the screen the steps ended on, read (never acted on) the way observe
+    # reads it after an action, also after a failed or interrupted run; each
+    # value the run kept sensitive stays out of it on its own
+    with flow_inline.masking(sensitive) as secret:
+        keys, warnings = observe_mod.after_action(
+            target, observe_mod.session_for(target), verb="ui do", timeout_ms=timeout_ms,
+            secret=secret)
+    if observe_mod.interrupted(keys):
+        _OBSERVE_INTERRUPTED = True
+    payload.update(keys)
+    if warnings:
+        payload.setdefault("warnings", []).extend(warnings)
+    emit({**payload, **target.identity()}, as_json=True)
+    return 0 if result.status == "passed" else 1
 
 
 # --- evidence ----------------------------------------------------------------
@@ -1903,6 +2059,8 @@ def _snapshot_base_dir(out: str | None) -> Path | None:
     """Artifact destination for snapshots: --out (dir, or a .json file's
     parent), else the session metrics/ dir, else None — no destination is
     allowed, the stdout payload still carries every metric."""
+    from autonom_lib.metrics import artifacts as metrics_artifacts
+
     if out:
         target = Path(out)
         if target.suffix == ".json":
@@ -1923,6 +2081,8 @@ def _write_snapshot_artifacts(payload: dict[str, Any], raw: str | None,
     analyze` globs `*-meminfo.txt` for capture packs, and a snapshot's raw
     dump must never fold into that series unasked. Stems are uniquified —
     a fast series would otherwise overwrite same-second artifacts."""
+    from autonom_lib.metrics import artifacts as metrics_artifacts
+
     if base is None:
         return []
     if out and Path(out).suffix == ".json":
@@ -1946,6 +2106,8 @@ def _write_snapshot_artifacts(payload: dict[str, Any], raw: str | None,
 
 
 def cmd_metrics_snapshot(args: argparse.Namespace) -> int:
+    from autonom_lib.metrics import snapshot as metrics_snapshot
+
     target = _target(args)
     app_id = _app_id(args)
     payload, raw = metrics_snapshot.take(target, app_id)
@@ -1958,6 +2120,10 @@ def cmd_metrics_snapshot(args: argparse.Namespace) -> int:
 
 
 def cmd_metrics_series(args: argparse.Namespace) -> int:
+    from autonom_lib.metrics import artifacts as metrics_artifacts
+    from autonom_lib.metrics import series as metrics_series
+    from autonom_lib.metrics import snapshot as metrics_snapshot
+
     if args.count < 1:
         raise errors.AutonomError(
             errors.INVALID_VALUE, f"--count must be >= 1, got {args.count}",
@@ -2000,6 +2166,8 @@ def cmd_metrics_series(args: argparse.Namespace) -> int:
 def _metrics_out_dir(args: argparse.Namespace) -> Path:
     """--out dir, else the session's metrics/ dir; metrics depth verbs write
     real evidence, so unlike snapshot they refuse to run with nowhere to put it."""
+    from autonom_lib.metrics import artifacts as metrics_artifacts
+
     if getattr(args, "out", None):
         return Path(args.out)
     record = session_mod.load_current()
@@ -2018,6 +2186,8 @@ def _require_android(target: Target, message: str, hint: str) -> None:
 
 
 def cmd_metrics_memory_capture(args: argparse.Namespace) -> int:
+    from autonom_lib.metrics import android_memory as metrics_memory
+
     target = _target(args)
     _require_android(target, "the memory pack reads Android dumpsys",
                      "On iOS use 'metrics snapshot' and "
@@ -2029,6 +2199,9 @@ def cmd_metrics_memory_capture(args: argparse.Namespace) -> int:
 
 
 def cmd_metrics_memory_analyze(args: argparse.Namespace) -> int:
+    from autonom_lib.metrics import android_memory as metrics_memory
+    from autonom_lib.metrics import artifacts as metrics_artifacts
+
     if args.dir:
         directory = Path(args.dir)
     else:
@@ -2064,23 +2237,31 @@ def cmd_metrics_memory_warn(args: argparse.Namespace) -> int:
                  **target.identity()}, as_json=True)
 
 
-# The hint must not send a Simulator run to `trace --preset hitches`:
-# Instruments refuses Animation Hitches on the Simulator.
-_FRAMES_ANDROID_ONLY = ("gfxinfo frame stats are Android-only",
-                        metrics_frames.IOS_FRAMES_HINT)
+def _frames_android_only() -> tuple[str, str]:
+    """The refusal of the gfxinfo verbs off Android. The hint must not send a
+    Simulator run to `trace --preset hitches`: Instruments refuses Animation
+    Hitches on the Simulator."""
+    from autonom_lib.metrics import frames as metrics_frames
+
+    return ("gfxinfo frame stats are Android-only", metrics_frames.IOS_FRAMES_HINT)
 
 
 def cmd_metrics_frames_reset(args: argparse.Namespace) -> int:
+    from autonom_lib.metrics import frames as metrics_frames
+
     target = _target(args)
-    _require_android(target, *_FRAMES_ANDROID_ONLY)
+    _require_android(target, *_frames_android_only())
     app_id = _app_id(args)
     metrics_frames.reset(target, app_id)
     return emit({"ok": True, "reset": app_id, **target.identity()}, as_json=True)
 
 
 def cmd_metrics_frames_capture(args: argparse.Namespace) -> int:
+    from autonom_lib.metrics import artifacts as metrics_artifacts
+    from autonom_lib.metrics import frames as metrics_frames
+
     target = _target(args)
-    _require_android(target, *_FRAMES_ANDROID_ONLY)
+    _require_android(target, *_frames_android_only())
     app_id = _app_id(args)
     raw, summary = metrics_frames.capture(target, app_id)
     payload: dict[str, Any] = {"ok": True, "summary": summary,
@@ -2101,6 +2282,8 @@ def cmd_metrics_frames_capture(args: argparse.Namespace) -> int:
 
 
 def cmd_metrics_frames_flutter(args: argparse.Namespace) -> int:
+    from autonom_lib.metrics import frames as metrics_frames
+
     path = Path(args.file)
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -2121,6 +2304,8 @@ def cmd_metrics_frames_flutter(args: argparse.Namespace) -> int:
 
 
 def cmd_metrics_trace(args: argparse.Namespace) -> int:
+    from autonom_lib.metrics import trace as metrics_trace
+
     target = _target(args)
     payload = metrics_trace.run_preset(
         target, _app_id(args), args.preset, duration=max(args.duration, 1.0),
@@ -2129,6 +2314,8 @@ def cmd_metrics_trace(args: argparse.Namespace) -> int:
 
 
 def cmd_metrics_list_presets(args: argparse.Namespace) -> int:
+    from autonom_lib.metrics import presets as metrics_presets
+
     platform = getattr(args, "platform", None)
     try:
         adb_path: str | None = adb_mod.find_adb(getattr(args, "adb", None))
@@ -2470,6 +2657,9 @@ def network_start_payload(record: dict[str, Any], *, port: int | None,
     Shared by the CLI verb and the Canvas tools process, so both start the
     proxy, record consent and warn exactly the same way.
     """
+    from autonom_lib.network import mocks as mocks_mod
+    from autonom_lib.network import proxy as proxy_mod
+
     entry = consent_mod.require(
         consent_mod.Operation(
             kind="mitm_proxy",
@@ -2571,6 +2761,7 @@ def cmd_network_stop(args: argparse.Namespace) -> int:
 def network_stop_payload(record: dict[str, Any], target_of: Any = None) -> dict[str, Any]:
     """Restore the target before stopping its proxy; keep both on failure."""
     from autonom_lib.network import attachment as attachment_mod
+    from autonom_lib.network import proxy as proxy_mod
 
     if attachment_mod.transparent_route_live(record):
         raise errors.AutonomError(
@@ -2608,6 +2799,9 @@ def network_status_payload(record: dict[str, Any], target: Any,
     `hit_counts` returns the mock hit counts the idle-rule warning is judged by.
     """
     from autonom_lib.network import attachment as attachment_mod
+    from autonom_lib.network import device_proxy_android
+    from autonom_lib.network import mocks as mocks_mod
+    from autonom_lib.network import proxy as proxy_mod
 
     state = proxy_mod.status(record)
     network = record.get("network") or {}
@@ -2672,6 +2866,9 @@ def network_attach_payload(record: dict[str, Any], target_of: Any, *, acknowledg
 
     `target_of` is called once the proxy is known to run, as the verb always did.
     """
+    from autonom_lib.network import device_proxy_android
+    from autonom_lib.network import proxy as proxy_mod
+
     state = proxy_mod.status(record)
     if not state["running"]:
         raise errors.AutonomError(
@@ -2725,6 +2922,8 @@ def cmd_network_detach(args: argparse.Namespace) -> int:
 
 def network_detach_payload(record: dict[str, Any], target: Target) -> dict[str, Any]:
     """`network detach` for `record` (shared with the Canvas tools process)."""
+    from autonom_lib.network import device_proxy_android
+
     # Never write one session's snapshot onto another device, or clear it there.
     if (target.target_id != record.get("target_id")
             or target.platform != record.get("platform")):
@@ -2748,10 +2947,12 @@ def network_detach_payload(record: dict[str, Any], target: Target) -> dict[str, 
 
 
 def cmd_network_requests_list(args: argparse.Namespace) -> int:
+    from autonom_lib.network import store as store_mod
+
     record = session_mod.require_current()
     payload = store_mod.listing(
         record,
-        max_items=args.max,
+        max_items=store_mod.DEFAULT_MAX if args.max is None else args.max,
         host=args.host,
         method=args.method,
         status=args.status,
@@ -2764,6 +2965,9 @@ def cmd_network_requests_list(args: argparse.Namespace) -> int:
 
 
 def cmd_network_requests_follow(args: argparse.Namespace) -> int:
+    from autonom_lib.network import redact as redact_mod
+    from autonom_lib.network import store as store_mod
+
     record = session_mod.require_current()
     filters = {"host": args.host, "method": args.method, "status": args.status,
                "path_glob": args.path, "mocked": args.mocked}
@@ -2844,6 +3048,8 @@ def cmd_network_requests_follow(args: argparse.Namespace) -> int:
 
 
 def cmd_network_requests_show(args: argparse.Namespace) -> int:
+    from autonom_lib.network import store as store_mod
+
     record = session_mod.require_current()
     flow = store_mod.find(record, args.id)
     payload: dict[str, Any] = {"ok": True, "request": flow}
@@ -2864,6 +3070,10 @@ def cmd_network_requests_show(args: argparse.Namespace) -> int:
 
 
 def cmd_network_export(args: argparse.Namespace) -> int:
+    from autonom_lib.network import har as har_mod
+    from autonom_lib.network import proxy as proxy_mod
+    from autonom_lib.network import store as store_mod
+
     record = session_mod.require_current()
     destination = Path(args.har).expanduser()
     if not destination.is_absolute():
@@ -2884,6 +3094,8 @@ def cmd_network_export(args: argparse.Namespace) -> int:
 def _mock_headers(args: argparse.Namespace) -> dict[str, str] | None:
     """`--header 'Name: value'`, repeatable. None when the flag was not used;
     a malformed header is refused rather than silently dropped."""
+    from autonom_lib.network import mocks as mocks_mod
+
     return mocks_mod.parse_header_args(getattr(args, "header", None))
 
 
@@ -2901,6 +3113,8 @@ def _mock_body(args: argparse.Namespace) -> tuple[Path | None, str | None]:
 
 def _mock_selector(args: argparse.Namespace) -> dict[str, Any]:
     """`--url` (exact endpoint) and `--match` (glob) are mutually exclusive."""
+    from autonom_lib.network import mocks as mocks_mod
+
     url = getattr(args, "url", None)
     match = getattr(args, "match", None)
     if url and match:
@@ -2929,6 +3143,8 @@ def _mock_hit_counts() -> dict[str, int]:
     this repository's own first live run — a glob ending in `/list` could not
     match a URL carrying a query string.
     """
+    from autonom_lib.network import store as store_mod
+
     record = session_mod.load_current()
     if not record:
         return {}
@@ -2945,10 +3161,14 @@ def _mock_hit_counts() -> dict[str, int]:
 
 
 def _annotate_hits(rules: list[dict[str, Any]]) -> list[dict[str, str]]:
+    from autonom_lib.network import mocks as mocks_mod
+
     return mocks_mod.annotate_hits(rules, _mock_hit_counts())
 
 
 def cmd_network_mock_add(args: argparse.Namespace) -> int:
+    from autonom_lib.network import mocks as mocks_mod
+
     selector = _mock_selector(args)
     mocks_mod.require_target(selector.get("url_glob"))
     body_file, body_text = _mock_body(args)
@@ -2973,6 +3193,8 @@ def cmd_network_mock_add(args: argparse.Namespace) -> int:
 
 
 def cmd_network_mock_list(args: argparse.Namespace) -> int:
+    from autonom_lib.network import mocks as mocks_mod
+
     rules = mocks_mod.load()
     if not getattr(args, "all", False):
         rules = [rule for rule in rules if rule.get("enabled", True)]
@@ -2985,6 +3207,9 @@ def cmd_network_mock_list(args: argparse.Namespace) -> int:
 
 
 def cmd_network_mock_show(args: argparse.Namespace) -> int:
+    from autonom_lib.network import mocks as mocks_mod
+    from autonom_lib.network import redact as redact_mod
+
     rule = mocks_mod.get(args.id)
     payload: dict[str, Any] = {"ok": True, "mock": rule}
     body_path = (rule.get("response") or {}).get("body_path")
@@ -2999,6 +3224,8 @@ def cmd_network_mock_show(args: argparse.Namespace) -> int:
 
 
 def cmd_network_mock_update(args: argparse.Namespace) -> int:
+    from autonom_lib.network import mocks as mocks_mod
+
     selector = _mock_selector(args) if (args.url or args.match) else {}
     body_file, body_text = _mock_body(args)
     rule = mocks_mod.update(
@@ -3019,20 +3246,28 @@ def cmd_network_mock_update(args: argparse.Namespace) -> int:
 
 
 def cmd_network_mock_enable(args: argparse.Namespace) -> int:
+    from autonom_lib.network import mocks as mocks_mod
+
     detail = mocks_mod.set_enabled(args.id, True, all_rules=args.all)
     return emit({"ok": True, **detail}, as_json=True)
 
 
 def cmd_network_mock_disable(args: argparse.Namespace) -> int:
+    from autonom_lib.network import mocks as mocks_mod
+
     detail = mocks_mod.set_enabled(args.id, False, all_rules=args.all)
     return emit({"ok": True, **detail}, as_json=True)
 
 
 def cmd_network_mock_remove(args: argparse.Namespace) -> int:
+    from autonom_lib.network import mocks as mocks_mod
+
     return emit({"ok": True, **mocks_mod.remove(args.id)}, as_json=True)
 
 
 def cmd_network_mock_clear(_: argparse.Namespace) -> int:
+    from autonom_lib.network import mocks as mocks_mod
+
     return emit({"ok": True, **mocks_mod.clear()}, as_json=True)
 
 
@@ -4408,6 +4643,8 @@ def _atlas_app_id(args: argparse.Namespace,
 
 
 def cmd_atlas_update(args: argparse.Namespace) -> int:
+    from autonom_lib.atlas import graph as atlas_graph
+
     record = _session_by_id(args.session)
     app_id = _atlas_app_id(args, record)
     graph = atlas_graph.load(app_id)
@@ -4435,18 +4672,24 @@ def cmd_atlas_update(args: argparse.Namespace) -> int:
 
 
 def cmd_atlas_show(args: argparse.Namespace) -> int:
+    from autonom_lib.atlas import graph as atlas_graph
+
     app_id = _atlas_app_id(args, session_mod.load_current())
     return emit({"ok": True,
                  **atlas_graph.summary(atlas_graph.load(app_id))}, as_json=True)
 
 
 def cmd_atlas_coverage(args: argparse.Namespace) -> int:
+    from autonom_lib.atlas import graph as atlas_graph
+
     app_id = _atlas_app_id(args, session_mod.load_current())
     return emit({"ok": True, "app_id": app_id,
                  **atlas_graph.coverage(atlas_graph.load(app_id))}, as_json=True)
 
 
 def cmd_atlas_paths(args: argparse.Namespace) -> int:
+    from autonom_lib.atlas import graph as atlas_graph
+
     app_id = _atlas_app_id(args, session_mod.load_current())
     graph = atlas_graph.load(app_id)
     return emit({"ok": True, "app_id": app_id,
@@ -4455,6 +4698,8 @@ def cmd_atlas_paths(args: argparse.Namespace) -> int:
 
 
 def cmd_atlas_export(args: argparse.Namespace) -> int:
+    from autonom_lib.atlas import graph as atlas_graph
+
     app_id = _atlas_app_id(args, session_mod.load_current())
     graph = atlas_graph.load(app_id)
     out = _output_path(args.out, "--out")
@@ -4466,6 +4711,8 @@ def cmd_atlas_export(args: argparse.Namespace) -> int:
 
 
 def cmd_atlas_diff(args: argparse.Namespace) -> int:
+    from autonom_lib.atlas import graph as atlas_graph
+
     # load_snapshot validates the shape: a truncated or foreign JSON file is a
     # clean envelope, never a traceback or a diff of garbage
     base = atlas_graph.load_snapshot(Path(args.base))
@@ -4529,6 +4776,9 @@ def _suite_manifests(record: dict[str, Any], last: int | None) -> list[dict]:
 
 
 def _report_model(record: dict[str, Any], run_id: str | None) -> tuple[Path, dict, dict]:
+    from autonom_lib import report_model as report_model_mod
+    from autonom_lib.flow import report as flow_report
+
     run_dir = _resolve_run_dir(record, run_id)
     manifest = flow_report.load_manifest(run_dir)
     return run_dir, manifest, report_model_mod.compile_manifest(manifest)
@@ -4547,6 +4797,9 @@ def cmd_report_model(args: argparse.Namespace) -> int:
 
 
 def cmd_report_bundle(args: argparse.Namespace) -> int:
+    from autonom_lib import report_bundle as report_bundle_mod
+    from autonom_lib.flow import report as flow_report
+
     record = _session_by_id(args.session)
     run_dir = _resolve_run_dir(record, args.run)
     manifest = flow_report.load_manifest(run_dir)
@@ -4557,6 +4810,7 @@ def cmd_report_bundle(args: argparse.Namespace) -> int:
 
 
 def cmd_report_verify(args: argparse.Namespace) -> int:
+    from autonom_lib import report_bundle as report_bundle_mod
     from autonom_lib.pretest import pack as pretest_pack
 
     path = Path(args.bundle)
@@ -4567,12 +4821,16 @@ def cmd_report_verify(args: argparse.Namespace) -> int:
 
 
 def cmd_report_annotate(args: argparse.Namespace) -> int:
+    from autonom_lib import report_bundle as report_bundle_mod
+
     return emit({"ok": True, **report_bundle_mod.annotate(
         Path(args.bundle), args.text, author=args.author, step_id=args.step)},
         as_json=True)
 
 
 def cmd_report_gate(args: argparse.Namespace) -> int:
+    from autonom_lib import gates as gates_mod
+
     out = _output_path(args.out, "--out") if args.out else None
     record = _session_by_id(args.session)
     _run_dir, _manifest, model = _report_model(record, args.run)
@@ -4587,6 +4845,9 @@ def cmd_report_gate(args: argparse.Namespace) -> int:
 
 
 def cmd_report_history(args: argparse.Namespace) -> int:
+    from autonom_lib import gates as gates_mod
+    from autonom_lib import report_model as report_model_mod
+
     record = _session_by_id(args.session)
     manifests = _suite_manifests(record, args.last)
     result = gates_mod.history([
@@ -4600,6 +4861,8 @@ def cmd_report_history(args: argparse.Namespace) -> int:
 
 
 def cmd_report_pack(args: argparse.Namespace) -> int:
+    from autonom_lib import campaign as campaign_mod
+
     bundle = Path(args.bundle)
     out = Path(args.out)
     return emit(campaign_mod.pack(bundle, out, shard_id=args.shard_id),
@@ -4607,6 +4870,8 @@ def cmd_report_pack(args: argparse.Namespace) -> int:
 
 
 def cmd_report_merge(args: argparse.Namespace) -> int:
+    from autonom_lib import campaign as campaign_mod
+
     result = campaign_mod.merge(
         [Path(path) for path in args.packs], Path(args.out),
         expected_shards=args.expected_shards)
@@ -4615,6 +4880,8 @@ def cmd_report_merge(args: argparse.Namespace) -> int:
 
 
 def cmd_report_finalize(args: argparse.Namespace) -> int:
+    from autonom_lib import campaign as campaign_mod
+
     result = campaign_mod.finalize(
         Path(args.campaign),
         rules_path=Path(args.rules) if args.rules else None)
@@ -4632,6 +4899,8 @@ def cmd_report_finalize(args: argparse.Namespace) -> int:
 
 def cmd_report_watch(args: argparse.Namespace) -> int:
     """Incrementally emit newly finalized run summaries as NDJSON."""
+    from autonom_lib import report_model as report_model_mod
+
     record = _session_by_id(args.session)
     flows_dir = Path(record["artifacts_dir"]) / "flows"
     seen: set[str] = set()
@@ -4658,6 +4927,8 @@ def cmd_report_watch(args: argparse.Namespace) -> int:
 
 def cmd_report_suite(args: argparse.Namespace) -> int:
     """One page for the whole session — the suite view CI and humans read."""
+    from autonom_lib.flow import report as flow_report
+
     record = _session_by_id(args.session)
     # --last N: the latest run of each of the N flows that ran most recently;
     # a re-run replaces its flow's earlier run instead of pushing another
@@ -4753,6 +5024,9 @@ def cmd_report_suite(args: argparse.Namespace) -> int:
 
 
 def cmd_report_build(args: argparse.Namespace) -> int:
+    from autonom_lib import report_bundle as report_bundle_mod
+    from autonom_lib.flow import report as flow_report
+
     record = _session_by_id(args.session)
     run_dir = _resolve_run_dir(record, args.run)
     manifest = flow_report.load_manifest(run_dir)
@@ -4779,6 +5053,8 @@ def cmd_report_build(args: argparse.Namespace) -> int:
 
 
 def cmd_report_open(args: argparse.Namespace) -> int:
+    from autonom_lib.flow import report as flow_report
+
     record = _session_by_id(args.session)
     run_dir = _resolve_run_dir(record, args.run)
     html_path = run_dir / "report.html"
@@ -4795,6 +5071,11 @@ def cmd_report_open(args: argparse.Namespace) -> int:
 
 
 def cmd_report_export(args: argparse.Namespace) -> int:
+    from autonom_lib import report_bundle as report_bundle_mod
+    from autonom_lib import report_export as report_export_mod
+    from autonom_lib import report_model as report_model_mod
+    from autonom_lib.flow import report as flow_report
+
     record = _session_by_id(args.session)
     run_dir = _resolve_run_dir(record, args.run)
     manifest = flow_report.load_manifest(run_dir)
@@ -4834,6 +5115,8 @@ def cmd_report_serve(args: argparse.Namespace) -> int:
     import http.server
     import secrets as secrets_mod
     import urllib.parse
+
+    from autonom_lib.flow import report as flow_report
 
     record = _session_by_id(args.session)
     initial_dir = _resolve_run_dir(record, args.run)
@@ -5022,6 +5305,8 @@ def cmd_capabilities(args: argparse.Namespace) -> int:
 
 
 def cmd_tour(args: argparse.Namespace) -> int:
+    from autonom_lib import tour as tour_mod
+
     payload, text = tour_mod.command(args)
     if getattr(args, "human", False):
         # The one verb written for a person first: --human prints the
@@ -5096,6 +5381,10 @@ def cmd_app_skill_promote(args: argparse.Namespace) -> int:
 
 
 def _source_for_replay(args: argparse.Namespace) -> tuple[dict, dict]:
+    from autonom_lib import report_bundle as report_bundle_mod
+    from autonom_lib import report_model as report_model_mod
+    from autonom_lib.flow import report as flow_report
+
     if args.bundle:
         bundle = Path(args.bundle)
         report_bundle_mod.verify(bundle)
@@ -5109,7 +5398,23 @@ def _source_for_replay(args: argparse.Namespace) -> tuple[dict, dict]:
 
 
 def cmd_replay(args: argparse.Namespace) -> int:
+    from autonom_lib.flow import inline as flow_inline
+
     source, model = _source_for_replay(args)
+    if str(source.get("flow_path") or "") == flow_inline.INLINE_PATH:
+        # A `ui do` run: its steps came on stdin and no flow file holds them.
+        # None is written for replay, because a sensitive value typed by a
+        # step would then sit on disk in clear, and a masked one would make
+        # the replay type the mask instead of the value.
+        run_id = source.get("run_id")
+        raise errors.AutonomError(
+            errors.REPLAY_MANIFEST_INVALID,
+            f"run {run_id or '(unknown)'} ran steps sent to 'ui do' on stdin; there is "
+            "no flow file to replay",
+            hint="Send the same steps to 'autonom ui do' again, or save them as a flow "
+                 "file (a 'schema:' and 'name:' header, a '---' line, then the steps) "
+                 "and run 'autonom flow run <file>'.",
+            flow=flow_inline.INLINE_PATH, **({"run_id": run_id} if run_id else {}))
     raw_flow_path = Path(str(source.get("flow_path") or ""))
     flow_path = ((Path(source["_bundle_root"]) / raw_flow_path).resolve()
                  if source.get("_bundle_root") and not raw_flow_path.is_absolute()
@@ -5194,6 +5499,10 @@ def cmd_simulator(args: argparse.Namespace) -> int:
 
 def cmd_ci_run(args: argparse.Namespace) -> int:
     """Supervise capture → bundle → shard → merge → gate → publish."""
+    from autonom_lib import campaign as campaign_mod
+    from autonom_lib import report_bundle as report_bundle_mod
+    from autonom_lib.flow import report as flow_report
+
     path = Path(args.path)
     files = _flow_files(path) if path.is_dir() else [path]
     if not files:
@@ -5282,11 +5591,16 @@ def cmd_ci_run(args: argparse.Namespace) -> int:
 
 
 def cmd_ci_publish(args: argparse.Namespace) -> int:
+    from autonom_lib import campaign as campaign_mod
+
     return emit({"ok": True, **campaign_mod.publish(
         Path(args.campaign), args.destination)}, as_json=True)
 
 
 def _agent_model(args: argparse.Namespace) -> tuple[dict[str, Any], Path | None]:
+    from autonom_lib import report_bundle as report_bundle_mod
+    from autonom_lib import report_model as report_model_mod
+
     if args.bundle:
         bundle = Path(args.bundle)
         report_bundle_mod.verify(bundle)
@@ -5297,6 +5611,8 @@ def _agent_model(args: argparse.Namespace) -> tuple[dict[str, Any], Path | None]
 
 
 def cmd_agent_export(args: argparse.Namespace) -> int:
+    from autonom_lib import report_export as report_export_mod
+
     model, bundle = _agent_model(args)
     out = Path(args.out)
     return emit({"ok": True, **report_export_mod.agent(model, out)}, as_json=True)
@@ -6236,10 +6552,11 @@ _CONTROL_MUTATING: frozenset[str] = frozenset({
 # `report serve` admits each /replay through the flow executor. The pre-test
 # verbs that run flows (`flows`, `repro`, `rerun`, `warmup`) go through the
 # same executor, so every mutating step is admitted like `flow run`; the
-# warm-up's Runtime Map replay admits each of its taps itself.
+# warm-up's Runtime Map replay admits each of its taps itself. `ui do` runs
+# its stdin steps through the same executor.
 _CONTROL_FLOW: frozenset[str] = frozenset({
     "flow run", "proof", "replay", "ci run", "teach approve", "report serve", "tour",
-    "pretest flows", "pretest repro", "pretest rerun", "pretest warmup",
+    "pretest flows", "pretest repro", "pretest rerun", "pretest warmup", "ui do",
 })
 # Verbs whose class depends on their positional action: the READONLY actions
 # are listed, every other action is MUTATING.
@@ -6378,6 +6695,26 @@ def _add_selector_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--mode", choices=("exact", "contains", "regex"), default="contains")
     parser.add_argument("--case-sensitive", action="store_true")
     parser.add_argument("--index", type=int)
+
+
+# The observe flags of the action verbs (AL-11), matched only when spelled
+# in full like every flag added after abbreviations were in use.
+_OBSERVE_FLAGS = frozenset({"--observe", "--no-observe", "--observe-timeout-ms"})
+
+
+def _add_observe_flags(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--observe", dest="observe", action="store_const", const=True,
+                        default=None,
+                        help="after the input, wait for the screen to settle and return it "
+                             "(screen, changes, foreground); the default in an "
+                             "agent-profile session")
+    parser.add_argument("--no-observe", dest="observe", action="store_const", const=False,
+                        help="return right after the input, whatever the session profile")
+    parser.add_argument("--observe-timeout-ms", type=int, default=observe_mod.DEFAULT_TIMEOUT_MS,
+                        metavar="MS",
+                        help="how long observe waits for the screen to settle "
+                             f"(default {observe_mod.DEFAULT_TIMEOUT_MS})")
+    parser.exact_only_options = journal_mod.EXACT_ONLY_OPTIONS | _OBSERVE_FLAGS
 
 
 # `session outputs`, `journal` and `logs follow` had their own --session-id
@@ -6570,8 +6907,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="record who started the session (with --alongside only)")
     p.add_argument("--label", metavar="TEXT",
                    help="a name for the session, shown by 'session list' (1-64 printable characters)")
-    # `--la` keeps reaching --launch: --label is matched only when spelled in full.
-    p.exact_only_options = journal_mod.EXACT_ONLY_OPTIONS | {"--label"}
+    p.add_argument("--profile", choices=session_mod.PROFILES,
+                   help="default (the default): replies as always; agent: 'ui tree' prints "
+                        "the outline and tap/type/swipe/key return the new screen")
+    # `--la` keeps reaching --launch and `--p` --platform: --label and
+    # --profile are matched only when spelled in full.
+    p.exact_only_options = journal_mod.EXACT_ONLY_OPTIONS | {"--label", "--profile"}
     p.set_defaults(func=cmd_session_start)
 
     p = session_sub.add_parser("list", help="list the live sessions of this machine (all with --all)",
@@ -6621,8 +6962,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--all", action="store_true", help="include non-meaningful nodes")
     p.add_argument("--max-depth", type=int, default=None)
     p.add_argument("--max-nodes", type=int, default=200)
-    p.add_argument("--format", choices=("json", "outline"), default="json",
-                   help="outline: one indented line per node instead of the nodes array")
+    p.add_argument("--format", choices=("json", "outline"), default=None,
+                   help="outline: one indented line per node instead of the nodes array "
+                        "(default json; outline in an agent-profile session)")
     p.add_argument("--interactable", action="store_true",
                    help="only nodes an agent can act on (buttons, fields, switches, ...)")
     p.add_argument("--no-accessibility-recovery", action="store_true",
@@ -6643,7 +6985,9 @@ def build_parser() -> argparse.ArgumentParser:
     p = ui_sub.add_parser("wait", help="wait until the screen stops changing",
                           parents=[target_flags])
     p.add_argument("--settled", action="store_true",
-                   help="poll until two consecutive trees match for --quiet-ms")
+                   help="wait until the screen holds still for --quiet-ms (iOS idb: "
+                        "'idb ui quiet', then one read; otherwise poll until two "
+                        "consecutive trees match)")
     p.add_argument("--timeout-ms", type=int, default=5000,
                    help="give up after N ms (exit 1, settled: false)")
     p.add_argument("--quiet-ms", type=int, default=500,
@@ -6656,6 +7000,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--y", type=int)
     p.add_argument("--duration", type=int, metavar="MS",
                    help="hold for MS milliseconds (a long press)")
+    _add_observe_flags(p)
     p.set_defaults(func=cmd_ui_tap)
 
     p = ui_sub.add_parser("swipe", help="swipe between two points", parents=[target_flags])
@@ -6663,6 +7008,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--to", dest="end", required=True, metavar="X,Y")
     p.add_argument("--duration", type=float, default=0.3, metavar="SECONDS",
                    help=f"seconds, e.g. 0.4 (default 0.3, at most {SWIPE_MAX_SECONDS:g})")
+    _add_observe_flags(p)
     p.set_defaults(func=cmd_ui_swipe)
 
     # Only pinch takes an anchor and a scale; `idb ui rotate|shake` accept
@@ -6679,11 +7025,24 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("text")
     p.add_argument("--sensitive", action="store_true",
                    help="a credential: keep only its length in every artifact")
+    _add_observe_flags(p)
     p.set_defaults(func=cmd_ui_type)
 
     p = ui_sub.add_parser("key", help="send a key or hardware button", parents=[target_flags])
     p.add_argument("keycode", help="Android: KEYCODE_BACK; iOS: HOME, LOCK, SIRI, SIDE_BUTTON")
+    _add_observe_flags(p)
     p.set_defaults(func=cmd_ui_key)
+
+    p = ui_sub.add_parser(
+        "do", help="run Flow v1 steps from stdin (a JSON array or a YAML step list) in "
+                   "one call; stops at the first failing step and returns the final screen",
+        parents=[target_flags])
+    p.add_argument("--observe-timeout-ms", type=int, default=observe_mod.DEFAULT_TIMEOUT_MS,
+                   metavar="MS",
+                   help="how long the final screen may take to settle "
+                        f"(default {observe_mod.DEFAULT_TIMEOUT_MS})")
+    p.exact_only_options = journal_mod.EXACT_ONLY_OPTIONS | {"--observe-timeout-ms"}
+    p.set_defaults(func=cmd_ui_do)
 
     p = sub.add_parser("screenshot", help="capture PNG screenshot", parents=[target_flags])
     p.add_argument("--out", help="extra copy at this exact path (the session keeps one too)")
@@ -7473,7 +7832,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--path", help="glob over path or url")
     p.add_argument("--since", type=float, help="seconds")
     p.add_argument("--mocked", nargs="?", const=True, default=None, type=_bool_flag)
-    p.add_argument("--max", type=int, default=store_mod.DEFAULT_MAX)
+    # None means the store's own DEFAULT_MAX, read when the verb runs: the
+    # parser is built for every call and must not import the network store.
+    p.add_argument("--max", type=int, default=None)
     p.add_argument("--since-id", help="only flows recorded after this id")
     p.set_defaults(func=cmd_network_requests_list)
     p = requests_sub.add_parser("follow", parents=[target_flags],
@@ -7771,6 +8132,7 @@ def _journal_mock_state(session: dict[str, Any], args: argparse.Namespace) -> No
     if not (changed or started):
         return
     try:
+        from autonom_lib.network import mocks as mocks_mod
         from autonom_lib.pretest import repro as pretest_repro
         from autonom_lib.pretest import store as pretest_store
 
@@ -7953,8 +8315,9 @@ def _select_session(args: argparse.Namespace) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    global _ROOT_PARSER, _LAST_EMIT
+    global _ROOT_PARSER, _LAST_EMIT, _OBSERVE_INTERRUPTED
     _LAST_EMIT = None
+    _OBSERVE_INTERRUPTED = False
     parser = build_parser()
     _ROOT_PARSER = parser
     # The claim flags are not options of any parser: the journal resolves the
@@ -7983,6 +8346,14 @@ def main(argv: list[str] | None = None) -> int:
             from autonom_lib import ui_ios
             ui_ios.set_preference(getattr(args, "ui_backend", None))
             code = args.func(args)
+            if code == 0 and _OBSERVE_INTERRUPTED:
+                # The one place an interrupt during observe (AL-11) ends:
+                # the input was sent once and its reply (ok: true,
+                # observe_error interrupted) is on stdout; `code` stays 0 so
+                # the finally below journals the action ok, and only then
+                # the process ends with the interrupt's status. Nothing is
+                # read or sent again.
+                return EXIT_INTERRUPTED
             return code
         finally:
             # A handler that returns nonzero (doctor --strict, flow run's
@@ -8040,8 +8411,8 @@ def main(argv: list[str] | None = None) -> int:
             "Check the argument values; run the verb with --help for the expected forms.",
         ))
     except KeyboardInterrupt:
-        ok = False
-        return fail("interrupted", code=130)
+        ok, error_code = False, errors.INTERRUPTED
+        return fail_error(_interrupted_error(), code=EXIT_INTERRUPTED)
     finally:
         try:
             _journal_command(args, argv_used, ok, error_code, before_session)
