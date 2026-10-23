@@ -694,6 +694,9 @@ class UiWaitTests(CliCase):
         self.assertGreaterEqual(payload["snapshots"], 2)
         self.assertEqual(payload["changes"], 0)
         self.assertIn("elapsed_ms", payload)
+        # AL-08: Android keeps polling, and never asks for an idb quiet signal
+        self.assertEqual(payload["method"], "poll")
+        self.assertNotIn("quiet_fallback", payload)
 
     def test_timeout_reports_not_settled_with_exit_1(self) -> None:
         code, payload = self.android("ui", "wait", "--settled", "--timeout-ms", "0")
@@ -742,7 +745,9 @@ class UiBackendTests(CliCase):
         self.assertEqual(code, 0, payload)
         self.assertEqual(payload["backend"], "axe")
         axe = self.calls("axe")
-        self.assertTrue(axe and axe[-1][0] == "tap", axe)
+        # AL-03: an AXe tap is a held touch, not `axe tap`
+        self.assertTrue(axe and axe[-1][:9] == ["touch", "-x", "20", "-y", "30", "--down",
+                                                "--up", "--delay", "0.12"], axe)
         self.assertFalse(any(argv[:2] == ["ui", "tap"] for argv in self.calls("idb")))
 
     def test_ios_hid_idb_keeps_idb(self) -> None:

@@ -19,6 +19,9 @@ either way. What differs is **which field carries the visible label** — see be
 ## CLI
 
 ```bash
+# Agent session: `ui tree` prints the outline, and every tap/type/swipe/key returns the new screen
+python3 <autonom-root>/scripts/autonom.py session start --profile agent --app-id <app-id>
+
 # Compact tree (meaningful nodes by default)
 python3 <autonom-root>/scripts/autonom.py ui tree
 python3 <autonom-root>/scripts/autonom.py --platform ios --target <UDID> ui tree
@@ -45,6 +48,12 @@ python3 <autonom-root>/scripts/autonom.py ui type "user@example.com"
 python3 <autonom-root>/scripts/autonom.py ui swipe --from 200,600 --to 200,200
 python3 <autonom-root>/scripts/autonom.py ui key KEYCODE_BACK      # Android
 python3 <autonom-root>/scripts/autonom.py ui key HOME              # iOS
+python3 <autonom-root>/scripts/autonom.py ui tap --desc "Continue" --observe        # outside an agent session: also return the new screen
+python3 <autonom-root>/scripts/autonom.py ui swipe --from 200,600 --to 200,200 --no-observe   # agent session: return right after the input
+
+# A known path in one call: Flow v1 steps on stdin, stops at the first failing step
+echo '[{"tapOn":{"visibleText":"General"}},{"assertVisible":{"visibleText":"About"}}]' \
+  | python3 <autonom-root>/scripts/autonom.py ui do
 
 # Evidence
 python3 <autonom-root>/scripts/autonom.py screenshot --out /tmp/screen.png
@@ -55,6 +64,70 @@ python3 <autonom-root>/scripts/autonom.py record stop
 python3 <autonom-root>/scripts/autonom.py ui tree --dump tests/fixtures/ui_dump.xml
 python3 <autonom-root>/scripts/autonom.py ui tree --dump tests/fixtures/idb_describe_all_sample.json
 ```
+
+Every reply is one line of JSON.
+
+## Agent profile: the new screen in every reply
+
+Start the session you drive with `session start --profile agent`. In that
+session:
+
+- `ui tree` prints the compact outline, one indented line per node:
+  `ref role "label" id=... @x,y wxh [state]`. `--format json` still gives `nodes`.
+- `ui tap`, `ui type`, `ui swipe` and `ui key` wait for the screen to settle
+  after the input (at most `--observe-timeout-ms`, default 3000) and add the
+  new screen to their own reply:
+  - `screen.outline` — the screen now, as `ui tree` prints it (`count`,
+    `truncated`);
+  - `changes` — `added`, `removed` and `changed` counts and up to 20 outline
+    lines marked `+` (new), `-` (gone) or `~` (changed). It is `null`, with
+    `changes_baseline: none`, when there was nothing to compare with; read
+    `screen.outline` itself then;
+  - `foreground` — `app` (Android package, iOS app label) and, when known,
+    `screen` (Android activity, iOS first heading): a tap that left the app
+    shows here.
+
+**Read the next step from that reply.** Do not follow every action with
+`ui tree` or `ui wait --settled`: the reply already waited and read the screen
+once. Read the tree yourself only when the reply says so:
+
+- `observe_error` — the input **was** sent; only the read after it failed.
+  Run `ui tree`. Never send the input again.
+- a `screen_not_settled` warning — the screen may still have been changing
+  when the timeout ran out. If the returned `screen` already shows what you
+  expected (the element or page you tapped toward), carry on with the next
+  step. Only when it does not, re-read: `ui wait --settled`, then `ui tree`,
+  or pass a larger `--observe-timeout-ms`. On Android, where one read takes
+  about 2 s, this warning is common while the screen is already right.
+
+`--no-observe` returns right after the input (a quick run of scrolls or key
+presses); `--observe` gives the same reply in a session without the agent
+profile.
+
+## `ui do`: a known path in one call
+
+When the steps are already known — a path walked before, a runbook from
+`mobile-memory`, the way back to a start screen — send them in one call
+instead of one action per turn. `ui do` reads Flow v1 steps from stdin, as a
+JSON array (above) or a YAML step list (the body of a flow file, without its
+header), and runs them through the flow engine: exact selectors, assertions
+that wait until the screen shows what they expect, and every input sent once.
+
+- Select with `visibleText` (the label, wherever the platform keeps it),
+  `id`, `text` or `description`. `text` alone misses iOS labels, as `--text` does.
+- Put an `assertVisible` after a step whose screen matters, so a wrong
+  screen stops the run instead of the next tap landing on it.
+- It stops at the first failing step. The reply has `ok`, `steps` (each with
+  its `status`), `failure` (`step`, `code`, `message`) and the final `screen`,
+  `changes` and `foreground`, as after an observed tap. Exit 0 when every step
+  passed, 1 when one failed.
+- A mistake in the steps (not JSON or YAML, an unknown command, `back` on
+  iOS) is `invalid_value` naming the step, before any step runs.
+- iOS has no `back` step: tap the navigation bar's back control (in Settings
+  `{"tapOn":{"id":"BackButton"}}`).
+- Explore an unknown screen step by step with observed actions; use `ui do`
+  only for what you already know. A path you will run again belongs in a flow
+  file (`mobile-flow`).
 
 ## Compact node schema (identical on both platforms)
 
@@ -72,6 +145,11 @@ python3 <autonom-root>/scripts/autonom.py ui tree --dump tests/fixtures/idb_desc
   "enabled": true
 }
 ```
+
+Text fields also carry `editable: true`, and `password: true` when the field
+hides its text. In the outline every switch and checkbox says `checked` or
+`unchecked`, so an off switch is visible as off; text fields say `editable`
+(and `password`).
 
 ## Where the visible label lives
 
@@ -114,7 +192,13 @@ and so does any node entirely outside the app's frame, live or from `--dump`.
   snapshot was a change. If it changed and then held still for less than
   `--quiet-ms`, it says that (`stable_ms`); if only one dump fit in
   `--timeout-ms` (an Android dump can take ~2 s), it says settling could not
-  be confirmed and how far to raise it.
+  be confirmed and how far to raise it. On the iOS idb route it asks idb
+  whether the app is quiet and then reads once (`method: idb-quiet`,
+  `snapshots: 1`); elsewhere it polls (`method: poll`).
+- `ui_not_idle` (Android) means the screen never stops changing — an
+  animation, a video, a timer, a spinner — so UI Automator cannot read it.
+  Waiting does not help: take `autonom screenshot` and act on what it shows,
+  or leave that screen.
 
 ## Which tool touched the screen (`backend`)
 
@@ -238,15 +322,25 @@ computed in when you report a coordinate.
 
 ## Agent workflow
 
-1. `session start` so the target and artifacts are explicit.
-2. `ui tree` → read labels, roles, enabled state. Note which field holds the label.
-3. `ui find` / `ui tap` for the next action; after a navigation, `ui wait
-   --settled` before the next read.
-4. `screenshot` after state changes that need visual proof — **compare before/after**;
+1. `session start --profile agent` so the target and artifacts are explicit and
+   every action returns the new screen.
+2. `ui tree` once → read labels, roles, enabled and checked state from the
+   outline. Note which field holds the label.
+3. `ui tap` / `ui type` / `ui swipe` / `ui key` for the next action, then read
+   the reply's `screen`, `changes` and `foreground` — no `ui tree` or
+   `ui wait --settled` in between unless the reply carries `observe_error`, or
+   a `screen_not_settled` warning and a `screen` that does not show what you
+   expected (common on Android while the screen is already right). Without
+   the agent profile, add `--observe`, or run `ui wait --settled` and
+   `ui tree` after each navigation.
+4. A path whose steps you already know goes in one `ui do`, with an
+   `assertVisible` where the screen matters.
+5. `screenshot` after state changes that need visual proof — **compare before/after**;
    an exit code of 0 does not prove the screen changed. Pin the status bar first
    so the diff shows only what the app changed.
-5. Re-dump the tree after navigation; never reuse stale refs.
-6. Report **measured** on-screen text and tree facts separately from hypotheses.
+6. Never reuse stale refs: after a navigation use the latest outline (the
+   action's `screen` or a new `ui tree`).
+7. Report **measured** on-screen text and tree facts separately from hypotheses.
 
 ## Boundaries
 

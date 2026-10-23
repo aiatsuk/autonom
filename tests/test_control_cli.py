@@ -8,6 +8,8 @@
 - READONLY verbs, `session stop` and unclaimed callers of an expired lease are
   admitted; a matching claim (flags or env, before or after the verb) is
   admitted with a `control` object; a stale claim is refused;
+- `ui do` is a FLOW verb: a foreign lease refuses it before any step, its
+  holder runs it, and another holder's claim never reaches the device;
 - `ui tree` skips its implicit accessibility recovery under a foreign lease;
 - each `pretest warmup` Runtime Map replay tap is admitted before it is sent;
 - claim, label, ttl and operation id validation; `canvas serve --control-idle`;
@@ -56,10 +58,15 @@ except ImportError:  # direct `python3 -m unittest tests.test_...` runs
     from tests.env_isolation import EnvSandboxMixin  # noqa: E402
 
 # `ui tap --x 1 --y 1` on the fake adb, as Autonom 0.35.1 (9acc89c) printed it.
-RECORDED_UI_TAP = (
+RECORDED_UI_TAP_INDENTED = (
     '{\n  "ok": true,\n  "x": 1,\n  "y": 1,\n  "ref": null,\n  "backend": "adb",\n'
     '  "platform": "android",\n  "target_id": "emulator-5590",\n'
     '  "serial": "emulator-5590"\n}\n')
+# The same reply since every JSON reply is printed on one line (AL-10): the
+# same keys, values and order, compact.
+RECORDED_UI_TAP = (
+    '{"ok":true,"x":1,"y":1,"ref":null,"backend":"adb","platform":"android",'
+    '"target_id":"emulator-5590","serial":"emulator-5590"}\n')
 
 
 def load_cli(name: str = "autonom_cli_control"):
@@ -128,6 +135,16 @@ class ControlCliCase(EnvSandboxMixin, unittest.TestCase):
         code, payload, _ = self.run_cli("--adb", str(FAKE_ADB), "--serial", serial, *argv,
                                         env=env)
         return code, payload
+
+    def ui_do(self, steps: str, *extra: str) -> tuple[int, dict]:
+        """`ui do` on the fake adb with ``steps`` on stdin."""
+        completed = subprocess.run(
+            [sys.executable, str(CLI), "--adb", str(FAKE_ADB), "--serial", SERIAL, *extra,
+             "ui", "do"], cwd=self.root, env=self.env, text=True, input=steps,
+            capture_output=True, check=False, timeout=120)
+        self.assertNotIn("Traceback", completed.stdout + completed.stderr)
+        stream = completed.stdout if completed.stdout.strip() else completed.stderr
+        return completed.returncode, json.loads(stream)
 
     def start(self, serial: str = SERIAL, *extra: str) -> dict:
         code, payload = self.android("session", "start", "--app-id", APP, *extra,
@@ -339,6 +356,24 @@ class RefusalTests(ControlCliCase):
         self.assertEqual(covered - set(cli._CONTROL_BY_ACTION), set(cli._CONTROL_MUTATING))
         self.assertEqual(covered & set(cli._CONTROL_BY_ACTION), set(cli._CONTROL_BY_ACTION))
 
+    def test_ui_do_is_a_flow_verb_refused_before_any_step(self) -> None:
+        session = self.start()
+        self.human_lease()
+        self.clear_calls()
+        code, payload = self.ui_do('[{"tapOn":{"id":"com.example.app:id/settings"}}]')
+        self.assertEqual(code, 2, payload)
+        self.assert_refusal(payload)
+        self.assertEqual(payload["holder"]["id"], HUMAN)
+        self.assertEqual(self.calls(), [])
+        entry = [item for item in self.journal(session) if item.get("verb") == "ui do"][-1]
+        self.assertFalse(entry["ok"])
+        self.assertEqual(entry["error_code"], errors.CONTROL_HELD)
+        cli = load_cli("autonom_cli_control_ui_do")
+        parser = cli.build_parser()
+        cli._ROOT_PARSER = parser
+        self.assertEqual(cli._control_mode(parser.parse_args(["ui", "do"])), "flow")
+        self.assertIn("ui do", cli._CONTROL_FLOW)
+
     def test_ios_verbs_are_refused_without_a_simctl_call(self) -> None:
         udid = "AAAAAAAA-1111-2222-3333-CCCCCCCCCCCC"
         self.write_state(simctl_devices={"devices": {
@@ -438,6 +473,23 @@ class ClaimTests(ControlCliCase):
                 self.assertFalse(any(token.startswith(("--control-", "--operation-id"))
                                      for token in entry["argv"]), entry["argv"])
                 self.assertIn("tap", entry["argv"])
+
+    def test_the_holder_may_run_ui_do_and_another_claim_may_not(self) -> None:
+        self.start()
+        grant = self.acquire()
+        code, payload = self.ui_do('[{"tapOn":{"id":"com.example.app:id/settings"}}]',
+                                   "--control-holder", "agent:a")
+        self.assertEqual(code, 0, payload)
+        self.assertEqual(payload["status"], "passed")
+        self.assertEqual((payload["control"]["holder_id"], payload["control"]["generation"]),
+                         ("agent:a", grant["generation"]))
+        self.assertEqual(sum(1 for call in self.calls() if "tap" in call), 1)
+        self.clear_calls()
+        code, payload = self.ui_do('[{"tapOn":{"id":"com.example.app:id/settings"}}]',
+                                   "--control-holder", "agent:b")
+        self.assertEqual(code, 2, payload)
+        self.assertEqual(payload["error_code"], errors.CONTROL_HELD)
+        self.assertEqual([call for call in self.calls() if "tap" in call], [])
 
     def test_the_claim_from_the_environment_and_a_generated_operation_id(self) -> None:
         session = self.start()
@@ -600,6 +652,10 @@ class CompatibilityTests(ControlCliCase):
                                               "ui", "tap", "--x", "1", "--y", "1")
         self.assertEqual(code, 0)
         self.assertEqual(stdout, RECORDED_UI_TAP)
+        # one line now, and the very object the indented 0.35.1 text parsed to
+        self.assertEqual(stdout.count("\n"), 1)
+        self.assertEqual(json.loads(stdout), json.loads(RECORDED_UI_TAP_INDENTED))
+        self.assertEqual(list(json.loads(stdout)), list(json.loads(RECORDED_UI_TAP_INDENTED)))
         self.assertFalse((self.home / "control").exists(), "admission created files")
 
     def test_in_process_output_equals_a_run_with_the_control_module_disabled(self) -> None:

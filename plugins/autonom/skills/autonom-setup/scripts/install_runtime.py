@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import compileall
 import hashlib
 import http.client
 import json
@@ -16,6 +17,7 @@ import tarfile
 import tempfile
 import urllib.error
 import urllib.request
+import warnings
 
 MAX_DOWNLOAD = 64 * 1024 * 1024
 MAX_UNPACKED = 256 * 1024 * 1024
@@ -154,6 +156,23 @@ def tree_digest(root: Path) -> dict[str, str]:
     return result
 
 
+def precompile(runtime: Path) -> bool:
+    """Write bytecode for every Python source of `runtime` with this
+    interpreter, the one the launcher runs, so later CLI calls load the
+    library from __pycache__ instead of compiling it on each start.
+
+    Best effort: tree_digest ignores __pycache__, so the cache never changes
+    the runtime's identity, and a runtime without bytecode still runs (it
+    compiles on import, as before). Nothing is printed: stdout carries the
+    install result only."""
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            return bool(compileall.compile_dir(runtime, quiet=2))
+    except Exception:  # noqa: BLE001 - bytecode is an optimization, never an install failure
+        return False
+
+
 def check_session_store() -> None:
     """The normal session listing tolerates damaged pointers; setup must not."""
     root = Path(os.environ.get("AUTONOM_HOME") or Path.home() / ".autonom") / "sessions"
@@ -228,10 +247,14 @@ def install(version: str, runtime_dir: Path, bin_dir: Path) -> dict:
                 raise InstallError("destination_exists", f"Existing runtime differs: {final}")
         else:
             runtime.rename(final)
+        # Also for an existing runtime: one installed by an older helper ran
+        # under `-B` and has no bytecode yet.
+        precompile(final)
         check_session_store()
         check_launcher(launcher)
         # Absolute interpreter and runtime paths also work in GUI apps with a short PATH.
-        content = (f"#!/bin/sh\n{MARKER}\nexec {shlex.quote(sys.executable)} -B "
+        # No `-B`: the interpreter that precompiled the runtime reuses its bytecode.
+        content = (f"#!/bin/sh\n{MARKER}\nexec {shlex.quote(sys.executable)} "
                    f"{shlex.quote(str(final / 'scripts/autonom.py'))} \"$@\"\n")
         temporary = None
         try:

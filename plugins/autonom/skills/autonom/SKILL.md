@@ -22,7 +22,8 @@ to the stack skills via `project-router`.
 Three layers, and it helps to know which is which:
 
 1. **The CLI control plane** — `scripts/autonom.py` (installed as `autonom`).
-   One dependency-free JSON API. Every command prints JSON; an expected failure
+   One dependency-free JSON API. Every reply is one line of JSON (a stream, one
+   line per event); an expected failure
    prints `{"ok": false, "error_code": "...", "hint": "..."}` on stderr with exit
    code 2, so you branch on a stable code, never parse prose. This is the source
    of truth; the skills are how to use it well.
@@ -62,12 +63,15 @@ names the exact fix.
 ```bash
 # 1. Own a target (boot it first if needed)
 autonom devices boot --avd Pixel_9                 # or --udid <sim>; session start also boots a sim
-autonom session start --serial emulator-5554 --app-id com.example.app
+autonom session start --serial emulator-5554 --app-id com.example.app --profile agent
+                                                   # agent profile: outline trees, actions return the new screen
 
 # 2. See the screen, then act by meaning (not coordinates)
-autonom ui tree                                    # compact accessibility tree
-autonom ui tap --desc "Log In"
+autonom ui tree                                    # compact outline of the screen
+autonom ui tap --desc "Log In"                     # reply: screen.outline, changes, foreground
 autonom ui type "test-user"                        # into the focused field
+echo '[{"tapOn":{"visibleText":"Profile"}},{"assertVisible":{"visibleText":"Sign out"}}]' \
+  | autonom ui do                                  # a known path in one call; stops at the first failing step
 
 # 3. Watch what happens
 autonom session outputs                            # what is followable + tail -f hints
@@ -96,14 +100,28 @@ Everything from step 1–6 is appended to the session **journal** automatically
 the result, and your notes. `autonom journal --kind note` / `--verb 'ui tap'`
 reads it back — the record you use to re-check or hand off a flow.
 
+## The agent profile
+
+Start the sessions you drive with `session start --profile agent`. In that
+session `ui tree` prints the compact outline, and `ui tap`, `ui type`,
+`ui swipe` and `ui key` wait for the screen to settle and return it in the same
+reply: `screen.outline`, `changes` (what appeared, went or changed) and
+`foreground` (the app and screen now showing). Read the next step from that
+reply instead of calling `ui tree` after every action; an `observe_error` in
+it means the input was sent and only the read failed, so read the tree and
+never repeat the input. `ui do` runs a path whose steps you already know (Flow
+v1 steps on stdin) in one call and stops at the first failing step. Without the
+profile every command replies as before; `--observe` asks for the new screen
+on one command, `--no-observe` skips it. `mobile-screen` has the details.
+
 ## What you can do (verb catalog)
 
 | Area | Verbs |
 | --- | --- |
 | Discover | `doctor`, `devices`, `devices boot/shutdown` |
-| Session | `session start/show/list/stop/launch/force-stop/clear/uninstall` (`session start --label`, `session list [--all]`) |
+| Session | `session start/show/list/stop/launch/force-stop/clear/uninstall` (`session start --label`, `session start --profile agent`, `session list [--all]`) |
 | Shared control | `control status/acquire/renew/release` — the device's control lease; claim it with `--control-holder`/`--control-generation` |
-| Screen | `ui tree/find/wait/tap/swipe/type/key` (`ui wait --settled`, `ui tree --format outline`); `find`/`tap` resolve on-screen matches first, and a node that is not on screen is `visible: false` in the tree and refused by `tap` (`element_offscreen`); `pinch/rotate/shake` are refused on both platforms; iOS input via idb or AXe, named in `backend` |
+| Screen | `ui tree/find/wait/tap/swipe/type/key/do` (`ui wait --settled`, `ui tree --format outline`, `--observe`/`--no-observe` on the actions, `ui do` for several Flow steps from stdin in one call); `find`/`tap` resolve on-screen matches first, and a node that is not on screen is `visible: false` in the tree and refused by `tap` (`element_offscreen`); `pinch/rotate/shake` are refused on both platforms; iOS input via idb or AXe, named in `backend` |
 | First run | `tour` — overview, the workflow, this machine's targets, and `--run` to walk three screens into Settings: before/after screenshots, hierarchy, and device log attached to each tap or back, an assertion that the screen changed after each, an HTML/JUnit report, and a written account |
 | Evidence | `screenshot` (with `width`/`height`), `shots list/show`, `record start/stop`, `note add/list`, `journal` |
 | Deterministic state | `simulator status-bar pin\|clear` (both platforms), `simulator keyboard pin\|reset\|show` (iOS), `simulator animations pin\|reset\|show` (Android) — remove clock, battery, animation, and autocorrect noise from before/after comparisons; `verified` only after a read-back |
@@ -151,7 +169,8 @@ screenshot + UI tree + logs → profile / memory / network → before/after repl
   config: they need their `--i-understand-mitm` (and `--install-ca`) flag every
   time, plus a typed phrase on a terminal. Consent is never cached.
 - **Exit 0 ≠ it worked.** A tap returning ok does not prove the screen changed.
-  Compare before/after trees or screenshots.
+  Read the action's `changes` and `screen` (agent profile or `--observe`), or
+  compare before/after trees or screenshots.
 - **A mocked screenshot is a lie waiting to happen.** Captures taken while a mock
   is active are flagged `screenshot_shows_mocked_data`; never present them as real
   backend behaviour.

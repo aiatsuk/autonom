@@ -51,6 +51,7 @@ UNSUPPORTED_KEY_FOR_PLATFORM = "unsupported_key_for_platform"
 UNSUPPORTED_ON_PLATFORM = "unsupported_on_platform"
 STALE_REF = "stale_ref"  # a node ref from an older tree snapshot
 ELEMENT_OFFSCREEN = "element_offscreen"  # the matched node is not on screen (0x0 / outside it)
+UI_NOT_IDLE = "ui_not_idle"  # Android: the screen never went idle, so uiautomator could not read it
 
 # --- Device state ------------------------------------------------------------
 INVALID_URL = "invalid_url"
@@ -202,6 +203,13 @@ CONTROL_HELD = "control_held"                          # another live holder con
 CONTROL_GENERATION_STALE = "control_generation_stale"  # the claim's generation is not the lease's
 CONTROL_LEASE_EXPIRED = "control_lease_expired"        # the claimed lease expired; acquire again
 CONTROL_NOT_HELD = "control_not_held"                  # a claim, release or renew without that lease
+
+# --- Interrupt ------------------------------------------------------------------
+# The exit-130 envelope of a command cut by Ctrl-C or SIGINT. Only the CLI's
+# interrupt handler builds it; observe's `observe_error.code` for an
+# interrupt after the input was sent is the same word.
+INTERRUPTED = "interrupted"
+
 
 class AutonomError(RuntimeError):
     """An expected failure with a stable code and an actionable hint."""

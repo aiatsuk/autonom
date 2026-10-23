@@ -2252,7 +2252,12 @@ class Executor:
                 # mid-transition and the dump comes back incomplete. That is
                 # the very moment this poll exists for: poll again, and only
                 # surface the backend error once the deadline has passed.
-                if exc.code != errors.BACKEND_FAILED or self.clock() >= deadline:
+                # `ui_not_idle` is handled exactly like `backend_failed`
+                # (DEC-007): a dump whose last read said "could not get idle
+                # state" was reported as `backend_failed` before it had its
+                # own code.
+                if (exc.code not in (errors.BACKEND_FAILED, errors.UI_NOT_IDLE)
+                        or self.clock() >= deadline):
                     raise
                 self.sleep(self.config.interval_ms / 1000)
                 continue

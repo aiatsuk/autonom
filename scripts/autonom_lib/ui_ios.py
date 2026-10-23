@@ -13,6 +13,7 @@ TASK-2.0.1 probe rather than assumed.
 from __future__ import annotations
 
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -106,9 +107,14 @@ def _bounds(element: dict[str, Any]) -> list[int] | None:
     return None
 
 
-def _role(element: dict[str, Any]) -> str:
+def _raw_type(element: dict[str, Any]) -> str:
+    """The element's type without the XCUIElementType prefix."""
     raw = _first(element, "type", "AXType", "role", "element_type") or ""
-    short = str(raw).replace("XCUIElementType", "")
+    return str(raw).replace("XCUIElementType", "")
+
+
+def _role(element: dict[str, Any]) -> str:
+    short = _raw_type(element)
     return ROLE_BY_TYPE.get(short, short.lower() or "node")
 
 
@@ -150,6 +156,29 @@ def _checked(element: dict[str, Any], role: str) -> bool:
     return False
 
 
+# Text input on iOS. `type` decides (TextField, SecureTextField, TextView and
+# SearchField all map to the role "textfield"); the AX role or subrole idb
+# sends next to it is the fallback. A secure field is the password one.
+TEXT_INPUT_AX_ROLES = {"AXTextField", "AXTextArea", "AXSearchField", "AXSecureTextField"}
+SECURE_TYPES = {"SecureTextField"}
+SECURE_AX_ROLES = {"AXSecureTextField"}
+
+
+def _ax_roles(element: dict[str, Any]) -> set[str]:
+    return {str(element.get(key) or "") for key in ("role", "subrole")}
+
+
+def is_secure(element: dict[str, Any]) -> bool:
+    """A secure (password) text field, by type or AX role/subrole."""
+    return _raw_type(element) in SECURE_TYPES or bool(_ax_roles(element) & SECURE_AX_ROLES)
+
+
+def is_text_input(element: dict[str, Any], role: str | None = None) -> bool:
+    """A text field, secure field, text view or search field."""
+    return ((role or _role(element)) == "textfield" or is_secure(element)
+            or bool(_ax_roles(element) & TEXT_INPUT_AX_ROLES))
+
+
 def compact_node(element: dict[str, Any], ref: str) -> dict[str, Any]:
     role = _role(element)
     traits = element.get("traits") or element.get("AXTraits") or []
@@ -181,6 +210,10 @@ def compact_node(element: dict[str, Any], ref: str) -> dict[str, Any]:
         "scrollable": role in {"scroll", "list"},
         "selected": _truthy(element, "selected", "AXSelected"),
         "checked": _checked(element, role),
+        # The Android schema's editable/password (C-03 key parity): a text
+        # field takes typed text, a secure one hides it.
+        "editable": is_text_input(element, role),
+        "password": is_secure(element),
         "depth": int(element.get("_depth") or 0),
     }
     if element.get("xcuitest_ref"):
@@ -393,8 +426,12 @@ def describe_all(target: Target) -> str:
         payload = ios_idb.describe_all(target)
         nodes = parse_all(payload)
         count = sum(is_meaningful(n) for n in nodes)
-        if count and screen_size_from(payload):
-            _record(target, "idb", meaningful_nodes=count, accessibility="available")
+        size = screen_size_from_nodes(nodes)
+        if count and size:
+            # The root frame is the screen in points: kept, so a later tap
+            # or swipe guards against it without another full read (AL-01).
+            _record(target, "idb", meaningful_nodes=count, accessibility="available",
+                    geometry=_idb_geometry(size))
             return payload
         reason = "empty_accessibility_tree" if not count else "invalid_accessibility_geometry"
     except errors.AutonomError as exc:
@@ -414,6 +451,22 @@ def describe_all(target: Target) -> str:
     return payload
 
 
+def quiet_route(target: Target) -> bool:
+    """Can settling ask idb whether the app is quiet (AL-08)? Only on the idb
+    route: a session served by the XCUITest runner keeps polling its tree."""
+    return selected_backend(target) != "xcuitest"
+
+
+def wait_quiet(target: Target, timeout_ms: int, quiet_ms: int, *,
+               clock: Callable[[], float] = time.monotonic,
+               deadline: float | None = None) -> dict[str, Any]:
+    """`ios_idb.ui_quiet` for this target: idb waits up to ``timeout_ms`` for
+    the frontmost app to hold quiet for ``quiet_ms``. No tree is read. A
+    retry after a dead companion carries only what is left before
+    ``deadline`` on ``clock`` (the caller's own budget)."""
+    return ios_idb.ui_quiet(target, timeout_ms, quiet_ms, clock=clock, deadline=deadline)
+
+
 def screen_size(target: Target) -> tuple[int, int] | None:
     """Screen rectangle in points, used by the tap guard (INV-06).
 
@@ -430,8 +483,7 @@ def screen_size(target: Target) -> tuple[int, int] | None:
     try:
         size = screen_size_from(ios_idb.describe_all(target))
         if size:
-            _record(target, selected_backend(target), geometry={"width": size[0], "height": size[1],
-                                                               "units": "points", "source": "idb.application_window"})
+            _record(target, selected_backend(target), geometry=_idb_geometry(size))
             return size
     except errors.AutonomError:
         pass
@@ -442,20 +494,58 @@ def screen_size(target: Target) -> tuple[int, int] | None:
     return None
 
 
+def _idb_geometry(size: tuple[int, int]) -> dict[str, Any]:
+    return {"width": size[0], "height": size[1], "units": "points",
+            "source": "idb.application_window"}
+
+
 def screen_size_from(payload: str | dict | list) -> tuple[int, int] | None:
     """The root application/window frame with a real area, else None.
 
     The widest node extent is no longer used as a stand-in: a tree whose root
     has no usable frame is reported as unusable geometry instead, and
     ``screen_size`` then measures the screen another way."""
-    nodes = parse_all(payload)
+    return screen_size_from_nodes(parse_all(payload))
+
+
+def screen_size_from_nodes(nodes: Iterable[dict[str, Any]]) -> tuple[int, int] | None:
+    """``screen_size_from`` for compact nodes already parsed (a snapshot):
+    the depth-0 application/window node with a real area, else None."""
     for node in nodes:
-        if node["depth"] == 0 and node.get("role") in {"app", "window"} and node.get("bounds"):
-            bounds = node["bounds"]
+        bounds = node.get("bounds")
+        if (node.get("depth") == 0 and node.get("role") in {"app", "window"}
+                and bounds and len(bounds) == 4):
             width, height = bounds[2] - bounds[0], bounds[3] - bounds[1]
             if width > 0 and height > 0:
                 return width, height
     return None
+
+
+def recorded_screen_size(target: Target) -> tuple[int, int] | None:
+    """The screen size this process or the target's session last recorded
+    (an idb read of the root frame, a lookup, or the XCUITest runner), with
+    no device call; None when nothing usable was recorded."""
+    from . import session
+    sources = [_OBSERVATIONS.get(target.target_id) or {}]
+    current = session.load_current() or {}
+    if current.get("target_id") == target.target_id:
+        sources.append(current.get("ui_observation") or {})
+    for observed in sources:
+        geometry = observed.get("geometry") if isinstance(observed, dict) else None
+        if not isinstance(geometry, dict):
+            continue
+        width, height = _whole_points(geometry.get("width")), _whole_points(geometry.get("height"))
+        if width and height:
+            return width, height
+    return None
+
+
+def _whole_points(value: Any) -> int | None:
+    """A recorded side length in whole points; None unless it is a finite
+    number of at least one point (not a bool, text, NaN or infinity)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        return None
+    return int(value) if int(value) > 0 else None
 
 
 # --- HID backend: idb or AXe ---------------------------------------------------
@@ -483,6 +573,8 @@ HID_ENV = "AUTONOM_IOS_HID"
 AXE_ENV = "AUTONOM_AXE"
 HID_MODES = ("auto", "idb", "axe")
 AXE_INSTALL_HINT = "Install AXe: brew install cameroncooke/axe/axe (or set AUTONOM_AXE=/path/to/axe)."
+# Seconds an AXe tap holds the touch down before lifting it (AL-03).
+AXE_TAP_HOLD_S = 0.12
 
 _hid_probe: dict[str, Any] | None = None
 _last_backend: str | None = None
@@ -647,11 +739,12 @@ def tap(target: Target, x: int, y: int, *, node: dict | None = None,
             values.update(ref=node["xcuitest_ref"], identifier=node.get("resource_id") or "",
                           label=node.get("desc") or "")
         return _xctest_input(target, "tap", **values)
-    if duration is not None:
-        axe_args = ["touch", "-x", str(x), "-y", str(y), "--down", "--up",
-                    "--delay", _seconds(duration)]
-    else:
-        axe_args = ["tap", "-x", str(x), "-y", str(y)]
+    # AXe's own `tap` lifts the finger at once and missed every tap of an A/B
+    # run (15 of 15); a touch held for AXE_TAP_HOLD_S lands. A long press is
+    # the same touch held for its own duration.
+    hold = AXE_TAP_HOLD_S if duration is None else duration
+    axe_args = ["touch", "-x", str(x), "-y", str(y), "--down", "--up",
+                "--delay", _seconds(hold)]
     return _hid_input(target, lambda: ios_idb.tap(target, x, y, duration=duration), axe_args)
 
 

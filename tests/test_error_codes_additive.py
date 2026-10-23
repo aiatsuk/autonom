@@ -64,6 +64,20 @@ FOLLOWUP_CODES = {
 }
 NEW_CODES.update(FOLLOWUP_CODES)
 
+# Android reads (agent loop, AL-05): a screen uiautomator never caught idle.
+ANDROID_READ_CODES = {
+    "UI_NOT_IDLE": "ui_not_idle",
+}
+NEW_CODES.update(ANDROID_READ_CODES)
+ANDROID_READ_SECTION = "### Android reads: never-idle screens and element state (Unreleased)"
+
+# Agent profile round (agent loop): the exit-130 envelope of an interrupt.
+AGENT_LOOP_CODES = {
+    "INTERRUPTED": "interrupted",
+}
+NEW_CODES.update(AGENT_LOOP_CODES)
+AGENT_LOOP_SECTION = "### Agent profile, one-line JSON and observe (Unreleased)"
+
 EXISTING_CODES = {
     "FLOW_NOT_FOUND": "flow_not_found",
     "FLOW_FILE_NOT_FOUND": "flow_file_not_found",
@@ -133,6 +147,36 @@ class AdditiveErrorCodeTests(unittest.TestCase):
                 self.assertIsNotNone(row, situation)
                 for code in codes:
                     self.assertIn(code, row)
+
+    def test_compatibility_records_the_android_read_code_and_change(self) -> None:
+        text = (ROOT / "docs/COMPATIBILITY.md").read_text(encoding="utf-8")
+        parts = text.split(ANDROID_READ_SECTION, 1)
+        self.assertEqual(len(parts), 2, "COMPATIBILITY.md has no Android read section")
+        section = parts[1].split("\n### ", 1)[0]
+        rows = [line for line in section.splitlines() if line.startswith("| ")]
+        for name, value in ANDROID_READ_CODES.items():
+            with self.subTest(code=name):
+                self.assertIn(f"| `{value}` |", section)
+        changed = next((line for line in rows
+                        if line.startswith("| Android tree read on a screen that never goes idle")),
+                       None)
+        self.assertIsNotNone(changed)
+        for code in ("`backend_failed`", "`ui_not_idle`"):
+            self.assertIn(code, changed)
+        self.assertIn("ui_not_idle", text.split("## Response shape", 1)[0],
+                      "the Error codes list names the round")
+
+    def test_compatibility_records_the_agent_loop_code(self) -> None:
+        text = (ROOT / "docs/COMPATIBILITY.md").read_text(encoding="utf-8")
+        parts = text.split(AGENT_LOOP_SECTION, 1)
+        self.assertEqual(len(parts), 2, "COMPATIBILITY.md has no agent profile section")
+        section = parts[1].split("\n### ", 1)[0]
+        for name, value in AGENT_LOOP_CODES.items():
+            with self.subTest(code=name):
+                self.assertIn(f"| `{value}` |", section)
+        self.assertNotIn("No `error_code` is added", section)
+        self.assertIn("`interrupted`", text.split("## Response shape", 1)[0],
+                      "the Error codes list names the round")
 
 
 if __name__ == "__main__":

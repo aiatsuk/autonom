@@ -323,7 +323,8 @@ class ActuationBackendTests(_Sandbox):
     def test_double_tap_goes_through_axe_twice(self) -> None:
         self.assertEqual(ui.double_tap(self.ios, 10, 20, screen=(400, 800)), "axe")
         self.assertEqual(self.calls("axe"),
-                         [["tap", "-x", "10", "-y", "20", "--udid", UDID]] * 2)
+                         [["touch", "-x", "10", "-y", "20", "--down", "--up",
+                           "--delay", "0.12", "--udid", UDID]] * 2)
 
     def test_every_verb_names_its_backend(self) -> None:
         screen = (400, 800)

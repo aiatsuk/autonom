@@ -82,6 +82,38 @@ class SetupTests(unittest.TestCase):
         self.assertEqual(self.install()["runtime"], result["runtime"])
         self.assertEqual(len(list(self.runtimes.iterdir())), 1)
 
+    def test_install_precompiles_runtime_for_launcher_interpreter(self):
+        result = self.install()
+        cli = Path(result["runtime"]) / "scripts/autonom.py"
+        self.assertTrue(Path(importlib.util.cache_from_source(str(cli))).is_file())
+        self.assertNotIn(" -B ", self.launcher.read_text())
+
+    def test_precompile_failure_never_blocks_install(self):
+        for error in (OSError("read-only runtime"), RuntimeError("compiler crashed")):
+            with self.subTest(error=error), patch.object(
+                    setup.compileall, "compile_dir", side_effect=error) as compile_dir:
+                result = self.install()
+                completed = subprocess.run([result["executable"], "version"],
+                                           text=True, capture_output=True, check=True)
+                self.assertEqual(json.loads(completed.stdout)["version"], "1.2.3")
+                compile_dir.assert_called_once_with(Path(result["runtime"]), quiet=2)
+
+    def test_precompile_is_silent_and_reports_failures(self):
+        tree = self.root / "tree"
+        tree.mkdir()
+        (tree / "good.py").write_text("VALUE = 1\n")
+        (tree / "warns.py").write_text('PATTERN = "\\d"\n')  # invalid escape warning
+        (tree / "broken.py").write_text("def (:\n")
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with patch.object(sys, "stdout", stdout), patch.object(sys, "stderr", stderr):
+            self.assertFalse(setup.precompile(tree))
+            setup.precompile(tree / "missing")  # nothing to compile: no raise, no output
+        self.assertEqual((stdout.getvalue(), stderr.getvalue()), ("", ""))
+        for name in ("good.py", "warns.py"):
+            self.assertTrue(Path(importlib.util.cache_from_source(str(tree / name))).is_file())
+        (tree / "broken.py").unlink()
+        self.assertTrue(setup.precompile(tree))
+
     def test_mismatch_does_not_touch_existing_launcher(self):
         previous = f"#!/bin/sh\n{setup.MARKER}\nexit 0\n"
         self.launcher.write_text(previous)

@@ -93,9 +93,24 @@ strengthened, never silently weakened.
   `clipboard_unavailable`, `pretest_damaged`, `race_needs_count`,
   `check_not_ended` and `git_missing`, and change three emissions; see
   [Ticket pre-test follow-ups](#ticket-pre-test-follow-ups-0362).
+- The Android read round adds one code, `ui_not_idle`, and changes one
+  emission (a screen that never goes idle was `backend_failed`); see
+  [Android reads: never-idle screens and element state](#android-reads-never-idle-screens-and-element-state-unreleased).
+- The agent profile round adds one code, `interrupted` (the exit-130
+  envelope of an interrupt now carries `error_code` and `hint` like every
+  other envelope; it had neither), and one warning code,
+  `ui_do_not_compilable`; see
+  [Agent profile, one-line JSON and observe](#agent-profile-one-line-json-and-observe-unreleased).
 
 ## Response shape
 
+- **JSON is printed on one line.** Every JSON reply on stdout is one compact
+  line (`separators=(",", ":")`, non-ASCII text as is), for every caller and
+  every session profile, with the same keys, values and key order the
+  indented form had; stderr error envelopes and NDJSON streams were already
+  one line per object. Pinned by `tests/test_one_line_json.py` and the
+  `ui tap` pin in `tests/test_control_cli.py`; see
+  [Agent profile, one-line JSON and observe](#agent-profile-one-line-json-and-observe-unreleased).
 - Response keys are **additive-only**. Removing, retyping, or renaming a key
   fails `tests/contract_probe.py` `compare()` against
   `tests/fixtures/android_contract_golden.json`.
@@ -435,7 +450,7 @@ action ran once and the command still exits 0) and `session_unreadable`
 | Surface | Before | Now |
 | --- | --- | --- |
 | No lease file for a target and no human Canvas input on it | — | every CLI verb, flow, Canvas route, WebSocket message, bridge and tools op behaves and answers exactly as before: no `control` key, same exit codes, same journal entries |
-| `session list [--all]` | — | `{"ok", "sessions": [{"session_id", "platform", "target_id", "label", "started_at", "stopped_at", "started_by", "current", "live"}], "count"}` (`warnings` only when non-empty); read-only, no device call, target flags filter it |
+| `session list [--all]` | — | `{"ok", "sessions": [{"session_id", "platform", "target_id", "label", "started_at", "stopped_at", "started_by", "current", "live"}], "count"}` (`warnings` only when non-empty); read-only, no device call, target flags filter it. Since the agent profile (Unreleased) an entry adds `"profile"` after `"live"` only for a session whose profile is not `default` |
 | `session start --label TEXT` | — | 1..64 printable characters (`invalid_value` otherwise), stored as the record's `label` and echoed in the start payload; records without it read `label: null`. `--la` still means `--launch` |
 | `session start` refusals, `--alongside`, `--started-by`, `current.json`, `--session-id` rules, `session_target_mismatch`, `session stop` | — | unchanged |
 | `control status [--all]`, `control acquire --holder ID [--kind] [--label] [--ttl] [--takeover]`, `control release`, `control renew` | — | new verbs; JSON answers `acquired`/`renewed`/`taken_over`/`released`/`was_expired`, `lease`, `generation`, `state`, the target identity, and `env` (`AUTONOM_CONTROL_HOLDER`, `AUTONOM_CONTROL_GENERATION`) for acquire and renew. Holder id `^[A-Za-z0-9._:@-]{1,128}$`, label 1..80 printable characters, TTL 5..3600 s (agent default 60, human 30) |
@@ -511,6 +526,60 @@ No `error_code` is added. Scripts that need the one-device page add `--single`.
 | `POST /api/devices` without `tab` (and `canvas attach` without `--tab`, and a page boot with no tab) | the active tab; `tab_full` when it has no empty tile | the active tab, its layout grown up to 4 tiles, else another tab with room, else a new tab; `tab_limit` (409, existing code) when 8 tabs are full; a device already placed stays in its tab (`attached: false`). The room is made only after the target checks pass, and a grown layout or new tab is taken back when the attach fails |
 | two or more `--device` at start | one tab each when the first tab is full | side by side in the first tab (grown up to 4 tiles) |
 
+### Android reads: never-idle screens and element state (Unreleased)
+
+Error code added (pinned by `tests/test_android_read_fixes.py` and
+`tests/test_error_codes_additive.py`):
+
+| Code | Emitted by |
+| --- | --- |
+| `ui_not_idle` | any Android tree read (`ui tree`, `ui find`, `ui tap` and the other verbs that select a node, flow steps) whose last read printed "could not get idle state" and no XML (seen with exit 0; a failing exit, which is never read again, counts too): the screen keeps changing (an animation, a video, a timer, a spinner), so uiautomator could not read it. The hint names `autonom screenshot`, which still reads the screen, and says `ui wait --settled` does not help. The reads before it are the same as before, plus at most one more within 2 s (see below). It used to be `backend_failed` "incomplete hierarchy (the screen was probably mid-transition)". Flow treats `ui_not_idle` exactly like `backend_failed`: the `inputText` focus poll reads again after either until its timeout, no other step reads again after either, and a flow classifies both as `infrastructure` |
+
+**Emitted code that changed:**
+
+| Situation | Was | Now |
+| --- | --- | --- |
+| Android tree read on a screen that never goes idle | `backend_failed` ("UIAutomator returned an incomplete hierarchy (the screen was probably mid-transition)") | `ui_not_idle`, when the last read said "could not get idle state"; the same reads as before, plus at most one more within 2 s |
+
+An agent that matched `backend_failed` for this situation should match both.
+
+| Surface | Before | Now |
+| --- | --- | --- |
+| Android dump read that ends without `</hierarchy>` (cut off while an activity switches in, or uiautomator's "could not get idle state") | read twice, 0.5 s apart, then `backend_failed` | the same two reads (the second one always, however slow the first was), plus at most one more read 0.5 s after the second, only when it can start within 2 s of the end of the first bad read; a dump that takes about 2 s, as on an emulator, gets the two reads it always had. Then `ui_not_idle` when the last read said "could not get idle state", else the same `backend_failed` |
+| Flow steps that read the tree | a screen that never went idle came back as `backend_failed`: the `inputText` focus poll read again after it until its timeout, every other step failed on it | the same, under `ui_not_idle`: Flow treats `ui_not_idle` exactly like `backend_failed`, so Flow files behave as before. A screen that is still for one of the dump's reads passes as before, since the dump itself reads again |
+| Compact nodes (Android and iOS: `ui tree`, `ui find`, saved trees, flow hierarchy evidence) | — | additive `editable` (Android: an EditText or a subclass, or a node with a `hint`; iOS: a text field, secure field, text view or search field) and `password` (Android: UI Automator's `password`; iOS: a secure text field). Where Autonom asks whether a node takes text (`ui type`'s focus check, the `inputText` focus poll, `--interactable`), an Android node with a `hint` now counts as a text field too |
+| `ui tree --format outline` | a state word only when true: `clickable scrollable focused selected checked`, then `disabled`, `offscreen` | every checkable node says `checked` or `unchecked` (an off switch printed no state word); `editable` and `password` when true; in the order `clickable scrollable focused selected checked`/`unchecked` `editable password disabled offscreen` |
+
+### Agent profile, one-line JSON and observe (Unreleased)
+
+Pinned by `tests/test_agent_profile.py`, `tests/test_one_line_json.py`,
+`tests/test_observe.py`, `tests/test_ui_do.py` and
+`tests/test_error_codes_additive.py`. One error code is added:
+
+| Code | Emitted by |
+| --- | --- |
+| `interrupted` | the exit-130 envelope on stderr of any command cut by an interrupt (Ctrl-C, SIGINT): `{"ok": false, "error_code": "interrupted", "error": "interrupted", "hint": ...}`, the hint saying the command may have stopped partway and to read the screen (`autonom ui tree`) before running it again. It used to be `{"ok": false, "error": "interrupted"}` with neither `error_code` nor `hint`; `error` and exit 130 are unchanged, and the journal entry of the command now carries the code. The same word is `observe_error.code` of an action whose observing was interrupted (exit 130 too, with its `ok: true` reply on stdout instead of the envelope) |
+
+One warning code is added (a `warnings[].code`, never an `error_code`):
+`ui_do_not_compilable` — `flow create --from-session`, `teach compile` and
+`pretest flow-draft` over a journal holding a `ui do`: its steps came on
+stdin and are not in the journal, so they are not compiled; the warning
+carries `seq` and the run's `run_id` and counts in `quality.skipped`. Before
+this, such an entry was left out without a word.
+
+| Surface | Before | Now |
+| --- | --- | --- |
+| Every JSON reply on stdout | indented over many lines (`indent=2`) | one line, `{"ok":true,...}`: the same keys, values and key order. A consumer that parses the reply (whole stdout, or one reply per line) is unaffected; one that matched the indented text must parse it instead. People can pipe it to `python3 -m json.tool` |
+| `session start` | — | additive `--profile default\|agent` (spelled in full only, so `--p` still means `--platform`); the session record and the `session start`/`session show` replies carry `profile` (`default` when not given). A record written by an older version has no `profile` and is a default session |
+| `session list` | entry keys `session_id platform target_id label started_at stopped_at started_by current live` | the same keys, in the same order, for every default session; a session with another profile adds `profile` after `live` |
+| `ui tree` without `--format` | `nodes` | `nodes` as before, except in an agent-profile session on the same target (or, for `--dump`, the invocation's session): `format: outline` and `outline` instead of `nodes`, exactly as `--format outline` prints. `--format json` prints `nodes` in every session |
+| `ui tap`, `ui type`, `ui swipe`, `ui key` | — | additive `--observe`, `--no-observe`, `--observe-timeout-ms MS` (default 3000; below 0 is `invalid_value` before any input), spelled in full only. Observe is on with `--observe`, or in an agent-profile session on the same target without `--no-observe`; otherwise the reply and the device calls are what they were |
+| Reply of an observed action | — | additive `screen` (`outline`, `count`, `truncated`, `saved` when the tree was written), `changes` (`added`, `removed`, `changed`, `lines`: at most 20 outline lines marked `+ `, `~ ` or `- `; null when there is no baseline), `changes_baseline` (`pre_read`, `saved_tree` or `none`), `changes_baseline_reason` (only with `none`: why there is no baseline, e.g. `saved tree read with --interactable`, `saved tree does not record how it was read (...)`, `no saved tree in this session`) and `foreground` (`app`, and `screen` when known). The baseline is the command's own full read before the input (`pre_read`: a selector tap's read, `ui type`'s focus read, or on the iOS idb route the `describe-all` the coordinate guard looked the screen size up with), taken from what the process already holds, never an extra read; else the session's latest saved tree of the target, only when its `read_shape` says it was read the way observe reads (filter `default`, `max_depth` null, `max_nodes` 200, `truncated` false); else none. A tree read with `--all`, `--interactable`, `--max-depth` or another `--max-nodes`, a cut one, and one without `read_shape` (an older version, the pre-test a11y check) is never compared. On an observe failure the reply keeps `ok: true` and exit 0 and carries `observe_error` (`code`, `message`, `hint` when there is one) instead of those keys. An interrupt (Ctrl-C, SIGINT) while observing ends observing at once. The input was already sent, so stdout still carries the reply with `ok: true` and `observe_error` `code: interrupted` (the message says the input was sent and which part of observe was cut; the hint says to run `autonom ui tree` and not to send the input again), beside what observe had already obtained: `screen` once the settle and its read ended (a read of a settle that was cut is not reported), `changes` and `changes_baseline` once compared, `screen.saved` once saved, and, when only the Android foreground lookup (`dumpsys`) was cut, `foreground` with `app` alone. The journal records the action ok; the command then exits 130, the status of any interrupt, so `cmd && next` and `set -e` scripts stop as before (before this, an interrupt at that point printed only the exit-130 `interrupted` envelope on stderr, journaled as failed). A second interrupt while that reply is printed or journaled, or one that lands after observe returned and before the reply is printed, still ends with that envelope. After `ui type --sensitive` the typed value never appears in these keys or in the saved tree: the `text` and `desc` of every editable or focused node, and of any node that may show the value or a part of it (the whole value however spaced, grouped or capitalised; a run of 4 or more of its letters and digits, the whole value when shorter; any one-character text), read `<N chars>` (N, the typed length). Warnings: `screen_not_settled` (the screen did not settle within `--observe-timeout-ms`; the screen is still reported) and `evidence_write_failed` (the tree could not be saved) |
+| Session tree history | trees from `ui tree` and the pre-test a11y check | also one tree per observed action, the same shape as `ui tree`'s plus `purpose: observe` and `after` (the verb); `latest.json` follows it. Every tree `ui tree` or observe saves adds `read_shape`: `source` (`ui_tree` or `observe`), `filter` (`default`, `all`, `interactable` or `all+interactable`), `max_depth` (null without a limit), `max_nodes` and `truncated`. The `ui tree` reply does not carry it |
+| Device calls of an observed action | — | after the input only reads: the settle's reads (idb `ui quiet` then one tree read on the iOS idb route; tree reads until two match elsewhere) and, on Android, one `dumpsys activity activities`. No read is added before the input and no input is ever sent again |
+| `replay --run` (or `--bundle`) of a `ui do` run | — | `replay_manifest_invalid` (an existing code) naming the run: its steps came on stdin (`flow_path: "<stdin>"`), so there is no flow file to replay; the hint says to send the steps to `ui do` again or save them as a flow file and use `flow run`. No file of the steps is written for replay, so a sensitive value a step types never sits on disk |
+| iOS idb input that fails with nothing on stderr | `error` was `idb <argv> failed (<exit>)`, the whole argv with the typed text, and that text was read for connection words (a typed `errno 61` sent `ui text` again after a prune) | `error` names the command words only (`idb ui text failed (1)`) and only idb's own stderr is classified: such a failure is `backend_failed`, never retried, and the input is sent once |
+
 ### iOS UI recovery and `--session-id` (0.32.0)
 
 Additive, with two behaviour changes listed at the end. A host that passes
@@ -552,7 +621,13 @@ Behaviour changes:
 
 - `0` success · `2` expected failure (`AutonomError` as one JSON object on
   **stderr**: `{"ok": false, "error_code", "error", "hint"}`) · `130`
-  interrupt. Argument errors (unknown verb, misspelt flag, a value that
+  interrupt (the `interrupted` envelope on stderr: `error_code` and `error`
+  `interrupted` and a `hint`, since the agent profile release; it carried
+  only `"error": "interrupted"` before; an action interrupted
+  while it observes the new screen prints its `ok: true` reply with
+  `observe_error` `interrupted` on stdout instead, see
+  [Agent profile, one-line JSON and observe](#agent-profile-one-line-json-and-observe-unreleased)).
+  Argument errors (unknown verb, misspelt flag, a value that
   looks like an option) are the same envelope with `error_code:
   usage_error` and the usage line in `hint` — never argparse prose. `doctor` exits `0` unless `--strict` (then `1` when unhealthy, with
   `ok: false` and `strict_failures`) —
@@ -560,7 +635,8 @@ Behaviour changes:
   `ui wait --settled` exits `1` when the screen never settled within
   `--timeout-ms`, like `flow run`'s test failures. `flow run` also exits `1`
   for a run that ended `interrupted` by the control lease.
-- stdout carries exactly **one pretty-printed JSON document** per invocation;
+- stdout carries exactly **one JSON document** per invocation (one line since
+  the agent profile release; it was pretty-printed before);
   human prose and consent prompts go to stderr. Documented exceptions are
   opt-in streaming modes — `flow run --events`, `logs follow`,
   `network requests follow`, `journal --follow` — which emit NDJSON (one JSON

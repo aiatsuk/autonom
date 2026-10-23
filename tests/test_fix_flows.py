@@ -236,6 +236,36 @@ class CompilerArgvTests(_TempDir):
         flow = validator.validate_tree(path)
         self.assertEqual(flow.steps[1].args["url"], "woolbox://catalog")
 
+    def test_a_ui_do_is_skipped_with_a_warning_not_silently(self) -> None:
+        # The journal keeps only the verb of a `ui do` (its steps came on
+        # stdin), so it cannot compile; the header promises it is never
+        # dropped without a word.
+        session = self._session([["open", "woolbox://catalog", "--serial", self.SERIAL]])
+        journal = self.root / "journal.ndjson"
+        rows = [
+            {"seq": 2, "kind": "action", "verb": "ui do", "ok": True, "origin": "agent",
+             "argv": ["--serial", self.SERIAL, "ui", "do"],
+             "result": {"status": "passed", "run_id": "fr_0123abcd", "platform": "android"}},
+            # without a run id in its result: no run_id key
+            {"seq": 3, "kind": "action", "verb": "ui do", "ok": True, "origin": "agent",
+             "argv": ["ui", "do"], "result": {"status": "passed"}},
+            # a failed ui do is left out like every failed action
+            {"seq": 4, "kind": "action", "verb": "ui do", "ok": False, "origin": "agent",
+             "argv": ["ui", "do"], "error_code": "invalid_value"},
+        ]
+        journal.write_text(journal.read_text(encoding="utf-8")
+                           + "".join(json.dumps(row) + "\n" for row in rows),
+                           encoding="utf-8")
+        flow, report = compiler.compile_session(session, name="walk")
+        skipped = [w for w in report["warnings"] if w["code"] == "ui_do_not_compilable"]
+        self.assertEqual([(w["seq"], w.get("run_id")) for w in skipped],
+                         [(2, "fr_0123abcd"), (3, None)])
+        self.assertNotIn("run_id", skipped[1])
+        self.assertIn("ui do", skipped[0]["error"])
+        self.assertEqual(report["quality"]["skipped"], 2)
+        self.assertTrue(report["review_required"])
+        self.assertEqual([step.command for step in flow.steps], ["openLink", "assertVisible"])
+
 
 class CompilerMatchesTheRealParserTests(unittest.TestCase):
     """The compiler's option table against scripts/autonom.py's argparse."""
