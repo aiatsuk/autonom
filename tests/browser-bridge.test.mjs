@@ -13,7 +13,7 @@ const BRIDGE = join(
 
 // The Android display presets /status lists, in order (DISPLAY-001).
 const DISPLAY_PRESETS = [
-  { id: "small", label: "Small phone", width: 720, height: 1280, density: 320 },
+  { id: "small", label: "Small phone (Nexus 5)", width: 720, height: 1280, density: 320 },
   { id: "pixel-10", label: "Pixel 10", width: 1080, height: 2424, density: 420 },
   { id: "pixel-fold", label: "Pixel Fold (open)", width: 2208, height: 1840, density: 420 },
   { id: "pixel-fold-closed", label: "Pixel Fold (folded)", width: 1080, height: 2092, density: 420 },

@@ -1903,6 +1903,7 @@ function ensureSession(context) {
     broadcastState(context);
   });
   session.on("state", (name) => {
+    if (context.session !== session) return;
     if (name === "restarting") {
       // What the lost companion's HID stream held down is lifted through the next one,
       // even an UP still waiting in the queue, which the new epoch drops.
@@ -2039,7 +2040,9 @@ function openVideoClient(context, ws, socket) {
   const video = context.video;
   if (video.sessionMessage) ws.send(video.sessionMessage);
   if (video.configMessage) ws.send(video.configMessage);
-  if (video.cache.length) {
+  // A long cached GOP overwhelms a newly created tab's decoder. It may drop a
+  // delta and wait forever on a static screen. Ask for a fresh frame instead.
+  if (video.cache.length && video.cache.length <= 30) {
     for (const message of video.cache) ws.send(message);
     client.mode = "live";
   } else {
@@ -3080,7 +3083,7 @@ function deviceWrite(context, buffer, clipboardSequence = null, onWritten = null
 function pasteText(context, text) {
   context.clipboardSequence += 1n;
   const sequence = context.clipboardSequence;
-  deviceWrite(context, encodeSetClipboard({ sequence, paste: true, text }), sequence);
+  deviceWrite(context, encodeSetClipboard({ sequence, paste: false, text }), sequence);
 }
 
 function holdForClipboard(context, sequence) {
@@ -3099,7 +3102,16 @@ function clipboardAcknowledged(context, sequence) {
   if (!hold || hold.acknowledged || hold.sequence !== sequence) return;
   hold.acknowledged = true;
   clearTimeout(hold.timer);
-  // The app handles the injected paste key a moment after the ack.
+  // KEYCODE_PASTE is ignored by Flutter and other shortcut-based editors.
+  // Send Ctrl+V only after SET_CLIPBOARD is acknowledged. Keep the chord in
+  // one write, with both releases, before any input waiting behind this paste.
+  if (context.session?.connected) context.session.send(Buffer.concat([
+    encodeKeycode({ action: KEY_ACTION.DOWN, keycode: 113, metaState: 0x3000 }),
+    encodeKeycode({ action: KEY_ACTION.DOWN, keycode: 50, metaState: 0x3000 }),
+    encodeKeycode({ action: KEY_ACTION.UP, keycode: 50, metaState: 0x3000 }),
+    encodeKeycode({ action: KEY_ACTION.UP, keycode: 113, metaState: 0 }),
+  ]));
+  // The app reads the clipboard asynchronously when it handles the shortcut.
   hold.timer = setTimeout(() => endClipboardHold(context, hold), CLIPBOARD_SETTLE_MS);
   hold.timer.unref?.();
 }

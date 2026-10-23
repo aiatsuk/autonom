@@ -19,7 +19,7 @@ import tempfile
 
 from . import emulator, errors
 
-VERSION = 4
+VERSION = 5
 MAX_PIXELS = 24_000_000
 
 
@@ -135,18 +135,21 @@ def android_source(target, model_override=None, variant=None):
     if rect["x"] + rect["width"] > body["width"] or rect["y"] + rect["height"] > body["height"]:
         raise ValueError("Screen outside skin")
     back = asset(root, bg["background"]["image"])
-    mask = asset(root, bg["foreground"]["mask"])
+    mask_name = bg.get("foreground", {}).get("mask")
+    mask = asset(root, mask_name) if mask_name else None
+    # Older official skins (e.g. Nexus 5) have a rectangular display and an
+    # optional decorative onion overlay, not a display occlusion mask.
     back_width, back_height = dimensions(back)
     if (back_width < body["width"] or back_height < body["height"]
             or back_width * back_height > MAX_PIXELS
-            or dimensions(mask) != (rect["width"], rect["height"])):
+            or (mask is not None and dimensions(mask) != (rect["width"], rect["height"]))):
         raise ValueError("Skin image dimensions differ from layout")
     # Official artwork can extend past the layout window (Pixel 10 includes a few
     # extra border pixels). Retain the whole image without moving/resizing the display.
     body = dict(width=back_width, height=back_height)
     return dict(model=model.replace("_", " ").title() or name, source="android-sdk-skin",
                 bodySize=body, screenRect=rect, back=back, mask=mask,
-                files=[root / "layout", back, mask])
+                files=[root / "layout", back] + ([mask] if mask else []))
 
 
 def android_rotation(target):
@@ -306,7 +309,7 @@ def generic_geometry(w, h, reason, model="Unknown"):
 
 # Explicit UI model selections must never fall back to the running AVD model.
 PRESET_MODELS = {
-    "small": ("small_phone", "Small phone"),
+    "small": ("nexus_5", "Small phone (Nexus 5)"),
     "pixel-10": ("pixel_10", "Pixel 10"),
     "pixel-fold": ("pixel_fold", "Pixel Fold (open)"),
     "pixel-fold-closed": ("pixel_fold", "Pixel Fold (folded)"),
@@ -415,6 +418,20 @@ class FrameRepository:
 
     @staticmethod
     def normalize_android(source, angle, work, rect):
+        if source.get("mask") is None:
+            # The declared rectangular display is fully visible; do not apply
+            # old skins' optional glare/onion artwork over application pixels.
+            command(["ffmpeg", "-v", "error", "-i", str(source["back"]),
+                     "-vf", (f"format=rgba,geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':"
+                             f"a='if(between(X,{rect['x']},{rect['x']+rect['width']-1})*"
+                             f"between(Y,{rect['y']},{rect['y']+rect['height']-1}),0,alpha(X,Y))',"
+                             f"{rotation_filter(angle)}"),
+                     "-frames:v", "1", str(work/"body.png")])
+            command(["ffmpeg", "-v", "error", "-f", "lavfi", "-i",
+                     f"color=white:s={rect['width']}x{rect['height']}",
+                     "-vf", f"{rotation_filter(angle)},format=rgba",
+                     "-frames:v", "1", str(work/"mask.png")])
+            return
         # SDK mask is an occlusion overlay, with transparent visible screen.
         command(["ffmpeg", "-v", "error", "-i", str(source["back"]), "-i", str(source["mask"]),
                  "-filter_complex", f'[0:v][1:v]overlay={rect["x"]}:{rect["y"]}:format=auto,{rotation_filter(angle)}',
