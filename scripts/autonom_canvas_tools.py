@@ -75,7 +75,7 @@ import autonom_canvas_bridge as bridge  # noqa: E402
 from autonom_lib import adb as adb_mod  # noqa: E402
 from autonom_lib import canvas_capture_frame, device_frames, device_language, captures, tool_health  # noqa: E402
 from autonom_lib import device_state, errors, ios_simctl, journal  # noqa: E402
-from autonom_lib import screenshot, session, simulator  # noqa: E402
+from autonom_lib import screenshot, session, simulator, ui  # noqa: E402
 from autonom_lib.network import device_proxy_ios  # noqa: E402
 from autonom_lib.network import mocks as mocks_mod  # noqa: E402
 from autonom_lib.network import redact, store  # noqa: E402
@@ -234,6 +234,11 @@ def _optional_bool(payload: dict[str, Any], name: str) -> bool | None:
 
 def _utf8_length(text: str) -> int:
     return len(text.encode("utf-8"))
+
+
+def recording_size(width: int, height: int, max_size: int = 1280) -> tuple[int, int]:
+    scale = min(1.0, max_size / max(width, height))
+    return max(2, round(width * scale / 2) * 2), max(2, round(height * scale / 2) * 2)
 
 
 class Tools:
@@ -865,8 +870,19 @@ class Tools:
         temp = captures.temp_path(directory, "mp4")
         if self.target.platform == ANDROID:
             remote = f"/sdcard/autonom-canvas-{secrets.token_hex(6)}.mp4"
+            # Software emulators already encode the live Canvas stream. A second
+            # full-resolution encoder (e.g. 1440x3120) can starve both recordings.
+            # Read the current orientation as well as wm overrides; never stretch.
+            size_args = []
+            if self.target.target_id.startswith("emulator-"):
+                size = ui.screen_size(self.target)
+                if not size:
+                    raise errors.AutonomError(errors.BACKEND_FAILED,
+                                              "Could not read the recording display size")
+                width, height = recording_size(*size)
+                size_args = ["--size", f"{width}x{height}", "--bit-rate", "4000000"]
             argv = [self.target.tool, "-s", self.target.target_id, "shell", "screenrecord",
-                    "--time-limit", str(RECORD_LIMIT_S), remote]
+                    *size_args, "--time-limit", str(RECORD_LIMIT_S), remote]
         else:
             remote = None
             argv = [self.target.tool, "simctl", "io", self.target.target_id, "recordVideo",
@@ -907,6 +923,7 @@ class Tools:
         """Ask the recorder to finish its file and wait for it (at most 10 s)."""
         process = state["process"]
         state["stopping"] = True
+        state.setdefault("ended_mono", time.monotonic())
         if state.get("timer") is not None:
             state["timer"].cancel()
         if process.poll() is not None:
@@ -945,7 +962,8 @@ class Tools:
         """Bring the finished video into the captures folder; the device file is
         always removed. Returns the record.stop result."""
         state["finalized"] = True
-        duration_ms = int((time.monotonic() - state["started_mono"]) * 1000)
+        duration_ms = int((state.get("ended_mono", time.monotonic()) - state["started_mono"]) * 1000)
+        duration_ms = min(duration_ms, RECORD_LIMIT_S * 1000)
         temp = state["temp"]
         try:
             if self.target.platform == ANDROID:
@@ -960,9 +978,13 @@ class Tools:
             self._remove_remote(state, 30)
         warning = None
         try:
-            canvas_capture_frame.render(temp, state.get("frame"), video=True, repository=self.frames)
+            canvas_capture_frame.render(temp, state.get("frame"), video=True, repository=self.frames,
+                                        duration_s=duration_ms / 1000)
         except errors.AutonomError:
-            warning = "Frame rendering failed; the original recording was saved without a frame."
+            warning = "Video processing failed; the original recording was preserved."
+            measured = canvas_capture_frame.video_duration(temp)
+            if measured is not None:
+                duration_ms = round(measured * 1000)
         capture, pruned = captures.commit(
             temp, state["directory"], "video",
             meta=self._meta(created=state["started"], duration_ms=duration_ms))

@@ -513,8 +513,10 @@ class FramedCaptureTests(ActionsCase):
             result = self.ok("record.status")
         self.assertEqual(render.call_args.args[1]["rotation"], 0)
         self.assertEqual(render.call_args.args[1]["source"]["model"], "Fixture")
-        self.assertEqual(render.call_args.kwargs, {"video": True, "repository": self.tools.frames})
-        self.assertIn("without a frame", result["last"]["warning"])
+        self.assertTrue(render.call_args.kwargs["video"])
+        self.assertIs(render.call_args.kwargs["repository"], self.tools.frames)
+        self.assertGreater(render.call_args.kwargs["duration_s"], 0)
+        self.assertIn("original recording", result["last"]["warning"])
         self.assertEqual(self.visible(), [result["last"]["capture"]["name"]])
         self.assertEqual(self.hidden(), [])
 
@@ -560,7 +562,7 @@ class AndroidRecordingTests(ActionsCase):
         record = next(argv for argv in calls if "screenrecord" in argv)
         remote = record[-1]
         self.assertRegex(remote, REMOTE)
-        self.assertEqual(record, ["-s", SERIAL, "shell", "screenrecord", "--time-limit", "180", remote])
+        self.assertEqual(record, ["-s", SERIAL, "shell", "screenrecord", "--size", "720x1280", "--bit-rate", "4000000", "--time-limit", "180", remote])
         self.assertIn(["-s", SERIAL, "shell", "pkill", "-INT", "-f", remote], calls)
         pull = next(argv for argv in calls if argv[2:3] == ["pull"])
         self.assertEqual(pull[:4], ["-s", SERIAL, "pull", remote])
@@ -1056,6 +1058,15 @@ class ToolHealthTests(ActionsCase):
         payload = json.loads(completed.stdout)
         self.assertEqual(set(payload), {"checked_at", "tools"})
         self.assertEqual(len(payload["tools"]), 7)
+
+
+class RecordingGeometryTests(unittest.TestCase):
+    def test_recording_preserves_portrait_landscape_fold_aspect_with_even_bounded_size(self):
+        for width,height in [(1440,3120),(3120,1440),(2208,1840),(1080,2092),(720,1280)]:
+            w,h = tools_mod.recording_size(width,height)
+            self.assertLessEqual(max(w,h),1280)
+            self.assertEqual((w%2,h%2),(0,0))
+            self.assertAlmostEqual(w/h,width/height,delta=0.003)
 
 
 if __name__ == "__main__":

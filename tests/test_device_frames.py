@@ -104,6 +104,25 @@ class SkinTests(unittest.TestCase):
         (self.avd/"config.ini").write_text("hw.device.name=fixture\nskin.path="+str(self.skin))
         self.target=SimpleNamespace(platform="android",tool=str(self.root/"platform-tools/adb"),target_id="emulator-5580")
 
+    def test_small_original_rectangular_skin_clears_display_without_an_occlusion_mask(self):
+        (self.skin/"layout").write_text(LAYOUT.replace("foreground { mask mask.png cutout hole }",
+                                                       "onion { image glare.png }"))
+        _png(self.skin/"back.png",50,100,[bytes((30,40,50,255))*50]*100)
+        shutil.copytree(self.skin,self.root/"skins"/"nexus_5")
+        repo=frames.FrameRepository(self.target,self.root/"cache")
+        source=repo.discover("small")
+        self.assertEqual(source["model"],"Small phone (Nexus 5)")
+        desc=repo.resolve(40,80,snapshot={"source":source})
+        self.assertEqual(desc["source"],"android-sdk-skin")
+        import subprocess
+        raw=subprocess.check_output(["ffmpeg","-v","error","-i",desc["layers"][0]["path"],
+                                     "-frames:v","1","-f","rawvideo","-pix_fmt","rgba","-"])
+        self.assertEqual(raw[(8*50+4)*4+3],0,"opaque original screen placeholder must be removed")
+        self.assertEqual(raw[(7*50+4)*4+3],255,"original bezel must stay intact")
+        mask=subprocess.check_output(["ffmpeg","-v","error","-i",desc["screenMask"]["path"],
+                                      "-frames:v","1","-f","rawvideo","-pix_fmt","rgba","-"])
+        self.assertTrue(all(value==255 for value in mask[3::4]))
+
     def test_explicit_model_uses_its_skin_instead_of_avd_skin(self):
         shutil.copytree(self.skin,self.root/"skins"/"pixel_10")
         with patch.object(frames.emulator,"running_avd_name",return_value="fixture"),patch.object(

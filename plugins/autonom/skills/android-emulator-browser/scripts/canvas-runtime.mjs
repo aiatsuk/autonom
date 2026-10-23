@@ -105,7 +105,7 @@ export const SYSTEM_PANELS = Object.freeze({
 // pixel_fold and pixel_tablet and the published Pixel 10 display. `default` resets the
 // target to its own size and density. The order is the order pages and /status show.
 export const DISPLAY_PRESETS = Object.freeze([
-  { id: "small", label: "Small phone", width: 720, height: 1280, density: 320 },
+  { id: "small", label: "Small phone (Nexus 5)", width: 720, height: 1280, density: 320 },
   { id: "pixel-10", label: "Pixel 10", width: 1080, height: 2424, density: 420 },
   { id: "pixel-fold", label: "Pixel Fold (open)", width: 2208, height: 1840, density: 420 },
   { id: "pixel-fold-closed", label: "Pixel Fold (folded)", width: 1080, height: 2092, density: 420 },

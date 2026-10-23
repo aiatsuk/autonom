@@ -73,3 +73,19 @@ class FrameExportTests(unittest.TestCase):
         with self.assertRaises(errors.AutonomError):
             frame.render(path, self.geometry, video=True, repository=self.repository)
         self.assertEqual(path.read_bytes(), b"original")
+
+
+@unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "ffmpeg required")
+class RecordingTimelineTests(unittest.TestCase):
+    def test_idle_tail_keeps_wall_duration_without_speeding_up_motion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)/"video.mp4"
+            subprocess.run(["ffmpeg","-v","error","-f","lavfi","-i",
+                            "testsrc2=size=120x200:rate=10:duration=0.5",
+                            "-c:v","libx264",str(path)],check=True)
+            frame.render(path,None,video=True,duration_s=1.5)
+            stream=json.loads(subprocess.check_output(["ffprobe","-v","error","-show_streams",
+                                                      "-of","json",str(path)]))["streams"][0]
+            self.assertAlmostEqual(float(stream["duration"]),1.5,places=2)
+            self.assertEqual(int(stream["nb_frames"]),45)
+            self.assertAlmostEqual(frame.video_duration(path),1.5,places=2)

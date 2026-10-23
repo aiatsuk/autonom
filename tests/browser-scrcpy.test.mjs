@@ -585,6 +585,8 @@ class FakeScrcpyDevice extends EventEmitter {
     if (message.type === "set-clipboard") {
       this.clipboard = message.text;
       if (message.paste) typed = () => this.clipboard;
+    } else if (message.type === "key" && message.action === 0 && message.keycode === 50 && (message.meta & 0x1000)) {
+      typed = () => this.clipboard;
     } else if (message.type === "text") {
       typed = () => message.text;
     } else if (message.type === "key" && message.action === 0 && message.keycode >= 29 && message.keycode <= 54) {
@@ -1995,6 +1997,29 @@ waitingTest("encoders: a probe that never answers holds the stream back no longe
   await stopCanvas(canvas);
 });
 
+test("fanout: returning to a long cached GOP requests a fresh key frame", async (t) => {
+  const { canvas, auth, device } = await streamingCanvas(t, { device: { resetAnswers: false } });
+  const first = await pageSocket(canvas, auth, "/ws/video");
+  await waitFor(() => device.connected, 8000, "the fake device connection");
+  device.sendConfig();
+  device.sendPacket({ key: true });
+  for (let i = 0; i < 40; i += 1) device.sendPacket({ size: 100 });
+  await waitFor(() => first.packets().length === 41, 5000, "the original viewer");
+  // Let the first viewer's reset throttle expire before the returning viewer.
+  await sleep(1100);
+  const resets = device.messages.filter((message) => message.type === "reset-video").length;
+  const returning = await pageSocket(canvas, auth, "/ws/video");
+  await waitFor(() => device.messages.filter((message) => message.type === "reset-video").length > resets,
+    5000, "a fresh key-frame request");
+  assert.equal(returning.packets().length, 0, "old GOP must not flood the new decoder");
+  const nextSeq = device.seq;
+  device.sendPacket({ key: true });
+  await waitFor(() => returning.packets().length === 1, 5000, "the fresh frame");
+  assert.equal(returning.packets()[0].seq, nextSeq);
+  assert.equal(returning.packets()[0].keyFrame, true);
+  await stopCanvas(canvas);
+});
+
 test("fanout: one device server feeds every client, late joiners start at a key frame", async (t) => {
   const { world, canvas, auth, device } = await streamingCanvas(t);
   const a = await pageSocket(canvas, auth, "/ws/video");
@@ -2487,16 +2512,16 @@ test("input: touches map to the current video size and every interruption lifts 
   control.send({ t: "system", op: "notifications" });
   control.send({ t: "system", op: "rotate" });
   control.send({ t: "clipboard-get" });
-  await waitFor(() => device.messages.length === count + 13, INPUT_WAIT_MS, "control messages");
-  const sent = device.messages.slice(count);
+  await waitFor(() => device.messages.length === count + 21, INPUT_WAIT_MS, "control messages");
+  const sent = pasteMessages({ messages: device.messages.slice(count) });
   assert.deepEqual(sent.slice(0, 4).map((message) => [message.action, message.keycode, message.meta]),
     [[0, 59, 0x41], [0, 29, 0x41], [1, 29, 0x41], [1, 59, 0]]);
   assert.equal(sent[4].type, "scroll");
   assert.deepEqual([sent[4].x, sent[4].y, sent[4].width, sent[4].height], [640, 285, 1280, 570]);
   assert.ok(sent[4].hScroll < 0 && sent[4].vScroll > 0, "the wheel lost an axis");
   assert.deepEqual(sent[5], { type: "text", text: "wifi" });
-  assert.deepEqual([sent[6].type, sent[6].paste, sent[6].text], ["set-clipboard", true, "Café ✓ naïve"]);
-  assert.deepEqual([sent[7].type, sent[7].paste, sent[7].text], ["set-clipboard", true, "π ≈ 3.14 ✓"]);
+  assert.deepEqual([sent[6].type, sent[6].paste, sent[6].text], ["set-clipboard", false, "Café ✓ naïve"]);
+  assert.deepEqual([sent[7].type, sent[7].paste, sent[7].text], ["set-clipboard", false, "π ≈ 3.14 ✓"]);
   assert.deepEqual(sent.slice(8, 10).map((message) => [message.type, message.action]),
     [["back-or-screen-on", 0], ["back-or-screen-on", 1]]);
   assert.deepEqual(sent.slice(10).map((message) => message.type), ["notifications", "rotate", "get-clipboard"]);
@@ -2852,9 +2877,16 @@ function clipboardWrites(device) {
   return device.messages.filter((message) => message.type === "set-clipboard");
 }
 
+// Logical operations for ordering tests; raw chord bytes are asserted separately.
+function pasteShortcutKey(message) {
+  return message.type === "key" && ((message.keycode === 50 && message.meta === 0x3000) ||
+    (message.keycode === 113 && [0, 0x3000].includes(message.meta)));
+}
+function pasteMessages(device) { return device.messages.filter(message => !pasteShortcutKey(message)); }
+
 /** Device control messages as short labels, in the order the device read them. */
 function deviceLabels(messages) {
-  return messages.map((message) => {
+  return messages.filter(message => !pasteShortcutKey(message)).map((message) => {
     if (message.type === "key") return `key ${message.action} ${message.keycode}`;
     if (message.type === "text") return `text ${message.text}`;
     if (message.type === "set-clipboard") return `paste ${message.text}`;
@@ -2871,7 +2903,7 @@ test("input: nothing follows a clipboard paste to the device until its ack and a
   control.send({ t: "paste", text: "B2ü" });
   await waitFor(() => device.count("set-clipboard") === 1, INPUT_WAIT_MS, "the paste");
   const [paste] = device.messages;
-  assert.equal(paste.paste, true);
+  assert.equal(paste.paste, false);
   assert.ok(paste.sequence > 0n, "the paste asked for no acknowledgement");
   const pasted = device.controlBytes;
   control.send({ t: "key", a: "down", code: 54 });
@@ -2886,8 +2918,8 @@ test("input: nothing follows a clipboard paste to the device until its ack and a
   await expectNoDeviceWrite(device, pasted, 150);
   const ackedAt = Date.now();
   device.ack(paste.sequence);
-  await waitFor(() => device.messages.length === 6, INPUT_WAIT_MS, "the held input");
-  const settled = device.arrivals[1] - ackedAt;
+  await waitFor(() => pasteMessages(device).length === 6, INPUT_WAIT_MS, "the held input");
+  const settled = device.arrivals[5] - ackedAt;
   // CLIPBOARD_SETTLE_MS is 200; a few ms less only for timer granularity.
   assert.ok(settled >= 195, `input followed the ack after ${settled} ms`);
   assert.deepEqual(deviceLabels(device.messages),
@@ -2903,9 +2935,9 @@ test("input: a burst of text and pastes reaches a device that reads its clipboar
   // Send a burst at once; the device's text field once everything has reached it.
   const burst = async (messages) => {
     device.field = "";
-    const before = device.messages.length;
+    const before = pasteMessages(device).length;
     for (const message of messages) control.send(message);
-    await waitFor(() => device.messages.length === before + messages.length, INPUT_WAIT_MS, "the burst on the device");
+    await waitFor(() => pasteMessages(device).length === before + messages.length, INPUT_WAIT_MS, "the burst on the device");
     await sleep(100);
     return device.field;
   };
@@ -2931,7 +2963,7 @@ test("input: a key between two clipboard texts keeps two clipboard pastes, in or
   const { canvas, device, control } = await connectedControl(t);
   sendBurst(control, [{ t: "text", text: "é1" }, { t: "key", a: "down", code: 54 }, { t: "key", a: "up", code: 54 },
     { t: "text", text: "é2" }]);
-  await waitFor(() => device.messages.length === 4, INPUT_WAIT_MS, "the burst on the device");
+  await waitFor(() => pasteMessages(device).length === 4, INPUT_WAIT_MS, "the burst on the device");
   await sleep(300);
   assert.deepEqual(deviceLabels(device.messages), ["paste é1", "key 0 54", "key 1 54", "paste é2"]);
   await stopCanvas(canvas);
@@ -2988,7 +3020,7 @@ test("input: a paste the device never acknowledges holds later input for 1 s, th
   const { canvas, device, control } = await connectedControl(t, { device: { autoAck: false } });
   control.send({ t: "paste", text: "q" });
   control.send({ t: "text", text: "after" });
-  await waitFor(() => device.messages.length === 2, INPUT_WAIT_MS, "the input after the paste");
+  await waitFor(() => pasteMessages(device).length === 2, INPUT_WAIT_MS, "the input after the paste");
   const waited = device.arrivals[1] - device.arrivals[0];
   assert.ok(waited >= 950 && waited < 3000, `input followed an unacknowledged paste after ${waited} ms`);
   assert.deepEqual(deviceLabels(device.messages), ["paste q", "text after"]);
@@ -2996,7 +3028,7 @@ test("input: a paste the device never acknowledges holds later input for 1 s, th
   // Nothing is held any more: input without the clipboard goes straight on.
   const sentAt = Date.now();
   control.send({ t: "text", text: "more" });
-  await waitFor(() => device.messages.length === 3, INPUT_WAIT_MS, "input after the timeout");
+  await waitFor(() => pasteMessages(device).length === 3, INPUT_WAIT_MS, "input after the timeout");
   assert.ok(device.arrivals[2] - sentAt < 500, "input after the timeout was held");
   assert.deepEqual(control.json("error"), []);
   assert.equal((await stopCanvas(canvas)).code, 0);
@@ -3023,10 +3055,10 @@ test("input: a device server restart while input waits for a clipboard ack refus
   for (const error of refused) assert.match(error.message, /not ready/);
   await streaming;
   await waitFor(() => device.connected, INPUT_WAIT_MS, "the new device server");
-  const before = device.messages.length;
+  const before = pasteMessages(device).length;
   const sentAt = Date.now();
   control.send({ t: "text", text: "c" });
-  await waitFor(() => device.messages.length === before + 1, INPUT_WAIT_MS, "input after the restart");
+  await waitFor(() => pasteMessages(device).length === before + 1, INPUT_WAIT_MS, "input after the restart");
   assert.ok(device.arrivals[before] - sentAt < 500, "input after the restart was held");
   assert.deepEqual(deviceLabels(device.messages), ["paste é", "text c"]);
   assert.equal((await stopCanvas(canvas)).code, 0);
@@ -3036,7 +3068,7 @@ test("input: a takeover while input waits for a clipboard ack lifts the pointer 
   const { world, canvas, device, control } = await connectedControl(t, { device: { autoAck: false } });
   control.send({ t: "touch", a: "down", id: 1, x: 0.5, y: 0.5 });
   control.send({ t: "paste", text: "ü" });
-  await waitFor(() => device.messages.length === 2, INPUT_WAIT_MS, "the pointer and the paste");
+  await waitFor(() => pasteMessages(device).length === 2, INPUT_WAIT_MS, "the pointer and the paste");
   const pasted = device.controlBytes;
   control.send({ t: "touch", a: "move", id: 1, x: 0.5, y: 0.6 });
   control.send({ t: "text", text: "z" });
@@ -3052,8 +3084,8 @@ test("input: a takeover while input waits for a clipboard ack lifts the pointer 
   const refused = waitFor(() => control.json("error").length === 2 && control.json("error"), INPUT_WAIT_MS,
     "the held input refused");
   device.ack(device.messages[1].sequence);
-  await waitFor(() => device.messages.length === 3, INPUT_WAIT_MS, "the lifted pointer");
-  assert.deepEqual(device.messages.map((message) => message.type === "touch" ? `touch ${message.action}`
+  await waitFor(() => pasteMessages(device).length === 3, INPUT_WAIT_MS, "the lifted pointer");
+  assert.deepEqual(pasteMessages(device).map((message) => message.type === "touch" ? `touch ${message.action}`
     : message.type), ["touch 0", "set-clipboard", "touch 1"]);
   // Held input meets the handoff check when it is handled, after the takeover.
   const errors = await refused;
@@ -4530,7 +4562,7 @@ test("fanout: restart backoff doubles from 1 s to 10 s and resets after 30 s of 
 // Against the fake adb's display (physical 1080x2400 @ 420, see FAKE_WM); no device.
 
 const PRESETS = [
-  { id: "small", label: "Small phone", width: 720, height: 1280, density: 320 },
+  { id: "small", label: "Small phone (Nexus 5)", width: 720, height: 1280, density: 320 },
   { id: "pixel-10", label: "Pixel 10", width: 1080, height: 2424, density: 420 },
   { id: "pixel-fold", label: "Pixel Fold (open)", width: 2208, height: 1840, density: 420 },
   { id: "pixel-fold-closed", label: "Pixel Fold (folded)", width: 1080, height: 2092, density: 420 },
@@ -5607,7 +5639,7 @@ test("display: the Android page shows a Size picker with four models and Device 
   const { sandbox, sent, run, html } = await loadPage(t);
   assert.match(html, /<button type="button" class="popup" id="display-preset" aria-haspopup="listbox"[^>]* disabled>/,
     "the Android page has no Size picker");
-  assert.deepEqual(presetOptions(html), [["small", "Small phone", "720 × 1280"], ["pixel-10", "Pixel 10", "1080 × 2424"],
+  assert.deepEqual(presetOptions(html), [["small", "Small phone (Nexus 5)", "720 × 1280"], ["pixel-10", "Pixel 10", "1080 × 2424"],
     ["pixel-fold", "Pixel Fold (open)", "2208 × 1840"], ["pixel-fold-closed", "Pixel Fold (folded)", "1080 × 2092"], ["default", "Device default", ""]]);
   const picker = () => JSON.parse(run("JSON.stringify([sizePicker.value,sizePicker.disabled])"));
 
@@ -6379,7 +6411,7 @@ test("ios: auto picks idb when idb_companion is on PATH; its frames reach /ws/vi
   await stopCanvas(canvas);
 });
 
-test("ios: tabs share one companion stream; a late joiner starts at the cached key frame and a tab that asks for one waits for the periodic key frame, never a second stream", async (t) => {
+test("ios: tabs share one companion stream; a late joiner starts at a recent key frame and a tab that asks for one waits for the periodic key frame, never a second stream", async (t) => {
   const { world, canvas, auth } = await iosCanvas(t, { env: { FAKE_IDB_KEY_EVERY: "100", FAKE_IDB_INTERVAL_MS: "10" } });
   const first = await pageSocket(canvas, auth, "/ws/video");
   await waitFor(() => first.packets().length >= 30, 10_000, "the first tab's packets");
@@ -6387,8 +6419,9 @@ test("ios: tabs share one companion stream; a late joiner starts at the cached k
   await waitFor(() => late.packets().length >= 5, 5000, "the late tab's packets");
   const latePackets = late.packets();
   assert.equal(latePackets[0].keyFrame, true, "the late tab did not start at a key frame");
-  assert.equal(latePackets[0].seq, 0, "the late tab did not start at the cached key frame");
-  assert.deepEqual(latePackets.map((packet) => packet.seq).slice(0, 5), [0, 1, 2, 3, 4]);
+  assert.equal(latePackets[0].seq % 100, 0, "the late tab must start at a periodic key frame");
+  assert.deepEqual(latePackets.map((packet) => packet.seq).slice(0, 5),
+    Array.from({length: 5}, (_, i) => latePackets[0].seq + i));
   assert.equal(late.video()[0].kind, "session");
   assert.equal(late.video()[1].kind, "config");
   // A page asks for a key frame (as after a decoder error): the next periodic one answers it.
@@ -7831,7 +7864,7 @@ test("video: keyframe recovery retries a lost control request and stops after a 
   sandbox.EncodedVideoChunk = class { constructor(value) { Object.assign(this, value); } };
   const decoded = [];
   sandbox.recordChunk = (chunk) => decoded.push(chunk);
-  run('view.mode="webcodecs";waitingKey=false;decoder={state:"configured",decodeQueueSize:31,decode:recordChunk};controlSocket.readyState=0');
+  run('view.mode="webcodecs";view.session="streaming";waitingKey=false;decoder={state:"configured",decodeQueueSize:31,decode:recordChunk};controlSocket.readyState=0');
   run('decode(false,1,new Uint8Array([1]))');
   assert.equal(run("waitingKey"), true);
   assert.equal(sent.length, 0);
@@ -7853,4 +7886,53 @@ test("video: keyframe recovery retries a lost control request and stops after a 
   sandbox.WebSocket = class { constructor() { this.readyState = 1; } send(text) { sent.push(JSON.parse(text)); } };
   run('connectControl();controlSocket.onopen()');
   assert.equal(sent.length, 3, "control reconnect must request a keyframe without another delta");
+});
+
+
+test("input: paste uses one acknowledged Ctrl+V chord and releases both keys", async (t) => {
+  const { canvas, device, control } = await connectedControl(t, { device: { autoAck: false } });
+  control.send({ t: "paste", text: "paste fixture" });
+  await waitFor(() => device.count("set-clipboard") === 1, INPUT_WAIT_MS, "clipboard");
+  assert.equal(device.messages[0].paste, false, "native PASTE would double-insert");
+  await expectNoDeviceWrite(device, device.controlBytes, 100);
+  const sequence = device.messages[0].sequence;
+  device.ack(sequence);
+  await waitFor(() => device.messages.length === 5, INPUT_WAIT_MS, "shortcut");
+  assert.deepEqual(device.messages.slice(1).map(m => [m.action,m.keycode,m.meta]),
+    [[0,113,0x3000],[0,50,0x3000],[1,50,0x3000],[1,113,0]]);
+  device.ack(sequence);
+  await expectNoDeviceWrite(device, device.controlBytes, 250);
+  assert.equal(device.field, "paste fixture");
+  assert.equal(device.keysDown.size, 0);
+  await stopCanvas(canvas);
+});
+
+test("video: resetting a stream rejects stale async codec checks and closes old frames", async () => {
+  const { sandbox, run } = runPage(renderPage({serial:"fixture",options:{}}));
+  const checks = [], configured = [], closed = [];
+  sandbox.VideoDecoder = class {
+    static isConfigSupported() { return new Promise(resolve => checks.push(resolve)); }
+    constructor() { this.state = "unconfigured"; }
+    configure(value) { configured.push(value.codec); this.state = "configured"; }
+    close() { this.state = "closed"; closed.push("decoder"); }
+  };
+  sandbox.frameClosed = () => closed.push("frame");
+  run('view.mode="webcodecs";frameQueue.push({close:frameClosed});configure(new Uint8Array([0,0,1,103,66,192,41]))');
+  run('resetVideoDecoder();configure(new Uint8Array([0,0,1,103,66,192,42]))');
+  checks[1]({supported:true}); await Promise.resolve(); await Promise.resolve();
+  checks[0]({supported:true}); await Promise.resolve(); await Promise.resolve();
+  assert.deepEqual(configured, ["avc1.42C02A"], "old stream support response must not configure the new decoder");
+  assert.deepEqual(closed, ["frame"]);
+  assert.equal(run("configuring"), false);
+  run("resetVideoDecoder()");
+  assert.deepEqual(closed, ["frame","decoder"]);
+});
+
+
+test("video: keyframe recovery waits for streaming after a tab resumes", () => {
+  const { sent, run } = runPage(renderPage({serial:"fixture",options:{}}));
+  run('view.mode="webcodecs";view.session="idle";waitingKey=true;config=new Uint8Array([0,0,1,7]);requestVideoKeyFrame()');
+  assert.equal(sent.length, 0, "idle streams must not receive recovery commands");
+  run('applyState({owner:"shared",paused:false,session:"streaming"})');
+  assert.deepEqual(sent, [{t:"system",op:"keyframe"}]);
 });

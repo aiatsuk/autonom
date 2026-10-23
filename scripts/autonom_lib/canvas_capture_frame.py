@@ -41,8 +41,21 @@ def _png(path, width, height, rows, *, gray=False):
         stream.write(chunk(b"IEND", b""))
 
 
-def render(path, frame, *, video=False, repository=None):
-    if frame is None:
+def video_duration(path):
+    try:
+        result = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                                 "-of", "json", str(path)], capture_output=True, check=True, timeout=15)
+        value = float(json.loads(result.stdout)["format"]["duration"])
+        return value if 0 < value < 86400 else None
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError):
+        return None
+
+
+def render(path, frame, *, video=False, repository=None, duration_s=None):
+    timing = video and duration_s is not None
+    if timing and (not isinstance(duration_s, (int, float)) or not 0 < duration_s <= 180):
+        raise errors.AutonomError(errors.INVALID_VALUE, "Invalid recording duration")
+    if frame is None and not timing:
         return
     try:
         probe = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0",
@@ -54,15 +67,18 @@ def render(path, frame, *, video=False, repository=None):
                       stream.get("tags", {}).get("rotate", 0))
         if abs(float(rotate)) % 180 == 90:
             width, height = height, width
-        if repository is None:
+        if frame is not None and repository is None:
             raise ValueError("Frame repository required")
-        desc = repository.resolve(width, height, frame["rotation"], snapshot=frame)
-        if desc["source"] == "generic" or not desc["layers"]:
-            return  # Unavailable artwork: retain the original capture, never invent a frame.
-        rect, body = desc["screenRect"], desc["bodySize"]
-        scale = width/rect["width"]
-        x, y = round(rect["x"]*scale), round(rect["y"]*scale)
-        ow, oh = max(width+x, round(body["width"]*scale)), max(height+y, round(body["height"]*scale))
+        desc = repository.resolve(width, height, frame["rotation"], snapshot=frame) if frame else None
+        framed = desc and desc["source"] != "generic" and desc["layers"]
+        if not framed and not timing:
+            return  # Unavailable artwork: never invent a frame.
+        ow, oh = width, height
+        if framed:
+            rect, body = desc["screenRect"], desc["bodySize"]
+            scale = width/rect["width"]
+            x, y = round(rect["x"]*scale), round(rect["y"]*scale)
+            ow, oh = max(width+x, round(body["width"]*scale)), max(height+y, round(body["height"]*scale))
         if video:
             ow += ow % 2
             oh += oh % 2
@@ -70,12 +86,19 @@ def render(path, frame, *, video=False, repository=None):
             directory = Path(temp)
             output = directory/("capture.mp4" if video else "capture.png")
             argv = ["ffmpeg", "-v", "error", "-nostdin", "-y", "-i", str(path)]
-            layer = desc["layers"][0]["path"]
-            argv += ["-i", layer, "-i", desc["screenMask"]["path"]]
-            graph = (f"[1:v]scale={round(body['width']*scale)}:{round(body['height']*scale)}[body];"
-                     f"[2:v]scale={width}:{height},format=rgba,alphaextract[mask];"
-                     f"[0:v]format=rgba[raw];[raw][mask]alphamerge,pad={ow}:{oh}:{x}:{y}:color=black@0[screen];"
-                     "[screen][body]overlay=0:0:format=auto[framed];")
+            # Native recorders emit frames only on changes. Preserve real timestamps
+            # and hold the last image through Stop; never report wall time for a shorter MP4.
+            timing_filter = (f"setpts=PTS-STARTPTS,tpad=stop_mode=clone:stop_duration={duration_s},"
+                             f"fps=30,trim=duration={duration_s}") if timing else "null"
+            graph = f"[0:v]{timing_filter},format=rgba[raw];"
+            if framed:
+                argv += ["-i", desc["layers"][0]["path"], "-i", desc["screenMask"]["path"]]
+                graph += (f"[1:v]scale={round(body['width']*scale)}:{round(body['height']*scale)}[body];"
+                          f"[2:v]scale={width}:{height},format=rgba,alphaextract[mask];"
+                          f"[raw][mask]alphamerge,pad={ow}:{oh}:{x}:{y}:color=black@0[screen];"
+                          "[screen][body]overlay=0:0:format=auto[framed];")
+            else:
+                graph += f"[raw]pad={ow}:{oh}:0:0[framed];"
             if video:
                 graph += ("[framed]split[fg][bg];[bg]lutrgb=r=255:g=255:b=255,format=rgb24[white];"
                           "[white][fg]overlay=0:0:format=auto[out]")
@@ -86,7 +109,7 @@ def render(path, frame, *, video=False, repository=None):
             argv += ["-filter_complex_threads", "1", "-filter_complex", graph, "-map", "[out]"]
             if video:
                 argv += ["-map", "0:a?", "-c:a", "copy", "-c:v", "libx264", "-preset", "fast",
-                         "-crf", "18", "-pix_fmt", "yuv420p", "-fps_mode", "passthrough", "-movflags", "+faststart"]
+                         "-threads", "2", "-crf", "18", "-pix_fmt", "yuv420p", "-fps_mode", "passthrough", "-movflags", "+faststart"]
             else:
                 argv += ["-frames:v", "1", "-pix_fmt", "rgba"]
             subprocess.run([*argv, str(output)], capture_output=True, check=True, timeout=120 if video else 30)
