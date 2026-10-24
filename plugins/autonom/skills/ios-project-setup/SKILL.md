@@ -1,6 +1,7 @@
 ---
 name: ios-project-setup
 description: Inspect an iOS project's real layout for AI agents — resolve workspace vs project, schemes, configurations, bundle identifiers, simulator destinations, and the built .app path without hard-coding versions.
+model: inherit
 ---
 
 # iOS Project Setup

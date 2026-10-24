@@ -1,6 +1,8 @@
 ---
 name: android-runtime-performance
 description: Capture and interpret Android runtime performance with Macrobenchmark, Baseline Profiles, Perfetto, Simpleperf, gfxinfo, and comparable device flows while separating native and Flutter evidence.
+model: opus
+effort: high
 ---
 
 # Android Runtime Performance

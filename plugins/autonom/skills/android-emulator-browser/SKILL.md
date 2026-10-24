@@ -1,6 +1,7 @@
 ---
 name: android-emulator-browser
 description: "Mirror and control an Android target or iOS Simulator in a browser through the authenticated Autonom Mobile Canvas: live H.264 decoded with WebCodecs and real-time input from scrcpy on Android and from an idb_companion on the iOS Simulator (60 fps at full resolution), with screenrecord and screenshot fallbacks."
+model: inherit
 ---
 
 # Mobile Canvas browser

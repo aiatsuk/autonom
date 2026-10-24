@@ -149,6 +149,16 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
   device again; `--help` touches no device.
 
 ### Changed
+- **Skill model and effort.** Every skill's frontmatter now names a `model`,
+  and an `effort` where it matters. The debugger, memory-leak, performance
+  and ticket pre-test skills ask for opus at high effort; `autonom-setup`
+  asks for sonnet at low; `android-app-actions` for sonnet at medium; the
+  Flutter platform, release-validation and testing skills for sonnet at high.
+  Skills that other skills load mid-flow (the start-here map, the router, the
+  session, screen, network, memory and flow manuals, the canvas skill, both
+  project-setup skills and `toolchain-doctor`) use `model: inherit` with no
+  effort, so loading them does not change the turn's model or effort. Hosts
+  that do not read these keys ignore them.
 - **The interrupt envelope has a code and a hint.** A command cut by Ctrl-C
   or SIGINT still exits 130 with `"error": "interrupted"` on stderr, and the
   envelope now also carries `error_code: interrupted` (a new code) and a

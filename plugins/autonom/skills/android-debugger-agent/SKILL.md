@@ -1,6 +1,8 @@
 ---
 name: android-debugger-agent
 description: Build, install, launch, inspect, and debug Android apps on explicit adb targets using Gradle or Flutter builds, screenshots, robust UI Automator selectors, input events, and focused logcat evidence.
+model: opus
+effort: high
 ---
 
 # Android Debugger Agent

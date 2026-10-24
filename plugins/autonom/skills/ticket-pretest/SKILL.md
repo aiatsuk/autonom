@@ -1,6 +1,8 @@
 ---
 name: ticket-pretest
 description: Pre-test one ticket and its diff on an Android emulator or iOS Simulator before it goes to QA, with the `autonom pretest` verbs. Read the ticket and diff context, plan checks before touching the device (acceptance points, then edge cases from the 18-case kit, then regression flows), drive each check under an action budget and forbidden-tap rules, record findings with expected vs actual and evidence refs, pack an integrity-checked report and state the verdict plainly. Also covers the QA review loop, draft regression flows, reproducibility, rerun after a fix, app profile and warm-up, and accessibility and analytics checks. Use when asked to pre-test, smoke-test or validate a ticket, PR, branch or diff on a device.
+model: opus
+effort: high
 ---
 
 # Ticket pre-test

@@ -1,6 +1,8 @@
 ---
 name: android-app-actions
 description: Design, implement, and validate Android deep links, verified App Links, launcher shortcuts, external intents, and Assistant-facing actions through one typed and sanitized routing model.
+model: sonnet
+effort: medium
 ---
 
 # Android App Actions

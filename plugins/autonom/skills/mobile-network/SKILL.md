@@ -1,6 +1,7 @@
 ---
 name: mobile-network
 description: Inspect and mock a mobile app's HTTP(S) traffic for AI agents — start a localhost MITM proxy, attach a device with explicit consent, filter recorded requests, force responses, and export HAR without leaking credentials.
+model: inherit
 ---
 
 # Mobile Network (inspect and mock)

@@ -1,6 +1,7 @@
 ---
 name: mobile-flow
 description: Author, validate, and run repeatable Flow v1 files for AI agents — strict YAML flows with exact selectors, polling assertions, single-fire mutations, failure classes, and per-run event evidence via the Autonom CLI.
+model: inherit
 ---
 
 # Mobile Flow (Android + iOS Simulator)

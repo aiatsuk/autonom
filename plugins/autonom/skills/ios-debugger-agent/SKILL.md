@@ -1,6 +1,8 @@
 ---
 name: ios-debugger-agent
 description: Build, run, and debug iOS apps on the Simulator for AI agents — resolve the scheme and destination, install and launch, then climb an evidence ladder through accessibility trees, screenshots, logs, and crash reports.
+model: opus
+effort: high
 ---
 
 # iOS Debugger Agent (Simulator)

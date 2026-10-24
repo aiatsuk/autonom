@@ -1,6 +1,7 @@
 ---
 name: project-router
 description: Route Flutter, native Android, native iOS, and device test/debug tasks to the smallest relevant Autonom skill set after inspecting the repository stack and runtime boundary.
+model: inherit
 ---
 
 # Project Router
