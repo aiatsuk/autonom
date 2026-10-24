@@ -5,7 +5,13 @@ ffmpeg and mitmdump with the probes `autonom doctor` uses (doctor.py), cached
 for 60 s. Each entry is a ToolHealth:
 
     {"name", "found": bool, "path"|null, "version"|null, "ok": bool,
-     "needed_for": text, "error"|null, "hint"|null}
+     "needed_for": text, "error"|null, "hint"|null,
+     "group": "android"|"ios"|"optional", "fix": text|null}
+
+`group` orders the Canvas Setup checklist. `fix` is the command that fixes a
+tool that is not ok, the same text `autonom doctor` prints (doctor.fix_command),
+or the hint when there is no single command; it is null for an ok tool and for
+an iOS tool on a system that cannot run one. Nothing here or in the Canvas runs it.
 
 `scrcpy_server` is ok only at the scrcpy protocol version the Canvas speaks;
 the iOS tools report `found: false`, `error: "macOS only"` on other systems.
@@ -43,8 +49,19 @@ NEEDED_FOR = {
 }
 EMULATOR_HINT = ("Install the Android SDK 'emulator' package (Android Studio does), "
                  "or set AUTONOM_EMULATOR.")
-FFMPEG_HINT = "Install ffmpeg (brew install ffmpeg, or sudo apt-get install ffmpeg)."
+FFMPEG_FIX_MACOS = "brew install ffmpeg"
+FFMPEG_FIX_LINUX = "sudo apt-get install ffmpeg"
+FFMPEG_HINT = f"Install ffmpeg ({FFMPEG_FIX_MACOS}, or {FFMPEG_FIX_LINUX})."
 MACOS_ONLY = "macOS only"
+GROUPS = {
+    "adb": "android",
+    "emulator": "android",
+    "scrcpy_server": "android",
+    "xcrun_simctl": "ios",
+    "idb_companion": "ios",
+    "ffmpeg": "optional",
+    "mitmdump": "optional",
+}
 
 _lock = threading.Lock()
 _cache: dict[str, Any] = {"at": None, "value": None}
@@ -54,11 +71,28 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
+def fix_for(name: str, hint: str | None = None) -> str | None:
+    """The command shown (never run) to fix `name` on this system: doctor's,
+    else this module's own for the tools doctor does not check, else `hint`."""
+    macos = _macos()
+    command = doctor.fix_command(name, macos=macos)
+    if command:
+        return command
+    if name == "ffmpeg":
+        return FFMPEG_FIX_MACOS if macos else FFMPEG_FIX_LINUX
+    if name == "emulator":
+        return hint or EMULATOR_HINT
+    return hint
+
+
 def _entry(name: str, *, found: bool, path: str | None = None, version: str | None = None,
            ok: bool = False, error: str | None = None, hint: str | None = None) -> dict[str, Any]:
+    ok = bool(ok) and bool(found)
+    fix = None if ok or error == MACOS_ONLY else fix_for(name, hint)
     return {"name": name, "found": bool(found), "path": path, "version": version,
-            "ok": bool(ok) and bool(found), "needed_for": NEEDED_FOR[name],
-            "error": error, "hint": hint if not ok else None}
+            "ok": ok, "needed_for": NEEDED_FOR[name],
+            "error": error, "hint": hint if not ok else None,
+            "group": GROUPS[name], "fix": fix}
 
 
 def _from_doctor(name: str, probe: dict[str, Any]) -> dict[str, Any]:

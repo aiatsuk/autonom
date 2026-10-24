@@ -37,6 +37,7 @@ import {
 } from "../plugins/autonom/skills/android-emulator-browser/scripts/canvas-tools-server.mjs";
 import {
   COMMAND_LOG_MAX,
+  HEALTH_REFRESH_MIN_MS,
   activityApiRoute,
   createActivityApiRoute,
   createCommandLog,
@@ -51,6 +52,10 @@ import {
   actionsMarkup,
   actionsScript,
   actionsStyles,
+  SETUP_GROUPS,
+  SETUP_POLL_MS,
+  setupChecklistScript,
+  setupChecklistStyles,
 } from "../plugins/autonom/skills/android-emulator-browser/scripts/canvas-actions-page.mjs";
 import {
   toolsButton,
@@ -515,6 +520,60 @@ describe("activity routes", () => {
   });
 });
 
+describe("health refresh limit (QW-07, INV-5)", () => {
+  test("?refresh=1 runs a fresh check at most once per 5 s per Canvas; sooner it answers from the cache", async () => {
+    let clock = 1_000_000;
+    let runs = 0;
+    const asked = [];
+    const route = createActivityApiRoute({
+      now: () => clock,
+      runHealth: async ({ refresh }) => { runs += 1; asked.push(refresh); return { checked_at: `run-${runs}`, tools: [] }; },
+    });
+    assert.equal(HEALTH_REFRESH_MIN_MS, 5000);
+    const first = await route(routeContext("/api/health?refresh=1"));
+    assert.equal(first.body.checked_at, "run-1");
+    assert.equal(first.body.cached, false);
+    clock += 4999;
+    const early = await route(routeContext("/api/health?refresh=1"));
+    assert.equal(runs, 1, "a second refresh within 5 s does not run the check");
+    assert.equal(early.body.checked_at, "run-1");
+    assert.equal(early.body.cached, true);
+    const plain = await route(routeContext("/api/health"));
+    assert.equal(plain.body.cached, true);
+    clock += 1;
+    const later = await route(routeContext("/api/health?refresh=1"));
+    assert.equal(runs, 2);
+    assert.equal(later.body.checked_at, "run-2");
+    assert.equal(later.body.cached, false);
+    assert.deepEqual(asked, [true, true]);
+    // Polling every 5 s for 30 s from several pages: at most one fresh check per 5 s.
+    for (let step = 0; step < 30; step += 1) {
+      clock += 1000;
+      await route(routeContext("/api/health?refresh=1"));
+      await route(routeContext("/api/health?refresh=1"));
+    }
+    assert.equal(runs, 2 + 6);
+  });
+
+  test("the limit also holds for a device's tools process: a refused refresh asks without refresh", async () => {
+    let clock = 0;
+    const asked = [];
+    const tools = { call: async (op, payload) => { asked.push(payload.refresh); return { status: 200, body: { ok: true, result: { checked_at: "dev", tools: [] } } }; } };
+    const registry = { primary: () => ({ context: { tools } }) };
+    const route = createActivityApiRoute({ now: () => clock, runHealth: async () => { throw new Error("not used"); } });
+    const fresh = await route(routeContext("/api/health?refresh=1", { registry }));
+    clock += 2000;
+    const refused = await route(routeContext("/api/health?refresh=1", { registry }));
+    clock += 3000;
+    await route(routeContext("/api/health?refresh=1", { registry }));
+    assert.deepEqual(asked, [true, false, true]);
+    assert.equal(fresh.body.cached, false);
+    assert.equal(refused.body.cached, true);
+    const failing = createActivityApiRoute({ runHealth: async () => { throw new Error("python missing"); } });
+    assert.equal((await failing(routeContext("/api/health?refresh=1"))).body.cached, false, "no answer is never called cached");
+  });
+});
+
 async function realpath(path) {
   const { realpath: real } = await import("node:fs/promises");
   return real(path);
@@ -785,7 +844,7 @@ function defaultReply(op) {
   }
 }
 
-function bootPage({ withDock = false, platform = "android", reply = () => null, canSend = () => true, deviceId = DEVICE, withTools = true, captureFrameOptions } = {}) {
+function bootPage({ withDock = false, platform = "android", reply = () => null, canSend = () => true, deviceId = DEVICE, withTools = true, captureFrameOptions, shortcutHint, navigator } = {}) {
   const html = `<body><div class="actions">${withTools ? toolsButton() : ""}${actionsButton()}` +
     `<button type="button" class="icon" id="inspector-toggle" aria-pressed="true" aria-controls="inspector">I</button></div>` +
     `<aside class="side" id="inspector" aria-label="Inspector"></aside>${withTools ? toolsMarkup({ platform }) : ""}` +
@@ -808,15 +867,19 @@ function bootPage({ withDock = false, platform = "android", reply = () => null, 
     return { ok: answer.status < 400, status: answer.status, statusText: "", json: async () => answer.body };
   };
   const messageListeners = [];
+  const captureListeners = [];
   const sandbox = {
-    document, fetch, captureFrameOptions, view: { owner: "shared", paused: false, status: {} }, csrf: "csrf-123", TextEncoder, console,
+    document, fetch, captureFrameOptions, shortcutHint, navigator, view: { owner: "shared", paused: false, status: {} }, csrf: "csrf-123", TextEncoder, console,
     $: (id) => document.getElementById(id),
     url: (path) => path,
     note: () => {},
     canSendInput: () => canSend(),
     setInterval: timers.setInterval, clearInterval: timers.clear, setTimeout: timers.setTimeout, clearTimeout: timers.clear,
     location: { origin: "http://127.0.0.1:3277" },
-    addEventListener: (type, listener) => { if (type === "message") messageListeners.push(listener); },
+    addEventListener: (type, listener) => {
+      if (type === "message") messageListeners.push(listener);
+      if (type === "autonom:capture") captureListeners.push(listener);
+    },
     DEVICE_ID: deviceId, BASE: "", EMBED: false,
   };
   sandbox.window = sandbox;
@@ -827,7 +890,13 @@ function bootPage({ withDock = false, platform = "android", reply = () => null, 
   const $ = (id) => document.getElementById(id);
   const ops = (op) => calls.filter((call) => call.op === op);
   const post = (data, origin = "http://127.0.0.1:3277") => { for (const listener of messageListeners) listener({ data, origin, source: sandbox }); };
-  return { document, $, calls, ops, timers, post };
+  // The device page's Cmd+S / Cmd+R: an autonom:capture window event; true when a listener handled it.
+  const capture = (action) => {
+    const event = { type: "autonom:capture", detail: { action }, defaultPrevented: false, preventDefault() { this.defaultPrevented = true; } };
+    for (const listener of captureListeners) listener(event);
+    return event.defaultPrevented;
+  };
+  return { document, $, calls, ops, timers, post, capture };
 }
 
 describe("actions page markup and styles", () => {
@@ -1227,4 +1296,244 @@ test("dock and drawer capture snapshot the shared frame; Stop never re-reads it"
   assert.deepEqual(page.ops("record.stop")[0].body.payload,{});
   page.$("actions-shot").click();await flush();
   assert.deepEqual(page.ops("capture.screenshot")[1].body.payload,{});
+});
+
+test("capture shortcuts: Cmd+S and Cmd+R make the buttons' calls under the buttons' rules (QW-01-S02)", async () => {
+  let recording = false;
+  let allow = true;
+  const replies = ({ op }) => {
+    if (op === "capture.screenshot") return ok({ capture: SHOT, pruned: [] });
+    if (op === "record.start") { recording = true; return ok({ recording: { started_at: new Date().toISOString() } }); }
+    if (op === "record.stop") { recording = false; return ok({ capture: VIDEO, duration_ms: 2000 }); }
+    if (op === "record.status") return ok({ recording });
+    return null;
+  };
+  const page = bootPage({ withDock: true, canSend: () => allow, reply: replies,
+    captureFrameOptions: () => ({ frame: { corner: 0.1, inset: 0.02 } }) });
+  await page.timers.tick(2000);
+  // Cmd+S, then Cmd+R twice: one capture.screenshot, one record.start and one record.stop.
+  assert.equal(page.capture("screenshot"), true);
+  await flush();
+  assert.equal(page.capture("record"), true);
+  await flush();
+  assert.equal(page.$("dock-record").getAttribute("aria-pressed"), "true");
+  assert.equal(page.capture("record"), true);
+  await flush();
+  const done = page.calls.filter((call) => ["capture.screenshot", "record.start", "record.stop"].includes(call.op));
+  assert.deepEqual(done.map((call) => [call.op, call.body.payload]), [
+    ["capture.screenshot", { frame: { corner: 0.1, inset: 0.02 } }],
+    ["record.start", { frame: { corner: 0.1, inset: 0.02 } }],
+    ["record.stop", {}],
+  ]);
+  assert.equal(page.$("actions").hidden, true, "the drawer stays closed");
+  // The same calls the buttons make, with the same CSRF header.
+  page.$("dock-shot").click();
+  await flush();
+  const [byKey, byButton] = page.ops("capture.screenshot");
+  assert.deepEqual([byKey.path, byKey.headers, byKey.body], [byButton.path, byButton.headers, byButton.body]);
+  // While another client controls the device, the shortcut is handled and calls nothing.
+  allow = false;
+  const before = page.calls.length;
+  assert.equal(page.capture("screenshot"), true);
+  assert.equal(page.capture("record"), true);
+  await flush();
+  assert.deepEqual(page.calls.slice(before).filter((call) => call.op !== "record.status"), []);
+  // An unknown action is left alone.
+  assert.equal(page.capture("delete"), false);
+});
+
+test("capture shortcuts: a screenshot in flight is not repeated by a second Cmd+S", async () => {
+  let finish;
+  const page = bootPage({ withDock: true, reply: ({ op }) => op === "capture.screenshot"
+    ? new Promise((resolve) => { finish = () => resolve(ok({ capture: SHOT, pruned: [] })); }) : null });
+  await page.timers.tick(2000);
+  page.capture("screenshot");
+  await flush();
+  page.capture("screenshot");
+  page.$("actions-shot").click();
+  await flush();
+  assert.equal(page.ops("capture.screenshot").length, 1);
+  finish();
+  await flush();
+  page.capture("screenshot");
+  await flush();
+  assert.equal(page.ops("capture.screenshot").length, 2);
+});
+
+test("capture shortcuts: tooltips name the chord the device page reports, and stay plain without one (QW-03)", async () => {
+  const chords = { screenshot: " (\u2318S)", record: " (\u2318R)" };
+  let recording = false;
+  const page = bootPage({ withDock: true, shortcutHint: (action) => chords[action] || "", reply: ({ op }) => {
+    if (op === "record.start") { recording = true; return ok({ recording: { started_at: new Date().toISOString() } }); }
+    if (op === "record.status") return ok({ recording });
+    return null;
+  }});
+  assert.equal(page.$("dock-shot").title, "Take screenshot (\u2318S)");
+  assert.equal(page.$("actions-shot").title, "Save a screenshot on this computer (\u2318S)");
+  assert.equal(page.$("dock-record").title, "Start recording (\u2318R)");
+  assert.equal(page.$("actions-record").title, "Record video on this computer, up to 3 minutes (\u2318R)");
+  await page.timers.tick(2000);
+  page.$("dock-record").click();
+  await flush();
+  assert.equal(page.$("dock-record").title, "Stop recording (\u2318R)");
+  assert.equal(page.$("dock-record").getAttribute("aria-label"), "Stop recording");
+  const plain = bootPage({ withDock: true });
+  assert.equal(plain.$("dock-shot").title, "Take screenshot");
+  assert.equal(plain.$("dock-record").title, "Start recording");
+  assert.equal(plain.$("actions-record").title, "Record video on this computer, up to 3 minutes");
+});
+
+// --- Setup checklist (QW-06, QW-07) -----------------------------------------------------------
+
+const SCRCPY_MISSING = { name: "scrcpy_server", found: false, path: null, version: null, ok: false, group: "android",
+  needed_for: "the fast Android stream and input of the Canvas", error: "not found", hint: "Install scrcpy 4.1", fix: "brew install scrcpy" };
+const SCRCPY_OK = { ...SCRCPY_MISSING, found: true, path: "/opt/scrcpy-server", version: "4.1", ok: true, error: null, hint: null, fix: null };
+const ADB_OK = { name: "adb", found: true, path: "/x/adb", version: "1.0.41", ok: true, group: "android", needed_for: "Android", error: null, hint: null, fix: null };
+const SIMCTL_MISSING = { name: "xcrun_simctl", found: true, path: "/usr/bin/xcrun", version: null, ok: false, group: "ios", needed_for: "iOS",
+  error: "simctl did not answer", hint: null, fix: "sudo xcode-select -s /Applications/Xcode.app/Contents/Developer" };
+const MITM_MISSING = { name: "mitmdump", found: false, path: null, version: null, ok: false, group: "optional", needed_for: "network capture",
+  error: "not found", hint: "Install mitmproxy (brew install mitmproxy, or pipx install mitmproxy).", fix: "brew install mitmproxy" };
+
+function healthPage({ tools, ...options }) {
+  const state = { tools };
+  const page = bootPage({
+    ...options,
+    reply: ({ path }) => path.startsWith("/api/health")
+      ? { status: 200, body: { ok: true, checked_at: "2026-10-23T07:00:00Z", cached: false, canvas: {}, tools: state.tools } }
+      : null,
+  });
+  const healthCalls = () => page.calls.filter((call) => call.path.startsWith("/api/health"));
+  const openActivity = async () => { page.$("actions-toggle").click(); await flush(); page.$("actions-tab-activity").click(); await flush(); };
+  return { ...page, state, healthCalls, openActivity };
+}
+
+describe("Setup checklist", () => {
+  test("the shared script and styles are inline-safe and the groups are Android, iOS, Optional", () => {
+    assert.deepEqual(SETUP_GROUPS.map((group) => group.label), ["Android", "iOS", "Optional"]);
+    assert.equal(SETUP_POLL_MS, 5000);
+    const script = setupChecklistScript();
+    assert.doesNotMatch(script, /`|\\|<\/|innerHTML/);
+    new Script(script);
+    assert.match(setupChecklistStyles(), /var\(--success\)/);
+    assert.doesNotMatch(setupChecklistStyles(), /min-width:\s*[3-9]\d\dpx/);
+    assert.match(actionsStyles(), /\.setup-command\{/);
+    assert.match(actionsMarkup({}), /id="actions-health-title">Setup</);
+  });
+
+  test("groups each tool, marks it OK, Problem or Missing and shows the fix with Copy; Copy never runs it (QW-06-S01)", async () => {
+    const copied = [];
+    const page = healthPage({ tools: [MITM_MISSING, SIMCTL_MISSING, SCRCPY_MISSING, ADB_OK],
+      navigator: { clipboard: { writeText: async (value) => { copied.push(value); } } } });
+    await page.openActivity();
+    const groups = page.$("actions-health").children;
+    assert.deepEqual(groups.map((group) => group.getAttribute("data-group")), ["android", "ios", "optional"]);
+    assert.deepEqual(groups.map((group) => group.children[0].textContent), ["Android", "iOS", "Optional"]);
+    const rows = page.$("actions-health").querySelectorAll("li");
+    const row = (tool) => rows.find((item) => item.getAttribute("data-tool") === tool);
+    assert.deepEqual(rows.map((item) => item.getAttribute("data-tool")), ["scrcpy_server", "adb", "xcrun_simctl", "mitmdump"]);
+    assert.equal(row("scrcpy_server").querySelector(".setup-badge").textContent, "Missing");
+    assert.equal(row("scrcpy_server").querySelector(".setup-name").textContent, "scrcpy-server");
+    assert.equal(row("xcrun_simctl").querySelector(".setup-badge").textContent, "Problem");
+    assert.equal(row("adb").querySelector(".setup-badge").textContent, "OK");
+    assert.equal(row("adb").querySelector(".setup-fix"), null, "an OK tool shows no command");
+    assert.equal(row("scrcpy_server").querySelector(".setup-command").textContent, "brew install scrcpy");
+    assert.match(row("scrcpy_server").querySelector(".setup-meta").textContent, /not found · Install scrcpy 4\.1 · For the fast Android stream/);
+    assert.doesNotMatch(row("mitmdump").querySelector(".setup-meta").textContent, /brew install mitmproxy/, "a hint holding the fix is not repeated");
+    const before = page.calls.length;
+    const copy = row("scrcpy_server").querySelector("button");
+    assert.equal(copy.textContent, "Copy");
+    assert.equal(copy.getAttribute("aria-label"), "Copy the command that fixes scrcpy-server");
+    copy.click();
+    await flush();
+    assert.deepEqual(copied, ["brew install scrcpy"]);
+    assert.equal(row("scrcpy_server").querySelector(".setup-copied").textContent, "Copied");
+    assert.equal(page.calls.length, before, "copying sends nothing to the Canvas");
+    assert.equal(page.calls.some((call) => call.op && /fix|install|exec|run/.test(call.op)), false);
+  });
+
+  test("without clipboard access Copy says how to copy by hand", async () => {
+    const page = healthPage({ tools: [SCRCPY_MISSING] });
+    await page.openActivity();
+    page.$("actions-health").querySelector("button").click();
+    await flush();
+    assert.equal(page.$("actions-health").querySelector(".setup-copied").textContent, "Select the command to copy it");
+  });
+
+  test("re-checks every 5 s while a needed tool is missing, ticks it OK without a click and stops (QW-07-S01)", async () => {
+    const page = healthPage({ tools: [ADB_OK, SCRCPY_MISSING, MITM_MISSING] });
+    await page.openActivity();
+    assert.deepEqual(page.healthCalls().map((call) => call.path), ["/api/health"]);
+    assert.match(page.$("actions-health-time").textContent, /checking again every 5 s/);
+    await page.timers.tick(5000);
+    assert.deepEqual(page.healthCalls().map((call) => call.path), ["/api/health", "/api/health?refresh=1"]);
+    await page.timers.tick(5000);
+    assert.equal(page.healthCalls().length, 3);
+    page.state.tools = [ADB_OK, SCRCPY_OK, MITM_MISSING];
+    await page.timers.tick(5000);
+    assert.equal(page.healthCalls().length, 4);
+    const scrcpy = page.$("actions-health").querySelectorAll("li").find((item) => item.getAttribute("data-tool") === "scrcpy_server");
+    assert.equal(scrcpy.querySelector(".setup-badge").textContent, "OK");
+    assert.equal(scrcpy.querySelector(".setup-fix"), null);
+    assert.doesNotMatch(page.$("actions-health-time").textContent, /checking again/);
+    await page.timers.tick(30000);
+    assert.equal(page.healthCalls().length, 4, "an optional tool alone never keeps re-checking");
+    page.$("actions-health-refresh").click();
+    await flush();
+    assert.equal(page.healthCalls().at(-1).path, "/api/health?refresh=1", "Check again stays");
+  });
+
+  test("a hidden tab, a closed drawer or a hidden browser tab makes no health request (QW-07-S02)", async () => {
+    const page = healthPage({ tools: [SCRCPY_MISSING] });
+    await page.openActivity();
+    assert.equal(page.healthCalls().length, 1);
+    page.$("actions-tab-capture").click();
+    await flush();
+    await page.timers.tick(30000);
+    assert.equal(page.healthCalls().length, 1, "Capture tab shown");
+    page.$("actions-tab-activity").click();
+    await flush();
+    await page.timers.tick(5000);
+    assert.equal(page.healthCalls().length, 2, "re-checks again once visible");
+    page.$("actions-close").click();
+    await flush();
+    await page.timers.tick(30000);
+    assert.equal(page.healthCalls().length, 2, "drawer closed");
+    page.$("actions-toggle").click();
+    await flush();
+    page.document.visibilityState = "hidden";
+    await page.timers.tick(30000);
+    assert.equal(page.healthCalls().length, 2, "browser tab hidden");
+    page.document.visibilityState = "visible";
+    page.$("actions-health-refresh").click();
+    await flush();
+    await page.timers.tick(5000);
+    assert.equal(page.healthCalls().length, 4);
+  });
+
+  test("only the tools of this device's platform keep the checklist re-checking", async () => {
+    const android = healthPage({ tools: [ADB_OK, SIMCTL_MISSING] });
+    await android.openActivity();
+    await android.timers.tick(30000);
+    assert.equal(android.healthCalls().length, 1, "an iOS tool on an Android device page does not poll");
+    const ios = healthPage({ platform: "ios", deviceId: "ios~45A342A1-AA2F-4F40-8EFD-F0D0C590ECE5", tools: [ADB_OK, SIMCTL_MISSING] });
+    await ios.openActivity();
+    await ios.timers.tick(10000);
+    assert.equal(ios.healthCalls().length, 3);
+  });
+
+  test("a failed check keeps the last list and keeps re-checking while visible", async () => {
+    let fail = false;
+    const page = bootPage({ reply: ({ path }) => {
+      if (!path.startsWith("/api/health")) return null;
+      if (fail) return { status: 500, body: { ok: false, error: "boom" } };
+      return { status: 200, body: { ok: true, checked_at: "2026-10-23T07:00:00Z", canvas: {}, tools: [SCRCPY_MISSING] } };
+    } });
+    page.$("actions-toggle").click(); await flush();
+    page.$("actions-tab-activity").click(); await flush();
+    fail = true;
+    await page.timers.tick(10000);
+    const health = page.calls.filter((call) => call.path.startsWith("/api/health"));
+    assert.equal(health.length, 3);
+    assert.equal(page.$("actions-health").querySelectorAll("li").length, 1);
+  });
 });

@@ -10,6 +10,10 @@
  * /api/activity/clear and GET /api/health. Health comes from the primary device's tools
  * process (`health` op); with no device attached, from a short-lived
  * `python3 -m autonom_lib.tool_health` run (cached 60 s), so it works with zero devices.
+ * `?refresh=1` bypasses the cache at most once per HEALTH_REFRESH_MIN_MS per Canvas, so a
+ * Setup checklist that re-checks itself cannot start more than one fresh check per 5 s; a
+ * refresh asked sooner gets the cached answer. Every answer says `cached`: true when it is an
+ * earlier check's result (from a device's tools process: whenever no refresh was granted).
  */
 import { spawn } from "node:child_process";
 import { resolve } from "node:path";
@@ -21,6 +25,7 @@ export const SUMMARY_MAX = 120;
 export const ERROR_MAX = 300;
 export const HEALTH_TIMEOUT_MS = 30_000;
 export const HEALTH_CACHE_MS = 60_000;
+export const HEALTH_REFRESH_MIN_MS = 5_000;
 export const ENTRY_KINDS = Object.freeze(["tools", "input", "control", "display", "device", "session", "boot",
   "workspace", "stream"]);
 
@@ -231,7 +236,8 @@ function primaryTools(registry) {
  * The /api/activity and /api/health routes. Options (all for tests and wiring):
  * `runHealth({refresh})` replaces the python run; `canvasFacts(ctx)` gives the server's own
  * scrcpy, idb_companion and ffmpeg resolution (else `ctx.canvasFacts` or
- * `ctx.server.canvasFacts`, else "not resolved"); `now()` is the cache clock.
+ * `ctx.server.canvasFacts`, else "not resolved"); `now()` is the cache clock; `refreshMinMs`
+ * is the least time between two fresh checks that `?refresh=1` asks for.
  */
 export function createActivityApiRoute({
   python,
@@ -240,21 +246,31 @@ export function createActivityApiRoute({
   runHealth = null,
   canvasFacts = null,
   cacheMs = HEALTH_CACHE_MS,
+  refreshMinMs = HEALTH_REFRESH_MIN_MS,
   now = () => Date.now(),
 } = {}) {
   let cached = null;
   let cachedAt = -Infinity;
   let pending = null;
+  let refreshedAt = -Infinity;
+  // {value, cached}: cached is true when the answer came from an earlier run.
   const fallbackHealth = (refresh) => {
-    if (!refresh && cached && now() - cachedAt < cacheMs) return Promise.resolve(cached);
-    if (pending) return pending;
+    if (!refresh && cached && now() - cachedAt < cacheMs) return Promise.resolve({ value: cached, cached: true });
+    if (pending) return pending.then((value) => ({ value, cached: false }));
     const run = runHealth ? runHealth({ refresh }) : runToolHealth({ python, scriptsDir, env, refresh });
     pending = Promise.resolve(run).then((value) => {
       cached = value;
       cachedAt = now();
       return value;
     }).finally(() => { pending = null; });
-    return pending;
+    return pending.then((value) => ({ value, cached: false }));
+  };
+  // A fresh check is granted once per refreshMinMs for the whole Canvas, whoever asks.
+  const grantRefresh = () => {
+    const at = now();
+    if (at - refreshedAt < refreshMinMs) return false;
+    refreshedAt = at;
+    return true;
   };
 
   async function facts(ctx) {
@@ -267,10 +283,12 @@ export function createActivityApiRoute({
   }
 
   async function health(ctx) {
-    const refresh = ctx.url.searchParams.get("refresh") === "1";
+    const refresh = ctx.url.searchParams.get("refresh") === "1" && grantRefresh();
     const tools = primaryTools(ctx.registry);
     let checked = null;
     let error = null;
+    // The device's tools process keeps its own 60 s cache: only a granted refresh is fresh there.
+    let fromCache = !refresh;
     if (tools && typeof tools.call === "function") {
       const answer = await tools.call("health", { refresh }, "system");
       if (answer?.status === 200 && Array.isArray(answer.body?.result?.tools)) checked = answer.body.result;
@@ -278,7 +296,9 @@ export function createActivityApiRoute({
     }
     if (!checked) {
       try {
-        checked = await fallbackHealth(refresh);
+        const result = await fallbackHealth(refresh);
+        checked = result.value;
+        fromCache = result.cached;
         error = null;
       } catch (failure) {
         error = error ?? failure.message;
@@ -288,6 +308,7 @@ export function createActivityApiRoute({
       ok: true,
       checked_at: checked?.checked_at ?? null,
       tools: checked?.tools ?? [],
+      cached: Boolean(checked) && fromCache,
       canvas: await facts(ctx),
     };
     if (!checked) body.error = redactText(error, ERROR_MAX);

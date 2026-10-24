@@ -344,11 +344,20 @@ function formatCode(format) {
   return code;
 }
 
-/** Validated Start settings with defaults applied. */
+/**
+ * Validated Start settings with defaults applied. Normalizing twice gives the same result
+ * (a stream keeps normalized options and encodeVideoStreamStart normalizes them again), so
+ * fps 0, frames on change only, stays 0 and is not replaced by the default; a missing or
+ * null fps is the default.
+ */
 export function normalizeVideoOptions(options = {}) {
   const merged = { ...DEFAULT_VIDEO_OPTIONS, ...options };
   const out = { format: formatCode(merged.format) };
-  if (merged.fps !== undefined && merged.fps !== null && merged.fps !== 0) {
+  if (merged.fps === undefined || merged.fps === null) {
+    out.fps = DEFAULT_VIDEO_OPTIONS.fps;
+  } else if (merged.fps === 0) {
+    out.fps = 0;
+  } else {
     if (!Number.isInteger(merged.fps) || merged.fps < 1 || merged.fps > 240) {
       throw new RangeError("fps must be an integer from 1 to 240, or 0 for frames on change only.");
     }

@@ -243,6 +243,49 @@ class DoctorTests(unittest.TestCase):
 
 
 
+class FixCommandTests(unittest.TestCase):
+    """QW-06 / RISK-006 — the Canvas Setup checklist shows doctor's own fix
+    commands; exporting them changed nothing doctor prints."""
+
+    def test_exported_constants_keep_the_text_doctor_printed(self) -> None:
+        self.assertEqual(doctor.BREW_TRUST_HINT,
+                         "Homebrew refuses untrusted taps: brew tap facebook/fb && "
+                         "brew trust --formula facebook/fb/idb-companion && "
+                         "brew install idb-companion")
+        self.assertEqual(doctor.SCRCPY_INSTALL_HINT,
+                         "Install scrcpy 4.1 for the Mobile Canvas scrcpy transport: "
+                         "brew install scrcpy (macOS) or sudo apt-get install scrcpy (Linux); "
+                         "or point AUTONOM_SCRCPY_SERVER at a scrcpy-server-v4.1 file. "
+                         "Autonom never downloads it.")
+        self.assertEqual(doctor.XCODE_SELECT_FIX,
+                         "sudo xcode-select -s /Applications/Xcode.app/Contents/Developer")
+
+    def test_every_fix_command_is_text_doctor_prints(self) -> None:
+        # The bare-host doctor run of DoctorTests: nothing installed, every hint printed.
+        report = json.loads(DoctorTests._run(self, bare=True).stdout)
+        tools = report["tools"]
+        printed = {
+            "adb": tools["adb"]["install_hint"],
+            "idb_companion": tools["idb_companion"]["install_hint"],
+            "mitmdump": tools["mitmdump"]["install_hint"],
+            "scrcpy_server": report["optional_tools"]["scrcpy"]["install_hint"],
+            "xcrun_simctl": " ".join(str(check.get("fix") or "") for check in report["checks"]),
+        }
+        for macos in (True, False):
+            for name, text in printed.items():
+                with self.subTest(tool=name, macos=macos):
+                    command = doctor.fix_command(name, macos=macos)
+                    self.assertTrue(command)
+                    self.assertIn(command, text)
+        self.assertEqual(doctor.fix_command("adb", macos=True), tools["adb"]["install_hint"])
+        self.assertEqual(doctor.fix_command("scrcpy_server", macos=True), "brew install scrcpy")
+        self.assertEqual(doctor.fix_command("scrcpy_server", macos=False), "sudo apt-get install scrcpy")
+        self.assertEqual(doctor.fix_command("mitmdump", macos=True), "brew install mitmproxy")
+        self.assertEqual(doctor.fix_command("mitmdump", macos=False), "pipx install mitmproxy")
+        self.assertIsNone(doctor.fix_command("ffmpeg", macos=True))
+        self.assertIsNone(doctor.fix_command("emulator", macos=True))
+
+
 class XcodeSimulatorKitTests(unittest.TestCase):
     """IOS-001 — doctor detects the Xcode 27 SimulatorKit move.
 

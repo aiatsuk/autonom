@@ -106,6 +106,47 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
   (which keep their `@PORT`); the list is read again every 30 s.
   `--bootable-only` keeps it to the `--bootable` entries. Simulators show their
   name and iOS version.
+- **Canvas keyboard shortcuts.** The device page takes the Simulator.app
+  chords, Cmd on macOS and Ctrl elsewhere: Cmd+Shift+H Home, Cmd+L Lock,
+  Cmd+Up and Cmd+Down volume, Cmd+Left and Cmd+Right rotate, Cmd+S
+  screenshot and Cmd+R start or stop recording (as the Actions drawer's
+  buttons), and on Android Cmd+Backspace Back and Cmd+O Recent apps. A chord
+  runs the same path as its button, stops the browser's own action (save
+  page, reload) and never acts while focus is in a text field of the page;
+  it never reaches the device as a META or CTRL key. On iOS rotate says
+  "Rotate is not available on iOS yet" and sends nothing. Other chords keep
+  their behavior: Android gets them with their meta state, iOS ignores
+  them, Cmd/Ctrl+V pastes and the workspace's Ctrl+Alt hotkeys work. Button
+  tooltips name their chord and Device settings lists the shortcuts (10 on
+  Android, 6 on iOS).
+- **Canvas Display menu.** Device settings has Frame rate (60, 30, 15 fps,
+  and On change on iOS) and Size (Full, Half) for this device's stream,
+  sent as `{"t":"stream","fps":...,"size":...}` on `/ws/control`; the server
+  refuses other values with an error that names the allowed ones. iOS
+  changes the companion stream in place; Android restarts scrcpy with the
+  new max fps and max size and shows "Reconnecting…" until frames return (at
+  most 10 s). The choice is kept per device in the browser
+  (`autonom.canvas.display.<device id>`) and applied again after a reload;
+  an unfocused workspace tile uses the lower of the choice and the
+  background profile. `/status` adds `stream_settings`, the device summary
+  `display_choice`. Without a choice `--fps`, `--max-size` and the defaults
+  apply as before.
+- **Canvas Setup checklist.** The Activity tab's Tool health list is now a
+  Setup checklist grouped Android, iOS and Optional, each item OK, Problem
+  or Missing, with the command that fixes it and a Copy button; the Canvas
+  never runs the command. `/api/health` entries add `fix` (the command
+  `autonom doctor` prints, or its hint) and `group`, and the answer adds
+  `cached`. While the tab is visible and a needed item is not OK the list
+  checks again every 5 s with `?refresh=1`, which the server grants once per
+  5 s per Canvas, and stops when the items are OK or the tab is hidden. An
+  empty workspace with a needed tool missing shows Set up, which opens the
+  checklist.
+- **Live check for the three.** `tests/live/canvas_quick_wins_live.mjs
+  --platform android --create-avd` or `--platform ios --create-simulator`
+  creates its own AVD or Simulator, checks the shortcuts, the Display menu
+  and (Android) the checklist ticking by itself in a real browser, writes
+  `canvas-quick-wins-<platform>.json` to `--evidence-dir` and deletes the
+  device again; `--help` touches no device.
 
 ### Changed
 - **The interrupt envelope has a code and a hint.** A command cut by Ctrl-C

@@ -996,9 +996,13 @@ class ToolHealthTests(ActionsCase):
         self.assertEqual([entry["name"] for entry in result["tools"]], list(tool_health.TOOL_NAMES))
         for entry in result["tools"]:
             self.assertEqual(set(entry), {"name", "found", "path", "version", "ok", "needed_for",
-                                          "error", "hint"})
+                                          "error", "hint", "group", "fix"})
+            self.assertEqual(entry["group"], tool_health.GROUPS[entry["name"]])
             if entry["ok"]:
                 self.assertTrue(entry["found"])
+                self.assertIsNone(entry["fix"])
+            elif entry["error"] != tool_health.MACOS_ONLY:
+                self.assertTrue(entry["fix"], entry["name"])
         adb = next(entry for entry in result["tools"] if entry["name"] == "adb")
         self.assertEqual((adb["found"], adb["ok"], adb["path"]), (True, True, FAKE_ADB))
         self.assertIn("Android Debug Bridge", adb["version"])
@@ -1047,6 +1051,56 @@ class ToolHealthTests(ActionsCase):
         self.set_env(AUTONOM_SCRCPY_SERVER=str(self.tmp / "missing"))
         entry = tool_health._scrcpy_server()  # noqa: SLF001
         self.assertEqual((entry["found"], entry["ok"]), (False, False))
+
+    def test_groups_follow_the_setup_checklist(self) -> None:
+        self.assertEqual(tool_health.GROUPS, {
+            "adb": "android", "emulator": "android", "scrcpy_server": "android",
+            "xcrun_simctl": "ios", "idb_companion": "ios",
+            "ffmpeg": "optional", "mitmdump": "optional"})
+        self.assertEqual(set(tool_health.GROUPS), set(tool_health.TOOL_NAMES))
+
+    def test_missing_scrcpy_server_carries_its_install_command(self) -> None:
+        """QW-06-S01: a scrcpy-server path that does not exist is Missing with a fix."""
+        self.set_env(AUTONOM_SCRCPY_SERVER=str(self.tmp / "absent" / "scrcpy-server-v4.1"),
+                     SCRCPY_SERVER_PATH=None)
+        for macos, command in ((True, "brew install scrcpy"), (False, "sudo apt-get install scrcpy")):
+            with self.subTest(macos=macos), mock.patch.object(tool_health, "_macos", return_value=macos):
+                entry = tool_health._scrcpy_server()  # noqa: SLF001
+                self.assertEqual((entry["found"], entry["ok"], entry["group"]), (False, False, "android"))
+                self.assertEqual(entry["fix"], command)
+                self.assertEqual(entry["fix"], doctor.fix_command("scrcpy_server", macos=macos))
+
+    def test_each_fix_is_doctors_command_and_never_runs(self) -> None:
+        """RISK-006: every fix string is pinned to doctor's (or this module's own
+        install text for the tools doctor does not check); building an entry runs nothing."""
+        for macos in (True, False):
+            with mock.patch.object(tool_health, "_macos", return_value=macos), \
+                    mock.patch.object(subprocess, "run", side_effect=AssertionError("ran")), \
+                    mock.patch.object(subprocess, "Popen", side_effect=AssertionError("ran")):
+                for name in tool_health.TOOL_NAMES:
+                    with self.subTest(tool=name, macos=macos):
+                        entry = tool_health._entry(name, found=False, error="not found",  # noqa: SLF001
+                                                   hint="the probe's hint")
+                        doctors = doctor.fix_command(name, macos=macos)
+                        if doctors:
+                            self.assertEqual(entry["fix"], doctors)
+                        elif name == "ffmpeg":
+                            self.assertEqual(entry["fix"], "brew install ffmpeg" if macos
+                                             else "sudo apt-get install ffmpeg")
+                            self.assertIn(entry["fix"], tool_health.FFMPEG_HINT)
+                        else:
+                            self.assertEqual(entry["fix"], "the probe's hint")
+                        ok = tool_health._entry(name, found=True, path="/x", version="1", ok=True)  # noqa: SLF001
+                        self.assertIsNone(ok["fix"])
+                        self.assertIsNone(ok["hint"])
+        self.assertEqual(tool_health.fix_for("emulator"), tool_health.EMULATOR_HINT)
+
+    def test_ios_tools_off_macos_have_no_fix(self) -> None:
+        with mock.patch.object(tool_health, "_macos", return_value=False):
+            for name in ("xcrun_simctl", "idb_companion"):
+                entry = tool_health.PROBES[name]()
+                self.assertEqual((entry["error"], entry["fix"], entry["group"]),
+                                 (tool_health.MACOS_ONLY, None, "ios"))
 
     def test_the_module_prints_one_json_line(self) -> None:
         self.set_env(AUTONOM_ADB=FAKE_ADB)

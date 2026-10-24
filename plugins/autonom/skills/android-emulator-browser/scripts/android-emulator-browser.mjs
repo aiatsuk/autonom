@@ -13,8 +13,10 @@ import {
   DeviceRegistry,
   FocusController,
   MAX_DEVICES,
+  beginDisplayApply,
   deviceIdFor,
   devicePath,
+  displayChoiceNeedsRestart,
   profileVideo,
   splitDevicePath,
 } from "./canvas-devices.mjs";
@@ -66,6 +68,7 @@ import {
   fallbackReason,
   findAdb,
   findExecutable,
+  halfSizeBase,
   handleRequest,
   handleUpgrade,
   iosHidWrite,
@@ -223,6 +226,7 @@ export async function startCanvas(options, hooks = {}, { processHandlers = true,
   server.discoveryPath = null;
   server.stopping = null;
   server.profileName = (context) => profileNameOf(server, context.id);
+  server.setStreamChoice = (context, choice) => setStreamChoice(server, context, choice);
   server.deviceStatus = (context) => deviceStatusOf(server, context);
   server.bridgeFailed = (id) => {
     const entry = server.registry?.get(id);
@@ -264,6 +268,13 @@ export async function startCanvas(options, hooks = {}, { processHandlers = true,
   } else {
     const context = createDeviceContext(server, legacyDevice);
     server.legacyContext = context;
+    // The single device has no focus plan; its Display menu choices are applied by one of
+    // its own, so they restart the stream as rarely as a workspace device's (QW-04).
+    server.streamPlanner = new FocusController({
+      apply: (id, profile) => applyProfile(server, id, profile),
+      busy: () => Boolean(context.devicePointers.size || context.iosFinger),
+    });
+    server.streamPlanner.add(context.id);
     // The registry entry of the one device (its create returns the context made above), so
     // /api reads and the /d/<id>/ aliases see it. A serial outside the id rule has no entry.
     try {
@@ -881,9 +892,63 @@ function profileNameOf(server, id) {
 }
 
 function profileOf(server, entry) {
+  const focused = profileNameOf(server, entry.id) === "focused";
+  return entry.context ? streamProfile(server, entry.context, focused)
+    : profileVideo({ platform: entry.platform, focused, options: server.options });
+}
+
+/**
+ * The stream profile of a device context: its focus profile combined with its Display menu
+ * choice (QW-05); with no choice exactly the focus profile.
+ */
+function streamProfile(server, context, focused, choice = context.displayChoice ?? null) {
   return profileVideo({
-    platform: entry.platform, focused: profileNameOf(server, entry.id) === "focused", options: server.options,
+    platform: context.options.platform, focused, options: server.options, choice,
+    baseMaxSize: choice?.size === "half" ? halfSizeBase(context) : null,
   });
+}
+
+/** The context of device `id`: its registry entry's, or the single-device Canvas's own. */
+function contextOf(server, id) {
+  return server.registry.get(id)?.context ?? (server.legacyContext?.id === id ? server.legacyContext : null);
+}
+
+/**
+ * A Display menu choice for a device (QW-04): kept on its context, and when it changed, the
+ * stream is restarted with it through the focus plan (or the single device's own plan), which
+ * allows one restart per RESTART_MIN_INTERVAL_MS. An unchanged choice (sent again when a page
+ * reconnects) restarts nothing, unless the last restart did not apply it and none runs now:
+ * then it is tried once more. Answers the settings the stream gets.
+ */
+function setStreamChoice(server, context, choice) {
+  const previous = context.displayChoice;
+  const next = { fps: choice.fps, size: choice.size };
+  const restart = displayChoiceNeedsRestart(context, next);
+  context.displayChoice = next;
+  if (restart) {
+    const planner = server.focus ?? server.streamPlanner;
+    if (!planner?.refresh(context.id)) {
+      context.displayChoice = previous;
+      throw new Error("The device's stream cannot be changed now.");
+    }
+  }
+  const profile = streamProfile(server, context, profileNameOf(server, context.id) === "focused");
+  const ios = context.options.platform === "ios";
+  return {
+    fps: profile.fps,
+    max_size: ios ? null : Number.isFinite(profile.maxSize) ? profile.maxSize : null,
+    scale_factor: ios ? profile.scaleFactor : null,
+  };
+}
+
+/**
+ * The frame rate a device streams with under `profile`: the profile's (what the companion or
+ * scrcpy is sent, 0 for frames on change) on a fast transport; on multipart --fps, capped by
+ * the profile's when that is above 0 (frames on change caps nothing there, as multipartFps).
+ */
+function fpsCapOf(context, profile, multipart) {
+  if (!multipart || !context) return profile.fps;
+  return profile.fps > 0 ? Math.min(context.options.fps, profile.fps) : context.options.fps;
 }
 
 /**
@@ -893,11 +958,13 @@ function profileOf(server, entry) {
 function appliedProfileOf(server, entry, multipart) {
   const applied = server.focus?.appliedOf(entry.id) ?? null;
   if (!applied) return null;
-  const profile = profileVideo({ platform: entry.platform, focused: applied.profile === "focused", options: server.options });
+  const profile = entry.context
+    ? streamProfile(server, entry.context, applied.profile === "focused", entry.context.displayApplied ?? null)
+    : profileVideo({ platform: entry.platform, focused: applied.profile === "focused", options: server.options });
   const context = entry.context;
   return {
     profile: profile.profile,
-    fps_cap: multipart && context ? Math.min(context.options.fps, profile.fps) : profile.fps,
+    fps_cap: fpsCapOf(context, profile, multipart),
     max_size: entry.platform === "android" && Number.isFinite(profile.maxSize) ? profile.maxSize : null,
     scale_factor: entry.platform === "ios" ? profile.scaleFactor : null,
     applied_at: applied.applied_at,
@@ -923,7 +990,7 @@ function deviceSummary(server, entry) {
     focused: server.focus?.focus === entry.id,
     profile: profile.profile,
     transport,
-    fps_cap: multipart && context ? Math.min(context.options.fps, profile.fps) : profile.fps,
+    fps_cap: fpsCapOf(context, profile, multipart),
     max_size: entry.platform === "android" && Number.isFinite(profile.maxSize) ? profile.maxSize : null,
     scale_factor: entry.platform === "ios" ? profile.scaleFactor : null,
     control_owner: context?.state.controlOwner ?? "shared",
@@ -937,6 +1004,8 @@ function deviceSummary(server, entry) {
     attached_at: entry.attachedAt,
     // The profile the stream runs now (the fields above are the planned one).
     profile_applied: appliedProfileOf(server, entry, multipart),
+    // The Display menu choice of this device ({fps, size}, QW-05), null for none.
+    display_choice: context?.displayChoice ? { ...context.displayChoice } : null,
     // The host control lease and the bound session (contract 6.7); null before the device is live.
     lease: context?.lease ? leaseStatus(context) : null,
     session_stopped: context?.lease ? (refreshSession(context), sessionStoppedOf(context)) : false,
@@ -1420,6 +1489,8 @@ async function restoreDevice(server, entry, { delays = RESTORE_DELAYS_MS, origin
       const log = beginLog(server, { device: entry.id, kind: "device", name: "restore", origin, summary: `restore ${entry.id}` });
       try {
         const focused = server.focus.profileOf(entry.id) === "focused";
+        // The Display menu choice outlives the context it was made on.
+        const choice = old?.displayChoice ?? null;
         const context = await deviceScope.run({ id: entry.id }, async () => {
           const tool = entry.platform === "ios" ? await iosTool(server) : await androidTool(server);
           const options = {
@@ -1429,7 +1500,14 @@ async function restoreDevice(server, entry, { delays = RESTORE_DELAYS_MS, origin
           const device = await resolveDeviceOptions(options, { platform: entry.platform, target: entry.target });
           device.name = entry.name;
           device.profile = profileVideo({ platform: entry.platform, focused, options: server.options });
-          return createDeviceContext(server, device);
+          const created = createDeviceContext(server, device);
+          if (choice) {
+            // Its streams open with the choice, so it counts as applied.
+            created.displayChoice = choice;
+            created.displayApplied = choice;
+            created.profile = streamProfile(server, created, focused);
+          }
+          return created;
         });
         if (server.registry.get(entry.id) !== entry || entry.state === "detaching") {
           await closeDeviceContext(context);
@@ -1502,12 +1580,17 @@ async function streamingWithin(context, timeoutMs) {
  * reports the profile as applied only after a restart that worked.
  */
 async function applyProfile(server, id, profileName) {
-  const entry = server.registry.get(id);
-  const context = entry?.context;
+  const context = contextOf(server, id);
   if (!context) return false;
-  const profile = profileVideo({ platform: entry.platform, focused: profileName === "focused", options: server.options });
-  context.profile = profile;
-  const log = beginLog(server, { device: id, kind: "stream", name: "profile", origin: "system", summary: `${id} ${profileName}` });
+  const choice = context.displayChoice ?? null;
+  const profile = streamProfile(server, context, profileName === "focused", choice);
+  // The single-device Canvas keeps its CLI settings (no profile) until a choice is made.
+  context.profile = server.mode === "workspace" || choice ? profile : null;
+  const rate = choice?.fps === 0 ? "on change" : choice?.fps === null ? "own fps" : `${choice?.fps} fps`;
+  const summary = choice ? `${id} ${profileName} ${rate} ${choice.size}` : `${id} ${profileName}`;
+  const log = beginLog(server, { device: id, kind: "stream", name: "profile", origin: "system", summary });
+  // Only the newest of overlapping restarts records the choice it applied.
+  const settle = beginDisplayApply(context, choice);
   try {
     const session = context.session;
     let ok = true;
@@ -1517,17 +1600,21 @@ async function applyProfile(server, id, profileName) {
       ok = restarted === true || context.videoClients.size === 0;
     } else if (session && chooseTransport(context) === "scrcpy") {
       const wanted = context.videoClients.size > 0 || context.controlClients.size > 0;
-      await deviceScope.run({ id }, async () => {
+      const restart = async () => {
         await stopSession(context);
         if (wanted) ensureSession(context);
-      });
+      };
+      // A workspace device's failure stays its own (deviceScope); the single device has no scope.
+      await (server.mode === "workspace" ? deviceScope.run({ id }, restart) : restart());
       if (wanted) ok = await streamingWithin(context, PROFILE_STREAM_WAIT_MS);
     }
     broadcastState(context);
+    settle(ok);
     if (ok) log.end({ ok: true });
     else log.end({ ok: false, errorCode: "backend_failed", error: "the stream did not restart with the new profile" });
     return ok;
   } catch (error) {
+    settle(false);
     log.end({ ok: false, errorCode: "backend_failed", error: error.message });
     return false;
   }

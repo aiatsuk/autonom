@@ -9,6 +9,7 @@ import { Script, createContext } from "node:vm";
 import {
   EMPTY_WORKSPACE_TEXT,
   LAYOUTS,
+  SETUP_PROMPT_TEXT,
   hotkey,
   normalizeModel,
   parseTabPath,
@@ -1376,4 +1377,124 @@ test("Workspace settings and Inspector stay synchronized with embedded panel clo
   assert.equal(settings.getAttribute("aria-pressed"),"true","foreign messages cannot change panel state");
   page.message(frame,{type:"autonom:panels",id:ANDROID,settings:false});
   assert.equal(settings.getAttribute("aria-pressed"),"false");
+});
+
+// --- Setup link on the empty workspace (QW-08) -------------------------------------------------
+
+const ADB_MISSING = { name: "adb", found: false, path: null, version: null, ok: false, group: "android", needed_for: "every Android device action",
+  error: "adb not found on PATH", hint: "Install Android platform-tools, or pass --adb /path/to/adb. Run 'autonom doctor'.",
+  fix: "Install Android platform-tools, or pass --adb /path/to/adb. Run 'autonom doctor'." };
+const ADB_FINE = { ...ADB_MISSING, found: true, path: "/x/adb", version: "1.0.41", ok: true, error: null, hint: null, fix: null };
+const SIMCTL_OFF = { name: "xcrun_simctl", found: false, path: null, version: null, ok: false, group: "ios", needed_for: "iOS", error: "macOS only", hint: null, fix: null };
+const FFMPEG_MISSING = { name: "ffmpeg", found: false, path: null, version: null, ok: false, group: "optional", needed_for: "fallback", error: "not found", hint: null, fix: "brew install ffmpeg" };
+
+function healthServer(tools, extra = {}) {
+  const server = new FakeCanvas(extra);
+  server.health = tools;
+  server.overrides.push((method, path) => method === "GET" && path.startsWith("/api/health")
+    ? { status: 200, body: { ok: true, checked_at: "2026-10-23T07:00:00Z", cached: false, canvas: {}, tools: server.health } }
+    : null);
+  return server;
+}
+const healthGets = (page) => page.calls.filter((call) => call.method === "GET" && call.path.startsWith("/api/health"));
+
+describe("Set up on the empty workspace", () => {
+  test("markup: the prompt, the link and the checklist start hidden and carry their names", () => {
+    const document = parseMarkup(workspaceMarkup({}));
+    const prompt = document.getElementById("ws-setup-prompt");
+    assert.ok(prompt.hidden);
+    assert.equal(prompt.textContent, SETUP_PROMPT_TEXT + "Set up");
+    const link = document.getElementById("ws-setup-link");
+    assert.equal(link.getAttribute("aria-controls"), "ws-setup");
+    assert.ok(document.getElementById("ws-setup").hidden);
+    assert.equal(document.getElementById("ws-setup-title").textContent, "Setup");
+    assert.match(workspaceStyles(), /\.setup-command\{/);
+  });
+
+  test("no device and adb missing: Set up is visible and opens the checklist (QW-08-S01)", async () => {
+    const page = await started({ server: healthServer([ADB_MISSING, SIMCTL_OFF, FFMPEG_MISSING]) });
+    assert.equal(page.$("ws-empty").hidden, false);
+    assert.equal(page.$("ws-setup-prompt").hidden, false);
+    assert.deepEqual(healthGets(page).map((call) => call.path), ["/api/health"]);
+    click(page.$("ws-setup-link"));
+    await flush();
+    assert.equal(page.$("ws-setup").hidden, false);
+    assert.equal(page.$("ws-setup-prompt").hidden, true);
+    assert.equal(page.$("ws-setup-link").getAttribute("aria-expanded"), "true");
+    assert.equal(page.document.activeElement, page.$("ws-setup-title"));
+    const rows = page.$("ws-setup-list").querySelectorAll("li");
+    assert.deepEqual(rows.map((row) => row.getAttribute("data-tool")), ["adb", "xcrun_simctl", "ffmpeg"]);
+    assert.equal(rows[0].querySelector(".setup-badge").textContent, "Missing");
+    assert.equal(rows[0].querySelector(".setup-command").textContent, ADB_MISSING.fix);
+    assert.equal(rows[1].querySelector(".setup-fix"), null, "macOS only has nothing to run");
+    assert.equal(healthGets(page).at(-1).path, "/api/health?refresh=1", "opening checks again");
+    assert.equal(page.$("ws-notice").hidden, true);
+  });
+
+  test("the open checklist re-checks every 5 s until adb is OK, then stops; closing brings the link back", async () => {
+    const page = await started({ server: healthServer([ADB_MISSING]) });
+    click(page.$("ws-setup-link"));
+    await flush();
+    const opened = healthGets(page).length;
+    await page.timers.tick(5000);
+    assert.equal(healthGets(page).length, opened + 1);
+    assert.match(page.$("ws-setup-time").textContent, /checking again every 5 s/);
+    page.server.health = [ADB_FINE];
+    await page.timers.tick(5000);
+    assert.equal(healthGets(page).length, opened + 2);
+    assert.equal(page.$("ws-setup-list").querySelector(".setup-badge").textContent, "OK");
+    await page.timers.tick(30000);
+    assert.equal(healthGets(page).length, opened + 2, "stops once everything needed is OK");
+    click(page.$("ws-setup-close"));
+    await flush();
+    assert.equal(page.$("ws-setup").hidden, true);
+    assert.equal(page.$("ws-setup-prompt").hidden, true, "nothing missing: no link");
+  });
+
+  test("closed checklist or hidden window: no re-checks", async () => {
+    const page = await started({ server: healthServer([ADB_MISSING]) });
+    await page.timers.tick(30000);
+    assert.equal(healthGets(page).length, 1, "the link alone does not poll");
+    click(page.$("ws-setup-link"));
+    await flush();
+    const opened = healthGets(page).length;
+    page.document.visibilityState = "hidden";
+    dispatch(page.document, "visibilitychange");
+    await page.timers.tick(30000);
+    assert.equal(healthGets(page).length, opened);
+    click(page.$("ws-setup-close"));
+    await flush();
+    assert.equal(page.$("ws-setup-prompt").hidden, false, "still missing: the link is back");
+  });
+
+  test("only optional tools or tools this computer cannot run missing: no Set up", async () => {
+    const page = await started({ server: healthServer([ADB_FINE, SIMCTL_OFF, FFMPEG_MISSING]) });
+    assert.equal(healthGets(page).length, 1);
+    assert.equal(page.$("ws-setup-prompt").hidden, true);
+  });
+
+  test("with a device there is no Set up and no health request; attaching one hides the checklist", async () => {
+    const withDevice = await started({ server: healthServer([ADB_MISSING], {
+      tabs: [{ id: TAB_1, name: "Canvas 1", layout: 1, slots: [{ device: ANDROID, present: true }] }], devices: [summary(ANDROID)] }) });
+    assert.equal(withDevice.$("ws-setup-prompt").hidden, true);
+    assert.equal(healthGets(withDevice).length, 0);
+    const server = healthServer([ADB_MISSING]);
+    const page = await started({ server });
+    click(page.$("ws-setup-link"));
+    await flush();
+    server.tabs[0].slots[0] = { device: ANDROID, present: true };
+    server.devices.set(ANDROID, summary(ANDROID));
+    await page.timers.tick(1000);
+    assert.equal(page.$("ws-setup").hidden, true);
+    assert.equal(page.$("ws-setup-prompt").hidden, true);
+    const seen = healthGets(page).length;
+    await page.timers.tick(30000);
+    assert.equal(healthGets(page).length, seen);
+  });
+
+  test("a Canvas without /api/health shows no link and no error", async () => {
+    const page = await started({ server: new FakeCanvas() });
+    assert.equal(page.$("ws-setup-prompt").hidden, true);
+    assert.equal(page.$("ws-notice").hidden, true);
+  });
 });

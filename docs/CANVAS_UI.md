@@ -55,11 +55,19 @@ polling, validation and destructive confirmation remain domain behavior.
 ## Verification
 
     node --test tests/canvas-ui.test.mjs tests/canvas-dropdown.test.mjs tests/canvas-theme-page.test.mjs tests/canvas-tools-page.test.mjs tests/canvas-actions.test.mjs tests/canvas-workspace-page.test.mjs
+    node --test tests/canvas-shortcuts.test.mjs tests/canvas-display-menu.test.mjs
     node --test --test-name-pattern='^(page:|display: the Android page)' tests/browser-scrcpy.test.mjs
     make check
 
 Inspect both themes, narrow/wide panels, tabs, dropdown dismissal and disabled
 controls. Presentation checks do not need device/network mutation.
+
+The live check of the shortcuts, the Display menu and the Setup checklist,
+`tests/live/canvas_quick_wins_live.mjs`, creates its own AVD or Simulator, uses
+it and deletes it again; `--help` lists its flags without touching a device.
+It deletes only a device its own create made: after a failed create it reports
+an AVD or Simulator of its name instead of deleting it, and on Ctrl+C or
+SIGTERM it waits for a create still running so the new device does not stay.
 
 ## Workspace parity
 
@@ -127,3 +135,74 @@ not a measured compositor performance result.
 ### Device language
 
 Device settings uses the shared dropdown for the system language. Opening settings reads the current language from the selected device; an unlisted current language is retained in the options. Android applies changes through the shell configuration API and verifies them. iOS asks before restarting Simulator, preserves the region and other preferences, and refuses a restart during recording. This is independent of per-app language overrides.
+
+### Keyboard shortcuts
+
+The device page maps the Simulator.app chords, with Cmd on macOS and Ctrl
+elsewhere (`canvas-shortcuts.mjs`, matched by `KeyboardEvent.code`, so every
+layout behaves the same):
+
+| Chord | Action | Platforms |
+| --- | --- | --- |
+| Cmd+Shift+H | Home | Android, iOS |
+| Cmd+L | Lock (Power) | Android, iOS |
+| Cmd+Up / Cmd+Down | Volume up / down | Android, iOS |
+| Cmd+Left / Cmd+Right | Rotate | Android (iOS says "Rotate is not available on iOS yet" and sends nothing) |
+| Cmd+S | Screenshot, as the Capture button | Android, iOS |
+| Cmd+R | Start or stop recording, as the Record button | Android, iOS |
+| Cmd+Backspace | Back | Android |
+| Cmd+O | Recent apps | Android |
+
+A chord acts while the device screen or the page has focus, never while focus
+is in a text field, text area, select or editable element of the page. It runs
+the matching button's own path (a hidden or disabled button does nothing) and
+stops the browser's default action, such as save page or reload. Screenshot and
+record go to the Actions drawer as an `autonom:capture` event, so its busy and
+control rules apply. On Android the modifier's key down is held back until the
+next key shows the chord, so a shortcut never reaches the device as a META or
+CTRL key; any other chord goes to the device as before, with its meta state.
+Ctrl+Alt (the workspace hotkeys and AltGr) never matches, and Cmd/Ctrl+V still
+pastes. Each button with a chord names it in its tooltip ("Home (⌘⇧H)"), and
+Device settings lists the shortcuts of the page's platform: 10 on Android, 6 on
+iOS.
+
+### Display menu
+
+Device settings has a Display group (`canvas-display-menu.mjs`) with Frame rate
+(60, 30 and 15 fps, and on iOS also On change, which sends frames only when the
+screen changes) and Size (Full or Half), built on the shared dropdown and
+showing what the stream uses now. A choice applies to this device's stream
+only, sent as `{"t":"stream","fps":…,"size":…}` on `/ws/control`. Half is half
+the long side the Android stream uses at full size, and half scale on iOS. iOS
+changes the running companion stream in place. Android restarts scrcpy with the
+new max fps and max size and the page shows "Reconnecting…" until frames
+return, at most 10 s; restarts follow the 3 s restart spacing, so quick changes
+share one. The server accepts only the
+listed values and answers anything else with an error that names them; the
+page shows it and forgets the refused choice.
+
+The choice is kept in this browser under `autonom.canvas.display.<device id>`
+and sent again whenever the control socket opens (a reload or reconnect). A
+workspace tile that is not focused uses the lower of the choice and the
+background profile (30 fps, half size). `/status` `stream_settings` and the
+device summary's `display_choice` report it. Without a choice the stream uses
+the defaults and the `--fps` and `--max-size` flags exactly as before.
+
+### Setup checklist
+
+The Activity tab shows a Setup checklist in place of the old Tool health list:
+Android (adb, emulator, scrcpy-server), iOS (xcrun simctl, idb_companion) and
+Optional (ffmpeg, mitmdump), each OK, Problem or Missing. An item that is not
+OK shows the command that fixes it with a Copy button, from the new `fix` field
+of the `/api/health` entry (the commands `autonom doctor` prints, or its hint
+when there is no single command). The page copies the text only; the Canvas
+never runs it.
+
+While the tab is visible and an item the device's platform needs is not OK, the
+list checks itself again every 5 s with `/api/health?refresh=1`. The server
+grants one uncached check per 5 s per Canvas and answers other requests from
+its cache (`cached: true`). Re-checking stops once the needed items are OK or
+the tab, drawer or browser tab is hidden, and an item that becomes OK ticks
+without a click; Check again stays. When the workspace has no device and a
+needed Android or iOS tool is not OK, the empty view says so and offers Set up,
+which opens the same checklist there.

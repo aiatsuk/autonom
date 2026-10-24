@@ -1,4 +1,5 @@
 import { CANVAS_ICONS, canvasIcon, canvasDomScript } from "./canvas-ui.mjs";
+import { setupChecklistScript, setupChecklistStyles } from "./canvas-actions-page.mjs";
 import { themeControl, themeHead, themeStyles } from "./canvas-theme-page.mjs";
 
 // The workspace page of the Mobile Canvas (contract section 4 of run canvas-multi-device): the
@@ -20,6 +21,8 @@ export const LAYOUTS = Object.freeze({
 
 export const EMPTY_WORKSPACE_TEXT = "Attach a device or boot one. The Canvas keeps running when devices leave; " +
   "stop it with Ctrl+C or `autonom canvas stop`.";
+// Shown under the empty-workspace text while /api/health reports a needed tool not OK.
+export const SETUP_PROMPT_TEXT = "A tool the Canvas needs is missing or not working.";
 
 const TAB_ID_PATTERN = /^t_[0-9a-f]{8}$/;
 const WORKSPACE_NAME_PATTERN = /^[A-Za-z0-9._-]{1,40}$/;
@@ -141,6 +144,13 @@ a{color:inherit}
 /* stage and tiles */
 .ws-stage{display:flex;flex-direction:column;gap:12px;min-height:0;padding:12px;overflow:hidden}
 .ws-lead{margin:0;padding:10px 14px;border-radius:var(--r-md);background:var(--surface);border:1px solid var(--line);color:var(--text);max-width:75ch}
+.ws-setup-prompt{display:flex;align-items:center;flex-wrap:wrap;gap:4px 10px}
+.ws-link{height:auto;padding:0;border:0;background:none;color:var(--accent);font-weight:600;text-decoration:underline;text-underline-offset:2px}
+.ws-setup{flex:none;max-height:60%;overflow:auto}
+.ws-setup-head{display:flex;align-items:center;gap:8px}
+.ws-setup-head h2{flex:1;margin:0;font-size:14px}
+.ws-setup-time{margin:8px 0 0;color:var(--text-2);font-size:12px}
+${setupChecklistStyles()}
 .ws-grid{flex:1;min-height:0;display:grid;gap:12px;grid-template-columns:minmax(0,1fr);grid-template-rows:minmax(0,1fr)}
 .ws-grid[data-layout="2"]{grid-template-columns:repeat(2,minmax(0,1fr))}
 .ws-grid[data-layout="3"]{grid-template-columns:repeat(3,minmax(0,1fr))}
@@ -245,6 +255,12 @@ export function workspaceMarkup(model) {
 </section>
 <main class="ws-stage" id="ws-stage" role="tabpanel" tabindex="-1">
   <p class="ws-lead" id="ws-empty" hidden>${escapeHtml(EMPTY_WORKSPACE_TEXT)}</p>
+  <p class="ws-lead ws-setup-prompt" id="ws-setup-prompt" hidden><span>${escapeHtml(SETUP_PROMPT_TEXT)}</span><button type="button" class="ws-link" id="ws-setup-link" aria-controls="ws-setup" aria-expanded="false">Set up</button></p>
+  <section class="ws-lead ws-setup" id="ws-setup" aria-labelledby="ws-setup-title" hidden>
+    <div class="ws-setup-head"><h2 id="ws-setup-title" tabindex="-1">Setup</h2><button type="button" class="ws-icon" id="ws-setup-refresh" aria-label="Check tools again" title="Check again">${svg("refresh")}</button><button type="button" class="ws-icon" id="ws-setup-close" aria-label="Close setup" title="Close setup">${svg("close")}</button></div>
+    <div class="setup" id="ws-setup-list" role="group" aria-labelledby="ws-setup-title"></div>
+    <p class="ws-setup-time" id="ws-setup-time" hidden></p>
+  </section>
   <div class="ws-grid" id="ws-grid" data-layout="1"></div>
 </main>
 <p class="ws-notice" id="ws-notice" role="status" aria-live="polite" hidden></p>
@@ -786,6 +802,7 @@ function render(){
   renderLayout(tab);
   renderTiles(tab);
   ui.empty.hidden=devicesList().length+absentList().length>0;
+  syncSetup();
   syncTimers();
 }
 
@@ -809,7 +826,7 @@ document.addEventListener("keydown",event=>{
 });
 // iOS Safari applies :active (the press feedback) only while the document has a touch listener.
 document.addEventListener("touchstart",()=>{},{passive:true});
-document.addEventListener("visibilitychange",()=>{if(visible())refresh();syncTimers()});
+document.addEventListener("visibilitychange",()=>{if(visible())refresh();syncTimers();setupChecker.sync()});
 window.addEventListener("focus",()=>{if(focusedId&&tileFor(focusedId))api("POST","/api/focus",{id:focusedId}).catch(()=>{})});
 window.addEventListener("popstate",()=>{const id=parseTabPath(location.pathname);if(id===undefined)return;selectTab(id===null?(ws&&ws.active_tab)||currentTab:id,false)});
 window.addEventListener("message",event=>{
@@ -830,6 +847,24 @@ settingsButton.addEventListener("click",()=>showSettings(settingsPanel.hidden));
 $("ws-settings-close").addEventListener("click",()=>showSettings(false,true));
 document.addEventListener("pointerdown",event=>{if(!settingsPanel.hidden&&!settingsPanel.contains(event.target)&&!settingsButton.contains(event.target))showSettings(false)});
 document.addEventListener("keydown",event=>{if(event.key==="Escape"&&!event.defaultPrevented&&!settingsPanel.hidden){event.preventDefault();showSettings(false,true)}});
+// --- setup checklist -----------------------------------------------------------------------
+// With no device attached, the empty view reads /api/health once; when a needed Android or iOS
+// tool is not OK it offers Set up, which opens the checklist here (there is no device drawer to
+// open). While it is open and visible it re-checks itself; fix commands are only shown and copied.
+${setupChecklistScript()}
+const setupUi={prompt:$("ws-setup-prompt"),link:$("ws-setup-link"),panel:$("ws-setup"),title:$("ws-setup-title"),list:$("ws-setup-list"),time:$("ws-setup-time"),refresh:$("ws-setup-refresh"),close:$("ws-setup-close")};
+let setupAsked=false;
+function setupShown(){return!ui.empty.hidden}
+function setupNeedsHelp(){const last=setupChecker.last;return Boolean(last&&setupMissing(last.tools,null).length)}
+function syncSetupPrompt(){const show=setupShown()&&setupUi.panel.hidden&&setupNeedsHelp();if(setupUi.prompt.hidden===show)setupUi.prompt.hidden=!show}
+function renderSetup(result){renderSetupChecklist(setupUi.list,result&&result.tools);const parts=[];if(result&&result.checked_at){const at=new Date(result.checked_at);if(!isNaN(at))parts.push("Checked at "+at.toLocaleTimeString([],{hour:"2-digit",minute:"2-digit",second:"2-digit"}))}if(result&&result.error)parts.push(String(result.error));if(setupChecker.wanted())parts.push("checking again every "+Math.round(SETUP_POLL_MS/1000)+" s");setText(setupUi.time,parts.join(" · "));setupUi.time.hidden=!parts.length;syncSetupPrompt()}
+const setupChecker=createSetupChecker({fetch:refresh=>api("GET","/api/health"+(refresh?"?refresh=1":"")),render:renderSetup,visible:()=>setupShown()&&!setupUi.panel.hidden&&visible(),platforms:()=>null});
+function showSetup(open,focus){setupUi.panel.hidden=!open;setAttr(setupUi.link,"aria-expanded",open);syncSetupPrompt();if(open){if(focus&&setupUi.title.focus)setupUi.title.focus();setupChecker.load(true)}else{if(focus&&!setupUi.prompt.hidden)setupUi.link.focus();setupChecker.sync()}}
+function syncSetup(){if(setupShown()){if(!setupAsked){setupAsked=true;setupChecker.load(false)}}else{setupAsked=false;if(!setupUi.panel.hidden)showSetup(false,false)}syncSetupPrompt();setupChecker.sync()}
+setupUi.link.addEventListener("click",()=>showSetup(true,true));
+setupUi.close.addEventListener("click",()=>showSetup(false,true));
+setupUi.refresh.addEventListener("click",()=>setupChecker.load(true));
+
 async function bootstrap(){if(!(await authenticate()))return;await refresh();syncTimers()}
 bootstrap().catch(showError);`;
 }

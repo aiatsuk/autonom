@@ -6,7 +6,10 @@ import {
   DEFAULT_FPS,
   DEFAULT_MAX_SIZE,
   SOFTWARE_ENCODER_MAX_SIZE,
+  STREAM_FPS,
+  STREAM_FPS_ANDROID,
   STREAM_KEYCODES,
+  STREAM_SIZES,
   encodeAdbText,
   extractJpegFrames,
   generateToken,
@@ -209,6 +212,30 @@ test("control messages are validated strictly and keep only known fields", () =>
   for (const [raw, type] of rejects) {
     assert.throws(() => parseControlMessage(raw), (error) => error.for === type, raw.slice(0, 60));
   }
+});
+
+test("stream messages (QW-04) carry only the Display menu's values; 0 (On change) is refused on Android", () => {
+  assert.deepEqual([...STREAM_FPS], [60, 30, 15, 0]);
+  assert.deepEqual([...STREAM_FPS_ANDROID], [60, 30, 15]);
+  assert.deepEqual([...STREAM_SIZES], ["full", "half"]);
+  const parse = (message, platform) => parseControlMessage(JSON.stringify(message), { platform });
+  // Valid values keep only fps and size.
+  assert.deepEqual(parse({ t: "stream", fps: 15, size: "half", extra: 1 }, "android"), { t: "stream", fps: 15, size: "half" });
+  assert.deepEqual(parse({ t: "stream", fps: 0, size: "full" }, "ios"), { t: "stream", fps: 0, size: "full" });
+  assert.deepEqual(parse({ t: "stream", fps: 60, size: "full" }), { t: "stream", fps: 60, size: "full" });
+  // fps null keeps the stream's own frame rate (a Size picked alone), on both platforms.
+  assert.deepEqual(parse({ t: "stream", fps: null, size: "half" }, "android"), { t: "stream", fps: null, size: "half" });
+  assert.deepEqual(parse({ t: "stream", fps: null, size: "full" }, "ios"), { t: "stream", fps: null, size: "full" });
+  // QW-04-S03: anything else is refused with an error for "stream" that names the allowed values.
+  const refused = (message, platform, pattern) => assert.throws(() => parse(message, platform),
+    (error) => error.for === "stream" && pattern.test(error.message), JSON.stringify(message));
+  refused({ t: "stream", fps: 45, size: "full" }, "ios", /fps must be one of: 60, 30, 15, 0 .*or null to keep the stream's own frame rate/);
+  refused({ t: "stream", fps: 45, size: "full" }, "android", /fps must be one of: 60, 30, 15 /);
+  refused({ t: "stream", fps: 0, size: "full" }, "android", /iOS only/);
+  refused({ t: "stream", fps: "15", size: "full" }, "ios", /fps must be one of/);
+  refused({ t: "stream", size: "full" }, "ios", /fps must be one of/);
+  refused({ t: "stream", fps: 15, size: "quarter" }, "ios", /size must be one of: full, half/);
+  refused({ t: "stream", fps: 15 }, "android", /size must be one of/);
 });
 
 // Workspace and multi-device options (contract 3.5); appended, the tests above are unchanged.

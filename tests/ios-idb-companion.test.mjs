@@ -260,7 +260,7 @@ test("invalid Start options and HID events are refused", () => {
   assert.throws(() => normalizeVideoOptions({ avgBitrate: 0 }), RangeError);
   assert.throws(() => normalizeVideoOptions({ format: "vp9" }), RangeError);
   assert.throws(() => normalizeVideoOptions({ format: 42 }), RangeError);
-  assert.equal(normalizeVideoOptions({ fps: null }).fps, undefined);
+  assert.equal(normalizeVideoOptions({ fps: null }).fps, DEFAULT_VIDEO_OPTIONS.fps, "a null fps is the default");
   assert.equal(normalizeVideoOptions({ format: VIDEO_FORMAT.MJPEG }).format, 2);
   assert.throws(() => encodeHidEvent({ touch: { x: -1, y: 0 }, direction: "down" }), RangeError);
   assert.throws(() => encodeHidEvent({ touch: { x: 1, y: Infinity }, direction: "down" }), TypeError);
@@ -819,6 +819,50 @@ test("restart() sends Stop, then a new Start, and the same iterator continues", 
   await waitFor(() => state.videoCalls.every((c) => !c.running), { message: "both encoders stopped" });
   assert.equal(state.leaks, 0);
   await assert.rejects(stream.restart(), /closed/);
+});
+
+test("fps 0 (frames on change) survives normalizing twice and goes out as fps 0, not the default 60", () => {
+  const once = normalizeVideoOptions({ fps: 0, scaleFactor: 0.5 });
+  assert.equal(once.fps, 0);
+  assert.deepEqual(normalizeVideoOptions(once), once, "normalizing is idempotent");
+  for (const fps of [0, 15, 30, 60]) {
+    const options = normalizeVideoOptions({ fps, scaleFactor: 0.5 });
+    assert.deepEqual(normalizeVideoOptions(options), options, `fps ${fps}`);
+    // What a stream sends: its kept (normalized) options, encoded (and normalized) again.
+    assert.equal(decodeVideoStreamRequest(encodeVideoStreamStart(options)).fps, fps, `fps ${fps} on the wire`);
+  }
+  // Without an fps the Start keeps today's default.
+  assert.equal(normalizeVideoOptions({}).fps, 60);
+  assert.equal(decodeVideoStreamRequest(encodeVideoStreamStart(normalizeVideoOptions({}))).fps, 60);
+  assert.equal(hex(encodeVideoStreamStart(normalizeVideoOptions())), GOLDEN.start, "the default Start is unchanged");
+});
+
+test("a stream opened or restarted with fps 0 sends Start with fps 0, and its options say so", async (t) => {
+  const { endpoint, state } = await fakeServer(t);
+  const client = clientFor(t, endpoint);
+  const stream = await client.openVideoStream({ fps: 0, scaleFactor: 0.5 });
+  await stream.next();
+  assert.equal(state.starts.length, 1);
+  assert.equal(state.starts[0].fps, 0, "the first Start asks for frames on change");
+  assert.equal(state.starts[0].scaleFactor, 0.5);
+  assert.equal(stream.options.fps, 0);
+  // A frame rate change in place, then back to frames on change, as the Canvas Display menu does.
+  await stream.restart({ options: { ...stream.options, fps: 15 } });
+  await waitFor(() => state.starts.length === 2, { message: "second Start" });
+  assert.equal(state.starts[1].fps, 15);
+  assert.equal(stream.options.fps, 15);
+  await stream.restart({ options: { fps: 0, scaleFactor: 1 } });
+  await waitFor(() => state.starts.length === 3, { message: "third Start" });
+  assert.equal(state.starts[2].fps, 0, "a restart with fps 0 is not turned into 60");
+  assert.equal(state.starts[2].scaleFactor, 1);
+  assert.equal(stream.options.fps, 0);
+  // A plain restart (a forced key frame) keeps fps 0.
+  await stream.restart();
+  await waitFor(() => state.starts.length === 4, { message: "fourth Start" });
+  assert.equal(state.starts[3].fps, 0);
+  await stream.stop();
+  await waitFor(() => state.videoCalls.every((c) => !c.running), { message: "encoders stopped" });
+  assert.equal(state.leaks, 0);
 });
 
 /** A video call whose Stop write fails, as on a call the transport can no longer carry. */

@@ -89,6 +89,12 @@ export const SYSTEM_OPS = Object.freeze([
   "notifications", "quick-settings", "collapse", "rotate", "keyframe",
 ]);
 export const CONTROL_MODES = Object.freeze(["pause", "resume", "takeover", "release"]);
+// The Display menu's stream settings (QW-04): frame rates in menu order, where 0 sends frames
+// only when the screen changes (the idb companion's mode, so iOS only), and the sizes. A stream
+// message's fps may also be null: a Size picked alone keeps the stream's own frame rate.
+export const STREAM_FPS = Object.freeze([60, 30, 15, 0]);
+export const STREAM_FPS_ANDROID = Object.freeze([60, 30, 15]);
+export const STREAM_SIZES = Object.freeze(["full", "half"]);
 export const ORIGINS = Object.freeze(["human", "agent", "replay", "system"]);
 
 // `idb` is the iOS Simulator fast transport (idb_companion H.264); scrcpy and screenrecord
@@ -559,8 +565,9 @@ const INT32_MAX = 0x7fff_ffff;
 /**
  * Parse and strictly validate one control WebSocket message. Returns a normalized
  * copy with only the known fields; throws an error whose `for` names the message type.
+ * `platform` ("android" or "ios"), when known, narrows what a stream message may ask for.
  */
-export function parseControlMessage(raw) {
+export function parseControlMessage(raw, { platform = null } = {}) {
   let message;
   try {
     message = JSON.parse(raw);
@@ -619,6 +626,15 @@ export function parseControlMessage(raw) {
       return { t: type, op: choice(message, "op", SYSTEM_OPS) };
     case "control":
       return { t: type, mode: choice(message, "mode", CONTROL_MODES) };
+    case "stream": {
+      const allowed = platform === "android" ? STREAM_FPS_ANDROID : STREAM_FPS;
+      if (message.fps !== null && !allowed.includes(message.fps)) {
+        fail(type, `fps must be one of: ${allowed.join(", ")}` +
+          (platform === "android" ? " (0, frames on change, is for iOS only)" : " (0 sends frames on change, iOS only)") +
+          ", or null to keep the stream's own frame rate.");
+      }
+      return { t: type, fps: message.fps, size: choice(message, "size", STREAM_SIZES) };
+    }
     case "ping":
       return { t: type, ts: bounded(message, "ts", -Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER) };
     default:
