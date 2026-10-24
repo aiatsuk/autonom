@@ -1,6 +1,7 @@
 import { canvasIcon as svg, canvasTabList, canvasTabPanel, canvasDomScript } from "./canvas-ui.mjs";
 // The Actions drawer contains capture controls and gallery (Capture tab), plus the
-// command log and tool health (Activity tab). App management belongs outside Capture.
+// command log and the Setup checklist of device tools (Activity tab). App management belongs
+// outside Capture.
 // Four functions provide markup, styles and behavior through hooks.pageExtensions.
 // The markup holds no device data; the script renders everything with textContent, never
 // innerHTML. Actions, Tools and the inspector share one column and are mutually exclusive.
@@ -12,6 +13,14 @@ const RECORD_POLL_MS = 2000;
 // plus the start's own wait for a limit-ended recording to be saved.
 const RECORD_RECHECKS = 150;
 const RECORD_LIMIT_S = 180;
+// The Setup checklist re-checks this long after its last answer while it is visible and a
+// needed tool is not OK; the Canvas grants one uncached check per 5 s (canvas-activity.mjs).
+export const SETUP_POLL_MS = 5000;
+export const SETUP_GROUPS = Object.freeze([
+  Object.freeze({ id: "android", label: "Android" }),
+  Object.freeze({ id: "ios", label: "iOS" }),
+  Object.freeze({ id: "optional", label: "Optional" }),
+]);
 
 export const ACTIONS_TABS = Object.freeze([
   Object.freeze({ id: "capture", label: "Capture" }),
@@ -26,6 +35,52 @@ function platformOf(context) {
 }
 
 
+
+/**
+ * The Setup checklist shared by the Activity tab and the empty workspace: plain JavaScript for
+ * an inline script (no backticks, no backslashes, no closing tags) that needs `el` and
+ * `makeButton` from canvasDomScript(). It defines:
+ * - renderSetupChecklist(root, tools): the /api/health entries grouped Android, iOS, Optional,
+ *   each OK, Problem or Missing, with the entry's `fix` command and a Copy button when not OK.
+ *   The command is text only: the page copies it and never runs it.
+ * - setupMissing(tools, platforms): the needed entries that are not OK. Needed: the Android or
+ *   iOS entries of the given platforms, or with none attached every Android and iOS entry
+ *   this computer can run. Optional entries never count.
+ * - createSetupChecker({fetch(refresh), render(result), visible(), platforms(), error?}): load()
+ *   and sync(); while visible() and setupMissing() is not empty it re-checks with a refresh
+ *   SETUP_POLL_MS after the last answer, and stops when nothing needed is missing or hidden.
+ */
+export function setupChecklistScript() {
+  const groups = JSON.stringify(SETUP_GROUPS.map((group) => [group.id, group.label]));
+  return `const SETUP_POLL_MS=${SETUP_POLL_MS},SETUP_GROUPS=${groups};
+const SETUP_GROUP_OF={adb:"android",emulator:"android",scrcpy_server:"android",xcrun_simctl:"ios",idb_companion:"ios",ffmpeg:"optional",mitmdump:"optional"};
+const SETUP_LABELS={scrcpy_server:"scrcpy-server",xcrun_simctl:"xcrun simctl"};
+function setupGroup(tool){const group=tool&&tool.group;return group==="android"||group==="ios"||group==="optional"?group:SETUP_GROUP_OF[tool&&tool.name]||"optional"}
+function setupNeeded(tool,platforms){if(!tool||typeof tool!=="object")return false;const group=setupGroup(tool);if(group==="optional")return false;if(platforms&&platforms.length)return platforms.indexOf(group)>=0;return tool.error!=="macOS only"}
+function setupMissing(tools,platforms){return(Array.isArray(tools)?tools:[]).filter(tool=>setupNeeded(tool,platforms)&&!tool.ok)}
+function setupState(tool){return tool.ok?"OK":tool.found?"Problem":"Missing"}
+async function setupCopy(value){if(typeof navigator==="undefined"||!navigator||!navigator.clipboard||typeof navigator.clipboard.writeText!=="function")return false;try{await navigator.clipboard.writeText(value);return true}catch{return false}}
+function setupItem(tool){const state=setupState(tool),label=SETUP_LABELS[tool.name]||String(tool.name||"tool"),row=el("li","setup-item");row.setAttribute("data-state",state.toLowerCase());row.setAttribute("data-tool",String(tool.name||""));row.appendChild(el("span","setup-name",label));const badge=el("span","setup-badge",state);badge.setAttribute("data-ok",String(Boolean(tool.ok)));row.appendChild(badge);const fix=!tool.ok&&typeof tool.fix==="string"?tool.fix.trim():"";const hint=!tool.ok&&tool.hint&&(!fix||String(tool.hint).indexOf(fix)<0)?String(tool.hint):null;const detail=[tool.version||tool.error,hint,tool.needed_for?"For "+tool.needed_for:null].filter(Boolean).join(" · ");row.title=detail;if(!tool.ok&&detail)row.appendChild(el("span","setup-meta",detail));if(fix){const box=el("div","setup-fix"),command=el("code","setup-command",fix),copy=makeButton("Copy","btn small setup-copy",{"aria-label":"Copy the command that fixes "+label,title:"Copy this command to run it yourself"}),status=el("span","setup-copied");status.setAttribute("role","status");copy.addEventListener("click",async()=>{status.textContent=await setupCopy(fix)?"Copied":"Select the command to copy it"});box.appendChild(command);box.appendChild(copy);box.appendChild(status);row.appendChild(box)}return row}
+function renderSetupChecklist(root,tools){if(!root)return;const list=Array.isArray(tools)?tools.filter(tool=>tool&&typeof tool==="object"):[];root.textContent="";for(const pair of SETUP_GROUPS){const items=list.filter(tool=>setupGroup(tool)===pair[0]);if(!items.length)continue;const section=el("section","setup-group");section.setAttribute("data-group",pair[0]);section.appendChild(el("h4","setup-group-title",pair[1]));const listNode=el("ul","setup-list");listNode.setAttribute("aria-label",pair[1]);for(const tool of items)listNode.appendChild(setupItem(tool));section.appendChild(listNode);root.appendChild(section)}}
+function createSetupChecker(options){const setup={timer:null,busy:false,last:null};function wanted(){return Boolean(setup.last&&options.visible()&&setupMissing(setup.last.tools,options.platforms()).length)}function sync(){const want=wanted();if(want&&!setup.timer&&!setup.busy)setup.timer=setTimeout(()=>{setup.timer=null;if(wanted())load(true);else sync()},SETUP_POLL_MS);if(!want&&setup.timer){clearTimeout(setup.timer);setup.timer=null}}async function load(refresh){if(setup.busy)return;setup.busy=true;if(setup.timer){clearTimeout(setup.timer);setup.timer=null}let result=null,failed=false;try{result=await options.fetch(Boolean(refresh))}catch(error){failed=true;if(options.error)options.error(error)}setup.busy=false;try{if(!failed){setup.last=result||null;options.render(setup.last)}}finally{sync()}}return{load,sync,wanted,get last(){return setup.last},get polling(){return Boolean(setup.timer)}}}`;
+}
+
+/** Styles of the Setup checklist on the page tokens (light and dark come from the theme). */
+export function setupChecklistStyles() {
+  return `.setup-group+.setup-group{margin-top:10px}
+.setup-group-title{margin:8px 0 2px;color:var(--text-2);font-size:12px;font-weight:600}
+.setup-list{list-style:none;margin:0;padding:0}
+.setup-item{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:4px 8px;padding:8px 0;border-top:1px solid var(--line);min-width:0}
+.setup-list .setup-item:first-child{border-top:0}
+.setup-name{min-width:0;overflow-wrap:anywhere;font-size:13px}
+.setup-badge{font-size:12px;font-weight:600;white-space:nowrap}
+.setup-badge[data-ok=true]{color:var(--success)}.setup-badge[data-ok=false]{color:var(--danger)}
+.setup-meta{grid-column:1/-1;color:var(--text-2);font-size:12px;overflow-wrap:anywhere}
+.setup-fix{grid-column:1/-1;display:flex;align-items:center;gap:8px;min-width:0;flex-wrap:wrap}
+.setup-command{flex:1 1 180px;min-width:0;padding:4px 8px;border-radius:var(--r-sm);background:var(--fill);font:11.5px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;overflow-wrap:anywhere;user-select:all;-webkit-user-select:all}
+.setup-copied{color:var(--text-2);font-size:12px}
+.setup-copied:empty{display:none}`;
+}
 
 /** Quick capture controls share the drawer's operations and state. */
 export function actionsDock() {
@@ -73,9 +128,9 @@ function activityPanel() {
       `<p class="act-hint" id="actions-activity-dropped" hidden></p>` +
     `</div>` +
     `<div class="act-group">` +
-      `<div class="act-group-head"><h3 id="actions-health-title">Tool health</h3>` +
+      `<div class="act-group-head"><h3 id="actions-health-title">Setup</h3>` +
       `<button type="button" class="icon act-icon" id="actions-health-refresh" title="Check again" aria-label="Check tools again">${svg("refresh")}</button></div>` +
-      `<ul class="act-list" id="actions-health" aria-labelledby="actions-health-title"></ul>` +
+      `<div class="setup" id="actions-health" role="group" aria-labelledby="actions-health-title"></div>` +
       `<p class="act-hint" id="actions-health-time" hidden></p>` +
     `</div>`);
 }
@@ -153,6 +208,7 @@ body.actions-open aside.side{display:none}
 .act-log-result{white-space:nowrap;font-variant-numeric:tabular-nums}
 .act-log li[data-ok=false] .act-log-result{color:var(--a-danger)}
 .act-log-detail{grid-column:2/-1;color:var(--text-2);overflow-wrap:anywhere}
+${setupChecklistStyles()}
 /* Narrow windows retain desktop density in a bounded overlay. */
 @media (max-width:760px){
   .actions .icon.actions-toggle{display:grid}
@@ -166,11 +222,14 @@ body.actions-open aside.side{display:none}
  * The drawer's code: plain JavaScript appended to the page script. It is written inside this
  * template literal, so it avoids backticks and its escapes are doubled. It reads the page
  * globals url, $, csrf, view, canSendInput, note, BASE, EMBED and DEVICE_ID (the last three
- * may be absent on a page without devices routes) and keeps its names in one function scope.
+ * may be absent on a page without devices routes), and shortcutHint when the device page has
+ * shortcuts, and keeps its names in one function scope. The device page's Cmd+S and Cmd+R reach
+ * it as an autonom:capture event ({action: "screenshot" | "record"}), which it marks handled.
  */
 export function actionsScript() {
   return `(function(){
 "use strict";
+${setupChecklistScript()}
 const ROW_LIMIT=${ACTIVITY_ROW_LIMIT},ACTIVITY_MS=${ACTIVITY_POLL_MS},RECORD_MS=${RECORD_POLL_MS},RECORD_RECHECKS=${RECORD_RECHECKS},RECORD_LIMIT=${RECORD_LIMIT_S};
 const drawer=$("actions"),toggle=$("actions-toggle");
 if(!drawer||!toggle)return;
@@ -202,6 +261,8 @@ function showOk(panel,value,hint){message(panel,"ok",value,hint||"");if(panel===
 function bytes(value){const n=Number(value)||0;if(n<1024)return n+" B";if(n<1048576)return(n/1024).toFixed(0)+" KB";if(n<1073741824)return(n/1048576).toFixed(1)+" MB";return(n/1073741824).toFixed(2)+" GB"}
 function clock(ms){const s=Math.max(0,Math.floor(ms/1000));return Math.floor(s/60)+":"+String(s%60).padStart(2,"0")}
 function timeOf(iso){const d=new Date(iso);return isNaN(d)?"":d.toLocaleTimeString([],{hour:"2-digit",minute:"2-digit",second:"2-digit"})}
+// The chord of a capture shortcut for a tooltip, " (⌘S)", when the device page has shortcuts.
+function chord(action){try{return typeof shortcutHint==="function"?shortcutHint(action):""}catch{return""}}
 function baseName(path){const parts=String(path||"").split("/");return parts[parts.length-1]||String(path||"")}
 
 // Device changes follow the page's control rule; the reason shows while they are off.
@@ -212,10 +273,10 @@ async function mutate(control,op,payload){if(!allowed()){syncLock();return null}
 
 // Drawer and tabs (arrows, Home and End move between tabs; Escape closes).
 function selectTab(name,focus){const index=TABS.indexOf(name);if(index<0)return;state.tab=name;canvasSelectTab(tabs,panels,index,focus);onTabShown(name);syncPolling()}
-function onTabShown(name){if(!state.open)return;if(name==="capture"){loadRecordStatus();loadGallery()}else{pollActivity();if(!state.health.loaded)loadHealth(false)}}
+function onTabShown(name){if(!state.open)return;if(name==="capture"){loadRecordStatus();loadGallery()}else{pollActivity();if(!state.health.loaded)health.load(false)}}
 function closeTools(){if(!document.body.classList.contains("tools-open"))return;const close=$("tools-close");if(close&&typeof close.click==="function")close.click()}
 function setOpen(open,returnFocus){open=Boolean(open);if(state.open===open)return;if(open)closeTools();state.open=open;drawer.hidden=!open;document.body.classList.toggle("actions-open",open);toggle.setAttribute("aria-pressed",String(open));toggle.title=open?"Hide device actions":"Device actions";if(inspectorToggle)inspectorToggle.setAttribute("aria-pressed",String(!open&&!document.body.classList.contains("no-inspector")&&!document.body.classList.contains("tools-open")));if(open){syncLock();state.lockTimer=setInterval(syncLock,500);const tab=tabs[TABS.indexOf(state.tab)];if(tab)tab.focus();onTabShown(state.tab)}else{clearInterval(state.lockTimer);state.lockTimer=null;if(returnFocus)toggle.focus()}syncPolling()}
-function syncPolling(){const activity=state.open&&state.tab==="activity";if(activity&&!state.activity.timer)state.activity.timer=setInterval(pollActivity,ACTIVITY_MS);if(!activity&&state.activity.timer){clearInterval(state.activity.timer);state.activity.timer=null}syncRecordTimers()}
+function syncPolling(){const activity=state.open&&state.tab==="activity";if(activity&&!state.activity.timer)state.activity.timer=setInterval(pollActivity,ACTIVITY_MS);if(!activity&&state.activity.timer){clearInterval(state.activity.timer);state.activity.timer=null}health.sync();syncRecordTimers()}
 toggle.addEventListener("click",()=>setOpen(!state.open,false));
 $("actions-close").addEventListener("click",()=>setOpen(false,true));
 // The Tools drawer and the inspector take the same column: opening either closes this one.
@@ -233,9 +294,10 @@ function showPrune(count){const box=$("actions-prune");if(!box)return;if(!count)
 async function takeScreenshot(){const result=await mutate($("actions-shot"),"capture.screenshot",typeof captureFrameOptions==="function"?captureFrameOptions():{});if(!result||!result.capture)return;showOk("capture",savedText(result.capture),result.warning||"");if(result.pruned&&result.pruned.length)showPrune(result.pruned.length);loadGallery()}
 $("actions-shot").addEventListener("click",takeScreenshot);
 if(dockShot)dockShot.addEventListener("click",takeScreenshot);
+for(const button of [$("actions-shot"),dockShot])if(button)button.title+=chord("screenshot");
 
 // Recording: one per device; the elapsed time counts locally, the status is re-read every 2 s.
-function syncRecordButton(){const button=$("actions-record");button.textContent=state.record.active?"Stop recording":"Record";button.setAttribute("aria-pressed",String(state.record.active));if(dockRecord){const label=state.record.active?"Stop recording":"Start recording";dockRecord.setAttribute("aria-label",label);dockRecord.setAttribute("title",label);dockRecord.setAttribute("aria-pressed",String(state.record.active))}if(!state.record.active)text("actions-rec-time","")}
+function syncRecordButton(){const button=$("actions-record");button.textContent=state.record.active?"Stop recording":"Record";button.setAttribute("aria-pressed",String(state.record.active));button.title="Record video on this computer, up to 3 minutes"+chord("record");if(dockRecord){const label=state.record.active?"Stop recording":"Start recording";dockRecord.setAttribute("aria-label",label);dockRecord.setAttribute("title",label+chord("record"));dockRecord.setAttribute("aria-pressed",String(state.record.active))}if(!state.record.active)text("actions-rec-time","")}
 function renderElapsed(){if(!state.record.active)return;text("actions-rec-time","Recording "+clock(Date.now()-state.record.started)+" / "+clock(RECORD_LIMIT*1000))}
 function syncRecordTimers(){const on=(state.open||Boolean(dockRecord))&&state.record.active;if(on&&!state.record.tick){state.record.tick=setInterval(renderElapsed,1000);state.record.poll=setInterval(loadRecordStatus,RECORD_MS)}if(!on&&state.record.tick){clearInterval(state.record.tick);clearInterval(state.record.poll);state.record.tick=null;state.record.poll=null}}
 function setRecording(active,startedAt,elapsed){state.record.known=true;state.record.active=active;if(active){const parsed=Date.parse(startedAt||"");state.record.started=typeof elapsed==="number"?Date.now()-elapsed:(isNaN(parsed)?Date.now():parsed)}syncRecordButton();renderElapsed();syncRecordTimers();syncLock()}
@@ -246,6 +308,8 @@ function retryRecordStatus(){if(state.record.unsure<=0||state.record.retry)retur
 function confirmRecordState(){state.record.unsure=RECORD_RECHECKS;loadRecordStatus()}
 async function toggleRecording(){const button=$("actions-record");if(button.getAttribute("data-busy")==="1"||(dockRecord&&!state.record.known))return;state.record.revision+=1;if(!state.record.active){const result=await mutate(button,"record.start",typeof captureFrameOptions==="function"?captureFrameOptions():{});if(result&&result.recording){setRecording(true,result.recording.started_at);showOk("capture","Recording. Press Stop recording to save it.")}else if(!result){confirmRecordState()}return}const result=await mutate(button,"record.stop",{});if(!result){confirmRecordState();return}setRecording(false);if(result.capture)showOk("capture",savedText(result.capture)+" ("+clock(result.duration_ms||0)+")",result.warning||(result.ended_early?"The recording reached its 3 minute limit before you stopped it.":""));if(result.pruned&&result.pruned.length)showPrune(result.pruned.length);loadGallery()}
 $("actions-record").addEventListener("click",toggleRecording);
+// Cmd+S and Cmd+R on the device page: the same calls as the buttons, under the same rules.
+if(typeof window!=="undefined"&&typeof window.addEventListener==="function")window.addEventListener("autonom:capture",event=>{const action=event&&event.detail&&event.detail.action;if(action!=="screenshot"&&action!=="record")return;if(typeof event.preventDefault==="function")event.preventDefault();if(action==="screenshot")takeScreenshot();else toggleRecording()});
 if(dockRecord){dockRecord.addEventListener("click",toggleRecording);setInterval(()=>{syncLock();if(hasCsrf()&&!state.record.active)loadRecordStatus()},RECORD_MS)}
 
 $("actions-open-folder").addEventListener("click",async()=>{message("capture");try{const result=await call("captures.open_directory",{});if(result.opened)showOk("capture","Opened the captures folder in Finder.");else message("capture","error","The folder was not opened.","")}catch(error){showError("capture",error)}});
@@ -261,9 +325,15 @@ function resetActivity(){state.activity.generation+=1;state.activity.after=0;sta
 $("actions-failures").addEventListener("change",()=>{resetActivity();pollActivity()});
 $("actions-activity-clear").addEventListener("click",async()=>{try{await request("POST","/api/activity/clear",{});resetActivity();pollActivity()}catch(error){showError("activity",error)}});
 
-// Tool health.
-async function loadHealth(refresh){if(state.health.busy)return;state.health.busy=true;try{const result=await request("GET","/api/health"+(refresh?"?refresh=1":""));state.health.loaded=true;const list=$("actions-health");list.replaceChildren();for(const tool of result.tools||[]){const row=el("li");row.appendChild(el("span","act-item-title",tool.name));const badge=el("span","act-badge",tool.ok?"OK":tool.found?"Problem":"Missing");badge.setAttribute("data-ok",String(Boolean(tool.ok)));row.appendChild(badge);const detail=[tool.version||tool.error,tool.ok?null:tool.hint,"For "+tool.needed_for].filter(Boolean).join(" · ");row.title=detail;if(!tool.ok)row.appendChild(el("span","act-item-meta",detail));list.appendChild(row)}text("actions-health-time",result.checked_at?"Checked at "+timeOf(result.checked_at)+(result.error?" · "+result.error:""):(result.error||""));$("actions-health-refresh").title=$("actions-health-time").textContent||"Check tools again";$("actions-health-time").hidden=!result.error}catch(error){showError("activity",error)}finally{state.health.busy=false}}
-$("actions-health-refresh").addEventListener("click",()=>loadHealth(true));
+// Setup checklist: this device's platform decides which tools are needed. While the Activity
+// tab is visible and one of them is not OK it re-checks itself; it stops once they are OK, or
+// while the drawer, the tab or the browser tab is hidden. Fix commands are shown and copied only.
+function healthVisible(){return state.open&&state.tab==="activity"&&!(typeof document!=="undefined"&&document.visibilityState==="hidden")}
+function healthPlatforms(){return[drawer.getAttribute("data-platform")==="ios"?"ios":"android"]}
+function renderHealth(result){state.health.loaded=true;renderSetupChecklist($("actions-health"),result&&result.tools);const parts=[];if(result&&result.checked_at)parts.push("Checked at "+timeOf(result.checked_at));if(result&&result.error)parts.push(result.error);if(health.wanted())parts.push("checking again every "+Math.round(SETUP_POLL_MS/1000)+" s");const value=parts.join(" · ");text("actions-health-time",value);$("actions-health-time").hidden=!value;$("actions-health-refresh").title=value||"Check tools again"}
+const health=createSetupChecker({fetch:refresh=>request("GET","/api/health"+(refresh?"?refresh=1":"")),render:renderHealth,visible:healthVisible,platforms:healthPlatforms,error:error=>showError("activity",error)});
+$("actions-health-refresh").addEventListener("click",()=>health.load(true));
+if(typeof document!=="undefined"&&typeof document.addEventListener==="function")document.addEventListener("visibilitychange",()=>health.sync());
 syncRecordButton();
 })();`;
 }

@@ -288,8 +288,16 @@ export function createDeviceContext(server, device) {
     server,
     id,
     name: device.name ?? serial,
-    // The workspace stream profile (profileVideo), null on the single-device Canvas.
+    // The workspace stream profile (profileVideo), null on the single-device Canvas until a
+    // Display menu choice is made there.
     profile: device.profile ?? null,
+    // The Display menu choice ({fps, size}, QW-04) the stream should use, null for none, and
+    // the one its newest finished restart applied; displaySeq counts restarts and
+    // displayApplying is true while the newest one runs.
+    displayChoice: null,
+    displayApplied: null,
+    displaySeq: 0,
+    displayApplying: false,
     actionBridge,
     tools,
     session: null,
@@ -904,6 +912,7 @@ async function sendStatus(context, response) {
     input_paused: context.state.inputPaused,
     scrcpy: scrcpyStatus(context),
     idb: idbStatus(context),
+    stream_settings: streamSettings(context),
     tools: context.tools.status(),
     lease: leaseStatus(context),
     session_stopped: (refreshSession(context), sessionStoppedOf(context)),
@@ -1841,10 +1850,45 @@ function catchUpState(context, client) {
   client.ws.send(stateMessage(context));
 }
 
-/** The multipart frame rate: --fps, capped by the focus profile of a workspace device. */
+/**
+ * The multipart frame rate: --fps, capped by the stream profile (a workspace focus profile
+ * or a Display menu choice); 0, frames on change, is a companion mode and caps nothing here.
+ */
 function multipartFps(context) {
   const cap = context.profile?.fps;
-  return Number.isFinite(cap) ? Math.min(context.options.fps, cap) : context.options.fps;
+  return Number.isFinite(cap) && cap > 0 ? Math.min(context.options.fps, cap) : context.options.fps;
+}
+
+/**
+ * The long side, in px, an Android stream of this device uses at full size: the base the
+ * Display menu's Half halves. --max-size when set, else the size the encoders chose, else
+ * the device's screen; null while none is known (a native size before the screen is read).
+ */
+export function halfSizeBase(context) {
+  const { options } = context;
+  if (options.maxSizeExplicit && options.maxSize > 0) return options.maxSize;
+  const chosen = context.state.fullStreamSize?.maxSize;
+  if (chosen > 0) return chosen;
+  const display = context.display;
+  if (display?.width > 0 && display?.height > 0) return Math.max(display.width, display.height);
+  return null;
+}
+
+/**
+ * The stream settings /status reports (QW-04): the Display choice (null for none) and the
+ * frame rate, Android size (0 is native, null until known) or iOS scale the stream uses.
+ */
+function streamSettings(context) {
+  const ios = isIosCanvas(context);
+  const profile = context.profile ?? null;
+  const fast = FAST_TRANSPORTS.has(chooseTransport(context));
+  const fastFps = profile ? profile.fps : context.options.fpsExplicit ? context.options.fps : DEFAULT_SCRCPY_MAX_FPS;
+  return {
+    choice: context.displayChoice ? { ...context.displayChoice } : null,
+    fps: fast ? fastFps : multipartFps(context),
+    max_size: ios ? null : Number.isFinite(profile?.maxSize) ? profile.maxSize : streamSizeInUse(context)?.maxSize ?? null,
+    scale_factor: ios ? profile?.scaleFactor ?? 1 : null,
+  };
 }
 
 /** Start the device server (or companion) for the first WebSocket client; at most one per Canvas. */
@@ -1861,6 +1905,9 @@ function ensureSession(context) {
   const profileSize = Number.isFinite(profile?.maxSize) ? profile.maxSize : null;
   if (profileSize !== null && transport === "scrcpy") {
     context.state.streamSize = { maxSize: profileSize, source: "profile", encoder: null, encoderName: null };
+  } else if (transport === "scrcpy" && context.state.streamSize?.source === "profile") {
+    // Back at full size: the size before the profile's, until the encoders are read again.
+    context.state.streamSize = options.maxSizeExplicit ? streamMaxSize(options) : context.state.fullStreamSize ?? null;
   }
   const session = transport === "idb"
     ? new IosFastSession({
@@ -1881,6 +1928,7 @@ function ensureSession(context) {
       // Without --max-size the size follows the device's encoder (DEC-005).
       chooseMaxSize: options.maxSizeExplicit || profileSize !== null ? null : (probe) => {
         context.state.streamSize = streamMaxSize(options, probe);
+        context.state.fullStreamSize = context.state.streamSize;
         logStreamSize(context);
         return context.state.streamSize.maxSize;
       },
@@ -2908,9 +2956,9 @@ function dropsRefusedPointer(context, client, message) {
  * The shared parser knows device input only; a display change is this server's own
  * message, and its preset is checked once its sender may change the display.
  */
-function parseCanvasMessage(raw) {
+function parseCanvasMessage(context, raw) {
   try {
-    return parseControlMessage(raw);
+    return parseControlMessage(raw, { platform: context.options.platform });
   } catch (error) {
     if (error.for !== "display") throw error;
     return { t: "display", preset: JSON.parse(raw).preset };
@@ -2920,7 +2968,7 @@ function parseCanvasMessage(raw) {
 function handleControlMessage(context, client, raw) {
   let message;
   try {
-    message = parseCanvasMessage(raw);
+    message = parseCanvasMessage(context, raw);
   } catch (error) {
     reply(context, client, { t: "error", message: error.message, for: error.for ?? null });
     return;
@@ -2989,6 +3037,10 @@ function dispatchControl(context, client, message, { applied = false } = {}) {
       }
       requestClipboard(context, client);
       return;
+    case "stream":
+      // A viewing setting, not device input: no lease or handoff applies.
+      setStreamChoice(context, client, message);
+      return;
     case "system":
       if (message.op === "keyframe") {
         requireSession(context);
@@ -3054,6 +3106,20 @@ function dispatchControl(context, client, message, { applied = false } = {}) {
     default:
       throw new InputError("Unsupported control message.");
   }
+}
+
+/**
+ * A Display menu choice (QW-04): kept on the context and applied by the server's stream
+ * planner (Android: a scrcpy restart, at most one per RESTART_MIN_INTERVAL_MS; iOS: the
+ * running companion stream in place). Answered with the choice and the settings the device
+ * streams with once it is applied.
+ */
+function setStreamChoice(context, client, message) {
+  const plan = context.server?.setStreamChoice;
+  if (typeof plan !== "function") throw new InputError("This Canvas cannot change the stream settings.");
+  const choice = { fps: message.fps, size: message.size };
+  const applied = plan(context, choice);
+  reply(context, client, { t: "stream", ok: true, choice, applied });
 }
 
 function requireSession(context) {

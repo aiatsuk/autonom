@@ -29,10 +29,20 @@ PYTHON_314_HINT = (
     "Reinstall it under an older interpreter: "
     "pipx reinstall fb-idb --python /opt/homebrew/opt/python@3.12/bin/python3.12"
 )
-BREW_TRUST_HINT = (
-    "Homebrew refuses untrusted taps: brew tap facebook/fb && "
+# The commands that fix a missing tool, exactly as doctor prints them inside its
+# hints and checks. `fix_command` hands them to the Canvas Setup checklist,
+# which only shows and copies them: neither doctor nor the Canvas runs one.
+BREW_TRUST_FIX = (
+    "brew tap facebook/fb && "
     "brew trust --formula facebook/fb/idb-companion && brew install idb-companion"
 )
+BREW_TRUST_HINT = f"Homebrew refuses untrusted taps: {BREW_TRUST_FIX}"
+XCODE_SELECT_FIX = "sudo xcode-select -s /Applications/Xcode.app/Contents/Developer"
+SCRCPY_FIX_MACOS = "brew install scrcpy"
+SCRCPY_FIX_LINUX = "sudo apt-get install scrcpy"
+# Doctor prints these inside errors.tool_missing("mitmdump").hint.
+MITMPROXY_FIX_MACOS = "brew install mitmproxy"
+MITMPROXY_FIX_OTHER = "pipx install mitmproxy"
 
 # Environment overrides the resolvers honour. A host-wide override is the
 # classic invisible trap: a stale AUTONOM_ADB makes every probe report adb as
@@ -59,7 +69,7 @@ SCRCPY_CAPABILITY = "canvas.scrcpy"
 SCRCPY_SERVER_VARS = ("AUTONOM_SCRCPY_SERVER", "SCRCPY_SERVER_PATH")
 SCRCPY_INSTALL_HINT = (
     f"Install scrcpy {SCRCPY_PROTOCOL_VERSION} for the Mobile Canvas scrcpy transport: "
-    "brew install scrcpy (macOS) or sudo apt-get install scrcpy (Linux); or point "
+    f"{SCRCPY_FIX_MACOS} (macOS) or {SCRCPY_FIX_LINUX} (Linux); or point "
     f"AUTONOM_SCRCPY_SERVER at a scrcpy-server-v{SCRCPY_PROTOCOL_VERSION} file. "
     "Autonom never downloads it."
 )
@@ -69,6 +79,23 @@ SCRCPY_INSTALL_HINT = (
 SCRCPY_VERSION_TOKEN = r"\d+(?:\.\d+)+(?:-[0-9A-Za-z.]+)?"
 _SERVER_FILE_VERSION = re.compile(rf"scrcpy-server-v({SCRCPY_VERSION_TOKEN})(?:\.jar)?")
 _CLI_VERSION = re.compile(rf"^\s*scrcpy\s+v?({SCRCPY_VERSION_TOKEN})(?=\s|$)", re.M)
+
+
+def fix_command(tool: str, *, macos: bool) -> str | None:
+    """The command doctor prints to fix `tool` (adb, xcrun_simctl, idb_companion,
+    scrcpy_server or mitmdump) on macOS or elsewhere; the install hint when doctor
+    has no single command for it; None for a tool doctor does not check."""
+    if tool == "adb":
+        return errors.tool_missing("adb").hint
+    if tool == "xcrun_simctl":
+        return XCODE_SELECT_FIX
+    if tool == "idb_companion":
+        return BREW_TRUST_FIX
+    if tool == "scrcpy_server":
+        return SCRCPY_FIX_MACOS if macos else SCRCPY_FIX_LINUX
+    if tool == "mitmdump":
+        return MITMPROXY_FIX_MACOS if macos else MITMPROXY_FIX_OTHER
+    return None
 
 
 def _overrides() -> tuple[dict[str, Any], list[dict[str, Any]]]:
@@ -375,7 +402,7 @@ def _ios_state(tools: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any],
         {"name": "xcode_developer_dir", "ok": bool(xcode.get("developer_dir")), "required": True,
          "detail": xcode.get("developer_dir"),
          "fix": None if xcode.get("developer_dir")
-         else "sudo xcode-select -s /Applications/Xcode.app/Contents/Developer"},
+         else XCODE_SELECT_FIX},
         {"name": "simulatorkit", "ok": bool(xcode.get("simulatorkit_path")), "required": True,
          "detail": xcode.get("simulatorkit_path"),
          "fix": None if xcode.get("simulatorkit_path")

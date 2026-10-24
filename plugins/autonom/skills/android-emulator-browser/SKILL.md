@@ -107,7 +107,7 @@ machine (listed again every 30 s); `--bootable-only` keeps the list to the
   explains the flag), launch, open link, app language, a gallery of the captures in
   `~/Downloads/Autonom/<device>/` (`--captures-dir`, `AUTONOM_CAPTURES_DIR`; at 200
   files or 2 GB the oldest are deleted and the gallery says so). Open in Finder opens only that device folder on macOS. The single-device drawer shows Capture and Gallery; workspace tiles also expose app/install actions. The command log
-  (Activity) and tool health.
+  and the Setup checklist (Activity; see The page).
 - `canvas attach`/`detach` answer with the API's own `error_code` and `hint`
   (`tab_full`, `device_in_other_tab`, `target_not_found`, `device_limit`, …);
   `canvas_not_found` and `canvas_ambiguous` mean no Canvas or several matched.
@@ -307,6 +307,64 @@ Theme choice is browser-local and synchronized across workspace tiles; Auto trac
 the system. The element ids `video`, `screen`, `status`, `text`, `clipboard`,
 `device` and `refresh`, and `window.autonomCanvas`, remain stable for scripts.
 
+### Keyboard shortcuts
+
+Simulator.app chords, Cmd on macOS and Ctrl elsewhere, while the screen or the
+page has focus and focus is not in a text field of the page:
+
+| Chord | Action |
+| --- | --- |
+| Cmd+Shift+H | Home |
+| Cmd+L | Lock (Power) |
+| Cmd+Up / Cmd+Down | Volume up / down |
+| Cmd+Left / Cmd+Right | Rotate (Android; iOS shows "Rotate is not available on iOS yet" and sends nothing) |
+| Cmd+S | Screenshot, as the Actions drawer's button |
+| Cmd+R | Start or stop recording, as the Actions drawer's button |
+| Cmd+Backspace | Back (Android) |
+| Cmd+O | Recent apps (Android) |
+
+A shortcut runs its button's own path (`{"t":"system","op":...}`, or the
+drawer's `capture.screenshot` / `record.start` / `record.stop` calls), stops
+the browser's own action (save page, reload) and never reaches the device as
+a key event. Every other chord behaves as before: Android gets it with META or
+CTRL meta state (Cmd+A goes as A with META), iOS ignores it, Cmd/Ctrl+V pastes
+and the workspace's Ctrl+Alt+1..4 and Ctrl+Alt+Left/Right work, also inside a
+tile. Tooltips name the chord ("Home (⌘⇧H)") and Device settings lists the
+platform's shortcuts (10 on Android, 6 on iOS).
+
+### Display menu
+
+Device settings → Display: Frame rate 60, 30 or 15 fps (iOS also On change:
+frames only when the screen changes) and Size Full or Half (Android half the
+long side used at full size; iOS half scale), for this device only. The page
+sends `{"t":"stream","fps":15,"size":"half"}` on `/ws/control` (`fps` null keeps
+the stream's own rate); the reply is `{"t":"stream","ok":true,"applied":{...}}`
+or an error naming the allowed values (fps 45, or fps 0 on Android, is
+refused). iOS changes the companion stream in place, without a reconnect;
+Android restarts scrcpy and the page shows "Reconnecting…" until frames return
+(at most 10 s), at most one restart per 3 s. The choice is kept in the browser
+under `autonom.canvas.display.<device id>` and sent again when the control
+socket opens, so a reload keeps it. An unfocused workspace tile uses the lower
+of the choice and the background profile (30 fps, half size). `/status`
+`stream_settings` (`choice`, `fps`, `max_size`, `scale_factor`) and the device
+summary's `display_choice` report it. Without a choice, the defaults and
+`--fps` / `--max-size` apply unchanged.
+
+### Setup checklist
+
+The Actions drawer's Activity tab lists the device tools as a Setup
+checklist: Android (adb, emulator, scrcpy-server), iOS (xcrun simctl,
+idb_companion) and Optional (ffmpeg, mitmdump), each OK, Problem or Missing.
+An item that is not OK shows its fix command with Copy; the command comes from
+the `fix` field of the `/api/health` entry (as `autonom doctor` prints it) and
+is only shown and copied, never run. While the tab is visible and an item the
+device's platform needs is not OK, the list checks again every 5 s with
+`GET /api/health?refresh=1`; the Canvas allows one uncached check per 5 s and
+answers other requests from its cache (`cached: true`). It stops once the items
+are OK or the tab is hidden; an item that becomes OK ticks by itself. A
+workspace with no device and a needed tool missing shows Set up in its empty
+view, which opens the same checklist.
+
 ## Tools drawer
 
 The Tools toggle in the toolbar opens a drawer with five tabs for the
@@ -416,7 +474,8 @@ On the scrcpy transport (focus the screen for keys):
   That covers other layouts (AZERTY, QWERTZ, Cyrillic, ...), the AltGr layer
   (Ctrl+Alt) and the macOS Option layer. A dead key sends nothing; the
   character it composes goes as text with the next key. Plain Ctrl and Meta
-  shortcuts keep their keycodes. Input-method composition beyond dead keys
+  chords keep their keycodes, except the Canvas shortcuts (see The page),
+  which never reach the device. Input-method composition beyond dead keys
   (Chinese, Japanese or Korean input, for example) is not supported on the
   screen; use the text box. Other single characters, numpad digits included,
   are sent as text. CapsLock is not sent. Leaving the screen releases held

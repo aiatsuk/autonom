@@ -3034,8 +3034,24 @@ test("input: a paste the device never acknowledges holds later input for 1 s, th
   assert.equal((await stopCanvas(canvas)).code, 0);
 });
 
+// Gives the Canvas a 20 s clipboard ack timeout instead of 1 s. Tests that check what input
+// does while a paste waits for its ack use it, so a slow, busy machine cannot let the
+// timeout end the wait in the middle of the test and write the held input early.
+const LONG_CLIPBOARD_ACK = `data:text/javascript,${encodeURIComponent(`
+import { registerHooks } from "node:module";
+registerHooks({
+  load(url, context, nextLoad) {
+    const result = nextLoad(url, context);
+    if (!url.endsWith("/canvas-runtime.mjs")) return result;
+    const source = String(result.source).replace(/CLIPBOARD_ACK_TIMEOUT_MS = 1000;/, "CLIPBOARD_ACK_TIMEOUT_MS = 20000;");
+    return { ...result, source };
+  },
+});
+`)}`;
+
 test("input: a device server restart while input waits for a clipboard ack refuses that input at once and holds nothing after it", async (t) => {
-  const { canvas, device, control } = await connectedControl(t, { device: { autoAck: false } });
+  const { canvas, device, control } = await connectedControl(t, { device: { autoAck: false },
+    nodeArgs: ["--import", LONG_CLIPBOARD_ACK] });
   control.send({ t: "paste", text: "é" });
   await waitFor(() => device.count("set-clipboard") === 1, INPUT_WAIT_MS, "the paste");
   const pasted = device.controlBytes;
@@ -3065,7 +3081,8 @@ test("input: a device server restart while input waits for a clipboard ack refus
 });
 
 test("input: a takeover while input waits for a clipboard ack lifts the pointer after the paste and refuses the input held behind it", async (t) => {
-  const { world, canvas, device, control } = await connectedControl(t, { device: { autoAck: false } });
+  const { world, canvas, device, control } = await connectedControl(t, { device: { autoAck: false },
+    nodeArgs: ["--import", LONG_CLIPBOARD_ACK] });
   control.send({ t: "touch", a: "down", id: 1, x: 0.5, y: 0.5 });
   control.send({ t: "paste", text: "ü" });
   await waitFor(() => pasteMessages(device).length === 2, INPUT_WAIT_MS, "the pointer and the paste");
@@ -3388,8 +3405,11 @@ function attributeMatcher(selector) {
  * The Canvas page script of `html`, run in a node:vm sandbox over a fake document of that
  * page (its sign-in never answers), on the scrcpy transport with an open control socket.
  * `sent` collects the control messages it sends; `run` evaluates code inside the page.
+ * `navigator` is the browser's navigator the page sees (none by default); window events
+ * (CustomEvent, dispatchEvent) go through the document's listeners; `parent` is the
+ * window of an embedded page's shell.
  */
-function runPage(html, { hash = "" } = {}) {
+function runPage(html, { hash = "", navigator, parent } = {}) {
   const script = html.match(/<script>([\s\S]*)<\/script>/)[1];
   const document = fakeDocument(html);
   const sent = [];
@@ -3402,7 +3422,11 @@ function runPage(html, { hash = "" } = {}) {
     URLSearchParams, TextEncoder, performance, setTimeout, clearTimeout,
     setInterval: (...args) => { const timer = setInterval(...args); timer.unref(); return timer; }, clearInterval,
     record: (text) => sent.push(JSON.parse(text)),
+    CustomEvent: class CustomEvent { constructor(type, init = {}) { this.type = type; this.detail = init.detail; } },
+    dispatchEvent: (event) => !document.dispatch(event.type, { detail: event.detail }).defaultPrevented,
   };
+  if (navigator) sandbox.navigator = navigator;
+  if (parent) sandbox.parent = parent;
   sandbox.window = sandbox;
   const page = createContext(sandbox);
   new Script(script).runInContext(page);
@@ -3478,6 +3502,277 @@ test("input: the page sends the characters of other keyboard layouts as text and
     ["KeyT", "\u0435"], ["KeyN", "\u0442"]];
   assert.deepEqual(privet.flatMap(([code, key]) => press(code, key)), privet.map(([, key]) => `text ${key}`));
   assert.deepEqual(press("KeyC", "\u0441", { ctrlKey: true }), ["key down 31 12288", "key up 31 12288"]);
+});
+
+const MAC = { platform: "MacIntel" };
+const shortcutKey = (code, key, extra = {}) => ({ code, key, repeat: false, shiftKey: false, ctrlKey: false, altKey: false,
+  metaKey: false, defaultPrevented: false, preventDefault() { this.defaultPrevented = true; }, ...extra });
+
+/** A device page of `platform` run by runPage, ready for input, with its autonom:capture events in `captures`. */
+function shortcutPage(platform, { navigator = MAC, embed = false } = {}) {
+  const html = renderPage({ serial: platform === "ios" ? "45A342A1-AA2F-4F40-8EFD-F0D0C590ECE5" : "emulator-5554", id: `${platform}~x`,
+    options: { platform } }, { embed });
+  const page = runPage(html, { navigator });
+  page.run(`view.status={};view.transport=${JSON.stringify(platform === "ios" ? "idb" : "scrcpy")};view.mode="webcodecs";applyTransport();syncControls()`);
+  const captures = [];
+  page.sandbox.addEventListener("autonom:capture", (event) => { captures.push(event.detail.action); event.preventDefault(); });
+  const press = (code, key, extra = {}) => {
+    page.sent.length = 0;
+    const event = shortcutKey(code, key, extra);
+    page.sandbox.onKeyDown(event);
+    page.sandbox.onKeyUp(event);
+    return { sent: [...page.sent], prevented: event.defaultPrevented };
+  };
+  return { ...page, html, captures, press };
+}
+
+test("shortcuts: every Android chord with Cmd on macOS runs its button's action, never reaches the device as a key and stops the browser's default", () => {
+  const page = shortcutPage("android");
+  const cmd = { metaKey: true };
+  // QW-01-S01: Home is one system message and no META key event.
+  assert.deepEqual(page.press("KeyH", "h", { ...cmd, shiftKey: true }), { sent: [{ t: "system", op: "home" }], prevented: true });
+  for (const [code, key, op] of [["KeyL", "l", "power"], ["ArrowUp", "ArrowUp", "volume-up"], ["ArrowDown", "ArrowDown", "volume-down"],
+    ["Backspace", "Backspace", "back"], ["KeyO", "o", "app-switch"], ["ArrowLeft", "ArrowLeft", "rotate"], ["ArrowRight", "ArrowRight", "rotate"]]) {
+    page.run("view.rotateBusy=false;syncControls()");
+    assert.deepEqual(page.press(code, key, cmd), { sent: [{ t: "system", op }], prevented: true }, code);
+  }
+  // Rotate takes the button's path: busy until the device answers, so a second press waits.
+  assert.equal(page.run("view.rotateBusy"), true);
+  assert.deepEqual(page.press("ArrowLeft", "ArrowLeft", cmd), { sent: [], prevented: true });
+  // QW-01-S02: Cmd+S and Cmd+R go to the Actions drawer as the Capture and Record buttons do.
+  assert.deepEqual(page.press("KeyS", "s", cmd), { sent: [], prevented: true });
+  assert.deepEqual(page.press("KeyR", "r", cmd), { sent: [], prevented: true });
+  assert.deepEqual(page.press("KeyR", "r", cmd), { sent: [], prevented: true });
+  assert.deepEqual(page.captures, ["screenshot", "record", "record"]);
+  // A held chord acts once; held volume keeps stepping.
+  assert.deepEqual(page.press("KeyS", "s", { ...cmd, repeat: true }), { sent: [], prevented: true });
+  assert.deepEqual(page.captures.length, 3);
+  assert.deepEqual(page.press("ArrowUp", "ArrowUp", { ...cmd, repeat: true }).sent, [{ t: "system", op: "volume-up" }]);
+  // While input is not the person's (paused), the disabled buttons do nothing and nor do their chords.
+  page.run("view.paused=true;syncControls()");
+  assert.deepEqual(page.press("KeyH", "h", { ...cmd, shiftKey: true }), { sent: [], prevented: true });
+});
+
+test("shortcuts: chords outside the map keep today's handling on Android (QW-02)", () => {
+  const page = shortcutPage("android");
+  const metaOn = 0x10000 | 0x20000;
+  // QW-02-S01: Cmd+A goes to the device with the A keycode and META, as before.
+  assert.deepEqual(page.press("KeyA", "a", { metaKey: true }).sent,
+    [{ t: "key", a: "down", code: 29, meta: metaOn, repeat: 0 }, { t: "key", a: "up", code: 29, meta: metaOn, repeat: 0 }]);
+  // Ctrl is not the shortcut modifier on macOS: Ctrl+S is still a device key; Cmd+Shift+S and Cmd+H are not chords.
+  assert.deepEqual(page.press("KeyS", "s", { ctrlKey: true }).sent.map((message) => `${message.a} ${message.code} ${message.meta}`),
+    ["down 47 12288", "up 47 12288"]);
+  assert.equal(page.press("KeyS", "s", { metaKey: true, shiftKey: true }).sent[0].code, 47);
+  assert.equal(page.press("KeyH", "h", { metaKey: true }).sent[0].code, 36);
+  // Cmd+V still leaves the paste to the browser's paste event; Alt and AltGr layers type as before.
+  assert.deepEqual(page.press("KeyV", "v", { metaKey: true }), { sent: [], prevented: false });
+  assert.deepEqual(page.press("KeyL", "@", { metaKey: true, altKey: true }).sent.map((message) => message.t), ["key", "key"]);
+  assert.deepEqual(page.press("KeyQ", "@", { ctrlKey: true, altKey: true }).sent, [{ t: "text", text: "@" }]);
+  assert.deepEqual(page.captures, []);
+});
+
+/**
+ * Types `steps` on the screen of a shortcutPage the way a real keyboard sends them: "+Code" is a
+ * keydown and "-Code" a keyup, and the modifier flags of every event follow the modifier keys
+ * held at that moment (a modifier's own keydown has its flag, its keyup does not). Returns the
+ * control messages as "down 117 196608" or "system home" strings and whether every keydown was
+ * prevented. "blur" moves the focus away from the screen.
+ */
+function typeKeys(page, steps) {
+  const held = new Set();
+  const flag = (prefix) => [...held].some((code) => code.startsWith(prefix));
+  const keys = { MetaLeft: "Meta", ShiftLeft: "Shift", ControlLeft: "Control", AltLeft: "Alt" };
+  page.sent.length = 0;
+  let prevented = true;
+  for (const step of steps) {
+    if (step === "blur") { page.sandbox.releaseKeys(); continue; }
+    const code = step.slice(1);
+    if (step[0] === "+") held.add(code); else held.delete(code);
+    const key = keys[code] || (code.startsWith("Key") ? code.slice(3).toLowerCase() : code);
+    const event = shortcutKey(code, key, { type: step[0] === "+" ? "keydown" : "keyup", metaKey: flag("Meta"), shiftKey: flag("Shift"),
+      ctrlKey: flag("Control"), altKey: flag("Alt") });
+    if (step[0] === "+") { page.sandbox.onKeyDown(event); prevented &&= event.defaultPrevented; } else page.sandbox.onKeyUp(event);
+  }
+  const sent = page.sent.map((message) => message.t === "key" ? `${message.a} ${message.code} ${message.meta}` : `${message.t} ${message.op ?? message.text}`);
+  return { sent, prevented };
+}
+
+test("shortcuts: the modifier's own key never reaches an Android device as part of a shortcut (QW-01-S01, INV-1)", () => {
+  const page = shortcutPage("android");
+  const META = 196608, SHIFT = 65;
+  // QW-01-S01 as a keyboard sends it: Cmd, Shift, H, then the releases. Only Home is sent.
+  assert.deepEqual(typeKeys(page, ["+MetaLeft", "+ShiftLeft", "+KeyH", "-KeyH", "-ShiftLeft", "-MetaLeft"]),
+    { sent: ["system home"], prevented: true });
+  // Every chord without Shift, released in either order: no META key event, no lone META tap.
+  for (const [code, op] of [["KeyL", "system power"], ["ArrowUp", "system volume-up"], ["ArrowDown", "system volume-down"],
+    ["Backspace", "system back"], ["KeyO", "system app-switch"], ["ArrowRight", "system rotate"]]) {
+    page.run("view.rotateBusy=false;syncControls()");
+    assert.deepEqual(typeKeys(page, ["+MetaLeft", `+${code}`, `-${code}`, "-MetaLeft"]), { sent: [op], prevented: true }, code);
+    page.run("view.rotateBusy=false;syncControls()");
+    assert.deepEqual(typeKeys(page, ["+MetaLeft", `+${code}`, "-MetaLeft", `-${code}`]).sent, [op], `${code}, Cmd released first`);
+  }
+  assert.deepEqual(typeKeys(page, ["+MetaLeft", "+KeyS", "-KeyS", "+KeyR", "-KeyR", "-MetaLeft"]), { sent: [], prevented: true });
+  assert.deepEqual(page.captures, ["screenshot", "record"]);
+  // QW-02-S01 as a keyboard sends it: Cmd+A reaches the device exactly as before this change.
+  assert.deepEqual(typeKeys(page, ["+MetaLeft", "+KeyA", "-KeyA", "-MetaLeft"]).sent,
+    [`down 117 ${META}`, `down 29 ${META}`, `up 29 ${META}`, "up 117 0"]);
+  assert.deepEqual(typeKeys(page, ["+MetaLeft", "+ShiftLeft", "+KeyS", "-KeyS", "-ShiftLeft", "-MetaLeft"]).sent,
+    [`down 117 ${META}`, `down 59 ${META | SHIFT}`, `down 47 ${META | SHIFT}`, `up 47 ${META | SHIFT}`, `up 59 ${META}`, "up 117 0"]);
+  // Cmd pressed and released alone, or with Shift alone, still goes to the device as before.
+  assert.deepEqual(typeKeys(page, ["+MetaLeft", "-MetaLeft"]).sent, [`down 117 ${META}`, "up 117 0"]);
+  assert.deepEqual(typeKeys(page, ["+MetaLeft", "+ShiftLeft", "-ShiftLeft", "-MetaLeft"]).sent,
+    [`down 117 ${META}`, `down 59 ${META | SHIFT}`, `up 59 ${META}`, "up 117 0"]);
+  // After a shortcut, an unmapped key with Cmd still held sends Cmd first, then the key.
+  assert.deepEqual(typeKeys(page, ["+MetaLeft", "+KeyL", "-KeyL", "+KeyA", "-KeyA", "-MetaLeft"]).sent,
+    ["system power", `down 117 ${META}`, `down 29 ${META}`, `up 29 ${META}`, "up 117 0"]);
+  // Shift pressed before Cmd was sent already; its release says nothing of the Cmd the device never saw.
+  assert.deepEqual(typeKeys(page, ["+ShiftLeft", "+MetaLeft", "+KeyH", "-KeyH", "-ShiftLeft", "-MetaLeft"]).sent,
+    [`down 59 ${SHIFT}`, "system home", "up 59 0"]);
+  // A held-back Cmd that loses focus is forgotten, and Cmd+V leaves the paste to the paste event.
+  assert.deepEqual(typeKeys(page, ["+MetaLeft", "blur", "-MetaLeft"]).sent, []);
+  assert.deepEqual(typeKeys(page, ["+MetaLeft", "+KeyV", "-KeyV", "-MetaLeft"]).sent, []);
+  // Ctrl is not the shortcut modifier on macOS, so it goes to the device at once, as before.
+  assert.deepEqual(typeKeys(page, ["+ControlLeft", "+KeyL", "-KeyL", "-ControlLeft"]).sent,
+    ["down 113 12288", "down 40 12288", "up 40 12288", "up 113 0"]);
+});
+
+test("shortcuts: off macOS the Ctrl key of a shortcut never reaches an Android device", () => {
+  const page = shortcutPage("android", { navigator: { platform: "Win32" } });
+  assert.deepEqual(typeKeys(page, ["+ControlLeft", "+ShiftLeft", "+KeyH", "-KeyH", "-ShiftLeft", "-ControlLeft"]),
+    { sent: ["system home"], prevented: true });
+  assert.deepEqual(typeKeys(page, ["+ControlLeft", "+KeyL", "-KeyL", "-ControlLeft"]).sent, ["system power"]);
+  // Ctrl+C, and Cmd chords off macOS, reach the device as before.
+  assert.deepEqual(typeKeys(page, ["+ControlLeft", "+KeyC", "-KeyC", "-ControlLeft"]).sent,
+    ["down 113 12288", "down 31 12288", "up 31 12288", "up 113 0"]);
+  assert.deepEqual(typeKeys(page, ["+MetaLeft", "+KeyL", "-KeyL", "-MetaLeft"]).sent,
+    ["down 117 196608", "down 40 196608", "up 40 196608", "up 117 0"]);
+});
+
+test("shortcuts: off macOS Ctrl is the modifier, and Cmd chords go to the device as before", () => {
+  const page = shortcutPage("android", { navigator: { platform: "Win32", userAgentData: { platform: "Windows" } } });
+  assert.equal(page.run("IS_MAC"), false);
+  assert.deepEqual(page.press("KeyH", "h", { ctrlKey: true, shiftKey: true }).sent, [{ t: "system", op: "home" }]);
+  assert.deepEqual(page.press("Backspace", "Backspace", { ctrlKey: true }).sent, [{ t: "system", op: "back" }]);
+  assert.deepEqual(page.press("KeyH", "h", { metaKey: true, shiftKey: true }).sent.map((message) => message.code), [36, 36]);
+  // Ctrl+C keeps its keycode and the Ctrl meta state.
+  assert.deepEqual(page.press("KeyC", "c", { ctrlKey: true }).sent.map((message) => message.meta), [12288, 12288]);
+  page.press("KeyS", "s", { ctrlKey: true });
+  assert.deepEqual(page.captures, ["screenshot"]);
+});
+
+test("shortcuts: with focus elsewhere in the page they act, never while typing in a field (QW-01-S03)", () => {
+  const page = shortcutPage("android");
+  const { document, sent } = page;
+  const byLabel = (label) => document.elements.find((element) => element.getAttribute("aria-label") === label);
+  const fire = (target, code, key, extra) => { sent.length = 0; return target.dispatch("keydown", shortcutKey(code, key, extra)); };
+  // A dock button or the page body has the focus.
+  assert.equal(fire(byLabel("Rotate"), "KeyH", "h", { metaKey: true, shiftKey: true }).defaultPrevented, true);
+  assert.deepEqual(sent, [{ t: "system", op: "home" }]);
+  fire(document.body, "KeyL", "l", { metaKey: true });
+  assert.deepEqual(sent, [{ t: "system", op: "power" }]);
+  // Keys on the screen are handled there once, not again by the page.
+  fire(document.getElementById("screen"), "KeyH", "h", { metaKey: true, shiftKey: true });
+  assert.deepEqual(sent, [{ t: "system", op: "home" }]);
+  // The Tools drawer's deeplink field and the inspector's text box keep the chord for the browser.
+  for (const id of ["tools-deeplink", "text", "device-language"]) {
+    const event = fire(document.getElementById(id), "KeyL", "l", { metaKey: true });
+    assert.equal(event.defaultPrevented, false, id);
+    assert.deepEqual(sent, [], id);
+  }
+  // A content-editable region is a text field too; a switch is not.
+  const editable = { tagName: "DIV", isContentEditable: true };
+  document.dispatch("keydown", { ...shortcutKey("KeyS", "s", { metaKey: true }), target: editable });
+  assert.deepEqual(page.captures, []);
+  assert.equal(fire(document.getElementById("device-frame-style"), "KeyS", "s", { metaKey: true }).defaultPrevented, true);
+  assert.deepEqual(page.captures, ["screenshot"]);
+  // Other keys outside the screen never reach the device.
+  fire(document.body, "KeyA", "a", { metaKey: true });
+  assert.deepEqual(sent, []);
+});
+
+test("shortcuts: the iOS page maps six chords, says rotate is not available and keeps Cmd chords off the Simulator (QW-01-S04)", () => {
+  const page = shortcutPage("ios");
+  const cmd = { metaKey: true };
+  assert.deepEqual(page.press("KeyH", "h", { ...cmd, shiftKey: true }).sent, [{ t: "system", op: "home" }]);
+  assert.deepEqual(page.press("KeyL", "l", cmd).sent, [{ t: "system", op: "power" }]);
+  assert.deepEqual(page.press("ArrowUp", "ArrowUp", cmd).sent, [{ t: "system", op: "volume-up" }]);
+  assert.deepEqual(page.press("ArrowDown", "ArrowDown", cmd).sent, [{ t: "system", op: "volume-down" }]);
+  for (const code of ["ArrowLeft", "ArrowRight"]) {
+    page.run("view.note=\"\"");
+    assert.deepEqual(page.press(code, code, cmd), { sent: [], prevented: true });
+    assert.equal(page.run("view.note"), "Rotate is not available on iOS yet");
+  }
+  page.press("KeyS", "s", cmd);
+  page.press("KeyR", "r", cmd);
+  assert.deepEqual(page.captures, ["screenshot", "record"]);
+  // Android-only chords and other Cmd chords are ignored on iOS as before; typing still types.
+  for (const [code, key] of [["Backspace", "Backspace"], ["KeyO", "o"], ["KeyA", "a"]]) {
+    assert.deepEqual(page.press(code, key, cmd), { sent: [], prevented: false }, code);
+  }
+  assert.deepEqual(page.press("KeyA", "a").sent, [{ t: "text", text: "a" }]);
+  // Volume on the screencap transport is out of sight, so its chord does nothing.
+  page.run("controlSocket.close=()=>{};const kept=controlSocket;view.transport=\"screencap\";applyTransport();controlSocket=kept");
+  assert.deepEqual(page.press("ArrowUp", "ArrowUp", cmd), { sent: [], prevented: true });
+});
+
+test("shortcuts: without the Actions drawer, Cmd+S says screenshots are not available", () => {
+  const html = renderPage({ serial: "emulator-5554", options: { platform: "android" } });
+  const bare = runPage(html, { navigator: MAC });
+  bare.sandbox.onKeyDown(shortcutKey("KeyS", "s", { metaKey: true }));
+  assert.equal(bare.run("view.note"), "Screenshots are not available on this page");
+  bare.sandbox.onKeyDown(shortcutKey("KeyR", "r", { metaKey: true }));
+  assert.equal(bare.run("view.note"), "Recording is not available on this page");
+  assert.deepEqual(bare.sent, []);
+});
+
+test("shortcuts: workspace hotkeys keep working from inside a tile", () => {
+  const html = renderPage({ serial: "emulator-5554", id: "android~emulator-5554", options: { platform: "android" } }, { embed: true });
+  const posted = [];
+  const page = runPage(html, { navigator: MAC, parent: { postMessage: (message) => posted.push(message) } });
+  page.run("view.status={}");
+  for (const code of ["Digit2", "ArrowLeft", "ArrowRight"]) {
+    const event = shortcutKey(code, code, { type: "keydown", ctrlKey: true, altKey: true });
+    page.sandbox.onKeyDown(event);
+    assert.equal(event.defaultPrevented, true);
+  }
+  assert.deepEqual(posted.filter((message) => message.type === "autonom:hotkey").map((message) => message.key), ["2", "ArrowLeft", "ArrowRight"]);
+  assert.deepEqual(page.sent, []);
+  // A Cmd chord in a tile is a shortcut there.
+  page.sandbox.onKeyDown(shortcutKey("ArrowRight", "ArrowRight", { metaKey: true }));
+  assert.deepEqual(page.sent, [{ t: "system", op: "rotate" }]);
+});
+
+test("shortcuts: tooltips name the chord and Device settings lists 10 Android and 6 iOS shortcuts (QW-03-S01)", () => {
+  const listed = (html) => [...html.match(/<ul class="shortcut-list"[^>]*>([\s\S]*?)<\/ul>/)[1].matchAll(/<li><span>([^<]+)<\/span><kbd data-shortcut="\d+">([^<]+)<\/kbd><\/li>/g)]
+    .map(([, label, chord]) => `${label} ${chord}`);
+  const android = shortcutPage("android");
+  assert.deepEqual(listed(android.html), ["Home ⌘⇧H", "Lock ⌘L", "Volume up ⌘↑", "Volume down ⌘↓", "Rotate left ⌘←", "Rotate right ⌘→",
+    "Screenshot ⌘S", "Start or stop recording ⌘R", "Back ⌘⌫", "Recent apps ⌘O"]);
+  const settings = android.html.match(/<section class="canvas-settings"[\s\S]*?<\/section>/)[0];
+  assert.match(settings, /id="canvas-shortcuts"/, "the list is part of Device settings");
+  const title = (page, label) => page.document.elements.find((element) => element.getAttribute("aria-label") === label).title;
+  assert.equal(title(android, "Home"), "Home (⌘⇧H)");
+  assert.equal(title(android, "Power"), "Power (⌘L)");
+  assert.equal(title(android, "Back"), "Back (⌘⌫)");
+  assert.equal(title(android, "Recent apps"), "Recent apps (⌘O)");
+  assert.equal(title(android, "Rotate"), "Rotate (⌘← or ⌘→)");
+  assert.equal(title(android, "Volume up"), "Volume up (⌘↑)");
+  assert.equal(title(android, "Volume down"), "Volume down (⌘↓)");
+  // The aria-label stays the plain name.
+  assert.match(android.html, /aria-label="Home"/);
+  const ios = shortcutPage("ios");
+  assert.deepEqual(listed(ios.html), ["Home ⌘⇧H", "Lock ⌘L", "Volume up ⌘↑", "Volume down ⌘↓", "Screenshot ⌘S", "Start or stop recording ⌘R"]);
+  assert.equal(title(ios, "Home"), "Home (⌘⇧H)");
+  assert.equal(title(ios, "Rotate"), "Rotate", "iOS has no rotate chord to show");
+  // Off macOS the page shows Ctrl in tooltips and in the list.
+  const windows = shortcutPage("android", { navigator: { platform: "Win32" } });
+  assert.equal(title(windows, "Home"), "Home (Ctrl+Shift+H)");
+  const chords = windows.document.elements.filter((element) => element.tagName === "KBD").map((element) => element.textContent);
+  assert.deepEqual(chords, ["Ctrl+Shift+H", "Ctrl+L", "Ctrl+Up", "Ctrl+Down", "Ctrl+Left", "Ctrl+Right", "Ctrl+S", "Ctrl+R", "Ctrl+Backspace", "Ctrl+O"]);
+  // The embedded page (a workspace tile) has the same list in its Device settings.
+  const embedded = renderPage({ serial: "emulator-5554", id: "android~x", options: { platform: "android" } }, { embed: true });
+  assert.equal(listed(embedded).length, 10);
+  assert.match(embedded, /<h2 id="canvas-settings-title">Device settings<\/h2>/);
 });
 
 /**
@@ -7935,4 +8230,150 @@ test("video: keyframe recovery waits for streaming after a tab resumes", () => {
   assert.equal(sent.length, 0, "idle streams must not receive recovery commands");
   run('applyState({owner:"shared",paused:false,session:"streaming"})');
   assert.deepEqual(sent, [{t:"system",op:"keyframe"}]);
+});
+
+// ---------------------------------------------------------------------------
+// Display menu (QW-04, QW-05): {t:"stream"} on the control socket changes this device's
+// stream; the page side is in tests/canvas-display-menu.test.mjs.
+// ---------------------------------------------------------------------------
+
+/** The scrcpy-server starts so far, each as its list of options. */
+async function serverStarts(world) {
+  return (await adbCalls(world)).filter(isServerStart).map((args) => args[3].split(" "));
+}
+
+test("display: Size Half on Android restarts scrcpy once with half the max size; quick changes share one later restart; refused values change nothing (QW-04-S02, S03)", async (t) => {
+  const { world, canvas, control, device } = await connectedControl(t, { args: ["--max-size", "1280"] });
+  // INV-3: without a choice the stream runs on the CLI settings.
+  assert.deepEqual((await status(canvas)).stream_settings, { choice: null, fps: 60, max_size: 1280, scale_factor: null });
+  assert.equal((await serverStarts(world)).length, 1);
+  // QW-04-S03: values outside the menu are refused with the allowed ones named, fps 0 too.
+  control.send({ t: "stream", fps: 45, size: "full" });
+  const refused = await control.next((message) => message.json?.t === "error" && message.json.for === "stream");
+  assert.match(refused.json.message, /^fps must be one of: 60, 30, 15 /);
+  control.send({ t: "stream", fps: 0, size: "full" });
+  await control.next((message) => message.json?.t === "error" && message.json.for === "stream" &&
+    /iOS only/.test(message.json.message));
+  control.send({ t: "stream", fps: 15, size: "quarter" });
+  await control.next((message) => message.json?.t === "error" && message.json.for === "stream" &&
+    /size must be one of: full, half/.test(message.json.message));
+  await sleep(300);
+  assert.equal((await serverStarts(world)).length, 1, "a refused value restarted scrcpy");
+  assert.equal((await status(canvas)).stream_settings.choice, null);
+  // QW-04-S02: Half restarts scrcpy once, with max size 640, and frames return.
+  control.send({ t: "stream", fps: 60, size: "half" });
+  const answer = await control.next((message) => message.json?.t === "stream");
+  assert.deepEqual(answer.json, { t: "stream", ok: true, choice: { fps: 60, size: "half" },
+    applied: { fps: 60, max_size: 640, scale_factor: null } });
+  const restartedAt = performance.now();
+  await waitFor(async () => (await serverStarts(world)).length === 2, 8000, "one scrcpy restart");
+  const half = (await serverStarts(world))[1];
+  assert.ok(half.includes("max_size=640"), half.join(" "));
+  assert.ok(half.includes("max_fps=60"), half.join(" "));
+  await waitFor(async () => (await status(canvas)).scrcpy.session_state === "streaming" && device.connected,
+    10_000, "frames again within 10 s");
+  assert.deepEqual((await status(canvas)).stream_settings, { choice: { fps: 60, size: "half" }, fps: 60, max_size: 640, scale_factor: null });
+  // The same choice again (a reload re-sending it) is answered without a restart.
+  control.send({ t: "stream", fps: 60, size: "half" });
+  await control.next((message) => message.json?.t === "stream" && message !== answer);
+  // Two changes inside RESTART_MIN_INTERVAL_MS share one restart when it ends; the newest wins.
+  control.send({ t: "stream", fps: 30, size: "half" });
+  control.send({ t: "stream", fps: 15, size: "full" });
+  await sleep(Math.max(0, 2500 - (performance.now() - restartedAt)));
+  assert.equal((await serverStarts(world)).length, 2, "a change restarted scrcpy within 3 s of the last restart");
+  await waitFor(async () => (await serverStarts(world)).length === 3, 8000, "the shared restart");
+  const newest = (await serverStarts(world))[2];
+  assert.ok(newest.includes("max_size=1280"), newest.join(" "));
+  assert.ok(newest.includes("max_fps=15"), newest.join(" "));
+  await sleep(3500);
+  assert.equal((await serverStarts(world)).length, 3, "more restarts than changes needed");
+  await waitFor(async () => (await status(canvas)).scrcpy.session_state === "streaming", 10_000, "streaming at 15 fps");
+  assert.deepEqual((await status(canvas)).stream_settings, { choice: { fps: 15, size: "full" }, fps: 15, max_size: 1280, scale_factor: null });
+  await stopCanvas(canvas);
+});
+
+test("display: a Size picked alone (fps null) keeps --fps, also one outside the menu", async (t) => {
+  const { world, canvas, control } = await connectedControl(t, { args: ["--max-size", "1280", "--fps", "24"] });
+  assert.equal((await status(canvas)).stream_settings.fps, 24);
+  control.send({ t: "stream", fps: null, size: "half" });
+  const answer = await control.next((message) => message.json?.t === "stream");
+  assert.deepEqual(answer.json, { t: "stream", ok: true, choice: { fps: null, size: "half" },
+    applied: { fps: 24, max_size: 640, scale_factor: null } });
+  await waitFor(async () => (await serverStarts(world)).length === 2, 8000, "one scrcpy restart");
+  const half = (await serverStarts(world))[1];
+  assert.ok(half.includes("max_size=640"), half.join(" "));
+  assert.ok(half.includes("max_fps=24"), half.join(" "));
+  await waitFor(async () => (await status(canvas)).scrcpy.session_state === "streaming", 10_000, "streaming at half size");
+  assert.deepEqual((await status(canvas)).stream_settings, { choice: { fps: null, size: "half" }, fps: 24, max_size: 640, scale_factor: null });
+  await stopCanvas(canvas);
+});
+
+test("display: Frame rate 15 on iOS changes the companion stream in place, one Stop and one Start with fps 15; On change and Half follow (QW-04-S01)", async (t) => {
+  const { world, canvas, auth, control } = await iosControl(t);
+  const tab = await pageSocket(canvas, auth, "/ws/video");
+  await waitFor(() => tab.packets().length >= 5, 10_000, "packets");
+  assert.deepEqual((await status(canvas)).stream_settings, { choice: null, fps: 60, max_size: null, scale_factor: 1 });
+  const typed = (type) => idbEventsNow(world).filter((event) => event.type === type);
+  assert.equal(typed("start").length, 1);
+  control.send({ t: "stream", fps: 15, size: "full" });
+  const answer = await control.next((message) => message.json?.t === "stream");
+  assert.deepEqual(answer.json, { t: "stream", ok: true, choice: { fps: 15, size: "full" },
+    applied: { fps: 15, max_size: null, scale_factor: 1 } });
+  const changedAt = performance.now();
+  await waitFor(() => typed("start").length === 2, 5000, "the second Start");
+  assert.equal(typed("stop").length, 1);
+  assert.equal(typed("start")[1].fps, 15);
+  assert.equal(typed("start")[1].scale, 1);
+  assert.equal(typed("spawn").length, 1, "the same companion streams on");
+  const before = tab.packets().length;
+  await waitFor(() => tab.packets().length >= before + 5, 5000, "frames after the change");
+  assert.deepEqual((await status(canvas)).stream_settings, { choice: { fps: 15, size: "full" }, fps: 15, max_size: null, scale_factor: 1 });
+  // On change (fps 0) at half scale: one more Stop and Start once the 3 s interval ends.
+  control.send({ t: "stream", fps: 0, size: "half" });
+  await control.next((message) => message.json?.t === "stream" && message.json.choice.fps === 0);
+  await waitFor(() => typed("start").length === 3, 6000, "the On change Start");
+  assert.ok(performance.now() - changedAt >= 2900, "a second change waited for the restart interval");
+  // The Start asks for frames on change (fps 0, not the default 60) at half scale.
+  assert.equal(typed("start")[2].fps, 0);
+  assert.equal(typed("start")[2].scale, 0.5);
+  assert.equal(typed("stop").length, 2);
+  assert.equal(typed("spawn").length, 1);
+  // What the Canvas reports is what the companion was sent.
+  const settings = (await status(canvas)).stream_settings;
+  assert.deepEqual(settings, { choice: { fps: 0, size: "half" }, fps: 0, max_size: null, scale_factor: 0.5 });
+  assert.equal(settings.fps, typed("start")[2].fps);
+  assert.equal(settings.scale_factor, typed("start")[2].scale);
+  await stopCanvas(canvas);
+});
+
+test("display: Device settings has the Display group on both platforms; the page sends a pick and routes the answers", () => {
+  for (const [platform, embed] of [["android", false], ["android", true], ["ios", false], ["ios", true]]) {
+    const html = renderPage({ serial: "fixture", id: `${platform}~fixture`, options: { platform } }, { embed });
+    const settings = html.match(/<section class="canvas-settings"[\s\S]*?<\/section>/)[0];
+    assert.match(settings, /<h3 class="canvas-settings-group" id="display-group-title">Display<\/h3>/, `${platform} ${embed}`);
+    assert.equal(settings.includes('<option value="0">On change</option>'), platform === "ios");
+  }
+  const page = runPage(renderPage({ serial: "emulator-5554", id: "android~emulator-5554", options: { platform: "android" } }));
+  page.run("view.status={stream_settings:{choice:null,fps:60,max_size:1280,scale_factor:null}};syncStreamMenu()");
+  const fps = page.document.getElementById("display-fps");
+  assert.equal(fps.disabled, false);
+  assert.equal(fps.value, "60");
+  fps.value = "15";
+  fps.dispatch("change", {});
+  assert.deepEqual(page.sent, [{ t: "stream", fps: 15, size: "full" }]);
+  // The answers reach the menu through the page's control message handler.
+  page.run('onControlMessage({t:"error",for:"stream",message:"fps must be one of: 60, 30, 15"})');
+  assert.equal(page.document.getElementById("display-stream").textContent, "fps must be one of: 60, 30, 15");
+  assert.equal(page.run("view.note"), "fps must be one of: 60, 30, 15");
+  page.run('onControlMessage({t:"stream",ok:true,choice:{fps:30,size:"full"},applied:{fps:30,max_size:null,scale_factor:null}})');
+  // The page asks for the stored choice whenever its control socket opens.
+  assert.equal(page.run("typeof streamMenuOpened"), "function");
+  assert.match(renderPage({ serial: "x", options: { platform: "android" } }), /requestVideoKeyFrame\(\);streamMenuOpened\(\)\}/);
+});
+
+test("display: On change (fps 0) reaches the companion's Start as fps 0", async () => {
+  const { decodeVideoStreamRequest, encodeVideoStreamStart, normalizeVideoOptions } = await import(IDB_MODULE_URL);
+  const start = decodeVideoStreamRequest(encodeVideoStreamStart(normalizeVideoOptions({ fps: 0, scaleFactor: 0.5 })));
+  assert.equal(start.fps, 0);
+  assert.equal(start.scaleFactor, 0.5);
 });

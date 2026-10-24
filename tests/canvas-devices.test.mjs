@@ -10,11 +10,15 @@ import {
   DEVICE_ID_PATTERN,
   DeviceRegistry,
   FocusController,
+  HALF_IOS_SCALE,
   MAX_DEVICES,
   PROFILE,
   RESTART_INPUT_WAIT_MS,
+  beginDisplayApply,
   deviceIdFor,
   devicePath,
+  displayChoiceNeedsRestart,
+  halfMaxSize,
   parseDeviceId,
   profileVideo,
   splitDevicePath,
@@ -341,4 +345,132 @@ test("focus: a restart overtaken by a newer one, or of a device that left, is no
   await Promise.resolve();
   await Promise.resolve();
   assert.equal(focus.appliedOf("a"), null);
+});
+
+test("display choice (QW-05): without one every profile is exactly today's, whatever the options", () => {
+  const optionSets = [{}, { fps: 20, fpsExplicit: true }, { fps: 45, fpsExplicit: true },
+    { maxSize: 800, maxSizeExplicit: true }, { maxSize: 0, maxSizeExplicit: true }, { maxSize: 2048, maxSizeExplicit: true }];
+  for (const platform of ["android", "ios"]) {
+    for (const focused of [true, false]) {
+      for (const options of optionSets) {
+        const today = profileVideo({ platform, focused, options });
+        assert.deepEqual(profileVideo({ platform, focused, options, choice: null, baseMaxSize: 1280 }), today,
+          `${platform} ${focused} ${JSON.stringify(options)}`);
+      }
+    }
+  }
+});
+
+test("display choice (QW-04, QW-05): focused uses the choice, background the lower of choice and background profile", () => {
+  assert.equal(halfMaxSize(1280), 640);
+  assert.equal(halfMaxSize(2400), 1200);
+  assert.equal(halfMaxSize(1080), 536, "rounded down to a multiple of 8");
+  assert.equal(halfMaxSize(null), 640, "an unknown base halves the default 1280");
+  assert.equal(HALF_IOS_SCALE, 0.5);
+  const android = (focused, choice, options = {}) =>
+    profileVideo({ platform: "android", focused, options, choice, baseMaxSize: 1280 });
+  const ios = (focused, choice, options = {}) => profileVideo({ platform: "ios", focused, options, choice });
+  // Focused: the chosen frame rate (over --fps too) and, with Half, half the full-size long side.
+  assert.deepEqual(android(true, { fps: 15, size: "full" }), { profile: "focused", fps: 15, maxSize: undefined, scaleFactor: 1 });
+  assert.deepEqual(android(true, { fps: 60, size: "half" }), { profile: "focused", fps: 60, maxSize: 640, scaleFactor: 1 });
+  assert.equal(android(true, { fps: 60, size: "full" }, { fps: 20, fpsExplicit: true }).fps, 60);
+  assert.deepEqual(ios(true, { fps: 0, size: "half" }), { profile: "focused", fps: 0, maxSize: undefined, scaleFactor: 0.5 });
+  assert.deepEqual(ios(true, { fps: 30, size: "full" }), { profile: "focused", fps: 30, maxSize: undefined, scaleFactor: 1 });
+  // QW-05-S02: a 60 fps choice runs 30 in the background and 60 again when focused.
+  assert.equal(android(false, { fps: 60, size: "full" }).fps, 30);
+  assert.equal(android(true, { fps: 60, size: "full" }).fps, 60);
+  assert.equal(ios(false, { fps: 60, size: "full" }).fps, 30);
+  // A lower choice stays lower in the background; On change (0) is the lowest of all.
+  assert.equal(android(false, { fps: 15, size: "full" }).fps, 15);
+  assert.equal(ios(false, { fps: 0, size: "full" }).fps, 0);
+  // Size: the background cap and Half, whichever is smaller; iOS stays at half scale.
+  assert.equal(android(false, { fps: 60, size: "full" }).maxSize, 1024);
+  assert.equal(android(false, { fps: 60, size: "half" }).maxSize, 640);
+  assert.equal(profileVideo({ platform: "android", focused: false, options: {}, choice: { fps: 60, size: "half" },
+    baseMaxSize: 2400 }).maxSize, 1024, "half of 2400 is above the background cap");
+  assert.equal(android(false, { fps: 60, size: "half" }, { maxSize: 480, maxSizeExplicit: true }).maxSize, 480);
+  assert.equal(ios(false, { fps: 60, size: "half" }).scaleFactor, 0.5);
+  assert.equal(ios(false, { fps: 60, size: "full" }).scaleFactor, 0.5);
+  // fps null (a Size picked alone) keeps the configured frame rate: 60, or --fps.
+  assert.deepEqual(android(true, { fps: null, size: "half" }), { profile: "focused", fps: 60, maxSize: 640, scaleFactor: 1 });
+  assert.equal(android(true, { fps: null, size: "half" }, { fps: 24, fpsExplicit: true }).fps, 24);
+  assert.equal(android(false, { fps: null, size: "half" }, { fps: 24, fpsExplicit: true }).fps, 24);
+  assert.equal(ios(false, { fps: null, size: "full" }).fps, 30);
+  assert.deepEqual(ios(true, { fps: null, size: "half" }), { profile: "focused", fps: 60, maxSize: undefined, scaleFactor: 0.5 });
+});
+
+test("display choice bookkeeping: a restart is needed for a new choice, or to retry one no restart applied", () => {
+  const context = { displayChoice: null, displayApplied: null, displaySeq: 0, displayApplying: false };
+  const half = { fps: 60, size: "half" };
+  assert.equal(displayChoiceNeedsRestart(context, half), true, "a first choice");
+  context.displayChoice = half;
+  // Two restarts overlap: the older one finishes last and must not record its stale choice.
+  const settleOld = beginDisplayApply(context, { fps: 30, size: "full" });
+  assert.equal(context.displayApplying, true);
+  assert.equal(displayChoiceNeedsRestart(context, { ...half }), false, "the same choice while a restart runs");
+  const settleNew = beginDisplayApply(context, half);
+  assert.equal(settleNew(true), true);
+  assert.deepEqual(context.displayApplied, half);
+  assert.equal(context.displayApplying, false);
+  assert.equal(settleOld(true), false, "the overtaken restart records nothing");
+  assert.deepEqual(context.displayApplied, half);
+  assert.equal(displayChoiceNeedsRestart(context, { ...half }), false, "applied: a re-send restarts nothing");
+  assert.equal(displayChoiceNeedsRestart(context, { fps: 15, size: "half" }), true, "a new choice");
+  // A restart that failed leaves the choice unapplied: the same choice sent again retries it.
+  context.displayChoice = { fps: 15, size: "half" };
+  const settleFailed = beginDisplayApply(context, context.displayChoice);
+  assert.equal(settleFailed(false), true);
+  assert.deepEqual(context.displayApplied, half);
+  assert.equal(context.displayApplying, false);
+  assert.equal(displayChoiceNeedsRestart(context, { fps: 15, size: "half" }), true, "retried after a failure");
+  // A context made before these fields existed counts from zero.
+  const bare = {};
+  beginDisplayApply(bare, null)(true);
+  assert.deepEqual([bare.displaySeq, bare.displayApplying, bare.displayApplied], [1, false, null]);
+});
+
+test("focus: refresh restarts with the same profile, at once and then at most once per 3 s with the newest settings", () => {
+  const clock = fakeClock();
+  const applied = [];
+  let setting = "a";
+  const focus = new FocusController({
+    apply: (id, profile) => applied.push([clock.now(), id, profile, setting]),
+    now: clock.now, setTimer: clock.setTimer, clearTimer: clock.clearTimer,
+  });
+  assert.equal(focus.refresh("nobody"), false);
+  focus.add("x");
+  clock.advance(10_000);
+  // One change: one restart, at once, with the profile the device already runs.
+  assert.equal(focus.refresh("x"), true);
+  assert.deepEqual(applied, [[10_000, "x", "focused", "a"]]);
+  // Two more changes inside 3 s share one restart when the interval ends, with the newest.
+  clock.advance(500);
+  setting = "b";
+  focus.refresh("x");
+  clock.advance(500);
+  setting = "c";
+  focus.refresh("x");
+  assert.equal(applied.length, 1);
+  clock.advance(1999);
+  assert.equal(applied.length, 1);
+  clock.advance(1);
+  assert.deepEqual(applied.slice(1), [[13_000, "x", "focused", "c"]]);
+  clock.advance(10_000);
+  assert.equal(applied.length, 2, "nothing restarts after the coalesced restart");
+  // A refresh waits while a pointer is down, like a profile change.
+  let busy = true;
+  const held = [];
+  const second = new FocusController({
+    apply: (id, profile) => held.push([clock.now(), id, profile]), busy: () => busy,
+    now: clock.now, setTimer: clock.setTimer, clearTimer: clock.clearTimer,
+  });
+  second.add("y");
+  clock.advance(5000);
+  second.refresh("y");
+  clock.advance(300);
+  assert.deepEqual(held, []);
+  busy = false;
+  clock.advance(100);
+  assert.equal(held.length, 1);
+  assert.equal(held[0][2], "focused");
 });

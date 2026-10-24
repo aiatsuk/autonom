@@ -1014,5 +1014,110 @@ test("iOS: restart({options}) starts the next call with new fps and scale; witho
   await assert.rejects(stream.restart({ options: { scaleFactor: 2 } }), RangeError);
   assert.equal(calls.length, 3);
   assert.equal(calls[2].closed, false);
+  // On change (fps 0), as the Display menu's applyProfile asks: the Start carries fps 0 and
+  // the stream's options say 0, also through a later plain restart.
+  await stream.restart({ timeoutMs: 500, options: { fps: 0, scaleFactor: 0.5, avgBitrate: 1_000_000 } });
+  assert.equal(calls[3].requests[0].fps, 0);
+  assert.equal(calls[3].requests[0].scaleFactor, 0.5);
+  assert.equal(stream.options.fps, 0);
+  await stream.restart({ timeoutMs: 500 });
+  assert.equal(calls[4].requests[0].fps, 0, "a plain restart keeps frames on change");
   await stream.stop({ timeoutMs: 500 });
+});
+
+test("display choice in a workspace (QW-05): per device, reported as display_choice, the lower of it and the background profile, kept by a restore", async (t) => {
+  const world = await makeWorld(t);
+  for (const [key, value] of Object.entries(world.env)) {
+    if (key === "PATH" || key === "HOME") continue;
+    const before = process.env[key];
+    process.env[key] = value;
+    t.after(() => {
+      if (before === undefined) delete process.env[key];
+      else process.env[key] = before;
+    });
+  }
+  // --fps 60 so the multipart cap does not hide the profile's frame rate; --max-size 1600 is
+  // the full size Half halves.
+  const options = parseArgs([
+    "--adb", world.fakeAdb, "--port", "0", "--token", TOKEN, "--transport", "screencap", "--fps", "60",
+    "--max-size", "1600", "--python", process.execPath, "--bridge", world.fakeBridge, "--tools", world.fakeTools,
+    "--autonom", world.fakeAutonom, "--ephemeral", "--device", `android:${A}`, "--device", `android:${B}`,
+  ]);
+  const log = [];
+  const commandLog = { begin: (fields) => ({ end: (end) => log.push({ ...fields, ...end }) }) };
+  const originalError = console.error;
+  const originalLog = console.log;
+  console.error = () => {};
+  console.log = () => {};
+  t.after(() => {
+    console.error = originalError;
+    console.log = originalLog;
+  });
+  const handle = await startCanvasInProcess(options, { commandLog },
+    { processHandlers: false, env: { ...process.env, AUTONOM_HOME: world.home } });
+  t.after(() => handle.stop());
+  const canvas = { origin: `http://127.0.0.1:${handle.port}` };
+  await liveDevices(canvas, 2);
+  const devices = async () => Object.fromEntries((await api(canvas, "GET", "/api/devices")).json.devices
+    .map((device) => [device.id, device]));
+  const contextOf = (id) => handle.server.registry.get(id).context;
+  // INV-3: no choice is today's profile.
+  let byId = await devices();
+  for (const id of [ID_A, ID_B]) {
+    assert.equal(byId[id].display_choice, null);
+    assert.equal(byId[id].fps_cap, 60);
+    assert.equal(byId[id].max_size, null);
+  }
+  // A choice for A only, as the control message sets it; nothing of B changes.
+  assert.deepEqual(handle.server.setStreamChoice(contextOf(ID_A), { fps: 60, size: "half" }),
+    { fps: 60, max_size: 800, scale_factor: null });
+  byId = await devices();
+  assert.deepEqual(byId[ID_A].display_choice, { fps: 60, size: "half" });
+  assert.equal(byId[ID_A].max_size, 800);
+  assert.equal(byId[ID_B].display_choice, null);
+  await waitFor(async () => (await devices())[ID_A].profile_applied?.max_size === 800, 3000, "A's choice applied");
+  assert.ok(log.some((entry) => entry.device === ID_A && entry.kind === "stream" && entry.name === "profile" &&
+    entry.summary === `${ID_A} focused 60 fps half` && entry.ok === true), JSON.stringify(log.filter((entry) => entry.kind === "stream")));
+  // QW-05-S02: A loses the focus and runs 30 fps (the background cap below its 60) at its
+  // half size (below the 1024 cap); focused again it returns to 60.
+  await api(canvas, "POST", "/api/focus", { body: { id: ID_B } });
+  byId = await devices();
+  assert.equal(byId[ID_A].profile, "background");
+  assert.equal(byId[ID_A].fps_cap, 30);
+  assert.equal(byId[ID_A].max_size, 800);
+  byId = await waitFor(async () => {
+    const now = await devices();
+    return now[ID_A].profile_applied?.profile === "background" ? now : null;
+  }, 6000, "A's background profile applied");
+  assert.equal(byId[ID_A].profile_applied.fps_cap, 30);
+  assert.equal(byId[ID_A].profile_applied.max_size, 800);
+  // B, focused with no choice, keeps today's focused profile.
+  assert.equal(byId[ID_B].fps_cap, 60);
+  assert.equal(byId[ID_B].max_size, null);
+  await api(canvas, "POST", "/api/focus", { body: { id: ID_A } });
+  byId = await waitFor(async () => {
+    const now = await devices();
+    return now[ID_A].profile_applied?.profile === "focused" ? now : null;
+  }, 6000, "A focused again");
+  assert.equal(byId[ID_A].profile_applied.fps_cap, 60);
+  assert.equal(byId[ID_A].fps_cap, 60);
+  // A lower choice stays lower in the background: B at 15 fps runs 15, not 30.
+  assert.deepEqual(handle.server.setStreamChoice(contextOf(ID_B), { fps: 15, size: "full" }),
+    { fps: 15, max_size: 1024, scale_factor: null });
+  assert.equal((await devices())[ID_B].fps_cap, 15);
+  // A restore after a crash keeps the device's choice.
+  deviceScope.run({ id: ID_A }, () => handle.onUncaught(new Error("boom in A")));
+  await waitFor(async () => {
+    const entry = handle.server.registry.get(ID_A);
+    return entry.state === "live" && entry.context !== null ? entry : null;
+  }, 8000, "A restored");
+  byId = await devices();
+  assert.deepEqual(byId[ID_A].display_choice, { fps: 60, size: "half" });
+  assert.equal(byId[ID_A].profile_applied.max_size, 800);
+  assert.equal(contextOf(ID_A).profile.maxSize, 800);
+  // A device the focus plan does not know refuses a change and keeps its choice.
+  handle.server.focus.forget(ID_B);
+  assert.throws(() => handle.server.setStreamChoice(contextOf(ID_B), { fps: 30, size: "half" }), /cannot be changed now/);
+  assert.deepEqual((await devices())[ID_B].display_choice, { fps: 15, size: "full" });
+  await handle.stop();
 });

@@ -2,6 +2,7 @@ import { deviceLanguageMarkup, deviceLanguageScript } from "./canvas-device-lang
 import { deviceFrameStyles, deviceFrameScript } from "./canvas-device-frame.mjs";
 import { canvasIcon as icon, canvasIconButton as iconButton } from "./canvas-ui.mjs";
 import { CanvasDropdown } from "./canvas-dropdown.mjs";
+import { displayMenuMarkup, displayMenuScript, displayMenuStyles } from "./canvas-display-menu.mjs";
 /** The device page, rendered as self-contained HTML with inline styles and scripts. */
 import { themeControl, themeHead, themeStyles } from "./canvas-theme-page.mjs";
 import { MAX_CONTROL_MESSAGE_BYTES } from "./browser-lib.mjs";
@@ -19,6 +20,15 @@ import {
   toolsStyles,
 } from "./canvas-tools-page.mjs";
 import { DISPLAY_MENU_PRESETS, DISPLAY_PRESETS, escapeHtml, scriptString } from "./canvas-runtime.mjs";
+import {
+  SHORTCUTS,
+  SHORTCUT_SYSTEM_OPS,
+  actionChords,
+  isMacPlatform,
+  listedShortcuts,
+  shortcutFor,
+  shortcutLabel,
+} from "./canvas-shortcuts.mjs";
 
 // Inline SVG paths of the page's icons, on a 24 px grid; stroke and size come from the CSS.
 
@@ -38,6 +48,18 @@ function displayPicker(context) {
     `<span id="display-label">Size</span>${icon("chevron", "chev")}</button>` +
     `<div class="menu" id="display-menu"><div role="listbox" id="display-list" aria-label="Display size">${options}</div>` +
     `<p class="note">Changes the device's screen size and density. Restored when the Canvas stops.</p></div></div>`;
+}
+
+/**
+ * The Shortcuts list of Device settings (QW-03): the chords of the page's platform, rendered
+ * with the macOS glyphs; the page script relabels them with Ctrl elsewhere.
+ */
+function shortcutList(platform) {
+  const items = listedShortcuts(platform).map(({ entry, index }) =>
+    `<li><span>${escapeHtml(entry.label)}</span><kbd data-shortcut="${index}">${escapeHtml(shortcutLabel(entry, true))}</kbd></li>`).join("");
+  return `<details class="canvas-shortcuts" id="canvas-shortcuts"><summary>Keyboard shortcuts</summary>` +
+    `<ul class="shortcut-list" id="shortcut-list" aria-label="Keyboard shortcuts">${items}</ul>` +
+    `<p class="note">They act while the device or this page has focus, not while you type in a field.</p></details>`;
 }
 
 /**
@@ -103,6 +125,12 @@ body.no-inspector .side{display:none}
 .canvas-setting .popup,.canvas-setting .canvas-theme{width:100%;max-width:none}
 .canvas-setting .popup #display-label{overflow:hidden;text-overflow:ellipsis}
 .canvas-settings .menu{left:auto;right:0;max-width:calc(100vw - 42px);max-height:calc(100dvh - 210px)}
+.canvas-shortcuts{border-top:1px solid var(--line);padding:4px 0}
+.canvas-shortcuts summary{min-height:36px;display:flex;align-items:center;cursor:pointer}
+.shortcut-list{list-style:none;margin:0;padding:0;display:grid;gap:2px}
+.shortcut-list li{display:flex;align-items:center;justify-content:space-between;gap:12px;min-height:26px}
+.shortcut-list kbd{font:12px var(--mono);color:var(--text-2);font-variant-numeric:tabular-nums;white-space:nowrap}
+.canvas-shortcuts .note{margin:6px 0 0;color:var(--text-2);font-size:11.5px;line-height:1.35}
 
 /* size menu: anchor to the trigger, not the full toolbar column. */
 .display-picker{position:relative;min-width:0;max-width:100%}
@@ -181,7 +209,7 @@ dd code{font:12px var(--mono)}
   body.no-inspector .side{display:none}
 }
 @media (max-width:360px){.dock{gap:0;padding:2px}.dock .div{display:none}}
-${toolsStyles()}${extension("styles")}${embed ? EMBED_STYLES : ""}${deviceFrameStyles()}
+${toolsStyles()}${extension("styles")}${embed ? EMBED_STYLES : ""}${deviceFrameStyles()}${displayMenuStyles()}
 </style>
 </head>
 <body>
@@ -200,6 +228,8 @@ ${`<section class="canvas-settings" id="canvas-settings" role="dialog" aria-labe
   ${android ? `<div class="canvas-setting"><span>Device dimensions</span>${displayPicker(context)}</div>` : ""}
   ${deviceLanguageMarkup()}
   <div class="canvas-setting"><label for="device-frame-style">Device frame</label><input type="checkbox" role="switch" class="ui-switch" id="device-frame-style" aria-label="Device frame" checked></div><div id="device-frame-source" class="frame-source" role="status"></div>
+  ${displayMenuMarkup(context.options.platform === "ios" ? "ios" : "android", context.options)}
+  ${shortcutList(context.options.platform === "ios" ? "ios" : "android")}
 </section>`}
 <main class="stage">
   <p class="notice" id="notice" role="status" aria-live="polite"></p>
@@ -282,6 +312,15 @@ const META_STATE=${JSON.stringify(META_STATE)};
 const MAX_CONTROL_BYTES=${MAX_CONTROL_MESSAGE_BYTES};
 ${metaStateFor.toString()}
 ${keyInputFor.toString()}
+const SHORTCUTS=${JSON.stringify(SHORTCUTS)};
+const SHORTCUT_SYSTEM_OPS=${JSON.stringify(SHORTCUT_SYSTEM_OPS)};
+${isMacPlatform.toString()}
+${shortcutFor.toString()}
+${shortcutLabel.toString()}
+${listedShortcuts.toString()}
+${actionChords.toString()}
+// Cmd on macOS, Ctrl elsewhere (DEC-004).
+const IS_MAC=isMacPlatform(typeof navigator!=="undefined"?navigator:null);
 const $=id=>document.getElementById(id);
 const image=$("screen"),video=$("video"),device=$("device"),statusEl=$("status"),textInput=$("text"),sizePicker=$("display-preset");
 const sizeMenu=$("display-menu"),sizeLabel=$("display-label"),defaultSize=$("display-default-size"),sendButton=$("sendText");
@@ -361,9 +400,9 @@ window.addEventListener("pageshow",event=>{if(event.persisted&&view.mode==="webc
 function onDecoderError(error){stats.errors+=1;note("decoder: "+(error&&error.message||error));try{if(decoder&&decoder.state!=="closed")decoder.close()}catch{}decoder=null;waitingKey=true;if(stats.codec&&supportedCodecs.get(stats.codec))applyDecoderConfig(stats.codec);requestVideoKeyFrame()}
 
 // scrcpy control: one WebSocket carrying touch, wheel, keys, text and system actions.
-function connectControl(){if(controlSocket||!fastActive())return;const socket=new WebSocket(wsUrl("/ws/control"));controlSocket=socket;socket.onopen=()=>{controlRetry=500;if(waitingKey&&config&&view.mode==="webcodecs")requestVideoKeyFrame()};socket.onmessage=event=>{let message;try{message=JSON.parse(event.data)}catch{return}onControlMessage(message)};socket.onclose=()=>{if(controlSocket!==socket)return;controlSocket=null;activePointers.clear();displayBusy=false;view.rotateBusy=false;syncControls();if(fastActive()){setTimeout(connectControl,controlRetry);controlRetry=Math.min(5000,controlRetry*2)}}}
+function connectControl(){if(controlSocket||!fastActive())return;const socket=new WebSocket(wsUrl("/ws/control"));controlSocket=socket;socket.onopen=()=>{controlRetry=500;if(waitingKey&&config&&view.mode==="webcodecs")requestVideoKeyFrame();streamMenuOpened()};socket.onmessage=event=>{let message;try{message=JSON.parse(event.data)}catch{return}onControlMessage(message)};socket.onclose=()=>{if(controlSocket!==socket)return;controlSocket=null;activePointers.clear();displayBusy=false;view.rotateBusy=false;syncControls();if(fastActive()){setTimeout(connectControl,controlRetry);controlRetry=Math.min(5000,controlRetry*2)}}}
 function closeControlSocket(){const socket=controlSocket;controlSocket=null;if(socket)socket.close()}
-function onControlMessage(message){if(message.t==="state")applyState(message);else if(message.t==="display")onDisplay(message.display);else if(message.t==="rotation"){if(typeof invalidateDeviceFrame==="function")invalidateDeviceFrame();view.rotateBusy=false;syncControls();note(message.legacy?"Rotation requested through scrcpy":"Device rotated")}else if(message.t==="error"){stats.errors+=1;note(message.message);if(message.for==="rotate"){view.rotateBusy=false;syncControls()}if(message.for==="display"){displayBusy=false;syncPicker()}}else if(message.t==="clipboard"){if(typeof message.text!=="string"){note("the device clipboard has no text");return}textInput.value=message.text;if(navigator.clipboard&&navigator.clipboard.writeText)navigator.clipboard.writeText(message.text).catch(()=>{});note("device clipboard copied")}else if(message.t==="paste"){if(message.message)note(message.message)}else if(message.t==="pong"){view.rtt=Math.round(performance.now()-message.ts)}}
+function onControlMessage(message){if(message.t==="state")applyState(message);else if(message.t==="display")onDisplay(message.display);else if(message.t==="stream")onStreamReply(message);else if(message.t==="rotation"){if(typeof invalidateDeviceFrame==="function")invalidateDeviceFrame();view.rotateBusy=false;syncControls();note(message.legacy?"Rotation requested through scrcpy":"Device rotated")}else if(message.t==="error"){stats.errors+=1;note(message.message);if(message.for==="rotate"){view.rotateBusy=false;syncControls()}if(message.for==="display"){displayBusy=false;syncPicker()}if(message.for==="stream")onStreamRefused(message)}else if(message.t==="clipboard"){if(typeof message.text!=="string"){note("the device clipboard has no text");return}textInput.value=message.text;if(navigator.clipboard&&navigator.clipboard.writeText)navigator.clipboard.writeText(message.text).catch(()=>{});note("device clipboard copied")}else if(message.t==="paste"){if(message.message)note(message.message)}else if(message.t==="pong"){view.rtt=Math.round(performance.now()-message.ts)}}
 function sendControl(message){if(!controlSocket||controlSocket.readyState!==1)return false;controlSocket.send(JSON.stringify(message));return true}
 function applyLease(data){if("lease" in data)view.lease=data.lease&&typeof data.lease==="object"?data.lease:null;if("session_stopped" in data)view.sessionStopped=data.session_stopped===true}
 function applyState(message){const wasStreaming=view.session==="streaming";view.owner=message.owner;view.paused=message.paused;view.session=message.session;view.clients=message.clients;applyLease(message);if("clipboard" in message){view.clipboard=message.clipboard===true;if(iosFast())applyHint()}if("preset" in message){view.preset=message.preset;view.density=message.density}syncPicker();if("rotation" in message)setRotation(message.rotation);if(view.mode==="webcodecs"&&message.width&&message.height)setVideoSize(message.width,message.height);if(message.transport&&message.transport!==view.transport){view.transport=message.transport;applyTransport()}if(!wasStreaming&&view.session==="streaming"&&view.mode==="webcodecs"&&waitingKey&&config)requestVideoKeyFrame()}
@@ -443,17 +482,45 @@ for(const element of [image,video]){
   element.addEventListener("paste",onPaste);
 }
 async function onWheel(event){event.preventDefault();if(fastActive()){const at=normalized(event,false);if(!at)return;const scale=event.deltaMode===1?1/3:event.deltaMode===2?1:1/100;const dx=Math.max(-16,Math.min(16,event.deltaX*scale)),dy=Math.max(-16,Math.min(16,-event.deltaY*scale));if(dx||dy)sendControl({t:"scroll",x:at.x,y:at.y,dx,dy});return}if(!image.naturalWidth)return;const sent=sentSize(),width=sent?sent.dw:image.naturalWidth,height=sent?sent.dh:image.naturalHeight,x=Math.round(width/2),y1=Math.round(height*.55),y2=Math.round(height*(event.deltaY>0?.25:.78));try{await post("/swipe",{x1:x,y1,x2:x,y2,duration:220,...sent})}catch(error){note(error.message)}}
-function metaFor(event){return metaStateFor({shiftKey:event.shiftKey,ctrlKey:event.ctrlKey,altKey:event.altKey,metaKey:event.metaKey})}
+// Android: the keydown of the shortcut modifier (Cmd on macOS, Ctrl elsewhere) is held back in
+// withheld until the next key shows what the chord is for, so a shortcut never reaches the device
+// as a META or CTRL key (INV-1). Other modifiers pressed meanwhile wait with it. A key the device
+// gets sends them first, in order, so unmapped chords go exactly as before (QW-02); a shortcut or
+// another page chord drops them; a modifier pressed and released alone is sent on release.
+const MODIFIER_FLAGS={ShiftLeft:"shiftKey",ShiftRight:"shiftKey",ControlLeft:"ctrlKey",ControlRight:"ctrlKey",AltLeft:"altKey",AltRight:"altKey",MetaLeft:"metaKey",MetaRight:"metaKey"};
+let withheld=null;
+function shortcutModifier(code){return IS_MAC?code==="MetaLeft"||code==="MetaRight":code==="ControlLeft"||code==="ControlRight"}
+function rawMeta(event){return metaStateFor({shiftKey:event.shiftKey,ctrlKey:event.ctrlKey,altKey:event.altKey,metaKey:event.metaKey})}
+// The meta state the device has seen: a held-back modifier is left out until it is sent.
+function metaFor(event){const state={shiftKey:event.shiftKey,ctrlKey:event.ctrlKey,altKey:event.altKey,metaKey:event.metaKey};if(withheld)for(const entry of withheld.keys){const flag=MODIFIER_FLAGS[entry.code];if(![...heldKeys.keys()].some(name=>MODIFIER_FLAGS[name]===flag))state[flag]=false}return metaStateFor(state)}
+function flushWithheld(){if(!withheld)return;const keys=withheld.keys;withheld=null;for(const entry of keys){heldKeys.set(entry.code,0);sendControl({t:"key",a:"down",code:KEYCODES[entry.code],meta:entry.meta,repeat:0})}}
+function withholdModifier(event){if(!MODIFIER_FLAGS[event.code]||KEYCODES[event.code]===undefined||heldKeys.has(event.code))return false;if(!withheld){if(!shortcutModifier(event.code))return false;withheld={primary:event.code,keys:[],used:false}}event.preventDefault();if(!withheld.keys.some(entry=>entry.code===event.code))withheld.keys.push({code:event.code,meta:rawMeta(event)});return true}
 // iOS: a printable character typed on the screen goes as text; Android keycodes have no equivalent there.
 function onIosKey(event){if(event.ctrlKey||event.metaKey||event.isComposing||typeof event.key!=="string"||[...event.key].length!==1)return;event.preventDefault();sendControl({t:"text",text:event.key})}
-function onKeyDown(event){if(embedHotkey(event))return;if(iosFast()){onIosKey(event);return}if(!scrcpyActive())return;const input=keyInputFor(event,KEYCODES,US_KEY_CHARS);if(!input)return;event.preventDefault();if(input.text!==undefined){sendControl({t:"text",text:input.text});return}const repeat=event.repeat?(heldKeys.get(event.code)||0)+1:0;heldKeys.set(event.code,repeat);sendControl({t:"key",a:"down",code:input.code,meta:metaFor(event),repeat})}
-function onKeyUp(event){if(!scrcpyActive()||!heldKeys.has(event.code))return;event.preventDefault();heldKeys.delete(event.code);sendControl({t:"key",a:"up",code:KEYCODES[event.code],meta:metaFor(event),repeat:0})}
-function releaseKeys(){for(const name of heldKeys.keys()){const code=KEYCODES[name];if(code!==undefined)sendControl({t:"key",a:"up",code,meta:0,repeat:0})}heldKeys.clear()}
+function onKeyDown(event){if(withheld&&!MODIFIER_FLAGS[event.code])withheld.used=true;if(embedHotkey(event))return;if(deviceShortcut(event))return;if(iosFast()){onIosKey(event);return}if(!scrcpyActive()){withheld=null;return}if(withholdModifier(event))return;const input=keyInputFor(event,KEYCODES,US_KEY_CHARS);if(!input)return;event.preventDefault();if(!(event.repeat&&MODIFIER_FLAGS[event.code]))flushWithheld();if(input.text!==undefined){sendControl({t:"text",text:input.text});return}const repeat=event.repeat?(heldKeys.get(event.code)||0)+1:0;heldKeys.set(event.code,repeat);sendControl({t:"key",a:"down",code:input.code,meta:metaFor(event),repeat})}
+function onKeyUp(event){if(!scrcpyActive()){withheld=null;return}if(withheld&&withheld.keys.some(entry=>entry.code===event.code)){event.preventDefault();if(withheld.used){if(event.code===withheld.primary)withheld=null;else withheld.keys=withheld.keys.filter(entry=>entry.code!==event.code);return}flushWithheld()}if(!heldKeys.has(event.code))return;event.preventDefault();heldKeys.delete(event.code);sendControl({t:"key",a:"up",code:KEYCODES[event.code],meta:metaFor(event),repeat:0})}
+function releaseKeys(){withheld=null;for(const name of heldKeys.keys()){const code=KEYCODES[name];if(code!==undefined)sendControl({t:"key",a:"up",code,meta:0,repeat:0})}heldKeys.clear()}
 function onPaste(event){if(!fastActive())return;const text=event.clipboardData&&event.clipboardData.getData("text/plain");if(!text)return;event.preventDefault();if(iosFast()&&!view.clipboard){if(utf8Length(text)>300){note("the iOS Simulator takes at most 300 bytes of text at a time; nothing was sent");return}sendControl({t:"text",text});return}const message={t:"paste",text};if(!fitsControl(message,"clipboard text"))return;sendControl(message)}
 function utf8Length(text){return new TextEncoder().encode(text).length}
 function iosTypeable(text){return /^[\\n\\x20-\\x7e]*$/.test(text)}
 function fitsControl(message,what){const size=utf8Length(JSON.stringify(message));if(size<=MAX_CONTROL_BYTES)return true;note(what+" is too large: "+size+" bytes as a control message after JSON escaping, at most "+MAX_CONTROL_BYTES+"; nothing was sent");return false}
-for(const button of document.querySelectorAll("[data-system],[data-code],[data-key]")){button.addEventListener("click",()=>{if(fastActive()){if(button.dataset.system){const sent=sendControl({t:"system",op:button.dataset.system});if(button.dataset.system==="rotate"&&sent){view.rotateBusy=true;syncControls();note("Rotating device…")}}else if(button.dataset.code){const code=Number(button.dataset.code);sendControl({t:"key",a:"down",code,meta:0,repeat:0});sendControl({t:"key",a:"up",code,meta:0,repeat:0})}return}if(button.dataset.key)post("/key",{key:button.dataset.key}).catch(error=>note(error.message))})}
+function pressButton(button){if(fastActive()){if(button.dataset.system){const sent=sendControl({t:"system",op:button.dataset.system});if(button.dataset.system==="rotate"&&sent){view.rotateBusy=true;syncControls();note("Rotating device…")}}else if(button.dataset.code){const code=Number(button.dataset.code);sendControl({t:"key",a:"down",code,meta:0,repeat:0});sendControl({t:"key",a:"up",code,meta:0,repeat:0})}return}if(button.dataset.key)post("/key",{key:button.dataset.key}).catch(error=>note(error.message))}
+// The first button of each system operation is the one its shortcut presses.
+const systemButtons={};
+for(const button of document.querySelectorAll("[data-system],[data-code],[data-key]")){if(button.dataset.system&&!systemButtons[button.dataset.system])systemButtons[button.dataset.system]=button;button.addEventListener("click",()=>pressButton(button))}
+// Simulator.app-style shortcuts (QW-01): they run before device key forwarding, so a mapped chord
+// never reaches the device and the browser does not act on it; any other chord goes on as before.
+// A device action presses its button's path (a hidden or disabled button does nothing); screenshot
+// and record go to the Actions drawer as an autonom:capture event, so its busy and lock rules apply.
+function shortcutHint(action){const chords=actionChords(action,PLATFORM,IS_MAC);return chords?" ("+chords+")":""}
+function requestCapture(action){let handled=false;if(typeof CustomEvent==="function"&&typeof window.dispatchEvent==="function")handled=!window.dispatchEvent(new CustomEvent("autonom:capture",{cancelable:true,detail:{action}}));if(!handled)note(action==="record"?"Recording is not available on this page":"Screenshots are not available on this page")}
+function deviceShortcut(event){const action=shortcutFor(event,PLATFORM,IS_MAC);if(!action)return false;event.preventDefault();if(event.repeat&&action!=="volume-up"&&action!=="volume-down")return true;if(action==="rotate"&&PLATFORM==="ios"){note("Rotate is not available on iOS yet");return true}if(action==="screenshot"||action==="record"){requestCapture(action);return true}const button=systemButtons[SHORTCUT_SYSTEM_OPS[action]];if(button&&!button.hidden&&!button.disabled)pressButton(button);return true}
+// With focus elsewhere in the page the same shortcuts act, except while typing in a field.
+function typingTarget(node){if(!node||typeof node!=="object")return false;if(node.isContentEditable)return true;const tag=node.tagName;if(tag==="TEXTAREA"||tag==="SELECT")return true;if(tag!=="INPUT")return false;const type=String(node.type||(typeof node.getAttribute==="function"&&node.getAttribute("type"))||"text").toLowerCase();return !["checkbox","radio","button","submit","reset","range","color"].includes(type)}
+document.addEventListener("keydown",event=>{if(event.defaultPrevented||event.target===image||event.target===video||typingTarget(event.target))return;deviceShortcut(event)});
+// Tooltips name the chord (QW-03), and the Shortcuts list shows Ctrl off macOS.
+function labelShortcuts(){const actions=Object.keys(SHORTCUT_SYSTEM_OPS);for(const op of Object.keys(systemButtons)){const button=systemButtons[op],action=actions.find(name=>SHORTCUT_SYSTEM_OPS[name]===op),hint=action?shortcutHint(action):"";if(hint)button.title=(button.getAttribute("aria-label")||button.title)+hint}for(const node of document.querySelectorAll("[data-shortcut]")){const entry=SHORTCUTS[Number(node.dataset.shortcut)];if(entry)setText(node,shortcutLabel(entry,IS_MAC))}}
+labelShortcuts();
 $("clipboard").onclick=()=>sendControl({t:"clipboard-get"});
 async function pasteFromClipboard(){
   if(view.pasteBusy||!view.status||!canSendInput()||!scrcpyActive())return;
@@ -474,7 +541,7 @@ async function sendText(){const value=textInput.value;if(!value)return;if(iosFas
 $("sendText").onclick=sendText;textInput.addEventListener("keydown",event=>{if(event.key==="Enter")sendText()});
 function transportLabel(){if(!view.transport)return"connecting";if(!fastActive())return view.transport;if(view.mode==="webcodecs")return scrcpyActive()?"scrcpy (webcodecs)":view.transport+" (webcodecs)";return view.transport+" (multipart"+(view.reason?": "+view.reason:"")+")"}
 function currentFps(){const now=performance.now();while(stats.renderTimes.length&&now-stats.renderTimes[0]>1000)stats.renderTimes.shift();return stats.renderTimes.length}
-function render(){if(view.width&&view.height)refreshDeviceFrame(view.width,view.height);currentFps();const data=view.status||{},lines=["platform: "+(data.platform||"unknown"),"transport: "+transportLabel()];if(data.fallback_reason)lines.push("fallback: "+data.fallback_reason);if(view.mode==="webcodecs"){lines.push("decoder: "+(stats.codec||"waiting for config"));lines.push("fps: "+stats.renderTimes.length+" rendered, "+stats.framesDecoded+" decoded, "+stats.framesDropped+" dropped, queue "+(decoder?decoder.decodeQueueSize:0));lines.push("video: "+(view.width?view.width+"x"+view.height:"waiting")+", session "+view.session)}else{lines.push("frames: "+(data.frames_sent??0)+"\\nstream clients: "+(data.stream_clients??0))}if(view.clients)lines.push("clients: video "+view.clients.video+", control "+view.clients.control);lines.push("display: "+(data.display&&data.display.width?data.display.width+"x"+data.display.height+(view.density?" @ "+view.density:"")+(sizePicker?" ("+(view.preset||"other")+")":""):"unknown"));lines.push("control: "+view.owner+(view.paused?" (paused)":""));if(data.last_error)lines.push("last error: "+data.last_error);if(view.note)lines.push("note: "+view.note);setStatus(lines.join("\\n"));syncPicker();renderChrome()}
+function render(){if(view.width&&view.height)refreshDeviceFrame(view.width,view.height);syncStreamMenu();currentFps();const data=view.status||{},lines=["platform: "+(data.platform||"unknown"),"transport: "+transportLabel()];if(data.fallback_reason)lines.push("fallback: "+data.fallback_reason);if(view.mode==="webcodecs"){lines.push("decoder: "+(stats.codec||"waiting for config"));lines.push("fps: "+stats.renderTimes.length+" rendered, "+stats.framesDecoded+" decoded, "+stats.framesDropped+" dropped, queue "+(decoder?decoder.decodeQueueSize:0));lines.push("video: "+(view.width?view.width+"x"+view.height:"waiting")+", session "+view.session)}else{lines.push("frames: "+(data.frames_sent??0)+"\\nstream clients: "+(data.stream_clients??0))}if(view.clients)lines.push("clients: video "+view.clients.video+", control "+view.clients.control);lines.push("display: "+(data.display&&data.display.width?data.display.width+"x"+data.display.height+(view.density?" @ "+view.density:"")+(sizePicker?" ("+(view.preset||"other")+")":""):"unknown"));lines.push("control: "+view.owner+(view.paused?" (paused)":""));if(data.last_error)lines.push("last error: "+data.last_error);if(view.note)lines.push("note: "+view.note);setStatus(lines.join("\\n"));syncPicker();renderChrome()}
 // The toolbar, caption, notice and Stream details; every string reaches the page as text.
 function sizeText(width,height){return width&&height?width+" × "+height:""}
 function displayText(){const display=logicalDisplay||{},size=sizeText(display.width,display.height);return size&&view.density?size+" · "+view.density+" dpi":size}
@@ -490,6 +557,7 @@ async function bootstrap(){await authenticate();setInterval(render,500);await po
 bootstrap().catch(error=>{setStatus(error.message);setText(ui.notice,error.message)});
 ${deviceFrameScript()}
 ${deviceLanguageScript()}
+${displayMenuScript()}
 ${EMBED_SCRIPT}`;
 }
 

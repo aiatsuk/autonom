@@ -19,6 +19,10 @@ const RESTART_INPUT_POLL_MS = 100;
 export const ATTACH_CONCURRENCY = 2;
 export const DEVICE_STATES = Object.freeze(["attaching", "live", "offline", "failed", "detaching"]);
 const FOCUSED_FPS = 60;
+// Display menu "Half" (QW-04): iOS streams at half scale; Android at half the long side the
+// stream would use at full size, or of HALF_SIZE_FALLBACK_BASE when that is not known yet.
+export const HALF_IOS_SCALE = 0.5;
+const HALF_SIZE_FALLBACK_BASE = 1280;
 
 /** A refusal of the Canvas API: an HTTP status, a stable code, a hint and extra fields. */
 export class CanvasError extends Error {
@@ -76,25 +80,80 @@ export function splitDevicePath(pathname) {
   return { id, rest: slash < 0 ? null : after.slice(slash) };
 }
 
+/** Half of `base` px (the full-size long side), rounded down to a multiple of 8 as encoders want. */
+export function halfMaxSize(base) {
+  const long = Number.isFinite(base) && base > 0 ? base : HALF_SIZE_FALLBACK_BASE;
+  return Math.max(8, Math.floor(long / 16) * 8);
+}
+
+/** Whether two Display menu choices ({fps, size} or null) are the same. */
+export function sameDisplayChoice(a, b) {
+  if (!a || !b) return !a && !b;
+  return a.fps === b.fps && a.size === b.size;
+}
+
+/**
+ * Whether Display menu choice `next` needs a stream restart of the device `context`: it
+ * differs from the choice kept there, or it is the same (sent again by a page that
+ * reconnected) but the newest restart did not apply it and none runs now, so it is tried
+ * once more.
+ */
+export function displayChoiceNeedsRestart(context, next) {
+  return !sameDisplayChoice(context.displayChoice, next) ||
+    (!context.displayApplying && !sameDisplayChoice(context.displayApplied, next));
+}
+
+/**
+ * Begin one stream restart of the device `context` that applies Display menu `choice`.
+ * Restarts can overlap (a slow one still waits for frames when the next begins), so the
+ * returned `settle(ok)` records the choice as applied only for the newest restart and
+ * answers whether it was the newest.
+ */
+export function beginDisplayApply(context, choice) {
+  const seq = (context.displaySeq ?? 0) + 1;
+  context.displaySeq = seq;
+  context.displayApplying = true;
+  return (ok) => {
+    if (context.displaySeq !== seq) return false;
+    context.displayApplying = false;
+    if (ok) context.displayApplied = choice;
+    return true;
+  };
+}
+
 /**
  * The stream settings of a device. Focused: the configured frame rate (60 unless --fps),
  * the automatic size, full scale. Background: at most 30 fps, Android at most 1024 px on
  * the long side (or the explicit --max-size when smaller; 0 = native counts as unbounded),
  * iOS at half scale.
+ *
+ * A Display menu `choice` ({fps, size}, QW-05) replaces the configured frame rate (fps null
+ * keeps it) and, with
+ * size "half", halves the picture: Android to halfMaxSize(`baseMaxSize`), the long side the
+ * stream uses at full size, iOS to HALF_IOS_SCALE. In the background the lower of the
+ * choice and the background profile applies (fps 0, frames on change, is the lowest). With
+ * no choice the result is exactly the one above.
  */
-export function profileVideo({ platform, focused, options = {} }) {
-  const focusedFps = options.fpsExplicit ? options.fps : FOCUSED_FPS;
+export function profileVideo({ platform, focused, options = {}, choice = null, baseMaxSize = null }) {
+  const focusedFps = choice?.fps ?? (options.fpsExplicit ? options.fps : FOCUSED_FPS);
+  const half = choice?.size === "half";
   if (focused) {
-    return { profile: "focused", fps: focusedFps, maxSize: undefined, scaleFactor: 1 };
+    return {
+      profile: "focused", fps: focusedFps,
+      maxSize: half && platform !== "ios" ? halfMaxSize(baseMaxSize) : undefined,
+      scaleFactor: half && platform === "ios" ? HALF_IOS_SCALE : 1,
+    };
   }
   const fps = Math.min(PROFILE.BACKGROUND_FPS, focusedFps);
   if (platform === "ios") {
-    return { profile: "background", fps, maxSize: undefined, scaleFactor: PROFILE.BACKGROUND_IOS_SCALE };
+    const scaleFactor = Math.min(PROFILE.BACKGROUND_IOS_SCALE, half ? HALF_IOS_SCALE : 1);
+    return { profile: "background", fps, maxSize: undefined, scaleFactor };
   }
   const auto = options.maxSizeExplicit ? options.maxSize : undefined;
   const effective = auto === undefined || auto === 0 ? Infinity : auto;
+  const chosen = half ? halfMaxSize(baseMaxSize) : Infinity;
   return {
-    profile: "background", fps, maxSize: Math.min(effective, PROFILE.BACKGROUND_ANDROID_MAX_SIZE), scaleFactor: 1,
+    profile: "background", fps, maxSize: Math.min(effective, PROFILE.BACKGROUND_ANDROID_MAX_SIZE, chosen), scaleFactor: 1,
   };
 }
 
@@ -316,6 +375,19 @@ export class FocusController {
 
   #confirm(id, profile) {
     this.#confirmed.set(id, { profile, at: this.#now(), applied_at: new Date().toISOString() });
+  }
+
+  /**
+   * Restart a device with the profile it wants once more, because what that profile means
+   * changed (a Display menu choice, QW-04): planned like a profile change, so at most one
+   * restart per RESTART_MIN_INTERVAL_MS (changes meanwhile share the next one, and `apply`
+   * reads the newest choice), after a pointer or key is up. False for an unknown device.
+   */
+  refresh(id) {
+    if (!this.#wanted.has(id)) return false;
+    this.#applied.set(id, null);
+    this.#schedule(id);
+    return true;
   }
 
   /** A device left: its timers end. A focused device that leaves clears the focus. */
