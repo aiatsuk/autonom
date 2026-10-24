@@ -1,6 +1,7 @@
 ---
 name: android-project-setup
 description: Create, inspect, or modernize native Android modules with Kotlin, Gradle, Compose, SDK configuration, version catalogs, and compatibility checks based on the active repository and official guidance.
+model: inherit
 ---
 
 # Android Project Setup

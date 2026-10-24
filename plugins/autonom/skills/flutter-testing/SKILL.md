@@ -1,6 +1,8 @@
 ---
 name: flutter-testing
 description: Design and run a layered Flutter test strategy across unit, widget, golden, integration, platform-channel, and native-UI tests with focused commands and reproducible device setup.
+model: sonnet
+effort: high
 ---
 
 # Flutter Testing

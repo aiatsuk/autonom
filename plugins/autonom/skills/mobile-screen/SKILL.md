@@ -1,6 +1,7 @@
 ---
 name: mobile-screen
 description: Understand and control what is on an Android or iOS screen for AI agents using compact accessibility/UI trees, semantic find/tap, gestures, screenshots, and key/text input via the Autonom CLI.
+model: inherit
 ---
 
 # Mobile Screen (Android + iOS Simulator)

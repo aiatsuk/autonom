@@ -1,6 +1,7 @@
 ---
 name: mobile-memory
 description: Reuse and record per-app Autonom knowledge for device work. Read the app's overlay and flow runbooks before driving a device, and save a new flow only when it is durable, reusable, and evidence-backed. Triggers on a device task against a known app (a package/bundle id is in play), and after working out a repeatable procedure — make an order, mock a screen, log in, reproduce a bug.
+model: inherit
 ---
 
 # Mobile Memory

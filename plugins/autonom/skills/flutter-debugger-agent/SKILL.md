@@ -1,6 +1,8 @@
 ---
 name: flutter-debugger-agent
 description: Build, launch, attach to, inspect, and debug Flutter applications on explicit devices using Flutter machine output, Dart VM service evidence, adb, screenshots, logs, and repeatable user flows.
+model: opus
+effort: high
 ---
 
 # Flutter Debugger Agent

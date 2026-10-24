@@ -1,6 +1,7 @@
 ---
 name: autonom
 description: Start here for Autonom — the universal mobile test/debug harness for AI agents on Android and the iOS Simulator. The map of the whole system — what it can do, how it works, and how to use it end to end (own a session, see the screen, drive it, watch logs and network, mock responses, capture evidence, journal every step). Read this first when asked to test, debug, profile, reproduce, or validate a running app, or when unsure which Autonom skill to load. Then let project-router narrow to the stack-specific skills.
+model: inherit
 ---
 
 # Autonom — how the whole harness works

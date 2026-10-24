@@ -1,6 +1,8 @@
 ---
 name: autonom-setup
 description: Install, update, or hand off the Autonom harness — the CLI plus all skills — on a machine or in an agent. Use when checking for a newer Autonom version, downloading and installing an update in Codex or Claude Code, setting up a new machine, or packaging the harness for handoff.
+model: sonnet
+effort: low
 ---
 
 # Autonom Setup

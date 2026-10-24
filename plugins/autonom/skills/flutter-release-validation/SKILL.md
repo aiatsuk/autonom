@@ -1,6 +1,8 @@
 ---
 name: flutter-release-validation
 description: Validate Flutter Android release candidates across flavors, targets, Dart defines, signing boundaries, analysis, tests, APK or app bundle builds, smoke flows, and app-size artifacts.
+model: sonnet
+effort: high
 ---
 
 # Flutter Release Validation

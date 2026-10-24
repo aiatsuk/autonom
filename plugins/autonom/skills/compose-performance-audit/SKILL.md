@@ -1,6 +1,8 @@
 ---
 name: compose-performance-audit
 description: Audit Compose performance from code and runtime evidence, focusing on invalidation scope, stability, lazy identity, effects, layout, draw work, images, and comparable profiling captures.
+model: opus
+effort: high
 ---
 
 # Compose Performance Audit

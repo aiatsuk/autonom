@@ -1,6 +1,7 @@
 ---
 name: mobile-session
 description: Own an explicit Android device or iOS simulator session for AI agents — list targets, start Autonom session artifacts, install/launch/force-stop/clear apps, and stop cleanly with evidence directories.
+model: inherit
 ---
 
 # Mobile Session (Android + iOS Simulator)

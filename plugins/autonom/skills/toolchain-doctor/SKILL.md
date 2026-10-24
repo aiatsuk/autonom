@@ -1,6 +1,7 @@
 ---
 name: toolchain-doctor
 description: Inspect Flutter, Dart, Gradle, Android Gradle Plugin, Kotlin, SDK levels, Java, adb devices, and repository-pinned toolchain configuration without asserting stale latest versions.
+model: inherit
 ---
 
 # Toolchain Doctor
