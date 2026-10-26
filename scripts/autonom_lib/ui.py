@@ -545,6 +545,12 @@ def _asks_quiet(target: Target | None, timeout_ms: int,
     return _ios().quiet_route(target)
 
 
+# `settle`'s ``method`` on the iOS idb route: `idb ui quiet` through the idb
+# process, or the device daemon's open quiet stream.
+METHOD_IDB_QUIET = "idb-quiet"
+METHOD_QUIET_STREAM = "quiet-stream"
+
+
 def settle(
     target: Target | None,
     timeout_ms: int = 5000,
@@ -560,7 +566,8 @@ def settle(
 
     On the iOS idb route (AL-08) idb is asked first whether the frontmost
     app goes quiet within the budget (`idb ui quiet`), and the tree is then
-    read exactly once: ``method: "idb-quiet"``, ``snapshots: 1``, and
+    read exactly once: ``method: "idb-quiet"`` (``"quiet-stream"`` when the
+    device daemon answered from its open quiet stream), ``snapshots: 1``, and
     ``settled`` is idb's answer — false, with the read made, when idb still
     saw the app busy or settling at the deadline (``quiet_state`` and
     ``busy_signals`` say what it saw). A dead companion is pruned and idb
@@ -613,8 +620,11 @@ def settle(
             take()
             now = clock()
             quiet = bool(answer.get("quiet"))
+            # the device daemon answers from its open quiet stream (ID-10)
+            method = (METHOD_QUIET_STREAM if answer.get("transport") == "daemon"
+                      else METHOD_IDB_QUIET)
             result: dict[str, Any] = {
-                "settled": quiet, "method": "idb-quiet", "snapshots": 1, "changes": 0,
+                "settled": quiet, "method": method, "snapshots": 1, "changes": 0,
                 "elapsed_ms": int((now - started) * 1000),
                 "dump_ms": int((now - began) * 1000),
                 # idb counts the app quiet only after the whole quiet window
@@ -707,7 +717,7 @@ def unsettled_message(result: Mapping[str, Any], timeout_ms: int, quiet_ms: int,
     CLI, `timeoutMs` in a flow); `node_wait` is how that caller waits for a
     node instead. An ``idb-quiet`` result says what idb last saw instead.
     """
-    if result.get("method") == "idb-quiet":
+    if result.get("method") in (METHOD_IDB_QUIET, METHOD_QUIET_STREAM):
         return _unquiet_message(result, timeout_ms, quiet_ms, timeout_name, node_wait)
     snapshots = int(result.get("snapshots") or 0)
     changes = int(result.get("changes") or 0)

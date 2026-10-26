@@ -18,10 +18,11 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import time
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from . import errors
 from . import processes as processes_mod
@@ -186,6 +187,372 @@ def _command_words(args: Sequence[str]) -> str:
     return " ".join(words) or "command"
 
 
+# --- the iOS device daemon seam (ID-06..ID-08, DEC-007) --------------------------
+#
+# Six `idb ui` subcommands are served by the simulator's device daemon
+# (`ios_daemon`) when it can be used: `describe-all --json`, `quiet`, `tap`,
+# `swipe`, `button` and `key`. Its reply comes back as the CompletedProcess the
+# idb client would have given — the same stdout text and exit status — so the
+# parsers above stay as they are. Everything else (`ui text`, `crash`, `file
+# pull`, `screenshot`, `list-targets`, `connect`), a remote companion and a call
+# without a UDID stay on the idb process. When the daemon was wanted and not
+# used, the call goes to the idb process as before, and the reason is kept for
+# the reply (`transport_reason`). An input the daemon may have received is never
+# sent again through idb (INV-1): it fails with the after-connection error.
+
+TRANSPORT_DAEMON = "daemon"
+TRANSPORT_SUBPROCESS = "subprocess"
+# The keys `transport_of` gives the CLI's reply (additive; `backend` keeps
+# naming the input route).
+TRANSPORT_KEYS = ("transport", "transport_reason", "ax_backend")
+_TRANSPORT: dict[str, dict[str, Any]] = {}
+_DAEMON_INPUTS = ("tap", "swipe", "button", "key")
+# How long an observed input (`act`) may take beyond the observe budget (and
+# the input's own duration). The daemon replies within its ACT_REPLY_MARGIN_MS
+# (20 s: the input's deadline, the confirmation and grace windows, the cause
+# check and one tree read) plus INPUT_REPLY_SLACK_MS (3 s), inside this.
+ACT_MARGIN_S = 25.0
+# How long the CLI waits for the daemon's reply to a plain input (tap, swipe,
+# button, key), plus the input's own duration. The daemon gives up on an input
+# at its DEFAULT_HID_WAIT_MS (15 s) from arrival, cancels what the companion has
+# not performed, and replies within INPUT_REPLY_SLACK_MS (3 s) after that, so
+# its `input_unconfirmed` reply always arrives before this runs out and nothing
+# is performed after the CLI gave up (REV-029). Tests pin the pairing.
+DAEMON_INPUT_BUDGET_S = 20.0
+# The act an observed action armed in this thread (see `arm_act`).
+_ACT = threading.local()
+
+
+class _DaemonCompleted(subprocess.CompletedProcess):
+    """A CompletedProcess the daemon answered (``transport`` says so)."""
+
+    transport = TRANSPORT_DAEMON
+
+
+def transport_of(udid: str | None) -> dict[str, Any]:
+    """How this process's idb calls for ``udid`` were served: ``transport``
+    (``daemon`` or ``subprocess``) of the command's input when it sent one,
+    else of its last read; ``transport_reason`` when that call wanted the
+    daemon and did not get it; and the ``ax_backend`` of the last daemon tree
+    read. Empty when no call ran."""
+    held = _TRANSPORT.get(udid or "", {})
+    return {key: held[key] for key in TRANSPORT_KEYS if held.get(key) is not None}
+
+
+def reset_transport() -> None:
+    """Forget what was recorded (tests)."""
+    _TRANSPORT.clear()
+    disarm_act()
+
+
+def _note_transport(udid: str, args: Sequence[str], transport: str, *,
+                    reason: str | None = None, ax_backend: str | None = None,
+                    wanted: bool = True) -> None:
+    """Record how one call was served. An input decides what the reply says
+    (the last one wins); a read only while no input was sent; a call the
+    daemon never serves (`ui text` aside, which is an input) does not
+    replace what a read recorded."""
+    held = _TRANSPORT.setdefault(udid, {})
+    if ax_backend:
+        held["ax_backend"] = ax_backend
+    is_input = _command(args, INPUT_COMMANDS) is not None
+    if not is_input and (held.get("input") or (not wanted and "transport" in held)):
+        return
+    held["transport"] = transport
+    held.pop("transport_reason", None)
+    if transport == TRANSPORT_SUBPROCESS and wanted and reason:
+        held["transport_reason"] = reason
+    if is_input:
+        held["input"] = True
+
+
+def arm_act(udid: str, timeout_ms: int) -> None:
+    """The next input this thread sends to ``udid`` on the daemon route is
+    an observed one (ID-10): one `act` request sends it, waits for the
+    confirmation and the settle within ``timeout_ms``, and reads the screen
+    once; the observe step takes the result with ``take_act``."""
+    _ACT.armed = {"udid": udid, "timeout_ms": max(int(timeout_ms), 0)}
+    _ACT.result = None
+
+
+def disarm_act() -> None:
+    _ACT.armed = None
+    _ACT.result = None
+
+
+def take_act(udid: str) -> dict[str, Any] | None:
+    """The result of the `act` this thread sent to ``udid``, once; None when
+    the input did not go through `act`."""
+    held = getattr(_ACT, "result", None)
+    _ACT.result = None
+    if not held or held[0] != udid:
+        return None
+    return held[1]
+
+
+def _number(text: str) -> int | float | None:
+    try:
+        value = float(text)
+    except (TypeError, ValueError):
+        return None
+    if value != value or value in (float("inf"), float("-inf")):
+        return None
+    return int(value) if value.is_integer() and "." not in str(text) else value
+
+
+def _daemon_call(args: Sequence[str]) -> dict[str, Any] | None:
+    """The daemon request one of the six served argv shapes maps to, or
+    None for any other argv (which stays on the idb process)."""
+    words = [str(word) for word in args]
+    if words[:1] != ["ui"] or len(words) < 2:
+        return None
+    verb, rest = words[1], words[2:]
+    if verb == "describe-all":
+        return {"op": "tree"} if rest == ["--json"] else None
+    if verb == "quiet":
+        if len(rest) != 4 or rest[1] != "--json" or rest[2] != "--quiet-window-ms":
+            return None
+        seconds, window = _number(rest[0]), _number(rest[3])
+        if seconds is None or window is None or seconds <= 0 or window < 0:
+            return None
+        return {"op": "quiet", "timeout_ms": max(int(round(seconds * 1000)), 1),
+                "quiet_ms": int(window), "_seconds": rest[0]}
+    if verb == "tap":
+        if len(rest) not in (2, 4) or (len(rest) == 4 and rest[2] != "--duration"):
+            return None
+        x, y = _number(rest[0]), _number(rest[1])
+        if x is None or y is None:
+            return None
+        call: dict[str, Any] = {"op": "tap", "x": x, "y": y}
+        if len(rest) == 4:
+            duration = _number(rest[3])
+            if duration is None or duration < 0:
+                return None
+            call["duration"] = duration
+        return call
+    if verb == "swipe":
+        if len(rest) != 6 or rest[4] != "--duration":
+            return None
+        values = [_number(value) for value in (*rest[:4], rest[5])]
+        if any(value is None for value in values):
+            return None
+        x1, y1, x2, y2, duration = values
+        return {"op": "swipe", "x1": x1, "y1": y1, "x2": x2, "y2": y2, "duration": duration}
+    if verb == "button":
+        return {"op": "button", "name": rest[0]} if len(rest) == 1 and rest[0] in BUTTONS else None
+    if verb == "key":
+        return ({"op": "key", "code": int(rest[0])}
+                if len(rest) == 1 and rest[0].isdigit() else None)
+    return None
+
+
+def _quiet_stdout(reply: dict[str, Any], seconds: str) -> tuple[str, int]:
+    """`idb ui quiet --json`'s lines and exit status for a daemon `quiet`
+    reply: the last state, then `timed_out` (exit 1) when it ran out."""
+    state = str(reply.get("state") or "quiet").lower()
+    timed_out = bool(reply.get("timed_out"))
+    if timed_out and state == "quiet":
+        state = "busy"
+    event: dict[str, Any] = {"event": "state", "state": state}
+    if state == "busy":
+        signals = reply.get("busy_signals")
+        event["signals"] = sorted(str(name) for name in signals or () if isinstance(name, str))
+    lines = [json.dumps(event, sort_keys=True)]
+    if not timed_out:
+        return lines[0] + "\n", 0
+    timeout = _number(seconds)
+    lines.append(json.dumps({"event": "timed_out", "timeout": float(timeout or 0)},
+                            sort_keys=True))
+    return "\n".join(lines) + "\n", 1
+
+
+def _after_send_error(args: Sequence[str], detail: str) -> errors.AutonomError:
+    action = _command(args, INPUT_COMMANDS) or "input"
+    return errors.AutonomError(
+        errors.IDB_COMPANION_UNAVAILABLE,
+        f"the iOS device daemon failed after the {action} was sent: {detail}"[:400],
+        _failure_hint(AFTER_CONNECTION, args),
+        stage=AFTER_CONNECTION, transport=TRANSPORT_DAEMON)
+
+
+# The hint of an input the daemon sent and idb_companion never confirmed, when
+# the daemon's own reply carries none.
+UNCONFIRMED_HINT = ("The input was sent once, but idb_companion did not confirm it: another client "
+                    "held the simulator's input (idb ui text, a Canvas press) past the safety "
+                    "limit, or the companion connection was lost. It was not sent again. Read the "
+                    "screen ('autonom ui tree') before you repeat it.")
+
+
+def _unconfirmed_error(args: Sequence[str], error: dict[str, Any],
+                       message: str) -> errors.AutonomError:
+    """The daemon's `input_unconfirmed` failure as the CLI's: its message,
+    hint and `unconfirmed_events` kept, stage after_connection (sent once,
+    never again)."""
+    events = error.get("unconfirmed_events")
+    extra: dict[str, Any] = {"stage": AFTER_CONNECTION, "transport": TRANSPORT_DAEMON}
+    if isinstance(events, int) and not isinstance(events, bool):
+        extra["unconfirmed_events"] = events
+    hint = error.get("hint")
+    return errors.AutonomError(
+        errors.INPUT_UNCONFIRMED, message[:400],
+        str(hint) if isinstance(hint, str) and hint.strip() else UNCONFIRMED_HINT, **extra)
+
+
+def xcuitest_session(udid: str) -> bool:
+    """Is ``udid`` served by the XCUITest runner (``--ui-backend xcuitest``,
+    AUTONOM_UI_BACKEND, the session's preference, or an auto session that
+    switched to it)? Such a session never starts or uses the device daemon
+    (ID-06). When the backend cannot be told, the answer is yes: the idb
+    process serves the call, as before the daemon existed."""
+    try:
+        from . import ui_ios
+        from .platform import IOS
+
+        return ui_ios.selected_backend(Target(IOS, udid, "xcrun")) == "xcuitest"
+    except Exception:  # noqa: BLE001 - an unreadable backend never starts a daemon
+        return True
+
+
+def _via_daemon(args: Sequence[str], udid: str, timeout: float | None,
+                binary: bool, spent: dict[str, Any] | None = None,
+                ) -> subprocess.CompletedProcess | None:
+    """Serve ``args`` through the device daemon: the CompletedProcess the
+    idb client would have given, or None when the idb process serves it
+    (the transport and the reason are recorded either way). When a read was
+    sent and no usable reply came back, ``spent["after_send_s"]`` is how
+    long that request took, so the idb process gets only what is left."""
+    from . import ios_daemon
+
+    call = _daemon_call(args) if not binary else None
+    if call is None or xcuitest_session(udid):
+        _note_transport(udid, args, TRANSPORT_SUBPROCESS, wanted=False)
+        return None
+    op = call["op"]
+    is_input = op in _DAEMON_INPUTS
+    try:
+        registry = ios_daemon.ensure(udid)
+    except ios_daemon.Unavailable as exc:
+        _note_transport(udid, args, TRANSPORT_SUBPROCESS, reason=exc.reason)
+        return None
+    seconds = call.pop("_seconds", None)
+    armed = getattr(_ACT, "armed", None)
+    act = is_input and bool(armed) and armed.get("udid") == udid
+    budget = float(timeout) if timeout else 30.0
+    duration = float(call.get("duration") or 0) if op in ("tap", "swipe") else 0.0
+    if act:
+        _ACT.armed = None  # one input per observed command
+        request = {"op": "act", "input": call, "timeout_ms": armed["timeout_ms"], "read": True}
+        budget = armed["timeout_ms"] / 1000 + duration + ACT_MARGIN_S
+    elif op == "quiet":
+        request = call
+        budget = max(budget, call["timeout_ms"] / 1000 + QUIET_GRACE_S)
+    elif is_input:
+        request = call
+        budget = max(budget, DAEMON_INPUT_BUDGET_S) + duration
+    else:
+        request = call
+    sent_at = time.monotonic()
+    try:
+        reply = ios_daemon.request(str(registry["socket"]), request, timeout_s=budget)
+    except ios_daemon.Unavailable as exc:
+        if exc.stage == ios_daemon.AFTER_SEND and is_input:
+            _note_transport(udid, args, TRANSPORT_DAEMON)
+            raise _after_send_error(args, exc.message) from exc
+        # nothing was written, or only a read was: the idb process, once
+        if exc.stage == ios_daemon.AFTER_SEND and spent is not None:
+            spent["after_send_s"] = time.monotonic() - sent_at
+            spent["message"] = exc.message
+        ios_daemon.remember(udid, exc.reason)
+        _note_transport(udid, args, TRANSPORT_SUBPROCESS, reason=exc.reason)
+        return None
+    error = reply.get("error") if isinstance(reply.get("error"), dict) else {}
+    if reply.get("ok") is not True:
+        code = str(error.get("code") or errors.BACKEND_FAILED)
+        message = str(error.get("message") or f"the iOS device daemon refused {op}")
+        stage = error.get("stage")
+        if act and "input_confirmed" in reply:
+            # the input went out and was answered; only the read after it
+            # failed: the action ran, observe reports the failure
+            _note_transport(udid, args, TRANSPORT_DAEMON)
+            _ACT.result = (udid, {**reply, "error": {"code": code, "message": message,
+                                                    "hint": error.get("hint")}})
+            return _DaemonCompleted(list(args), 0, "", "")
+        if code == errors.IOS_DISPLAY_NOT_LIT:
+            _note_transport(udid, args, TRANSPORT_DAEMON)
+            raise errors.AutonomError(
+                errors.IOS_DISPLAY_NOT_LIT, message,
+                str(error.get("hint") or "The simulator's display is not lit yet: a foldable "
+                    "device or a display change is in progress. Wait, or use a device type "
+                    "with one fixed display."),
+                transport=TRANSPORT_DAEMON)
+        if code == errors.INPUT_UNCONFIRMED and is_input:
+            # sent once and given up at the daemon's deadline (its calls cancelled) or
+            # lost with the companion: never resent, never served by idb (INV-1)
+            _note_transport(udid, args, TRANSPORT_DAEMON)
+            raise _unconfirmed_error(args, error, message)
+        if stage != ios_daemon.BEFORE_SEND and is_input:
+            _note_transport(udid, args, TRANSPORT_DAEMON)
+            raise _after_send_error(args, message)
+        reason = (ios_daemon.COMPANION_TOO_OLD if code == ios_daemon.COMPANION_TOO_OLD
+                  else ios_daemon.DAEMON_UNREACHABLE)
+        ios_daemon.remember(udid, reason)
+        _note_transport(udid, args, TRANSPORT_SUBPROCESS, reason=reason)
+        return None
+    if act:
+        _note_transport(udid, args, TRANSPORT_DAEMON, ax_backend=reply.get("ax_backend"))
+        _ACT.result = (udid, reply)
+        return _DaemonCompleted(list(args), 0, "", "")
+    if op == "tree":
+        text = reply.get("json")
+        if not isinstance(text, str):
+            ios_daemon.remember(udid, ios_daemon.DAEMON_UNREACHABLE)
+            _note_transport(udid, args, TRANSPORT_SUBPROCESS, reason=ios_daemon.DAEMON_UNREACHABLE)
+            return None
+        _note_transport(udid, args, TRANSPORT_DAEMON, ax_backend=reply.get("ax_backend"))
+        return _DaemonCompleted(list(args), 0, text if text.endswith("\n") else text + "\n", "")
+    _note_transport(udid, args, TRANSPORT_DAEMON)
+    if op == "quiet":
+        stdout, code = _quiet_stdout(reply, seconds or "0")
+        return _DaemonCompleted(list(args), code, stdout, "")
+    return _DaemonCompleted(list(args), 0, "", "")
+
+
+# Less than this left of a read's budget after the daemon kept it: the idb
+# process is not asked, the read fails instead.
+MIN_FALLBACK_S = 1.0
+
+
+def _remaining_budget(
+    args: Sequence[str], timeout: float | None, spent: Mapping[str, Any],
+    resend: Callable[[], tuple[Sequence[str], float | None] | None] | None,
+) -> tuple[Sequence[str], float | None]:
+    """The argv and process timeout the idb process gets after the daemon
+    took a read and gave no usable reply: ``resend`` (the caller's own
+    deadline) when there is one, else ``timeout`` less what the daemon took.
+    Raises ``backend_failed`` when nothing worth a call is left, so one read
+    never takes about twice its budget (RISK-012)."""
+    detail = str(spent.get("message") or "no reply")
+    if resend is not None:
+        again = resend()
+        if again is None:
+            raise errors.AutonomError(
+                errors.BACKEND_FAILED,
+                f"the iOS device daemon did not answer idb {_command_words(args)}: {detail}"[:400],
+                DEFAULT_HINT, transport=TRANSPORT_DAEMON)
+        return again[0], again[1]
+    if timeout is None:
+        return args, None
+    left = float(timeout) - float(spent.get("after_send_s") or 0.0)
+    if left < MIN_FALLBACK_S:
+        raise errors.AutonomError(
+            errors.BACKEND_FAILED,
+            (f"the iOS device daemon did not answer idb {_command_words(args)}: {detail} "
+             f"(not asked again through idb: nothing was left of the {float(timeout):g} s "
+             "budget)")[:400],
+            DEFAULT_HINT, transport=TRANSPORT_DAEMON)
+    return args, left
+
+
 def run_idb(
     idb: str,
     args: Sequence[str],
@@ -210,6 +577,24 @@ def run_idb(
     # then raised as it is. Without it the retry repeats `args` and `timeout`.
     # `--companion` is a top-level idb option, so it goes before the verb.
     endpoint = companion or companion_endpoint()
+    if udid and _retry:
+        # the device daemon first (DEC-007); a remote companion is never its
+        if endpoint:
+            _note_transport(udid, args, TRANSPORT_SUBPROCESS, wanted=False)
+        else:
+            spent: dict[str, Any] = {}
+            served = _via_daemon(args, udid, timeout, binary, spent)
+            if served is not None:
+                if check and served.returncode != 0 and not (accept and accept(served)):
+                    raise errors.AutonomError(
+                        errors.BACKEND_FAILED,
+                        f"idb {_command_words(args)} failed ({served.returncode})",
+                        DEFAULT_HINT, transport=TRANSPORT_DAEMON)
+                return served
+            if "after_send_s" in spent:
+                # a read the daemon took and never answered: the idb process
+                # gets only what is left of the caller's budget (RISK-012)
+                args, timeout = _remaining_budget(args, timeout, spent, resend)
     command = [idb, *(["--companion", endpoint] if endpoint else []), *args]
     if udid:
         command += ["--udid", udid]
@@ -692,12 +1077,16 @@ def ui_quiet(target: Target, timeout_ms: int, quiet_ms: int, *,
             DEFAULT_HINT,
         )
     signals = last.get("signals") if state == "busy" else None
-    return {
+    answer: dict[str, Any] = {
         "quiet": completed.returncode == 0,
         "state": state,
         "signals": sorted(str(name) for name in signals if isinstance(name, str))
         if isinstance(signals, list) else [],
     }
+    if getattr(completed, "transport", None) == TRANSPORT_DAEMON:
+        # answered from the daemon's open quiet stream (ID-10)
+        answer["transport"] = TRANSPORT_DAEMON
+    return answer
 
 
 def tap(target: Target, x: int, y: int, *, duration: float | None = None,

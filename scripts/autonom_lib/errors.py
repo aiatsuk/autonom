@@ -204,6 +204,18 @@ CONTROL_GENERATION_STALE = "control_generation_stale"  # the claim's generation 
 CONTROL_LEASE_EXPIRED = "control_lease_expired"        # the claimed lease expired; acquire again
 CONTROL_NOT_HELD = "control_not_held"                  # a claim, release or renew without that lease
 
+# --- iOS device daemon (speed plan 2b) -------------------------------------------
+# An input sent once that the app did not confirm, and the cause when one is
+# known, are warnings on an `ok: true` reply; the other three are failures (or,
+# for the daemon, the reason a call went to the idb process instead). An input
+# idb_companion itself never confirmed (cancelled at the daemon's deadline, or
+# lost with the companion) fails with `input_unconfirmed`: sent once, not again.
+INPUT_UNCONFIRMED = "input_unconfirmed"  # sent once; unconfirmed by the app or the companion
+IOS_INPUT_BLOCKED = "ios_input_blocked"  # warning: dtuhidd.active set and no Device Hub; reboot it
+IOS_DISPLAY_NOT_LIT = "ios_display_not_lit"  # a read hit a display that is not lit yet (foldable)
+COMPANION_TOO_OLD = "companion_too_old"  # idb_companion older than 1.6.4 (no quiet stream)
+DAEMON_UNREACHABLE = "daemon_unreachable"  # the device daemon did not answer before the request
+
 # --- Interrupt ------------------------------------------------------------------
 # The exit-130 envelope of a command cut by Ctrl-C or SIGINT. Only the CLI's
 # interrupt handler builds it; observe's `observe_error.code` for an

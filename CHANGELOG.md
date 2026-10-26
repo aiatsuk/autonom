@@ -147,8 +147,109 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
   and (Android) the checklist ticking by itself in a real browser, writes
   `canvas-quick-wins-<platform>.json` to `--evidence-dir` and deletes the
   device again; `--help` touches no device.
+- **iOS device daemon.** On the iOS idb route one Node process per
+  Simulator (`ios-device-daemon.mjs`, Node 22+, started on first use) keeps
+  the Simulator's one `idb_companion` connection open and serves tree reads,
+  `ui wait --settled`, taps, swipes, buttons and keys over a private Unix
+  socket, so a call no longer starts an `idb` process. The parsers read the
+  same `idb` output as before. `ui type`, crash, file pull, `screenshot`, a
+  remote companion and the XCUITest route stay on the `idb` process. The
+  daemon uses the companion idb's state file lists, else starts one with
+  `idb connect` so `ui type` reuses it too, starts a lost one again, never
+  boots, reboots or erases a Simulator, and stops after 5 minutes with no
+  request and no Canvas attached, ending only a companion it started.
+  Registry and log in `$AUTONOM_HOME/iosd/`. `AUTONOM_IOS_DAEMON=off` sends
+  every call through the `idb` process as before.
+- **The daemon never holds the Simulator's input.** `idb_companion` 1.6.4
+  serves one `hid` call at a time, so the daemon keeps no `hid` call open: it
+  primes input with one key-up at start, and each call ends 250 ms after its
+  last event (10 s while a press is held). `idb ui text`, idb's buttons and
+  the Canvas are not blocked by it, and the Canvas ends its own calls the
+  same way. An input's reply waits for the companion's status on its call,
+  behind another client's call if need be, within one limit counted from the
+  input's arrival: 15 s plus the input's own duration
+  (`AUTONOM_IOSD_HID_WAIT_MS` overrides it), so the reply always comes before
+  the CLI stops waiting (20 s for a plain input; an observed one replies
+  within the observe timeout plus 20 s, the CLI waits it plus 25 s). At
+  the limit the call is cancelled, so nothing is performed later; an input
+  that could not start by then is refused unsent and goes through the `idb`
+  process once. The daemon's `status` reply adds `hid_calls`,
+  `hid_idle_closes`, `hid_lost` and `hid_open`.
+- **No silent input loss.** An input whose events `idb_companion` never
+  confirmed (lost with the companion, or cut at the limit) fails with the
+  `error_code` `input_unconfirmed` (stage `after_connection`,
+  `unconfirmed_events`, a hint to read the screen first) instead of
+  `ok: true`, and is never sent again, through the daemon or `idb`. An input
+  whose reply was lost after it was written still fails
+  `idb_companion_unavailable`. The Canvas counts such events in `/status`
+  `idb.hid_lost` and reports each loss as an error.
+- **How a call was served.** iOS replies on the idb route add `transport`
+  (`daemon` or `subprocess`), `transport_reason` when the daemon was wanted
+  and not used (`daemon_disabled`, `node_missing`, `daemon_start_failed`,
+  `companion_too_old`, `daemon_unreachable`) and `ax_backend`: `ax` by
+  default, `axbridge` with the interactable filter for web content, where
+  `ax` misses the page text (Safari). `backend` still names the input route.
+- **Confirmed input on the observe path.** An observed tap, swipe or key on
+  the daemon route is one request: the input, up to 500 ms for the app's
+  `touches_completed` (1.5 s for the first touch on a new companion or a
+  reopened quiet stream, and for the first touch after an app was launched,
+  relaunched or brought to the front, which the app reports late; the daemon
+  also serves only once its quiet stream sent its first event, before which a
+  touch is not reported), a 300 ms grace period that runs while the companion's
+  status on the input is still on its way, a wait for quiet, one read. The
+  reply adds `input_confirmed` and `method: quiet-stream`; an input the app
+  did not confirm adds the warning `input_unconfirmed`, or
+  `ios_input_blocked` with a hint to reboot the Simulator when its HID flag
+  is set with no Device Hub running, and stays `ok: true`: the input was sent
+  once. A quiet stream that is stuck (`idb_companion` 1.6.4 at times ends
+  with one BUSY report whose pending signals include RUN_LOOP_IDLE and then
+  reports no touch on any stream until it is replaced: seen on a freshly
+  booted Simulator under load and after about six app relaunches) is only
+  suspected after 3 s of that silence, since a healthy companion idling on
+  the Home screen can stay silent the same way: the daemon then opens a probe
+  stream, and only when two such streams in a row (a healthy companion's
+  probe stream is itself silent at times) send no other report within 2 s
+  each (log `quiet_probe`) is a companion the daemon started replaced, at
+  most once every 30 s; from the third replacement in a row with no sign in
+  between that the new companion was healthy (a report other than that BUSY,
+  a confirmed touch or a probe that answered; a target change is none) the
+  gap doubles each time (30 s, 30 s, 60 s, 120 s, ... up to 10 minutes), and
+  never while the host's 1-minute load is above 6 per CPU, 60 on 10 CPUs
+  (log `quiet_suspect` reason `host_load`: under that load healthy companions
+  answer probes too slowly, and each replacement starts a replacement
+  companion on a host already short of time; touches go to the current
+  companion once), while
+  no request runs or before the next touch
+  (inside the touch's deadline; when the probes and the replacement do not
+  fit in it, the touch goes to the current companion and is reported as it
+  is), so the touch is reported; one it did not start is left
+  running (log `quiet_stuck`) and its touches stay unconfirmed. A tap after which
+  the app sends no quiet event (the Back tap in Settings) returns after the
+  grace period instead of waiting out the timeout. `ui wait --settled`
+  answers `method: quiet-stream`. A read of a display that is not
+  lit yet fails with `ios_display_not_lit` after one retry; a companion older
+  than 1.6.4 is `companion_too_old` and falls back to the `idb` process.
+- **One companion for the Canvas and the agent.** The Canvas idb transport
+  streams on the daemon's companion instead of starting its own (`/status`
+  `idb.companion_source`, `daemon_attached`, `daemon_fallback`), connects
+  again when the daemon starts a lost companion, and keeps the daemon alive
+  while it is attached. With the daemon off or unable to serve it runs its
+  own companion as before.
+- **Live check for the daemon.** `tests/live/ios_daemon_live.py --part cli
+  --create-simulator` creates its own Simulator and measures `ui tree`
+  (daemon off, then on), the General and Back taps, a tap that changes
+  nothing, a Safari page read and the idle stop, with medians, p95 and the
+  host load; `--part canvas` checks one companion with the Canvas streaming,
+  `ui type` reusing it and video coming back after the companion is killed.
+  Each tap must send exactly one HID touch down/up pair, counted inside the
+  daemon's own process by a hook the script loads through `AUTONOM_NODE`.
+  Both write their JSON to `--evidence-dir`, delete the Simulator and the
+  temporary home at the end, and `--help` touches no device.
 
 ### Changed
+- **`session stop` leaves the daemon's companion alone.** A companion a live
+  iOS device daemon started is stopped by the daemon's idle rule; `session
+  stop` no longer kills it or names it in `companion_left_running`.
 - **Skill model and effort.** Every skill's frontmatter now names a `model`,
   and an `effort` where it matters. The debugger, memory-leak, performance
   and ticket pre-test skills ask for opus at high effort; `autonom-setup`
