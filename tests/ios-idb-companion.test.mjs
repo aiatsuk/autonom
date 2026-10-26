@@ -9,28 +9,46 @@ import { PassThrough } from "node:stream";
 import test from "node:test";
 
 import {
+  ACCESSIBILITY_INFO_TIMEOUT_MS,
+  AX_BACKEND,
+  AX_FILTER,
+  AX_FORMAT,
   DEFAULT_VIDEO_OPTIONS,
   FRAME_QUEUE_HIGH_WATER,
   ERROR_CODE,
   GrpcError,
   GrpcMessageParser,
   HID_BUTTON,
+  HID_CLOSE_WAIT_MS,
+  HID_HELD_IDLE_CLOSE_MS,
+  HID_IDLE_CLOSE_MS,
   IDB_CAPABILITY,
   IDB_COMPANION_BIN_ENV,
   IDB_COMPANION_HINT,
   IDB_INSTALL_HINT,
   IdbCompanion,
   IdbCompanionClient,
+  IdbHidStream,
+  IdbQuiescenceStream,
   IdbVideoStream,
+  HidUnconfirmedError,
   StructuredError,
   VIDEO_FORMAT,
   analyzeAccessUnit,
+  decodeAccessibilityInfoRequest,
+  decodeAccessibilityInfoResponse,
+  decodeAccessibilityQuiescenceRequest,
+  decodeAccessibilityQuiescenceResponse,
   decodeHidEvent,
   decodeOrientationResponse,
   decodeProtoFields,
   decodeTargetDescriptionResponse,
   decodeVideoStreamRequest,
   decodeVideoStreamResponse,
+  encodeAccessibilityInfoRequest,
+  encodeAccessibilityInfoResponse,
+  encodeAccessibilityQuiescenceRequest,
+  encodeAccessibilityQuiescenceResponse,
   encodeHidEvent,
   encodeVideoStreamResponse,
   encodeVideoStreamStart,
@@ -492,10 +510,14 @@ test("access units are classified and their SPS/PPS extracted", () => {
 // In-process fake companion gRPC server
 // ---------------------------------------------------------------------------
 
-async function fakeServer(t, { frames = [KEY_FRAME, P_FRAME, P_FRAME], intervalMs = 2, video = {}, unary = {} } = {}) {
+async function fakeServer(t, { frames = [KEY_FRAME, P_FRAME, P_FRAME], intervalMs = 2, video = {}, unary = {}, hid = {} } = {}) {
   const dir = tempDir(t);
   const socketPath = join(dir, "s.sock");
-  const state = { calls: [], starts: [], stops: 0, leaks: 0, hidEvents: [], hidCalls: 0, hidEnds: 0, videoCalls: [] };
+  const state = {
+    calls: [], starts: [], stops: 0, leaks: 0, hidEvents: [], hidCalls: 0, hidEnds: 0, videoCalls: [],
+    hidServed: 0, hidWaits: 0, hidActive: null, hidEventCalls: [],
+  };
+  const hidWaiting = [];
   const sessions = new Set();
   const server = http2.createServer();
   server.on("session", (session) => {
@@ -505,7 +527,9 @@ async function fakeServer(t, { frames = [KEY_FRAME, P_FRAME, P_FRAME], intervalM
   });
   server.on("stream", (stream, headers) => {
     const method = headers[":path"].split("/").pop();
-    state.calls.push({ method, path: headers[":path"], contentType: headers["content-type"], te: headers.te });
+    state.calls.push({
+      method, path: headers[":path"], contentType: headers["content-type"], te: headers.te, timeout: headers["grpc-timeout"],
+    });
     stream.on("error", () => {});
     const parser = new GrpcMessageParser();
     let trailers = { "grpc-status": "0" };
@@ -559,14 +583,38 @@ async function fakeServer(t, { frames = [KEY_FRAME, P_FRAME, P_FRAME], intervalM
     }
     if (method === "hid") {
       state.hidCalls += 1;
-      stream.on("data", (chunk) => {
-        for (const message of parser.push(chunk)) state.hidEvents.push(decodeHidEvent(message));
+      // Like idb_companion: one hid call at a time. A second call (another client) is not
+      // served, and none of its events performed, until the open one ends.
+      const serve = () => {
+        state.hidActive = stream;
+        state.hidServed += 1;
+        if (hid.onCall) return hid.onCall(ctx);
+        const served = state.hidServed;
+        stream.on("data", (chunk) => {
+          for (const message of parser.push(chunk)) {
+            state.hidEvents.push(decodeHidEvent(message));
+            state.hidEventCalls.push(served);
+          }
+        });
+        stream.on("end", () => {
+          state.hidEnds += 1;
+          ctx.send(Buffer.alloc(0));
+          ctx.end(0);
+        });
+      };
+      stream.on("close", () => {
+        const waiting = hidWaiting.indexOf(serve);
+        if (waiting >= 0) hidWaiting.splice(waiting, 1);
+        if (state.hidActive !== stream) return;
+        state.hidActive = null;
+        hidWaiting.shift()?.();
       });
-      stream.on("end", () => {
-        state.hidEnds += 1;
-        ctx.send(Buffer.alloc(0));
-        ctx.end(0);
-      });
+      if (state.hidActive) {
+        state.hidWaits += 1;
+        hidWaiting.push(serve);
+      } else {
+        serve();
+      }
       return;
     }
     const handler = unary[method];
@@ -585,8 +633,8 @@ async function fakeServer(t, { frames = [KEY_FRAME, P_FRAME, P_FRAME], intervalM
   return { endpoint: { socketPath }, state, sessions };
 }
 
-function clientFor(t, endpoint) {
-  const client = new IdbCompanionClient(endpoint);
+function clientFor(t, endpoint, options) {
+  const client = new IdbCompanionClient(endpoint, options);
   t.after(() => client.close({ timeoutMs: 200 }));
   return client;
 }
@@ -1047,7 +1095,8 @@ test("a stream opened while close() is stopping the others is refused, so none l
 
 test("HID events go out in order on one open call, and a new call opens after it ends", async (t) => {
   const { endpoint, state } = await fakeServer(t);
-  const client = clientFor(t, endpoint);
+  // idleCloseMs 0: the call stays open until close(), so a slow machine cannot split it.
+  const client = clientFor(t, endpoint, { hidIdleCloseMs: 0 });
   const hid = client.hid();
   assert.equal(client.hid(), hid);
   await hid.touchDown(200, 650);
@@ -1605,4 +1654,886 @@ test("the idb refusal is the CLI's JSON error object: tool_missing, canvas.idb, 
   assert.match(IDB_COMPANION_HINT, /brew install facebook\/fb\/idb-companion/);
   assert.match(IDB_COMPANION_HINT, /AUTONOM_IDB_COMPANION_BIN/);
   assert.equal(IDB_CAPABILITY, "canvas.idb");
+});
+
+// ---------------------------------------------------------------------------
+// accessibility_info, accessibility_quiescence and the kept-open HID stream
+// ---------------------------------------------------------------------------
+
+// Golden bytes from the reference protobuf library (fb-idb 1.6.5 idb_pb2, SerializeToString).
+const AX_GOLDEN = {
+  // AccessibilityInfoRequest(format=COMPLETE, backend=AX, collect_frame_coverage=True)
+  infoAx: "180240015001",
+  // AccessibilityInfoRequest(format=NESTED, backend=AXBRIDGE, filter=FILTER_INTERACTABLE,
+  // keys=["AXLabel", "frame"], profile=True)
+  infoBridge: "18013a0741584c6162656c3a056672616d65400248016801",
+  // AccessibilityInfoResponse(json='[{"a":1}]')
+  infoResponse: "0a095b7b2261223a317d5d",
+  // AccessibilityQuiescenceRequest(pid=4242, busy_threshold_ms=0, quiet_window_ms=250)
+  quietPid: "089221180020fa01",
+  // AccessibilityQuiescenceRequest(bundle_id="com.apple.Preferences", busy_threshold_ms=150)
+  quietBundle: "1215636f6d2e6170706c652e507265666572656e636573189601",
+  // AccessibilityQuiescenceResponse events.
+  busy: "084d1206080112020102",
+  quiet: "084d12020803",
+  settling: "084d12020802",
+  touches: "084d1a00",
+  changed: "084e2200",
+  exited: "084e2a00",
+};
+const GRPC_UNIMPLEMENTED = 12;
+const GRPC_DEADLINE_EXCEEDED = 4;
+const GRPC_UNAVAILABLE = 14;
+
+test("accessibility_info requests and responses encode exactly like the reference library", () => {
+  assert.deepEqual(AX_FORMAT, { LEGACY: 0, NESTED: 1, COMPLETE: 2 });
+  assert.deepEqual(AX_BACKEND, { UNSPECIFIED: 0, AX: 1, AXBRIDGE: 2, AXBRIDGE_PERSISTENT: 3 });
+  assert.deepEqual(AX_FILTER, { ALL: 0, INTERACTABLE: 1 });
+  // Nothing asked: an empty message, the companion's historical read.
+  assert.equal(hex(encodeAccessibilityInfoRequest()), "");
+  assert.equal(hex(encodeAccessibilityInfoRequest({ format: "complete", backend: "ax", collectFrameCoverage: true })), AX_GOLDEN.infoAx);
+  assert.equal(
+    hex(encodeAccessibilityInfoRequest({
+      format: AX_FORMAT.NESTED, backend: "BACKEND_AXBRIDGE", filter: "FILTER_INTERACTABLE",
+      keys: ["AXLabel", "frame"], profile: true,
+    })),
+    AX_GOLDEN.infoBridge,
+  );
+  assert.equal(hex(encodeAccessibilityInfoRequest({ backend: "axbridge", filter: "interactable", format: "nested", keys: ["AXLabel", "frame"], profile: true })),
+    AX_GOLDEN.infoBridge, "names are case-insensitive and the option order does not matter");
+  assert.deepEqual(decodeAccessibilityInfoRequest(Buffer.from(AX_GOLDEN.infoBridge, "hex")), {
+    format: "NESTED", keys: ["AXLabel", "frame"], backend: "AXBRIDGE", profile: true, collectFrameCoverage: false, filter: "INTERACTABLE",
+  });
+  assert.deepEqual(decodeAccessibilityInfoRequest(Buffer.alloc(0)), {
+    format: "LEGACY", keys: [], backend: "UNSPECIFIED", profile: false, collectFrameCoverage: false, filter: "ALL",
+  });
+  assert.equal(decodeAccessibilityInfoRequest(encodeAccessibilityInfoRequest({ backend: "axbridge_persistent" })).backend, "AXBRIDGE_PERSISTENT");
+  assert.equal(hex(encodeAccessibilityInfoResponse('[{"a":1}]')), AX_GOLDEN.infoResponse);
+  assert.equal(decodeAccessibilityInfoResponse(Buffer.from(AX_GOLDEN.infoResponse, "hex")), '[{"a":1}]');
+  assert.equal(decodeAccessibilityInfoResponse(Buffer.alloc(0)), "");
+  const big = JSON.stringify(Array.from({ length: 3000 }, (_, i) => ({ AXLabel: `row ${i}`, frame: { x: i, y: i } })));
+  assert.equal(decodeAccessibilityInfoResponse(encodeAccessibilityInfoResponse(big)), big);
+});
+
+test("bad accessibility_info options are refused before anything is sent", () => {
+  assert.throws(() => encodeAccessibilityInfoRequest({ backend: "xcuitest" }), RangeError);
+  assert.throws(() => encodeAccessibilityInfoRequest({ backend: 9 }), RangeError);
+  assert.throws(() => encodeAccessibilityInfoRequest({ format: "flat" }), RangeError);
+  assert.throws(() => encodeAccessibilityInfoRequest({ filter: "visible" }), RangeError);
+  assert.throws(() => encodeAccessibilityInfoRequest({ keys: "AXLabel" }), TypeError);
+  assert.throws(() => encodeAccessibilityInfoRequest({ keys: ["AXLabel", ""] }), TypeError);
+  assert.throws(() => encodeAccessibilityInfoRequest({ profile: "yes" }), TypeError);
+  assert.throws(() => encodeAccessibilityInfoRequest({ collectFrameCoverage: 1 }), TypeError);
+  assert.throws(() => encodeAccessibilityInfoRequest(null), TypeError);
+});
+
+test("accessibility_quiescence requests and all four events match the reference library", () => {
+  assert.equal(hex(encodeAccessibilityQuiescenceRequest()), "", "no target follows the frontmost app");
+  // busy_threshold_ms 0 is a set oneof member: it is written, unlike a plain proto3 zero.
+  assert.equal(hex(encodeAccessibilityQuiescenceRequest({ pid: 4242, busyThresholdMs: 0, quietWindowMs: 250 })), AX_GOLDEN.quietPid);
+  assert.equal(hex(encodeAccessibilityQuiescenceRequest({ bundleId: "com.apple.Preferences", busyThresholdMs: 150 })), AX_GOLDEN.quietBundle);
+  assert.deepEqual(decodeAccessibilityQuiescenceRequest(Buffer.from(AX_GOLDEN.quietPid, "hex")), {
+    pid: 4242, bundleId: null, busyThresholdMs: 0, quietWindowMs: 250,
+  });
+  assert.deepEqual(decodeAccessibilityQuiescenceRequest(Buffer.alloc(0)), {
+    pid: null, bundleId: null, busyThresholdMs: null, quietWindowMs: null,
+  });
+
+  const events = {
+    busy: { type: "state_changed", pid: 77, state: "BUSY", busySignals: ["RUN_LOOP_IDLE", "ANIMATIONS_INACTIVE"] },
+    quiet: { type: "state_changed", pid: 77, state: "QUIET", busySignals: [] },
+    settling: { type: "state_changed", pid: 77, state: "SETTLING", busySignals: [] },
+    touches: { type: "touches_completed", pid: 77 },
+    changed: { type: "target_changed", pid: 78 },
+    exited: { type: "target_exited", pid: 78 },
+  };
+  for (const [name, event] of Object.entries(events)) {
+    assert.deepEqual(decodeAccessibilityQuiescenceResponse(Buffer.from(AX_GOLDEN[name], "hex")), event, name);
+    assert.equal(hex(encodeAccessibilityQuiescenceResponse(event)), AX_GOLDEN[name], name);
+  }
+  // Unpacked repeated signals decode too, and values newer than this client keep their number.
+  const unpacked = Buffer.from("084d12060801100110 02".replace(/ /g, ""), "hex");
+  assert.deepEqual(decodeAccessibilityQuiescenceResponse(unpacked).busySignals, ["RUN_LOOP_IDLE", "ANIMATIONS_INACTIVE"]);
+  assert.deepEqual(decodeAccessibilityQuiescenceResponse(Buffer.from("084d1205080912010f", "hex")), {
+    type: "state_changed", pid: 77, state: 9, busySignals: [15],
+  });
+  // An event newer than this client does not break the stream.
+  assert.deepEqual(decodeAccessibilityQuiescenceResponse(Buffer.from("084d3200", "hex")), { type: "unknown", pid: 77, field: 6 });
+  assert.deepEqual(decodeAccessibilityQuiescenceResponse(Buffer.alloc(0)), { type: "unknown", pid: 0, field: null });
+});
+
+test("bad accessibility_quiescence requests are refused before anything is sent", () => {
+  assert.throws(() => encodeAccessibilityQuiescenceRequest({ pid: 1, bundleId: "com.example" }), TypeError);
+  assert.throws(() => encodeAccessibilityQuiescenceRequest({ bundleId: "" }), TypeError);
+  assert.throws(() => encodeAccessibilityQuiescenceRequest({ pid: -1 }), RangeError);
+  assert.throws(() => encodeAccessibilityQuiescenceRequest({ busyThresholdMs: -1 }), RangeError);
+  assert.throws(() => encodeAccessibilityQuiescenceRequest({ quietWindowMs: 2 ** 32 }), RangeError);
+  assert.throws(() => encodeAccessibilityQuiescenceRequest({ quietWindowMs: 1.5 }), RangeError);
+  assert.throws(() => encodeAccessibilityQuiescenceResponse({ type: "frozen" }), RangeError);
+});
+
+test("accessibilityInfo sends every option and returns the JSON string; UNIMPLEMENTED, errors and deadlines map to GrpcError", async (t) => {
+  const tree = JSON.stringify({ elements: [{ AXLabel: "General" }], frame_coverage: 0.93 });
+  const { endpoint, state } = await fakeServer(t, {
+    unary: {
+      accessibility_info: (ctx, message) => {
+        const request = decodeAccessibilityInfoRequest(message);
+        (ctx.state.axRequests ??= []).push(request);
+        if (request.backend === "AXBRIDGE_PERSISTENT") return; // never answers
+        if (request.filter === "INTERACTABLE" && request.backend === "AX") {
+          return ctx.end(2, "Cannot read the accessibility of a display that is not lit yet");
+        }
+        ctx.send(encodeAccessibilityInfoResponse(request.backend === "AXBRIDGE" ? "" : tree));
+        ctx.end(0);
+      },
+    },
+  });
+  const client = clientFor(t, endpoint);
+  assert.equal(
+    await client.accessibilityInfo({ backend: "ax", format: "complete", keys: ["AXLabel"], profile: true, collectFrameCoverage: true }),
+    tree,
+  );
+  assert.deepEqual(state.axRequests[0], {
+    format: "COMPLETE", keys: ["AXLabel"], backend: "AX", profile: true, collectFrameCoverage: true, filter: "ALL",
+  });
+  const read = state.calls.find((call) => call.method === "accessibility_info");
+  assert.equal(read.path, "/idb.CompanionService/accessibility_info");
+  assert.equal(read.timeout, `${ACCESSIBILITY_INFO_TIMEOUT_MS}m`, "the default read deadline goes out as grpc-timeout");
+  // An empty document is still an answer.
+  assert.equal(await client.accessibilityInfo({ backend: "axbridge", filter: "interactable" }), "");
+  assert.equal(state.axRequests[1].filter, "INTERACTABLE");
+  await assert.rejects(client.accessibilityInfo({ backend: "ax", filter: "interactable" }),
+    (error) => error instanceof GrpcError && error.code === 2 && /not lit yet/.test(error.details) && error.method === "accessibility_info");
+  const started = Date.now();
+  await assert.rejects(client.accessibilityInfo({ backend: "axbridge_persistent" }, { timeoutMs: 150 }),
+    (error) => error instanceof GrpcError && error.code === GRPC_DEADLINE_EXCEEDED);
+  assert.ok(Date.now() - started < 2000, "the deadline is kept");
+  await assert.rejects(client.accessibilityInfo({ backend: "nope" }), RangeError);
+  assert.equal(state.axRequests.length, 4, "a refused option sends nothing");
+  const controller = new AbortController();
+  const pending = client.accessibilityInfo({ backend: "axbridge_persistent" }, { signal: controller.signal });
+  controller.abort();
+  await assert.rejects(pending, /aborted/);
+
+  // A companion without the method (older than the read backend field).
+  const old = await fakeServer(t);
+  const oldClient = clientFor(t, old.endpoint);
+  await assert.rejects(oldClient.accessibilityInfo({ backend: "ax" }),
+    (error) => error instanceof GrpcError && error.code === GRPC_UNIMPLEMENTED);
+});
+
+/** A gRPC server that answers every call with a trailers-only status, as real servers do for UNIMPLEMENTED. */
+async function trailersOnlyServer(t, code, message) {
+  const dir = tempDir(t);
+  const socketPath = join(dir, "t.sock");
+  const server = http2.createServer();
+  const sessions = new Set();
+  server.on("session", (session) => {
+    sessions.add(session);
+    session.on("close", () => sessions.delete(session));
+    session.on("error", () => {});
+  });
+  server.on("stream", (stream) => {
+    stream.on("error", () => {});
+    stream.respond({
+      ":status": 200, "content-type": "application/grpc", "grpc-status": String(code), "grpc-message": encodeURIComponent(message),
+    }, { endStream: true });
+  });
+  await new Promise((resolve) => server.listen(socketPath, resolve));
+  t.after(async () => {
+    for (const session of sessions) session.destroy();
+    await new Promise((resolve) => server.close(resolve));
+  });
+  return { socketPath };
+}
+
+test("a trailers-only UNIMPLEMENTED answer rejects accessibility_info and the quiet stream", async (t) => {
+  const endpoint = await trailersOnlyServer(t, GRPC_UNIMPLEMENTED, "Method not found: idb.CompanionService/accessibility_quiescence");
+  const client = clientFor(t, endpoint);
+  await assert.rejects(client.accessibilityInfo({ backend: "ax" }), (error) => error.code === GRPC_UNIMPLEMENTED);
+  const stream = await client.accessibilityQuiescence();
+  await assert.rejects(stream.started, (error) => error instanceof GrpcError && error.code === GRPC_UNIMPLEMENTED
+    && /Method not found/.test(error.details) && error.method === "accessibility_quiescence");
+  await assert.rejects(stream.next(), (error) => error.code === GRPC_UNIMPLEMENTED);
+  assert.deepEqual(await stream.next(), { value: undefined, done: true }, "the error is reported once");
+  const closed = await stream.closed;
+  assert.equal(closed.error.code, GRPC_UNIMPLEMENTED);
+  assert.equal(closed.cancelled, false);
+  assert.equal(stream.status.code, GRPC_UNIMPLEMENTED);
+});
+
+/** A fake accessibility_quiescence handler: records the request and hands the call to `script`. */
+function quietHandler(script) {
+  return (ctx, message) => {
+    const request = decodeAccessibilityQuiescenceRequest(message);
+    (ctx.state.quietRequests ??= []).push(request);
+    (ctx.state.quietCalls ??= []).push(ctx.stream);
+    script(ctx, request);
+  };
+}
+
+test("the quiet stream yields all four event kinds in order and ends with the companion's OK status", async (t) => {
+  const { endpoint, state } = await fakeServer(t, {
+    unary: {
+      accessibility_quiescence: quietHandler((ctx) => {
+        // The reference client half-closes its side right after the request.
+        ctx.state.requestEnded = ctx.stream.readableEnded;
+        ctx.stream.on("end", () => { ctx.state.requestEnded = true; });
+        ctx.send(Buffer.from(AX_GOLDEN.busy, "hex"));
+        setTimeout(() => {
+          ctx.send(Buffer.from(AX_GOLDEN.touches, "hex"));
+          ctx.send(Buffer.from(AX_GOLDEN.settling, "hex"));
+          ctx.send(Buffer.from(AX_GOLDEN.quiet, "hex"));
+          ctx.send(Buffer.from(AX_GOLDEN.changed, "hex"));
+          ctx.send(Buffer.from(AX_GOLDEN.exited, "hex"));
+          ctx.end(0);
+        }, 20);
+      }),
+    },
+  });
+  const client = clientFor(t, endpoint);
+  const stream = await client.accessibilityQuiescence({ pid: 77, busyThresholdMs: 0, quietWindowMs: 250 });
+  assert.ok(stream instanceof IdbQuiescenceStream);
+  assert.equal(await stream.started, true);
+  const seen = [];
+  for await (const event of stream) seen.push(event);
+  assert.deepEqual(seen.map((event) => event.type), [
+    "state_changed", "touches_completed", "state_changed", "state_changed", "target_changed", "target_exited",
+  ]);
+  assert.deepEqual(seen[0], { type: "state_changed", pid: 77, state: "BUSY", busySignals: ["RUN_LOOP_IDLE", "ANIMATIONS_INACTIVE"] });
+  assert.deepEqual(seen.slice(2, 4).map((event) => event.state), ["SETTLING", "QUIET"]);
+  assert.deepEqual(seen[5], { type: "target_exited", pid: 78 });
+  assert.equal(stream.events, 6);
+  assert.equal(stream.done, true);
+  assert.deepEqual(stream.status, { code: 0, details: "" });
+  assert.deepEqual(await stream.closed, { error: null, status: { code: 0, details: "" }, cancelled: false });
+  assert.deepEqual(state.quietRequests, [{ pid: 77, bundleId: null, busyThresholdMs: 0, quietWindowMs: 250 }]);
+  await waitFor(() => state.requestEnded === true, { message: "request side half-closed" });
+  const call = state.calls.find((c) => c.method === "accessibility_quiescence");
+  assert.equal(call.path, "/idb.CompanionService/accessibility_quiescence");
+  assert.equal(call.timeout, undefined, "the stream is meant to stay open: no deadline by default");
+});
+
+test("cancel(), return() from a loop, an abort and client.close() each end the quiet stream and the companion's call", async (t) => {
+  const { endpoint, state } = await fakeServer(t, {
+    unary: {
+      accessibility_quiescence: quietHandler((ctx) => ctx.send(Buffer.from(AX_GOLDEN.quiet, "hex"))), // never ends
+    },
+  });
+  const client = new IdbCompanionClient(endpoint);
+  t.after(() => client.close({ timeoutMs: 200 }));
+  const serverClosed = (index) => waitFor(() => state.quietCalls?.[index]?.closed, { message: `server call ${index} closed` });
+
+  const first = await client.accessibilityQuiescence({ bundleId: "com.apple.Preferences" });
+  assert.equal((await first.next()).value.state, "QUIET");
+  const pending = first.next();
+  first.cancel();
+  assert.deepEqual(await pending, { value: undefined, done: true }, "a pending read ends without an error");
+  first.cancel();
+  assert.deepEqual(await first.closed, { error: null, status: null, cancelled: true });
+  await serverClosed(0);
+
+  const second = await client.accessibilityQuiescence();
+  for await (const event of second) {
+    assert.equal(event.type, "state_changed");
+    break;
+  }
+  assert.equal(second.done, true);
+  await serverClosed(1);
+
+  const controller = new AbortController();
+  const third = await client.accessibilityQuiescence({}, { signal: controller.signal });
+  await third.next();
+  const read = third.next();
+  controller.abort();
+  await assert.rejects(read, /aborted/);
+  await serverClosed(2);
+
+  const fourth = await client.accessibilityQuiescence();
+  await fourth.started;
+  await client.close({ timeoutMs: 300 });
+  assert.equal(fourth.done, true, "client.close() cancels open quiet streams");
+  assert.equal((await fourth.closed).cancelled, true);
+  await serverClosed(3);
+  await assert.rejects(client.accessibilityQuiescence(), /closed/);
+  assert.deepEqual(state.quietRequests.map((r) => r.bundleId), ["com.apple.Preferences", null, null, null]);
+});
+
+test("a quiet stream deadline rejects with code 4 and cancels the call; a dropped session rejects with code 14", async (t) => {
+  const { endpoint, state, sessions } = await fakeServer(t, {
+    unary: {
+      accessibility_quiescence: quietHandler((ctx) => ctx.send(Buffer.from(AX_GOLDEN.busy, "hex"))), // never ends
+    },
+  });
+  const client = clientFor(t, endpoint);
+  const timed = await client.accessibilityQuiescence({}, { timeoutMs: 150 });
+  assert.equal((await timed.next()).value.state, "BUSY");
+  const started = Date.now();
+  await assert.rejects(timed.next(), (error) => error instanceof GrpcError && error.code === GRPC_DEADLINE_EXCEEDED);
+  assert.ok(Date.now() - started < 2000);
+  assert.equal(state.calls.find((c) => c.method === "accessibility_quiescence").timeout, "150m");
+  await waitFor(() => state.quietCalls[0].closed, { message: "server call cancelled at the deadline" });
+  await assert.rejects(client.accessibilityQuiescence({}, { timeoutMs: -1 }), RangeError);
+  await assert.rejects(client.accessibilityQuiescence({ pid: 1, bundleId: "x" }), TypeError);
+  assert.equal(state.quietRequests.length, 1, "refused requests open no call");
+
+  const open = await client.accessibilityQuiescence();
+  await open.next();
+  const read = open.next();
+  for (const session of sessions) session.destroy();
+  await assert.rejects(read, (error) => error instanceof GrpcError ? error.code === GRPC_UNAVAILABLE : error instanceof Error);
+  assert.equal(open.done, true);
+  assert.ok((await open.closed).error);
+
+  // The client reconnects for the next stream.
+  const again = await client.accessibilityQuiescence();
+  assert.equal((await again.next()).value.state, "BUSY");
+  again.cancel();
+});
+
+test("a quiet stream whose companion ends without a status, or sends a broken message, rejects", async (t) => {
+  const { endpoint } = await fakeServer(t, {
+    unary: {
+      accessibility_quiescence: quietHandler((ctx, request) => {
+        if (request.pid === 1) {
+          ctx.stream.write(grpcFrame(Buffer.from([0x08]))); // truncated varint
+          return;
+        }
+        ctx.stream.close(http2.constants.NGHTTP2_INTERNAL_ERROR);
+      }),
+    },
+  });
+  const client = clientFor(t, endpoint);
+  const broken = await client.accessibilityQuiescence({ pid: 1 });
+  await assert.rejects(broken.next(), RangeError);
+  const reset = await client.accessibilityQuiescence({ pid: 2 });
+  await assert.rejects(reset.next(), Error);
+  // The companion had answered with headers before it reset the call: started, then failed.
+  assert.equal(await reset.started, true);
+  assert.ok((await reset.closed).error instanceof Error);
+  assert.equal((await broken.closed).error instanceof RangeError, true);
+});
+
+test("a kept-open HID stream is open before the first event and carries priming and taps on one call", async (t) => {
+  const { endpoint, state } = await fakeServer(t);
+  const client = clientFor(t, endpoint, { hidIdleCloseMs: 0 });
+  const hid = await client.openHid();
+  assert.ok(hid instanceof IdbHidStream);
+  assert.equal(hid, client.hid(), "the client keeps one HID stream");
+  assert.equal(hid.keepOpen, true);
+  assert.equal(hid.isOpen, true);
+  await waitFor(() => state.hidCalls === 1, { message: "hid call open on the companion" });
+  assert.equal(state.hidEvents.length, 0, "opened with no event");
+  await hid.open();
+  await client.openHid();
+  assert.equal(hid.calls, 1, "open() on an open call is a no-op");
+  await hid.keyUp(0xe1); // priming key-up of a harmless key
+  await hid.tap(10, 20);
+  await waitFor(() => state.hidEvents.length === 3, { message: "3 HID events" });
+  assert.deepEqual(state.hidEvents, [
+    { key: 0xe1, direction: "up" },
+    { touch: { x: 10, y: 20 }, direction: "down" },
+    { touch: { x: 10, y: 20 }, direction: "up" },
+  ]);
+  assert.equal(state.hidCalls, 1);
+  assert.equal(hid.sent, 3);
+  const drops = [];
+  hid.on("drop", (drop) => drops.push(drop));
+  await hid.close();
+  await waitFor(() => state.hidEnds === 1, { message: "hid ended" });
+  assert.deepEqual(drops, [], "close() is not a drop");
+  assert.equal(hid.isOpen, false);
+  await assert.rejects(hid.open(), /closed/);
+});
+
+test("a kept-open HID stream reports drops at once and open() opens the next call", async (t) => {
+  let answer = null;
+  const { endpoint, state, sessions } = await fakeServer(t, {
+    hid: {
+      onCall: (ctx) => {
+        ctx.stream.on("data", (chunk) => {
+          (ctx.state.rawHid ??= []).push(chunk.length);
+        });
+        if (answer) answer(ctx);
+      },
+    },
+  });
+  const client = clientFor(t, endpoint);
+  const hid = client.hid();
+  const drops = [];
+  hid.on("drop", (drop) => drops.push(drop));
+  await hid.open();
+  await waitFor(() => state.hidCalls === 1, { message: "first call" });
+
+  // The transport goes away under an open call.
+  for (const session of sessions) session.destroy();
+  await waitFor(() => drops.length === 1, { message: "drop after a lost session" });
+  assert.equal(drops[0].call, 1);
+  assert.ok(drops[0].error instanceof Error);
+  assert.equal(hid.isOpen, false);
+
+  // The companion refuses the method (UNIMPLEMENTED) on the next call.
+  answer = (ctx) => ctx.end(GRPC_UNIMPLEMENTED, "hid is not available");
+  await hid.open().catch(() => {});
+  await waitFor(() => drops.length === 2, { message: "drop on UNIMPLEMENTED" });
+  assert.equal(drops[1].call, 2);
+  assert.equal(drops[1].error.code, GRPC_UNIMPLEMENTED);
+  assert.deepEqual(drops[1].status, { code: GRPC_UNIMPLEMENTED, details: "hid is not available" });
+  assert.equal(hid.lastError.code, GRPC_UNIMPLEMENTED);
+
+  // A companion that finishes the call cleanly is a drop without an error.
+  answer = (ctx) => ctx.end(0);
+  await hid.open().catch(() => {});
+  await waitFor(() => drops.length === 3, { message: "drop on a clean end" });
+  assert.equal(drops[2].error, null);
+  assert.deepEqual(drops[2].status, { code: 0, details: "" });
+
+  answer = null;
+  await hid.open();
+  await hid.touchDown(1, 1);
+  await waitFor(() => state.rawHid?.length >= 1, { message: "event on the fourth call" });
+  assert.equal(state.hidCalls, 4);
+  assert.equal(hid.calls, 4);
+  assert.equal(drops.length, 3);
+});
+
+test("a kept-open HID open() fails on an unreachable companion and is bounded by its deadline", async (t) => {
+  const dir = tempDir(t);
+  const unreachable = new IdbCompanionClient({ socketPath: join(dir, "missing.sock") });
+  t.after(() => unreachable.close({ timeoutMs: 100 }));
+  await assert.rejects(unreachable.openHid({ timeoutMs: 2000 }), Error);
+
+  // A call that never gets its stream id: the deadline cancels it.
+  const call = new EventEmitter();
+  Object.assign(call, {
+    pending: true, destroyed: false, writable: true, closedWith: null,
+    close(code) { this.closedWith = code; this.destroyed = true; },
+    write() {}, end() {},
+  });
+  const hid = new IdbHidStream({ openCall: () => call });
+  const started = Date.now();
+  await assert.rejects(hid.open({ timeoutMs: 100 }), (error) => error instanceof GrpcError && error.code === GRPC_DEADLINE_EXCEEDED);
+  assert.ok(Date.now() - started < 2000);
+  assert.equal(call.closedWith, http2.constants.NGHTTP2_CANCEL);
+  assert.equal(hid.isOpen, false);
+  assert.equal(call.listenerCount("ready"), 0, "no listener is left behind");
+});
+
+// ---------------------------------------------------------------------------
+// HID idle close: idb_companion serves one hid call at a time
+// ---------------------------------------------------------------------------
+
+/**
+ * Another client's whole hid call (what `idb ui key` or `idb ui text` does): open, write
+ * the events, half-close, and wait for the companion's status. `completed` is true when
+ * the call closed with status 0 within `timeoutMs`; a call still waiting is cancelled.
+ */
+async function otherClientHid(endpoint, events, { timeoutMs = 2000 } = {}) {
+  const other = new IdbCompanionClient(endpoint);
+  const started = Date.now();
+  try {
+    const call = other.openCall("hid");
+    let status = null;
+    call.on("error", () => {});
+    call.on("data", () => {});
+    call.on("response", (headers) => { status = headers["grpc-status"] ?? status; });
+    call.on("trailers", (trailers) => { status = trailers["grpc-status"] ?? status; });
+    const closed = new Promise((resolve) => call.once("close", () => resolve(true)));
+    for (const event of events) call.write(grpcFrame(encodeHidEvent(event)));
+    call.end();
+    let timer;
+    const done = await Promise.race([closed, new Promise((resolve) => { timer = setTimeout(() => resolve(false), timeoutMs); })]);
+    clearTimeout(timer);
+    if (!done && !call.destroyed) call.close(http2.constants.NGHTTP2_CANCEL);
+    return { completed: done && status === "0", ms: Date.now() - started };
+  } finally {
+    await other.close({ timeoutMs: 200 });
+  }
+}
+
+test("the HID idle windows are pinned and checked", () => {
+  assert.equal(HID_IDLE_CLOSE_MS, 250);
+  assert.equal(HID_HELD_IDLE_CLOSE_MS, 10_000);
+  const client = { openCall() { throw new Error("not used"); } };
+  assert.equal(new IdbHidStream(client).idleCloseMs, HID_IDLE_CLOSE_MS);
+  assert.equal(new IdbHidStream(client, { idleCloseMs: 0 }).idleCloseMs, 0);
+  assert.throws(() => new IdbHidStream(client, { idleCloseMs: -1 }), RangeError);
+  assert.throws(() => new IdbHidStream(client, { heldIdleCloseMs: Number.NaN }), RangeError);
+  assert.equal(HID_CLOSE_WAIT_MS, 60_000);
+  assert.equal(new IdbHidStream(client).closeWaitMs, HID_CLOSE_WAIT_MS);
+  assert.equal(new IdbHidStream(client, { closeWaitMs: 500 }).closeWaitMs, 500);
+  assert.throws(() => new IdbHidStream(client, { closeWaitMs: -1 }), RangeError);
+  assert.equal(new IdbCompanionClient({ socketPath: "/nonexistent" }, { hidCloseWaitMs: 700 }).hid().closeWaitMs, 700);
+  const error = new HidUnconfirmedError(2, new GrpcError(4, "late", { method: "hid" }));
+  assert.equal(error.code, "hid_unconfirmed");
+  assert.equal(error.events, 2);
+  assert.match(error.message, /2 HID events were sent but not confirmed .*late.*may not have been performed/);
+});
+
+test("the fake companion serves one hid call at a time: a call left open blocks another client (old behaviour)", { timeout: 20_000 }, async (t) => {
+  const { endpoint, state } = await fakeServer(t);
+  const client = clientFor(t, endpoint, { hidIdleCloseMs: 0 });
+  await client.hid().tap(1, 1);
+  await waitFor(() => state.hidEvents.length === 2, { message: "the tap" });
+  const blocked = await otherClientHid(endpoint, [{ key: 4, direction: "down" }, { key: 4, direction: "up" }], { timeoutMs: 600 });
+  assert.equal(blocked.completed, false, "a second hid call waits while the first is open");
+  assert.equal(state.hidWaits, 1);
+  assert.equal(state.hidEvents.length, 2, "none of the second client's events were performed");
+});
+
+test("an idle HID call ends cleanly after the window, so another client's hid call completes", { timeout: 20_000 }, async (t) => {
+  const { endpoint, state } = await fakeServer(t);
+  const client = clientFor(t, endpoint);
+  const hid = client.hid();
+  const drops = [];
+  const idle = [];
+  hid.on("drop", (drop) => drops.push(drop));
+  hid.on("idle_close", (event) => idle.push(event));
+  await hid.tap(10, 20);
+  const other = await otherClientHid(endpoint, [{ key: 4, direction: "down" }, { key: 4, direction: "up" }]);
+  assert.equal(other.completed, true, `the other client's call completed (${other.ms} ms)`);
+  assert.deepEqual(state.hidEvents, [
+    { touch: { x: 10, y: 20 }, direction: "down" },
+    { touch: { x: 10, y: 20 }, direction: "up" },
+    { key: 4, direction: "down" },
+    { key: 4, direction: "up" },
+  ]);
+  assert.deepEqual(idle, [{ call: 1 }]);
+  assert.equal(hid.idleCloses, 1);
+  assert.equal(hid.isOpen, false);
+  // The next event opens a new call; it too ends when idle.
+  await hid.keyUp(0xe1);
+  await waitFor(() => state.hidEvents.length === 5, { message: "the event on the new call" });
+  assert.equal(hid.calls, 2);
+  await waitFor(() => hid.idleCloses === 2 && state.hidActive === null, { message: "the second idle close" });
+  assert.deepEqual(drops, [], "an idle close is not a drop");
+  assert.equal(hid.lastError, null);
+  await hid.close();
+});
+
+test("a kept-open HID call opened with no event ends after the window too", { timeout: 20_000 }, async (t) => {
+  const { endpoint, state } = await fakeServer(t);
+  const client = clientFor(t, endpoint, { hidIdleCloseMs: 30 });
+  const hid = await client.openHid();
+  const drops = [];
+  hid.on("drop", (drop) => drops.push(drop));
+  await waitFor(() => state.hidServed === 1, { message: "the call on the companion" });
+  await waitFor(() => hid.idleCloses === 1 && state.hidEnds === 1, { message: "the idle close" });
+  assert.equal(hid.isOpen, false);
+  const other = await otherClientHid(endpoint, [{ key: 4, direction: "up" }]);
+  assert.equal(other.completed, true);
+  await hid.open();
+  assert.equal(hid.calls, 2, "open() after an idle close opens a new call");
+  assert.deepEqual(drops, []);
+  await hid.close();
+  assert.equal(hid.isOpen, false);
+});
+
+test("idle close keeps every event, in order, under rapid bursts and sends racing the close", { timeout: 20_000 }, async (t) => {
+  const { endpoint, state } = await fakeServer(t);
+  const client = clientFor(t, endpoint, { hidIdleCloseMs: 3 });
+  const hid = client.hid();
+  const drops = [];
+  hid.on("drop", (drop) => drops.push(drop));
+  const expected = [];
+  const sends = [];
+  const send = (event) => {
+    expected.push(event);
+    sends.push(hid.send(event));
+  };
+  // A send from the idle_close listener runs while that call is closing.
+  let racing = 0;
+  hid.on("idle_close", () => {
+    if (racing >= 5) return;
+    racing += 1;
+    send({ key: 100 + racing, direction: "down" });
+    send({ key: 100 + racing, direction: "up" });
+  });
+  for (let burst = 0; burst < 30; burst += 1) {
+    const x = burst + 1;
+    send({ touch: { x, y: 1 }, direction: "down" });
+    send({ touch: { x, y: 2 }, direction: "down" });
+    send({ touch: { x, y: 2 }, direction: "up" });
+    // Gaps below, around and above the window.
+    await sleep(burst % 3 === 0 ? 0 : burst % 3 === 1 ? 3 : 8);
+  }
+  await Promise.all(sends);
+  await waitFor(() => racing === 5 && state.hidEvents.length === expected.length, { timeoutMs: 5000, message: "every event" });
+  await Promise.all(sends);
+  await waitFor(() => state.hidEvents.length === expected.length && state.hidActive === null, { timeoutMs: 5000, message: "the last call to end" });
+  assert.deepEqual(state.hidEvents, expected, "no event lost or reordered across calls");
+  assert.equal(hid.sent, expected.length);
+  assert.ok(hid.calls > 1, `calls were idle-closed and reopened (${hid.calls})`);
+  assert.deepEqual(drops, []);
+  assert.equal(state.hidServed, hid.calls);
+  // Each burst's downs and up, and each racing key's down and up, share one call.
+  for (let i = 0; i < expected.length; i += 1) {
+    if (expected[i].direction === "up") {
+      const start = expected[i].touch ? i - 2 : i - 1;
+      assert.equal(new Set(state.hidEventCalls.slice(start, i + 1)).size, 1, `press ending at event ${i} was split across calls`);
+    }
+  }
+  await hid.close();
+});
+
+test("a held press keeps its call past the short window, so its up goes out on the same call", { timeout: 20_000 }, async (t) => {
+  const { endpoint, state } = await fakeServer(t);
+  const client = clientFor(t, endpoint, { hidIdleCloseMs: 20, hidHeldIdleCloseMs: 5000 });
+  const hid = client.hid();
+  await hid.touchDown(5, 5);
+  await sleep(150);
+  assert.equal(hid.idleCloses, 0, "a held finger is not idle");
+  assert.equal(hid.isOpen, true);
+  await hid.touchUp(5, 5);
+  await hid.buttonDown("HOME");
+  await sleep(150);
+  assert.equal(hid.idleCloses, 0, "a held button is not idle");
+  await hid.buttonUp("HOME");
+  await waitFor(() => hid.idleCloses === 1 && state.hidActive === null, { message: "the idle close after the ups" });
+  assert.equal(hid.calls, 1);
+  assert.equal(state.hidServed, 1);
+  assert.equal(state.hidEvents.length, 4);
+  // A press left held past the longer window is let go of: the call still ends.
+  const short = clientFor(t, endpoint, { hidIdleCloseMs: 10, hidHeldIdleCloseMs: 60 });
+  const abandoned = short.hid();
+  await abandoned.touchDown(9, 9);
+  await waitFor(() => abandoned.idleCloses === 1 && state.hidActive === null, { message: "the held window" });
+  await abandoned.keyUp(4);
+  await waitFor(() => abandoned.idleCloses === 2, { message: "the short window again after a fresh call" });
+});
+
+test("close() while an idle call is closing ends cleanly, and queued sends are refused", { timeout: 20_000 }, async (t) => {
+  const { endpoint, state } = await fakeServer(t, {
+    hid: {
+      // A companion slow to finish the call: its status comes 200 ms after the half-close.
+      onCall: (ctx) => {
+        ctx.stream.on("data", () => {});
+        ctx.stream.on("end", () => setTimeout(() => ctx.end(0), 200));
+      },
+    },
+  });
+  const client = clientFor(t, endpoint, { hidIdleCloseMs: 5 });
+  const hid = client.hid();
+  const drops = [];
+  hid.on("drop", (drop) => drops.push(drop));
+  const closing = new Promise((resolve) => hid.once("idle_close", resolve));
+  await hid.keyUp(4);
+  await closing;
+  const queued = hid.keyDown(5);
+  const started = Date.now();
+  await hid.close();
+  assert.ok(Date.now() - started < 2500, "close() is bounded");
+  await assert.rejects(queued, /closed/);
+  await waitFor(() => state.hidActive === null, { message: "the call to end" });
+  assert.equal(state.hidServed, 1, "the queued send opened no call");
+  assert.deepEqual(drops, []);
+});
+
+/**
+ * Another client that takes the companion's hid call and keeps it (a Canvas long press, a
+ * long `idb ui text`): resolves once its key-down was performed, i.e. it is being served.
+ * `release()` sends the key-up, ends the call and waits for it to close.
+ */
+async function holdHid(t, endpoint, state) {
+  const holder = new IdbCompanionClient(endpoint);
+  t.after(() => holder.close({ timeoutMs: 200 }));
+  const call = holder.openCall("hid");
+  call.on("error", () => {});
+  call.on("data", () => {});
+  const closed = new Promise((resolve) => call.once("close", resolve));
+  const before = state.hidEvents.length;
+  call.write(grpcFrame(encodeHidEvent({ key: 99, direction: "down" })));
+  await waitFor(() => state.hidEvents.length > before, { message: "the holder's call to be served" });
+  return {
+    async release() {
+      call.write(grpcFrame(encodeHidEvent({ key: 99, direction: "up" })));
+      call.end();
+      await closed;
+    },
+  };
+}
+
+test("REV-024: an ended call waiting behind another client's held call past 2.5 s is not cancelled; its tap is performed once, in order", { timeout: 20_000 }, async (t) => {
+  const { endpoint, state } = await fakeServer(t);
+  const holder = await holdHid(t, endpoint, state);
+  const heldAt = Date.now();
+  const client = clientFor(t, endpoint);
+  const hid = client.hid();
+  const lost = [];
+  const drops = [];
+  hid.on("lost", (event) => lost.push(event));
+  hid.on("drop", (event) => drops.push(event));
+  const idle = new Promise((resolve) => hid.once("idle_close", resolve));
+  await hid.tap(1, 2);
+  await idle;
+  await waitFor(() => state.hidWaits === 1, { message: "the call to wait behind the holder's" });
+  // A tap sent while that call is ending queues behind it.
+  const queued = hid.tap(3, 4);
+  let flushed = false;
+  const flush = hid.flush().then(() => { flushed = true; });
+  assert.equal(hid.unconfirmed, 2, "the first tap is written but not confirmed");
+  // Longer than the old 2 s stop timeout plus the idle window, after which the call was cancelled.
+  await sleep(Math.max(0, 2600 - (Date.now() - heldAt)));
+  assert.equal(flushed, false, "flush() waits while the call is not served");
+  assert.equal(state.hidEvents.length, 1, "only the holder's down so far");
+  await holder.release();
+  await flush;
+  await queued;
+  await hid.flush();
+  assert.deepEqual(state.hidEvents, [
+    { key: 99, direction: "down" }, { key: 99, direction: "up" },
+    { touch: { x: 1, y: 2 }, direction: "down" }, { touch: { x: 1, y: 2 }, direction: "up" },
+    { touch: { x: 3, y: 4 }, direction: "down" }, { touch: { x: 3, y: 4 }, direction: "up" },
+  ], "each event once, in send order, after the holder");
+  assert.equal(hid.sent, 4);
+  assert.equal(hid.lostEvents, 0);
+  assert.equal(hid.unconfirmed, 0);
+  assert.deepEqual(lost, []);
+  assert.deepEqual(drops, []);
+  await hid.close();
+});
+
+test("REV-024: an ended call not served within the safety limit is cancelled and its events reported lost, never as sent and fine", { timeout: 20_000 }, async (t) => {
+  const { endpoint, state } = await fakeServer(t);
+  const holder = await holdHid(t, endpoint, state);
+  const client = clientFor(t, endpoint, { hidCloseWaitMs: 300 });
+  const hid = client.hid();
+  const lost = [];
+  hid.on("lost", (event) => lost.push(event));
+  await hid.tap(1, 2);
+  const started = Date.now();
+  const failure = await hid.flush().then(() => null, (error) => error);
+  assert.ok(failure instanceof HidUnconfirmedError, `flush() rejects with HidUnconfirmedError (${failure})`);
+  assert.equal(failure.events, 2);
+  assert.equal(failure.cause?.code, 4);
+  assert.ok(Date.now() - started < 5000, "bounded by the limit");
+  assert.equal(lost.length, 1);
+  assert.equal(lost[0].call, 1);
+  assert.equal(lost[0].events, 2);
+  assert.equal(lost[0].error.code, 4);
+  assert.equal(hid.lostEvents, 2);
+  assert.equal(hid.lastError?.code, 4);
+  await holder.release();
+  await waitFor(() => state.hidActive === null, { message: "the holder's call to end" });
+  assert.deepEqual(state.hidEvents, [{ key: 99, direction: "down" }, { key: 99, direction: "up" }], "the cancelled tap was not performed");
+  // The loss was reported once; the next input goes out on a new call and is confirmed.
+  await hid.tap(5, 6);
+  await hid.flush();
+  assert.deepEqual(state.hidEvents.slice(2), [{ touch: { x: 5, y: 6 }, direction: "down" }, { touch: { x: 5, y: 6 }, direction: "up" }]);
+  assert.equal(hid.lostEvents, 2);
+  await hid.close();
+});
+
+test("REV-024: a lost session while an ended call waits reports its events lost", { timeout: 20_000 }, async (t) => {
+  const { endpoint, state, sessions } = await fakeServer(t);
+  const holder = await holdHid(t, endpoint, state);
+  const client = clientFor(t, endpoint);
+  const hid = client.hid();
+  const lost = [];
+  hid.on("lost", (event) => lost.push(event));
+  await hid.keyDown(7);
+  await hid.keyUp(7);
+  const flush = hid.flush().then(() => null, (error) => error);
+  await waitFor(() => state.hidWaits === 1, { message: "the call to wait" });
+  // Drop the client's session (not the holder's): the waiting call goes with it.
+  const [, ...clientSessions] = [...sessions];
+  assert.equal(clientSessions.length, 1);
+  for (const session of clientSessions) session.destroy();
+  const failure = await flush;
+  assert.ok(failure instanceof HidUnconfirmedError, `flush() rejects (${failure})`);
+  assert.equal(failure.events, 2);
+  assert.equal(lost.length, 1);
+  await holder.release();
+});
+
+test("REV-026: close() during an idle close ends that call too: it is cancelled after the timeout and its events reported lost", { timeout: 20_000 }, async (t) => {
+  const { endpoint, state } = await fakeServer(t);
+  const holder = await holdHid(t, endpoint, state);
+  const client = clientFor(t, endpoint);
+  const hid = client.hid();
+  const lost = [];
+  hid.on("lost", (event) => lost.push(event));
+  const idle = new Promise((resolve) => hid.once("idle_close", resolve));
+  await hid.tap(1, 2);
+  await idle;
+  const flush = hid.flush().then(() => null, (error) => error);
+  const started = Date.now();
+  await hid.close({ timeoutMs: 100 });
+  assert.ok(Date.now() - started < 2000, `close() is bounded by its timeout (${Date.now() - started} ms)`);
+  assert.equal(lost.length, 1, "close() cancelled the call that was being ended and reported its events");
+  assert.equal(lost[0].events, 2);
+  const failure = await flush;
+  assert.ok(failure instanceof HidUnconfirmedError, `a flush in progress rejects (${failure})`);
+  // Had close() left the ending call alone, it would be served now and the tap performed after close().
+  await holder.release();
+  await waitFor(() => state.hidActive === null, { message: "the holder's call to end" });
+  assert.equal(state.hidServed, 1, "the ending call was never served after close()");
+  assert.deepEqual(state.hidEvents, [{ key: 99, direction: "down" }, { key: 99, direction: "up" }]);
+  // A companion that does answer in time: close() waits for its status and loses nothing.
+  const quick = clientFor(t, endpoint, { hidIdleCloseMs: 5 });
+  const stream = quick.hid();
+  const quickLost = [];
+  stream.on("lost", (event) => quickLost.push(event));
+  const quickIdle = new Promise((resolve) => stream.once("idle_close", resolve));
+  await stream.tap(8, 9);
+  await quickIdle;
+  await stream.close({ timeoutMs: 2000 });
+  await waitFor(() => state.hidEvents.length === 4, { message: "the tap closed in time" });
+  assert.deepEqual(quickLost, []);
+  assert.equal(stream.lostEvents, 0);
+});
+
+test("REV-032: cancel() refuses a send queued behind an ending call; nothing from before the cancel is performed after the holder releases", { timeout: 20_000 }, async (t) => {
+  const { endpoint, state } = await fakeServer(t);
+  const holder = await holdHid(t, endpoint, state);
+  // Short idle windows (also while a press is held), a long close wait: the ended call
+  // waits behind the holder's call and is not cancelled by its own limit.
+  const client = clientFor(t, endpoint, { hidIdleCloseMs: 20, hidHeldIdleCloseMs: 20, hidCloseWaitMs: 15_000 });
+  const hid = client.hid();
+  const lost = [];
+  const drops = [];
+  hid.on("lost", (event) => lost.push(event));
+  hid.on("drop", (event) => drops.push(event));
+  const idle = new Promise((resolve) => hid.once("idle_close", resolve));
+  await hid.touchDown(1, 2);
+  await idle;
+  await waitFor(() => state.hidWaits === 1, { message: "the ended call to wait behind the holder's" });
+  // The up queues behind the ending call (written only once that call closes).
+  let upSettled = false;
+  const up = hid.touchUp(1, 2).then(
+    () => { upSettled = true; return "written"; },
+    (error) => { upSettled = true; return error; },
+  );
+  await sleep(50);
+  assert.equal(upSettled, false, "the up waits for the ending call");
+  assert.equal(hid.unconfirmed, 1, "the down is written but not confirmed");
+  const flush = hid.flush().then(() => null, (error) => error);
+  await hid.cancel("test deadline");
+  const refused = await up;
+  assert.ok(refused instanceof Error, `the queued up is refused, not written (${refused})`);
+  assert.match(refused.message, /cancelled before it was written/);
+  const failure = await flush;
+  assert.ok(failure instanceof HidUnconfirmedError, `flush() rejects with HidUnconfirmedError (${failure})`);
+  assert.equal(failure.events, 1, "the down that was written is reported lost");
+  assert.equal(lost.length, 1);
+  assert.equal(lost[0].events, 1);
+  assert.equal(hid.lostEvents, 1);
+  assert.equal(hid.sent, 1, "only the down was ever written");
+  // The stream stays usable: a send after cancel() goes out on a new call.
+  const afterCancel = hid.keyDown(9);
+  await afterCancel;
+  await hid.keyUp(9);
+  await sleep(100);
+  assert.deepEqual(state.hidEvents, [{ key: 99, direction: "down" }], "nothing of this client is performed while the holder holds");
+  await holder.release();
+  await hid.flush();
+  await waitFor(() => state.hidActive === null, { message: "every call to end" });
+  assert.deepEqual(state.hidEvents, [
+    { key: 99, direction: "down" }, { key: 99, direction: "up" },
+    { key: 9, direction: "down" }, { key: 9, direction: "up" },
+  ], "after the release only what was sent after cancel() is performed: no down or up from before it");
+  assert.equal(state.hidServed, 2, "the cancelled call was never served: the holder's call, then the one opened after cancel()");
+  assert.equal(hid.lostEvents, 1, "the loss is not counted again");
+  assert.deepEqual(drops, []);
+  await hid.close();
 });

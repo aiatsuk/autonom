@@ -4,20 +4,34 @@
 // and every file goes to a temporary AUTONOM_HOME.
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { EventEmitter } from "node:events";
 import { connect, createServer as createNetServer } from "node:net";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import test from "node:test";
 
 import { parseArgs } from "../plugins/autonom/skills/android-emulator-browser/scripts/browser-lib.mjs";
 import {
+  DEFAULT_VIDEO_OPTIONS,
   GrpcMessageParser,
+  IdbCompanionClient,
   IdbVideoStream,
   decodeVideoStreamRequest,
+  encodeHidEvent,
+  grpcFrame,
 } from "../plugins/autonom/skills/android-emulator-browser/scripts/ios-idb-companion.mjs";
+import {
+  IosFastSession,
+  iosDaemonEnabled,
+} from "../plugins/autonom/skills/android-emulator-browser/scripts/canvas-device-server.mjs";
+import {
+  IOSD_SCHEMA,
+  daemonPaths,
+  pidAlive,
+  socketPathFor,
+} from "../plugins/autonom/skills/android-emulator-browser/scripts/ios-device-daemon.mjs";
 import {
   deviceScope,
   startCanvas as startCanvasInProcess,
@@ -1120,4 +1134,650 @@ test("display choice in a workspace (QW-05): per device, reported as display_cho
   assert.throws(() => handle.server.setStreamChoice(contextOf(ID_B), { fps: 30, size: "half" }), /cannot be changed now/);
   assert.deepEqual((await devices())[ID_B].display_choice, { fps: 15, size: "full" });
   await handle.stop();
+});
+
+// ---------------------------------------------------------------------------
+// ID-14: an iOS session streams on the device daemon's companion. A fake daemon in this
+// process speaks the daemon's socket protocol (attach, companion, detach) and runs fake
+// idb_companion processes; the session opens its own gRPC session on the one it names.
+// ---------------------------------------------------------------------------
+
+const IOS_UDID = "5D2B0D6C-7A5B-4E0B-9C51-2B1A3F4E8D90";
+const IDB_MODULE_URL = new URL(
+  "../plugins/autonom/skills/android-emulator-browser/scripts/ios-idb-companion.mjs", import.meta.url).href;
+
+// A fake idb_companion: describe, get_orientation, a video stream of tiny H.264-shaped frames
+// (real simulator SPS/PPS on every key frame), HID; each spawn, Start, Stop and HID event is a
+// line in __EVENTS__. `--version` prints a version, as the daemon's version check reads it.
+const FAKE_COMPANION = String.raw`
+import { appendFileSync } from "node:fs";
+import * as http2 from "node:http2";
+import { GrpcMessageParser, decodeHidEvent, decodeVideoStreamRequest, encodeVideoStreamResponse, grpcFrame } from "__MODULE__";
+
+const EVENTS = "__EVENTS__";
+const args = process.argv.slice(2);
+if (args.includes("--version")) { console.log("1.6.5"); process.exit(0); }
+const arg = (name) => { const i = args.indexOf(name); return i >= 0 ? args[i + 1] : undefined; };
+const record = (event) => appendFileSync(EVENTS, JSON.stringify({ pid: process.pid, ...event }) + "\n");
+record({ type: "spawn", args });
+process.on("SIGTERM", () => { record({ type: "term" }); process.exit(0); });
+const varint = (value) => { const out = []; let v = value; while (v >= 0x80) { out.push((v & 0x7f) | 0x80); v = Math.floor(v / 128); } out.push(v); return Buffer.from(out); };
+const tag = (field, wire) => varint(field * 8 + wire);
+const len = (field, bytes) => Buffer.concat([tag(field, 2), varint(bytes.length), bytes]);
+const uint = (field, value) => Buffer.concat([tag(field, 0), varint(value)]);
+const dbl = (field, value) => { const b = Buffer.alloc(8); b.writeDoubleLE(value); return Buffer.concat([tag(field, 1), b]); };
+const str = (field, text) => len(field, Buffer.from(text));
+const SC = Buffer.from([0, 0, 0, 1]);
+const SPS = Buffer.from("27640033ac13143c04c0149e6a9a80868083c20108f8", "hex");
+const PPS = Buffer.from("28ee3cb0", "hex");
+let seq = 0;
+let hidActive = null;
+const hidWaiting = [];
+const frame = (key) => {
+  const body = Buffer.alloc(5);
+  body[0] = key ? 0x65 : 0x41;
+  body.writeUInt32BE(seq++, 1);
+  return key ? Buffer.concat([SC, SPS, SC, PPS, SC, body]) : Buffer.concat([SC, body]);
+};
+const server = http2.createServer();
+server.on("session", (session) => session.on("error", () => {}));
+server.on("stream", (stream, headers) => {
+  const method = headers[":path"].split("/").pop();
+  const parser = new GrpcMessageParser();
+  stream.on("error", () => {});
+  stream.respond({ ":status": 200, "content-type": "application/grpc" }, { waitForTrailers: true });
+  stream.on("wantTrailers", () => stream.sendTrailers({ "grpc-status": "0" }));
+  if (method === "video_stream") {
+    let timer = null;
+    let sent = 0;
+    stream.on("data", (chunk) => {
+      for (const message of parser.push(chunk)) {
+        const request = decodeVideoStreamRequest(message);
+        record({ type: request.type });
+        if (request.type === "start") {
+          timer = setInterval(() => {
+            stream.write(grpcFrame(encodeVideoStreamResponse({ data: frame(sent % 30 === 0) })));
+            sent += 1;
+          }, 10);
+        } else if (request.type === "stop") {
+          clearInterval(timer);
+          stream.end();
+        }
+      }
+    });
+    stream.on("close", () => clearInterval(timer));
+  } else if (method === "hid") {
+    // Like idb_companion: one hid call at a time; a second call is served, and its events
+    // performed, only once the open one ends.
+    const serve = () => {
+      hidActive = stream;
+      record({ type: "hid_open" });
+      stream.on("data", (chunk) => { for (const message of parser.push(chunk)) record({ type: "hid", event: decodeHidEvent(message) }); });
+      stream.on("end", () => stream.end());
+    };
+    stream.on("close", () => {
+      const waiting = hidWaiting.indexOf(serve);
+      if (waiting >= 0) hidWaiting.splice(waiting, 1);
+      if (hidActive !== stream) return;
+      hidActive = null;
+      record({ type: "hid_close" });
+      hidWaiting.shift()?.();
+    });
+    if (hidActive) {
+      record({ type: "hid_wait" });
+      hidWaiting.push(serve);
+    } else {
+      serve();
+    }
+  } else {
+    stream.on("data", (chunk) => {
+      for (const message of parser.push(chunk)) {
+        if (method === "describe") {
+          const screen = Buffer.concat([uint(1, 1206), uint(2, 2622), dbl(3, 3), uint(4, 402), uint(5, 874)]);
+          stream.write(grpcFrame(len(1, Buffer.concat([str(1, arg("--udid")), str(2, "Autonom-Daemon-Test"), len(3, screen), str(4, "Booted")]))));
+        } else if (method === "get_orientation") {
+          stream.write(grpcFrame(uint(1, 1)));
+        }
+        stream.end();
+      }
+    });
+  }
+});
+const socketPath = arg("--grpc-domain-sock");
+server.listen(socketPath, () => process.stdout.write(JSON.stringify({ grpc_path: socketPath }) + "\n"));
+`;
+
+// simctl for the session's Simulator watch: the one UDID, Booted.
+const FAKE_SIMCTL = String.raw`
+const args = process.argv.slice(2);
+if (args[0] === "simctl" && args[1] === "list") {
+  console.log(JSON.stringify({ devices: { "iOS 27.0": [{ udid: "__UDID__", state: "Booted", isAvailable: true }] } }));
+} else {
+  process.exitCode = 2;
+}
+`;
+
+/** A temporary home, fake companion and simctl for an iOS session; everything goes at the end. */
+async function iosDaemonWorld(t) {
+  const directory = await mkdtemp(join(tmpdir(), "autonom-iosd-canvas-"));
+  // Unix socket paths stay short: their own folder directly under the temporary directory.
+  const sockets = await mkdtemp(join(tmpdir(), "aic-"));
+  const bin = join(directory, "bin");
+  await mkdir(bin);
+  const world = {
+    directory, sockets, bin,
+    home: join(directory, "autonom-home"),
+    events: join(directory, "companion-events.jsonl"),
+    companion: join(directory, "idb_companion"),
+    xcrun: join(directory, "xcrun"),
+    daemons: [],
+    sessions: [],
+  };
+  await writeFile(world.events, "");
+  await writeFile(world.companion, `#!${process.execPath}\n${FAKE_COMPANION
+    .replace("__MODULE__", IDB_MODULE_URL).replace("__EVENTS__", world.events)}`);
+  await chmod(world.companion, 0o755);
+  await writeFile(world.xcrun, `#!${process.execPath}\n${FAKE_SIMCTL.replace("__UDID__", IOS_UDID)}`);
+  await chmod(world.xcrun, 0o755);
+  // What a daemon this test might start gets: no idb client, no real idb state, no real home.
+  world.daemonEnv = {
+    PATH: bin, HOME: directory, TMPDIR: tmpdir(), AUTONOM_HOME: world.home,
+    AUTONOM_IDB_COMPANION_BIN: world.companion, AUTONOM_IDB_STATE_FILE: join(directory, "idb-state"),
+  };
+  t.after(async () => {
+    await Promise.allSettled(world.sessions.map((session) => session.stop()));
+    await Promise.allSettled(world.daemons.map((daemon) => daemon.close()));
+    for (const { pid } of companionEvents(world).filter((event) => event.type === "spawn")) {
+      try { process.kill(pid, "SIGKILL"); } catch {}
+    }
+    rmSync(socketPathFor(world.home, IOS_UDID, { tmp: tmpdir() }).dir, { recursive: true, force: true });
+    await rm(sockets, { recursive: true, force: true });
+    await rm(directory, { recursive: true, force: true });
+  });
+  return world;
+}
+
+function companionEvents(world) {
+  return readFileSync(world.events, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line));
+}
+
+/**
+ * The device daemon's side of the socket protocol: `attach` and `companion` answer with the
+ * companion's socket and pid (waiting while it restarts, as the daemon does for up to 6 s),
+ * `detach` and a closed connection drop the attachment. Its registry names this process.
+ */
+class FakeIosDaemon {
+  ops = [];
+  state = "serving";
+  companion = null;
+  /** How many more `attach` requests are answered daemon_unreachable (Infinity: all of them). */
+  refuseAttaches = 0;
+  #world;
+  #attachments = new Map();
+  #connections = new Set();
+  #waiters = [];
+  #server = null;
+
+  constructor(world) {
+    this.#world = world;
+    world.daemons.push(this);
+  }
+
+  get attached() {
+    let count = 0;
+    for (const value of this.#attachments.values()) count += value;
+    return count;
+  }
+
+  async start({ companion = null } = {}) {
+    this.dir = await mkdtemp(join(this.#world.sockets, "d-"));
+    this.socket = join(this.dir, "d.sock");
+    this.#server = createNetServer((socket) => this.#onConnection(socket));
+    await new Promise((resolvePromise, reject) => {
+      this.#server.once("error", reject);
+      this.#server.listen(this.socket, resolvePromise);
+    });
+    this.companion = companion ?? await this.spawnCompanion();
+    this.writeRegistry();
+    return this;
+  }
+
+  /** One fake companion on the one socket path idb uses for this UDID, like `idb connect`. */
+  async spawnCompanion() {
+    const socketPath = join(this.#world.sockets, "companion.sock");
+    rmSync(socketPath, { force: true });
+    const child = spawn(this.#world.companion, ["--udid", IOS_UDID, "--grpc-domain-sock", socketPath, "--only", "simulator"],
+      { stdio: ["ignore", "pipe", "ignore"] });
+    await new Promise((resolvePromise, reject) => {
+      let text = "";
+      child.stdout.on("data", (chunk) => {
+        text += chunk;
+        if (text.includes("grpc_path")) resolvePromise();
+      });
+      child.once("exit", (code) => reject(new Error(`the fake companion exited (${code})`)));
+    });
+    return { child, pid: child.pid, socketPath };
+  }
+
+  /** Kills the companion and starts the next one after `delayMs`, as the daemon replaces a lost one. */
+  async restartCompanion({ delayMs = 300 } = {}) {
+    this.state = "companion_restarting";
+    const old = this.companion;
+    const exited = new Promise((resolvePromise) => old.child.once("exit", resolvePromise));
+    old.child.kill("SIGKILL");
+    await exited;
+    await sleep(delayMs);
+    this.companion = await this.spawnCompanion();
+    this.state = "serving";
+    this.writeRegistry();
+    for (const wake of this.#waiters.splice(0)) wake();
+  }
+
+  writeRegistry() {
+    const { registry } = daemonPaths(this.#world.home, IOS_UDID);
+    mkdirSync(dirname(registry), { recursive: true });
+    writeFileSync(registry, JSON.stringify({
+      schema: IOSD_SCHEMA, udid: IOS_UDID, pid: process.pid, socket: this.socket, state: this.state,
+      companion: { pid: this.companion?.pid ?? null, socket: this.companion?.socketPath ?? null, owned: true },
+    }));
+  }
+
+  /** Gone: the server and every connection close; `keepCompanion` leaves the companion running. */
+  async close({ keepCompanion = false } = {}) {
+    if (!this.#server) return;
+    const server = this.#server;
+    this.#server = null;
+    for (const socket of this.#connections) socket.destroy();
+    await new Promise((resolvePromise) => server.close(resolvePromise));
+    if (!keepCompanion && this.companion?.child.exitCode === null) this.companion.child.kill("SIGKILL");
+    rmSync(this.dir, { recursive: true, force: true });
+  }
+
+  #ready() {
+    if (this.state === "serving") return Promise.resolve(true);
+    return new Promise((resolvePromise) => {
+      const timer = setTimeout(() => resolvePromise(false), 6000);
+      this.#waiters.push(() => {
+        clearTimeout(timer);
+        resolvePromise(true);
+      });
+    });
+  }
+
+  #onConnection(socket) {
+    this.#connections.add(socket);
+    let buffer = "";
+    socket.setEncoding("utf8");
+    socket.on("error", () => {});
+    socket.on("data", (chunk) => {
+      buffer += chunk;
+      let index;
+      while ((index = buffer.indexOf("\n")) >= 0) {
+        const line = buffer.slice(0, index);
+        buffer = buffer.slice(index + 1);
+        if (line.trim()) this.#handle(socket, JSON.parse(line));
+      }
+    });
+    socket.on("close", () => {
+      this.#connections.delete(socket);
+      this.#attachments.delete(socket);
+    });
+  }
+
+  async #handle(socket, request) {
+    this.ops.push(request.op);
+    let reply;
+    const companion = () => ({ socket: this.companion.socketPath, pid: this.companion.pid, owned: true });
+    if (request.op === "attach" && this.refuseAttaches > 0) {
+      this.refuseAttaches -= 1;
+      reply = { ok: false, error: { code: "daemon_unreachable", message: "The companion is being restarted.", stage: "before_send" } };
+    } else if (request.op === "attach" || request.op === "companion") {
+      if (!(await this.#ready())) {
+        reply = { ok: false, error: { code: "daemon_unreachable", message: "restarting", stage: "before_send" } };
+      } else {
+        if (request.op === "attach") this.#attachments.set(socket, (this.#attachments.get(socket) ?? 0) + 1);
+        reply = { ok: true, ...(request.op === "attach" ? { attached: this.attached } : {}), ...companion() };
+      }
+    } else if (request.op === "detach") {
+      const count = this.#attachments.get(socket) ?? 0;
+      if (count <= 1) this.#attachments.delete(socket);
+      else this.#attachments.set(socket, count - 1);
+      reply = { ok: true, attached: this.attached };
+    } else {
+      reply = { ok: false, error: { code: "invalid_request", message: `unknown op ${request.op}`, stage: "before_send" } };
+    }
+    if (!socket.destroyed) socket.write(`${JSON.stringify({ id: request.id, ...reply })}\n`);
+  }
+}
+
+function iosSession(world, { daemon = true, daemonOptions = {} } = {}) {
+  const session = new IosFastSession({
+    udid: IOS_UDID,
+    xcrunPath: world.xcrun,
+    binary: world.companion,
+    video: { ...DEFAULT_VIDEO_OPTIONS, fps: 60 },
+    daemon: daemon ? { stateBase: world.home, env: world.daemonEnv, ...daemonOptions } : null,
+  });
+  world.sessions.push(session);
+  session.packets = 0;
+  session.states = [];
+  session.errors = [];
+  session.on("packet", () => { session.packets += 1; });
+  session.on("state", (name) => session.states.push(name));
+  session.on("error", (error) => session.errors.push(error.message));
+  return session;
+}
+
+test("iOS daemon switch: AUTONOM_IOS_DAEMON=off (0, false, no) keeps the Canvas on its own companion; anything else uses the daemon", () => {
+  for (const value of ["off", "OFF", " off ", "0", "false", "no"]) {
+    assert.equal(iosDaemonEnabled({ AUTONOM_IOS_DAEMON: value }), false, value);
+  }
+  for (const value of [undefined, "", "on", "1"]) {
+    assert.equal(iosDaemonEnabled({ AUTONOM_IOS_DAEMON: value }), true, String(value));
+  }
+});
+
+test("iOS attach (ID-14): the session streams on the daemon's companion, starts none of its own, and detaches when the device leaves", async (t) => {
+  const world = await iosDaemonWorld(t);
+  const daemon = await new FakeIosDaemon(world).start();
+  const session = iosSession(world);
+  await session.start();
+  await waitFor(() => session.packets >= 10, 5000, "frames from the daemon's companion");
+  assert.deepEqual(daemon.ops, ["attach"]);
+  assert.equal(daemon.attached, 1);
+  const stats = session.stats;
+  assert.equal(stats.companionSource, "daemon");
+  assert.equal(stats.daemonAttached, true);
+  assert.equal(stats.daemonFallback, null);
+  assert.equal(stats.companionStarts, 0, "the Canvas started no companion");
+  assert.equal(stats.companionAttaches, 1);
+  assert.equal(stats.companionPid, daemon.companion.pid);
+  assert.deepEqual(session.points, { width: 402, height: 874 });
+  const spawns = companionEvents(world).filter((event) => event.type === "spawn");
+  assert.deepEqual(spawns.map((event) => event.pid), [daemon.companion.pid], "one companion process for the UDID");
+  // HID goes to the same companion, on the session's own gRPC session.
+  await session.hid({ touch: { x: 10, y: 20 }, direction: "down" });
+  await session.hid({ touch: { x: 10, y: 20 }, direction: "up" });
+  await waitFor(() => companionEvents(world).filter((event) => event.type === "hid").length >= 2, 5000, "two HID events");
+  assert.ok(companionEvents(world).filter((event) => event.type === "hid").every((event) => event.pid === daemon.companion.pid));
+  // The device leaves: Stop on the stream, detach, and the daemon's companion keeps running.
+  await session.stop();
+  assert.deepEqual(daemon.ops, ["attach", "detach"]);
+  assert.equal(daemon.attached, 0);
+  assert.equal(session.stats.detaches, 1);
+  assert.equal(session.stats.daemonAttached, false);
+  assert.ok(companionEvents(world).some((event) => event.type === "stop" && event.pid === daemon.companion.pid), "Stop reached the companion");
+  assert.equal(pidAlive(daemon.companion.pid), true, "the Canvas never stops the daemon's companion");
+  assert.equal(companionEvents(world).some((event) => event.type === "term"), false);
+});
+
+test("iOS attach (ID-15): the Canvas's hid call on the daemon's companion ends when idle, so the daemon's input and the Canvas's both go through", { timeout: 30_000 }, async (t) => {
+  const world = await iosDaemonWorld(t);
+  const daemon = await new FakeIosDaemon(world).start();
+  const session = iosSession(world);
+  await session.start();
+  await waitFor(() => session.packets >= 10, 5000, "frames from the daemon's companion");
+  const hid = () => companionEvents(world).filter((event) => event.type === "hid").map((event) => event.event);
+  await session.hid({ touch: { x: 10, y: 20 }, direction: "down" });
+  await session.hid({ touch: { x: 10, y: 20 }, direction: "up" });
+  await waitFor(() => hid().length >= 2, 5000, "the Canvas's touch");
+  // The daemon's input: a gRPC session and hid stream of its own on the same companion.
+  const daemonClient = new IdbCompanionClient({ socketPath: daemon.companion.socketPath });
+  t.after(() => daemonClient.close({ timeoutMs: 200 }));
+  await daemonClient.hid().tap(30, 40);
+  await waitFor(() => hid().length >= 4, 3000, "the daemon's tap performed while the Canvas is attached");
+  // And the other way round: the Canvas's next input after the daemon's.
+  await session.hid({ key: 4, direction: "down" });
+  await session.hid({ key: 4, direction: "up" });
+  await waitFor(() => hid().length >= 6, 3000, "the Canvas's input after the daemon's tap");
+  assert.deepEqual(hid(), [
+    { touch: { x: 10, y: 20 }, direction: "down" },
+    { touch: { x: 10, y: 20 }, direction: "up" },
+    { touch: { x: 30, y: 40 }, direction: "down" },
+    { touch: { x: 30, y: 40 }, direction: "up" },
+    { key: 4, direction: "down" },
+    { key: 4, direction: "up" },
+  ]);
+  assert.ok(companionEvents(world).filter((event) => event.type === "hid_open").length >= 3, "a call per burst");
+  await session.stop();
+});
+
+test("iOS attach (REV-024): Canvas input sent while the daemon holds the companion's hid call past 2.5 s is performed once, in order, and not reported lost", { timeout: 30_000 }, async (t) => {
+  const world = await iosDaemonWorld(t);
+  const daemon = await new FakeIosDaemon(world).start();
+  const session = iosSession(world);
+  await session.start();
+  await waitFor(() => session.packets >= 10, 5000, "frames from the daemon's companion");
+  const hid = () => companionEvents(world).filter((event) => event.type === "hid").map((event) => event.event);
+  // The daemon (another client) takes the companion's hid call and keeps it: a long press.
+  const daemonClient = new IdbCompanionClient({ socketPath: daemon.companion.socketPath });
+  t.after(() => daemonClient.close({ timeoutMs: 200 }));
+  const held = daemonClient.openCall("hid");
+  held.on("error", () => {});
+  held.on("data", () => {});
+  const heldClosed = new Promise((resolve) => held.once("close", resolve));
+  held.write(grpcFrame(encodeHidEvent({ touch: { x: 1, y: 1 }, direction: "down" })));
+  await waitFor(() => hid().length === 1, 5000, "the daemon's press to be served");
+  const heldAt = Date.now();
+  await session.hid({ touch: { x: 10, y: 20 }, direction: "down" });
+  await session.hid({ touch: { x: 10, y: 20 }, direction: "up" });
+  await waitFor(() => companionEvents(world).some((event) => event.type === "hid_wait"), 5000, "the Canvas's call to wait");
+  // Longer than the old 2 s stop timeout plus the idle window, after which the waiting call was cancelled.
+  await new Promise((resolve) => setTimeout(resolve, Math.max(0, 2600 - (Date.now() - heldAt))));
+  assert.equal(hid().length, 1, "nothing of the Canvas performed while the daemon holds the call");
+  held.write(grpcFrame(encodeHidEvent({ touch: { x: 1, y: 1 }, direction: "up" })));
+  held.end();
+  await heldClosed;
+  await waitFor(() => hid().length >= 4, 5000, "the Canvas's touch after the daemon's press");
+  assert.deepEqual(hid(), [
+    { touch: { x: 1, y: 1 }, direction: "down" },
+    { touch: { x: 1, y: 1 }, direction: "up" },
+    { touch: { x: 10, y: 20 }, direction: "down" },
+    { touch: { x: 10, y: 20 }, direction: "up" },
+  ]);
+  await waitFor(() => companionEvents(world).filter((event) => event.type === "hid_close").length >= 2, 5000, "the Canvas's call to end");
+  assert.equal(session.stats.hidLost, 0);
+  assert.deepEqual(session.errors.filter((message) => /not confirmed/.test(message)), []);
+  await session.stop();
+});
+
+test("iOS reconnect (ID-14-S02): a companion the daemon restarts is reconnected to within 10 s, never replaced by the Canvas", async (t) => {
+  const world = await iosDaemonWorld(t);
+  const daemon = await new FakeIosDaemon(world).start();
+  const session = iosSession(world);
+  await session.start();
+  await waitFor(() => session.packets >= 10, 5000, "first frames");
+  const before = daemon.companion.pid;
+  const killedAt = Date.now();
+  await daemon.restartCompanion({ delayMs: 300 });
+  const after = daemon.companion.pid;
+  assert.notEqual(after, before);
+  // Frames from the new companion: its Start arrives and the session streams again.
+  await waitFor(() => companionEvents(world).some((event) => event.type === "start" && event.pid === after), 10_000,
+    "a Start on the restarted companion");
+  const packetsAtStart = session.packets;
+  await waitFor(() => session.state === "streaming" && session.packets >= packetsAtStart + 10, 10_000, "frames again");
+  assert.ok(Date.now() - killedAt < 10_000, "video is back within 10 s");
+  assert.ok(session.states.includes("restarting"), session.states.join(","));
+  // One attach for the whole session; the new companion was asked for, not attached to again.
+  assert.equal(daemon.ops.filter((op) => op === "attach").length, 1, daemon.ops.join(","));
+  assert.ok(daemon.ops.includes("companion"), daemon.ops.join(","));
+  assert.equal(daemon.attached, 1);
+  const stats = session.stats;
+  assert.equal(stats.companionStarts, 0, "no companion of the Canvas's own");
+  assert.equal(stats.companionAttaches, 2);
+  assert.equal(stats.companionPid, after);
+  assert.equal(stats.companionSource, "daemon");
+  // Only the daemon ever spawned companions: the killed one and its replacement.
+  assert.deepEqual(companionEvents(world).filter((event) => event.type === "spawn").map((event) => event.pid), [before, after]);
+  await session.hid({ key: 4, direction: "down" });
+  await waitFor(() => companionEvents(world).some((event) => event.type === "hid" && event.pid === after), 5000, "HID on the new companion");
+  await session.stop();
+  assert.equal(daemon.attached, 0);
+  assert.equal(daemon.ops.at(-1), "detach");
+  assert.equal(pidAlive(after), true);
+});
+
+test("iOS attach: a daemon that goes away is attached to again through the daemon that took over, on the same companion", async (t) => {
+  const world = await iosDaemonWorld(t);
+  const first = await new FakeIosDaemon(world).start();
+  const session = iosSession(world);
+  await session.start();
+  await waitFor(() => session.packets >= 10, 5000, "first frames");
+  // A new daemon adopts the running companion and takes over the registry; the old one goes.
+  const second = await new FakeIosDaemon(world).start({ companion: first.companion });
+  await first.close({ keepCompanion: true });
+  await waitFor(() => second.attached === 1, 10_000, "an attach to the new daemon");
+  assert.deepEqual(second.ops, ["attach"]);
+  assert.equal(session.stats.daemonLosses, 1);
+  assert.equal(session.stats.daemonAttaches, 2);
+  // The same companion keeps streaming: no new connection, no stream restart.
+  assert.equal(session.stats.companionAttaches, 1);
+  const packets = session.packets;
+  await waitFor(() => session.packets >= packets + 10, 5000, "frames keep coming");
+  assert.equal(session.state, "streaming");
+  await session.stop();
+  assert.deepEqual(second.ops, ["attach", "detach"]);
+  assert.equal(second.attached, 0);
+});
+
+/** The daemon start lock, held by another live process (the test runner): ensureDaemon waits on it. */
+function holdStartLock(t, world) {
+  const { startLock } = daemonPaths(world.home, IOS_UDID);
+  mkdirSync(dirname(startLock), { recursive: true });
+  writeFileSync(startLock, String(process.ppid));
+  const release = () => rmSync(startLock, { force: true });
+  t.after(release);
+  return release;
+}
+
+const spawnPids = (world) => companionEvents(world).filter((event) => event.type === "spawn").map((event) => event.pid);
+
+test("iOS attach: a daemon whose companion is restarting does not fail the first stream; the session asks again", async (t) => {
+  const world = await iosDaemonWorld(t);
+  const daemon = await new FakeIosDaemon(world).start();
+  daemon.refuseAttaches = 2;
+  const session = iosSession(world);
+  await session.start();
+  await waitFor(() => session.packets >= 10, 5000, "frames from the daemon's companion");
+  assert.deepEqual(daemon.ops, ["attach", "attach", "attach"]);
+  assert.equal(daemon.attached, 1);
+  const stats = session.stats;
+  assert.equal(stats.companionSource, "daemon");
+  assert.equal(stats.daemonFallback, null);
+  assert.equal(stats.companionStarts, 0, "the Canvas started no companion");
+  assert.deepEqual(spawnPids(world), [daemon.companion.pid]);
+  assert.ok(session.errors.some((message) => /being restarted/.test(message)), session.errors.join("\n"));
+  await session.stop();
+  assert.equal(daemon.attached, 0);
+});
+
+test("iOS attach: past the first wait the session streams on its own companion, then returns to the daemon's once it attaches", async (t) => {
+  const world = await iosDaemonWorld(t);
+  const daemon = await new FakeIosDaemon(world).start();
+  daemon.refuseAttaches = Infinity;
+  const session = iosSession(world, { daemonOptions: { firstWaitMs: 1200 } });
+  await session.start();
+  await waitFor(() => session.packets >= 10, 10_000, "frames from the Canvas's own companion");
+  assert.equal(session.stats.companionSource, "private");
+  assert.match(session.stats.daemonFallback, /being restarted/);
+  assert.equal(session.stats.companionStarts, 1);
+  const own = spawnPids(world).find((pid) => pid !== daemon.companion.pid);
+  assert.ok(own, "the Canvas started its own companion");
+  // The daemon serves again: the session attaches, its own companion goes, frames come from the daemon's.
+  daemon.refuseAttaches = 0;
+  await waitFor(() => session.stats.companionSource === "daemon" && daemon.attached === 1, 10_000, "a return to the daemon");
+  await waitFor(() => companionEvents(world).some((event) => event.type === "start" && event.pid === daemon.companion.pid), 10_000,
+    "a Start on the daemon's companion");
+  const packets = session.packets;
+  await waitFor(() => session.state === "streaming" && session.packets >= packets + 10, 10_000, "frames again");
+  await waitFor(() => !pidAlive(own), 5000, "the Canvas's own companion stopped");
+  const stats = session.stats;
+  assert.equal(stats.daemonFallback, null);
+  assert.equal(stats.daemonReturns, 1);
+  assert.equal(stats.companionPid, daemon.companion.pid);
+  assert.deepEqual(spawnPids(world).filter((pid) => pidAlive(pid)), [daemon.companion.pid], "one companion runs for the UDID");
+  await session.stop();
+  assert.equal(daemon.attached, 0);
+  assert.equal(pidAlive(daemon.companion.pid), true);
+});
+
+test("iOS attach: a daemon start that fails for a passing reason (start lock held) is tried again; the session returns to the daemon's companion", async (t) => {
+  const world = await iosDaemonWorld(t);
+  const release = holdStartLock(t, world);
+  const session = iosSession(world, { daemonOptions: { startTimeoutMs: 300, retryMinMs: 200, retryMaxMs: 400 } });
+  await session.start();
+  await waitFor(() => session.packets >= 10, 10_000, "frames from the Canvas's own companion");
+  assert.equal(session.stats.companionSource, "private");
+  assert.match(session.stats.daemonFallback, /start lock/);
+  const [own] = spawnPids(world);
+  // Tried again while the lock stays taken. Until the session's own first stream has settled a
+  // try only reschedules itself on the idb schedule (0.5 s doubling: 0.5 + 1 + 2 + 4 s), so the
+  // first reported failure can come several seconds late on a busy host; the bound covers that.
+  await waitFor(() => session.errors.some((message) => /attach failed: .*start lock/.test(message)), 20_000, "a retry of the daemon");
+  assert.equal(session.stats.companionSource, "private");
+  // Another process brings the daemon up: the session attaches to it and stops its own companion.
+  const daemon = await new FakeIosDaemon(world).start();
+  release();
+  await waitFor(() => session.stats.companionSource === "daemon" && daemon.attached === 1, 10_000, "a return to the daemon");
+  const packets = session.packets;
+  await waitFor(() => session.state === "streaming" && session.packets >= packets + 10, 10_000, "frames on the daemon's companion");
+  await waitFor(() => !pidAlive(own), 5000, "the Canvas's own companion stopped");
+  assert.equal(session.stats.companionPid, daemon.companion.pid);
+  assert.equal(session.stats.daemonFallback, null);
+  assert.deepEqual(spawnPids(world).filter((pid) => pidAlive(pid)), [daemon.companion.pid], "one companion runs for the UDID");
+  await session.stop();
+  assert.equal(daemon.attached, 0);
+});
+
+test("iOS attach: a lost daemon whose restart fails for a passing reason is attached to again while the stream keeps running", async (t) => {
+  const world = await iosDaemonWorld(t);
+  const first = await new FakeIosDaemon(world).start();
+  const session = iosSession(world, { daemonOptions: { startTimeoutMs: 300, retryMinMs: 200, retryMaxMs: 400 } });
+  await session.start();
+  await waitFor(() => session.packets >= 10, 5000, "first frames");
+  const streams = session.stats.streamsOpened;
+  // The daemon dies, its companion keeps running, and no new daemon can start yet.
+  const release = holdStartLock(t, world);
+  await first.close({ keepCompanion: true });
+  await waitFor(() => session.errors.filter((message) => /attach failed: .*start lock/.test(message)).length >= 2, 10_000,
+    "reattach tried again after daemon_start_failed");
+  assert.equal(session.stats.companionSource, "daemon", "a passing failure keeps the stream on the daemon's companion");
+  assert.equal(session.stats.daemonAttached, false);
+  // A daemon that adopts the companion comes up: the session attaches to it, so its idle stop counts the Canvas.
+  const second = await new FakeIosDaemon(world).start({ companion: first.companion });
+  release();
+  await waitFor(() => second.attached === 1, 10_000, "an attach to the new daemon");
+  assert.equal(session.stats.daemonAttached, true);
+  assert.equal(session.stats.companionAttaches, 1, "the same companion connection");
+  assert.equal(session.stats.streamsOpened, streams, "the stream never restarted");
+  const packets = session.packets;
+  await waitFor(() => session.packets >= packets + 10, 5000, "frames keep coming");
+  assert.equal(session.stats.companionStarts, 0);
+  await session.stop();
+  assert.equal(second.attached, 0);
+});
+
+test("iOS attach: a daemon that cannot start (no idb client) leaves the session on a companion of its own and says why", async (t) => {
+  const world = await iosDaemonWorld(t);
+  const session = iosSession(world, { daemonOptions: { retryMinMs: 100, retryMaxMs: 200 } });
+  await session.start();
+  await waitFor(() => session.packets >= 10, 10_000, "frames from the Canvas's own companion");
+  const stats = session.stats;
+  assert.equal(stats.companionSource, "private");
+  assert.match(stats.daemonFallback, /idb client was not found/);
+  assert.equal(stats.daemonAttached, false);
+  assert.equal(stats.companionStarts, 1);
+  assert.ok(session.errors.some((message) => /device daemon is unavailable/.test(message)), session.errors.join("\n"));
+  // The failed daemon left nothing: no registry, no socket folder.
+  assert.equal(existsSync(daemonPaths(world.home, IOS_UDID).registry), false);
+  assert.equal(existsSync(socketPathFor(world.home, IOS_UDID, { tmp: tmpdir() }).dir), false);
+  const spawns = companionEvents(world).filter((event) => event.type === "spawn" && event.args.includes("--grpc-domain-sock"));
+  assert.equal(spawns.length, 1, "one companion: the Canvas's own");
+  // A lasting failure (idb_missing) is not tried again.
+  await sleep(800);
+  assert.equal(session.errors.some((message) => /attach failed/.test(message)), false, session.errors.join("\n"));
+  assert.equal(session.stats.companionSource, "private");
+  await session.stop();
+  assert.equal(pidAlive(spawns[0].pid), false, "the Canvas stops a companion it started");
 });

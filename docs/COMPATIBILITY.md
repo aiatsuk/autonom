@@ -509,6 +509,14 @@ Error codes added (pinned by `tests/test_error_codes_additive.py`):
 
 An agent that matched an old code for these situations should match both.
 
+- The iOS device daemon round adds five codes, `input_unconfirmed` (a
+  warning code, and an `error_code` for an input whose events
+  `idb_companion` did not confirm), `ios_input_blocked` (a warning code),
+  `ios_display_not_lit` (an `error_code`), `companion_too_old` and
+  `daemon_unreachable` (values of the new `transport_reason` key, and the
+  daemon's own error codes), and no emission on the `idb` process changes; see
+  [iOS device daemon](#ios-device-daemon-unreleased).
+
 ### Every Canvas is a workspace (Unreleased)
 
 No `error_code` is added. Scripts that need the one-device page add `--single`.
@@ -579,6 +587,37 @@ this, such an entry was left out without a word.
 | Device calls of an observed action | — | after the input only reads: the settle's reads (idb `ui quiet` then one tree read on the iOS idb route; tree reads until two match elsewhere) and, on Android, one `dumpsys activity activities`. No read is added before the input and no input is ever sent again |
 | `replay --run` (or `--bundle`) of a `ui do` run | — | `replay_manifest_invalid` (an existing code) naming the run: its steps came on stdin (`flow_path: "<stdin>"`), so there is no flow file to replay; the hint says to send the steps to `ui do` again or save them as a flow file and use `flow run`. No file of the steps is written for replay, so a sensitive value a step types never sits on disk |
 | iOS idb input that fails with nothing on stderr | `error` was `idb <argv> failed (<exit>)`, the whole argv with the typed text, and that text was read for connection words (a typed `errno 61` sent `ui text` again after a prune) | `error` names the command words only (`idb ui text failed (1)`) and only idb's own stderr is classified: such a failure is `backend_failed`, never retried, and the input is sent once |
+
+### iOS device daemon (Unreleased)
+
+Additive: on by default, and `AUTONOM_IOS_DAEMON=off` (also `0`, `false`,
+`no`) restores the `idb` process for every call. Pinned by
+`tests/test_ios_daemon_client.py`, `tests/ios-device-daemon.test.mjs`,
+`tests/canvas-multi-device.test.mjs` and `tests/test_error_codes_additive.py`.
+Codes added (in `scripts/autonom_lib/errors.py`):
+
+| Code | Emitted by |
+| --- | --- |
+| `input_unconfirmed` | a warning (`warnings[].code`): an observed tap or swipe served by the daemon whose `touches_completed` did not come within 500 ms (1.5 s for the first touch on a new companion's quiet stream and for the first touch after an app was launched or brought to the front). The reply stays `ok: true` with `input_confirmed: false` and the screen read after it; the input was sent once and is never sent again. Also an `error_code` (stage `after_connection`, `unconfirmed_events`, the daemon's hint) for a tap, swipe, button or key, observed or not, whose events `idb_companion` never confirmed: lost with the companion, or cancelled at the daemon's wait limit. It is never sent again, through the daemon or `idb` |
+| `ios_input_blocked` | a warning in place of `input_unconfirmed` when the daemon finds the cause: the Simulator's `com.apple.coredevice.dtuhidd.active` flag is 1 and no Device Hub process runs. The hint says to reboot the Simulator; Autonom never boots, reboots or erases one |
+| `ios_display_not_lit` | `ui tree` and every other daemon read that hits a display that is not lit yet (a foldable or a display change), after at most one retry |
+| `companion_too_old` | `transport_reason` when the installed `idb_companion` is older than 1.6.4 (no `accessibility_quiescence`); the daemon then serves nothing and the call goes through the `idb` process |
+| `daemon_unreachable` | `transport_reason` when no daemon answered before the request was written, a read got no reply, or the daemon refused an input unsent because it could not start before its wait limit; the call goes through the `idb` process once (a read only with what is left of its budget, an input only when it was never written) |
+
+| Surface | Before | Now |
+| --- | --- | --- |
+| iOS idb route: `ui tree`, `ui find`, selector lookups, `ui wait --settled`, `ui tap`, `ui swipe`, `ui key` (buttons and keys) | one `idb` process per call | served by one Node daemon per Simulator (`ios-device-daemon.mjs`, Node 22+, started on first use), which keeps the companion connection open. The `idb` stdout and exit status the parsers read are the same, so `nodes`, `outline` and every other key are unchanged. `ui type`, crash, file pull, `screenshot`, a remote companion (`--idb-host`, `AUTONOM_IDB_COMPANION`) and the XCUITest route stay on the `idb` process |
+| Reply of an iOS verb on the idb route | — | additive `transport` (`daemon` or `subprocess`); `transport_reason` when the daemon was wanted and not used (`daemon_disabled`, `node_missing`, `daemon_start_failed`, `companion_too_old`, `daemon_unreachable`); `ax_backend` (`ax` or `axbridge`) after a daemon read. `backend` keeps naming the input route (`idb` or `axe`) |
+| Tree read on the daemon route | idb's default backend | `ax` by default; `axbridge` with the interactable filter when the frontmost app is Safari or its `ax` tree holds a web view, when the `ax` read covers less than half of the screen below the status bar, or when `ax` fails with "No translation object". Web page text (Safari) now appears in the tree |
+| Observed `ui tap`, `ui swipe`, `ui key` on the daemon route | input, `idb ui quiet`, then one `describe-all` | one daemon request: the input, up to 500 ms for `touches_completed` (1.5 s for the first touch on a new companion's quiet stream and for the first touch after an app was launched or brought to the front), a 300 ms grace period, a wait for quiet within `--observe-timeout-ms`, one read. The reply adds `input_confirmed` (true or false) and `method: quiet-stream`; the other observe keys are as before. `ui type` keeps its text on the `idb` process |
+| `ui wait --settled` on the daemon route | `method: idb-quiet` | `method: quiet-stream`, answered from the daemon's open quiet stream; the other keys and the exit status are as before |
+| An input whose daemon reply was lost after it was written | — | `idb_companion_unavailable` with stage `after_connection` and the existing hint that it may have been delivered; it is never sent again through `idb` (the existing after-connection classification) |
+| An input the daemon sent whose events `idb_companion` never confirmed | — | `input_unconfirmed` (`error_code`, stage `after_connection`, `unconfirmed_events`, a hint to read the screen first), never `ok: true`; it is never sent again, through the daemon or `idb`. An observed input fails the same way, without the observe keys |
+| Daemon input beside other clients | — | `idb_companion` 1.6.4 serves one `hid` call at a time, so the daemon holds none open: it primes with one key-up at start, and each call ends 250 ms after its last event (10 s while a press is held), so `idb ui text`, idb's buttons and Canvas input are not blocked by it. An input's reply waits for the companion's status, behind another client's call if need be, up to one limit from its arrival: 15 s plus the input's duration (`AUTONOM_IOSD_HID_WAIT_MS` overrides it), inside the CLI's 20 s plain-input budget (an observed input replies within the observe timeout plus 20 s; the CLI waits it plus 25 s). At the limit the call is cancelled, so nothing is performed later; an input that could not start by then is refused unsent and goes through the `idb` process once. The daemon's `status` reply adds `hid_calls`, `hid_idle_closes`, `hid_lost` and `hid_open` |
+| `session stop` | named every idb companion it did not start in `companion_left_running` | a companion a live daemon started is left to the daemon and not named; any other companion is reported as before |
+| Machine state | — | `$AUTONOM_HOME/iosd/` (else `~/.autonom/iosd/`): `<UDID>.json` (schema `autonom-iosd/v1`: daemon pid, socket, companion pid, socket and `owned`, Xcode, CoreSimulator and companion versions, start time, idle limit), `<UDID>.log` (ops and timings only) and two lock files; the socket is `$TMPDIR/autonom-iosd-<12 hex>/d.sock` in a 0700 directory, at most 103 bytes. The process registry gains rows of kind `iosd`. Older versions ignore the directory |
+| Companion lifetime | each `idb` call could start a companion; the Canvas ran its own | one companion per Simulator: the one idb's state file lists (used, never stopped by the daemon), else one the daemon starts with `idb connect` and restarts after a crash (0.5 s growing to 5 s). The daemon stops after 5 minutes with no request and no Canvas attached, and then ends only a companion it started (`idb disconnect`, SIGTERM, SIGKILL after 3 s) |
+| Canvas idb transport | its own companion on a private socket | the daemon's companion (`attach`, then its own gRPC session for video; `detach` when the device leaves); a private companion only with `AUTONOM_IOS_DAEMON=off` or a daemon that cannot serve. `/status` `idb` adds `companion_source` (`daemon` or `private`), `daemon_attached`, `daemon_fallback`, `companion_attaches` and `hid_lost` (input events the companion never confirmed, each also reported as an error). The Canvas, too, ends each `hid` call 250 ms after its last event (10 s while a press is held) |
 
 ### iOS UI recovery and `--session-id` (0.32.0)
 

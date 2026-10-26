@@ -94,6 +94,13 @@ once. Read the tree yourself only when the reply says so:
 
 - `observe_error` — the input **was** sent; only the read after it failed.
   Run `ui tree`. Never send the input again.
+- `input_confirmed: false` with an `input_unconfirmed` warning (iOS daemon
+  route) — the input **was** sent once, but the app did not report the touch
+  within 500 ms (1.5 s for the first touch on a new companion or after an app launch). Read `screen.outline`: if it shows the expected screen, carry
+  on; if not, the tap probably did not land. Never repeat it blindly: read the
+  tree, then decide. `ios_input_blocked` instead means input is not reaching
+  the Simulator at all (its HID flag is stuck): ask for the Simulator to be
+  rebooted; Autonom never reboots it.
 - a `screen_not_settled` warning — the screen may still have been changing
   when the timeout ran out. If the returned `screen` already shows what you
   expected (the element or page you tapped toward), carry on with the next
@@ -195,7 +202,8 @@ and so does any node entirely outside the app's frame, live or from `--dump`.
   `--timeout-ms` (an Android dump can take ~2 s), it says settling could not
   be confirmed and how far to raise it. On the iOS idb route it asks idb
   whether the app is quiet and then reads once (`method: idb-quiet`,
-  `snapshots: 1`); elsewhere it polls (`method: poll`).
+  `snapshots: 1`; `method: quiet-stream` when the device daemon answered);
+  elsewhere it polls (`method: poll`).
 - `ui_not_idle` (Android) means the screen never stops changing — an
   animation, a video, a timer, a spinner — so UI Automator cannot read it.
   Waiting does not help: take `autonom screenshot` and act on what it shows,
@@ -215,6 +223,54 @@ the verb. `autonom doctor` reports `ios_tree` and `ios_hid` separately with
 the fix for each. On Xcode 27 with AXe carrying input, `ios_hid.ready` stays
 `false` (idb's own HID) while `ios_hid.axe_ready` and `ios_ui.ready` are
 `true`: read `ios_ui` and `axe_ready` — input works, do not give up on it.
+
+## The iOS device daemon (`transport`)
+
+On the iOS idb route one small Node process per Simulator, the **device
+daemon**, keeps the connection to the Simulator's one `idb_companion` open.
+It holds no input call open between inputs (each ends 250 ms after its last
+event), so `ui type`, idb buttons and the Canvas are not blocked by it.
+It starts on the first `ui` call (Node 22+ needed), serves tree reads, `ui
+wait --settled`, taps, swipes, buttons and keys, and stops by itself after
+**5 minutes** with no request and no Canvas attached. `ui type`, crash
+reports, file pull, screenshots, a remote companion and the XCUITest route
+still use the `idb` process. Nothing to start or stop by hand: `session stop`
+leaves the daemon's companion to it (it is not reported as
+`companion_left_running`), and the Canvas streams on the same companion.
+
+Each iOS reply on the idb route says how it was served:
+
+- `transport: daemon` — the daemon answered; `transport: subprocess` — the
+  `idb` process did. With `subprocess`, `transport_reason` says why the
+  daemon was not used: `daemon_disabled` (`AUTONOM_IOS_DAEMON=off`),
+  `node_missing`, `daemon_start_failed`, `companion_too_old` (the companion
+  is older than 1.6.4) or `daemon_unreachable`. The call still worked; only
+  the speed differs.
+- `ax_backend` — which accessibility read made the tree: `ax` (native
+  screens), or `axbridge` for web content (Safari, a web view, or a native
+  read that covered too little of the screen). Web page text shows up only
+  in `axbridge` reads. `backend` still names the input route (`idb`, `axe`).
+- On an observed action: `input_confirmed` (the app reported the touch) and
+  `method: quiet-stream`; `ui wait --settled` also answers
+  `method: quiet-stream`.
+
+Codes to know:
+
+| Code | Meaning | What to do |
+| --- | --- | --- |
+| `input_unconfirmed` (warning) | the input was sent once; the app did not report the touch in 500 ms (1.5 s for the first touch on a new companion or after an app launch) | read the returned screen; never resend blindly |
+| `input_unconfirmed` (error) | the input was sent once, but `idb_companion` never confirmed it: another client held the Simulator's input past 15 s, or the companion was lost | run `ui tree` before you repeat it; it was not sent again |
+| `ios_input_blocked` (warning) | the Simulator's HID flag is set and no Device Hub runs: input is lost | have the Simulator rebooted |
+| `ios_display_not_lit` (error) | the display is not lit yet (a foldable, a display change) | wait and read again, or use a device type with one fixed display |
+| `companion_too_old` (`transport_reason`) | `idb_companion` older than 1.6.4 | works through `idb`; upgrade the companion for speed |
+
+An input whose daemon reply was lost after it was written fails
+`idb_companion_unavailable`, and one the companion never confirmed fails
+`input_unconfirmed`; neither is **sent again**: read the screen before doing
+anything else. An input the daemon could not start within its 15 s limit is
+refused unsent and goes through the `idb` process once. To rule the daemon
+out while debugging, set `AUTONOM_IOS_DAEMON=off`; every call then goes
+through the `idb` process.
 
 ## Gestures and keys by platform
 

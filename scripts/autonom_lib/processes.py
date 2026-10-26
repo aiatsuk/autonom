@@ -777,8 +777,18 @@ def reap_session(record: dict[str, Any]) -> dict[str, Any]:
     if not session_id:
         return result
     handled: set[int] = set()
+    # A companion a live iOS device daemon owns is the daemon's to stop (by
+    # its idle rule): never killed here, never reported as left running. One
+    # it only adopted is not listed, so whoever started it still stops it.
+    daemon_companions: set[int] = set()
+    if (record.get("platform") or "android") == "ios":
+        from . import ios_daemon
+
+        daemon_companions = ios_daemon.live_companion_pids(record.get("target_id"))
     if _registry_file_if_present() is not None:
-        owned = [entry for entry in _read() if owned_by(entry, session_id)]
+        owned = [entry for entry in _read() if owned_by(entry, session_id)
+                 and not (entry.get("kind") == "idb_companion"
+                          and entry.get("pid") in daemon_companions)]
         for entry in _supervisors_first(owned):
             pid = int(entry["pid"])
             outcome = terminate_entry(entry)
@@ -793,7 +803,7 @@ def reap_session(record: dict[str, Any]) -> dict[str, Any]:
     if (record.get("platform") or "android") == "ios":
         udid = record.get("target_id")
         for companion in discover_companions(udid):
-            if companion["pid"] in handled:
+            if companion["pid"] in handled or companion["pid"] in daemon_companions:
                 continue
             result["companion_left_running"].append({
                 "pid": companion["pid"], "udid": udid,

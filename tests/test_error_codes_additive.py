@@ -78,6 +78,17 @@ AGENT_LOOP_CODES = {
 NEW_CODES.update(AGENT_LOOP_CODES)
 AGENT_LOOP_SECTION = "### Agent profile, one-line JSON and observe (Unreleased)"
 
+# iOS device daemon (speed plan 2b): warnings of an unconfirmed input and the
+# daemon's failures. Their COMPATIBILITY.md rows come with the docs task.
+IOS_DAEMON_CODES = {
+    "INPUT_UNCONFIRMED": "input_unconfirmed",
+    "IOS_INPUT_BLOCKED": "ios_input_blocked",
+    "IOS_DISPLAY_NOT_LIT": "ios_display_not_lit",
+    "COMPANION_TOO_OLD": "companion_too_old",
+    "DAEMON_UNREACHABLE": "daemon_unreachable",
+}
+NEW_CODES.update(IOS_DAEMON_CODES)
+
 EXISTING_CODES = {
     "FLOW_NOT_FOUND": "flow_not_found",
     "FLOW_FILE_NOT_FOUND": "flow_file_not_found",

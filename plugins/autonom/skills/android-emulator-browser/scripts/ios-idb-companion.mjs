@@ -1,7 +1,8 @@
 /**
  * One idb_companion per iOS Simulator, owned by the Canvas, and a small gRPC client
  * for it over node:http2 with a hand-written protobuf codec for exactly the messages
- * the Canvas needs (idb.proto, package `idb`, service `CompanionService`):
+ * the Canvas and the iOS device daemon need (idb.proto of fb-idb 1.6.5, package `idb`,
+ * service `CompanionService`):
  *
  * - `video_stream`: VideoStreamRequest Start/Stop in, VideoStreamResponse payload out.
  *   One gRPC message carries one H.264 access unit; a keyframe comes with its SPS and
@@ -9,9 +10,17 @@
  *   Stop, so every close path here sends Stop while the call can still carry it, and a
  *   stream that ended without one reports `abnormal` so the owner restarts the
  *   companion.
- * - `hid`: one long client stream of HIDEvent presses (touch down/up at logical
- *   points, HOME/LOCK buttons, keyboard usage codes).
- * - `describe` and `get_orientation`: unary queries.
+ * - `hid`: a client stream of HIDEvent presses (touch down/up at logical points,
+ *   HOME/LOCK buttons, keyboard usage codes), opened on first send or ahead of it
+ *   (`openHid()`), with a `drop` event when the companion ends it. The companion serves
+ *   one `hid` call at a time, so the call ends after a short idle window and the next
+ *   event opens a new one: an idle call would block every other client's input. An
+ *   ended call waits for the companion to serve it (up to a safety limit) rather than
+ *   being cancelled, and events it could not confirm are reported (`lost`, flush()).
+ * - `describe`, `get_orientation` and `accessibility_info` (backend, format, filter,
+ *   keys, profile, frame coverage): unary queries.
+ * - `accessibility_quiescence`: a server stream of StateChanged, TouchesCompleted,
+ *   TargetChanged and TargetExited events.
  *
  * The companion listens on a private Unix domain socket by default: its TCP listener
  * binds every interface, not loopback only. It runs in its own process group and is
@@ -143,6 +152,21 @@ export const STOP_TIMEOUT_MS = 3000;
 export const KILL_WAIT_MS = 2000;
 export const STREAM_STOP_TIMEOUT_MS = 2000;
 export const UNARY_TIMEOUT_MS = 5000;
+/**
+ * idb_companion serves one `hid` call at a time, so an idle call blocks every other
+ * client's input: it ends this long after its last event (see IdbHidStream).
+ */
+export const HID_IDLE_CLOSE_MS = 250;
+/** The same window while a touch, button or key is held down (a long press). */
+export const HID_HELD_IDLE_CLOSE_MS = 10_000;
+/**
+ * How long an ended (half-closed) HID call that carried events waits for the companion's
+ * status. While another client holds the companion's one hid call (a long press, a long
+ * `idb ui text`), the call is not served yet and its events are not read: cancelling it
+ * would throw them away. So it waits this long, a safety limit, not a short timer; when
+ * the limit is hit (or the session is lost) its events are reported as unconfirmed.
+ */
+export const HID_CLOSE_WAIT_MS = 60_000;
 export const MAX_GRPC_MESSAGE_BYTES = 32 * 1024 * 1024;
 /** Frames buffered before the HTTP/2 stream is paused (flow control then backs up). */
 export const FRAME_QUEUE_HIGH_WATER = 8;
@@ -582,6 +606,214 @@ export function decodeOrientationResponse(buf) {
 }
 
 // ---------------------------------------------------------------------------
+// Accessibility reads and the quiet stream (idb.proto of fb-idb 1.6.5).
+// ---------------------------------------------------------------------------
+
+/** AccessibilityInfoRequest.Format. */
+export const AX_FORMAT = Object.freeze({ LEGACY: 0, NESTED: 1, COMPLETE: 2 });
+/** AccessibilityInfoRequest.Backend; UNSPECIFIED is the companion's historical default. */
+export const AX_BACKEND = Object.freeze({ UNSPECIFIED: 0, AX: 1, AXBRIDGE: 2, AXBRIDGE_PERSISTENT: 3 });
+/** AccessibilityInfoRequest.Filter. */
+export const AX_FILTER = Object.freeze({ ALL: 0, INTERACTABLE: 1 });
+/** AccessibilityQuiescenceResponse.State, by number. */
+export const QUIESCENCE_STATE_NAMES = Object.freeze(["STATE_UNSPECIFIED", "BUSY", "SETTLING", "QUIET"]);
+/** AccessibilityQuiescenceResponse.Signal, by number. */
+export const QUIESCENCE_SIGNAL_NAMES = Object.freeze(["SIGNAL_UNSPECIFIED", "RUN_LOOP_IDLE", "ANIMATIONS_INACTIVE"]);
+/** The four AccessibilityQuiescenceResponse events, by their oneof field number. */
+const QUIESCENCE_EVENT_FIELDS = Object.freeze({
+  2: "state_changed",
+  3: "touches_completed",
+  4: "target_changed",
+  5: "target_exited",
+});
+/** Default deadline of one accessibility_info read: a full axbridge tree can take seconds. */
+export const ACCESSIBILITY_INFO_TIMEOUT_MS = 10_000;
+const UINT32_MAX = 2 ** 32 - 1;
+
+/** An enum value by name (case-insensitive, with or without the proto prefix) or number. */
+function enumCode(table, value, name, prefix) {
+  if (typeof value === "number") {
+    if (!Object.values(table).includes(value)) throw new RangeError(`Unknown ${name} ${value}.`);
+    return value;
+  }
+  let key = String(value).toUpperCase();
+  if (prefix && key.startsWith(prefix)) key = key.slice(prefix.length);
+  const code = table[key];
+  if (code === undefined) throw new RangeError(`Unknown ${name} ${value}.`);
+  return code;
+}
+
+function enumName(table, code) {
+  return Object.keys(table).find((key) => table[key] === code) ?? code;
+}
+
+/**
+ * AccessibilityInfoRequest { format = 3, keys = 7, backend = 8, profile = 9,
+ * collect_frame_coverage = 10, filter = 13 } for a whole-screen read. Every option is
+ * optional; an unset one keeps the companion's historical behaviour (LEGACY format,
+ * unspecified backend, every element, the default key set). Fields are written in
+ * number order, so the bytes equal the reference library's.
+ */
+export function encodeAccessibilityInfoRequest(options = {}) {
+  if (!options || typeof options !== "object") throw new TypeError("accessibility_info options must be an object.");
+  const { backend, format, filter, keys, profile = false, collectFrameCoverage = false } = options;
+  const formatCode = format === undefined || format === null ? 0 : enumCode(AX_FORMAT, format, "accessibility format");
+  const backendCode = backend === undefined || backend === null
+    ? 0 : enumCode(AX_BACKEND, backend, "accessibility backend", "BACKEND_");
+  const filterCode = filter === undefined || filter === null ? 0 : enumCode(AX_FILTER, filter, "accessibility filter", "FILTER_");
+  if (keys !== undefined && keys !== null && (!Array.isArray(keys) || keys.some((key) => typeof key !== "string" || !key))) {
+    throw new TypeError("keys must be an array of non-empty strings.");
+  }
+  if (typeof profile !== "boolean") throw new TypeError("profile must be a boolean.");
+  if (typeof collectFrameCoverage !== "boolean") throw new TypeError("collectFrameCoverage must be a boolean.");
+  const writer = new ProtoWriter().uint(3, formatCode);
+  for (const key of keys ?? []) writer.string(7, key);
+  return writer
+    .uint(8, backendCode)
+    .bool(9, profile)
+    .bool(10, collectFrameCoverage)
+    .uint(13, filterCode)
+    .finish();
+}
+
+/** Inverse of encodeAccessibilityInfoRequest (used by test servers), with enum names. */
+export function decodeAccessibilityInfoRequest(buf) {
+  const records = decodeProtoFields(buf);
+  const f = lastFields(buf);
+  return {
+    format: enumName(AX_FORMAT, fieldUint(f, 3)),
+    keys: records.filter((r) => r.field === 7 && r.wire === WIRE.LEN).map((r) => r.value.toString("utf8")),
+    backend: enumName(AX_BACKEND, fieldUint(f, 8)),
+    profile: fieldUint(f, 9) !== 0,
+    collectFrameCoverage: fieldUint(f, 10) !== 0,
+    filter: enumName(AX_FILTER, fieldUint(f, 13)),
+  };
+}
+
+/** AccessibilityInfoResponse { json = 1 } (used by test servers). */
+export function encodeAccessibilityInfoResponse(json) {
+  return new ProtoWriter().string(1, String(json)).finish();
+}
+
+/** AccessibilityInfoResponse.json: the companion's JSON document as a string. */
+export function decodeAccessibilityInfoResponse(buf) {
+  return fieldString(lastFields(buf), 1);
+}
+
+function optionalUint32(value, name) {
+  if (value === undefined || value === null) return undefined;
+  if (!Number.isInteger(value) || value < 0 || value > UINT32_MAX) throw new RangeError(`${name} must be a uint32.`);
+  return value;
+}
+
+/**
+ * AccessibilityQuiescenceRequest { oneof target { pid = 1, bundle_id = 2 },
+ * oneof busy_threshold { busy_threshold_ms = 3 }, oneof quiet_window { quiet_window_ms = 4 } }.
+ * No target follows the frontmost application. Each tunable sits in its own oneof, so
+ * a zero that is passed is written (an unset one takes the companion's default).
+ */
+export function encodeAccessibilityQuiescenceRequest(request = {}) {
+  if (!request || typeof request !== "object") throw new TypeError("accessibility_quiescence request must be an object.");
+  const { pid, bundleId, busyThresholdMs, quietWindowMs } = request;
+  const hasPid = pid !== undefined && pid !== null;
+  const hasBundle = bundleId !== undefined && bundleId !== null;
+  if (hasPid && hasBundle) throw new TypeError("Pass pid or bundleId as the target, not both.");
+  if (hasBundle && (typeof bundleId !== "string" || !bundleId)) throw new TypeError("bundleId must be a non-empty string.");
+  const busy = optionalUint32(busyThresholdMs, "busyThresholdMs");
+  const quiet = optionalUint32(quietWindowMs, "quietWindowMs");
+  const parts = [];
+  const scalar = (field, value) => parts.push(varint((field << 3) | WIRE.VARINT), varint(value));
+  if (hasPid) scalar(1, requireUint(pid, "pid"));
+  if (hasBundle) parts.push(new ProtoWriter().bytes(2, bundleId, { always: true }).finish());
+  if (busy !== undefined) scalar(3, busy);
+  if (quiet !== undefined) scalar(4, quiet);
+  return Buffer.concat(parts);
+}
+
+/** Inverse of encodeAccessibilityQuiescenceRequest (used by test servers); unset fields are null. */
+export function decodeAccessibilityQuiescenceRequest(buf) {
+  const f = lastFields(buf);
+  const present = (field) => (f.get(field)?.wire === WIRE.VARINT ? fieldUint(f, field) : null);
+  // `target` is a oneof: the last of pid/bundle_id on the wire wins.
+  const target = decodeProtoFields(buf).filter((r) => r.field === 1 || r.field === 2).at(-1);
+  return {
+    pid: target?.field === 1 && target.wire === WIRE.VARINT ? fieldUint(f, 1) : null,
+    bundleId: target?.field === 2 && target.wire === WIRE.LEN ? target.value.toString("utf8") : null,
+    busyThresholdMs: present(3),
+    quietWindowMs: present(4),
+  };
+}
+
+/** Repeated enum values, packed (proto3 default) or one per record. */
+function repeatedUints(records, field) {
+  const out = [];
+  for (const record of records) {
+    if (record.field !== field) continue;
+    if (record.wire === WIRE.VARINT) {
+      out.push(Number(record.value));
+    } else if (record.wire === WIRE.LEN) {
+      let offset = 0;
+      while (offset < record.value.length) {
+        const [value, next] = readVarint(record.value, offset);
+        out.push(Number(value));
+        offset = next;
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * One AccessibilityQuiescenceResponse as
+ * `{ type: "state_changed", pid, state, busySignals }`, `{ type: "touches_completed", pid }`,
+ * `{ type: "target_changed", pid }` or `{ type: "target_exited", pid }`. A state or signal
+ * newer than this client is reported by its number; an event newer than it is
+ * `{ type: "unknown", pid, field }`, so a long-lived stream outlives a companion update.
+ */
+export function decodeAccessibilityQuiescenceResponse(buf) {
+  const records = decodeProtoFields(buf);
+  const f = lastFields(buf);
+  const pid = fieldUint(f, 1);
+  // `event` is a oneof: the last known choice on the wire wins.
+  const event = records.filter((r) => QUIESCENCE_EVENT_FIELDS[r.field] && r.wire === WIRE.LEN).at(-1);
+  if (!event) {
+    const other = records.find((r) => r.field !== 1);
+    return { type: "unknown", pid, field: other?.field ?? null };
+  }
+  const type = QUIESCENCE_EVENT_FIELDS[event.field];
+  if (type !== "state_changed") return { type, pid };
+  const stateRecords = decodeProtoFields(event.value);
+  const code = fieldUint(lastFields(event.value), 1);
+  return {
+    type,
+    pid,
+    state: QUIESCENCE_STATE_NAMES[code] ?? code,
+    busySignals: repeatedUints(stateRecords, 2).map((signal) => QUIESCENCE_SIGNAL_NAMES[signal] ?? signal),
+  };
+}
+
+/** Inverse of decodeAccessibilityQuiescenceResponse for the four known events (test servers). */
+export function encodeAccessibilityQuiescenceResponse(event) {
+  if (!event || typeof event !== "object") throw new TypeError("Quiescence event must be an object.");
+  const field = Number(Object.keys(QUIESCENCE_EVENT_FIELDS).find((key) => QUIESCENCE_EVENT_FIELDS[key] === event.type));
+  if (!field) throw new RangeError(`Unknown quiescence event ${event.type}.`);
+  let body = Buffer.alloc(0);
+  if (event.type === "state_changed") {
+    const state = typeof event.state === "number" ? event.state : QUIESCENCE_STATE_NAMES.indexOf(String(event.state));
+    if (state < 0) throw new RangeError(`Unknown quiescence state ${event.state}.`);
+    const signals = (event.busySignals ?? []).map((signal) => {
+      const code = typeof signal === "number" ? signal : QUIESCENCE_SIGNAL_NAMES.indexOf(String(signal));
+      if (code < 0) throw new RangeError(`Unknown quiescence signal ${signal}.`);
+      return varint(code);
+    });
+    const writer = new ProtoWriter().uint(1, state);
+    if (signals.length) writer.bytes(2, Buffer.concat(signals));
+    body = writer.finish();
+  }
+  return new ProtoWriter().uint(1, requireUint(event.pid ?? 0, "pid")).message(field, body).finish();
+}
+
+// ---------------------------------------------------------------------------
 // gRPC length-prefixed message framing.
 // ---------------------------------------------------------------------------
 
@@ -912,13 +1144,24 @@ export class IdbCompanionClient {
   #closed = false;
   #closing = null;
   #videoStreams = new Set();
+  #quietStreams = new Set();
   #hid = null;
+  #hidOptions;
 
-  constructor(endpoint) {
+  /**
+   * @param {object} endpoint `{ socketPath }` or `{ host, port }`.
+   * @param {object} [options] `{ hidIdleCloseMs, hidHeldIdleCloseMs, hidCloseWaitMs }` for the HID stream.
+   */
+  constructor(endpoint, { hidIdleCloseMs, hidHeldIdleCloseMs, hidCloseWaitMs } = {}) {
     if (!endpoint || (!endpoint.socketPath && !endpoint.port)) {
       throw new TypeError("Companion endpoint needs socketPath or port.");
     }
     this.#endpoint = { host: "127.0.0.1", ...endpoint };
+    this.#hidOptions = {
+      ...(hidIdleCloseMs !== undefined ? { idleCloseMs: hidIdleCloseMs } : {}),
+      ...(hidHeldIdleCloseMs !== undefined ? { heldIdleCloseMs: hidHeldIdleCloseMs } : {}),
+      ...(hidCloseWaitMs !== undefined ? { closeWaitMs: hidCloseWaitMs } : {}),
+    };
   }
 
   get endpoint() {
@@ -1021,6 +1264,32 @@ export class IdbCompanionClient {
     return decodeOrientationResponse(await this.unary("get_orientation", Buffer.alloc(0), options));
   }
 
+  /**
+   * One `accessibility_info` read of the whole screen (see encodeAccessibilityInfoRequest
+   * for `options`); resolves with the companion's JSON document as a string. A companion
+   * without the method rejects with GrpcError code 12 (UNIMPLEMENTED), a read that
+   * outlives `timeoutMs` with code 4.
+   */
+  async accessibilityInfo(options = {}, { timeoutMs = ACCESSIBILITY_INFO_TIMEOUT_MS, signal } = {}) {
+    const request = encodeAccessibilityInfoRequest(options);
+    return decodeAccessibilityInfoResponse(await this.unary("accessibility_info", request, { timeoutMs, signal }));
+  }
+
+  /**
+   * Opens the server-streaming `accessibility_quiescence` call (see
+   * encodeAccessibilityQuiescenceRequest for `request`); iterate the stream for events
+   * and `cancel()` it when done. `timeoutMs` (none by default: the stream is meant to
+   * stay open) ends it with GrpcError code 4.
+   */
+  async accessibilityQuiescence(request = {}, { timeoutMs, signal } = {}) {
+    this.#assertOpen();
+    const stream = new IdbQuiescenceStream(this, encodeAccessibilityQuiescenceRequest(request), { timeoutMs, signal });
+    this.#quietStreams.add(stream);
+    stream.closed.finally(() => this.#quietStreams.delete(stream));
+    stream.start();
+    return stream;
+  }
+
   /** Starts a video stream; iterate it for frames and always `stop()` it. */
   async openVideoStream(options = {}, { signal } = {}) {
     this.#assertOpen();
@@ -1031,14 +1300,25 @@ export class IdbCompanionClient {
     return stream;
   }
 
-  /** The one HID stream of this client, opened on first send. */
+  /** The one HID stream of this client, opened on first send and ended when idle. */
   hid() {
     this.#assertOpen();
-    this.#hid ??= new IdbHidStream(this);
+    this.#hid ??= new IdbHidStream(this, this.#hidOptions);
     return this.#hid;
   }
 
-  /** Stops every video stream (sending Stop), ends the HID stream and closes the session. */
+  /**
+   * The same HID stream in kept-open mode: its call is opened now and resolves once the
+   * request headers are out on a connected session, so the first event pays no connect
+   * cost. See IdbHidStream.open().
+   */
+  async openHid({ timeoutMs } = {}) {
+    const hid = this.hid();
+    await hid.open({ timeoutMs });
+    return hid;
+  }
+
+  /** Stops every video stream (sending Stop), cancels quiet streams, ends the HID stream and closes the session. */
   async close(options) {
     if (this.#closed) return;
     // Refuse new calls from the start, so a stream opened while the open ones are
@@ -1049,6 +1329,7 @@ export class IdbCompanionClient {
 
   async #close({ timeoutMs = STREAM_STOP_TIMEOUT_MS } = {}) {
     const pending = [...this.#videoStreams].map((s) => s.stop({ timeoutMs }));
+    for (const stream of this.#quietStreams) stream.cancel();
     if (this.#hid) pending.push(this.#hid.close({ timeoutMs }));
     await Promise.allSettled(pending);
     this.#closed = true;
@@ -1427,69 +1708,675 @@ export class IdbVideoStream {
   }
 }
 
+/** Events queued on a quiet stream before its HTTP/2 stream is paused (flow control then backs up). */
+const QUIET_QUEUE_HIGH_WATER = 256;
+
+/**
+ * One server-streaming `accessibility_quiescence` call, read as an async iterator of
+ * decoded events (see decodeAccessibilityQuiescenceResponse). The request goes out with
+ * the request side ended, as the reference client sends it. The iterator ends when the
+ * companion finishes the call with status OK (after `target_exited`, for one), rejects
+ * with a GrpcError for any other status (12 for a companion without the method), for a
+ * dropped call (14) or at the deadline (4), and ends quietly after `cancel()`.
+ *
+ * `started` resolves once the companion answered the call with headers or a first event,
+ * and rejects when it ends with an error before that; `closed` always resolves with
+ * `{ error, status, cancelled }`.
+ */
+export class IdbQuiescenceStream {
+  #client;
+  #request;
+  #timeoutMs;
+  #signal;
+  #onAbort = null;
+  #call = null;
+  #timer = null;
+  #queue = [];
+  #waiter = null;
+  #paused = false;
+  #done = false;
+  #error = null;
+  #errorThrown = false;
+  #cancelled = false;
+  #status = null;
+  #startedResolve;
+  #startedReject;
+  #startedSettled = false;
+  #closedResolve;
+  events = 0;
+
+  constructor(client, requestBytes, { timeoutMs, signal } = {}) {
+    if (timeoutMs !== undefined && timeoutMs !== null) requireNumber(timeoutMs, "timeoutMs", { min: 0, exclusiveMin: true });
+    this.#client = client;
+    this.#request = Buffer.from(requestBytes);
+    this.#timeoutMs = timeoutMs ?? null;
+    this.#signal = signal;
+    this.started = new Promise((resolve, reject) => {
+      this.#startedResolve = resolve;
+      this.#startedReject = reject;
+    });
+    // A caller that only iterates never awaits `started`: its rejection is reported there.
+    this.started.catch(() => {});
+    this.closed = new Promise((resolve) => {
+      this.#closedResolve = resolve;
+    });
+  }
+
+  get done() {
+    return this.#done;
+  }
+
+  /** The final gRPC status `{ code, details }`, once the companion sent one. */
+  get status() {
+    return this.#status ? { ...this.#status } : null;
+  }
+
+  start() {
+    if (this.#call || this.#done) throw new Error("Quiet stream already started or closed.");
+    if (this.#signal?.aborted) {
+      this.#finish(abortError(this.#signal));
+      return;
+    }
+    if (this.#signal) {
+      this.#onAbort = () => this.#fail(abortError(this.#signal));
+      this.#signal.addEventListener("abort", this.#onAbort, { once: true });
+    }
+    let call;
+    try {
+      call = this.#client.openCall("accessibility_quiescence", { timeoutMs: this.#timeoutMs ?? undefined });
+    } catch (error) {
+      this.#finish(error);
+      return;
+    }
+    this.#call = call;
+    if (this.#timeoutMs) {
+      // Referenced, as for unary(): the session is unref'd.
+      this.#timer = setTimeout(
+        () => this.#fail(new GrpcError(4, "Deadline exceeded.", { method: "accessibility_quiescence" })),
+        this.#timeoutMs,
+      );
+    }
+    const parser = new GrpcMessageParser();
+    call.on("response", (headers) => {
+      this.#status = grpcStatusFrom(headers) ?? this.#status;
+      if (!this.#status || this.#status.code === 0) this.#markStarted();
+    });
+    call.on("trailers", (trailers) => {
+      this.#status = grpcStatusFrom(trailers) ?? this.#status;
+    });
+    call.on("data", (chunk) => {
+      if (this.#done) return;
+      let messages;
+      try {
+        messages = parser.push(chunk);
+      } catch (error) {
+        this.#fail(error);
+        return;
+      }
+      for (const message of messages) {
+        let event;
+        try {
+          event = decodeAccessibilityQuiescenceResponse(message);
+        } catch (error) {
+          this.#fail(error);
+          return;
+        }
+        this.events += 1;
+        this.#markStarted();
+        this.#push(event);
+      }
+    });
+    call.on("error", (error) => this.#fail(error));
+    const ended = () => {
+      if (this.#done) return;
+      const status = this.#status;
+      if (!status) {
+        this.#finish(new GrpcError(14, "Quiet stream ended without a gRPC status (connection lost).", {
+          method: "accessibility_quiescence",
+        }));
+      } else if (status.code !== 0) {
+        this.#finish(new GrpcError(status.code, status.details, { method: "accessibility_quiescence" }));
+      } else {
+        this.#finish(null);
+      }
+    };
+    call.on("end", ended);
+    call.on("close", ended);
+    call.end(grpcFrame(this.#request));
+  }
+
+  #markStarted() {
+    if (this.#startedSettled) return;
+    this.#startedSettled = true;
+    this.#startedResolve(true);
+  }
+
+  #push(event) {
+    if (this.#waiter) {
+      const { resolve } = this.#waiter;
+      this.#waiter = null;
+      resolve({ value: event, done: false });
+      return;
+    }
+    this.#queue.push(event);
+    if (this.#queue.length >= QUIET_QUEUE_HIGH_WATER && !this.#paused && this.#call) {
+      this.#paused = true;
+      this.#call.pause();
+    }
+  }
+
+  /** An error on our side or a deadline: the call is cancelled, the iterator rejects. */
+  #fail(error) {
+    if (this.#done) return;
+    this.#finish(error);
+  }
+
+  #finish(error) {
+    if (this.#done) return;
+    this.#done = true;
+    clearTimeout(this.#timer);
+    if (this.#onAbort) this.#signal?.removeEventListener("abort", this.#onAbort);
+    if (error) this.#error ??= error;
+    const call = this.#call;
+    this.#call = null;
+    // Cancel a call still running on our side (error, deadline, cancel()); one the
+    // companion finished with status OK is just released.
+    if (call && !call.destroyed) call.close(this.#error || this.#cancelled ? http2.constants.NGHTTP2_CANCEL : undefined);
+    if (!this.#startedSettled) {
+      this.#startedSettled = true;
+      if (this.#error) this.#startedReject(this.#error);
+      else this.#startedResolve(!this.#cancelled);
+    }
+    if (this.#waiter) {
+      const { resolve, reject } = this.#waiter;
+      this.#waiter = null;
+      if (this.#error && this.#queue.length === 0) reject(this.#error);
+      else resolve({ value: undefined, done: true });
+    }
+    this.#closedResolve({ error: this.#error, status: this.status, cancelled: this.#cancelled });
+  }
+
+  /** Cancels the call (RST_STREAM CANCEL); the iterator ends without an error. Safe to repeat. */
+  cancel() {
+    if (this.#done) return;
+    this.#cancelled = true;
+    this.#finish(null);
+  }
+
+  next() {
+    if (this.#queue.length > 0) {
+      const value = this.#queue.shift();
+      if (this.#paused && this.#queue.length < QUIET_QUEUE_HIGH_WATER / 2 && this.#call) {
+        this.#paused = false;
+        this.#call.resume();
+      }
+      return Promise.resolve({ value, done: false });
+    }
+    if (this.#done) {
+      if (this.#error && !this.#errorThrown) {
+        this.#errorThrown = true;
+        return Promise.reject(this.#error);
+      }
+      return Promise.resolve({ value: undefined, done: true });
+    }
+    if (this.#waiter) return Promise.reject(new Error("Only one pending read is allowed."));
+    return new Promise((resolve, reject) => {
+      this.#waiter = {
+        resolve,
+        reject: (error) => {
+          this.#errorThrown = true;
+          reject(error);
+        },
+      };
+    });
+  }
+
+  async return() {
+    this.cancel();
+    this.#queue.length = 0;
+    return { value: undefined, done: true };
+  }
+
+  async throw(error) {
+    this.cancel();
+    throw error;
+  }
+
+  [Symbol.asyncIterator]() {
+    return this;
+  }
+}
+
+/**
+ * Events of ended HID calls that the companion did not confirm with its OK status: the
+ * call was cancelled at the safety limit (`closeWaitMs`) or by close(), failed, or its
+ * session was lost before the companion served it. They may not have been performed.
+ */
+export class HidUnconfirmedError extends Error {
+  constructor(events, cause = null) {
+    const what = events === 1 ? "1 HID event was" : `${events} HID events were`;
+    super(`${what} sent but not confirmed by idb_companion${cause?.message ? ` (${cause.message})` : ""}; `
+      + `${events === 1 ? "it" : "they"} may not have been performed.`);
+    this.name = "HidUnconfirmedError";
+    this.code = "hid_unconfirmed";
+    this.events = events;
+    this.cause = cause;
+  }
+}
+
 /**
  * The `hid` client stream. Events go out on one open call; after the call ends or
  * fails, the next event opens a new one. Touch points are logical points.
+ *
+ * idb_companion serves one `hid` call at a time: while one call is open, every other
+ * client's `hid` call (another gRPC session, or an `idb ui text`/`idb ui key` process)
+ * waits until it ends, and none of its events are read meanwhile. So a call never stays
+ * open while idle: `idleCloseMs` (default HID_IDLE_CLOSE_MS) after the last event was
+ * written, with no press held down, the stream ends the call cleanly (half-close, no
+ * `drop`), and the next send or open() opens a new one. While a touch, button or key is
+ * held down the window is `heldIdleCloseMs` (default HID_HELD_IDLE_CLOSE_MS), so a down
+ * and its up stay on one call unless the press is left without an event that long.
+ * Events sent while an ended call is still closing wait for that call to close and then
+ * go out on the new call in send order. `idleCloseMs: 0` keeps a call open until close()
+ * (the old behaviour).
+ *
+ * An ended call that carried events waits for the companion's status for as long as the
+ * companion takes to serve it, up to `closeWaitMs` (default HID_CLOSE_WAIT_MS): while
+ * another client holds the companion's call, this call's events are written but not read
+ * yet, and cancelling it would throw them away although send() already resolved. A call
+ * that closes without status OK after it carried events (cancelled at the limit or by
+ * close(), failed, or its session lost) emits `lost` with `{ call, events, error }`;
+ * `lostEvents` counts them. flush() ends the current call at once and resolves when the
+ * companion confirmed every event sent so far, or rejects with HidUnconfirmedError.
+ * cancel() gives up at once on every call not confirmed yet (its owner's own deadline):
+ * they are cancelled, their events reported lost, sends still waiting are refused, and
+ * the stream stays usable.
+ *
+ * Kept-open mode (`open()`, or `client.openHid()`): the call is opened before any event,
+ * so the first event pays no connect cost; it too ends after the idle window. When the
+ * companion ends or drops an open call other than through close(), flush() or an idle
+ * close, the stream emits `drop` with `{ error, status, call }` (error null for a clean
+ * status OK) so its owner learns of it at once rather than on the next send; the next
+ * send or open() opens a new call. An idle close (and a flush) emits `idle_close` with
+ * `{ call }`.
  */
-export class IdbHidStream {
+export class IdbHidStream extends EventEmitter {
   #client;
   #call = null;
   #closed = false;
+  #idleCloseMs;
+  #heldIdleCloseMs;
+  #closeWaitMs;
+  #idleTimer = null;
+  /** Bumped by cancel(): a send queued before it is refused, never written later. */
+  #generation = 0;
+  /** Writes handed to the current call whose callback has not run yet. */
+  #writing = 0;
+  /** Sends waiting for an ended call to finish closing. */
+  #queued = 0;
+  /** Resolves once the call being ended has closed (or was cancelled); null when none. */
+  #ending = null;
+  /** The call being ended, until it closes. */
+  #endingCall = null;
+  #tail = Promise.resolve();
+  /** The last write handed to a call, settled either way. */
+  #lastWrite = Promise.resolve();
+  /** Records of calls that carried events and have not closed yet. */
+  #unsettled = new Set();
+  /** Events lost since the last flush(), and the cause of the latest loss. */
+  #lostUnreported = 0;
+  #lostError = null;
+  /** Presses held down: "touch", "button:<name>", "key:<code>". */
+  #held = new Set();
   lastError = null;
   sent = 0;
+  /** Calls opened so far. */
+  calls = 0;
+  /** Calls this stream ended because they were idle (or flushed). */
+  idleCloses = 0;
+  /** Events on calls that closed without the companion's OK status (see `lost`). */
+  lostEvents = 0;
+  /** True once open() asked for kept-open mode. */
+  keepOpen = false;
 
-  constructor(client) {
+  /**
+   * @param {object} client An IdbCompanionClient (anything with `openCall("hid")`).
+   * @param {object} [options]
+   * @param {number} [options.idleCloseMs] Idle window before the call ends; 0 = never.
+   * @param {number} [options.heldIdleCloseMs] The same window while a press is held down.
+   * @param {number} [options.closeWaitMs] Safety limit an ended call with events waits for its status.
+   */
+  constructor(client, {
+    idleCloseMs = HID_IDLE_CLOSE_MS, heldIdleCloseMs = HID_HELD_IDLE_CLOSE_MS, closeWaitMs = HID_CLOSE_WAIT_MS,
+  } = {}) {
+    super();
     this.#client = client;
+    this.#idleCloseMs = nonNegativeMs(idleCloseMs, "idleCloseMs");
+    this.#heldIdleCloseMs = Math.max(this.#idleCloseMs, nonNegativeMs(heldIdleCloseMs, "heldIdleCloseMs"));
+    this.#closeWaitMs = nonNegativeMs(closeWaitMs, "closeWaitMs");
+  }
+
+  /** True while a call is open for writing. */
+  get isOpen() {
+    const call = this.#call;
+    return Boolean(call) && !call.destroyed && call.writable;
+  }
+
+  /** The idle window in ms (0: calls stay open until close()). */
+  get idleCloseMs() {
+    return this.#idleCloseMs;
+  }
+
+  /** The safety limit an ended call with events waits for the companion's status. */
+  get closeWaitMs() {
+    return this.#closeWaitMs;
+  }
+
+  /** Events sent on calls that have not been confirmed or lost yet. */
+  get unconfirmed() {
+    let events = 0;
+    for (const record of this.#unsettled) events += record.events;
+    return events;
   }
 
   #open() {
     const call = this.#client.openCall("hid");
+    const number = ++this.calls;
+    const record = { number, events: 0, status: null, error: null };
+    record.settled = new Promise((resolve) => {
+      record.resolve = resolve;
+    });
+    call.hidRecord = record;
+    let callError = null;
     call.on("error", (error) => {
+      callError ??= error;
       this.lastError = error;
-      if (this.#call === call) this.#call = null;
+      if (this.#call === call) this.#forget(call);
+    });
+    call.on("response", (headers) => {
+      record.status = grpcStatusFrom(headers) ?? record.status;
+      const status = record.status;
+      if (status && status.code !== 0) this.lastError = new GrpcError(status.code, status.details, { method: "hid" });
     });
     call.on("trailers", (trailers) => {
-      const status = grpcStatusFrom(trailers);
+      record.status = grpcStatusFrom(trailers) ?? record.status;
+      const status = record.status;
       if (status && status.code !== 0) this.lastError = new GrpcError(status.code, status.details, { method: "hid" });
     });
     call.on("close", () => {
-      if (this.#call === call) this.#call = null;
+      if (this.#call === call) this.#forget(call);
+      if (this.#endingCall === call) this.#endingCall = null;
+      // close(), flush() and an idle close end the call on purpose; only an end the owner
+      // did not ask for is a drop.
+      if (!this.#closed && !call.idleClosed) {
+        const status = record.status;
+        let error = callError;
+        if (!error && !status) error = new GrpcError(14, "HID stream ended without a gRPC status (connection lost).", { method: "hid" });
+        if (!error && status.code !== 0) error = new GrpcError(status.code, status.details, { method: "hid" });
+        this.emit("drop", { error, status: status ? { ...status } : null, call: number });
+      }
+      this.#settle(record, callError);
     });
     call.on("end", () => {
       // The companion finished the call; the next event opens a new one.
-      if (this.#call === call) this.#call = null;
+      if (this.#call === call) this.#forget(call);
       if (!call.destroyed && call.writable) call.end();
     });
     // HIDResponse is empty; drain it so the call can close.
     call.on("data", () => {});
     this.#call = call;
+    this.#writing = 0;
     return call;
+  }
+
+  /**
+   * A call closed: its events are confirmed by status OK (the companion reads the call to
+   * its end before it answers), and lost otherwise.
+   */
+  #settle(record, callError) {
+    this.#unsettled.delete(record);
+    const confirmed = record.status?.code === 0 && !record.error;
+    let error = null;
+    if (!confirmed && record.events > 0) {
+      const status = record.status;
+      error = record.error ?? callError
+        ?? (status && status.code !== 0 ? new GrpcError(status.code, status.details, { method: "hid" }) : null)
+        ?? new GrpcError(14, "HID call closed without a gRPC status (connection lost).", { method: "hid" });
+      if (record.error) this.lastError = record.error;
+      else this.lastError ??= error;
+      this.lostEvents += record.events;
+      this.#lostUnreported += record.events;
+      this.#lostError = error;
+      this.emit("lost", { call: record.number, events: record.events, error });
+    }
+    record.resolve({ confirmed: confirmed || record.events === 0, events: record.events, error });
+  }
+
+  /** The current call is gone: nothing to idle-close any more. */
+  #forget(call) {
+    if (this.#call !== call) return;
+    this.#call = null;
+    this.#writing = 0;
+    this.#clearIdle();
+  }
+
+  #clearIdle() {
+    clearTimeout(this.#idleTimer);
+    this.#idleTimer = null;
+  }
+
+  /** Arms the idle close once nothing is being written or waiting to be. */
+  #armIdle() {
+    this.#clearIdle();
+    if (!this.#idleCloseMs || this.#closed || this.#writing > 0 || this.#queued > 0) return;
+    const call = this.#call;
+    if (!call || call.destroyed || !call.writable) return;
+    const ms = this.#held.size > 0 ? this.#heldIdleCloseMs : this.#idleCloseMs;
+    this.#idleTimer = setTimeout(() => {
+      this.#idleTimer = null;
+      if (this.#call !== call || this.#writing > 0 || this.#queued > 0 || this.#closed) return;
+      this.#idleClose(call);
+    }, ms);
+    this.#idleTimer.unref?.();
+  }
+
+  /**
+   * Ends a call cleanly: half-close, then wait for the companion's status. Sends that
+   * arrive meanwhile wait for the close, so the companion, which serves one call at a
+   * time, gets every event in send order. A call that carried events is never cancelled
+   * on a short timer: it may not have been served yet (another client holds the
+   * companion's call), and a cancel would throw its events away. It waits up to
+   * `closeWaitMs`; at that limit it is cancelled and its events reported as lost.
+   */
+  #idleClose(call) {
+    this.#forget(call);
+    call.idleClosed = true;
+    this.idleCloses += 1;
+    // A press still held after its (longer) window was left without its up: the next
+    // call starts with nothing held, so it gets the short window again.
+    this.#held.clear();
+    const record = call.hidRecord;
+    const closed = new Promise((resolve) => {
+      if (call.destroyed) resolve();
+      else call.once("close", resolve);
+    });
+    if (call.writable) call.end();
+    // With no event on it a cancel loses nothing: the short stop timeout is enough.
+    const limit = record && record.events > 0 ? this.#closeWaitMs : STREAM_STOP_TIMEOUT_MS;
+    const ending = withTimeout(closed, limit).then(async ({ timedOut }) => {
+      if (!timedOut || call.destroyed) return;
+      if (record && record.events > 0) {
+        record.error ??= new GrpcError(4, `the HID call was not served within ${limit} ms `
+          + "(another client may hold the companion's hid call), so it was cancelled", { method: "hid" });
+      }
+      call.close(http2.constants.NGHTTP2_CANCEL);
+      await withTimeout(closed, STREAM_STOP_TIMEOUT_MS);
+    });
+    this.#endingCall = call;
+    this.#ending = ending;
+    this.#tail = ending;
+    ending.then(() => {
+      if (this.#ending === ending) this.#ending = null;
+    });
+    // Last, so a send from a listener already waits for this call to close.
+    this.emit("idle_close", { call: record?.number ?? this.calls });
+  }
+
+  /**
+   * Kept-open mode: opens the call now when none is open, and resolves once its request
+   * headers are out on a connected session (the stream has its id). Rejects when the
+   * call fails or closes first, and with GrpcError code 4 when that takes longer than
+   * `timeoutMs` (the call is cancelled then). Calling it on an open call is a no-op.
+   */
+  async open({ timeoutMs = UNARY_TIMEOUT_MS } = {}) {
+    if (this.#closed) throw new Error("HID stream is closed.");
+    this.keepOpen = true;
+    // An ended call still closing, or sends waiting for it: open after them.
+    while (this.#ending || this.#queued > 0) await this.#tail;
+    if (this.#closed) throw new Error("HID stream is closed.");
+    let call = this.#call;
+    if (!call || call.destroyed || !call.writable) call = this.#open();
+    if (!call.pending) {
+      if (this.#writing === 0) this.#armIdle();
+      return;
+    }
+    let cleanup = () => {};
+    const ready = new Promise((resolve, reject) => {
+      const onReady = () => {
+        cleanup();
+        resolve();
+      };
+      const onGone = (error) => {
+        cleanup();
+        reject(error ?? this.lastError ?? new GrpcError(14, "HID stream closed before it was open.", { method: "hid" }));
+      };
+      const onError = (error) => onGone(error);
+      const onClose = () => onGone(null);
+      cleanup = () => {
+        call.off("ready", onReady);
+        call.off("error", onError);
+        call.off("close", onClose);
+      };
+      call.once("ready", onReady);
+      call.once("error", onError);
+      call.once("close", onClose);
+    });
+    ready.catch(() => {});
+    const { timedOut } = await withTimeout(ready, timeoutMs);
+    if (timedOut) {
+      cleanup();
+      if (this.#call === call) this.#forget(call);
+      if (!call.destroyed) call.close(http2.constants.NGHTTP2_CANCEL);
+      throw new GrpcError(4, "HID stream was not open within the deadline.", { method: "hid" });
+    }
+    // Opened with no event: it must not stay open while idle either.
+    if (this.#call === call && this.#writing === 0) this.#armIdle();
   }
 
   /** Sends one HID event (see encodeHidEvent); resolves once it is written. */
   send(event) {
     if (this.#closed) return Promise.reject(new Error("HID stream is closed."));
     let frame;
-    let call;
     try {
       frame = grpcFrame(encodeHidEvent(event));
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    this.#clearIdle();
+    this.#track(event);
+    if (!this.#ending && this.#queued === 0) return this.#write(frame);
+    // An ended call is closing: go out on the next call, after every earlier send.
+    this.#queued += 1;
+    const generation = this.#generation;
+    const run = this.#tail.then(() => {
+      this.#queued -= 1;
+      if (generation !== this.#generation) throw new Error("HID send cancelled before it was written.");
+      return this.#write(frame);
+    });
+    this.#tail = run.then(() => {}, () => {});
+    return run;
+  }
+
+  /**
+   * Ends the current call now, as an idle close does (a press still held is let go of),
+   * and resolves once the companion confirmed every event sent so far with status OK:
+   * the companion reads a call to its end before it answers, so they were performed.
+   * While another client holds the companion's hid call this waits, up to `closeWaitMs`
+   * per call. Rejects with HidUnconfirmedError when events sent since the last flush()
+   * were lost (the limit was hit, a call failed, the session was lost, or close() cut a
+   * call short); the count is then reset.
+   */
+  async flush() {
+    // Every send handed over so far is written first.
+    for (;;) {
+      if (this.#queued > 0) await this.#tail;
+      else if (this.#writing > 0) await this.#lastWrite;
+      else break;
+    }
+    const call = this.#call;
+    if (call && !call.destroyed && call.writable) {
+      this.#clearIdle();
+      this.#idleClose(call);
+    }
+    await Promise.all([...this.#unsettled].map((record) => record.settled));
+    const lost = this.#lostUnreported;
+    if (lost > 0) {
+      const error = new HidUnconfirmedError(lost, this.#lostError);
+      this.#lostUnreported = 0;
+      this.#lostError = null;
+      throw error;
+    }
+  }
+
+  /** Remembers which presses are held down, for the idle window. */
+  #track(event) {
+    const direction = event?.direction;
+    if (direction === undefined || direction === null) return;
+    let key = null;
+    if (event.touch) key = "touch";
+    else if (event.button !== undefined && event.button !== null) key = `button:${String(event.button).toUpperCase()}`;
+    else if (event.key !== undefined && event.key !== null) key = `key:${event.key}`;
+    if (!key) return;
+    const down = direction === HID_DIRECTION.DOWN || String(direction).toLowerCase() === "down";
+    if (down) this.#held.add(key);
+    else this.#held.delete(key);
+  }
+
+  #write(frame) {
+    if (this.#closed) return Promise.reject(new Error("HID stream is closed."));
+    let call;
+    try {
       call = this.#call;
       if (!call || call.destroyed || !call.writable) call = this.#open();
     } catch (error) {
       return Promise.reject(error);
     }
-    return new Promise((resolve, reject) => {
+    this.#clearIdle();
+    this.#writing += 1;
+    // Unconfirmed from the moment the call has it, until the call's status.
+    const record = call.hidRecord;
+    if (record) {
+      record.events += 1;
+      this.#unsettled.add(record);
+    }
+    const written = new Promise((resolve, reject) => {
       call.write(frame, (error) => {
+        if (this.#call === call) this.#writing = Math.max(0, this.#writing - 1);
         if (error) {
+          // The sender learns of this one from the rejection.
+          if (record) record.events = Math.max(0, record.events - 1);
           this.lastError = error;
-          if (this.#call === call) this.#call = null;
+          if (this.#call === call) this.#forget(call);
           reject(error);
         } else {
           this.sent += 1;
+          if (this.#call === call && this.#writing === 0) this.#armIdle();
           resolve();
         }
       });
     });
+    this.#lastWrite = written.then(() => {}, () => {});
+    return written;
   }
 
   touchDown(x, y) {
@@ -1536,16 +2423,69 @@ export class IdbHidStream {
     return this.send({ key: keycode, direction: "up" });
   }
 
+  /**
+   * Refuses new sends, ends the open call and the one still being ended (an idle close or
+   * a flush in progress), and waits up to `timeoutMs` for their status; a call not done by
+   * then is cancelled, and its events, if any, are reported as lost.
+   */
   async close({ timeoutMs = STREAM_STOP_TIMEOUT_MS } = {}) {
     this.#closed = true;
-    const call = this.#call;
+    this.#clearIdle();
+    const calls = [this.#endingCall, this.#call].filter((call) => call && !call.destroyed);
+    const ending = this.#ending;
     this.#call = null;
-    if (!call || call.destroyed) return;
-    const ended = new Promise((resolve) => call.once("close", resolve));
+    this.#writing = 0;
+    await Promise.all(calls.map((call) => this.#endCall(call, timeoutMs)));
+    if (ending) await ending;
+  }
+
+  /**
+   * Gives up now on every call not confirmed yet, the open one and the one being ended:
+   * each is cancelled (a call the companion has not read yet is then never performed)
+   * and its events reported lost (`lost`, flush() rejects with HidUnconfirmedError);
+   * sends still waiting for an ended call are refused. Unlike close() the stream stays
+   * usable: the next send opens a new call. Resolves once those calls closed.
+   */
+  async cancel(reason = "its owner's deadline passed") {
+    this.#generation += 1;
+    this.#clearIdle();
+    this.#held.clear();
+    const current = this.#call;
+    if (current) {
+      // Ended on purpose: not a drop.
+      current.idleClosed = true;
+      this.#forget(current);
+    }
+    const calls = [this.#endingCall, current].filter((call) => call && !call.destroyed);
+    const ending = this.#ending;
+    await Promise.all(calls.map((call) => this.#endCall(call, 0, reason)));
+    if (ending) await ending;
+  }
+
+  async #endCall(call, timeoutMs, reason = null) {
+    const ended = new Promise((resolve) => {
+      if (call.destroyed) resolve();
+      else call.once("close", resolve);
+    });
     if (call.writable) call.end();
     const { timedOut } = await withTimeout(ended, timeoutMs);
-    if (timedOut && !call.destroyed) call.close(http2.constants.NGHTTP2_CANCEL);
+    if (!timedOut || call.destroyed) return;
+    const record = call.hidRecord;
+    if (record && record.events > 0) {
+      record.error ??= new GrpcError(4, reason
+        ? `the HID call was cancelled before idb_companion confirmed it: ${reason}`
+        : `the HID stream was closed before idb_companion confirmed the call within ${timeoutMs} ms, `
+          + "so it was cancelled", { method: "hid" });
+    }
+    call.close(http2.constants.NGHTTP2_CANCEL);
+    await withTimeout(ended, STREAM_STOP_TIMEOUT_MS);
   }
+}
+
+function nonNegativeMs(value, name) {
+  const ms = Number(value);
+  if (!Number.isFinite(ms) || ms < 0) throw new RangeError(`${name} must be a non-negative number of milliseconds.`);
+  return ms;
 }
 
 // ---------------------------------------------------------------------------
