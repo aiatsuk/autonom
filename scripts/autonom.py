@@ -1779,16 +1779,25 @@ def cmd_ui_swipe(args: argparse.Namespace) -> int:
 
 
 def cmd_ui_gesture(args: argparse.Namespace) -> int:
-    target = _target(args)
-    kwargs: dict[str, Any] = {}
     if args.gesture == "pinch":
+        from autonom_lib import pinch as pinch_mod
+
         if args.at is None:
             raise errors.AutonomError(
                 errors.INVALID_COORDINATES, "pinch requires --at X,Y", "Example: --at 200,400"
             )
         x, y = _point(args.at, "--at")
-        kwargs = {"x": x, "y": y, "scale": args.scale}
-    ui_mod.gesture(target, args.gesture, **kwargs)
+        pinch_mod.check_values(args.scale, args.duration)
+        plan = _ObservePlan(args)
+        target = _target(args)
+        plan.resolve(target)
+        metadata = ui_mod.pinch(target, x, y, scale=args.scale, duration=args.duration)
+        payload = {"ok": True, "gesture": "pinch", "at": [x, y], "scale": args.scale,
+                   "duration": args.duration, **metadata, **target.identity()}
+        plan.into(payload, target, "ui pinch")
+        return emit(payload, as_json=True)
+    target = _target(args)
+    ui_mod.gesture(target, args.gesture)
     return emit({"ok": True, "gesture": args.gesture, **target.identity()}, as_json=True)
 
 
@@ -7019,14 +7028,18 @@ def build_parser() -> argparse.ArgumentParser:
     _add_observe_flags(p)
     p.set_defaults(func=cmd_ui_swipe)
 
-    # Only pinch takes an anchor and a scale; `idb ui rotate|shake` accept
-    # neither, and offering the flags there advertised an argument that was
-    # parsed, ignored, and never reached the device.
+    # Rotate and shake remain unsupported; only pinch takes these arguments.
     for name in ("pinch", "rotate", "shake"):
-        p = ui_sub.add_parser(name, help=f"{name} gesture (no backend: refused on Android and iOS)", parents=[target_flags])
+        help_text = ("two-finger pinch (Android scrcpy or iOS idb HID)" if name == "pinch"
+                     else f"{name} gesture (no backend: refused on Android and iOS)")
+        p = ui_sub.add_parser(name, help=help_text, parents=[target_flags])
         if name == "pinch":
-            p.add_argument("--at", metavar="X,Y", help="anchor point")
-            p.add_argument("--scale", type=float, default=2.0)
+            p.add_argument("--at", metavar="X,Y", help="center: Android pixels, iOS points")
+            p.add_argument("--scale", type=float, default=2.0,
+                           help="final finger separation / initial separation (0.1 to 10; default 2)")
+            p.add_argument("--duration", type=float, default=0.4, metavar="SECONDS",
+                           help="gesture duration in seconds (0.1 to 2; default 0.4)")
+            _add_observe_flags(p)
         p.set_defaults(func=cmd_ui_gesture, gesture=name)
 
     p = ui_sub.add_parser("type", help="type text into the focused field", parents=[target_flags])

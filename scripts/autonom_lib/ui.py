@@ -960,6 +960,33 @@ def press_key(target: Target, key: str) -> str:
     return _ios().press_key(target, key)
 
 
+def pinch(target: Target, x: int, y: int, *, scale: float, duration: float) -> dict[str, Any]:
+    """Send one guarded pinch in Android pixels or iOS points."""
+    from . import pinch as pinch_mod
+
+    pinch_mod.check_values(scale, duration)
+    size = screen_size(target)
+    if not size or min(size) <= 0:
+        raise errors.AutonomError(
+            errors.DISPLAY_GEOMETRY_UNAVAILABLE, "Could not measure the screen for pinch",
+            "Read the device's screen geometry and retry; no input was sent.")
+    width, height = size
+    radius = pinch_mod.radius_for(x, y, width, height, scale)
+    if target.platform == IOS:
+        ios = _ios()
+        if ios.selected_backend(target) == "xcuitest" or ios.hid_mode(target) == "axe":
+            raise errors.AutonomError(
+                errors.UNSUPPORTED_CAPABILITY, "pinch requires the iOS idb HID backend",
+                "Use --ui-backend idb --ios-hid idb and a compatible idb_companion; "
+                "AXe and the XCUITest runner do not provide this pinch path.",
+                capability="ui.pinch")
+    _pretest_guard("gesture", target)
+    _sending(target)
+    backend = pinch_mod.dispatch(target, x=x, y=y, scale=scale, duration=duration,
+                                 radius=radius, width=width, height=height)
+    return {"backend": backend, "radius": radius}
+
+
 def gesture(target: Target, name: str, **kwargs: Any) -> None:
     """Gestures Android's `input` cannot express are refused, not faked."""
     if target.platform == ANDROID:
