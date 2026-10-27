@@ -1,3 +1,4 @@
+import { prepareHostVideo, CaptureDecorations } from "./host-video.mjs";
 /** One device's transports, input, authentication and lifecycle inside the Canvas. */
 import { mkdtempSync, rmSync } from "node:fs";
 import {
@@ -437,7 +438,8 @@ async function closeDevice(context) {
   // The tools process and the log feed go with it: no orphans. A held control lease is
   // handed back first, through the bridge, while it still runs (bounded, 6.4).
   await Promise.race([
-    Promise.all([releaseLeaseOnClose(context), stopSession(context), restoreDisplay(context),
+    Promise.all([releaseLeaseOnClose(context),
+      stopSession(context).then(() => context.hostDecorations?.restore()), restoreDisplay(context),
       restoreDeviceRotation(context), context.tools.close()]),
     sleep(SHUTDOWN_STOP_MS),
   ]);
@@ -880,15 +882,23 @@ function fallbackReason(context) {
 }
 
 async function sendStatus(context, response) {
-  const [measured] = await Promise.all([
-    // A bound session that stopped refuses the measure (contract 4.2); /status still answers,
-    // so the page can show the device as stopped.
-    iosStreamDisplay(context) ?? context.actionBridge.call("screen-size", {}, "system").catch((error) => {
+  // Android already shares a bounded-age wm reading between page polls and the
+  // display watcher. Asking the bridge as well runs another wm size + dumpsys
+  // input for every client poll, only to discard that result in displayStatus().
+  // Keep the bridge fallback when wm failed, and the existing iOS fast path.
+  // The bound session is independently refreshed below for session_stopped.
+  await freshDisplay(context);
+  // wm reports natural orientation. Keep the bridge's rotated input dimensions
+  // when the video is rotated (or no stream metadata can confirm orientation).
+  const wm = context.displayWm, videoSize = context.video.size;
+  const reuseWm = context.options.platform === "android" && wm && videoSize &&
+    (wm.width > wm.height) === (videoSize.width > videoSize.height);
+  const measured = reuseWm
+    ? { display: { width: wm.width, height: wm.height } }
+    : iosStreamDisplay(context) ?? await context.actionBridge.call("screen-size", {}, "system").catch((error) => {
       if (!error.errorCode) throw error;
       return { display: null };
-    }),
-    freshDisplay(context),
-  ]);
+    });
   if (measured.display) context.display = measured.display;
   const transport = chooseTransport(context);
   sendJson(response, 200, {
@@ -976,11 +986,14 @@ function scrcpyStatus(context) {
     // The size asked of scrcpy-server (0 is native) and why: "explicit" (--max-size),
     // "encoder" (the encoder named) or "default" (the encoders could not be read); all
     // null until the first session has chosen, and while scrcpy is not the transport.
-    max_size: scrcpySize?.maxSize ?? null,
+    max_size: stats?.maxSize ?? scrcpySize?.maxSize ?? null,
     max_fps: stats?.maxFps ?? null,
+    video_backend: stats?.videoBackend ?? "android",
+    host_fallback: stats?.hostFallback ?? null,
+    host_capture: stats?.hostCapture ?? null,
     max_size_source: scrcpySize?.source ?? null,
-    encoder: scrcpySize?.encoder ?? null,
-    encoder_name: scrcpySize?.encoderName ?? null,
+    encoder: stats?.videoBackend === "videotoolbox" ? "hardware" : scrcpySize?.encoder ?? null,
+    encoder_name: stats?.videoBackend === "videotoolbox" ? "VideoToolbox" : scrcpySize?.encoderName ?? null,
     width: context.video.size?.width ?? null,
     height: context.video.size?.height ?? null,
     packets: stats?.packets ?? 0,
@@ -1920,6 +1933,10 @@ function ensureSession(context) {
       },
     })
     : new ScrcpySession({
+      hostFactory: opts => prepareHostVideo({ ...opts,
+        decorations: context.hostDecorations ??= new CaptureDecorations(),
+        orientation: async () => { context.hostRotation = await currentDeviceRotation(context); },
+        geometry: () => context.displayWm ? { ...context.displayWm, rotation: context.hostRotation } : null }),
       adbPath,
       serial,
       serverPath: scrcpy.serverPath,
@@ -3508,6 +3525,7 @@ async function changeDeviceRotation(context, client) {
       if (context.shuttingDown) throw inputError(503, "Canvas is stopping");
       if (await currentDeviceRotation(context) === rotation) {
         if (context.shuttingDown) throw inputError(503, "Canvas is stopping");
+        context.hostRotation = rotation;
         journal(context, client, { kind: "system", op: "rotate" });
         return { rotation };
       }
@@ -4683,6 +4701,7 @@ async function changeDisplay(context, preset, origin, client) {
       await context.displayChrome.apply(preset.id, () => {
         if (context.shuttingDown) throw new Error("Canvas is stopping");
       });
+      await context.hostDecorations?.refresh();
     } catch (error) {
       const failures = [`Display artwork: ${adbFailure(error)}`];
       try { await context.displayChrome.restore(); }

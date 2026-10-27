@@ -286,6 +286,8 @@ export class ScrcpySession extends EventEmitter {
   #deviceName = null;
   #maxSize = null;
   #maxFps = null;
+  #hostDisabled = false;
+  #hostFallback = null;
 
   constructor({
     adbPath,
@@ -300,9 +302,10 @@ export class ScrcpySession extends EventEmitter {
     exec = defaultExec,
     spawn = nodeSpawn,
     connect = nodeConnect,
+    hostFactory = null,
   }) {
     super();
-    this.#options = { adbPath, serial, serverPath, version, maxSize, chooseMaxSize, chooseMaxFps, bitRate, maxFps };
+    this.#options = { adbPath, serial, serverPath, version, maxSize, chooseMaxSize, chooseMaxFps, bitRate, maxFps, hostFactory };
     this.#exec = exec;
     this.#spawn = spawn;
     this.#connect = connect;
@@ -324,6 +327,9 @@ export class ScrcpySession extends EventEmitter {
   get stats() {
     return {
       state: this.#state,
+      videoBackend: this.#attempt?.host ? "videotoolbox" : "android",
+      hostFallback: this.#hostFallback,
+      hostCapture: this.#attempt?.host?.stats ?? null,
       maxSize: this.#maxSize,
       maxFps: this.#maxFps,
       width: this.#size?.width ?? null,
@@ -406,7 +412,8 @@ export class ScrcpySession extends EventEmitter {
 
   #sendKeyFrameRequest() {
     this.#keyFrameSentAt = performance.now();
-    this.#attempt.control.write(encodeEmpty(CONTROL_MESSAGE_TYPE.RESET_VIDEO));
+    if (this.#attempt.host) this.#attempt.host.requestKeyFrame();
+    else this.#attempt.control.write(encodeEmpty(CONTROL_MESSAGE_TYPE.RESET_VIDEO));
   }
 
   #adb(args, timeout) {
@@ -433,6 +440,8 @@ export class ScrcpySession extends EventEmitter {
       await this.#open(attempt);
     } catch (error) {
       this.#fail(attempt, error);
+      // A failed host attempt retries once through the normal Android encoder.
+      if (attempt.hostStart && !this.#stopped) return false;
       throw error;
     }
     return true;
@@ -450,6 +459,19 @@ export class ScrcpySession extends EventEmitter {
       if (chooseMaxSize) maxSize = chooseMaxSize(encoders);
       if (chooseMaxFps) maxFps = chooseMaxFps(encoders);
     }
+    if (!this.#hostDisabled && this.#options.hostFactory) {
+      try {
+        attempt.hostStart = await this.#options.hostFactory({
+          serial: this.#options.serial, adbPath: this.#options.adbPath,
+          maxSize, maxFps: this.#options.maxFps, bitRate,
+        });
+      } catch {
+        this.#hostDisabled = true;
+        this.#hostFallback = "Host capture preparation failed; using Android encoder";
+      }
+      this.#checkAttempt(attempt);
+    }
+    if (attempt.hostStart) maxFps = this.#options.maxFps;
     this.#maxSize = maxSize;
     this.#maxFps = maxFps;
     // A teardown that starts while adb is still answering waits for this to remove the forward.
@@ -459,7 +481,7 @@ export class ScrcpySession extends EventEmitter {
 
     const { adbPath, serial } = this.#options;
     const child = this.#spawn(adbPath, [
-      "-s", serial, "shell", serverCommand({ version, scid: attempt.scid, maxSize, bitRate, maxFps }),
+      "-s", serial, "shell", serverCommand({ version, scid: attempt.scid, maxSize, bitRate, maxFps }) + (attempt.hostStart ? " video=false" : ""),
     ], { stdio: ["ignore", "pipe", "pipe"] });
     attempt.child = child;
     const keepLog = (chunk) => {
@@ -485,11 +507,45 @@ export class ScrcpySession extends EventEmitter {
     });
 
     const { socket: video, rest } = await this.#connectVideo(attempt);
+    if (attempt.hostStart) {
+      attempt.control = this.#adopt(attempt, video);
+      await this.#controlMetadata(attempt, rest);
+      this.#checkAttempt(attempt);
+      this.#readControl(attempt);
+      video.resume();
+      attempt.host = attempt.hostStart();
+      attempt.video = attempt.host.stdout;
+      await this.#readVideo(attempt, EMPTY);
+      return;
+    }
     attempt.video = this.#adopt(attempt, video);
     // The server accepts the control socket right after the video one, then sends meta.
     attempt.control = this.#adopt(attempt, await this.#connectSocket(attempt, CONNECT_ATTEMPT_MS));
     this.#readControl(attempt);
     await this.#readVideo(attempt, rest);
+  }
+
+  // With video=false scrcpy puts its device name on the sole control socket.
+  #controlMetadata(attempt, rest) {
+    const socket = attempt.control;
+    return new Promise((resolvePromise, reject) => {
+      let bytes = rest;
+      const timer = setTimeout(() => finish(new Error("scrcpy control metadata timed out")), CONNECT_TIMEOUT_MS);
+      const more = chunk => {
+        bytes = Buffer.concat([bytes, chunk]);
+        if (bytes.length >= DEVICE_NAME_FIELD_LENGTH) finish();
+      };
+      const closed = () => finish(new Error("scrcpy control metadata interrupted"));
+      const finish = error => {
+        clearTimeout(timer); socket.off("data", more); socket.off("close", closed); socket.off("error", closed);
+        socket.pause();
+        if (error) { reject(error); return; }
+        if (bytes.length > DEVICE_NAME_FIELD_LENGTH) socket.unshift(bytes.subarray(DEVICE_NAME_FIELD_LENGTH));
+        resolvePromise();
+      };
+      socket.on("data", more); socket.once("close", closed); socket.once("error", closed);
+      if (bytes.length >= DEVICE_NAME_FIELD_LENGTH) finish(); else socket.resume();
+    });
   }
 
   async #forward(attempt) {
@@ -707,7 +763,12 @@ export class ScrcpySession extends EventEmitter {
     if (attempt.failed || attempt !== this.#attempt) return;
     attempt.failed = true;
     attempt.error = error;
+    if (attempt.hostStart) {
+      this.#hostDisabled = true;
+      this.#hostFallback = "Host capture stopped; using Android encoder";
+    }
     if (this.#stopped) return;
+    attempt.host?.abort?.();
     if (this.listenerCount("error")) this.emit("error", error);
     const streamedMs = this.#streamingSince ? performance.now() - this.#streamingSince : 0;
     const { delay, next } = restartDelay(this.#backoff, streamedMs);
@@ -732,6 +793,7 @@ export class ScrcpySession extends EventEmitter {
     attempt.torndown = (async () => {
       attempt.video?.destroy();
       attempt.control?.destroy();
+      if (attempt.host) await attempt.host.stop();
       const child = attempt.child;
       if (child && !attempt.exited) {
         // The server ends by itself once its sockets close; the adb child follows.

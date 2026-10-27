@@ -5024,6 +5024,30 @@ function supersededAnswer(preset) {
     message: `The display change to ${preset} was superseded by a later one` };
 }
 
+test("display: concurrent status polls reuse wm without redundant bridge screen measurements", async (t) => {
+  const { world, canvas, control, device } = await connectedControl(t);
+  await settledDisplay(control);
+  await status(canvas);
+  const before = (await bridgeCalls(world, "screen-size")).length;
+  const responses = await Promise.all(Array.from({ length: 8 }, () => status(canvas)));
+  for (const body of responses) {
+    assert.deepEqual(displayValues(body.display), [1080, 2400, 420, "default"]);
+    assert.equal(body.session_stopped, false);
+  }
+  assert.equal((await bridgeCalls(world, "screen-size")).length, before,
+    "status polls added wm size / dumpsys input through the action bridge");
+  // Rotated input coordinates still need the bridge: wm remains natural.
+  device.sendSession(1280, 570);
+  await control.next((message) => message.json?.t === "state" && message.json.width === 1280);
+  await status(canvas);
+  assert.equal((await bridgeCalls(world, "screen-size")).length, before + 1);
+  device.sendSession(570, 1280);
+  await control.next((message) => message.json?.t === "state" && message.json.width === 570);
+  await status(canvas);
+  assert.equal((await bridgeCalls(world, "screen-size")).length, before + 1);
+  await stopCanvas(canvas);
+});
+
 test("display: /status lists the six presets in order and reports the device default with its physical size and density", async (t) => {
   const { world, canvas, control } = await connectedControl(t);
   // A page's state messages carry the preset, read when it connected, without asking /status.
