@@ -173,7 +173,7 @@ Two rules carry the design.
 | `version`, `devices`, `doctor` | identify the CLI, discover targets, diagnose the machine |
 | `session *` | start/show/list/stop, launch/clear/force-stop/uninstall, artifact dirs |
 | `control status\|acquire\|renew\|release` | the host-wide control lease of a target (see [Control lease](#control-lease)) |
-| `ui tree\|find\|wait\|tap\|swipe\|type\|key` | understand and control the screen; `ui pinch\|rotate\|shake` exist but have no backend on either platform and are refused |
+| `ui tree\|find\|wait\|tap\|swipe\|pinch\|type\|key` | understand and control the screen; pinch uses scrcpy on Android or idb HID on iOS; `ui rotate\|shake` are refused |
 | `screenshot`, `shots list\|show`, `record start\|stop` | visual evidence and its provenance |
 | `note add\|list`, `journal` | the run's own record: what was done, what was concluded |
 | `logs tail`, `crash list\|show` | textual evidence |

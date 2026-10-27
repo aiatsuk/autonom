@@ -36,12 +36,9 @@ UI_SUBCOMMANDS = (
     "key-sequence", "swipe",
 )
 GESTURES = ("swipe",)
-# Offered by the CLI, backed by nothing. idb has no pinch/rotate/shake — not
-# under `idb ui`, not at the top level (verified against fb-idb 1.1.7) — so
-# these were dispatched as commands that do not exist and came back as
-# `backend_failed` carrying idb's own argparse usage text. Refusing them the way
-# Android gestures are already refused is the honest shape: a typed code, and a
-# hint that names the alternative instead of sending the reader to `doctor`.
+# This legacy CLI adapter has no pinch/rotate/shake command (fb-idb 1.1.7).
+# The supported `ui pinch` path uses the companion's HID protocol separately;
+# never dispatch `idb ui pinch`, which does not exist.
 UNBACKED_GESTURES = ("pinch", "rotate", "shake")
 
 # Xcode 27 moved SimulatorKit.framework to <Xcode.app>/Contents/SharedFrameworks.

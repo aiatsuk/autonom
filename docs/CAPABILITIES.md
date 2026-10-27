@@ -28,7 +28,7 @@ Legend: ✅ shipped · ⚠️ partial · 🔜 planned · ❌ not planned for nea
 | Semantic find / tap | ✅ | ✅ | text, desc/label, resource-id / accessibility identifier, whitespace-normalised (iOS joins a merged label with a newline, Android with a space); an empty selector is `selector_required`; `ui tap` and `ui find` resolve on-screen matches first and count `--index` among them, as a flow does; `ui tap` on a node never laid out on screen is `element_offscreen` and taps nothing; `ui find --all` lists on-screen matches first, and every match `ui find` reports carries the `index` that selects it; a `--text` miss whose value matches a `desc` says so on both platforms (iOS and Flutter-on-Android labels live in `desc`) |
 | iOS input through AXe | — | ✅ | tap/swipe/type/key go through idb, or AXe when idb's HID cannot load SimulatorKit (Xcode 27 with an old companion); `--ios-hid auto\|idb\|axe` / `AUTONOM_IOS_HID`, `--axe PATH` / `AUTONOM_AXE`; every input payload names its `backend`. An AXe tap, and each tap of a double tap, is a touch held 0.12 s (`axe touch -x X -y Y --down --up --delay 0.12`; Unreleased, a plain `axe tap` missed); a long press holds its own duration |
 | iOS reads per action and companion recovery (Unreleased) | — | ✅ | on the idb and AXe routes a selector `ui tap` makes one `describe-all` before its input (was two): the coordinate guard of `ui tap` and `ui swipe` takes the screen size from the command's own read, else the size recorded by an earlier `ui tree` or lookup, and looks it up once more only to confirm a refusal or when nothing is known (once for both ends of a swipe); the XCUITest route still refuses input without a known geometry. An idb call skips the `ps` scans of the companion tracker when idb's registry lists a live local companion for the simulator. An idb call that fails before reaching the companion (socket gone, `[Errno 2]`, or refused) prunes the registry (`idb list-targets`) and is sent once more, any command; after the connection was made (reset, terminated stream, `UNAVAILABLE`) only a read is sent again, and an input fails `idb_companion_unavailable` with a hint that it may have been delivered; a remote companion is never pruned |
-| Gestures | ⚠️ | ⚠️ | tap/swipe on both; `ui pinch\|rotate\|shake` have no backend on either and are refused — see below |
+| Gestures | ⚠️ | ⚠️ | tap/swipe on both; pinch uses scrcpy on Android and idb HID on iOS; rotate and shake are refused — see below |
 | Text and hardware keys | ✅ | ✅ | Android `KEYCODE_*`; iOS `HOME`/`LOCK`/`SIRI`/`SIDE_BUTTON`; `ui type` warns `no_focused_field` when nothing on screen has keyboard focus |
 | Screenshot | ✅ | ✅ | iOS uses `simctl`, so it works without idb |
 | Screenshot provenance | ✅ | ✅ | metadata embedded in the PNG; shots taken under an active mock are flagged `screenshot_shows_mocked_data` |
@@ -98,21 +98,16 @@ Legend: ✅ shipped · ⚠️ partial · 🔜 planned · ❌ not planned for nea
 | XCUITest UI backend | — | ✅ | optional bundled runner (`native/ios`) behind `--ui-backend auto|idb|xcuitest`: `auto` keeps idb and falls back for an app session whose idb tree is empty, has no usable root frame or fails, and records `fallback_reason`; tree, find, selector and coordinate tap, long press, swipe, text and Home; single dispatch (`ui_action_uncertain`, never repeated or re-sent); stopped by `session stop`; Simulator only, builds on first use; see `docs/IOS_UI_RECOVERY.md`. Running an app's own XCUITest suites is not a goal |
 | Optional MCP wrapper | 🔜 | 🔜 | CLI is source of truth first |
 
-### `ui pinch|rotate|shake` have no backend
+### Pinch, rotate and shake
 
-Neither platform can perform them. Android's `input` cannot express them, and
-idb has no such command either — `idb ui` accepts only `describe-all`,
-`describe-point`, `tap`, `button`, `text`, `key`, `key-sequence`, and `swipe`
-(verified against fb-idb 1.1.7). Both platforms therefore refuse the three verbs
-with `unsupported_on_platform` and a hint, rather than dispatching something the
-tool will reject.
-
-Until 0.15.1 the iOS path did dispatch them, and every real machine answered
-with `backend_failed` wrapping idb's argparse usage text plus a hint pointing at
-`doctor` — a tool that was working fine. The suite missed it because the fake
-idb returned 0 for any argv: it proved *what was dispatched*, never *that the
-dispatch names a command idb has*. The fake now carries idb's real command
-surface and refuses anything outside it.
+`ui pinch --at X,Y --scale 2` zooms in; a scale below one zooms out. Android
+uses a temporary scrcpy 4.1 control session and requires Node.js and scrcpy.
+iOS uses Node.js and an idb_companion with HIDPinch support, including a remote
+companion selected by `--idb-host` / `--idb-port`. AXe and the XCUITest runner
+do not provide this pinch route. Coordinates are Android pixels or iOS points;
+the radius is chosen to keep both fingers on screen. A failed connection after
+input starts is `ui_action_uncertain`: inspect the screen before retrying.
+`ui rotate` and `ui shake` remain `unsupported_on_platform`.
 
 Use `ui swipe` for anything reachable by a drag. Rotation and shake need a hand
 on the Simulator window (Device > Rotate).
@@ -182,7 +177,8 @@ autonom ui tap [selector flags] | [--x X --y Y] [--duration MS] [--observe|--no-
                [--observe-timeout-ms MS]
 autonom ui swipe --from X,Y --to X,Y [--duration S] [--observe|--no-observe] [--observe-timeout-ms MS]
                                  # --duration in seconds (0.3 default); not in (0, 60] is invalid_value
-autonom ui pinch --at X,Y [--scale F] | ui rotate | ui shake   # refused on both platforms
+autonom ui pinch --at X,Y [--scale F] [--duration S] [--observe|--no-observe] [--observe-timeout-ms MS]
+autonom ui rotate | ui shake   # refused on both platforms
 autonom ui type <text> [--sensitive] [--observe|--no-observe] [--observe-timeout-ms MS]
 autonom ui key <keycode> [--observe|--no-observe] [--observe-timeout-ms MS]
                                  # --observe: wait for the screen to settle, then return screen,

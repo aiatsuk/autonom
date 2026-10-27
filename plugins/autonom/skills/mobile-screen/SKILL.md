@@ -221,13 +221,21 @@ the fix for each. On Xcode 27 with AXe carrying input, `ios_hid.ready` stays
 | Verb | Android | iOS |
 | --- | --- | --- |
 | `ui tap`, `ui swipe`, `ui type` | yes | yes |
-| `ui pinch`, `ui rotate`, `ui shake` | refused with `unsupported_on_platform` | refused with `unsupported_on_platform` |
+| `ui pinch` | scrcpy 4.1 + Node.js | idb_companion HIDPinch + Node.js |
+| `ui rotate`, `ui shake` | refused with `unsupported_on_platform` | refused with `unsupported_on_platform` |
 | `ui key` | `KEYCODE_*` | `HOME`, `LOCK`, `SIDE_BUTTON`, `SIRI`, `APPLE_PAY`, or a numeric HID code |
 
-**No platform has pinch, rotate, or shake.** Android's `input` cannot express
-them and idb has no such command either, so both are refused rather than faked.
-Use `ui swipe` for anything reachable by a drag; rotation and shake need a hand
-on the Simulator window (Device > Rotate).
+`ui pinch --at X,Y --scale 2` zooms in; `--scale 0.5` zooms out. The default
+duration is 0.4 seconds. The center is in Android pixels or iOS points; the
+command measures the screen and chooses a radius that fits. Android needs
+scrcpy 4.1, resolved as for Canvas (`AUTONOM_SCRCPY_SERVER`,
+`SCRCPY_SERVER_PATH`, or installed scrcpy). iOS uses idb_companion directly,
+not the idb CLI; an explicitly selected AXe or XCUITest backend is refused.
+Both paths require Node.js. Scale is the ratio of finger separation, not a
+promise of an exact app zoom: gesture thresholds and zoom limits can change
+the effect. A `ui_action_uncertain` result means input may
+have happened: inspect the screen before retrying. Rotate and shake remain
+unsupported; rotate the Simulator window by hand if needed.
 
 iOS has no global Back button; tap the navigation bar's back control instead.
 
