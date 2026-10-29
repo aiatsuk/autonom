@@ -9,8 +9,21 @@ import {
 import { connect as netConnect } from "node:net";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
-import test from "node:test";
+import test, { describe } from "node:test";
 import { isDeepStrictEqual } from "node:util";
+
+// Tests that spend nearly all their time waiting on the daemon's own timers: QUIET_STUCK_MS,
+// the stuck probes, the replacement intervals and their backoff, the idle limit, the
+// restart backoff. Each has its own world (temporary directory, state base, fakes, daemon
+// socket, environment and host-load file) and no test changes process.env, so they run
+// side by side at the end of this file (see the describe below), which keeps the file
+// well inside the time its CI job allows. Each keeps its own timeout.
+const waitingTests = [];
+const WAITING_CONCURRENCY = 6;
+function waitingTest(name, options, fn) {
+  if (typeof options === "function") waitingTests.push([name, {}, options]);
+  else waitingTests.push([name, options, fn]);
+}
 
 import {
   ACT_REPLY_MARGIN_MS,
@@ -1085,7 +1098,7 @@ test("ID-03-S01: with no request for the idle limit the daemon stops and leaves 
   assert.match(log, /"event":"stopping","reason":"idle"/);
 });
 
-test("ID-03-S02: an attached Canvas keeps the daemon alive past the idle limit; detach lets it stop", async (t) => {
+waitingTest("ID-03-S02: an attached Canvas keeps the daemon alive past the idle limit; detach lets it stop", async (t) => {
   const world = harness(t, {}, { idleMs: 2000 });
   const status = await world.start();
   const canvas = await world.connect(status);
@@ -1592,7 +1605,7 @@ test("ID-10: a stop while the start waits for a silent quiet stream ends the wai
   assert.ok(Date.now() - stoppedAt < QUIET_WARM_MS - 500, `stopped in ${Date.now() - stoppedAt} ms`);
 });
 
-test("ID-10: a quiet stream that never sends an event is waited for once; its touches stay unconfirmed, never confirmed by default", { timeout: 20_000 }, async (t) => {
+waitingTest("ID-10: a quiet stream that never sends an event is waited for once; its touches stay unconfirmed, never confirmed by default", { timeout: 20_000 }, async (t) => {
   const world = harness(t, { quietSilent: true });
   const startedAt = Date.now();
   const status = await world.start();
@@ -1664,7 +1677,7 @@ test("ID-10: the first touch after the quiet stream reports a new target gets th
   await assertRecorded(() => tapPairs(world.hid()), ["down@3,3", "up@3,3", "down@4,4", "up@4,4", "down@5,5", "up@5,5"], "each tap once");
 });
 
-test("ID-10: a stuck quiet stream gets its owned companion replaced while idle once two probes in a row stay silent; the next touch is reported", { timeout: 30_000 }, async (t) => {
+waitingTest("ID-10: a stuck quiet stream gets its owned companion replaced while idle once two probes in a row stay silent; the next touch is reported", { timeout: 30_000 }, async (t) => {
   const world = harness(t, { stuckAfterMs: 300 });
   const status = await world.start();
   const first = status.companion.pid;
@@ -1699,7 +1712,7 @@ test("ID-10: a stuck quiet stream gets its owned companion replaced while idle o
   await assertRecorded(() => tapPairs(world.hid()), ["down@4,4", "up@4,4"], "sent once");
 });
 
-test("ID-10: a touch that finds the stream stuck probes it and, silent twice in a row, replaces the owned companion before it is written", { timeout: 30_000 }, async (t) => {
+waitingTest("ID-10: a touch that finds the stream stuck probes it and, silent twice in a row, replaces the owned companion before it is written", { timeout: 30_000 }, async (t) => {
   // This time the stuck companion's new stream sends nothing at all (seen live too).
   const world = harness(t, { stuckAfterMs: 300, stuckProbeSilent: true });
   const status = await world.start();
@@ -1732,7 +1745,7 @@ test("ID-10: a touch that finds the stream stuck probes it and, silent twice in 
   await waiting.catch(() => {});
 });
 
-test("REV-055: a healthy companion silent after BUSY with RUN_LOOP_IDLE pending answers the probe: kept while idle, and the next tap is confirmed at once", { timeout: 30_000 }, async (t) => {
+waitingTest("REV-055: a healthy companion silent after BUSY with RUN_LOOP_IDLE pending answers the probe: kept while idle, and the next tap is confirmed at once", { timeout: 30_000 }, async (t) => {
   // The probe stream's first event comes late (1 s), still within QUIET_STUCK_PROBE_MS.
   const world = harness(t, { healthySilentAfterMs: 300, probeColdMs: 1000 });
   const status = await world.start();
@@ -1764,7 +1777,7 @@ test("REV-055: a healthy companion silent after BUSY with RUN_LOOP_IDLE pending 
   await assertRecorded(() => tapPairs(world.hid()), ["down@6,6", "up@6,6"], "sent once");
 });
 
-test("REV-055: a report on the open stream while a probe waits ends the probe as healthy: no replacement", { timeout: 30_000 }, async (t) => {
+waitingTest("REV-055: a report on the open stream while a probe waits ends the probe as healthy: no replacement", { timeout: 30_000 }, async (t) => {
   // The probe stream would answer only after 5 s (past QUIET_STUCK_PROBE_MS); a new app
   // reports on the open stream 0.5 s into the probe.
   const world = harness(t, { healthySilentAfterMs: 300, probeColdMs: 5000 });
@@ -1782,7 +1795,7 @@ test("REV-055: a report on the open stream while a probe waits ends the probe as
   assert.equal(world.registry().companion.pid, first);
 });
 
-test("REV-055: a touch on a healthy companion whose probe just answered is not probed again", { timeout: 30_000 }, async (t) => {
+waitingTest("REV-055: a touch on a healthy companion whose probe just answered is not probed again", { timeout: 30_000 }, async (t) => {
   const world = harness(t, { healthySilentAfterMs: 300 });
   const status = await world.start();
   await loggedAtLeast(world, "quiet_probe", 1, { timeoutMs: QUIET_STUCK_MS + QUIET_STUCK_PROBE_MS + 3000 });
@@ -1794,7 +1807,7 @@ test("REV-055: a touch on a healthy companion whose probe just answered is not p
   assert.equal(logged(world, "companion_restarted").length, 0);
 });
 
-test("REV-056: a touch whose deadline leaves no room for both probes and a replacement is not probed: sent once on the current companion, reported as it is; the idle check replaces it after", { timeout: 45_000 }, async (t) => {
+waitingTest("REV-056: a touch whose deadline leaves no room for both probes and a replacement is not probed: sent once on the current companion, reported as it is; the idle check replaces it after", { timeout: 45_000 }, async (t) => {
   const limit = 2500;
   const world = harness(t, { stuckAfterMs: 300, stuckProbeSilent: true });
   world.env[HID_WAIT_ENV] = String(limit);
@@ -1830,7 +1843,7 @@ test("REV-056: a touch whose deadline leaves no room for both probes and a repla
   await assertRecorded(() => tapPairs(world.hid()), ["down@5,5", "up@5,5"], "never sent again");
 });
 
-test("REV-056: a stuck check before a touch runs both probes at full length inside the deadline; a replacement that then does not fit refuses the touch unsent", { timeout: 60_000 }, async (t) => {
+waitingTest("REV-056: a stuck check before a touch runs both probes at full length inside the deadline; a replacement that then does not fit refuses the touch unsent", { timeout: 60_000 }, async (t) => {
   // Room for two full probes and RESTART_WAIT_MS with 1 s to spare at each step.
   const limit = ARM_WAIT_SPARE_MS + STUCK_SILENT_PROBES * QUIET_STUCK_PROBE_MS + RESTART_WAIT_MS + 1000;
   // The new companion's idb connect returns only after 9 s: longer than what the deadline
@@ -1864,7 +1877,7 @@ test("REV-056: a stuck check before a touch runs both probes at full length insi
   await waiting.catch(() => {});
 });
 
-test("REV-056: one silent probe and then an ok one keep a healthy companion while idle: no replacement", { timeout: 30_000 }, async (t) => {
+waitingTest("REV-056: one silent probe and then an ok one keep a healthy companion while idle: no replacement", { timeout: 30_000 }, async (t) => {
   // The healthy companion's first probe stream (its second quiet call) stays silent; the next answers.
   const world = harness(t, { healthySilentAfterMs: 300, probeSilentCalls: [2] });
   const status = await world.start();
@@ -1886,7 +1899,7 @@ test("REV-056: one silent probe and then an ok one keep a healthy companion whil
   assert.equal(logged(world, "companion_restarted").length, 0);
 });
 
-test("REV-056: before a touch, one silent probe and then an ok one keep a healthy companion; the touch is confirmed on it", { timeout: 30_000 }, async (t) => {
+waitingTest("REV-056: before a touch, one silent probe and then an ok one keep a healthy companion; the touch is confirmed on it", { timeout: 30_000 }, async (t) => {
   const world = harness(t, { healthySilentAfterMs: 300, probeSilentCalls: [2] });
   const status = await world.start();
   const first = status.companion.pid;
@@ -1914,7 +1927,7 @@ test("REV-056: before a touch, one silent probe and then an ok one keep a health
   await waiting.catch(() => {});
 });
 
-test("REV-055: a request that arrives while an idle probe runs is let finish before a silent probe replaces the companion", { timeout: 30_000 }, async (t) => {
+waitingTest("REV-055: a request that arrives while an idle probe runs is let finish before a silent probe replaces the companion", { timeout: 30_000 }, async (t) => {
   const world = harness(t, { stuckAfterMs: 300 });
   const status = await world.start();
   const first = status.companion.pid;
@@ -1939,7 +1952,7 @@ function stuckAt(world, pid) {
   return world.events().filter((e) => e.k === "stuck" && (pid === undefined || e.pid === pid));
 }
 
-test("REV-043: target changes from a stuck companion keep it stuck; it is replaced while idle and the next touch is reported", { timeout: 30_000 }, async (t) => {
+waitingTest("REV-043: target changes from a stuck companion keep it stuck; it is replaced while idle and the next touch is reported", { timeout: 30_000 }, async (t) => {
   // Stuck 300 ms after start, then two apps launched on it, 1 s and 1.5 s after the stuck report.
   const world = harness(t, { stuckAfterMs: 300, stuckTargetChanges: [1000, 1500] });
   const status = await world.start();
@@ -1968,7 +1981,7 @@ test("REV-043: target changes from a stuck companion keep it stuck; it is replac
   assert.deepEqual(touches.map((e) => [e.pid !== first, e.stuck]), [[true, false]], "written once, on the new companion only");
 });
 
-test("REV-055: apps launched on a stuck companion, each with one BUSY report, neither end its silence nor void its probe", { timeout: 30_000 }, async (t) => {
+waitingTest("REV-055: apps launched on a stuck companion, each with one BUSY report, neither end its silence nor void its probe", { timeout: 30_000 }, async (t) => {
   // As live: every app launched on the stuck companion reports target_changed and one BUSY
   // with RUN_LOOP_IDLE pending, every 1.5 s; none of them ends the suspicion.
   // They go on far past the expected replacement (about 300 + QUIET_STUCK_MS + 2 probes = 7.3 s
@@ -1991,7 +2004,7 @@ test("REV-055: apps launched on a stuck companion, each with one BUSY report, ne
   assert.equal(reply.input_confirmed, true, "reported on the new companion");
 });
 
-test("REV-043: a touch after target changes from a stuck companion replaces it before it is written", { timeout: 30_000 }, async (t) => {
+waitingTest("REV-043: a touch after target changes from a stuck companion replaces it before it is written", { timeout: 30_000 }, async (t) => {
   const world = harness(t, { stuckAfterMs: 300, stuckTargetChanges: [800, 1300] });
   const status = await world.start();
   const first = status.companion.pid;
@@ -2019,7 +2032,7 @@ test("REV-043: a touch after target changes from a stuck companion replaces it b
   await waiting.catch(() => {});
 });
 
-test("REV-043: a new app that reports normally after the stuck report clears it: no probe, no replacement", { timeout: 30_000 }, async (t) => {
+waitingTest("REV-043: a new app that reports normally after the stuck report clears it: no probe, no replacement", { timeout: 30_000 }, async (t) => {
   const world = harness(t, { stuckAfterMs: 300 });
   const status = await world.start();
   const first = status.companion.pid;
@@ -2039,7 +2052,7 @@ test("REV-043: a new app that reports normally after the stuck report clears it:
   assert.equal(logged(world, "quiet_probe").length, 0);
 });
 
-test("REV-044: a BUSY report without RUN_LOOP_IDLE pending, then silence (a busy main thread), is neither probed nor replaced", { timeout: 30_000 }, async (t) => {
+waitingTest("REV-044: a BUSY report without RUN_LOOP_IDLE pending, then silence (a busy main thread), is neither probed nor replaced", { timeout: 30_000 }, async (t) => {
   const world = harness(t, {
     stuckAfterMs: 300, stuckEvent: { type: "state_changed", pid: 77, state: "BUSY", busySignals: ["ANIMATIONS_INACTIVE"] },
   });
@@ -2059,7 +2072,7 @@ test("REV-044: a BUSY report without RUN_LOOP_IDLE pending, then silence (a busy
   assert.ok(pidAlive(first));
 });
 
-test("REV-046: a stuck episode within the interval is neither probed nor replaced until the interval has passed; then it is", { timeout: 60_000 }, async (t) => {
+waitingTest("REV-046: a stuck episode within the interval is neither probed nor replaced until the interval has passed; then it is", { timeout: 60_000 }, async (t) => {
   const interval = 8000;
   const world = harness(t, { stuckAfterMs: 300 });
   world.env[STUCK_INTERVAL_ENV] = String(interval);
@@ -2099,7 +2112,7 @@ test("REV-046: a stuck episode within the interval is neither probed nor replace
   assert.equal(reply.input_confirmed, true, "reported on the third companion");
 });
 
-test("r523: on an overloaded host a stuck companion is neither probed nor replaced, a touch goes once and is reported as it is; once the load drops it is", { timeout: 45_000 }, async (t) => {
+waitingTest("r523: on an overloaded host a stuck companion is neither probed nor replaced, a touch goes once and is reported as it is; once the load drops it is", { timeout: 45_000 }, async (t) => {
   const interval = 1000;
   const world = harness(t, { stuckAfterMs: 300 });
   world.env[STUCK_INTERVAL_ENV] = String(interval);
@@ -2138,7 +2151,7 @@ test("r523: on an overloaded host a stuck companion is neither probed nor replac
   await assertRecorded(() => tapPairs(world.hid()), ["down@5,5", "up@5,5", "down@6,6", "up@6,6"], "each sent once");
 });
 
-test("r523: a load that rises while a touch's probes run stops the replacement; the touch goes once on the current companion", { timeout: 45_000 }, async (t) => {
+waitingTest("r523: a load that rises while a touch's probes run stops the replacement; the touch goes once on the current companion", { timeout: 45_000 }, async (t) => {
   const world = harness(t, { stuckAfterMs: 300, stuckProbeSilent: true });
   const status = await world.start();
   const first = status.companion.pid;
@@ -2168,7 +2181,7 @@ test("r523: a load that rises while a touch's probes run stops the replacement; 
   assert.equal(logged(world, "companion_restarted").length, 0);
 });
 
-test("r523: stuck replacements in a row with no sign of health double the gap (5, 5, 10, 20 s here); a confirmed touch resets it", { timeout: 120_000 }, async (t) => {
+waitingTest("r523: stuck replacements in a row with no sign of health double the gap (5, 5, 10, 20 s here); a confirmed touch resets it", { timeout: 120_000 }, async (t) => {
   const interval = 5000;
   // Every companion is stuck from its start, as live: its first report is that BUSY.
   const world = harness(t, { stuckFromStart: true });
@@ -2210,7 +2223,7 @@ test("r523: stuck replacements in a row with no sign of health double the gap (5
 // once it serves, as 3 of 6 new companions did in the live r523 run.
 const STUCK_PROOF_MS = QUIET_STUCK_MS + STUCK_SILENT_PROBES * QUIET_STUCK_PROBE_MS;
 
-test("REV-059: a replacement's stuck BUSY and its target changes while it serves are no sign of health: the backoff is kept and doubles", { timeout: 120_000 }, async (t) => {
+waitingTest("REV-059: a replacement's stuck BUSY and its target changes while it serves are no sign of health: the backoff is kept and doubles", { timeout: 120_000 }, async (t) => {
   const interval = 2000;
   // Each episode: that BUSY on the open stream, then an app launched and one that exits.
   const world = harness(t, { stuckTargetChanges: [[300, "target_changed"], [600, "target_exited"]] });
@@ -2232,7 +2245,7 @@ test("REV-059: a replacement's stuck BUSY and its target changes while it serves
   assert.deepEqual(logged(world, "quiet_probe").map((p) => p.result), Array(6).fill("silent"));
 });
 
-test("REV-059: after a replacement, a state report while the new companion serves resets the backoff, and so does a probe that answers", { timeout: 120_000 }, async (t) => {
+waitingTest("REV-059: after a replacement, a state report while the new companion serves resets the backoff, and so does a probe that answers", { timeout: 120_000 }, async (t) => {
   const interval = 2000;
   const world = harness(t);
   world.env[STUCK_INTERVAL_ENV] = String(interval);
@@ -2258,7 +2271,7 @@ test("REV-059: after a replacement, a state report while the new companion serve
     [["idle", true, interval, 0], ["idle", true, interval, 0], ["idle", true, interval, 0]], JSON.stringify(stuck));
 });
 
-test("REV-059: a load that rises during the idle check's second probe stops the replacement: the idle check looks at the load before it replaces", { timeout: 60_000 }, async (t) => {
+waitingTest("REV-059: a load that rises during the idle check's second probe stops the replacement: the idle check looks at the load before it replaces", { timeout: 60_000 }, async (t) => {
   const interval = 1000;
   const world = harness(t);
   world.env[STUCK_INTERVAL_ENV] = String(interval);
@@ -2285,7 +2298,7 @@ test("REV-059: a load that rises during the idle check's second probe stops the 
   assert.deepEqual(logged(world, "quiet_stuck").map((r) => [r.when, r.replace]), [["idle", true]]);
 });
 
-test("REV-059: a touch inside the backoff gap is not probed: sent at once on the current companion and reported as it is", { timeout: 60_000 }, async (t) => {
+waitingTest("REV-059: a touch inside the backoff gap is not probed: sent at once on the current companion and reported as it is", { timeout: 60_000 }, async (t) => {
   const interval = 20_000;
   const world = harness(t);
   world.env[STUCK_INTERVAL_ENV] = String(interval);
@@ -2312,7 +2325,7 @@ test("REV-059: a touch inside the backoff gap is not probed: sent at once on the
   assert.ok(pidAlive(second));
 });
 
-test("REV-067: at streak 2 a touch inside the doubled gap but past the plain interval is not probed: too_soon with the doubled gap_ms, a quick reply, sent once", { timeout: 90_000 }, async (t) => {
+waitingTest("REV-067: at streak 2 a touch inside the doubled gap but past the plain interval is not probed: too_soon with the doubled gap_ms, a quick reply, sent once", { timeout: 90_000 }, async (t) => {
   // The touch path must use the backoff gap (2 x interval at streak 2), not the plain interval:
   // at streak 1 the two are equal, so only a touch at streak >= 2 tells them apart.
   const interval = 8000;
@@ -2351,7 +2364,7 @@ test("REV-067: at streak 2 a touch inside the doubled gap but past the plain int
   assert.ok(pidAlive(third));
 });
 
-test("ID-10: a stuck companion the daemon does not own is probed and left running; its touches stay unconfirmed", { timeout: 30_000 }, async (t) => {
+waitingTest("ID-10: a stuck companion the daemon does not own is probed and left running; its touches stay unconfirmed", { timeout: 30_000 }, async (t) => {
   const world = harness(t, { stuckAfterMs: 300 });
   execFileSync(world.paths.idb, ["connect", UDID], { env: world.env });
   const [companion] = world.companionPids();
@@ -2672,7 +2685,7 @@ test("REV-029: with a holder that never lets go, a tap, a queued key and an act 
   await assertRecorded(() => tapPairs(world.hid()), ["down@7,8", "up@7,8"], "the stream still works, the tap once");
 });
 
-test("REV-032: an input that starts late and then waits behind a holder is cancelled at its arrival deadline, not at the client's close wait, and never performed", { timeout: 30_000 }, async (t) => {
+waitingTest("REV-032: an input that starts late and then waits behind a holder is cancelled at its arrival deadline, not at the client's close wait, and never performed", { timeout: 30_000 }, async (t) => {
   const world = harness(t);
   // DEFAULT_HID_WAIT_MS scaled down. The late start (PRESS_S) is longer than
   // INPUT_REPLY_SLACK_MS, so the companion client's own close wait, which counts from
@@ -2820,7 +2833,7 @@ test("a quiet stream the companion finishes is reopened and keeps confirming inp
   await loggedAtLeast(world, "quiet_reopened");
 });
 
-test("while the companion cannot be replaced, input fails before it is sent and the restart keeps trying", async (t) => {
+waitingTest("while the companion cannot be replaced, input fails before it is sent and the restart keeps trying", async (t) => {
   const world = harness(t);
   const status = await world.start();
   const config = JSON.parse(readFileSync(world.paths.config, "utf8"));
@@ -2869,4 +2882,8 @@ test("a failing idb connect refuses the start with daemon_start_failed and leave
   assert.equal(existsSync(daemonPaths(world.paths.base, UDID).daemonLock), false);
   assert.equal(existsSync(daemonPaths(world.paths.base, UDID).startLock), false);
   assert.deepEqual(daemonProcesses(world.paths.base), []);
+});
+
+describe("tests that wait on the daemon's timers, run side by side", { concurrency: WAITING_CONCURRENCY }, () => {
+  for (const [name, options, fn] of waitingTests) test(name, options, fn);
 });
