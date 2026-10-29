@@ -1992,14 +1992,13 @@ test("a quiet stream deadline rejects with code 4 and cancels the call; a droppe
 });
 
 test("a quiet stream whose companion ends without a status, or sends a broken message, rejects", async (t) => {
-  const { endpoint } = await fakeServer(t, {
+  const { endpoint, state } = await fakeServer(t, {
     unary: {
       accessibility_quiescence: quietHandler((ctx, request) => {
         if (request.pid === 1) {
           ctx.stream.write(grpcFrame(Buffer.from([0x08]))); // truncated varint
-          return;
         }
-        ctx.stream.close(http2.constants.NGHTTP2_INTERNAL_ERROR);
+        // pid 2: the call stays open with headers only; the test resets it below.
       }),
     },
   });
@@ -2007,9 +2006,15 @@ test("a quiet stream whose companion ends without a status, or sends a broken me
   const broken = await client.accessibilityQuiescence({ pid: 1 });
   await assert.rejects(broken.next(), RangeError);
   const reset = await client.accessibilityQuiescence({ pid: 2 });
-  await assert.rejects(reset.next(), Error);
-  // The companion had answered with headers before it reset the call: started, then failed.
+  const read = reset.next();
+  // The companion answers with headers and only then resets the call: started, then failed.
+  // (A reset in the same tick as respond() is no answer with headers: an HTTP/2 server on
+  // Node 22 then sends RST_STREAM without the HEADERS frame.)
   assert.equal(await reset.started, true);
+  await waitFor(() => state.quietRequests?.some((r) => r.pid === 2), { message: "pid 2 call on the companion" });
+  state.quietCalls[state.quietRequests.findIndex((r) => r.pid === 2)].close(http2.constants.NGHTTP2_INTERNAL_ERROR);
+  await assert.rejects(read, Error);
+  assert.equal(reset.done, true);
   assert.ok((await reset.closed).error instanceof Error);
   assert.equal((await broken.closed).error instanceof RangeError, true);
 });
