@@ -1627,7 +1627,8 @@ test("iOS attach: a daemon that goes away is attached to again through the daemo
   // A new daemon adopts the running companion and takes over the registry; the old one goes.
   const second = await new FakeIosDaemon(world).start({ companion: first.companion });
   await first.close({ keepCompanion: true });
-  await waitFor(() => second.attached === 1, 10_000, "an attach to the new daemon");
+  // The fake counts the attach when it receives it; the session counts it only on the reply.
+  await waitFor(() => second.attached === 1 && session.stats.daemonAttaches === 2, 10_000, "an attach to the new daemon");
   assert.deepEqual(second.ops, ["attach"]);
   assert.equal(session.stats.daemonLosses, 1);
   assert.equal(session.stats.daemonAttaches, 2);
@@ -1747,7 +1748,8 @@ test("iOS attach: a lost daemon whose restart fails for a passing reason is atta
   // A daemon that adopts the companion comes up: the session attaches to it, so its idle stop counts the Canvas.
   const second = await new FakeIosDaemon(world).start({ companion: first.companion });
   release();
-  await waitFor(() => second.attached === 1, 10_000, "an attach to the new daemon");
+  // The fake counts the attach when it receives it; the session is attached only on the reply.
+  await waitFor(() => second.attached === 1 && session.stats.daemonAttached, 10_000, "an attach to the new daemon");
   assert.equal(session.stats.daemonAttached, true);
   assert.equal(session.stats.companionAttaches, 1, "the same companion connection");
   assert.equal(session.stats.streamsOpened, streams, "the stream never restarted");
