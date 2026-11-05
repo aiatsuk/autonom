@@ -7,6 +7,19 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
 
 ## [Unreleased]
 
+### Added
+
+- **Opt-in macOS hardware video for the Android Canvas.** With an emulator
+  listed in `~/.config/autonom/host-video.json` (AVD, serial, gRPC port),
+  Canvas captures frames over the emulator's token-protected loopback gRPC
+  endpoint and encodes them with VideoToolbox on the Mac instead of on the
+  device; any capture failure falls back to scrcpy. Frame size and rotation
+  changes recreate the encoder; optional `"manageCutout": true` hides the
+  emulator's own cutout drawing while capture is attached. Without the file
+  nothing changes. Measured about 53 fps while scrolling, not yet 60; a
+  focus-profile switch can briefly restart control and refuse the first
+  tap. See `docs/canvas-host-video.md`.
+
 ### Changed
 - **The iOS device daemon finds idb's companion in the process table.** It no
   longer reads idb's state file (`/tmp/idb/state`) or `AUTONOM_IDB_STATE_FILE`

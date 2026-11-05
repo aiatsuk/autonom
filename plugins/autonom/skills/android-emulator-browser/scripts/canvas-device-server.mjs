@@ -891,23 +891,15 @@ function fallbackReason(context) {
 }
 
 async function sendStatus(context, response) {
-  // Android already shares a bounded-age wm reading between page polls and the
-  // display watcher. Asking the bridge as well runs another wm size + dumpsys
-  // input for every client poll, only to discard that result in displayStatus().
-  // Keep the bridge fallback when wm failed, and the existing iOS fast path.
-  // The bound session is independently refreshed below for session_stopped.
-  await freshDisplay(context);
-  // wm reports natural orientation. Keep the bridge's rotated input dimensions
-  // when the video is rotated (or no stream metadata can confirm orientation).
-  const wm = context.displayWm, videoSize = context.video.size;
-  const reuseWm = context.options.platform === "android" && wm && videoSize &&
-    (wm.width > wm.height) === (videoSize.width > videoSize.height);
-  const measured = reuseWm
-    ? { display: { width: wm.width, height: wm.height } }
-    : iosStreamDisplay(context) ?? await context.actionBridge.call("screen-size", {}, "system").catch((error) => {
+  const [measured] = await Promise.all([
+    // A bound session that stopped refuses the measure (contract 4.2); /status still answers,
+    // so the page can show the device as stopped.
+    iosStreamDisplay(context) ?? context.actionBridge.call("screen-size", {}, "system").catch((error) => {
       if (!error.errorCode) throw error;
       return { display: null };
-    });
+    }),
+    freshDisplay(context),
+  ]);
   if (measured.display) context.display = measured.display;
   const transport = chooseTransport(context);
   sendJson(response, 200, {
