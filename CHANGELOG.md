@@ -24,6 +24,17 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
   nothing changes. Measured about 53 fps while scrolling, not yet 60; a
   focus-profile switch can briefly restart control and refuse the first
   tap. See `docs/canvas-host-video.md`.
+- **`ui pinch` on Android and iOS.** `autonom ui pinch --at X,Y --scale S
+  [--duration SECONDS]` sends a real two-finger pinch: through a short-lived
+  scrcpy control session on Android (scrcpy 4.1 and Node.js) and idb's
+  HIDPinch on the iOS Simulator (an idb_companion with HIDPinch and Node.js).
+  Scale above 1 zooms in, below 1 out; the finger span stays on screen;
+  `--observe` works as for other inputs. On Android a pinch that fails or is
+  interrupted after its fingers went down lifts them before the transport
+  stops; either platform replies `ui_action_uncertain` without retrying.
+  An iOS session on the XCUITest or AXe route refuses pinch with
+  `unsupported_capability` before any device call. `ui rotate` and
+  `ui shake` are still refused; the iOS AXe and XCUITest routes have no pinch.
 - **Autonom's own Android helper, built on first use.**
   `native/android/helper` is a small Java program (protocol 1, framework APIs
   only) that runs on the device as the shell user, holds one UiAutomation
