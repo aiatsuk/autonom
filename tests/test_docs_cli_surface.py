@@ -411,5 +411,91 @@ class UnreleasedNotesTests(unittest.TestCase):
             self.assertIn(text, notes, text)
 
 
+def _unreleased(changelog: str) -> str:
+    sections = {}
+    for chunk in changelog.split("\n## [")[1:]:
+        name, _, body = chunk.partition("]")
+        sections[name] = body
+    return " ".join(sections.get("Unreleased", "").split())
+
+
+class AndroidHelperDocsTests(unittest.TestCase):
+    """DL-01: the docs and skills describe the on-device Android helper, its
+    fallback and opt-out, `ui fill`, the signals, agent screenshots and
+    `ui helper status|stop`, and the Android `screen_not_settled` guidance
+    fits the helper path while keeping a note for the fallback."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        skills = ROOT / "plugins/autonom/skills"
+        cls.screen = (skills / "mobile-screen/SKILL.md").read_text(encoding="utf-8")
+        cls.start = (skills / "autonom/SKILL.md").read_text(encoding="utf-8")
+        cls.install = (ROOT / "docs/INSTALL.md").read_text(encoding="utf-8")
+        cls.architecture = (ROOT / "docs/ARCHITECTURE.md").read_text(encoding="utf-8")
+        cls.compatibility = (ROOT / "docs/COMPATIBILITY.md").read_text(encoding="utf-8")
+        cls.notes = _unreleased((ROOT / "CHANGELOG.md").read_text(encoding="utf-8"))
+
+    def test_mobile_screen_names_the_new_verbs_and_keys(self) -> None:  # DL-01-S01
+        flat = " ".join(self.screen.split())
+        for text in ("ui fill", "signals", "screenshot --agent", "ui helper stop",
+                     "ui helper status", "fallback_reason", "--ui-backend uiautomator",
+                     "AUTONOM_ANDROID_UI_BACKEND=uiautomator", "android_helper_unavailable",
+                     "signals.keyboard", "signals.dialog", "coordinates", "scale",
+                     "text_not_typable", "fill_target_mismatch", "text_matches",
+                     "ui_action_uncertain"):
+            self.assertIn(text, flat, text)
+
+    def test_the_settle_guidance_fits_the_helper_and_keeps_the_fallback_note(self) -> None:
+        flat = " ".join(self.screen.split())
+        self.assertNotIn("On Android, where one read takes about 2 s, this warning is common",
+                         flat)
+        section = flat.split("a `screen_not_settled` warning", 1)[1].split("`--no-observe`", 1)[0]
+        self.assertIn("through the on-device helper", section)
+        self.assertIn("settled: false", section)
+        self.assertIn("500 ms", section)
+        self.assertIn("uiautomator fallback", section)
+        self.assertIn("about 2 s", section)
+
+    def test_the_start_here_skill_maps_the_helper(self) -> None:
+        flat = " ".join(self.start.split())
+        for text in ("on-device helper", "ui fill", "ui helper stop", "screenshot --agent",
+                     "fallback_reason", "--ui-backend uiautomator", "signals"):
+            self.assertIn(text, flat, text)
+
+    def test_install_names_the_toolchain_and_life_without_it(self) -> None:
+        flat = " ".join(self.install.split())
+        for text in ("JDK, 11 or newer", "build-tools", "SDK platform", "android.jar",
+                     "Without these tools nothing breaks", "fallback_reason", "fallback_hint",
+                     "capabilities.android_helper", "API 26",
+                     "/data/local/tmp/autonom-helper-<build>.dex",
+                     "AUTONOM_REQUIRE_ANDROID_BUILD=1"):
+            self.assertIn(text, flat, text)
+
+    def test_architecture_has_the_helper_section(self) -> None:
+        section = self.architecture.split("### Android on-device helper", 1)
+        self.assertEqual(len(section), 2, "ARCHITECTURE.md has no helper section")
+        flat = " ".join(section[1].split("\n### ", 1)[0].split())
+        for text in ("**Build cache.**", "builds/<id>/", "build.lock", ".failed",
+                     "**Device files and the process.**",
+                     "/data/local/tmp/autonom-helper-<build>.dex", "autonom-helper.log",
+                     "**Socket and conversation.**", "localabstract:autonom-helper",
+                     "ui_action_uncertain", "use lock", "120 s", "**Teardown.**",
+                     "/proc/<pid>/cmdline", "forward --remove tcp:<port>", "--remove-all"):
+            self.assertIn(text, flat, text)
+        self.assertIn("android_helper_build.py", self.architecture)
+        self.assertIn("tests/live/android_helper_live.py", self.architecture)
+
+    def test_compatibility_and_changelog(self) -> None:
+        flat = " ".join(self.compatibility.split())
+        for text in ("AUTONOM_REQUIRE_ANDROID_BUILD=1", "| Device state |",
+                     "<state>/android-helper/builds/<id>/",
+                     "Only a read uiautomator serves can end in `ui_not_idle`"):
+            self.assertIn(text, flat, text)
+        for text in ("built on first use", "tests/live/android_helper_live.py",
+                     "android-helper-live.json", "The skills teach the on-device Android helper",
+                     "JDK 11 or newer"):
+            self.assertIn(text, self.notes, text)
+
+
 if __name__ == "__main__":
     unittest.main()

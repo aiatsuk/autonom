@@ -283,6 +283,9 @@ class Executor:
         self._artifact_steps: list[dict] = []
         self._writer_run_id: str | None = None
         self._last_nodes: list | None = None
+        # `settled`/`settle_ms` of the read behind `_last_nodes` when the
+        # Android helper served it (AU-01); empty otherwise
+        self._last_read: dict = {}
         self._last_match: dict | None = None
         self._last_repin: dict | None = None
         self._last_settle: dict | None = None
@@ -1790,9 +1793,11 @@ class Executor:
         sensitive = bool(step.args.get("sensitive"))
         started = self.clock()
         self._last_nodes = None
+        self._last_read = {}
         self._last_match = None
         self._last_repin = None
         self._last_settle = None
+        ui_mark = ui_mod.provenance_mark(self.target)
         attempts = [0]
         # `always` evidence shows what the action did, so its after-shot is
         # taken right after the action, before the step's own wait
@@ -1862,10 +1867,22 @@ class Executor:
             # nearly free: the snapshot is already in memory, and the Atlas
             # ingests these fingerprints into the observed graph
             finished["screen"] = atlas_fingerprint.fingerprint(self._last_nodes)
+            if self._last_settle is None:
+                # AU-01: a read the Android helper served says whether the
+                # screen went quiet first; a waitForSettled step's own
+                # settle (below) speaks for its reads instead
+                finished.update(self._last_read)
         if outcome.target:
             finished["target"] = outcome.target
         # a takeScreenshot re-asserted a live status-bar pin before its frame
         finished.update(_repin_fields(self._last_repin))
+        if ui_mod.provenance_mark(self.target) != ui_mark:
+            # an Android step that read or sent: which backend served its own
+            # reads and inputs (the on-device helper, or uiautomator and adb)
+            # and why auto did not use the helper for them (AU-02); iOS
+            # events carry these keys at their top level
+            for key, value in ui_mod.provenance(self.target, since=ui_mark).items():
+                finished.setdefault(key, value)
         if self._last_settle is not None:
             settle = self._last_settle
             outcome.settled = bool(settle["settled"])
@@ -2205,11 +2222,17 @@ class Executor:
 
     # -- polling --------------------------------------------------------------
 
+    def _keep_nodes(self, nodes: list) -> None:
+        """``nodes`` (a snapshot just read) as the step's latest screen, with
+        what the Android helper said of that read (``ui.read_settled``)."""
+        self._last_nodes = nodes
+        self._last_read = ui_mod.read_settled(self.target)
+
     def _matches(self, selector: FlowSelector) -> list:
         """Assertion-style matching — relations included, index narrows to
         that occurrence (missing = simply "not there", not an error)."""
         nodes = ui_mod.snapshot(self.target)
-        self._last_nodes = nodes
+        self._keep_nodes(nodes)
         matches = flow_selectors.select_all(nodes, selector)
         self._last_match = matches[0] if len(matches) == 1 else None
         return matches
@@ -2221,7 +2244,7 @@ class Executor:
         while True:
             attempts[0] += 1
             nodes = ui_mod.snapshot(self.target)
-            self._last_nodes = nodes
+            self._keep_nodes(nodes)
             candidates = flow_selectors.select(nodes, selector)
             if candidates:
                 self._last_match = candidates[0]
@@ -2261,7 +2284,7 @@ class Executor:
                     raise
                 self.sleep(self.config.interval_ms / 1000)
                 continue
-            self._last_nodes = nodes
+            self._keep_nodes(nodes)
             # Android trees say which node has focus; iOS trees do not, so
             # there the bar is "a text field is on screen" — still enough to
             # catch the case that passed on a real device with no field at all.
@@ -2310,7 +2333,7 @@ class Executor:
         def take() -> list:
             attempts[0] += 1
             nodes = ui_mod.snapshot(self.target)
-            self._last_nodes = nodes
+            self._keep_nodes(nodes)
             return nodes
 
         result = ui_mod.settle(self.target, timeout_ms=timeout_ms,
@@ -2489,7 +2512,7 @@ class Executor:
                 continue  # recompute against the fresh dimensions
             attempts[0] += 1
             nodes = ui_mod.snapshot(self.target)
-            self._last_nodes = nodes
+            self._keep_nodes(nodes)
             found = flow_selectors.select_all(nodes, selector)
             if not found:
                 raise errors.AutonomError(

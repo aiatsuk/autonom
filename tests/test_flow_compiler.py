@@ -113,6 +113,45 @@ class CompilerEndToEndTests(unittest.TestCase):
         blob = Path(summary["events"]).read_text(encoding="utf-8")
         self.assertNotIn("hunter2", blob)
 
+    def test_recorded_fills_compile_and_replay(self) -> None:
+        # AT-02: a fill is tapOn + eraseText + inputText; a sensitive one a secret
+        search = "com.example.app:id/search"
+        for step in [("session", "start", "--app-id", "com.example.app"),
+                     ("session", "launch", "com.example.app"),
+                     ("ui", "fill", "new text", "--resource-id", search, "--mode", "exact"),
+                     ("ui", "fill", "s3cret-fill", "--sensitive", "--resource-id", search,
+                      "--mode", "exact"),
+                     ("ui", "find", "--desc", "Flutter Save Button", "--mode", "exact")]:
+            result = self._cli(*step)
+            assert result.returncode == 0, (step, result.stderr)
+        out = self.root / "filled.yaml"
+        result = self._cli("flow", "create", "--from-session", "current", "--out", str(out))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        text = out.read_text(encoding="utf-8")
+        self.assertEqual(text.count(f"id: {search}"), 2)
+        self.assertEqual(text.count("- eraseText"), 2)
+        self.assertIn("value: new text", text)
+        self.assertIn("${SECRET_1}", text)
+        self.assertNotIn("s3cret-fill", text)
+        self.assertEqual(payload["secrets_required"], ["SECRET_1"])
+        self.assertEqual(payload["quality"]["skipped"], 0)
+        check = self._cli("flow", "check", str(out))
+        self.assertEqual(check.returncode, 0, check.stderr)
+        replay_env = dict(self.env)
+        replay_env["SECRET_1"] = "s3cret-fill"
+        replay = subprocess.run(
+            [sys.executable, str(CLI), "--platform", "android",
+             "--serial", "emulator-5554",
+             "--adb", str(ROOT / "tests/fakes/fake_adb.py"),
+             "flow", "run", str(out), "--secret", "SECRET_1"],
+            cwd=ROOT, env=replay_env, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+            timeout=300,
+        )
+        self.assertEqual(replay.returncode, 0, replay.stderr)
+        self.assertEqual(json.loads(replay.stdout)["status"], "passed")
+
     def test_coordinate_taps_are_flagged_not_approximated(self) -> None:
         for step in [("session", "start", "--app-id", "com.example.app"),
                      ("session", "launch", "com.example.app"),

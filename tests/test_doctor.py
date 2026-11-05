@@ -40,7 +40,10 @@ COMPANION_FIXED = '{"version":"1.6.2","build_date":"Jun 20 2026"}'
 TOOL_ENV = ("AUTONOM_ADB", "AUTONOM_SIMCTL", "AUTONOM_IDB", "AUTONOM_MITMDUMP",
             "AUTONOM_AXE", "AUTONOM_IOS_HID", "AUTONOM_IDB_COMPANION",
             "AUTONOM_IDB_COMPANION_BIN", "AUTONOM_IDB_STATE_FILE", "AUTONOM_FAKE_STATE", "AUTONOM_FAKE_LOG",
-            "DEVELOPER_DIR")
+            "DEVELOPER_DIR",
+            # the JDK and SDK the Android helper build would find (this Mac has both)
+            "JAVA_HOME", "ANDROID_HOME", "ANDROID_SDK_ROOT")
+FAKE_TOOLS = ROOT / "tests/fakes/fake_android_tools.py"
 
 
 def hermetic_env(home: str, path: str) -> dict:
@@ -111,7 +114,7 @@ class DoctorTests(unittest.TestCase):
         self.assertEqual(
             {key: value["ready"] for key, value in report["capabilities"].items()},
             {"android": False, "ios_session": False, "ios_ui": False, "network": False,
-             "ios_tree": False, "ios_hid": False},
+             "ios_tree": False, "ios_hid": False, "android_helper": False},
         )
         for entry in report["capabilities"].values():
             self.assertTrue(entry["needs"])
@@ -284,6 +287,113 @@ class FixCommandTests(unittest.TestCase):
         self.assertEqual(doctor.fix_command("mitmdump", macos=False), "pipx install mitmproxy")
         self.assertIsNone(doctor.fix_command("ffmpeg", macos=True))
         self.assertIsNone(doctor.fix_command("emulator", macos=True))
+
+
+def tool_wrapper(path: Path, tool: str) -> Path:
+    """An executable `tool` at `path` that runs the fake JDK/SDK tool."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "#!/bin/sh\n"
+        'AUTONOM_FAKE_TOOL_PATH="$0"; export AUTONOM_FAKE_TOOL_PATH\n'
+        f'exec "{sys.executable}" -B "{FAKE_TOOLS}" {tool} "$@"\n', encoding="utf-8")
+    path.chmod(0o755)
+    return path
+
+
+class AndroidHelperCapabilityTests(unittest.TestCase):
+    """AH-02: `doctor` names the helper's tools and whether their build is
+    cached, builds nothing, and asks no tool when the backend is uiautomator.
+    A fake JDK and SDK under a temporary directory; nothing real reachable."""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(tmp.name)
+        self.state = self.tmp / "state"
+        self.log = self.tmp / "tools.jsonl"
+        self.jdk = self.tmp / "jdk"
+        tool_wrapper(self.jdk / "bin/javac", "javac")
+        tool_wrapper(self.jdk / "bin/java", "java")
+        (self.jdk / "release").write_text('JAVA_VERSION="21.0.0"\n', encoding="utf-8")
+        self.sdk = self.tmp / "sdk"
+        tool_wrapper(self.sdk / "build-tools/36.0.0/d8", "d8")
+        jar = self.sdk / "platforms/android-36/android.jar"
+        jar.parent.mkdir(parents=True)
+        jar.write_bytes(b"PK fake")
+        (self.tmp / "home").mkdir()
+        self.env = hermetic_env(str(self.state), fakes_path(str(self.tmp)))
+        self.env.update(HOME=str(self.tmp / "home"), JAVA_HOME=str(self.jdk),
+                        ANDROID_HOME=str(self.sdk), AUTONOM_FAKE_TOOLS_LOG=str(self.log))
+
+    def doctor(self, backend: str, *args: str) -> dict:
+        env = {**self.env, "AUTONOM_ANDROID_UI_BACKEND": backend}
+        result = subprocess.run([sys.executable, str(CLI), "doctor", *args], cwd=ROOT,
+                                env=env, text=True, capture_output=True, check=False,
+                                timeout=120)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def tool_calls(self) -> list[dict]:
+        if not self.log.exists():
+            return []
+        return [json.loads(line) for line in self.log.read_text(encoding="utf-8").splitlines()]
+
+    def test_uiautomator_backend_asks_no_tool(self) -> None:
+        report = self.doctor("uiautomator", "--adb", str(FAKE_ADB))
+        entry = report["capabilities"]["android_helper"]
+        self.assertFalse(entry["ready"])
+        self.assertEqual(entry["backend"], "uiautomator")
+        self.assertIn("AUTONOM_ANDROID_UI_BACKEND=uiautomator", entry["reason"])
+        self.assertNotIn("tools", entry)
+        self.assertEqual(self.tool_calls(), [])
+        self.assertNotIn("android_helper", report["tools"])
+
+    def test_tools_found_then_the_cached_build(self) -> None:
+        report = self.doctor("auto", "--adb", str(FAKE_ADB))
+        entry = report["capabilities"]["android_helper"]
+        self.assertTrue(entry["ready"], entry)
+        self.assertTrue(entry["tools"])
+        self.assertFalse(entry["cached"])
+        self.assertFalse(entry["failed"])
+        self.assertRegex(entry["build"], r"^[0-9a-f]{16}$")
+        self.assertEqual(entry["javac"], str(self.jdk / "bin/javac"))
+        self.assertEqual(entry["d8"], str(self.sdk / "build-tools/36.0.0/d8"))
+        # doctor asked the versions and built nothing
+        self.assertEqual(sorted(call["argv"][0] for call in self.tool_calls()),
+                         ["--version", "-version"])
+        # javac and d8 are never doctor `tools`: --strict is unchanged
+        self.assertEqual(set(report["tools"]),
+                         {"adb", "simctl", "idb", "idb_companion", "mitmdump"})
+
+        from autonom_lib import android_helper_build  # noqa: PLC0415
+        built = android_helper_build.ensure(env=self.env)
+        self.assertTrue(built.ok, built.reason)
+        entry = self.doctor("auto", "--adb", str(FAKE_ADB))["capabilities"]["android_helper"]
+        self.assertTrue(entry["cached"])
+        self.assertEqual(entry["build"], built.build_id)
+
+    def test_no_adb_is_not_ready_even_with_the_tools(self) -> None:
+        entry = self.doctor("auto")["capabilities"]["android_helper"]
+        self.assertTrue(entry["tools"])
+        self.assertFalse(entry["ready"])
+        self.assertEqual(entry["reason"], "adb not found")
+
+    def test_missing_javac_is_named_with_a_hint(self) -> None:
+        del self.env["JAVA_HOME"]
+        entry = self.doctor("auto", "--adb", str(FAKE_ADB))["capabilities"]["android_helper"]
+        self.assertFalse(entry["ready"])
+        self.assertFalse(entry["tools"])
+        self.assertEqual(entry["reason"], "javac not found")
+        self.assertIn("JDK", entry["hint"])
+        self.assertEqual(self.tool_calls(), [])
+
+    def test_an_unknown_backend_value_is_a_warning(self) -> None:
+        report = self.doctor("sometimes", "--adb", str(FAKE_ADB))
+        self.assertTrue(report["ok"])
+        warning = next(w for w in report["warnings"]
+                       if w["code"] == "invalid_android_ui_backend")
+        self.assertEqual(warning["variable"], "AUTONOM_ANDROID_UI_BACKEND")
+        self.assertEqual(report["capabilities"]["android_helper"]["backend"], "auto")
 
 
 class XcodeSimulatorKitTests(unittest.TestCase):

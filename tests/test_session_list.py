@@ -10,7 +10,9 @@ Everything runs against the fake adb in a private AUTONOM_HOME:
 - target flags filter by string, without any device call;
 - `--session-id <stopped>` is accepted (a read-only verb);
 - `--label` is validated, and `--la` still reaches `--launch`;
-- a v1 record lists with `label: null`.
+- a v1 record lists with `label: null` and `profile: "default"`;
+- every entry carries `profile` (CO-01): `default` for a session started
+  without `--profile` or written before profiles existed.
 """
 from __future__ import annotations
 
@@ -42,8 +44,9 @@ try:
 except ImportError:  # direct `python3 -m unittest tests.test_...` runs
     from tests.env_isolation import EnvSandboxMixin  # noqa: E402
 
+# `profile` is on every entry (CO-01), default sessions and older records too.
 ENTRY_KEYS = ["session_id", "platform", "target_id", "label", "started_at",
-              "stopped_at", "started_by", "current", "live"]
+              "stopped_at", "started_by", "current", "live", "profile"]
 
 
 class SessionListCase(EnvSandboxMixin, unittest.TestCase):
@@ -133,6 +136,8 @@ class TwoSessionsTests(SessionListCase):
         second = entries[self.second["session_id"]]
         self.assertEqual((first["platform"], first["target_id"], first["label"]),
                          ("android", FIRST, "checkout bug"))
+        # CO-01-S01: started without --profile, listed as `default`
+        self.assertEqual((first["profile"], second["profile"]), ("default", "default"))
         self.assertEqual((second["target_id"], second["label"]), (SECOND, "canvas tile"))
         self.assertTrue(first["current"])
         self.assertFalse(second["current"])
@@ -253,6 +258,9 @@ class EmptyStoreTests(SessionListCase):
         self.assertEqual(entry["target_id"], record["serial"])
         self.assertIsNone(entry["started_by"])
         self.assertTrue(entry["current"] and entry["live"])
+        # written before profiles existed: no `profile` key, listed `default`
+        self.assertNotIn("profile", record)
+        self.assertEqual(entry["profile"], "default")
 
         everything = self.session_list("--all")
         self.assertEqual(everything["sessions"], payload["sessions"])
@@ -273,7 +281,7 @@ class EmptyStoreTests(SessionListCase):
             "session_id": record["session_id"], "platform": "android",
             "target_id": record["serial"], "label": None,
             "started_at": record["started_at"], "stopped_at": "2026-01-15T10:00:00Z",
-            "started_by": None, "current": False, "live": False}])
+            "started_by": None, "current": False, "live": False, "profile": "default"}])
         self.assertEqual(session_mod.list_sessions(), ([], []))
 
 
