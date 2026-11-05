@@ -37,6 +37,7 @@ export const REMOTE_SERVER_PATH = `/data/local/tmp/autonom-scrcpy-${SCRCPY_PROTO
 export const SERVER_CLASS = "com.genymobile.scrcpy.Server";
 
 export const CONNECT_TIMEOUT_MS = 10_000;
+const CONTROL_ONLY_CONNECT_TIMEOUT_MS = 60_000;
 export const RESTART_MIN_MS = 1000;
 export const RESTART_MAX_MS = 10_000;
 export const HEALTHY_STREAM_MS = 30_000;
@@ -47,6 +48,8 @@ const CONNECT_ATTEMPT_MS = 2000;
 // Before killing it, give the adb shell child time to exit by itself once its sockets close.
 const CHILD_EXIT_GRACE_MS = 1000;
 const ADB_COMMAND_TIMEOUT_MS = 2000;
+// A one-shot pinch has no streaming deadline and must tolerate a busy emulator.
+const CONTROL_ONLY_ADB_TIMEOUT_MS = 10_000;
 const PUSH_TIMEOUT_MS = 30_000;
 // The encoder list takes about 0.3 s on an emulator; past this bound the Canvas streams
 // without it (the size it uses when it cannot tell).
@@ -238,7 +241,13 @@ class ByteQueue {
   }
 }
 
-function serverCommand({ version, scid, maxSize, bitRate, maxFps }) {
+function serverCommand({ version, scid, maxSize, bitRate, maxFps, controlOnly, remotePath }) {
+  if (controlOnly) return [
+    `CLASSPATH=${remotePath}`, "app_process", "/", SERVER_CLASS, version,
+    `scid=${scid}`, "log_level=info", "tunnel_forward=true", "audio=false", "video=false",
+    // No display or power settings are changed; this owner removes its own JAR.
+    "control=true", "cleanup=false", "send_device_meta=false", "clipboard_autosync=false",
+  ].join(" ");
   return [
     `CLASSPATH=${REMOTE_SERVER_PATH}`, "app_process", "/", SERVER_CLASS, version,
     `scid=${scid}`, "log_level=info", "tunnel_forward=true", "audio=false", "control=true",
@@ -297,12 +306,13 @@ export class ScrcpySession extends EventEmitter {
     chooseMaxFps = null,
     bitRate,
     maxFps,
+    controlOnly = false,
     exec = defaultExec,
     spawn = nodeSpawn,
     connect = nodeConnect,
   }) {
     super();
-    this.#options = { adbPath, serial, serverPath, version, maxSize, chooseMaxSize, chooseMaxFps, bitRate, maxFps };
+    this.#options = { adbPath, serial, serverPath, version, maxSize, chooseMaxSize, chooseMaxFps, bitRate, maxFps, controlOnly };
     this.#exec = exec;
     this.#spawn = spawn;
     this.#connect = connect;
@@ -414,6 +424,10 @@ export class ScrcpySession extends EventEmitter {
     return this.#exec(adbPath, ["-s", serial, ...args], { timeout });
   }
 
+  #adbCommandTimeout() {
+    return this.#options.controlOnly ? CONTROL_ONLY_ADB_TIMEOUT_MS : ADB_COMMAND_TIMEOUT_MS;
+  }
+
   async #run() {
     const attempt = {
       id: ++this.#attemptCount,
@@ -439,8 +453,10 @@ export class ScrcpySession extends EventEmitter {
   }
 
   async #open(attempt) {
-    const { serverPath, version, chooseMaxSize, chooseMaxFps, bitRate } = this.#options;
-    await this.#adb(["push", serverPath, REMOTE_SERVER_PATH], PUSH_TIMEOUT_MS);
+    const { serverPath, version, chooseMaxSize, chooseMaxFps, bitRate, controlOnly } = this.#options;
+    attempt.remotePath = controlOnly ? `/data/local/tmp/autonom-pinch-${attempt.scid}.jar` : REMOTE_SERVER_PATH;
+    attempt.pushing = this.#adb(["push", serverPath, attempt.remotePath], PUSH_TIMEOUT_MS);
+    await attempt.pushing;
     this.#checkAttempt(attempt);
     let { maxSize, maxFps } = this.#options;
     if (chooseMaxSize || chooseMaxFps) {
@@ -459,7 +475,8 @@ export class ScrcpySession extends EventEmitter {
 
     const { adbPath, serial } = this.#options;
     const child = this.#spawn(adbPath, [
-      "-s", serial, "shell", serverCommand({ version, scid: attempt.scid, maxSize, bitRate, maxFps }),
+      "-s", serial, "shell", serverCommand({ version, scid: attempt.scid, maxSize, bitRate, maxFps,
+                                             controlOnly, remotePath: attempt.remotePath }),
     ], { stdio: ["ignore", "pipe", "pipe"] });
     attempt.child = child;
     const keepLog = (chunk) => {
@@ -485,6 +502,14 @@ export class ScrcpySession extends EventEmitter {
     });
 
     const { socket: video, rest } = await this.#connectVideo(attempt);
+    if (controlOnly) {
+      attempt.control = this.#adopt(attempt, video);
+      this.#readControl(attempt);
+      if (rest.length) attempt.control.emit("data", rest);
+      attempt.control.resume();
+      this.#streaming();
+      return;
+    }
     attempt.video = this.#adopt(attempt, video);
     // The server accepts the control socket right after the video one, then sends meta.
     attempt.control = this.#adopt(attempt, await this.#connectSocket(attempt, CONNECT_ATTEMPT_MS));
@@ -494,7 +519,7 @@ export class ScrcpySession extends EventEmitter {
 
   async #forward(attempt) {
     const { stdout } = await this.#adb(
-      ["forward", "tcp:0", `localabstract:scrcpy_${attempt.scid}`], ADB_COMMAND_TIMEOUT_MS);
+      ["forward", "tcp:0", `localabstract:scrcpy_${attempt.scid}`], this.#adbCommandTimeout());
     const port = Number(String(stdout).trim());
     if (!Number.isInteger(port) || port < 1 || port > 65535) {
       throw new Error(`adb forward did not report a port: ${String(stdout).trim()}`);
@@ -509,13 +534,14 @@ export class ScrcpySession extends EventEmitter {
    */
   async #listedForwards(attempt) {
     try {
-      const { stdout } = await this.#adb(["forward", "--list"], ADB_COMMAND_TIMEOUT_MS);
+      const { stdout } = await this.#adb(["forward", "--list"], this.#adbCommandTimeout());
       const remote = `localabstract:scrcpy_${attempt.scid}`;
       return String(stdout).split(/\r?\n/)
         .map((line) => line.trim().split(/\s+/))
         .filter((parts) => parts.length >= 3 && parts[2] === remote && /^tcp:\d+$/.test(parts[1]))
         .map((parts) => parts[1]);
-    } catch {
+    } catch (error) {
+      if (this.#options.controlOnly) throw error;
       return [];
     }
   }
@@ -561,7 +587,8 @@ export class ScrcpySession extends EventEmitter {
    * closes it, so only the server's dummy byte proves the tunnel is up.
    */
   async #connectVideo(attempt) {
-    const deadline = performance.now() + CONNECT_TIMEOUT_MS;
+    const timeoutMs = this.#options.controlOnly ? CONTROL_ONLY_CONNECT_TIMEOUT_MS : CONNECT_TIMEOUT_MS;
+    const deadline = performance.now() + timeoutMs;
     let lastError = null;
     while (performance.now() < deadline) {
       this.#checkAttempt(attempt);
@@ -574,7 +601,7 @@ export class ScrcpySession extends EventEmitter {
       await sleep(CONNECT_RETRY_MS);
     }
     const tail = attempt.log.trim();
-    throw new Error(`scrcpy-server did not accept a connection within ${CONNECT_TIMEOUT_MS / 1000} s` +
+    throw new Error(`scrcpy-server did not accept a connection within ${timeoutMs / 1000} s` +
       `${tail ? `: ${tail}` : lastError ? `: ${lastError.message}` : ""}`);
   }
 
@@ -709,6 +736,12 @@ export class ScrcpySession extends EventEmitter {
     attempt.error = error;
     if (this.#stopped) return;
     if (this.listenerCount("error")) this.emit("error", error);
+    // A one-shot input must never reconnect and continue half a gesture.
+    if (this.#options.controlOnly) {
+      this.#setState("failed");
+      this.#teardown(attempt).catch(() => {}); // stop() still reports cleanup failure to the owner
+      return;
+    }
     const streamedMs = this.#streamingSince ? performance.now() - this.#streamingSince : 0;
     const { delay, next } = restartDelay(this.#backoff, streamedMs);
     this.#backoff = next;
@@ -730,6 +763,9 @@ export class ScrcpySession extends EventEmitter {
     if (!attempt || attempt.torndown) return attempt?.torndown;
     attempt.done = true;
     attempt.torndown = (async () => {
+      // A cancelled control-only start must not remove the JAR while adb is still
+      // pushing it: the push could recreate the file after cleanup finished.
+      if (this.#options.controlOnly && attempt.pushing) await attempt.pushing.catch(() => {});
       attempt.video?.destroy();
       attempt.control?.destroy();
       const child = attempt.child;
@@ -741,20 +777,37 @@ export class ScrcpySession extends EventEmitter {
         }
       }
       let forwards = [];
+      let forwardLookupError = null;
       if (attempt.forwarding) {
         // `adb forward tcp:0` may still be running: its port is only known once it answers.
         const port = await attempt.forwarding.catch(() => null);
-        forwards = port ? [`tcp:${port}`] : await this.#listedForwards(attempt);
+        try {
+          forwards = port ? [`tcp:${port}`] : await this.#listedForwards(attempt);
+        } catch (error) {
+          forwardLookupError = error;
+        }
       }
       const cleanups = forwards.map((local) =>
-        this.#adb(["forward", "--remove", local], ADB_COMMAND_TIMEOUT_MS));
+        this.#adb(["forward", "--remove", local], this.#adbCommandTimeout()));
+      const checkedCleanups = cleanups.length;
       if (child) {
         // A server that never saw its sockets connect waits in accept() forever. The
         // bracket keeps this pattern from matching the shell that runs pkill itself.
         const pattern = `scid=[${attempt.scid[0]}]${attempt.scid.slice(1)}`;
-        cleanups.push(this.#adb(["shell", `pkill -f '${pattern}'`], ADB_COMMAND_TIMEOUT_MS));
+        cleanups.push(this.#adb(["shell", `pkill -f '${pattern}'`], this.#adbCommandTimeout()));
       }
-      await Promise.allSettled(cleanups);
+      const remoteCleanupIndex = cleanups.length;
+      if (this.#options.controlOnly && attempt.remotePath) {
+        cleanups.push(this.#adb(["shell", "rm", "-f", attempt.remotePath], this.#adbCommandTimeout()));
+      }
+      const results = await Promise.allSettled(cleanups);
+      if (this.#options.controlOnly) {
+        if (forwardLookupError) throw new Error(`scrcpy cleanup failed: ${forwardLookupError.message}`);
+        const checked = results.slice(0, checkedCleanups);
+        if (attempt.remotePath) checked.push(results[remoteCleanupIndex]);
+        const failed = checked.find((result) => result.status === "rejected");
+        if (failed) throw new Error(`scrcpy cleanup failed: ${failed.reason?.message ?? failed.reason}`);
+      }
     })();
     return attempt.torndown;
   }

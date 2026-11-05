@@ -17,7 +17,7 @@ python3 -m compileall -q scripts tests plugins/autonom/skills integrations
 
 while IFS= read -r -d '' module; do
   node --check "$module"
-done < <(find plugins tests integrations -type f -name '*.mjs' -print0)
+done < <(find scripts plugins tests integrations -type f -name '*.mjs' -print0)
 
 # One module per process, in parallel, each with its own AUTONOM_HOME and a
 # stdin that claims to be a TTY and raises on read (the tty_guard contract),
