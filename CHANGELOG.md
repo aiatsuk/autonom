@@ -9,6 +9,21 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
 
 ### Added
 
+- **Opt-in macOS hardware video for the Android Canvas.** With an emulator
+  listed in `~/.config/autonom/host-video.json` (AVD, serial, gRPC port),
+  `autonom devices boot` starts that AVD with `-grpc <port> -grpc-use-token`
+  (an emulator-control endpoint on loopback, token-protected), and Canvas
+  captures its frames over that endpoint and encodes them with VideoToolbox
+  on the Mac instead of on the device. A failed preparation or a capture
+  that stops falls back to the Android encoder for that session. Frame size
+  and rotation changes recreate the encoder. Optional `"manageCutout": true`
+  hides the emulator's own cutout drawing (root, one resource overlay) from
+  the first capture until the device detaches, Canvas stops or host capture
+  is turned off for the session. On macOS a malformed config file makes
+  `devices boot` refuse until it is fixed or removed; without the file
+  nothing changes. Measured about 53 fps while scrolling, not yet 60; a
+  focus-profile switch can briefly restart control and refuse the first
+  tap. See `docs/canvas-host-video.md`.
 - **`ui pinch` on Android and iOS.** `autonom ui pinch --at X,Y --scale S
   [--duration SECONDS]` sends a real two-finger pinch: through a short-lived
   scrcpy control session on Android (scrcpy 4.1 and Node.js) and idb's

@@ -1,3 +1,4 @@
+import { prepareHostVideo, CaptureDecorations } from "./host-video.mjs";
 /** One device's transports, input, authentication and lifecycle inside the Canvas. */
 import { mkdtempSync, rmSync } from "node:fs";
 import {
@@ -446,7 +447,8 @@ async function closeDevice(context) {
   // The tools process and the log feed go with it: no orphans. A held control lease is
   // handed back first, through the bridge, while it still runs (bounded, 6.4).
   await Promise.race([
-    Promise.all([releaseLeaseOnClose(context), stopSession(context), restoreDisplay(context),
+    Promise.all([releaseLeaseOnClose(context),
+      stopSession(context).then(() => context.hostDecorations?.restore()).catch(() => {}), restoreDisplay(context),
       restoreDeviceRotation(context), context.tools.close()]),
     sleep(SHUTDOWN_STOP_MS),
   ]);
@@ -992,11 +994,14 @@ function scrcpyStatus(context) {
     // The size asked of scrcpy-server (0 is native) and why: "explicit" (--max-size),
     // "encoder" (the encoder named) or "default" (the encoders could not be read); all
     // null until the first session has chosen, and while scrcpy is not the transport.
-    max_size: scrcpySize?.maxSize ?? null,
+    max_size: stats?.maxSize ?? scrcpySize?.maxSize ?? null,
     max_fps: stats?.maxFps ?? null,
+    video_backend: stats?.videoBackend ?? "android",
+    host_fallback: stats?.hostFallback ?? null,
+    host_capture: stats?.hostCapture ?? null,
     max_size_source: scrcpySize?.source ?? null,
-    encoder: scrcpySize?.encoder ?? null,
-    encoder_name: scrcpySize?.encoderName ?? null,
+    encoder: stats?.videoBackend === "videotoolbox" ? "hardware" : scrcpySize?.encoder ?? null,
+    encoder_name: stats?.videoBackend === "videotoolbox" ? "VideoToolbox" : scrcpySize?.encoderName ?? null,
     width: context.video.size?.width ?? null,
     height: context.video.size?.height ?? null,
     packets: stats?.packets ?? 0,
@@ -2305,6 +2310,12 @@ function ensureSession(context) {
       },
     })
     : new ScrcpySession({
+      hostFactory: opts => prepareHostVideo({ ...opts,
+        decorations: context.hostDecorations ??= new CaptureDecorations(),
+        orientation: async () => { context.hostRotation = await currentDeviceRotation(context); },
+        geometry: () => context.displayWm ? { ...context.displayWm, rotation: context.hostRotation } : null }),
+      // Host capture is off for this session from here on: the cutout override goes too.
+      onHostDisabled: () => { context.hostDecorations?.restore().catch(() => {}); },
       adbPath,
       serial,
       serverPath: scrcpy.serverPath,
@@ -3911,6 +3922,7 @@ async function changeDeviceRotation(context, client) {
       if (context.shuttingDown) throw inputError(503, "Canvas is stopping");
       if (await currentDeviceRotation(context) === rotation) {
         if (context.shuttingDown) throw inputError(503, "Canvas is stopping");
+        context.hostRotation = rotation;
         journal(context, client, { kind: "system", op: "rotate" });
         return { rotation };
       }
@@ -5086,6 +5098,7 @@ async function changeDisplay(context, preset, origin, client) {
       await context.displayChrome.apply(preset.id, () => {
         if (context.shuttingDown) throw new Error("Canvas is stopping");
       });
+      await context.hostDecorations?.refresh();
     } catch (error) {
       const failures = [`Display artwork: ${adbFailure(error)}`];
       try { await context.displayChrome.restore(); }

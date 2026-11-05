@@ -25,6 +25,7 @@ from typing import Any, Callable, Iterator
 from . import adb as adb_mod
 from . import errors
 from . import emulator_launch
+from . import host_video
 from . import processes
 
 try:  # POSIX (macOS, Linux: every platform Autonom runs on); absent on Windows
@@ -425,6 +426,9 @@ def _boot_locked(emulator_bin: str, adb_path: str, name: str, *, wait: bool,
         return {"avd": name, "pid": None, "booted": False, "waited": False,
                 "already_running": True, "serial": serial, "target_id": serial,
                 "port": _port_of(serial)}
+    host_capture = host_video.configured_device(name, port)
+    if host_capture:
+        port = host_capture["port"]
     listed = adb_mod.list_devices(adb_path)
     before = {device.serial for device in listed}
     if port is not None:
@@ -448,6 +452,10 @@ def _boot_locked(emulator_bin: str, adb_path: str, name: str, *, wait: bool,
         # change. It cannot be injected into a running emulator.
         routed_hostport = _proxy_hostport(http_proxy)
         argv += ["-http-proxy", _emulator_proxy_url(http_proxy)]
+    if host_capture:
+        if not _loopback_port_free(host_capture["grpcPort"]):
+            raise _port_unavailable(host_capture["grpcPort"], "configured host-video port is in use")
+        argv += ["-grpc", str(host_capture["grpcPort"]), "-grpc-use-token"]
     child = emulator_launch.start(argv)
     # Owned by the harness, not by a session: `devices boot` has no session
     # directory to point at, and an entry without one used to be classified
