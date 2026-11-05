@@ -9,12 +9,17 @@ const request = { platform: "android", target: "emulator-5554", adb: "adb", x: 2
   width: 400, height: 800, radius: 80, scale: 2, duration: 0.1 };
 
 class FakeSession extends EventEmitter {
-  constructor({ failAt = 0, failStart = false } = {}) {
-    super(); this.failAt = failAt; this.failStart = failStart; this.events = []; this.stopped = false;
+  constructor({ failAt = 0, failStart = false, failOnce = false } = {}) {
+    super(); this.failAt = failAt; this.failStart = failStart; this.failOnce = failOnce;
+    this.events = []; this.stopped = false; this.failed = false;
   }
   async start() { if (this.failStart) throw new Error("startup failed"); }
   send(bytes, done) {
-    if (this.events.length === this.failAt && this.failAt) return false;
+    if (this.events.length === this.failAt && this.failAt && !(this.failOnce && this.failed)) {
+      this.failed = true;
+      return false;
+    }
+    if (this.stopped) return false;
     this.events.push({ action: bytes.readUInt8(1), id: Number(bytes.readBigUInt64BE(2)),
       x: bytes.readInt32BE(10), y: bytes.readInt32BE(14),
       width: bytes.readUInt16BE(18), height: bytes.readUInt16BE(20) });
@@ -54,6 +59,17 @@ test("Android failures clean up and do not replay the gesture", async () => {
   await assert.rejects(performAndroid(request, androidDeps(before)),
     (error) => error.code === "backend_failed" && error.extra.sent === false);
   assert.equal(before.stopped, true);
+});
+
+test("Android lifts both fingers when a move fails, before stopping the transport", async () => {
+  const session = new FakeSession({ failAt: 3, failOnce: true });
+  await assert.rejects(performAndroid(request, androidDeps(session)),
+    (error) => error.code === "ui_action_uncertain" && error.extra.sent === true);
+  // two downs, one move, then the failed move; the release sends one up per finger
+  assert.deepEqual(session.events.map(({ action, id }) => [action, id]),
+    [[0, 1], [0, 2], [2, 1], [1, 1], [1, 2]]);
+  assert.equal(session.events.at(-1).x > 200, true);
+  assert.equal(session.stopped, true);
 });
 
 test("Android missing scrcpy is a structured refusal before starting anything", async () => {

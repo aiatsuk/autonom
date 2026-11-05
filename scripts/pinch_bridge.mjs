@@ -104,7 +104,17 @@ export async function performAndroid(request, dependencies = {}) {
   const create = dependencies.createSession ?? ((options) => new ScrcpySession(options));
   const session = create({ adbPath: request.adb, serial: request.target, serverPath: server.serverPath,
                            version: server.version, controlOnly: true });
-  activeCleanup = () => session.stop();
+  // Fingers that are down (pointer id -> last x). A failure or an interrupt
+  // after the downs lifts them before the transport stops, so no finger is
+  // left pressed on the device.
+  const down = new Map();
+  const release = async () => {
+    for (const [pointer, x] of [...down]) {
+      down.delete(pointer);
+      try { await writeTouch(session, touch(request, 1, pointer, x)); } catch { /* best effort */ }
+    }
+  };
+  activeCleanup = async () => { await release(); await session.stop(); };
   const sleep = dependencies.delay ?? delay;
   let sent = false;
   // An EventEmitter error between writes must not crash the process.
@@ -116,6 +126,7 @@ export async function performAndroid(request, dependencies = {}) {
       if (failure) throw failure;
       // Mark uncertainty immediately before handing bytes to the socket.
       sent = true;
+      if (action === 1) down.delete(pointer); else down.set(pointer, x);
       await writeTouch(session, touch(request, action, pointer, x));
     };
     await write(0, 1, request.x - request.radius);
@@ -135,6 +146,7 @@ export async function performAndroid(request, dependencies = {}) {
     if (failure) throw failure;
     return "scrcpy";
   } catch (error) {
+    if (!failure) await release();
     if (sent) throw new PinchError("ui_action_uncertain", `Android pinch may have been sent: ${error.message}`,
       "Inspect the screen before repeating the gesture.", { sent: true });
     throw new PinchError("backend_failed", `Could not start Android pinch: ${error.message}`,
