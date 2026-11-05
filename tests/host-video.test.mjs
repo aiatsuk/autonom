@@ -171,3 +171,13 @@ test("late transport errors after normal stop do not invalidate the decoration l
  const stop=host.stop();host.abort();host.child.stdin.emit("error",Error("closed transport"));
  release();await stop;assert.notEqual(failed,true);
 });
+
+test("stop resolves when the cutout restore fails, so session teardown continues",async()=>{
+  const lease=new CaptureDecorations();
+  const host=new HostVideo({binary:"/bin/cat",maxFps:60,bitRate:12000000,port:1,token:"x",maxSize:0,
+    decorate:()=>lease.acquire(async()=>async()=>{throw new Error("adb overlay disable failed")})});
+  await host.setup;host.abort();
+  const errors=[],original=console.error;console.error=(...args)=>errors.push(args.join(" "));
+  try{await host.stop();}finally{console.error=original;}
+  assert.match(errors.join("\n"),/restore failed/);
+});

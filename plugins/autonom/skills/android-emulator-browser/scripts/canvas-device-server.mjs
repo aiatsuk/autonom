@@ -448,7 +448,7 @@ async function closeDevice(context) {
   // handed back first, through the bridge, while it still runs (bounded, 6.4).
   await Promise.race([
     Promise.all([releaseLeaseOnClose(context),
-      stopSession(context).then(() => context.hostDecorations?.restore()), restoreDisplay(context),
+      stopSession(context).then(() => context.hostDecorations?.restore()).catch(() => {}), restoreDisplay(context),
       restoreDeviceRotation(context), context.tools.close()]),
     sleep(SHUTDOWN_STOP_MS),
   ]);
@@ -2314,6 +2314,8 @@ function ensureSession(context) {
         decorations: context.hostDecorations ??= new CaptureDecorations(),
         orientation: async () => { context.hostRotation = await currentDeviceRotation(context); },
         geometry: () => context.displayWm ? { ...context.displayWm, rotation: context.hostRotation } : null }),
+      // Host capture is off for this session from here on: the cutout override goes too.
+      onHostDisabled: () => { context.hostDecorations?.restore().catch(() => {}); },
       adbPath,
       serial,
       serverPath: scrcpy.serverPath,

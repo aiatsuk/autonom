@@ -312,10 +312,10 @@ export class HostVideo {
     this.child.stdin.destroy();this.child.kill("SIGTERM");
     const timer=setTimeout(()=>this.child.kill("SIGKILL"),1000);timer.unref();
     this.exit.finally(()=>clearTimeout(timer));
-    this.stopping=Promise.all([this.exit,this.setup]).then(()=>this.restore?.(this.failed));
-    // Preserve rejection for the session teardown, but avoid an unhandled rejection
-    // when stop originated from the helper's exit event.
-    this.stopping.catch(()=>{console.error("Host capture decoration restore failed");});
+    // Always resolves: a failed decoration restore is logged, never thrown into the
+    // session teardown (which must still end adb, the forward and the server).
+    this.stopping=Promise.all([this.exit,this.setup]).then(()=>this.restore?.(this.failed))
+      .catch(()=>{console.error("Host capture decoration restore failed");});
     return this.stopping;
   }
 }

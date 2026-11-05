@@ -303,9 +303,10 @@ export class ScrcpySession extends EventEmitter {
     spawn = nodeSpawn,
     connect = nodeConnect,
     hostFactory = null,
+    onHostDisabled = null,
   }) {
     super();
-    this.#options = { adbPath, serial, serverPath, version, maxSize, chooseMaxSize, chooseMaxFps, bitRate, maxFps, hostFactory };
+    this.#options = { adbPath, serial, serverPath, version, maxSize, chooseMaxSize, chooseMaxFps, bitRate, maxFps, hostFactory, onHostDisabled };
     this.#exec = exec;
     this.#spawn = spawn;
     this.#connect = connect;
@@ -468,6 +469,7 @@ export class ScrcpySession extends EventEmitter {
       } catch {
         this.#hostDisabled = true;
         this.#hostFallback = "Host capture preparation failed; using Android encoder";
+        this.#options.onHostDisabled?.();
       }
       this.#checkAttempt(attempt);
     }
@@ -766,6 +768,7 @@ export class ScrcpySession extends EventEmitter {
     if (attempt.hostStart) {
       this.#hostDisabled = true;
       this.#hostFallback = "Host capture stopped; using Android encoder";
+      this.#options.onHostDisabled?.();
     }
     if (this.#stopped) return;
     attempt.host?.abort?.();
@@ -793,7 +796,7 @@ export class ScrcpySession extends EventEmitter {
     attempt.torndown = (async () => {
       attempt.video?.destroy();
       attempt.control?.destroy();
-      if (attempt.host) await attempt.host.stop();
+      if (attempt.host) await attempt.host.stop().catch(() => {});
       const child = attempt.child;
       if (child && !attempt.exited) {
         // The server ends by itself once its sockets close; the adb child follows.
