@@ -7,6 +7,8 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
 
 ## [Unreleased]
 
+## [0.37.0] - 2026-11-05
+
 ### Added
 - **Agent profile.** `autonom session start --profile agent` stores the
   profile in the session record (`session show` reports it; `session list`
@@ -247,6 +249,30 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
   temporary home at the end, and `--help` touches no device.
 
 ### Changed
+- **Canvas workspace tiles keep the device page's controls.** Each tile has
+  its own Settings and Inspector again; Capture keeps screenshots, recording
+  and the gallery, and input, clipboard paste and device actions sit in
+  Inspector. Theme and display are grouped in general settings. The network
+  inspector shows Pretty and Raw bodies and copies a complete redacted body
+  (previews stay redacted and capped at 2 KB; full redacted bodies up to
+  4 MiB are kept privately with the session's artifacts).
+- **Original device frames.** Frames use the locally installed Android SDK
+  skins and iOS DeviceKit artwork for the selected model, the same geometry
+  in the preview and in PNG and MP4 exports; missing artwork is reported
+  instead of a generic frame, and no vendor artwork is bundled. A recording
+  keeps the frame it started with.
+- **Lighter Android encoding and recordings.** Software H.264 defaults to a
+  1280 px long side at 30 fps (explicit settings and hardware defaults are
+  kept), and emulator recordings are bounded to a 1280 px long side at
+  4 Mbps.
+- **Steadier Android emulator launch on macOS.** The Canvas starts an
+  emulator as an owned, single-run launchd job with the host GPU and a cold
+  boot, so it no longer inherits a background caller's scheduling policy;
+  the job is removed on shutdown or failure. Linux and the compatibility
+  mode launch directly as before.
+- **Paste into the emulator.** Clipboard text is inserted with one Ctrl+V
+  after the clipboard is acknowledged, keeping queued input in order.
+
 - **`session stop` leaves the daemon's companion alone.** A companion a live
   iOS device daemon started is stopped by the daemon's idle rule; `session
   stop` no longer kills it or names it in `companion_left_running`.
