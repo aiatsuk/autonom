@@ -15,7 +15,10 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
   `idb connect` starts one (the newest when there are several), else runs
   `idb connect` as before. A companion that serves only TCP (`--grpc-port`)
   is not used; when `idb connect` leaves none on a domain socket, the start
-  fails with `companion_start_failed` and a message that says so.
+  fails with `companion_start_failed` and a message that says so. When the
+  `ps` before `idb connect` fails, the companion found after it is used but
+  not owned (idb connect may have reused another session's), so the daemon
+  never stops it.
 
 ## [0.37.0] - 2026-11-05
 

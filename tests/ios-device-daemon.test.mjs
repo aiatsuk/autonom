@@ -779,14 +779,22 @@ process.exit(1);
 
 // `ps -axo comm=` lists a fixed set (plus Device Hub with ps.deviceHub). `ps -axwwo pid=,args=`
 // lists this world's live fake companions as macOS lists a real one (the node interpreter
-// that runs the fake script left out), then ps.extra lines; ps.failArgs makes it fail.
+// that runs the fake script left out), then ps.extra lines; ps.failArgs makes it fail,
+// ps.failArgsFirst makes only the first that many listings fail.
 const FAKE_PS = (paths) => `#!${process.execPath}
 import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 const config = JSON.parse(readFileSync(${JSON.stringify(paths.config)}, "utf8")).ps ?? {};
 const args = process.argv.slice(2);
 if (args.includes("pid=,args=")) {
   if (config.failArgs) process.exit(1);
+  if (config.failArgsFirst) {
+    const counter = ${JSON.stringify(paths.config)} + ".ps-listings";
+    let listings = 0;
+    try { listings = Number(readFileSync(counter, "utf8")) || 0; } catch {}
+    writeFileSync(counter, String(listings + 1));
+    if (listings < config.failArgsFirst) process.exit(1);
+  }
   const companion = ${JSON.stringify(paths.companion)};
   const lines = execFileSync("/bin/ps", ["-axwwo", "pid=,args="], { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 })
     .split("\\n").filter((line) => line.includes(" " + companion + " "))
@@ -1191,6 +1199,42 @@ test("a ps that fails counts as no companion: idb connect runs and, with still n
   assert.equal(world.registry(), null);
   assert.equal(existsSync(daemonPaths(world.paths.base, UDID).daemonLock), false);
   assert.deepEqual(daemonProcesses(world.paths.base), []);
+});
+
+test("a failed first scan never makes a running companion owned: idb connect reuses it, the daemon uses it and leaves it running on stop", async (t) => {
+  const world = harness(t, { ps: { failArgsFirst: 1 } });
+  // Another idb user's companion is running; the daemon's first ps fails (a timeout, say).
+  execFileSync(world.paths.idb, ["connect", UDID], { env: world.env });
+  const [companion] = world.companionPids();
+  assert.ok(pidAlive(companion));
+  const status = await world.start();
+  assert.equal(status.status, "serving");
+  assert.equal(status.companion.pid, companion);
+  assert.equal(status.companion.owned, false, "found only after a failed scan: not owned");
+  assert.deepEqual(world.idbCalls().map((c) => c.argv[0]), ["connect", "connect"], "the daemon ran idb connect, which reused the companion");
+  assert.deepEqual(world.companionPids(), [companion], "no second companion");
+  const log = readFileSync(daemonPaths(world.paths.base, UDID).log, "utf8");
+  assert.equal([...log.matchAll(/"event":"companion_scan_failed"/g)].length, 1);
+  assert.match(log, /"event":"idb_connect","code":0,"ms":\d+,"registered":true/);
+  assert.match(log, new RegExp(`"pid":${companion},"event":"companion_adopted","after":"idb_connect","scan_failed":true`));
+  const stop = await requestDaemon(status.socket, { id: "x", op: "stop" });
+  assert.equal(stop.ok, true);
+  await waitFor(() => !pidAlive(status.pid), { message: "daemon exit" });
+  assert.ok(pidAlive(companion), "the companion it did not start keeps running");
+  assert.equal(world.idbCalls().filter((c) => c.argv[0] === "disconnect").length, 0);
+});
+
+test("after a failed first scan the companion idb connect started is used but not owned, so it is never stopped", async (t) => {
+  const world = harness(t, { ps: { failArgsFirst: 1 } });
+  const status = await world.start();
+  assert.equal(status.status, "serving");
+  assert.deepEqual(world.companionPids(), [status.companion.pid]);
+  assert.equal(status.companion.owned, false, "whether it was new is unknown: treated as another's");
+  const stop = await requestDaemon(status.socket, { id: "x", op: "stop" });
+  assert.equal(stop.ok, true);
+  await waitFor(() => !pidAlive(status.pid), { message: "daemon exit" });
+  assert.ok(pidAlive(status.companion.pid), "left running rather than risk stopping another session's companion");
+  assert.equal(world.idbCalls().filter((c) => c.argv[0] === "disconnect").length, 0);
 });
 
 // ---------------------------------------------------------------------------
