@@ -86,7 +86,8 @@ import {
   idleLimit,
   inputDurationMs,
   inputWarning,
-  liveCompanionEntry,
+  idbCompanionProcesses,
+  liveIdbCompanion,
   parseNotifyValue,
   parseVersion,
   pidAlive,
@@ -388,15 +389,78 @@ test("inputs are validated before anything is sent", () => {
   }
 });
 
-test("only a live local companion in idb's state is adopted", () => {
-  const entries = [
-    { udid: UDID, is_local: true, pid: 999_999_9, path: "/tmp/idb/dead.sock" },
-    { udid: "OTHER", is_local: true, pid: process.pid, path: "/tmp/idb/other.sock" },
-    { udid: UDID, is_local: false, pid: process.pid, host: "10.0.0.1", port: 10882 },
-  ];
-  assert.equal(liveCompanionEntry(entries, UDID), null);
-  entries.push({ udid: UDID, is_local: true, pid: process.pid, path: "/tmp/idb/live.sock" });
-  assert.deepEqual(liveCompanionEntry(entries, UDID), { pid: process.pid, endpoint: { socketPath: "/tmp/idb/live.sock" } });
+// The process table as `ps -axwwo pid=,args=` prints it: one `<pid> <argv joined by spaces>` per line.
+const IDB_SOCK = `/tmp/idb/${UDID}_companion.sock`;
+const psLine = (pid, args) => `${String(pid).padStart(5)} ${args}`;
+
+test("the companion idb started is found in the process table: exact UDID, domain socket idb's way, idb_companion only", () => {
+  const listing = [
+    psLine(1, "/sbin/launchd"),
+    psLine(11, `/opt/homebrew/bin/idb_companion --udid ${UDID}0 --grpc-domain-sock /tmp/idb/${UDID}0_companion.sock --only simulator`),
+    psLine(12, `/opt/homebrew/bin/idb_companion --udid ${UDID.slice(0, -1)} --grpc-domain-sock /tmp/idb/${UDID.slice(0, -1)}_companion.sock`),
+    psLine(13, `/opt/homebrew/bin/idb_companion --udid OTHER --grpc-domain-sock ${IDB_SOCK}`),
+    psLine(14, `/opt/homebrew/bin/idb_companion --udid ${UDID} --grpc-port 10882 --only simulator`),
+    psLine(15, `/usr/local/bin/not_idb_companion --udid ${UDID} --grpc-domain-sock ${IDB_SOCK}`),
+    psLine(16, `/usr/bin/grep idb_companion --udid ${UDID} --grpc-domain-sock ${IDB_SOCK}`),
+    psLine(17, `/opt/homebrew/bin/idb_companion --udid ${UDID} --grpc-domain-sock /var/folders/x/T/autonom-idb-AbC123/companion.sock --only simulator`),
+    psLine(18, `/opt/homebrew/bin/idb_companion --udid --grpc-domain-sock ${IDB_SOCK}`),
+    psLine(19, `/opt/homebrew/bin/idb_companion --grpc-domain-sock ${IDB_SOCK}`),
+    psLine(20, `/opt/homebrew/bin/idb_companion --udid ${UDID} --grpc-domain-sock`),
+    psLine(21, "(idb_companion)"),
+    psLine(22, `/opt/homebrew/bin/idb_companion --udid ${UDID} --grpc-domain-sock ${IDB_SOCK} --only simulator`),
+  ].join("\n");
+  assert.deepEqual(idbCompanionProcesses(listing, UDID), [{ pid: 22, socketPath: IDB_SOCK }],
+    "only the exact UDID on idb's domain socket; prefixes, other UDIDs, TCP, other executables and the Canvas's own companion do not match");
+  assert.deepEqual(liveIdbCompanion(listing, UDID, { alive: () => true, socketExists: () => true }),
+    { pid: 22, endpoint: { socketPath: IDB_SOCK } });
+  assert.equal(liveIdbCompanion(listing.split("\n").slice(0, -1).join("\n"), UDID, { alive: () => true, socketExists: () => true }),
+    null, "without the last line nothing matches");
+});
+
+test("the companion's executable may sit in a path with spaces; the socket path may too", () => {
+  const exe = "/Users/me/Library/Application Support/idb tools/idb_companion";
+  const spaced = `/private/tmp/idb dir/${UDID}_companion.sock`;
+  const listing = [
+    psLine(31, `${exe} --udid ${UDID} --grpc-domain-sock ${IDB_SOCK} --only simulator --device-set-path /tmp/sets`),
+    psLine(32, `${exe} --udid ${UDID} --grpc-domain-sock ${spaced}`),
+    psLine(33, `/Users/me/idb_companion dir/bin/helper --udid ${UDID} --grpc-domain-sock ${IDB_SOCK}`),
+  ].join("\n");
+  assert.deepEqual(idbCompanionProcesses(listing, UDID), [{ pid: 31, socketPath: IDB_SOCK }, { pid: 32, socketPath: spaced }]);
+});
+
+test("several matching companions: an existing socket file wins, then the highest pid; a gone pid is skipped", () => {
+  const listing = [
+    psLine(40, `/opt/homebrew/bin/idb_companion --udid ${UDID} --grpc-domain-sock /tmp/a/${UDID}_companion.sock`),
+    psLine(41, `/opt/homebrew/bin/idb_companion --udid ${UDID} --grpc-domain-sock /tmp/b/${UDID}_companion.sock`),
+    psLine(42, `/opt/homebrew/bin/idb_companion --udid ${UDID} --grpc-domain-sock /tmp/c/${UDID}_companion.sock`),
+  ].join("\n");
+  const everyAlive = () => true;
+  assert.equal(liveIdbCompanion(listing, UDID, { alive: everyAlive, socketExists: () => true }).pid, 42, "the newest");
+  assert.equal(liveIdbCompanion(listing, UDID, { alive: everyAlive, socketExists: () => false }).pid, 42, "no socket anywhere: still the newest");
+  assert.deepEqual(liveIdbCompanion(listing, UDID, { alive: everyAlive, socketExists: (path) => path.startsWith("/tmp/a/") }),
+    { pid: 40, endpoint: { socketPath: `/tmp/a/${UDID}_companion.sock` } }, "the one whose socket exists");
+  assert.equal(liveIdbCompanion(listing, UDID, { alive: (pid) => pid !== 42, socketExists: () => true }).pid, 41, "pid 42 exited after ps");
+  assert.equal(liveIdbCompanion(listing, UDID, { alive: () => false, socketExists: () => true }), null);
+  // The real checks: a pid that does not exist is skipped.
+  assert.equal(liveIdbCompanion(psLine(999_999_9, `/x/idb_companion --udid ${UDID} --grpc-domain-sock ${IDB_SOCK}`), UDID), null);
+  assert.deepEqual(liveIdbCompanion(psLine(process.pid, `/x/idb_companion --udid ${UDID} --grpc-domain-sock ${IDB_SOCK}`), UDID, { socketExists: () => false }),
+    { pid: process.pid, endpoint: { socketPath: IDB_SOCK } });
+});
+
+test("a malformed or empty process listing finds no companion and never throws", () => {
+  for (const listing of ["", "\n\n", "garbage", "  -5 /x/idb_companion --udid U", "abc /x/idb_companion --udid U",
+    `0 /x/idb_companion --udid ${UDID} --grpc-domain-sock ${IDB_SOCK}`,
+    `99999999999999999999 /x/idb_companion --udid ${UDID} --grpc-domain-sock ${IDB_SOCK}`,
+    `   7`, `7 `, `7 idb_companion`, null, undefined, 42, Buffer.from("x")]) {
+    assert.deepEqual(idbCompanionProcesses(listing, UDID), [], JSON.stringify(String(listing)));
+    assert.equal(liveIdbCompanion(listing, UDID, { alive: () => true, socketExists: () => true }), null);
+  }
+  assert.deepEqual(idbCompanionProcesses(psLine(5, `/x/idb_companion --udid ${UDID} --grpc-domain-sock ${IDB_SOCK}`), ""), []);
+});
+
+test("the daemon reads no file of idb's: no state file path, no AUTONOM_IDB_STATE_FILE", () => {
+  const source = readFileSync(DAEMON_SCRIPT, "utf8");
+  assert.doesNotMatch(source, /idb\/state|IDB_STATE|AUTONOM_IDB_STATE_FILE/);
 });
 
 // ---------------------------------------------------------------------------
@@ -670,7 +734,8 @@ const [command, udid] = args;
 if (command === "connect") {
   if (config.failConnect) process.exit(1);
   if (read().some((entry) => entry.udid === udid && alive(entry.pid))) process.exit(0);
-  const sock = join(${JSON.stringify(paths.sockets)}, "c" + process.pid + ".sock");
+  // Like idb: <dir>/<UDID>_companion.sock (idb uses /tmp/idb).
+  const sock = join(${JSON.stringify(paths.sockets)}, udid + "_companion.sock");
   const child = spawn(${JSON.stringify(paths.companion)}, ["--udid", udid, "--grpc-domain-sock", sock, "--only", "simulator"], {
     detached: true, stdio: ["ignore", "pipe", "ignore"],
   });
@@ -712,9 +777,23 @@ if (args[0] === "simctl" && args[1] === "spawn" && args[3] === "notifyutil" && a
 process.exit(1);
 `;
 
+// `ps -axo comm=` lists a fixed set (plus Device Hub with ps.deviceHub). `ps -axwwo pid=,args=`
+// lists this world's live fake companions as macOS lists a real one (the node interpreter
+// that runs the fake script left out), then ps.extra lines; ps.failArgs makes it fail.
 const FAKE_PS = (paths) => `#!${process.execPath}
+import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 const config = JSON.parse(readFileSync(${JSON.stringify(paths.config)}, "utf8")).ps ?? {};
+const args = process.argv.slice(2);
+if (args.includes("pid=,args=")) {
+  if (config.failArgs) process.exit(1);
+  const companion = ${JSON.stringify(paths.companion)};
+  const lines = execFileSync("/bin/ps", ["-axwwo", "pid=,args="], { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 })
+    .split("\\n").filter((line) => line.includes(" " + companion + " "))
+    .map((line) => { const [, pid, rest] = /^\\s*(\\d+)\\s+(.*)$/.exec(line); return pid + " " + rest.slice(rest.indexOf(companion)); });
+  console.log([...lines, ...(config.extra ?? [])].join("\\n"));
+  process.exit(0);
+}
 const lines = ["/sbin/launchd", "/usr/libexec/logd",
   "/Applications/Xcode.app/Contents/SharedFrameworks/DVTInstrumentsFoundation.framework/Resources/DTServiceHub"];
 if (config.deviceHub) lines.push("/Applications/Xcode.app/Contents/Applications/DeviceHub.app/Contents/MacOS/DeviceHub");
@@ -775,9 +854,10 @@ function daemonProcesses(base) {
 function harness(t, config = {}, { idleMs = 60_000 } = {}) {
   const root = mkdtempSync(join(tmpdir(), "iosd-"));
   const bin = join(root, "bin");
-  const sockets = join(root, "s");
+  // The fake idb puts its companion's socket here as idb does (<UDID>_companion.sock, in
+  // /tmp/idb for the real one): a short directory, so the path fits macOS's 104 bytes.
+  const sockets = mkdtempSync("/tmp/iosd-s-");
   mkdirSync(bin);
-  mkdirSync(sockets);
   const developer = join(root, "Xcode.app", "Contents", "Developer");
   mkdirSync(developer, { recursive: true });
   writeFileSync(join(root, "Xcode.app", "Contents", "version.plist"),
@@ -799,7 +879,7 @@ function harness(t, config = {}, { idleMs = 60_000 } = {}) {
     },
     env: {
       PATH: `${bin}${delimiter}${process.env.PATH}`, HOME: process.env.HOME ?? root, TMPDIR: tmpdir(),
-      AUTONOM_IDB: paths.idb, AUTONOM_IDB_COMPANION_BIN: paths.companion, AUTONOM_IDB_STATE_FILE: paths.state,
+      AUTONOM_IDB: paths.idb, AUTONOM_IDB_COMPANION_BIN: paths.companion,
       AUTONOM_SIMCTL: paths.xcrun, AUTONOM_IOSD_IDLE_MS: String(idleMs), DEVELOPER_DIR: developer,
       CUSTOM_SECRET: "synthetic-secret", [HOST_LOAD_FILE_ENV]: paths.load,
     },
@@ -859,6 +939,7 @@ function harness(t, config = {}, { idleMs = 60_000 } = {}) {
       }
     }
     rmSync(socketPathFor(paths.base, UDID).dir, { recursive: true, force: true });
+    rmSync(sockets, { recursive: true, force: true });
     rmSync(root, { recursive: true, force: true });
   });
   return world;
@@ -1030,7 +1111,7 @@ test("ID-02: idb connect runs under the companion environment allowlist only", a
   assert.ok(!connect.env.includes("AUTONOM_IOSD_IDLE_MS"));
 });
 
-test("ID-02/ID-03: a companion idb already lists is used, not owned, and left running on stop", async (t) => {
+test("ID-02/ID-03: a companion idb already started (found in the process table) is used, not owned, and left running on stop", async (t) => {
   const world = harness(t);
   // Another idb user started the companion first.
   execFileSync(world.paths.idb, ["connect", UDID], { env: world.env });
@@ -1073,6 +1154,43 @@ test("ID-02-S01: a crashed companion is replaced within 6 s, the next tree works
   const statusReply = await connection.request({ op: "status" });
   assert.equal(statusReply.restarts, 1);
   assert.equal(connection.open, true, "the client connection survived the companion restart");
+});
+
+test("the daemon ignores idb's state file, a TCP-only companion and the Canvas's own companion, and starts one with idb connect", async (t) => {
+  const world = harness(t);
+  // A state file that lists a live companion for the UDID: the daemon never reads it.
+  const decoy = join(world.paths.root, "decoy-idb-state.json");
+  writeFileSync(decoy, JSON.stringify([{ udid: UDID, is_local: true, pid: process.pid, path: join(world.paths.root, "decoy.sock") }]));
+  world.env.AUTONOM_IDB_STATE_FILE = decoy;
+  // Live processes (this test runner's pid) with the right UDID that are not idb's companion.
+  world.setConfig({ version: "1.6.4", ax: { AX: SETTINGS, AXBRIDGE: SAFARI_AXBRIDGE }, ps: { extra: [
+    `${process.pid} ${world.paths.companion} --udid ${UDID} --grpc-port 10882 --only simulator`,
+    `${process.pid} ${world.paths.companion} --udid ${UDID} --grpc-domain-sock ${join(world.paths.root, "autonom-idb-x", "companion.sock")}`,
+    `${process.pid} /usr/bin/env --udid ${UDID} --grpc-domain-sock ${join(world.paths.sockets, `${UDID}_companion.sock`)}`,
+  ] } });
+  const status = await world.start();
+  assert.equal(status.status, "serving");
+  assert.equal(status.companion.owned, true);
+  assert.notEqual(status.companion.pid, process.pid);
+  assert.deepEqual(world.companionPids(), [status.companion.pid]);
+  assert.equal(status.companion.socket, join(world.paths.sockets, `${UDID}_companion.sock`));
+  assert.deepEqual(world.idbCalls().map((c) => c.argv[0]), ["connect"]);
+  const log = readFileSync(daemonPaths(world.paths.base, UDID).log, "utf8");
+  assert.match(log, /"event":"idb_connect","code":0,"ms":\d+,"registered":true/);
+  assert.doesNotMatch(log, /companion_adopted/);
+});
+
+test("a ps that fails counts as no companion: idb connect runs and, with still none found, the start fails clearly", async (t) => {
+  const world = harness(t, { ps: { failArgs: true } });
+  await assert.rejects(world.start(), (error) => error instanceof DaemonError && error.code === CODE.DAEMON_START_FAILED
+    && error.extra.reason === "companion_start_failed");
+  assert.deepEqual(world.idbCalls().map((c) => c.argv[0]), ["connect"], "idb connect ran after the failed scan");
+  const log = readFileSync(daemonPaths(world.paths.base, UDID).log, "utf8");
+  assert.equal([...log.matchAll(/"event":"companion_scan_failed"/g)].length, 2, "both scans failed and were logged");
+  assert.match(log, /"event":"idb_connect","code":0,"ms":\d+,"registered":false/);
+  assert.equal(world.registry(), null);
+  assert.equal(existsSync(daemonPaths(world.paths.base, UDID).daemonLock), false);
+  assert.deepEqual(daemonProcesses(world.paths.base), []);
 });
 
 // ---------------------------------------------------------------------------
@@ -2876,7 +2994,8 @@ test("an act whose read fails after the input reports after_send with the input 
 test("a failing idb connect refuses the start with daemon_start_failed and leaves no files", async (t) => {
   const world = harness(t, { idb: { failConnect: true } });
   await assert.rejects(world.start(), (error) => error instanceof DaemonError && error.code === CODE.DAEMON_START_FAILED
-    && error.extra.reason === "companion_start_failed");
+    && error.extra.reason === "companion_start_failed"
+    && /no live idb_companion/.test(error.message) && /--grpc-port/.test(error.message) && error.message.includes(`idb connect ${UDID}`));
   assert.equal(world.registry(), null);
   assert.equal(existsSync(socketPathFor(world.paths.base, UDID).dir), false);
   assert.equal(existsSync(daemonPaths(world.paths.base, UDID).daemonLock), false);
