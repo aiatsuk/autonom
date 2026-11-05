@@ -88,6 +88,20 @@ IOS_DAEMON_CODES = {
     "DAEMON_UNREACHABLE": "daemon_unreachable",
 }
 NEW_CODES.update(IOS_DAEMON_CODES)
+# Android helper round (Run 2): the host client of the on-device helper.
+ANDROID_HELPER_CODES = {
+    "ANDROID_HELPER_UNAVAILABLE": "android_helper_unavailable",
+}
+NEW_CODES.update(ANDROID_HELPER_CODES)
+ANDROID_HELPER_SECTION = "### Android helper: lifecycle and `ui helper` (Unreleased)"
+
+# Android typing round (Run 2, AT-01..AT-03): Unicode typing and `ui fill`.
+ANDROID_TEXT_CODES = {
+    "TEXT_NOT_TYPABLE": "text_not_typable",
+    "FILL_TARGET_MISMATCH": "fill_target_mismatch",
+}
+NEW_CODES.update(ANDROID_TEXT_CODES)
+ANDROID_TEXT_SECTION = "### Android typing, `ui fill` and key names (Unreleased)"
 
 EXISTING_CODES = {
     "FLOW_NOT_FOUND": "flow_not_found",
@@ -188,6 +202,46 @@ class AdditiveErrorCodeTests(unittest.TestCase):
         self.assertNotIn("No `error_code` is added", section)
         self.assertIn("`interrupted`", text.split("## Response shape", 1)[0],
                       "the Error codes list names the round")
+
+    def test_compatibility_records_the_android_helper_code(self) -> None:
+        text = (ROOT / "docs/COMPATIBILITY.md").read_text(encoding="utf-8")
+        parts = text.split(ANDROID_HELPER_SECTION, 1)
+        self.assertEqual(len(parts), 2, "COMPATIBILITY.md has no Android helper section")
+        section = parts[1].split("\n### ", 1)[0]
+        for name, value in ANDROID_HELPER_CODES.items():
+            with self.subTest(code=name):
+                self.assertIn(f"| `{value}` |", section)
+        rows = [line for line in section.splitlines() if line.startswith("| ")]
+        for surface in ("| `ui helper status\\|stop`", "| `session stop` (Android)",
+                        "| `doctor` `capabilities`"):
+            with self.subTest(surface=surface):
+                self.assertTrue(any(row.startswith(surface) for row in rows), surface)
+        self.assertIn("`android_helper_unavailable`", text.split("## Response shape", 1)[0],
+                      "the Error codes list names the round")
+
+
+    def test_compatibility_records_the_android_text_codes(self) -> None:
+        text = (ROOT / "docs/COMPATIBILITY.md").read_text(encoding="utf-8")
+        parts = text.split(ANDROID_TEXT_SECTION, 1)
+        self.assertEqual(len(parts), 2, "COMPATIBILITY.md has no Android typing section")
+        section = parts[1].split("\n### ", 1)[0]
+        for name, value in ANDROID_TEXT_CODES.items():
+            with self.subTest(code=name):
+                self.assertEqual(getattr(errors, name), value)
+                self.assertIn(f"| `{value}` |", section)
+        rows = [line for line in section.splitlines() if line.startswith("| ")]
+        for surface in ("| Android `ui type` (auto or helper)", "| `ui fill TEXT`",
+                        "| Android `ui key`", "| Journal and records of `ui fill`"):
+            with self.subTest(surface=surface):
+                self.assertTrue(any(row.startswith(surface) for row in rows), surface)
+        head = text.split("## Response shape", 1)[0]
+        for value in ANDROID_TEXT_CODES.values():
+            self.assertIn(f"`{value}`", head, "the Error codes list names the round")
+        # the CLI surface documents the verb and both codes
+        capabilities = (ROOT / "docs/CAPABILITIES.md").read_text(encoding="utf-8")
+        self.assertIn("autonom ui fill <text>", capabilities)
+        for value in ANDROID_TEXT_CODES.values():
+            self.assertIn(f"`{value}`", capabilities)
 
 
 if __name__ == "__main__":

@@ -38,7 +38,7 @@ The core design is **routing first, evidence second**.
 
 ```text
 Host agent  →  skills  →  scripts/autonom.py  →  adb / xcrun simctl / idb / axe / XCUITest / mitmdump
-                              ↓
+                              ↓                   └→ adb forward → on-device helper (Android UI)
                      ~/.autonom/sessions/<id>/
 ```
 
@@ -50,7 +50,7 @@ overridable by `AUTONOM_HOME`:
 | Root | Default | Holds |
 | --- | --- | --- |
 | Session store | `~/.autonom/sessions/<id>/` | `session.json`, `journal.ndjson`, shots, trees, logs, network flows, recordings, crashes, pulled files |
-| Machine state | `$XDG_STATE_HOME/autonom`, else `~/.local/state/autonom` | mock registry, process registry, mitmproxy confdir (CA key, mode `0700`), `simulator-state/<target>.json` and `simulator-prefs/<udid>.json` pin snapshots, `control/<platform>__<target>.json` control leases (see [Control lease](#control-lease)) |
+| Machine state | `$XDG_STATE_HOME/autonom`, else `~/.local/state/autonom` | mock registry, process registry, mitmproxy confdir (CA key, mode `0700`), `simulator-state/<target>.json` and `simulator-prefs/<udid>.json` pin snapshots, `control/<platform>__<target>.json` control leases (see [Control lease](#control-lease)), `android-helper/` builds and device records (see [Android on-device helper](#android-on-device-helper)) |
 | Per-app knowledge | `~/.autonom/apps/<package>/` | `mobile-memory` overlays and flow runbooks |
 
 The consequence that matters: a session started in one directory is found from
@@ -77,7 +77,11 @@ scripts/autonom_lib/
   consent.py                  the consent gate: per-invocation flag + typed phrase, never cached
   selector.py                 shared selector matching and duplicate policy
   ui.py                       platform dispatch + the compact node schema
-  ui_android.py / adb.py      UI Automator parsing and adb actuation
+  ui_android.py / adb.py      UI Automator parsing and adb actuation; the Android backend
+                              choice (helper or uiautomator), provenance, signals, the guard
+  android_helper_build.py     builds the on-device helper's dex on first use, cached by hash
+  android_helper.py           the helper's host client: start, hello, requests, use lock,
+                              stop and status (see "Android on-device helper" below)
   ui_ios.py / ios_idb.py      accessibility tree parsing; idb actuation, or AXe for input
   ios_simctl.py               simulator lifecycle, screenshots, logs, device state
   emulator.py                 AVD discovery, emulator boot (registered harness-owned) and kill
@@ -85,6 +89,7 @@ scripts/autonom_lib/
   ios_prefs.py                the shut-down simulator's preference store (`keyboard pin`)
   device_state.py             deep links, permissions, location, media, crashes, files, recording
   screenshot.py / logs.py     per-platform dispatch; shots carry provenance metadata in the PNG
+                              (an Android agent JPEG keeps it in the shots index instead)
   follow.py                   bounded NDJSON follows: file tail, device-log stream, store poll
   metrics/
     meminfo.py                dumpsys meminfo / proc status / cpuinfo parsers
@@ -158,7 +163,10 @@ Two rules carry the design.
    keep working when the wrapper does not. The Mobile Canvas scrcpy transport
    is the other one: its Node process writes streamed input to scrcpy's
    control socket itself and only journals through the Python bridge (see
-   [Mobile Canvas](#mobile-canvas)).
+   [Mobile Canvas](#mobile-canvas)). The Android on-device helper is a third:
+   the adb command lines that push, start, forward and stop it live in
+   `android_helper.py`, and the input it injects is built on the device by its
+   own Java source (see [Android on-device helper](#android-on-device-helper)).
 2. **Platform knowledge stays below the CLI.** `autonom.py` still branches on
    `target.platform` where the *verb itself* differs between platforms — iOS has
    no `pm clear`, Android has no per-process launch environment, iOS attach is
@@ -173,8 +181,8 @@ Two rules carry the design.
 | `version`, `devices`, `doctor` | identify the CLI, discover targets, diagnose the machine |
 | `session *` | start/show/list/stop, launch/clear/force-stop/uninstall, artifact dirs |
 | `control status\|acquire\|renew\|release` | the host-wide control lease of a target (see [Control lease](#control-lease)) |
-| `ui tree\|find\|wait\|tap\|swipe\|type\|key` | understand and control the screen; `ui pinch\|rotate\|shake` exist but have no backend on either platform and are refused |
-| `screenshot`, `shots list\|show`, `record start\|stop` | visual evidence and its provenance |
+| `ui tree\|find\|wait\|tap\|swipe\|type\|fill\|key` | understand and control the screen; `ui pinch\|rotate\|shake` exist but have no backend on either platform and are refused; `ui helper status\|stop` report and stop the Android on-device helper |
+| `screenshot`, `shots list\|show`, `record start\|stop` | visual evidence and its provenance; `screenshot --agent` is the Android helper's small JPEG with a tap-coordinate note |
 | `note add\|list`, `journal` | the run's own record: what was done, what was concluded |
 | `logs tail`, `crash list\|show` | textual evidence |
 | `open`, `permissions`, `location`, `media`, `file` | drive device state |
@@ -276,6 +284,147 @@ probe runs once per process. Every input payload names the `backend` it
 used, so evidence says which tool touched the screen. The idb retry for a
 stale companion follows the same rule: at most one retry, and only for a
 refused connection, which never delivered the action.
+
+### Android on-device helper
+
+Android reads and input go through Autonom's own helper program on the
+device by default (`--ui-backend auto`). `uiautomator dump` and
+`adb shell input` remain both the fallback and the explicit opt-out
+(`--ui-backend uiautomator`, `AUTONOM_ANDROID_UI_BACKEND=uiautomator`, a
+session started with it, the test harness default), which builds, starts and
+asks no helper and keeps the replies of before (no `ui_backend` keys).
+
+| Part | Where | Role |
+| --- | --- | --- |
+| Helper program | `native/android/helper/src/dev/autonom/helper/*.java` | Java 8 language level, framework APIs only. Runs as the shell user under `app_process`, holds one UiAutomation connection, and serves protocol 1 on the abstract socket `autonom-helper`: reads (uiautomator-compatible XML of the same window, plus a windows list), touches, keys, typing and set-text, JPEG screenshots. `native/android/helper/README.md` is the reference for every op and reply key |
+| Build | `scripts/autonom_lib/android_helper_build.py` | the dex, built on first use from the local JDK and SDK and cached |
+| Client | `scripts/autonom_lib/android_helper.py` | the device record, start, hello, requests, the use lock, stop and status |
+| Backend wiring | `ui_android.py`, `ui.py`, `observe.py`, `screenshot.py` | per call: helper or uiautomator, provenance (`ui_backend`, `input_backend`, `fallback_reason`), settle, signals, the coordinate guard's sizes, agent JPEGs |
+
+**Build cache.** The repository and the release hold only the Java source; no
+`.dex`, `.class` or `.jar` file. The first call that needs the helper runs
+`javac --release 8` (`$JAVA_HOME/bin/javac`, else `javac` on `PATH`) and then
+`d8 --min-api 26` from the newest SDK build-tools against the newest
+platform's `android.jar`, with that JDK's `bin` first on `PATH` (the SDK's
+`d8` script runs `java` from `PATH`). The build id is the first 16 hex digits
+of a SHA-256 over the protocol number, the recipe, every source path and
+content, the `javac -version` and `d8 --version` output and the
+`android.jar` path, size and modification time. A build is made in a
+temporary sibling directory and renamed to
+`<state>/android-helper/builds/<id>/` (`classes.dex` and a `complete`
+marker) under an exclusive `flock` on `<state>/android-helper/build.lock`, so
+concurrent first uses build once and nobody sees half a build. A failed build
+leaves `builds/<id>.failed` (the tool output's tail) and that id is not built
+again; changed sources or tools give a new id. Tool versions are asked once
+per tool file and kept in `tool-versions.json`, so a warm call costs a few
+`stat` calls and one hash. `<state>` is `AUTONOM_HOME`, else
+`$XDG_STATE_HOME/autonom`, else `~/.local/state/autonom`, never the install
+tree.
+
+**Device files and the process.** The dex is pushed as
+`/data/local/tmp/autonom-helper-<build>.dex`; other
+`/data/local/tmp/autonom-helper-*.dex` files are removed by exact name, so
+the device keeps one build (about 50 KB) until another build starts. The
+helper is started detached so it outlives the short-lived CLI call:
+
+```text
+adb -s SERIAL shell "CLASSPATH=/data/local/tmp/autonom-helper-<build>.dex nohup app_process \
+  /system/bin --nice-name=autonom-helper dev.autonom.helper.Main --build <build> \
+  --idle-ms 120000 --socket autonom-helper >/data/local/tmp/autonom-helper.log 2>&1 &"
+```
+
+Its log holds start and exit lines only, never request content. A second
+helper started while one serves the socket exits at once and never touches
+UiAutomation. A start lists the `autonom-helper` pids (`pidof`) before its
+launch and, when it fails, ends only the verified pids its launch added: a
+helper that was already running (another Autonom state directory's) is
+never killed by that cleanup. When that helper holds the socket and
+answers hello at once with another build or protocol, it is idle and is
+replaced as a recorded one is (quit, its verified pid killed only if it
+stays, the expected build started again; once per start). When its hello
+stays queued behind its call for the whole 5 s start budget, it is busy:
+the call fails with `helper_busy` (`helper_foreign_pids`) and that helper
+is left to its idle stop.
+
+**Socket and conversation.** The host reaches the abstract socket through
+`adb forward tcp:0 localabstract:autonom-helper` (the port adb prints; a
+recorded port is reused while `forward --list` still shows it for the
+serial). Hello names no device, so a recorded port is used at all only
+while `forward --list` shows `<serial> tcp:<port>
+localabstract:autonom-helper` for the target's serial: after an adb server
+restart a reused host port could reach another device's helper. A port not
+listed so is never sent to or removed; a fresh forward for the serial is
+made instead. The list is read once per CLI process per device, and again
+when that reading is 30 s old in a long-lived process (the Mobile Canvas
+bridge). Requests are UTF-8 JSON, one object per line, each with a unique id
+the helper refuses to perform twice (`duplicate_id`). Every connection starts
+with `hello`: a helper of another protocol or build is quit and replaced
+before anything is sent, and a dead one (refused, EOF, no answer) is
+restarted once, because a forward to an exited helper still accepts a TCP
+connection. Host timeouts: connect and hello 2 s, reads and most inputs 8 s,
+`type` and `set_text` 12 s. An input written and not answered is
+`ui_action_uncertain` and is never sent again by any retry, restart or
+fallback; a read is retried once on a restarted helper, then falls
+back (`auto`) or fails (`--ui-backend helper`). An observed input asks for its
+settle (first accessibility event within 300 ms, then 500 ms quiet, at most
+2000 ms) and the read after it in the same request, so a tap and its settled
+screen take one round trip.
+
+**Device record and locks.** `<state>/android-helper/devices/<serial>.json`
+holds `serial`, `port`, `pid`, `build`, `started_at`, `last_request_at` and a
+remembered failure (`unavailable`, with the device's boot id), written under
+a per-serial lock. A process talks to the helper only while it holds the
+device's use lock (an exclusive `flock` on `<serial>.use.lock`, its pid in
+`<serial>.use.owner`) for the whole conversation. Another process holding it
+means busy: wait up to 20 s, then `helper_busy`, with nothing sent, stopped
+or dumped. No hello while this process holds it means stuck: the verified
+pid is stopped and the helper started once. The lock is per state directory;
+a second state directory forwarding to the same device's socket is noticed
+in `adb forward --list` after a silent hello, and that hello is waited for
+instead of the helper being stopped.
+
+**One UiAutomation holder, idle stop.** While the helper runs, `uiautomator
+dump` on the device is killed, so before any dump (the opt-out, a fallback,
+the sparse-tree recovery) Autonom stops a helper it recorded, holding the
+use lock across the stop and the dump. The helper exits by itself
+120 s after its last request, releasing UiAutomation for uiautomator2,
+Appium or an instrumentation test; `ui helper stop` does it at once. Size
+lookups outside the coordinate guard (Mobile Canvas's status poll and
+recordings, the Flow engine's cached size) stay on `wm size`, so an open
+Canvas page never keeps the helper alive (DEC-020). Canvas bridge actions
+(the taps, swipes, keys and text the Canvas sends through
+`scripts/autonom_canvas_bridge.py`) go through the same `ui` functions as
+the CLI and follow the normal Android backend choice (ODA-003): in `auto`
+the helper serves them, and it stops 2 minutes after the last Canvas
+action. scrcpy video and scrcpy-streamed input do not touch the helper.
+
+**Teardown.** `ui helper stop` and the `session stop` step `android_helper`
+send `quit` on the helper's own connection, then `kill` the recorded pid only
+while `/proc/<pid>/cmdline` still starts with `autonom-helper`, then remove
+only the recorded forward (`forward --remove tcp:<port>`). `forward
+--remove-all` is never used: it clears every forward of the adb server, other
+tools' and other devices' included. A pid is gone when `cat` answers "No
+such file or directory" or "No such process", in whatever words the
+device's toybox, busybox or toolbox uses. When adb cannot read that file
+(the call times out, or adb itself fails, as opposed to the device answering
+that the pid is gone), nothing is killed or removed, the device record keeps
+the pid and the stop fails with `backend_failed`; a restart after an
+unanswered read, the end of a stuck helper and the replacement of a dead
+helper or one of another build do the same, so the call falls back or fails
+instead of starting a second helper, and the cleanup after a failed start
+keeps a launched pid it cannot check in the record (with its forward) for
+the next call to check. The dex stays on the device until another build
+replaces it.
+
+**Fallback.** Checks run in the order device record, host toolchain and
+build, device calls, so a host without a JDK or SDK sends the device nothing
+for the helper. In `auto` the rest of the invocation then reads with
+uiautomator and sends with adb, each reply carrying `fallback_reason` and
+`fallback_hint`; `--ui-backend helper` fails with
+`android_helper_unavailable` instead. A device where the helper cannot run
+(API below 26, `uiautomation_failed`, no hello within 5 s of its start) is
+remembered for its boot, `uiautomation_busy` for 60 s, so a failing device
+costs one attempt, not one per call.
 
 ### Journal redaction
 
@@ -698,13 +847,28 @@ validator fails the build when a plugin manifest disagrees with it.
   fan-out, input, journal, and a memory-bound flood test per message type.
   `tests/scrcpy-lib.test.mjs` compares every encoder with the bytes of
   scrcpy's own serialization tests.
+- **Android helper against fakes** — the harness sets
+  `AUTONOM_ANDROID_UI_BACKEND=uiautomator` in every worker (and
+  `tests/__init__.py` for direct runs), so a test reaches the helper path only
+  when it asks for it. Those tests use `tests/fakes/fake_android_helper.py`
+  (an in-process server speaking protocol 1, fed with XML fixtures) behind the
+  fake adb, and fake `javac`/`d8`; a real build runs only with
+  `AUTONOM_REQUIRE_ANDROID_BUILD=1`.
 - **Device-backed** — CI runs no emulator or simulator; device runs are
   manual and evidenced by before/after artifacts, never by exit codes alone.
   `tests/live/canvas_scrcpy_live.mjs` (cases `picture`, `bench`, `tabs`,
   `restart`, `input`, `journal`) is such a run for the Canvas: it needs an
   explicit `--serial`, runs in its own temporary `AUTONOM_HOME` so it never
   reads, stops or writes the operator's sessions, writes one JSON report per
-  case into `--evidence-dir`, and is never run by `run_checks.sh`.
+  case into `--evidence-dir`, and is never run by `run_checks.sh`. The
+  Android helper has two such runs, both refusing a serial whose AVD name is
+  not the one given: `tests/live/android_helper_smoke.py` speaks protocol 1
+  to the helper directly, and `tests/live/android_helper_live.py` drives the
+  whole Android path through the CLI (build on first use, parity with
+  uiautomator, a never-idle page, a settled navigation tap, Unicode typing
+  and fill, signals, an agent screenshot whose coordinates tap, restart,
+  replacement, idle stop, fallback without tools, and a teardown that leaves
+  other forwards alone) into one `android-helper-live.json`.
 
 ## Flutter-first boundary (current domain pack)
 

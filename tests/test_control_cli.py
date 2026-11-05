@@ -324,12 +324,14 @@ class RefusalTests(ControlCliCase):
             ("session", "uninstall", APP), ("ui", "tap", "--x", "1", "--y", "1"),
             ("ui", "swipe", "--from", "1,1", "--to", "2,2"), ("ui", "pinch", "--at", "1,1"),
             ("ui", "rotate"), ("ui", "shake"), ("ui", "type", "hello"),
+            ("ui", "fill", "hello", "--resource-id", "email"),
             ("ui", "key", "KEYCODE_BACK"), ("open", "https://example.com/"),
             ("permissions", "grant", "camera", APP), ("location", "set", "1,2"),
             ("location", "clear"), ("media", "add", str(media)),
             ("network", "attach", "--i-understand-mitm"), ("network", "detach"),
             ("network", "stop"), ("metrics", "memory", "warn"),
             ("ui", "accessibility", "enable"), ("ui", "accessibility", "reset"),
+            ("ui", "helper", "stop"),
             ("simulator", "battery", "set"), ("simulator", "network", "offline"),
             ("simulator", "push", "send"), ("simulator", "sms", "send"),
             ("simulator", "call", "incoming"), ("simulator", "biometric", "match"),
@@ -413,7 +415,8 @@ class RefusalTests(ControlCliCase):
         self.human_lease()
         for argv in (("ui", "tree", "--dump", str(UI_DUMP)), ("screenshot",),
                      ("session", "list"), ("control", "status"), ("journal",),
-                     ("ui", "accessibility", "status"), ("simulator", "clipboard", "get")):
+                     ("ui", "accessibility", "status"), ("ui", "helper", "status"),
+                     ("simulator", "clipboard", "get")):
             with self.subTest(argv=argv):
                 code, payload = self.android(*argv)
                 if argv[0] == "simulator":
@@ -569,8 +572,8 @@ class ClaimTests(ControlCliCase):
 
     def test_a_claim_flag_without_a_value_is_a_usage_error(self) -> None:
         for argv in (("ui", "tap", "--x", "1", "--y", "1", "--control-holder"),
-                     ("--operation-id", "--serial", SERIAL, "ui", "key", "BACK"),
-                     ("--control-generation", "--", "ui", "key", "BACK")):
+                     ("--operation-id", "--serial", SERIAL, "ui", "key", "KEYCODE_BACK"),
+                     ("--control-generation", "--", "ui", "key", "KEYCODE_BACK")):
             with self.subTest(argv=argv):
                 code, payload, _ = self.run_cli("--adb", str(FAKE_ADB), *argv)
                 self.assertEqual(code, 2, payload)
@@ -579,13 +582,13 @@ class ClaimTests(ControlCliCase):
         self.assertEqual(self.calls(), [])
 
     def test_invalid_claim_values(self) -> None:
-        for argv in (("--control-holder", "bad holder", "ui", "key", "BACK"),
+        for argv in (("--control-holder", "bad holder", "ui", "key", "KEYCODE_BACK"),
                      ("--control-holder", "agent:a", "--control-generation", "0",
-                      "ui", "key", "BACK"),
+                      "ui", "key", "KEYCODE_BACK"),
                      ("--control-holder", "agent:a", "--control-generation", "x",
-                      "ui", "key", "BACK"),
-                     ("--operation-id", "bad id", "ui", "key", "BACK"),
-                     ("--operation-id", "x" * 65, "ui", "key", "BACK")):
+                      "ui", "key", "KEYCODE_BACK"),
+                     ("--operation-id", "bad id", "ui", "key", "KEYCODE_BACK"),
+                     ("--operation-id", "x" * 65, "ui", "key", "KEYCODE_BACK")):
             with self.subTest(argv=argv):
                 code, payload = self.android(*argv)
                 self.assertEqual(code, 2, payload)

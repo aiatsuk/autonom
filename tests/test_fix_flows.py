@@ -266,6 +266,140 @@ class CompilerArgvTests(_TempDir):
         self.assertTrue(report["review_required"])
         self.assertEqual([step.command for step in flow.steps], ["openLink", "assertVisible"])
 
+    def test_ui_helper_housekeeping_is_not_a_step(self) -> None:
+        # `ui helper status|stop` manage the on-device Android helper; they
+        # are never part of the app journey, so they compile to nothing.
+        session = self._session([["open", "woolbox://catalog", "--serial", self.SERIAL]])
+        journal = self.root / "journal.ndjson"
+        rows = [{"seq": seq, "kind": "action", "verb": "ui helper", "ok": True,
+                 "origin": "agent", "argv": ["--serial", self.SERIAL, "ui", "helper", action],
+                 "result": {"platform": "android", "target_id": self.SERIAL}}
+                for seq, action in ((2, "status"), (3, "stop"))]
+        journal.write_text(journal.read_text(encoding="utf-8")
+                           + "".join(json.dumps(row) + "\n" for row in rows),
+                           encoding="utf-8")
+        flow, report = compiler.compile_session(session, name="walk")
+        self.assertEqual(report["warnings"], [])
+        self.assertEqual(report["quality"]["skipped"], 0)
+        self.assertEqual([step.command for step in flow.steps], ["openLink", "assertVisible"])
+
+    def test_an_agent_screenshot_compiles_to_take_screenshot(self) -> None:
+        # AS-03: `--agent`, `--no-agent` and `--max-edge` (and its value) are
+        # no label; Flow's takeScreenshot stays the PNG it always was
+        session = self._session([["open", "woolbox://catalog", "--serial", self.SERIAL]])
+        journal = self.root / "journal.ndjson"
+        rows = [{"seq": seq, "kind": "action", "verb": "screenshot", "ok": True,
+                 "origin": "agent", "argv": ["--serial", self.SERIAL, "screenshot", *argv],
+                 "result": {"platform": "android", "target_id": self.SERIAL}}
+                for seq, argv in ((2, ["--agent", "--max-edge", "800", "--label", "home"]),
+                                  (3, ["--no-agent"]))]
+        journal.write_text(journal.read_text(encoding="utf-8")
+                           + "".join(json.dumps(row) + "\n" for row in rows),
+                           encoding="utf-8")
+        flow, report = compiler.compile_session(session, name="walk")
+        self.assertEqual(report["warnings"], [])
+        shots = [step.args for step in flow.steps if step.command == "takeScreenshot"]
+        self.assertEqual(shots, [{"label": "home"}, {}])
+
+
+class FillCompileTests(_TempDir):
+    """A recorded `ui fill` (AT-02) compiles to tapOn (when a selector named
+    the field) + eraseText + inputText; a sensitive value or a
+    credential-shaped field becomes ${SECRET_n}."""
+
+    SERIAL = "emulator-5556"
+    FIELD = {"ref": "n4", "role": "textfield", "text": "abc", "desc": None,
+             "resource_id": "com.example.app:id/email", "class": "android.widget.EditText",
+             "bounds": [60, 400, 1020, 520], "editable": True, "password": False}
+
+    def _session(self, fills: list[tuple[list[str], dict | None]]) -> dict:
+        session = {"session_id": "s_fill", "artifacts_dir": str(self.root),
+                   "app_id": "com.example.app", "platform": "android"}
+        actions = self.root / "actions"
+        actions.mkdir(exist_ok=True)
+        lines = []
+        for seq, (argv, detail) in enumerate(fills, start=1):
+            result: dict = {"platform": "android", "target_id": self.SERIAL}
+            if detail is not None:
+                name = f"actions/{seq:04d}_fill.json"
+                (self.root / name).write_text(json.dumps(detail), encoding="utf-8")
+                result["detail"] = name
+            lines.append(json.dumps({"seq": seq, "kind": "action", "verb": "ui fill",
+                                     "argv": argv, "ok": True, "origin": "agent",
+                                     "result": result}))
+        (self.root / "journal.ndjson").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        (actions / "9999_find.json").write_text(json.dumps({
+            "kind": "find", "count": 1, "selector": {"desc": "Done", "mode": "exact"}}),
+            encoding="utf-8")
+        return session
+
+    def _detail(self, *, selector: dict | None, text: str | None, sensitive: bool = False,
+                node: dict | None = None) -> dict:
+        return {"kind": "fill", "coordinate": False, "focused": selector is None,
+                "selector": selector, "node": node or self.FIELD,
+                "nodes": [node or self.FIELD], "sensitive": sensitive, "text": text,
+                "text_len": len(text or "") if not sensitive else 8}
+
+    def test_a_fill_with_a_selector_is_tap_erase_type(self) -> None:
+        selector = {"resource_id": "com.example.app:id/email", "mode": "exact",
+                    "case_sensitive": False, "index": None}
+        flow, report = compiler.compile_session(self._session([
+            (["ui", "fill", "<6 chars>", "--resource-id", "com.example.app:id/email",
+              "--mode", "exact"], self._detail(selector=selector, text="Привет")),
+        ]), name="fill")
+        self.assertEqual([(step.command, step.args) for step in flow.steps[:3]], [
+            ("tapOn", {"selector": flow.steps[0].args["selector"]}),
+            ("eraseText", {}),
+            ("inputText", {"value": "Привет"}),
+        ])
+        self.assertEqual(flow.steps[0].args["selector"].fields,
+                         {"resource_id": "com.example.app:id/email"})
+        self.assertEqual(report["quality"]["selectors"]["id"], 1)
+        self.assertEqual(report["quality"]["skipped"], 0)
+        text = compiler.emit_flow(flow)
+        build = flow_schema.build_flow(flow_parser.parse_document(text, "f.yaml"))
+        self.assertEqual([step.command for step in build.steps],
+                         ["tapOn", "eraseText", "inputText", "assertVisible"])
+
+    def test_a_fill_of_the_focused_field_has_no_tap(self) -> None:
+        flow, _report = compiler.compile_session(self._session([
+            (["ui", "fill", "<2 chars>"], self._detail(selector=None, text="ok")),
+        ]), name="fill")
+        self.assertEqual([step.command for step in flow.steps],
+                         ["eraseText", "inputText", "assertVisible"])
+
+    def test_sensitive_and_credential_fills_become_secrets(self) -> None:
+        password = {**self.FIELD, "resource_id": "com.example.app:id/password", "text": "••••"}
+        flow, report = compiler.compile_session(self._session([
+            (["ui", "fill", "<8 chars>", "--sensitive", "--resource-id", "x"],
+             self._detail(selector={"resource_id": "x", "mode": "contains"}, text=None,
+                          sensitive=True)),
+            (["ui", "fill", "<5 chars>", "--resource-id", "com.example.app:id/password"],
+             self._detail(selector={"resource_id": "com.example.app:id/password",
+                                    "mode": "contains"}, text="plain", node=password)),
+        ]), name="fill")
+        typed = [step.args for step in flow.steps if step.command == "inputText"]
+        self.assertEqual(typed, [{"value": "${SECRET_1}", "sensitive": True},
+                                 {"value": "${SECRET_2}", "sensitive": True}])
+        self.assertEqual(report["secrets_required"], ["SECRET_1", "SECRET_2"])
+        self.assertNotIn("plain", compiler.emit_flow(flow))
+
+    def test_a_long_field_erases_what_it_showed_and_an_emptied_one_types_nothing(self) -> None:
+        long_field = {**self.FIELD, "text": "y" * 80}
+        flow, _report = compiler.compile_session(self._session([
+            (["ui", "fill", ""], self._detail(selector=None, text="", node=long_field)),
+        ]), name="fill")
+        self.assertEqual([(step.command, step.args) for step in flow.steps
+                          if step.command != "assertVisible"], [("eraseText", {"chars": 80})])
+
+    def test_a_fill_without_a_detail_record_is_skipped_with_a_warning(self) -> None:
+        flow, report = compiler.compile_session(self._session([
+            (["ui", "fill", "<3 chars>", "--resource-id", "x"], None),
+        ]), name="fill")
+        self.assertIn("filled_text_not_recorded", {w["code"] for w in report["warnings"]})
+        self.assertEqual(report["quality"]["skipped"], 1)
+        self.assertEqual([step.command for step in flow.steps], ["assertVisible"])
+
 
 class CompilerMatchesTheRealParserTests(unittest.TestCase):
     """The compiler's option table against scripts/autonom.py's argparse."""
@@ -333,6 +467,12 @@ class CompilerMatchesTheRealParserTests(unittest.TestCase):
             (["--session-id", "s_abc", "session", "launch", "com.app",
               "--ui-backend", "idb"], "session launch", ["app_id"]),
             (["ui", "key", "--ui-backend=xcuitest", "home"], "ui key", ["keycode"]),
+            # ui fill: selector values are never the entered text
+            (["ui", "fill", "--resource-id", "email", "hello", "--serial", "S"],
+             "ui fill", ["fill_text"]),
+            (["ui", "fill", "--text", "Email", "--sensitive", "--mode", "exact", "pw"],
+             "ui fill", ["fill_text"]),
+            (["ui", "fill", "--index=1", "--te", "Name", "--", "-x"], "ui fill", ["fill_text"]),
         ]
         for argv, verb, dests in cases:
             with self.subTest(argv=argv):

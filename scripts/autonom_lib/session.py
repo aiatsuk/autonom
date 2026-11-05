@@ -589,11 +589,11 @@ def profile_of(record: dict[str, Any] | None) -> str:
     return value if value in PROFILES else DEFAULT_PROFILE
 
 
-# The keys of one `session list` entry, in this order. `profile` follows
-# `live` only for a session whose profile is not `default`, so the entry of
-# every other session keeps exactly the keys it always had.
+# The keys of one `session list` entry, in this order. `profile` is on every
+# entry (CO-01): `default` for a session started without `--profile` and for
+# a record an older version wrote without the key (`profile_of`).
 LIST_KEYS = ("session_id", "platform", "target_id", "label", "started_at",
-             "stopped_at", "started_by", "current", "live")
+             "stopped_at", "started_by", "current", "live", "profile")
 
 
 def _list_entry(record: dict[str, Any], *, current: bool, live: bool) -> dict[str, Any]:
@@ -607,10 +607,8 @@ def _list_entry(record: dict[str, Any], *, current: bool, live: bool) -> dict[st
         "started_by": record.get("started_by"),
         "current": current,
         "live": live,
+        "profile": profile_of(record),
     }
-    profile = profile_of(record)
-    if profile != DEFAULT_PROFILE:
-        entry["profile"] = profile
     return entry
 
 
@@ -965,6 +963,24 @@ def run_teardown(actions: list[tuple[str, Callable[[], Any]]]) -> list[dict[str,
         except Exception as exc:  # noqa: BLE001 - teardown must not raise
             results.append({"action": name, "ok": False, "error": str(exc)})
     return results
+
+
+def stop_android_helper(record: dict[str, Any], target: Callable[[], Any], *,
+                        gone: bool) -> dict[str, Any]:
+    """The `session stop` step of the on-device Android helper (AH-07): the
+    helper recorded for the session's serial is stopped (quit, a kill of its
+    verified pid, the removal of its own forward only). Without a record it
+    is a no-op: no device call, no warning. A target that is gone took its
+    helper and forward with it, so only the record is dropped."""
+    from . import android_helper
+
+    serial = str(record.get("target_id") or record.get("serial") or "")
+    if not serial or not android_helper.has_record(serial):
+        return {"was_running": False}
+    if gone:
+        android_helper.forget(serial)
+        return {"was_running": None, "skipped": "stale_target"}
+    return android_helper.stop(target())
 
 
 def reap_owned_processes(record: dict[str, Any]) -> dict[str, Any]:

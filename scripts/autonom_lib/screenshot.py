@@ -16,6 +16,21 @@ screenshot is worth anything a week later is what is recorded *with* it:
 Metadata is written twice, on purpose. It goes into the PNG itself as `iTXt`
 chunks, so it survives being copied into a ticket, and into a per-session
 `index.jsonl`, so it can be searched without opening every file.
+
+Agent screenshots (AS-03): `screenshot --agent [--max-edge N]`, and a plain
+`screenshot` in an agent-profile session on Android, ask the on-device
+helper for a JPEG (quality 80) whose long edge is at most N pixels (1000 by
+default; a smaller screen is never upscaled), written with a `.jpg` name. The
+reply adds `format`, `screen` (the screen size), `scale` (screen pixels per
+image pixel) and `coordinates` (how an image pixel becomes a `ui tap
+--x/--y`). A JPEG carries no `iTXt` chunks, so its metadata lives in the
+index alone (`metadata_embedded: false`); its index row adds `format`,
+`screen` and `scale`. Without the helper it is today's full-size PNG with
+`scale` 1 and `fallback_reason`; a `--out` asked as `.jpg`/`.jpeg` is then
+written with `.png` (warning `out_renamed`), so no image carries another
+format's suffix. Every other capture (Flow
+`takeScreenshot` included) is the PNG it always was, with the same reply
+and index row.
 """
 from __future__ import annotations
 
@@ -33,7 +48,13 @@ from . import errors, ios_simctl
 from .platform import ANDROID, Target
 
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+JPEG_SIGNATURE = b"\xff\xd8"
 METADATA_PREFIX = "autonom:"
+# The file names a capture may have: the PNG of every capture, the JPEG of an
+# agent screenshot. `next_index` counts both, so numbering never repeats.
+SHOT_SUFFIXES = (".png", ".jpg")
+# The `--out` names an agent screenshot (a JPEG) may be written under.
+AGENT_OUT_SUFFIXES = (".jpg", ".jpeg")
 
 
 def capture(adb: str, serial: str, output: Path) -> Path:
@@ -96,6 +117,57 @@ def png_size(path: Path) -> tuple[int, int] | None:
     return width, height
 
 
+# The JPEG start-of-frame markers (SOF0..SOF15) that carry the image size;
+# 0xC4 (DHT), 0xC8 (JPG) and 0xCC (DAC) share the range but are not frames.
+_JPEG_SOF = frozenset(range(0xC0, 0xD0)) - {0xC4, 0xC8, 0xCC}
+# Markers that stand alone, with no length after them.
+_JPEG_STANDALONE = frozenset({0x01, *range(0xD0, 0xD8)})
+# How far into a file the frame header is looked for: the APPn and table
+# segments before it are small; a file that hides it further is not read.
+_JPEG_SCAN_LIMIT = 1 << 20
+
+
+def jpeg_size(path: Path) -> tuple[int, int] | None:
+    """Pixel width and height from a JPEG's start-of-frame (SOF) segment,
+    without an image library: the segments before it are skipped by their
+    lengths. None for anything that is not a JPEG with a readable frame."""
+    try:
+        with path.open("rb") as handle:
+            data = handle.read(_JPEG_SCAN_LIMIT)
+    except OSError:
+        return None
+    if not data.startswith(JPEG_SIGNATURE):
+        return None
+    offset = 2
+    while offset + 4 <= len(data):
+        if data[offset] != 0xFF:
+            return None
+        marker = data[offset + 1]
+        if marker == 0xFF:  # fill byte before a marker
+            offset += 1
+            continue
+        if marker in _JPEG_STANDALONE:
+            offset += 2
+            continue
+        if marker in (0xD9, 0xDA):  # end of image, start of scan: no frame seen
+            return None
+        length = struct.unpack(">H", data[offset + 2:offset + 4])[0]
+        if length < 2:
+            return None
+        if marker in _JPEG_SOF:
+            if offset + 9 > len(data) or length < 7:
+                return None
+            height, width = struct.unpack(">HH", data[offset + 5:offset + 9])
+            return (width, height) if width and height else None
+        offset += 2 + length
+    return None
+
+
+def image_size(path: Path) -> tuple[int, int] | None:
+    """`png_size` for a PNG, `jpeg_size` for a JPEG (an agent screenshot)."""
+    return png_size(path) or jpeg_size(path)
+
+
 # --- naming -------------------------------------------------------------------
 
 
@@ -107,19 +179,22 @@ def slugify(text: str | None, limit: int = 48) -> str:
 
 
 def next_index(directory: Path) -> int:
-    """Sequence per directory, so a listing sorts in capture order."""
+    """Sequence per directory, so a listing sorts in capture order. PNG and
+    JPEG shots share it: a number is never used twice."""
     highest = 0
     if directory.is_dir():
-        for entry in directory.glob("*.png"):
-            head = entry.name.split("_", 1)[0]
-            if head.isdigit():
-                highest = max(highest, int(head))
+        for suffix in SHOT_SUFFIXES:
+            for entry in directory.glob(f"*{suffix}"):
+                head = entry.name.split("_", 1)[0]
+                if head.isdigit():
+                    highest = max(highest, int(head))
     return highest + 1
 
 
-def build_filename(index: int, label: str | None, moment: float | None = None) -> str:
+def build_filename(index: int, label: str | None, moment: float | None = None,
+                   suffix: str = ".png") -> str:
     stamp = time.strftime("%H%M%S", time.localtime(moment if moment else time.time()))
-    return f"{index:04d}_{stamp}_{slugify(label)}.png"
+    return f"{index:04d}_{stamp}_{slugify(label)}{suffix}"
 
 
 # --- metadata -----------------------------------------------------------------
@@ -170,11 +245,14 @@ def embed_metadata(path: Path, fields: dict[str, Any]) -> bool:
 
 
 def read_metadata(path: Path) -> dict[str, str]:
-    """Read back what `embed_metadata` wrote, without a PNG library."""
+    """Read back what `embed_metadata` wrote, without a PNG library. Only a
+    PNG carries it: anything else (an agent JPEG) reads as empty."""
     found: dict[str, str] = {}
     try:
         data = path.read_bytes()
     except OSError:
+        return found
+    if not data.startswith(PNG_SIGNATURE):
         return found
     offset = len(PNG_SIGNATURE)
     while offset + 8 <= len(data):
@@ -277,6 +355,45 @@ def load_index(session: dict[str, Any]) -> list[dict[str, Any]]:
     return entries
 
 
+# --- agent screenshots (AS-03) -----------------------------------------------
+
+
+def agent_scale(screen: tuple[int, int], image: tuple[int, int]) -> int | float:
+    """Screen pixels per image pixel: the screen's long edge over the
+    image's (1 for an image that was not scaled down)."""
+    factor = round(max(screen) / max(image), 4)
+    return int(factor) if factor == int(factor) else factor
+
+
+def coordinates_note(scale: int | float) -> str:
+    """How an image pixel becomes a tap, with the factor filled in."""
+    factor = f"{scale:g}"
+    return f"image pixel (x, y) → ui tap --x round(x*{factor}) --y round(y*{factor})"
+
+
+def _write_image(output: Path, data: bytes) -> Path:
+    """Write a capture made elsewhere (the helper's JPEG) where `capture`
+    would have written the PNG."""
+    output = output.expanduser().resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_bytes(data)
+    return output
+
+
+def _agent_shot(target: Target, max_edge: int | None
+                ) -> tuple[dict[str, Any] | None, tuple[str, str | None] | None]:
+    """The helper's JPEG, or None and (fallback reason, hint)."""
+    if target.platform != ANDROID:
+        return None, ("agent screenshots are made by the Android on-device helper", None)
+    from . import ui_android  # lazily: only an agent screenshot needs it
+
+    shot, reason, hint = ui_android.helper_screenshot(
+        target, max_edge if max_edge is not None else ui_android.AGENT_SHOT_MAX_EDGE)
+    if shot is None:
+        return None, (reason or "the helper did not make the screenshot", hint)
+    return shot, None
+
+
 def capture_evidence(
     target: Target,
     session: dict[str, Any] | None,
@@ -284,6 +401,8 @@ def capture_evidence(
     label: str | None = None,
     task: str | None = None,
     out: Path | None = None,
+    agent: bool = False,
+    max_edge: int | None = None,
 ) -> dict[str, Any]:
     """Capture, annotate, and file the shot so it is findable later.
 
@@ -291,20 +410,54 @@ def capture_evidence(
     even when `--out` is given: `--out` used to divert the only copy away from
     the run's own evidence directory, so the artifact archive of a session
     contained no pictures of it.
+
+    ``agent`` (AS-03): the helper's JPEG, its long edge at most ``max_edge``
+    (default 1000), named ``.jpg``, with ``format``, ``screen``, ``scale`` and
+    ``coordinates`` in the result; without the helper today's PNG with
+    ``scale`` 1 and ``fallback_reason``, and an ``out`` asked as ``.jpg`` or
+    ``.jpeg`` is then written with ``.png`` instead (the result's paths name
+    it, and a warning ``out_renamed`` gives ``requested`` and ``written``).
+    Without ``agent`` nothing differs from before. An ``agent`` capture with
+    an ``out`` not ending in ``.jpg``/``.jpeg`` is ``invalid_value`` before
+    any capture. No image is ever written under a suffix that is not its
+    format's.
     """
+    if agent and out is not None and Path(out).suffix.lower() not in AGENT_OUT_SUFFIXES:
+        raise errors.AutonomError(
+            errors.INVALID_VALUE,
+            f"an agent screenshot is a JPEG; --out {Path(out).name} does not end in .jpg "
+            "or .jpeg",
+            "Use a .jpg name or drop --agent.", flag="--out")
     moment = time.time()
     # While a pre-test check is open, an unlabelled capture belongs to it
     # (tp-004). Without an active pre-test this is empty and nothing changes.
     attribution = pretest_attribution(session)
     if task is None and attribution.get("check_id"):
         task = attribution["check_id"]
+    shot: dict[str, Any] | None = None
+    fallback: tuple[str, str | None] | None = None
+    if agent:
+        shot, fallback = _agent_shot(target, max_edge)
+    suffix = ".jpg" if shot is not None else ".png"
+    renamed: dict[str, Any] | None = None
+    if agent and shot is None and out is not None:
+        # Without the helper the agent screenshot is today's PNG: never PNG
+        # bytes under the `.jpg`/`.jpeg` name asked for, so it is written
+        # under that name with `.png`, and the reply says so.
+        requested = Path(out)
+        out = requested.with_suffix(".png")
+        renamed = {"code": "out_renamed", "requested": str(requested), "written": str(out),
+                   "hint": "the helper was not available, so this is today's PNG"}
     if session:
         directory = shots_dir(session, task)
-        destination = directory / build_filename(next_index(directory), label, moment)
+        destination = directory / build_filename(next_index(directory), label, moment, suffix)
     else:
-        destination = out or Path(build_filename(1, label, moment))
+        destination = out or Path(build_filename(1, label, moment, suffix))
 
-    path = capture_target(target, destination)
+    if shot is not None:
+        path = _write_image(destination, shot["data"])
+    else:
+        path = capture_target(target, destination)
 
     meta = {
         "captured_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(moment)),
@@ -322,7 +475,8 @@ def capture_evidence(
     if mocks["active"]:
         meta["mocks"] = ",".join(str(item) for item in mocks["ids"])
 
-    embedded = embed_metadata(path, meta)
+    # A JPEG has no iTXt chunks: its metadata lives in the index alone.
+    embedded = embed_metadata(path, meta) if shot is None else False
 
     copies = [str(path)]
     if session and out:
@@ -331,24 +485,49 @@ def capture_evidence(
         extra.write_bytes(path.read_bytes())
         copies.append(str(extra))
 
-    size = png_size(path)
+    if shot is not None:
+        size = jpeg_size(path) or (shot["width"], shot["height"])
+    else:
+        size = png_size(path)
     result: dict[str, Any] = {"path": str(path), "copies": copies,
                               "metadata": meta, "metadata_embedded": embedded,
                               "width": size[0] if size else None,
                               "height": size[1] if size else None}
+    agent_keys: dict[str, Any] = {}
+    if shot is not None:
+        screen = (int(shot["screen"][0]), int(shot["screen"][1]))
+        scale = agent_scale(screen, size or (shot["width"], shot["height"]))
+        agent_keys = {"format": "jpeg", "screen": list(screen), "scale": scale}
+        result.update(agent_keys, coordinates=coordinates_note(scale))
+    elif agent:
+        # today's PNG: image pixels are screen pixels
+        result.update(format="png", screen=list(size) if size else None, scale=1,
+                      coordinates=coordinates_note(1))
+        if fallback is not None:
+            result["fallback_reason"] = fallback[0]
+            if fallback[1]:
+                result["fallback_hint"] = fallback[1]
     if session:
         # Resolve both sides: the capture path is resolved, but artifacts_dir is
         # stored as written, so under a symlinked root (macOS /var -> /private/var,
         # or a global session home on one) relative_to would wrongly reject it.
         artifacts = Path(session["artifacts_dir"]).resolve()
+        # a PNG's row keeps exactly its keys; a JPEG's adds how to read it
         append_index(session, {**meta, "file": str(path.resolve().relative_to(artifacts)),
-                               "width": result["width"], "height": result["height"]})
+                               "width": result["width"], "height": result["height"],
+                               **agent_keys})
+    warnings: list[dict[str, Any]] = []
     if mocks["active"]:
-        result["warnings"] = [{
+        warnings.append({
             "code": "screenshot_shows_mocked_data",
             "error": f"{mocks['active']} mock rule(s) were active — this image may "
                      f"show fabricated responses",
-            "hint": "The fact is embedded in the PNG and the index. Do not present "
-                    "this as evidence of real backend behaviour.",
-        }]
+            "hint": ("The fact is embedded in the PNG and the index. " if shot is None
+                     else "The fact is recorded in the shots index. ")
+                    + "Do not present this as evidence of real backend behaviour.",
+        })
+    if renamed is not None:
+        warnings.append(renamed)
+    if warnings:
+        result["warnings"] = warnings
     return result

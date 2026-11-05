@@ -6,6 +6,7 @@ fake adb, so they prove what lands in the journal and the screenshot index.
 """
 from __future__ import annotations
 
+import functools
 import json
 import os
 import re
@@ -1419,6 +1420,20 @@ class RedactionTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertEqual(store.redact_text(text), expected)
 
+    @staticmethod
+    def cpu_seconds(*calls) -> float:
+        """CPU time of the calls, the lower of two rounds. Not wall time:
+        under the parallel check run a preempted call counts only the time it
+        actually ran, so machine load cannot push a linear pattern over its
+        budget, while a backtracking one still takes far longer than it."""
+        times = []
+        for _ in range(2):
+            started = time.process_time()
+            for call in calls:
+                call()
+            times.append(time.process_time() - started)
+        return min(times)
+
     def test_ticket_text_loses_credentials_and_keeps_other_lines(self) -> None:
         text = ("Authorization: Bearer abc.def.ghi123\n"
                 "cookie: session=xyz\n"
@@ -1530,9 +1545,7 @@ class RedactionTests(unittest.TestCase):
                            ("one word", "Ab" * size + ":"), ("schemes", "token " * size),
                            ("dashes", "a-" * size), ("spaces", "a" + " " * size + "b")):
             with self.subTest(shape=name):
-                started = time.monotonic()
-                store.redact_text(text)
-                self.assertLess(time.monotonic() - started, 5.0)
+                self.assertLess(self.cpu_seconds(functools.partial(store.redact_text, text)), 5.0)
 
     def test_round_4_blank_runs_finish_fast(self) -> None:
         """Contract 8.2 item 1: the three named inputs, plus the same shapes
@@ -1549,10 +1562,8 @@ class RedactionTests(unittest.TestCase):
                   "blank run between words": ("a" + " " * 1000) * 200}
         for name, text in shapes.items():
             with self.subTest(shape=name):
-                started = time.monotonic()
-                store.redact_text(text)
-                store.clip(text, 4000)
-                self.assertLess(time.monotonic() - started, 1.0)
+                self.assertLess(self.cpu_seconds(functools.partial(store.redact_text, text),
+                                                 functools.partial(store.clip, text, 4000)), 1.0)
 
     def test_no_masking_pattern_has_two_adjacent_blank_runs(self) -> None:
         blank = r"(?:\\s|\[ \\t\]|\[\^\\S\\n\])[*+?]"
@@ -1578,21 +1589,16 @@ class RedactionTests(unittest.TestCase):
             for shape, text in self.ROUND_5_SHAPES.items():
                 for how in ("sub", "search"):
                     with self.subTest(pattern=name, shape=shape, how=how):
-                        started = time.monotonic()
-                        if how == "sub":
-                            pattern.sub("x", text)
-                        else:
-                            pattern.search(text)
-                        self.assertLess(time.monotonic() - started, 1.0)
+                        call = (functools.partial(pattern.sub, "x", text) if how == "sub"
+                                else functools.partial(pattern.search, text))
+                        self.assertLess(self.cpu_seconds(call), 1.0)
         for shape, text in {**self.ROUND_5_SHAPES,
                             "url with a bracket key": "https://h/?" + "[" * 200_000 + "=1",
                             "url with bracket groups": "https://h/?" + "[a]" * 60_000 + "=1"
                             }.items():
             for fn in (store.redact_text, lambda value: store.clip(value, 4000)):
                 with self.subTest(shape=shape, fn=getattr(fn, "__name__", "clip")):
-                    started = time.monotonic()
-                    fn(text)
-                    self.assertLess(time.monotonic() - started, 1.0)
+                    self.assertLess(self.cpu_seconds(functools.partial(fn, text)), 1.0)
 
     def test_round_5_the_pattern_list_is_complete_and_anchored(self) -> None:
         listed = set(map(id, store.MASKING_PATTERNS.values()))
@@ -1684,10 +1690,9 @@ class RedactionTests(unittest.TestCase):
             with self.subTest(kept=kept):
                 self.assertEqual(store.redact_text(kept), kept)
         # a long blank run before "=" is walked once
-        started = time.monotonic()
-        store.redact_text("GITHUBTOKEN" + " " * 400_000 + "= v")
-        store.redact_text("GITHUBTOKEN" + " " * 400_000 + "x")
-        self.assertLess(time.monotonic() - started, 2.0)
+        self.assertLess(self.cpu_seconds(
+            functools.partial(store.redact_text, "GITHUBTOKEN" + " " * 400_000 + "= v"),
+            functools.partial(store.redact_text, "GITHUBTOKEN" + " " * 400_000 + "x")), 2.0)
 
     def test_rework_query_key_is_linear_on_empty_bracket_groups(self) -> None:
         # CPU time, not wall time: under the parallel check run a preempted

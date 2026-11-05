@@ -52,6 +52,17 @@ UNSUPPORTED_ON_PLATFORM = "unsupported_on_platform"
 STALE_REF = "stale_ref"  # a node ref from an older tree snapshot
 ELEMENT_OFFSCREEN = "element_offscreen"  # the matched node is not on screen (0x0 / outside it)
 UI_NOT_IDLE = "ui_not_idle"  # Android: the screen never went idle, so uiautomator could not read it
+# Android on-device helper: it cannot serve the call (no JDK or SDK, a failed
+# build, a device where it cannot run); `reason` says why; nothing was sent.
+ANDROID_HELPER_UNAVAILABLE = "android_helper_unavailable"
+# Android typing: the text cannot be typed the way the call would send it
+# (`adb shell input text` takes printable ASCII only; through the helper, a
+# field whose current text cannot be read and text that needs set-text);
+# nothing was typed.
+TEXT_NOT_TYPABLE = "text_not_typable"
+# `ui fill` through the Android helper: the field that has input focus is not
+# the target (its bounds differ); nothing was typed.
+FILL_TARGET_MISMATCH = "fill_target_mismatch"
 
 # --- Device state ------------------------------------------------------------
 INVALID_URL = "invalid_url"
@@ -157,7 +168,7 @@ XCUITEST_START_FAILED = "xcuitest_start_failed"
 XCUITEST_TIMEOUT = "xcuitest_timeout"  # a read (tree, geometry) was not answered
 XCUITEST_FAILED = "xcuitest_failed"  # the runner reported an unexpected failure
 STALE_UI_ELEMENT = "stale_ui_element"  # the observed element changed; refresh the tree
-NO_FOCUSED_FIELD = "no_focused_field"  # text typed through the runner with no focused field
+NO_FOCUSED_FIELD = "no_focused_field"  # text typed (XCUITest runner, Android helper) with no focused field
 
 # --- Canvas actions (captures, recording, install roots) ----------------------
 RECORDING_NOT_ACTIVE = "recording_not_active"  # record.stop with no recording on this device

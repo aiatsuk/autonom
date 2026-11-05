@@ -8,6 +8,12 @@
   keep it;
 - the coordinate guard checks taps against the rotated size: (2000, 500) on
   a 1080x2400 phone is in range in landscape and refused in portrait;
+- a recorded size (AU-04: what the latest read recorded) is used without a
+  lookup, and a point it refuses is decided again on one fresh lookup, so a
+  rotation since that read never refuses a valid point (RISK-010); a size
+  an earlier command left in the session accepts a point only when it fits
+  the turned size too, so a rotation since then never sends a point off the
+  screen;
 - `ui tree` reports the rotated `screen` through the CLI.
 
 adb is an in-process fake (or `tests/fakes/fake_adb.py` for the CLI); no device.
@@ -178,6 +184,83 @@ class TapRangeTests(unittest.TestCase):
         self.assertEqual(caught.exception.extra["screen"], [2400, 1080])
 
 
+class RecordedSizeTests(unittest.TestCase):
+    """AU-04 on the uiautomator backend: the guard takes a recorded size
+    first and looks the screen up once only when that size refuses."""
+
+    def setUp(self) -> None:
+        patcher = mock.patch.dict("os.environ", {"AUTONOM_ANDROID_UI_BACKEND": "uiautomator"})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        ui_android.set_preference(None)
+        self.addCleanup(ui_android.set_preference, None)
+
+    def tap(self, fake: FakeAdb, x: int, y: int) -> None:
+        with mock.patch.object(ui_android.adb_mod, "run_adb", fake), \
+                mock.patch.object(ui, "_pretest_guard"), \
+                mock.patch.object(ui_android, "_owning_session", return_value=None):
+            ui.tap(TARGET, x, y)
+
+    def test_a_point_inside_the_recorded_size_needs_no_lookup(self) -> None:
+        ui_android.record_geometry(TARGET, (1080, 2400), 0)
+        fake = device(0)
+        self.tap(fake, 500, 2000)
+        self.assertEqual(fake.calls, [["shell", "input", "tap", "500", "2000"]])
+
+    def test_a_portrait_point_after_a_landscape_read_is_sent_after_one_lookup(self) -> None:
+        ui_android.record_geometry(TARGET, (2400, 1080), 1)  # read in landscape
+        fake = device(0)  # portrait now
+        self.tap(fake, 500, 2000)
+        self.assertEqual([tuple(call) for call in fake.calls], [WM, INPUT,
+                         ("shell", "input", "tap", "500", "2000")])
+
+    def test_a_rotation_since_the_read_is_found_by_one_lookup(self) -> None:
+        ui_android.record_geometry(TARGET, (1080, 2400), 0)  # read in portrait
+        fake = device(1)  # turned to landscape since
+        self.tap(fake, 2000, 500)
+        self.assertEqual([tuple(call) for call in fake.calls], [WM, INPUT,
+                         ("shell", "input", "tap", "2000", "500")])
+
+    def test_the_fresh_lookup_also_refusing_sends_nothing(self) -> None:
+        ui_android.record_geometry(TARGET, (2400, 1080), 1)  # read in landscape
+        fake = device(0)  # portrait now: (2000, 2000) is outside either way
+        with self.assertRaises(errors.AutonomError) as caught:
+            self.tap(fake, 2000, 2000)
+        self.assertEqual(caught.exception.code, errors.COORDINATE_SPACE_MISMATCH)
+        self.assertEqual(caught.exception.extra["screen"], [1080, 2400])
+        self.assertEqual([tuple(call) for call in fake.calls], [WM, INPUT])
+
+    # A size an earlier command left in the session (``android_geometry``)
+    # accepts a point only when it fits that size turned as well.
+    def tap_in_session(self, fake: FakeAdb, x: int, y: int, size: tuple[int, int]) -> None:
+        record = {"target_id": SERIAL, "platform": "android",
+                  ui_android.SESSION_GEOMETRY_KEY: {"width": size[0], "height": size[1],
+                                                    "rotation": 0}}
+        with mock.patch.object(ui_android.adb_mod, "run_adb", fake), \
+                mock.patch.object(ui, "_pretest_guard"), \
+                mock.patch.object(ui_android, "_owning_session", return_value=record):
+            ui.tap(TARGET, x, y)
+
+    def test_a_portrait_session_size_does_not_send_a_point_off_the_landscape_screen(self) -> None:
+        fake = device(1)  # recorded in portrait (1080x2400), turned to landscape since
+        with self.assertRaises(errors.AutonomError) as caught:
+            self.tap_in_session(fake, 500, 2000, (1080, 2400))
+        self.assertEqual(caught.exception.code, errors.COORDINATE_SPACE_MISMATCH)
+        self.assertEqual(caught.exception.extra["screen"], [2400, 1080])
+        self.assertEqual([tuple(call) for call in fake.calls], [WM, INPUT], "one lookup, no tap")
+
+    def test_a_session_size_point_off_its_transpose_is_sent_after_one_lookup(self) -> None:
+        fake = device(0)  # still portrait: the lookup confirms (500, 2000)
+        self.tap_in_session(fake, 500, 2000, (1080, 2400))
+        self.assertEqual([tuple(call) for call in fake.calls], [WM, INPUT,
+                         ("shell", "input", "tap", "500", "2000")])
+
+    def test_a_point_inside_both_orientations_of_a_session_size_needs_no_lookup(self) -> None:
+        fake = device(1)
+        self.tap_in_session(fake, 540, 700, (1080, 2400))
+        self.assertEqual(fake.calls, [["shell", "input", "tap", "540", "700"]])
+
+
 class UiTreeScreenCliTests(unittest.TestCase):
     """`ui tree` through the CLI and the fake adb (user_rotation source)."""
 
@@ -194,7 +277,9 @@ class UiTreeScreenCliTests(unittest.TestCase):
             env = {"PATH": str(root / "bin"), "HOME": str(root),
                    "AUTONOM_HOME": str(root / "home"),
                    "AUTONOM_FAKE_STATE": str(root / "state.json"),
-                   "AUTONOM_FAKE_LOG": str(root / "log.jsonl")}
+                   "AUTONOM_FAKE_LOG": str(root / "log.jsonl"),
+                   # the harness default (INV-5): uiautomator, never the helper
+                   "AUTONOM_ANDROID_UI_BACKEND": "uiautomator"}
             completed = subprocess.run(
                 [sys.executable, str(CLI), "--adb", str(FAKE_ADB), "--serial", SERIAL,
                  "ui", "tree"], cwd=root, env=env, text=True, stdin=subprocess.DEVNULL,

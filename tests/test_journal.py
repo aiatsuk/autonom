@@ -283,5 +283,103 @@ class HeaderMaskingTests(unittest.TestCase):
                         self.assertNotIn("\r", blob)
 
 
+class FillTextRedactionTests(unittest.TestCase):
+    """`ui fill TEXT` is masked like `ui type TEXT` (AT-02): only the length
+    of the entered text survives, in every scrub mode and wherever it sits;
+    a selector value names the field and stays."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        import importlib
+
+        cls.parser = importlib.import_module("autonom").build_parser()
+
+    def parse(self, argv: list[str]):
+        import contextlib
+        import io
+
+        with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+            return self.parser.parse_args(argv)
+
+    CASES = [
+        (["ui", "fill", "FILLSECRET1", "--resource-id", "email"], "FILLSECRET1"),
+        (["ui", "fill", "--resource-id", "email", "FILLSECRET2"], "FILLSECRET2"),
+        (["ui", "fill", "--text", "Email", "FILLSECRET3", "--sensitive"], "FILLSECRET3"),
+        (["ui", "fill", "--sensitive", "FILLSECRET4", "--res", "email"], "FILLSECRET4"),
+        (["--ser", "emulator-5554", "ui", "fill", "FILLSECRET5"], "FILLSECRET5"),
+        (["ui", "fill", "--te", "Email", "--mode", "exact", "--", "-FILLSECRET6"],
+         "-FILLSECRET6"),
+        (["ui", "fill", "--index=0", "--text=Email", "FILL SECRET 7"], "FILL SECRET 7"),
+        (["ui", "fill", "FILLSECRET8", "--observe", "--observe-timeout-ms", "500"],
+         "FILLSECRET8"),
+        (["ui", "fill", "--case-sensitive", "FILLSECRET9", "--desc", "Mail"], "FILLSECRET9"),
+    ]
+
+    def test_the_entered_text_is_masked_in_every_mode(self) -> None:
+        for argv, secret in self.CASES:
+            args = self.parse(argv)
+            self.assertEqual(args.fill_text, secret, argv)
+            for name, scrubbed in (
+                    ("parser", journal_mod.scrub_for_journal(argv, args, self.parser)),
+                    ("args", journal_mod.scrub_for_journal(argv, args)),
+                    ("argv", journal_mod.scrub_for_journal(argv)),
+                    ("scrub_argv", journal_mod.scrub_argv(argv)),
+                    ("canonical", journal_mod.scrub_canonical(self.parser, argv, args))):
+                with self.subTest(argv=argv, mode=name):
+                    self.assertNotIn("SECRET", " ".join(scrubbed))
+                    self.assertIn(f"<{len(secret)} chars>", scrubbed)
+                    self.assertEqual(len(scrubbed), len(argv))
+
+    def test_selector_values_are_kept(self) -> None:
+        argv = ["ui", "fill", "--resource-id", "com.example:id/email", "--text", "Email",
+                "--mode", "exact", "hunter2"]
+        args = self.parse(argv)
+        for scrubbed in (journal_mod.scrub_for_journal(argv, args, self.parser),
+                         journal_mod.scrub_argv(argv)):
+            self.assertEqual(scrubbed[:8], argv[:8])
+            self.assertEqual(scrubbed[8], "<7 chars>")
+
+    def test_unknown_or_ambiguous_options_mask_toward_safety(self) -> None:
+        # argparse refuses these; the argv-only scan masks rather than guesses
+        for argv in (["ui", "fill", "--c", "SECRETAMB", "x"],
+                     ["ui", "fill", "--bogus", "SECRETUNK"],
+                     ["ui", "fill", "--sensitive=1", "SECRETEQ"]):
+            with self.subTest(argv=argv):
+                self.assertNotIn("SECRET", " ".join(journal_mod.scrub_argv(argv)))
+
+    def test_the_fill_option_table_matches_the_parser(self) -> None:
+        import argparse
+
+        leaf = self.parser
+        for word in ("ui", "fill"):
+            sub = next(action for action in leaf._actions  # noqa: SLF001
+                       if isinstance(action, argparse._SubParsersAction))  # noqa: SLF001
+            leaf = sub.choices[word]
+        target_values = {"--session-id", "--ui-backend", "--platform", "--target", "--serial",
+                         "--udid", "--adb", "--simctl", "--idb", "--idb-host", "--idb-port"}
+        values, switches = set(), set()
+        for action in leaf._actions:  # noqa: SLF001
+            for option in action.option_strings:
+                if option.startswith("--") and option != "--help":
+                    (switches if action.nargs == 0 else values).add(option)
+        self.assertEqual(values - target_values, set(journal_mod._FILL_VALUE_OPTIONS))  # noqa: SLF001
+        self.assertEqual(switches, set(journal_mod._FILL_SWITCHES))  # noqa: SLF001
+        self.assertLessEqual(set(journal_mod._FILL_EXACT_ONLY),  # noqa: SLF001
+                             set(getattr(leaf, "exact_only_options", ())))
+
+
+class FillJournalTests(JournalBase):
+    def test_a_fill_is_journaled_with_its_text_masked(self) -> None:
+        self.start()
+        self.run_cli("ui", "fill", "fill-password-1", "--resource-id", "com.example:id/pw")
+        self.run_cli("ui", "fill", "--sensitive", "fill-password-2")
+        entries = [e for e in self.journal_lines() if e.get("verb") == "ui fill"]
+        self.assertEqual(len(entries), 2)
+        blob = json.dumps(self.journal_lines(), ensure_ascii=False)
+        self.assertNotIn("fill-password", blob)
+        self.assertIn("<15 chars>", blob)
+        self.assertIn("com.example:id/pw", blob, "the selector value is kept")
+
+
 if __name__ == "__main__":
     unittest.main()

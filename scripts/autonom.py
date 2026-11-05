@@ -240,6 +240,14 @@ def emit(data: Any, *, as_json: bool) -> int:
         for key, value in ios_idb.transport_of(data.get("target_id", "")).items():
             if key in ios_idb.TRANSPORT_KEYS and value is not None:
                 data.setdefault(key, value)
+    elif isinstance(data, dict) and data.get("platform") == ANDROID:
+        # The same for Android (AU-02, AH-02): the on-device helper or
+        # uiautomator served the tree, the helper or adb the input, and why
+        # auto fell back (with a hint). Only after a read or an input of this
+        # invocation; never overrides a key the verb set itself.
+        from autonom_lib import ui_android
+        for key, value in ui_android.provenance(str(data.get("target_id", ""))).items():
+            data.setdefault(key, value)
     _LAST_EMIT = data if isinstance(data, dict) else None
     if as_json or isinstance(data, (dict, list)):
         # One line for every caller and profile (AL-10): the same keys and
@@ -267,9 +275,51 @@ def fail_error(exc: errors.AutonomError, code: int = 2) -> int:
     return code
 
 
+# `--ui-backend` values per platform (AU-05): one flag, two sets.
+UI_BACKENDS_ANDROID = ("auto", "helper", "uiautomator")
+UI_BACKENDS_IOS = ("auto", "idb", "xcuitest")
+
+
+def _check_ui_backend(args: argparse.Namespace, target: Target) -> None:
+    """`--ui-backend` must name a backend of the target's platform, refused
+    with `invalid_value` before any device call, on every verb that
+    resolves a target (`_target`, `devices boot`/`shutdown`, `session
+    start`, `report serve`): the value reaches every Android read and input
+    of the invocation (`main` hands it to `ui_android`), so `flow run`,
+    `ui do`, `proof`, `replay` and a report's replays use it as the `ui`
+    verbs do.
+
+    - an iOS target takes only auto|idb|xcuitest (the flag took nothing
+      else before Android values existed; `session start` would store an
+      Android value its iOS ui verbs then cannot use);
+    - an Android target takes only auto|helper|uiautomator. One exception,
+      kept as it was: `session start` on Android still stores an iOS value
+      (its Android verbs then read no choice from it)."""
+    value = getattr(args, "ui_backend", None)
+    if value is None:
+        return
+    if target.platform == ANDROID:
+        func = getattr(args, "func", None)
+        if getattr(func, "__name__", "") == "cmd_session_start":
+            return
+    allowed = UI_BACKENDS_ANDROID if target.platform == ANDROID else UI_BACKENDS_IOS
+    if value in allowed:
+        return
+    other = "iOS" if target.platform == ANDROID else "Android"
+    raise errors.AutonomError(
+        errors.INVALID_VALUE,
+        f"--ui-backend {value} is an {other} backend; {target.platform} takes "
+        + ", ".join(allowed),
+        f"On {target.platform} pass --ui-backend " + "|".join(allowed)
+        + (" (or set AUTONOM_ANDROID_UI_BACKEND)." if target.platform == ANDROID
+           else " (or set AUTONOM_UI_BACKEND)."),
+        flag="--ui-backend", value=value, platform=target.platform)
+
+
 def _target(args: argparse.Namespace) -> Target:
     record = session_mod.load_current()
     target = platform_mod.resolve(args, session_record=record)
+    _check_ui_backend(args, target)
     if record and (record.get("target_id") != target.target_id or record.get("platform") != target.platform):
         if getattr(args, "session_id", None):
             raise errors.AutonomError(
@@ -459,6 +509,7 @@ def cmd_devices_boot(args: argparse.Namespace) -> int:
             "See 'autonom devices' for simulators and the avds list.",
         )
     target = platform_mod.resolve(args)
+    _check_ui_backend(args, target)
     if target.platform == IOS:
         booted = ios_simctl.boot(target.tool, target.target_id, timeout=args.timeout)
         return emit(
@@ -483,6 +534,7 @@ def cmd_devices_boot(args: argparse.Namespace) -> int:
 
 def cmd_devices_shutdown(args: argparse.Namespace) -> int:
     target = platform_mod.resolve(args)
+    _check_ui_backend(args, target)
     # Resolved without `_target` (no session binding): admitted here, before
     # the simulator lookup and the shutdown.
     control_mod.admit_once(target.platform, target.target_id)
@@ -578,6 +630,7 @@ def cmd_session_start(args: argparse.Namespace) -> int:
             raise _already_active(current, gone=True)
     alongside = alongside_flag or bool(current)
     target = platform_mod.resolve(args)
+    _check_ui_backend(args, target)  # an Android value is no iOS session's choice
     live = session_mod.live_for_target(target.target_id, target.platform)
     if live is not None:
         # The refused attempt is journaled where it belongs: in the session
@@ -849,6 +902,13 @@ def _session_stop_marked(args: argparse.Namespace, record: dict[str, Any]) -> in
         ("network_stop", lambda: (proxy_mod.stop(record) if gone else
                                   network_stop_payload(record, lambda: _target(args)))),
     ]))
+    if record.get("platform") == ANDROID:
+        # After the network steps (AH-07): the on-device helper the session's
+        # target ran. No helper record: no device call and no warning.
+        teardown.extend(session_mod.run_teardown([
+            ("android_helper", lambda: session_mod.stop_android_helper(
+                record, lambda: _target(args), gone=gone)),
+        ]))
     teardown.extend(session_mod.run_teardown([
         ("session_processes", lambda: session_mod.reap_owned_processes(record)),
     ]))
@@ -1143,6 +1203,10 @@ def cmd_ui_tree(args: argparse.Namespace) -> int:
     dump = getattr(args, "dump", None)
     warnings: list[dict[str, Any]] = []
     recovery: dict[str, Any] | None = None
+    # `settled`/`settle_ms` (AU-01) and `signals` (AS-01, AS-02) of the read
+    # the reported nodes came from, taken right after it: the sparse-tree
+    # check below may read again
+    read_keys: dict[str, Any] = {}
     if args.max_nodes is not None and args.max_nodes < 1:
         raise errors.AutonomError(
             errors.INVALID_VALUE, f"--max-nodes must be >= 1, got {args.max_nodes}",
@@ -1180,6 +1244,8 @@ def cmd_ui_tree(args: argparse.Namespace) -> int:
             target, meaningful_only=not args.all, max_depth=args.max_depth,
             max_nodes=args.max_nodes,
         )
+        # AS-01/AS-02: the keyboard and dialog this read shows (reporting only)
+        read_keys = {**ui_mod.read_settled(target), **ui_mod.read_signals(target)}
         source, label = "device", target.target_id
         identity = target.identity()
         if target.platform == ANDROID and not truncated and accessibility_mod.sparse(nodes):
@@ -1220,6 +1286,8 @@ def cmd_ui_tree(args: argparse.Namespace) -> int:
                             nodes, new_warnings, truncated = ui_mod.tree_clipped(
                                 target, meaningful_only=not args.all, max_depth=args.max_depth,
                                 max_nodes=args.max_nodes)
+                            read_keys = {**ui_mod.read_settled(target),
+                                         **ui_mod.read_signals(target)}
                             if not accessibility_mod.sparse(nodes):
                                 break
                             if attempt < 2:
@@ -1270,10 +1338,16 @@ def cmd_ui_tree(args: argparse.Namespace) -> int:
         # used, since the alternative is a second full accessibility dump.
         size = None
         if target.platform == ANDROID:
+            # the display the helper read carried, else one lookup; recorded
+            # as the target's geometry for the next guard (AU-04)
             try:
-                size = ui_mod.screen_size(target)
+                size = ui_mod.tree_screen(target)
             except errors.AutonomError:
                 size = None
+            # AU-01: the helper read after quiet (at most 2000 ms); a screen
+            # that never went quiet is still read, not settled. AS-01/AS-02:
+            # `signals` (keyboard, dialog) of that read
+            payload.update(read_keys)
         else:
             size = ui_mod.screen_from_nodes(nodes)
         if size:
@@ -1333,6 +1407,25 @@ def cmd_ui_accessibility(args: argparse.Namespace) -> int:
         detail = accessibility_mod.enable(target, record)
     else:
         detail = accessibility_mod.restore(target, record)
+    return emit({"ok": True, **detail, **target.identity()}, as_json=True)
+
+
+def cmd_ui_helper(args: argparse.Namespace) -> int:
+    """`ui helper status|stop` (AH-07): the on-device Android helper of the
+    target. `status` reports it (and starts none); `stop` ends it the way
+    `session stop` does, freeing UiAutomation for uiautomator, uiautomator2
+    or Appium: quit, a kill of its verified pid, the removal of its own
+    forward only."""
+    target = _target(args)
+    _require_android(target, "the on-device helper exists only on Android",
+                     "On iOS the tree and input come from idb or the XCUITest runner; "
+                     "see 'autonom doctor'.")
+    from autonom_lib import android_helper  # noqa: PLC0415 - not on quick verbs' path
+
+    if args.action == "status":
+        detail = android_helper.status(target)
+    else:
+        detail = android_helper.stop(target)
     return emit({"ok": True, **detail, **target.identity()}, as_json=True)
 
 
@@ -1613,6 +1706,9 @@ def cmd_ui_find(args: argparse.Namespace) -> int:
     evidence_warning = None
     if target:
         payload.update(target.identity())
+        # AU-01, as `ui tree`: a read the Android helper served says whether
+        # the screen went quiet first (`settled`, `settle_ms`)
+        payload.update(ui_mod.read_settled(target))
         detail, evidence_warning = actions_mod.record_detail_checked(
             session_mod.load_current(), "find", {
             "kind": "find",
@@ -1677,6 +1773,10 @@ class _ObservePlan:
         self.record = observe_mod.session_for(target)
         self.on = observe_mod.wanted(self.flag, self.record)
         self.mark = observe_mod.read_mark(target)
+        # through the Android helper, the input itself comes back with the
+        # settled screen (AU-03): one round trip, no read of observe's own
+        ui_mod.observe_inputs(target, self.timeout_ms if self.on else None,
+                              observe_mod.QUIET_MS)
         return self
 
     def into(self, payload: dict[str, Any], target: Target, verb: str,
@@ -1694,7 +1794,9 @@ class _ObservePlan:
         keys, warnings = observe_mod.after_action(
             target, self.record, verb=verb,
             baseline_payload=observe_mod.own_read(target, since=self.mark),
-            timeout_ms=self.timeout_ms, secret=secret)
+            timeout_ms=self.timeout_ms, secret=secret,
+            input_reply=ui_mod.input_reply(target, after=self.mark[1]),
+            input_ended=ui_mod.input_ended(target, after=self.mark[1]))
         if observe_mod.interrupted(keys):
             _OBSERVE_INTERRUPTED = True
         payload.update(keys)
@@ -1860,7 +1962,12 @@ def cmd_ui_type(args: argparse.Namespace) -> int:
                         "type; confirm with ui find on the typed text.",
             }
     sensitive = bool(getattr(args, "sensitive", False))
+    sent_before = ui_mod.inputs_sent()
     backend = _backend(ui_mod.type_text(target, args.text))
+    # through the Android helper: how it typed, what the field shows, whether
+    # every part landed (AT-01); the adb way and iOS add nothing
+    typed_reply = (ui_mod.input_reply(target, after=sent_before)
+                   if target.platform == ANDROID else None)
     detail, evidence_warning = actions_mod.record_detail_checked(
         session_mod.load_current(), "type", {
         "kind": "type",
@@ -1887,6 +1994,10 @@ def cmd_ui_type(args: argparse.Namespace) -> int:
         payload["focus"] = "verified" if certainty == "focused" else "unverified"
     if focus_warning:
         payload["warnings"] = [focus_warning]
+    if typed_reply is not None:
+        incomplete = _typed_keys(payload, typed_reply, args.text if sensitive else None)
+        if incomplete:
+            payload.setdefault("warnings", []).append(incomplete)
     if evidence_warning:
         payload.setdefault("warnings", []).append(evidence_warning)
     # a sensitive value never reaches the observed screen or its saved tree
@@ -1894,9 +2005,171 @@ def cmd_ui_type(args: argparse.Namespace) -> int:
     return emit({**payload, **target.identity()}, as_json=True)
 
 
+def _typed_keys(payload: dict[str, Any], reply: dict[str, Any],
+                secret: str | None) -> dict[str, Any] | None:
+    """The Android helper's answer about typed text, added to ``payload``:
+    ``method`` (``keys``, ``set_text`` or ``mixed``), ``text_after`` (what
+    the field shows; null when it cannot be read, a password field; with a
+    sensitive value ``<N chars>``, N its length, as observe masks it) and
+    ``complete`` (false: a part did not land and typing stopped there,
+    nothing was sent again; null: the field cannot be read). Returns the
+    ``text_incomplete`` warning when ``complete`` is false."""
+    if isinstance(reply.get("method"), str):
+        payload["method"] = reply["method"]
+    if "text_after" in reply:
+        after = reply.get("text_after")
+        payload["text_after"] = (f"<{len(secret)} chars>" if secret and isinstance(after, str)
+                                 else after)
+    if "complete" in reply:
+        payload["complete"] = reply.get("complete")
+    if reply.get("complete") is not False:
+        return None
+    return {
+        "code": "text_incomplete",
+        "error": "part of the text did not show up in the field, and typing stopped there; "
+                 "nothing was sent again",
+        "hint": "Read the field (text_after, or 'autonom ui find') before typing again; "
+                "'autonom ui fill' replaces the whole text.",
+    }
+
+
+def cmd_ui_fill(args: argparse.Namespace) -> int:
+    """`ui fill TEXT` (AT-02): replace the whole text of a field, named by
+    the selector flags of `ui tap` or, without them, the focused field.
+
+    Android only (iOS: `unsupported_on_platform` before any device call).
+    One read finds the field; a field that is not editable is refused before
+    any input. Through the helper the field is tapped (with a selector),
+    its text set while the focused field is the target (else
+    `fill_target_mismatch`), and read back: `text_after`, `complete` and,
+    except for a password field, `text_matches`. The uiautomator/adb way
+    (printable ASCII only, else `text_not_typable` before any input) taps,
+    deletes the field's text with key events and types with `adb shell input
+    text`. `--sensitive` keeps only the length, as `ui type --sensitive`."""
+    _check_selector_regex(args)
+    plan = _ObservePlan(args)
+    target = _target(args)
+    if target.platform != ANDROID:
+        raise errors.AutonomError(
+            errors.UNSUPPORTED_ON_PLATFORM,
+            f"ui fill is not supported on {target.platform} yet",
+            "Tap the field (ui tap), clear it if needed, then type with 'autonom ui type'.",
+            platform=target.platform)
+    plan.resolve(target)
+    selectors = _selectors(args)
+    has_selector = any(value is not None for value in selectors.values())
+    nodes = ui_mod.snapshot(target)
+    if has_selector:
+        node = ui_mod.select_for_action(nodes, selectors, mode=args.mode,
+                                        case_sensitive=args.case_sensitive, index=args.index)
+        if node is None:
+            raise ui_mod.no_match_error(
+                target.platform, nodes, selectors, mode=args.mode,
+                case_sensitive=args.case_sensitive, message="no matching node to fill")
+    else:
+        node = ui_mod.focused_node(nodes)
+        if node is None:
+            raise errors.AutonomError(
+                errors.NO_FOCUSED_FIELD,
+                "no node on screen reports keyboard focus, and no selector names the field",
+                "Pass the field's selector (--resource-id/--text/--desc/...), or tap it first.")
+    if not ui_mod.is_editable(node):
+        summary = {key: node.get(key) for key in ("ref", "role", "class", "resource_id", "desc")}
+        if has_selector:
+            raise errors.AutonomError(
+                errors.INVALID_VALUE,
+                "the node the selector matched is not an editable text field; nothing was sent",
+                "Name the text field itself (its --resource-id, or its hint with --text); "
+                "'autonom ui tree' marks fields as editable.",
+                reason="not_editable", node=summary)
+        raise errors.AutonomError(
+            errors.NO_FOCUSED_FIELD,
+            "the focused node is not an editable text field; nothing was sent",
+            "Pass the field's selector (--resource-id/--text/--desc/...), or tap it first.",
+            reason="not_editable", node=summary)
+    sensitive = bool(args.sensitive)
+    text = args.fill_text
+
+    def relocate(after: list[dict[str, Any]]) -> dict[str, Any] | None:
+        # the same selector on the screen the focusing tap led to
+        return ui_mod.select_for_action(after, selectors, mode=args.mode,
+                                        case_sensitive=args.case_sensitive, index=args.index)
+
+    backend, outcome = ui_mod.fill(target, text, node, tap=has_selector,
+                                   relocate=relocate if has_selector else None)
+    x, y = ui_mod.center_of(node)
+    detail, evidence_warning = actions_mod.record_detail_checked(
+        session_mod.load_current(), "fill", {
+        "kind": "fill",
+        "coordinate": False,
+        "focused": not has_selector,
+        "selector": None if not has_selector else {
+            **{k: v for k, v in selectors.items() if v is not None},
+            "mode": args.mode, "case_sensitive": args.case_sensitive,
+            "index": args.index,
+        },
+        "node": node,
+        "x": x, "y": y,
+        "nodes": nodes,
+        "sensitive": sensitive,
+        # as `ui type`: the value stays out of the record when sensitive
+        "text": None if sensitive else text,
+        "text_len": len(text),
+    })
+    shown = f"<{len(text)} chars>" if sensitive else text
+    payload: dict[str, Any] = {"ok": True, "filled": shown, "ref": node.get("ref")}
+    if sensitive:
+        payload["sensitive"] = True
+    payload["field"] = {key: node.get(key) for key in ("ref", "role", "resource_id", "desc")}
+    # with a selector the field was tapped to focus it; without one it had focus
+    payload["tapped"] = has_selector
+    if has_selector:
+        payload.update(x=x, y=y)
+    payload["backend"] = backend
+    warnings: list[dict[str, Any]] = []
+    reply = outcome.get("reply")
+    if isinstance(reply, dict):
+        payload["method"] = "set_text"
+        _typed_keys(payload, reply, text if sensitive else None)
+        after = reply.get("text_after")
+        if not node.get("password") and "text_after" in reply:
+            # read back (AT-02): never for a password field
+            payload["text_matches"] = after == text if isinstance(after, str) else None
+            if payload["text_matches"] is False:
+                warnings.append({
+                    "code": "text_mismatch",
+                    "error": "the field shows other text than the one set (it may limit or "
+                             "format its input); nothing was sent again",
+                    "hint": "Check the field with 'autonom ui find' or 'autonom ui tree'.",
+                })
+    else:
+        payload["method"] = "keys"
+        payload["deleted"] = outcome.get("deleted")
+    if detail:
+        payload["detail"] = detail
+    if warnings:
+        payload["warnings"] = warnings
+    if evidence_warning:
+        payload.setdefault("warnings", []).append(evidence_warning)
+    plan.into(payload, target, "ui fill", secret=text if sensitive else None)
+    return emit({**payload, **target.identity()}, as_json=True)
+
+
+def _check_android_key(key: str) -> None:
+    """`ui key` on Android (AT-03, widened by ODA-004): a `KEYCODE_*` name,
+    a bare upper-case name (sent as `KEYCODE_<name>` by `ui.press_key`) or a
+    decimal key number; anything else (shell text included) is refused
+    before the observe plan or any device call."""
+    from autonom_lib import ui_android  # noqa: PLC0415 - not on quick verbs' path
+
+    ui_android.android_key(key)
+
+
 def cmd_ui_key(args: argparse.Namespace) -> int:
     plan = _ObservePlan(args)
     target = _target(args)
+    if target.platform == ANDROID:
+        _check_android_key(args.keycode)
     plan.resolve(target)
     backend = _backend(ui_mod.press_key(target, args.keycode))
     payload: dict[str, Any] = {"ok": True, "keycode": args.keycode}
@@ -1949,18 +2222,87 @@ def cmd_ui_do(args: argparse.Namespace) -> int:
 # --- evidence ----------------------------------------------------------------
 
 
+def _check_max_edge(value: int | None) -> None:
+    """`screenshot --max-edge`: the long edge the helper takes, refused with
+    `invalid_value` before any device call."""
+    if value is None:
+        return
+    from autonom_lib import ui_android  # noqa: PLC0415 - not on quick verbs' path
+
+    low, high = ui_android.AGENT_SHOT_MIN_EDGE, ui_android.AGENT_SHOT_MAX_EDGE_LIMIT
+    if not low <= value <= high:
+        raise errors.AutonomError(
+            errors.INVALID_VALUE, f"--max-edge must be from {low} to {high}, got {value}",
+            f"Pass the longest image edge in pixels (default "
+            f"{ui_android.AGENT_SHOT_MAX_EDGE}); a smaller screen is never upscaled.")
+
+
+def _agent_screenshot(args: argparse.Namespace, target: Target,
+                      record: dict[str, Any] | None, out: Path | None = None) -> bool:
+    """Is this `screenshot` an agent screenshot (AS-03)? `--agent` /
+    `--no-agent` win; without either, yes in an agent-profile session of an
+    Android target (iOS agent screenshots are not there yet: an iOS session
+    keeps today's PNG), except that an explicit `--out` ending in `.png`
+    keeps today's PNG there (the file type asked for wins; `--max-edge`
+    still asks for the agent image). `--agent` or `--max-edge` on iOS is
+    `unsupported_on_platform`; `--max-edge` without agent mode is
+    `invalid_value`; an agent screenshot with an `--out` not ending in
+    `.jpg`/`.jpeg` is `invalid_value`, so a JPEG is never written under
+    another suffix. All before any capture. (When the helper then cannot
+    make the JPEG, `capture_evidence` writes today's PNG under the `--out`
+    name with `.png`, warning `out_renamed`.)"""
+    flag = getattr(args, "agent", None)
+    max_edge = getattr(args, "max_edge", None)
+    if target.platform != ANDROID:
+        if flag or max_edge is not None:
+            raise errors.AutonomError(
+                errors.UNSUPPORTED_ON_PLATFORM,
+                "agent screenshots (--agent, --max-edge) are made on Android only",
+                "Run 'autonom screenshot' for the full-size PNG; on iOS the image is in "
+                "pixels and taps are in points (see 'ui tree' screen).")
+        return False
+    suffix = out.suffix.lower() if out is not None else None
+    if flag is not None:
+        agent = bool(flag)
+    else:
+        agent = (observe_mod.owns(record, target)
+                 and session_mod.profile_of(record) == session_mod.AGENT_PROFILE
+                 and (suffix != ".png" or max_edge is not None))
+    if max_edge is not None and not agent:
+        raise errors.AutonomError(
+            errors.INVALID_VALUE, "--max-edge sizes an agent screenshot",
+            "Add --agent (the default in an agent-profile session), or drop --max-edge for "
+            "the full-size PNG.")
+    if agent and out is not None and suffix not in shot_mod.AGENT_OUT_SUFFIXES:
+        raise errors.AutonomError(
+            errors.INVALID_VALUE,
+            f"an agent screenshot is a JPEG; --out {out.name} does not end in .jpg or .jpeg",
+            "Use a .jpg name or drop --agent (--no-agent, or a .png --out without --agent "
+            "and --max-edge, takes the full-size PNG).",
+            flag="--out")
+    return agent
+
+
 def cmd_screenshot(args: argparse.Namespace) -> int:
     out = _output_path(args.out, "--out") if args.out else None
+    _check_max_edge(getattr(args, "max_edge", None))
     target = _target(args)
+    record = session_mod.load_current()
+    agent = _agent_screenshot(args, target, record, out)
     # A live Android status-bar pin drifts within a minute; re-send it so
     # before/after frames show the same bar.
     repin = simulator_mod.repin_before_capture(target)
+    # AS-03: an agent screenshot (`--agent`, or the agent profile on Android)
+    # is the helper's small JPEG with a coordinate note; every other one is
+    # exactly today's PNG
+    extra: dict[str, Any] = {"agent": True, "max_edge": args.max_edge} if agent else {}
     detail = shot_mod.capture_evidence(
         target,
-        session_mod.load_current(),
+        record,
         label=getattr(args, "label", None),
         task=getattr(args, "task", None),
         out=out,
+        **extra,
     )
     payload: dict[str, Any] = {"ok": True, **detail}
     if repin is not None:
@@ -2026,7 +2368,9 @@ def cmd_shots_show(args: argparse.Namespace) -> int:
             errors.BODY_FILE_NOT_FOUND, f"no such file: {path}",
             "Pass a path from 'autonom shots list'.",
         )
-    size = shot_mod.png_size(path)
+    # a PNG's header, or an agent JPEG's frame header (its metadata is in the
+    # shots index: a JPEG carries none, so `metadata` is empty for it)
+    size = shot_mod.image_size(path)
     return emit({"ok": True, "path": str(path),
                  "width": size[0] if size else None,
                  "height": size[1] if size else None,
@@ -5175,6 +5519,9 @@ def cmd_report_serve(args: argparse.Namespace) -> int:
     initial_dir = _resolve_run_dir(record, args.run)
     initial_manifest = flow_report.load_manifest(initial_dir)
     target = platform_mod.resolve(args, session_record=record)
+    # every replay runs on this target with this invocation's --ui-backend:
+    # a value of the other platform is refused before the server starts
+    _check_ui_backend(args, target)
     token = secrets_mod.token_urlsafe(24)
 
     def page_for(manifest: dict[str, Any]) -> str:
@@ -6598,7 +6945,7 @@ _CONTROL_HOST: frozenset[str] = frozenset({
 _CONTROL_MUTATING: frozenset[str] = frozenset({
     "devices shutdown", "session launch", "session force-stop", "session clear",
     "session uninstall", "ui tap", "ui swipe", "ui pinch", "ui rotate", "ui shake", "ui type",
-    "ui key", "open", "permissions", "location set", "location clear", "media add",
+    "ui fill", "ui key", "open", "permissions", "location set", "location clear", "media add",
     "network attach", "network detach", "network stop", "metrics memory warn",
 })
 # `teach approve` and `tour` run flows only with --run (else READONLY);
@@ -6615,6 +6962,8 @@ _CONTROL_FLOW: frozenset[str] = frozenset({
 # are listed, every other action is MUTATING.
 _CONTROL_BY_ACTION: dict[str, frozenset[str]] = {
     "ui accessibility": frozenset({"status"}),
+    # `stop` ends a device process the lease holder may be using.
+    "ui helper": frozenset({"status"}),
     "simulator battery": frozenset(),
     "simulator network": frozenset(),
     "simulator push": frozenset(),
@@ -6690,6 +7039,12 @@ def _begin_control(args: argparse.Namespace) -> None:
 # --- parser ------------------------------------------------------------------
 
 
+UI_BACKEND_CHOICES = ("auto", "idb", "xcuitest", "helper", "uiautomator")
+UI_BACKEND_HELP = ("tree and input backend: iOS auto|idb|xcuitest (default auto: idb, XCUITest on "
+                   "an unusable tree); Android auto|helper|uiautomator (default auto: the "
+                   "on-device helper when it can serve the call, else uiautomator and adb input)")
+
+
 def target_flags_parent() -> argparse.ArgumentParser:
     """Target flags repeated on every leaf subcommand.
 
@@ -6701,8 +7056,8 @@ def target_flags_parent() -> argparse.ArgumentParser:
     parent = argparse.ArgumentParser(add_help=False)
     parent.add_argument("--session-id", default=argparse.SUPPRESS,
                         help="bind this command to a session (a stopped one: read-only verbs)")
-    parent.add_argument("--ui-backend", choices=("auto", "idb", "xcuitest"), default=argparse.SUPPRESS,
-                        help="iOS tree and input backend (default auto: idb, XCUITest on an unusable tree)")
+    parent.add_argument("--ui-backend", choices=UI_BACKEND_CHOICES, default=argparse.SUPPRESS,
+                        help=UI_BACKEND_HELP)
     parent.add_argument("--platform", choices=("android", "ios"), default=argparse.SUPPRESS)
     parent.add_argument("--target", default=argparse.SUPPRESS)
     parent.add_argument("--serial", default=argparse.SUPPRESS)
@@ -6882,8 +7237,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--session-id",
                         help="bind this command to a session (a stopped one: read-only verbs)")
-    parser.add_argument("--ui-backend", choices=("auto", "idb", "xcuitest"),
-                        help="iOS tree and input backend (default auto: idb, XCUITest on an unusable tree)")
+    parser.add_argument("--ui-backend", choices=UI_BACKEND_CHOICES, help=UI_BACKEND_HELP)
     parser.add_argument("--platform", choices=("android", "ios"), help="target platform")
     parser.add_argument("--target", help="target id (adb serial or simulator udid)")
     parser.add_argument("--serial", help="adb serial / emulator id (Android alias of --target)")
@@ -7029,6 +7383,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("action", choices=("status", "enable", "reset"))
     p.set_defaults(func=cmd_ui_accessibility)
 
+    p = ui_sub.add_parser("helper", help="Android: status of the on-device helper, or stop "
+                          "it (frees UiAutomation for other tools)", parents=[target_flags])
+    p.add_argument("action", choices=("status", "stop"))
+    p.set_defaults(func=cmd_ui_helper)
+
     p = ui_sub.add_parser("find", help="find nodes by selector", parents=[target_flags])
     p.add_argument("--dump", help="parse an offline UI dump")
     _add_selector_flags(p)
@@ -7081,8 +7440,22 @@ def build_parser() -> argparse.ArgumentParser:
     _add_observe_flags(p)
     p.set_defaults(func=cmd_ui_type)
 
+    p = ui_sub.add_parser(
+        "fill", help="Android: replace the whole text of a field (by selector, or the focused "
+                     "field)", parents=[target_flags])
+    # `fill_text`: the selector flags already take `--text` (dest `text`)
+    p.add_argument("fill_text", metavar="TEXT", help="the field's new text (any Unicode "
+                   "through the on-device helper; printable ASCII through adb input)")
+    _add_selector_flags(p)
+    p.add_argument("--sensitive", action="store_true",
+                   help="a credential: keep only its length in every artifact")
+    _add_observe_flags(p)
+    p.set_defaults(func=cmd_ui_fill)
+
     p = ui_sub.add_parser("key", help="send a key or hardware button", parents=[target_flags])
-    p.add_argument("keycode", help="Android: KEYCODE_BACK; iOS: HOME, LOCK, SIRI, SIDE_BUTTON")
+    p.add_argument("keycode", help="Android: an upper-case key name (BACK or KEYCODE_BACK) "
+                                   "or a key number (up to 4 digits); iOS: HOME, LOCK, SIRI, "
+                                   "SIDE_BUTTON")
     _add_observe_flags(p)
     p.set_defaults(func=cmd_ui_key)
 
@@ -7101,6 +7474,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--out", help="extra copy at this exact path (the session keeps one too)")
     p.add_argument("--label", help="what this shows, e.g. 'preorders with mock'")
     p.add_argument("--task", help="group shots under a sub-directory")
+    p.add_argument("--agent", dest="agent", action="store_const", const=True, default=None,
+                   help="Android: a small JPEG made on the device (long edge --max-edge) with "
+                        "the factor that turns image pixels into tap coordinates; the default "
+                        "in an agent-profile session")
+    p.add_argument("--no-agent", dest="agent", action="store_const", const=False,
+                   help="today's full-size PNG, whatever the session profile")
+    p.add_argument("--max-edge", type=int, default=None, metavar="N",
+                   help="longest edge of an agent screenshot in pixels (default 1000; "
+                        "never upscaled)")
+    p.exact_only_options = journal_mod.EXACT_ONLY_OPTIONS | {"--agent", "--no-agent",
+                                                             "--max-edge"}
     p.set_defaults(func=cmd_screenshot)
 
     note = sub.add_parser("note", help="record an agent note in the session journal")
@@ -8396,8 +8780,9 @@ def main(argv: list[str] | None = None) -> int:
                 before_session = session_mod.load_current()
             except Exception:  # noqa: BLE001
                 before_session = None
-            from autonom_lib import ui_ios
+            from autonom_lib import ui_android, ui_ios
             ui_ios.set_preference(getattr(args, "ui_backend", None))
+            ui_android.set_preference(getattr(args, "ui_backend", None))
             code = args.func(args)
             if code == 0 and _OBSERVE_INTERRUPTED:
                 # The one place an interrupt during observe (AL-11) ends:
