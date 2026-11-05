@@ -768,9 +768,11 @@ export class ScrcpySession extends EventEmitter {
     if (attempt.hostStart) {
       this.#hostDisabled = true;
       this.#hostFallback = "Host capture stopped; using Android encoder";
-      this.#options.onHostDisabled?.();
     }
     if (this.#stopped) return;
+    // Only a capture that failed turns the cutout override off; a normal stop
+    // (idle, profile switch, hidden tab) keeps it for the next session.
+    if (attempt.hostStart) this.#options.onHostDisabled?.();
     attempt.host?.abort?.();
     if (this.listenerCount("error")) this.emit("error", error);
     const streamedMs = this.#streamingSince ? performance.now() - this.#streamingSince : 0;

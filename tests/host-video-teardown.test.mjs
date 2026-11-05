@@ -67,3 +67,40 @@ test("a host stop that rejects still tears down and restarts the session", { tim
     process.off("unhandledRejection", onUnhandled);
   }
 });
+
+test("a normal stop of a healthy host session keeps the cutout override", { timeout: 20_000 }, async () => {
+  const metadata = Buffer.concat([Buffer.alloc(64), Buffer.from([0x68, 0x32, 0x36, 0x34])]);
+  const commands = [];
+  let attemptConnections = 0, disabled = 0;
+  const spawn = (_file, args) => {
+    commands.push(args.at(-1)); attemptConnections = 0;
+    const child = new EventEmitter(); child.stdout = new PassThrough(); child.stderr = new PassThrough();
+    child.kill = () => {}; return child;
+  };
+  const connect = () => {
+    const first = attemptConnections++ === 0;
+    const socket = new Duplex({ read() {}, write(_b, _e, done) { done(); } });
+    socket.setNoDelay = () => {};
+    queueMicrotask(() => {
+      socket.emit("connect");
+      if (first) socket.push(Buffer.concat([Buffer.from([0]), Buffer.alloc(64)]));
+    });
+    return socket;
+  };
+  const session = new ScrcpySession({
+    adbPath: "fake", serial: "emulator-5556", serverPath: "fake", maxSize: 1280, maxFps: 60, bitRate: 12000000,
+    exec: async (_file, args) => ({ stdout: args.includes("forward") && !args.includes("--remove") ? "43210" : "" }),
+    spawn, connect,
+    onHostDisabled: () => { disabled += 1; },
+    hostFactory: async () => () => {
+      const stdout = new PassThrough();
+      queueMicrotask(() => stdout.write(metadata));
+      return { stdout, stats: {}, requestKeyFrame() {}, abort() {}, async stop() { stdout.destroy(); } };
+    },
+  });
+  session.on("error", () => {});
+  await session.start();
+  assert.equal(session.stats.videoBackend, "videotoolbox");
+  await session.stop();
+  assert.equal(disabled, 0);
+});
