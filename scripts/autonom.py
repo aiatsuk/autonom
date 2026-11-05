@@ -48,6 +48,46 @@ ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+
+
+class _LazyModule:
+    """A library module imported on first use. The flow modules (and teach,
+    app_skills and proof, which import them) and the emulator are needed by
+    few verbs, and importing them took about 40 ms of every call (an observed
+    `ui tap` included); attribute reads, writes and deletes go to the module
+    itself, so `mock.patch.object` on it works as on the module."""
+
+    __slots__ = ("_lazy_name", "_lazy_module")
+
+    def __init__(self, name: str) -> None:
+        object.__setattr__(self, "_lazy_name", name)
+        object.__setattr__(self, "_lazy_module", None)
+
+    def _lazy_load(self) -> Any:
+        module = object.__getattribute__(self, "_lazy_module")
+        if module is None:
+            import importlib
+
+            module = importlib.import_module(object.__getattribute__(self, "_lazy_name"))
+            object.__setattr__(self, "_lazy_module", module)
+        return module
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._lazy_load(), name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        setattr(self._lazy_load(), name, value)
+
+    def __delattr__(self, name: str) -> None:
+        delattr(self._lazy_load(), name)
+
+    def __dir__(self) -> list[str]:
+        return dir(self._lazy_load())
+
+    def __repr__(self) -> str:
+        return f"<lazy module {object.__getattribute__(self, '_lazy_name')!r}>"
+
+
 from autonom_lib import __version__  # noqa: E402
 from autonom_lib import actions as actions_mod  # noqa: E402
 from autonom_lib import accessibility as accessibility_mod  # noqa: E402
@@ -56,26 +96,26 @@ from autonom_lib import consent as consent_mod  # noqa: E402
 from autonom_lib import control as control_mod  # noqa: E402
 from autonom_lib import device_state  # noqa: E402
 from autonom_lib import doctor as doctor_mod  # noqa: E402
-from autonom_lib import emulator as emulator_mod  # noqa: E402
+emulator_mod = _LazyModule("autonom_lib.emulator")
 from autonom_lib import errors  # noqa: E402
 from autonom_lib import follow as follow_mod  # noqa: E402
 from autonom_lib import ios_idb  # noqa: E402
-from autonom_lib.flow import canonical as flow_canonical  # noqa: E402
-from autonom_lib.flow import compiler as flow_compiler  # noqa: E402
-from autonom_lib.flow import executor as flow_executor  # noqa: E402
-from autonom_lib.flow import maestro as flow_maestro  # noqa: E402
-from autonom_lib.flow import repair as flow_repair  # noqa: E402
-from autonom_lib.flow import validator as flow_validator  # noqa: E402
+flow_canonical = _LazyModule("autonom_lib.flow.canonical")
+flow_compiler = _LazyModule("autonom_lib.flow.compiler")
+flow_executor = _LazyModule("autonom_lib.flow.executor")
+flow_maestro = _LazyModule("autonom_lib.flow.maestro")
+flow_repair = _LazyModule("autonom_lib.flow.repair")
+flow_validator = _LazyModule("autonom_lib.flow.validator")
 from autonom_lib import journal as journal_mod  # noqa: E402
 from autonom_lib import observe as observe_mod  # noqa: E402
 from autonom_lib import providers as providers_mod  # noqa: E402
-from autonom_lib import teach as teach_mod  # noqa: E402
-from autonom_lib import app_skills as app_skills_mod  # noqa: E402
+teach_mod = _LazyModule("autonom_lib.teach")
+app_skills_mod = _LazyModule("autonom_lib.app_skills")
 from autonom_lib import simulator as simulator_mod  # noqa: E402
 from autonom_lib import ios_simctl  # noqa: E402
 from autonom_lib import logs as logs_mod  # noqa: E402
 from autonom_lib import platform as platform_mod  # noqa: E402
-from autonom_lib import proof as proof_mod  # noqa: E402
+proof_mod = _LazyModule("autonom_lib.proof")
 from autonom_lib import processes as processes_mod  # noqa: E402
 from autonom_lib import screenshot as shot_mod  # noqa: E402
 from autonom_lib import selector as selector_mod  # noqa: E402
@@ -195,6 +235,11 @@ def emit(data: Any, *, as_json: bool) -> int:
         for key in ui_ios.PROVENANCE_KEYS:
             if observed.get(key) is not None:
                 data.setdefault(key, observed[key])
+        # how the idb route served it: the device daemon or the idb process,
+        # and why not the daemon when it was wanted (additive keys)
+        for key, value in ios_idb.transport_of(data.get("target_id", "")).items():
+            if key in ios_idb.TRANSPORT_KEYS and value is not None:
+                data.setdefault(key, value)
     _LAST_EMIT = data if isinstance(data, dict) else None
     if as_json or isinstance(data, (dict, list)):
         # One line for every caller and profile (AL-10): the same keys and

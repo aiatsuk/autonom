@@ -62,18 +62,32 @@ After `ui type --sensitive`, the typed value is kept out of everything
 observe reports or saves: the text and description of editable or focused
 nodes, and of any node that may show the value or a part of it however
 formatted (``shows_secret``), read ``<N chars>``.
+
+On the iOS device daemon route (ID-10) an observed tap, swipe or key is one
+`act` request: the daemon sends the input, waits up to 500 ms (1.5 s for the
+first touch on a new companion's quiet stream) for the app to report the
+touch (``touches_completed`` on its open quiet stream), gives the
+app a grace period to turn busy and then waits for quiet within the observe
+budget, and reads the screen once. That read is the new screen; the reply
+adds ``input_confirmed`` and ``method: quiet-stream``, and an unconfirmed
+input adds the warning ``input_unconfirmed`` (or ``ios_input_blocked`` when
+the cause is known) while the reply stays ``ok: true``: the input was sent
+once. The command arms this before its input (``read_mark``, after
+``wanted`` said yes); `ui type` keeps its text on the idb process and is
+observed with the quiet stream and one read.
 """
 from __future__ import annotations
 
 import json
 import re
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Any, Mapping
 
 from . import adb as adb_mod
-from . import errors, ui
+from . import errors, ios_idb, ui
 from . import session as session_mod
 from .platform import ANDROID, IOS, Target
 
@@ -88,6 +102,8 @@ CHANGE_LINES = 20
 BASELINE_PRE_READ = "pre_read"
 BASELINE_SAVED = "saved_tree"
 BASELINE_NONE = "none"
+# the settle `method` of an observed input the device daemon sent (ID-10)
+METHOD_QUIET_STREAM = ui.METHOD_QUIET_STREAM
 
 # observe_error.code of an interrupt during observe: the code of the CLI's
 # exit-130 envelope (errors.INTERRUPTED), but here the action itself ran.
@@ -123,6 +139,12 @@ _RESUMED = re.compile(r"(?:topResumedActivity|mResumedActivity|ResumedActivity)"
 # --- when ---------------------------------------------------------------------------
 
 
+# What this thread's current action command decided before its input: the
+# observe budget (``check_timeout``) and whether it observes (``wanted``).
+# ``read_mark`` arms the daemon's `act` for the target from it.
+_PLAN = threading.local()
+
+
 def owns(record: Mapping[str, Any] | None, target: Target | None) -> bool:
     """Is ``record`` the session of ``target`` (same device, same platform)?"""
     if not record or target is None:
@@ -145,18 +167,25 @@ def wanted(flag: bool | None, record: Mapping[str, Any] | None) -> bool:
     """Observe or not: ``--observe`` / ``--no-observe`` win; without either,
     on exactly in an agent-profile session (AL-09)."""
     if flag is not None:
-        return bool(flag)
-    return session_mod.profile_of(dict(record) if record else None) == session_mod.AGENT_PROFILE
+        on = bool(flag)
+    else:
+        on = (session_mod.profile_of(dict(record) if record else None)
+              == session_mod.AGENT_PROFILE)
+    _PLAN.on = on
+    return on
 
 
 def check_timeout(timeout_ms: int | None) -> int:
     """``--observe-timeout-ms``: milliseconds >= 0, refused before any input."""
+    _PLAN.on = False
     if timeout_ms is None:
+        _PLAN.timeout_ms = DEFAULT_TIMEOUT_MS
         return DEFAULT_TIMEOUT_MS
     if timeout_ms < 0:
         raise errors.AutonomError(
             errors.INVALID_VALUE, f"--observe-timeout-ms must be >= 0, got {timeout_ms}",
             f"Pass a duration in milliseconds (default {DEFAULT_TIMEOUT_MS}).")
+    _PLAN.timeout_ms = int(timeout_ms)
     return int(timeout_ms)
 
 
@@ -164,8 +193,19 @@ def read_mark(target: Target) -> tuple[Any, int]:
     """Where this thread stands when a command starts: its last read of
     ``target`` and how many inputs it has sent. A read and an input the
     command makes itself can then be told from an earlier command's
-    (several commands can run in one process)."""
-    return ui.last_snapshot(target), ui.inputs_sent()
+    (several commands can run in one process).
+
+    When the command observes (``wanted`` said so) an iOS target, its input
+    is armed to go as one daemon `act` on the daemon route (ID-10); any
+    earlier arming of this thread is dropped either way. Never reads."""
+    mark = ui.last_snapshot(target), ui.inputs_sent()
+    if (target.platform == IOS and getattr(_PLAN, "on", False)
+            and not ios_idb.xcuitest_session(target.target_id)):
+        ios_idb.arm_act(target.target_id, getattr(_PLAN, "timeout_ms", DEFAULT_TIMEOUT_MS))
+    else:
+        ios_idb.disarm_act()
+    _PLAN.on = False
+    return mark
 
 
 def own_read(target: Target, since: tuple[Any, int] | None = None) -> Any:
@@ -525,9 +565,12 @@ def after_action(target: Target, record: Mapping[str, Any] | None, *, verb: str,
     input (``own_read``), or None; ``secret`` is a typed value to keep out
     of everything observe reports or saves."""
     progress: dict[str, Any] = {"stage": STAGE_SETTLE, "keys": {}, "warnings": []}
+    act = ios_idb.take_act(target.target_id) if target.platform == IOS else None
+    ios_idb.disarm_act()
     try:
         _observe(target, record, verb=verb, baseline_payload=baseline_payload,
-                 timeout_ms=timeout_ms, quiet_ms=quiet_ms, secret=secret, progress=progress)
+                 timeout_ms=timeout_ms, quiet_ms=quiet_ms, secret=secret, progress=progress,
+                 act=act)
     except KeyboardInterrupt:
         keys = dict(progress["keys"])
         keys["observe_error"] = _interrupted_error(verb, progress["stage"])
@@ -536,13 +579,65 @@ def after_action(target: Target, record: Mapping[str, Any] | None, *, verb: str,
         error = _scrubbed(_error(exc), secret)
         if error.get("code") == INTERRUPTED:  # that code is the interrupt's alone
             error["code"] = errors.BACKEND_FAILED
+        if act is not None:
+            # the daemon sent the input and said whether the app confirmed it;
+            # only its read failed: that much is still reported
+            kept = {key: progress["keys"][key] for key in ("input_confirmed", "method")
+                    if key in progress["keys"]}
+            return {**kept, "observe_error": error}, list(progress["warnings"])
         return {"observe_error": error}, []
     return progress["keys"], progress["warnings"]
 
 
+def _act_warning(item: Any) -> dict[str, Any] | None:
+    """A daemon `act` warning as a reply warning (``code``, ``error``,
+    ``hint``, and the cause it found)."""
+    if not isinstance(item, dict) or not isinstance(item.get("code"), str):
+        return None
+    code = item["code"]
+    error = ("input is not reaching the simulator: the app did not report the touch, "
+             "and the simulator's HID flag is set with no Device Hub running"
+             if code == errors.IOS_INPUT_BLOCKED else
+             "the input was sent once, but the app did not report the touch in time")
+    warning: dict[str, Any] = {"code": code, "error": error}
+    if item.get("hint"):
+        warning["hint"] = str(item["hint"])
+    for key in ("dtuhidd_active", "device_hub"):
+        if key in item:
+            warning[key] = item[key]
+    return warning
+
+
+def _settle_by_act(act: Mapping[str, Any], keys: dict[str, Any],
+                   warnings: list[dict[str, Any]]) -> tuple[dict[str, Any], Any]:
+    """What the daemon's `act` gave (ID-10): the settle result and the
+    one read it made. Raises its read failure as an AutonomError."""
+    keys["input_confirmed"] = bool(act.get("input_confirmed"))
+    keys["method"] = METHOD_QUIET_STREAM
+    for item in act.get("warnings") or ():
+        warning = _act_warning(item)
+        if warning:
+            warnings.append(warning)
+    error = act.get("error")
+    if isinstance(error, dict):
+        raise errors.AutonomError(str(error.get("code") or errors.BACKEND_FAILED),
+                                  str(error.get("message") or "the screen read failed"),
+                                  error.get("hint") or None)
+    payload = act.get("json")
+    if not isinstance(payload, str):
+        raise errors.AutonomError(errors.BACKEND_FAILED,
+                                  "the iOS device daemon returned no screen read")
+    settled = bool(act.get("settled"))
+    waited = int(act.get("waited_ms") or 0)
+    return ({"settled": settled, "method": METHOD_QUIET_STREAM, "snapshots": 1,
+             "changes": 0, "elapsed_ms": waited, "stable_ms": 0,
+             "quiet_state": "quiet" if settled else "busy"}, payload)
+
+
 def _observe(target: Target, record: Mapping[str, Any] | None, *, verb: str,
              baseline_payload: Any, timeout_ms: int, quiet_ms: int,
-             secret: str | None, progress: dict[str, Any]) -> None:
+             secret: str | None, progress: dict[str, Any],
+             act: Mapping[str, Any] | None = None) -> None:
     """Fill ``progress`` (``keys`` and ``warnings`` of the reply, and the
     ``stage`` reached) as each part is obtained, so an interrupt keeps what
     came before it."""
@@ -559,8 +654,13 @@ def _observe(target: Target, record: Mapping[str, Any] | None, *, verb: str,
     # the AL-08 settle: idb quiet then one read on the iOS idb route, polling
     # elsewhere; every read it makes is ours, so the last one is kept. A read
     # of a settle that did not end is not reported: it may be mid-change.
-    settled = ui.settle(target, timeout_ms=timeout_ms, quiet_ms=quiet_ms,
-                        snapshot_fn=read, quiet_signal=True)
+    # On the daemon route the input's own `act` already settled and read.
+    if act is not None:
+        settled, payload = _settle_by_act(act, keys, warnings)
+        held["read"] = _compact(target.platform, payload)
+    else:
+        settled = ui.settle(target, timeout_ms=timeout_ms, quiet_ms=quiet_ms,
+                            snapshot_fn=read, quiet_signal=True)
     if "read" not in held:
         read()  # the settle made no read of its own: one, and only one, more
     nodes, tree_warnings, truncated = held["read"]

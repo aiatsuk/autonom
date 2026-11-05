@@ -210,7 +210,7 @@ in a new session. The default source follows the repository's default branch.
 Its matching release may not yet exist, in which case setup reports that and
 leaves the CLI intact until publication.
 
-For a reproducible **fresh** install, add `--ref v0.36.2` to the marketplace
+For a reproducible **fresh** install, add `--ref v0.37.0` to the marketplace
 registration command. A pinned tag stays pinned on upgrade. Changing an
 existing ref requires replacing the marketplace registration; adding the same
 marketplace with another ref is refused. Preserve installed options and scope

@@ -9,7 +9,8 @@ whole suite a second time. This runner does both jobs in one pass:
   first, twice `os.cpu_count()` at a time (`AUTONOM_TEST_JOBS` overrides) —
   most tests wait on fake devices and timeouts rather than burn CPU;
 - each worker gets its own scratch `AUTONOM_HOME`, so modules never share a
-  machine store;
+  machine store, and `AUTONOM_IOS_DAEMON=off` unless the caller set it, so
+  no test starts a real iOS device daemon;
 - each worker loads `test_aa_env_snapshot` first and `test_zz_env_hygiene`
   last around its module, so the environment-restoration guard still sees
   every test;
@@ -107,6 +108,9 @@ def units(modules: list[str]) -> list[str]:
 def run_module(module: str) -> tuple[str, int, str, float]:
     home = tempfile.mkdtemp(prefix="autonom-test-")
     env = {**os.environ, "AUTONOM_HOME": home}
+    # Fake-idb tests never start a real iOS device daemon (and its companion);
+    # the daemon tests opt in with a fake daemon.
+    env.setdefault("AUTONOM_IOS_DAEMON", "off")
     started = time.monotonic()
     try:
         proc = subprocess.run(

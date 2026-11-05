@@ -293,7 +293,7 @@ class FollowupDocsTests(unittest.TestCase):
         for chunk in changelog.split("\n## [")[1:]:
             name, _, body = chunk.partition("]")
             sections[name] = body
-        cls.release_notes = sections.get("Unreleased", "") + sections.get("0.36.2", "")
+        cls.release_notes = sections.get("Unreleased", "") + sections.get("0.37.0", "") + sections.get("0.36.2", "")
 
     def test_new_flags_exist_and_are_documented(self) -> None:
         expected = {
@@ -392,7 +392,7 @@ class KitDocsTests(unittest.TestCase):
 
 
 class UnreleasedNotesTests(unittest.TestCase):
-    """Each follow-up after 0.36.2 has a line in the changelog's Unreleased section."""
+    """Each follow-up after 0.36.2 has a line in the changelog (Unreleased, then 0.37.0)."""
 
     def test_unreleased_names_every_followup(self) -> None:
         changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
@@ -400,7 +400,7 @@ class UnreleasedNotesTests(unittest.TestCase):
         for chunk in changelog.split("\n## [")[1:]:
             name, _, body = chunk.partition("]")
             sections[name] = body
-        notes = " ".join(sections.get("Unreleased", "").split())
+        notes = " ".join((sections.get("Unreleased", "") + sections.get("0.37.0", "")).split())
         for text in ("`slow` and `timeout`", "--delay 3", "`--hang`",
                      "never completed (<error_kind>)", "status None",
                      "Canvas", "pretest warmup", "pretest_damaged",
