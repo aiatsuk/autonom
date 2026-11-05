@@ -42,8 +42,8 @@ export const GRPC_SERVICE = "/idb.CompanionService";
 export const IDB_INSTALL_HINT =
   "idb_companion was not found. Install it with `brew install facebook/fb/idb-companion` or pass its path.";
 
-// The Canvas's own idb_companion binary. AUTONOM_IDB_COMPANION is not read here: it is the
-// `host:port` of a remote companion that every idb call of the CLI is sent to.
+// The Canvas's own idb_companion binary. AUTONOM_IDB_COMPANION (the CLI's companion
+// address setting) is not read here.
 export const IDB_CAPABILITY = "canvas.idb";
 export const IDB_COMPANION_BIN_ENV = "AUTONOM_IDB_COMPANION_BIN";
 export const IDB_COMPANION_HINT =
@@ -2532,18 +2532,18 @@ export function freeLoopbackPort() {
 
 const UDID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9-]{0,63}$/;
 
-// idb_companion needs the host's tool paths, home, temporary directory and locale,
-// not the coding agent's API keys or dynamic-loader overrides. Keep this an exact
-// allowlist: accepting a whole prefix (including LC_*) could carry unrelated secrets.
-const COMPANION_ENV_KEYS = Object.freeze([
+// idb_companion gets only the host's tool paths, home, temporary directory, locale and
+// Xcode selection; no other variable of the agent's environment reaches it. Keep this
+// an exact list of names: accepting a whole prefix (including LC_*) would pass more.
+const COMPANION_ENV_NAMES = Object.freeze([
   "PATH", "HOME", "TMPDIR", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "DEVELOPER_DIR",
 ]);
 
 /** A fresh environment for the local companion, including when the caller supplies one. */
 export function companionEnvironment(source = processEnv) {
-  return Object.fromEntries(COMPANION_ENV_KEYS
-    .filter((key) => typeof source[key] === "string")
-    .map((key) => [key, source[key]]));
+  return Object.fromEntries(COMPANION_ENV_NAMES
+    .filter((name) => typeof source[name] === "string")
+    .map((name) => [name, source[name]]));
 }
 
 /**
