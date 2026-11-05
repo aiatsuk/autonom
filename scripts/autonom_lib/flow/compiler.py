@@ -8,9 +8,12 @@ deliberately conservative — §8.4's "never silently" list is the contract:
 - an action whose provenance is missing (a coordinate tap, a pre-0.23
   session without detail records) is **skipped with a named warning**, never
   approximated;
-- sensitive input (``ui type --sensitive``, or a value typed right after
-  focusing a credential-shaped field) becomes ``${SECRET_n}`` — the value is
-  not in the artifacts and cannot leak into the flow;
+- sensitive input (``ui type --sensitive``, ``ui fill --sensitive``, or a
+  value typed right after focusing, or filled into, a credential-shaped
+  field) becomes ``${SECRET_n}`` — the value is not in the artifacts and
+  cannot leak into the flow;
+- a ``ui fill`` becomes ``tapOn`` (when a selector named the field; none
+  when it filled the focused field), ``eraseText`` and ``inputText``;
 - a selector that was proven unique during the session is reused verbatim;
   an explicit ``--index`` carries over as an explicit ``index`` (it was the
   operator's stated choice, §7.9 item 6);
@@ -38,6 +41,8 @@ _NOISE_VERBS = {
     "processes", "cleanup", "session show", "session stop", "session start",
     "network requests", "network status", "record start", "record stop",
     "flow", "crash", "file", "logs",
+    # the on-device Android helper's housekeeping, never a step of the app
+    "ui helper",
 }
 
 
@@ -59,10 +64,15 @@ _VERB_OPTIONS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "session clear": (("--strategy",), ()),
     "session uninstall": ((), ()),
     "ui key": (("--observe-timeout-ms",), ("--observe", "--no-observe")),
+    "ui fill": (("--text", "--desc", "--resource-id", "--class-name", "--package", "--role",
+                 "--clickable", "--enabled", "--mode", "--index", "--observe-timeout-ms"),
+                ("--case-sensitive", "--sensitive", "--observe", "--no-observe")),
     "location set": ((), ()),
     "permissions": ((), ()),
 }
 _NEGATIVE_NUMBER_RE = re.compile(r"^-\.?\d")
+# Flow's eraseText deletes 50 characters unless it says how many.
+_ERASE_DEFAULT_CHARS = 50
 # `session launch` options Flow v1 launchApp cannot express (schema.py:
 # launchApp takes clearState, resume, label, postcondition only)
 _LAUNCH_ONLY_OPTIONS = ("--activity", "--arg", "--setenv")
@@ -217,6 +227,28 @@ def compile_session(session: dict[str, Any], *, name: str | None = None,
         warnings.append({"code": code, "error": message, **extra})
         quality["skipped"] += 1
 
+    def count_selector(selector: FlowSelector) -> None:
+        if "resource_id" in selector.fields:
+            quality["selectors"]["id"] += 1
+        elif "text" in selector.fields:
+            quality["selectors"]["text"] += 1
+        elif "desc" in selector.fields:
+            quality["selectors"]["description"] += 1
+        if selector.index is not None:
+            quality["selectors"]["index"] += 1
+
+    def input_text(detail: dict[str, Any], sensitive: bool) -> None:
+        nonlocal secret_count
+        if sensitive or detail.get("text") is None:
+            secret_count += 1
+            variable = f"SECRET_{secret_count}"
+            flow.steps.append(Step("inputText",
+                                   {"value": f"${{{variable}}}",
+                                    "sensitive": True}))
+            quality["secrets"] += 1
+        else:
+            flow.steps.append(Step("inputText", {"value": detail["text"]}))
+
     for entry in entries:
         if entry.get("kind") == "note":
             flow.steps.append(Step("note", {"text": entry.get("text", "")}))
@@ -301,14 +333,7 @@ def compile_session(session: dict[str, Any], *, name: str | None = None,
                      seq=entry.get("seq"))
                 last_tap_node = None
                 continue
-            if "resource_id" in selector.fields:
-                quality["selectors"]["id"] += 1
-            elif "text" in selector.fields:
-                quality["selectors"]["text"] += 1
-            elif "desc" in selector.fields:
-                quality["selectors"]["description"] += 1
-            if selector.index is not None:
-                quality["selectors"]["index"] += 1
+            count_selector(selector)
             args: dict[str, Any] = {"selector": selector}
             if detail.get("duration_ms"):
                 flow.steps.append(Step("longPressOn",
@@ -325,15 +350,37 @@ def compile_session(session: dict[str, Any], *, name: str | None = None,
                 continue
             sensitive = bool(detail.get("sensitive")) or _looks_credential(
                 last_tap_node)
-            if sensitive or detail.get("text") is None:
-                secret_count += 1
-                variable = f"SECRET_{secret_count}"
-                flow.steps.append(Step("inputText",
-                                       {"value": f"${{{variable}}}",
-                                        "sensitive": True}))
-                quality["secrets"] += 1
-            else:
-                flow.steps.append(Step("inputText", {"value": detail["text"]}))
+            input_text(detail, sensitive)
+        elif verb == "ui fill":
+            # tapOn (a selector named the field), eraseText, inputText
+            if not detail:
+                warn("filled_text_not_recorded",
+                     "this fill has no detail record to compile",
+                     seq=entry.get("seq"))
+                continue
+            node = detail.get("node") or None
+            if not detail.get("focused"):
+                selector = _selector_from_detail(detail)
+                if selector is None and node:
+                    selector = _selector_from_node(node, detail.get("nodes") or [])
+                if selector is None:
+                    warn("selector_not_recoverable",
+                         "no stable selector could be derived for this fill",
+                         seq=entry.get("seq"))
+                    last_tap_node = None
+                    continue
+                quality["selectors"]["recorded"] += 1
+                count_selector(selector)
+                flow.steps.append(Step("tapOn", {"selector": selector}))
+                last_tap_node = node
+            shown = len(str((node or {}).get("text") or ""))
+            flow.steps.append(Step("eraseText", {"chars": shown}
+                                   if shown > _ERASE_DEFAULT_CHARS else {}))
+            sensitive = (bool(detail.get("sensitive")) or _looks_credential(node)
+                         or _looks_credential(last_tap_node))
+            if detail.get("text") == "" or detail.get("text_len") == 0:
+                continue  # an emptied field: nothing to type
+            input_text(detail, sensitive)
         elif verb == "ui key":
             key = positionals[0] if positionals else None
             if key == "KEYCODE_BACK":

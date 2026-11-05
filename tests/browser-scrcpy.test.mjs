@@ -6570,9 +6570,13 @@ if (args[0] === "simctl" && args[1] === "list") {
 }
 `;
 
-/** A world for an iOS Canvas: fake simctl, and a fake idb_companion on PATH unless `companion` is false. */
+/**
+ * A world for an iOS Canvas: fake simctl, and a fake idb_companion on PATH unless `companion` is
+ * false. The device daemon is off (AUTONOM_IOS_DAEMON=off), as in the Python harness: these
+ * tests drive the Canvas's own companion; tests/canvas-multi-device.test.mjs covers the daemon's.
+ */
 async function iosWorld(t, { env = {}, companion = true } = {}) {
-  const world = await makeWorld(t, { env: { FAKE_UDID: IOS_UDID, ...env } });
+  const world = await makeWorld(t, { env: { FAKE_UDID: IOS_UDID, AUTONOM_IOS_DAEMON: "off", ...env } });
   world.xcrun = join(world.directory, "fake-xcrun.mjs");
   await writeFile(world.xcrun, `#!${process.execPath}\n${FAKE_IOS_XCRUN}`);
   await chmod(world.xcrun, 0o755);
@@ -6688,6 +6692,11 @@ test("ios: auto picks idb when idb_companion is on PATH; its frames reach /ws/vi
   assert.deepEqual(body.idb.points, IOS_POINTS);
   assert.equal(body.idb.orientation, "PORTRAIT");
   assert.equal(body.idb.companion_starts, 1);
+  // AUTONOM_IOS_DAEMON=off: the Canvas's own companion, no daemon attached.
+  assert.equal(body.idb.companion_source, "private");
+  assert.equal(body.idb.daemon_attached, false);
+  assert.equal(body.idb.daemon_fallback, null);
+  assert.equal(body.idb.companion_attaches, 0);
   assert.equal(body.idb.streams_opened, 1);
   assert.ok(body.idb.packets >= 60);
   const state = tab.json("state").at(-1);

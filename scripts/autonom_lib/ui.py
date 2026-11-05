@@ -361,9 +361,11 @@ _LAST_PAYLOAD = threading.local()
 
 def read_payload(target: Target) -> Any:
     """One read of the raw tree from the device: the UI Automator XML on
-    Android, the idb (or XCUITest runner) payload on iOS."""
+    Android (from the on-device helper or ``uiautomator dump``, as
+    ``ui_android.read`` chooses), the idb (or XCUITest runner) payload on
+    iOS."""
     if target.platform == ANDROID:
-        return ui_android.dump_hierarchy(target.tool, target.target_id)
+        return ui_android.read(target)
     if target.platform == IOS:
         return _ios().describe_all(target)
     raise errors.AutonomError(errors.UNKNOWN_PLATFORM,
@@ -545,6 +547,28 @@ def _asks_quiet(target: Target | None, timeout_ms: int,
     return _ios().quiet_route(target)
 
 
+# `settle`'s ``method`` on the iOS idb route: `idb ui quiet` through the idb
+# process, or the device daemon's open quiet stream.
+METHOD_IDB_QUIET = "idb-quiet"
+METHOD_QUIET_STREAM = "quiet-stream"
+
+
+def _asks_helper(target: Target | None, timeout_ms: int, quiet_ms: int,
+                 snapshot_fn: Callable[[], list[dict[str, Any]]] | None,
+                 quiet_signal: bool | None) -> bool:
+    """Does `settle` let the Android helper wait for quiet (AU-03)? Under
+    the same conditions as idb's quiet signal on iOS, for an Android target
+    whose reads go to the helper, and for a quiet window one helper request
+    can wait for (at most ``HELPER_MAX_WAIT_MS``; a longer one is polled)."""
+    if quiet_signal is False or target is None or target.platform != ANDROID:
+        return False
+    if timeout_ms <= 0 or (snapshot_fn is not None and quiet_signal is not True):
+        return False
+    if quiet_ms > ui_android.HELPER_MAX_WAIT_MS:
+        return False
+    return ui_android.helper_serves_reads(target)
+
+
 def settle(
     target: Target | None,
     timeout_ms: int = 5000,
@@ -560,7 +584,8 @@ def settle(
 
     On the iOS idb route (AL-08) idb is asked first whether the frontmost
     app goes quiet within the budget (`idb ui quiet`), and the tree is then
-    read exactly once: ``method: "idb-quiet"``, ``snapshots: 1``, and
+    read exactly once: ``method: "idb-quiet"`` (``"quiet-stream"`` when the
+    device daemon answered from its open quiet stream), ``snapshots: 1``, and
     ``settled`` is idb's answer — false, with the read made, when idb still
     saw the app busy or settling at the deadline (``quiet_state`` and
     ``busy_signals`` say what it saw). A dead companion is pruned and idb
@@ -568,8 +593,19 @@ def settle(
     at all when nothing is left. When this idb has no such command or
     the call fails, the tree is polled as below within what is left of the
     budget: ``method: "poll"`` and ``quiet_fallback`` (``code``, ``error``).
-    Android, the XCUITest route and a zero budget always poll. The quiet
-    signal is used when the caller reads through the default ``snapshot``
+    On Android, when the on-device helper serves the reads (AU-03), the
+    helper waits for ``quiet_ms`` without accessibility events (at most
+    `timeout_ms`) and the tree is read in that one request:
+    ``method: "helper"``, ``snapshots: 1``, ``settled`` the helper's answer,
+    ``settle_ms`` and, when not settled, ``busy`` (what kept it busy). A
+    budget above what one helper request waits (60 s) is spent over several
+    such reads, until one is settled (``snapshots`` counts them); a quiet
+    window above it is polled. When the read fell back to uiautomator, the
+    tree is polled as below within what is left of the budget
+    (``quiet_fallback``), starting from the uiautomator read the fallback
+    already made. uiautomator, the
+    XCUITest route and a zero budget always poll. The quiet signal (and the
+    helper's) is used when the caller reads through the default ``snapshot``
     (``ui wait --settled``, observe); a caller with its own `snapshot_fn`
     (the Flow engine, tests) keeps polling unless it passes
     ``quiet_signal=True``, and ``quiet_signal=False`` always polls. The
@@ -598,6 +634,9 @@ def settle(
     started = clock()
     deadline = started + max(timeout_ms, 0) / 1000
     fallback: dict[str, Any] | None = None
+    # a read made before the poll (the helper's, fallen back to uiautomator):
+    # its nodes and when it began and ended
+    seed: tuple[list[dict[str, Any]], float, float] | None = None
     if _asks_quiet(target, timeout_ms, snapshot_fn, quiet_signal):
         try:
             # a retry after a dead companion sends only what is left before
@@ -613,8 +652,11 @@ def settle(
             take()
             now = clock()
             quiet = bool(answer.get("quiet"))
+            # the device daemon answers from its open quiet stream (ID-10)
+            method = (METHOD_QUIET_STREAM if answer.get("transport") == "daemon"
+                      else METHOD_IDB_QUIET)
             result: dict[str, Any] = {
-                "settled": quiet, "method": "idb-quiet", "snapshots": 1, "changes": 0,
+                "settled": quiet, "method": method, "snapshots": 1, "changes": 0,
                 "elapsed_ms": int((now - started) * 1000),
                 "dump_ms": int((now - began) * 1000),
                 # idb counts the app quiet only after the whole quiet window
@@ -624,6 +666,41 @@ def settle(
             if answer.get("signals"):
                 result["busy_signals"] = list(answer["signals"])
             return result
+    elif _asks_helper(target, timeout_ms, quiet_ms, snapshot_fn, quiet_signal):
+        assert target is not None
+        wait_ms = min(timeout_ms, ui_android.HELPER_MAX_WAIT_MS)
+        asked_ms = reads = 0
+        while True:
+            began = clock()
+            with ui_android.read_limits(quiet_ms=quiet_ms, max_ms=wait_ms):
+                nodes = take()
+            now = clock()
+            held = ui_android.last_helper_read(target)
+            if held is None:
+                # the read fell back to uiautomator: it is the poll's first
+                # snapshot, not thrown away. It is timed by its dump alone:
+                # the helper attempt and the stop before it are no forecast
+                # of the next dump
+                dumped = ui_android.last_dump(target)
+                if dumped is not None:
+                    began = max(began, now - max(0.0, dumped[1] - dumped[0]))
+                seed = (nodes, began, now)
+                break
+            reads += 1
+            asked_ms += wait_ms
+            # what the budget leaves after the waits asked so far (and the
+            # clock): a read that answers early never makes the next longer
+            left_ms = min(timeout_ms - asked_ms, int((deadline - now) * 1000))
+            if held.get("settled") or left_ms <= 0:
+                return ui_android.settle_report(
+                    held, quiet_ms=quiet_ms, elapsed_ms=int((now - started) * 1000),
+                    snapshots=reads) | {"dump_ms": int((now - began) * 1000)}
+            # that read waited as long as one request may: the next waits
+            # for what is left of the budget
+            wait_ms = min(left_ms, ui_android.HELPER_MAX_WAIT_MS)
+        state = ui_android.provenance(target.target_id)
+        fallback = {"code": errors.ANDROID_HELPER_UNAVAILABLE,
+                    "error": state.get("fallback_reason") or "the helper did not serve the read"}
     interval = max(interval_ms, 10) / 1000
     previous: tuple | None = None
     stable_since = started
@@ -646,10 +723,15 @@ def settle(
         return result
 
     while True:
-        began = clock()
-        signature = tree_signature(take())
+        if seed is not None:
+            nodes, began, now = seed
+            seed = None
+        else:
+            began = clock()
+            nodes = take()
+            now = clock()
+        signature = tree_signature(nodes)
         snapshots += 1
-        now = clock()
         if snapshots == 1:
             first = now - began
         else:
@@ -707,8 +789,10 @@ def unsettled_message(result: Mapping[str, Any], timeout_ms: int, quiet_ms: int,
     CLI, `timeoutMs` in a flow); `node_wait` is how that caller waits for a
     node instead. An ``idb-quiet`` result says what idb last saw instead.
     """
-    if result.get("method") == "idb-quiet":
+    if result.get("method") in (METHOD_IDB_QUIET, METHOD_QUIET_STREAM):
         return _unquiet_message(result, timeout_ms, quiet_ms, timeout_name, node_wait)
+    if result.get("method") == ui_android.HELPER:
+        return _helper_unsettled_message(result, timeout_ms, quiet_ms, timeout_name, node_wait)
     snapshots = int(result.get("snapshots") or 0)
     changes = int(result.get("changes") or 0)
     dump_ms = int(result.get("dump_ms") or 0)
@@ -739,6 +823,64 @@ def unsettled_message(result: Mapping[str, Any], timeout_ms: int, quiet_ms: int,
             f"Nothing was seen changing, but the budget was too short to prove the "
             f"screen still: raise {timeout_name}{needed} (two dumps plus the quiet "
             f"window).")
+
+
+def _helper_unsettled_message(result: Mapping[str, Any], timeout_ms: int, quiet_ms: int,
+                              timeout_name: str, node_wait: str) -> tuple[str, str]:
+    """``unsettled_message`` for the Android helper's settle, under the same
+    rule as the poll's: "still changing" is a claim only a change at the end
+    supports. ``busy`` (when the helper reported it) counts the
+    accessibility events of the wait and times the last ones. The cases:
+
+    - the app never answered the round trip after the input;
+    - no wait at all (``settle_ms`` null: an observed input with no budget
+      left asks for ``settle: false``);
+    - an event inside the last ``quiet_ms`` of a wait at least that long:
+      still changing;
+    - events, none at the end, or a wait shorter than the quiet window: it
+      may just have settled;
+    - no event: nothing was seen changing, the wait was too short to prove
+      the screen still."""
+    busy = result.get("busy") if isinstance(result.get("busy"), dict) else {}
+    count = busy.get("events") if isinstance(busy.get("events"), int) else 0
+    packages = busy.get("packages") if isinstance(busy.get("packages"), dict) else {}
+    seen = ""
+    if count:
+        top = next(iter(packages), None)
+        seen = f" ({count} accessibility event(s)" + (f", most from {top}" if top else "") + ")"
+    settle_ms = result.get("settle_ms")
+    if isinstance(settle_ms, bool) or not isinstance(settle_ms, int):
+        settle_ms = None
+    after = f" {settle_ms} ms" if settle_ms is not None else f" {timeout_ms} ms"
+    if busy.get("app_answered") is False:
+        return (f"the app did not answer the helper within{after}: its main thread was still "
+                f"busy{seen}",
+                f"The app is working on the main thread: raise {timeout_name}, or {node_wait}.")
+    if settle_ms is None:
+        need = max(int(quiet_ms), 0) + ui_android.SETTLE_FIRST_EVENT_MS
+        return (f"could not confirm the screen settled: the helper read it without waiting, as "
+                f"the {timeout_ms} ms budget left no time for the {quiet_ms} ms quiet window",
+                f"Nothing was checked for changes: raise {timeout_name} to at least ~{need} ms "
+                f"(the first-event wait plus the quiet window) so the helper can wait for quiet.")
+    times = [item.get("ms") for item in busy.get("last") or () if isinstance(item, dict)]
+    times = [ms for ms in times if isinstance(ms, (int, float)) and not isinstance(ms, bool)]
+    last_ms = max(times) if times else None
+    window = settle_ms >= quiet_ms
+    if count and window and (last_ms is None or last_ms > settle_ms - quiet_ms):
+        return (f"the screen was still changing after{after}: no {quiet_ms} ms without "
+                f"accessibility events{seen}",
+                f"An animation, a timer or a loading list keeps it changing: raise "
+                f"{timeout_name}, or {node_wait}.")
+    fit = (f"shorter than the {quiet_ms} ms quiet window" if not window
+           else f"and the {quiet_ms} ms quiet window did not fit in it")
+    if count:
+        return (f"the screen changed{seen}, then the helper's{after} wait ended, {fit}",
+                f"It may have just settled: raise {timeout_name} by at least ~{quiet_ms} ms "
+                f"so the quiet window fits.")
+    return (f"could not confirm the screen settled: the helper saw no accessibility event in "
+            f"its{after} wait, {fit}",
+            f"Nothing was seen changing, but the wait was too short to prove the screen "
+            f"still: raise {timeout_name} by at least ~{quiet_ms} ms so the quiet window fits.")
 
 
 _INTERACTABLE_ROLES = ("button", "textfield", "searchfield", "securetextfield", "switch",
@@ -833,11 +975,101 @@ def outline(nodes: list[dict[str, Any]], *, interactable_only: bool = False) -> 
 
 
 def screen_size(target: Target) -> tuple[int, int] | None:
+    """One lookup of the screen size as input coordinates see it now. On
+    Android always today's `wm size` and rotation sources, whatever the ui
+    backend: callers outside the ui verbs ask it (Mobile Canvas polls it
+    with its status, a Canvas recording on an emulator sizes itself with
+    it, the Flow engine caches it once per run), and none of them may start
+    the on-device helper, wait for its use lock or keep it holding
+    UiAutomation (Canvas is unchanged: scrcpy, no UiAutomation). Only the
+    coordinate guard asks the helper (``_guard_lookup``)."""
     if target.platform == ANDROID:
         return ui_android.screen_size(target.tool, target.target_id)
     if _ios().selected_backend(target) == "xcuitest":
         return _ios().screen_size(target)
     return _idb_screen_size(target)
+
+
+def _guard_lookup(target: Target) -> tuple[int, int] | None:
+    """The coordinate guard's one lookup (AU-04): on Android the helper's
+    display info when the helper serves ``target`` (the input after the
+    guard goes to it as well), else `wm size` and the rotation sources;
+    elsewhere ``screen_size``."""
+    if target.platform == ANDROID:
+        return ui_android.lookup_screen_size(target)
+    return screen_size(target)
+
+
+def tree_screen(target: Target) -> tuple[int, int] | None:
+    """The ``screen`` an Android ``ui tree`` reports: the display the helper
+    read of this command carried, else one lookup (``screen_size``: `wm
+    size` and the rotation sources, so a read uiautomator served never
+    starts the helper for its size); either way recorded as the target's
+    geometry, so a later guard needs no lookup (AU-04)."""
+    held = ui_android.last_helper_read(target)
+    found = ui_android._display_size((held or {}).get("display"))  # noqa: SLF001
+    if found:
+        return found[0], found[1]
+    size = screen_size(target)
+    if size:
+        ui_android.record_geometry(target, size)
+    return size
+
+
+def helper_read(target: Target) -> dict[str, Any] | None:
+    """``settled``, ``settle_ms`` (and ``busy``) of this thread's latest
+    read of ``target`` when the Android helper served it; else None."""
+    if target.platform != ANDROID:
+        return None
+    return ui_android.last_helper_read(target)
+
+
+def read_settled(target: Target) -> dict[str, Any]:
+    """The reply keys of this thread's latest read of ``target`` (AU-01):
+    ``settled`` and ``settle_ms`` when the Android helper served it. The
+    helper reads after 500 ms without accessibility events, at most
+    2000 ms, and a screen that never got there is still read, with
+    ``settled: false``. Empty when uiautomator or iOS served the read: the
+    explicit uiautomator opt-out keeps today's reply (ODA-001), and an auto
+    fall-back read reports what it knows, its ``ui_backend`` and
+    ``fallback_reason``, as uiautomator says nothing of how long it
+    waited."""
+    held = helper_read(target)
+    if held is None:
+        return {}
+    return {"settled": bool(held.get("settled")), "settle_ms": held.get("settle_ms")}
+
+
+def read_signals(target: Target) -> dict[str, Any]:
+    """``{"signals": {"keyboard", "dialog"}}`` of this thread's latest read
+    of ``target`` (AS-01, AS-02; ``ui_android.read_signals``): Android
+    reads the helper served, and auto fall-back reads (``keyboard`` null).
+    Empty on iOS, for a read under the explicit uiautomator choice (today's
+    reply, DEC-018) and when nothing was read. Reporting only, no device
+    call."""
+    if target.platform != ANDROID:
+        return {}
+    found = ui_android.read_signals(target)
+    return {} if found is None else {"signals": found}
+
+
+def provenance_mark(target: Target) -> int:
+    """A mark of this invocation's Android reads and inputs of ``target``
+    (0 on iOS): taken before a step, it lets ``provenance`` describe that
+    step alone."""
+    if target.platform != ANDROID:
+        return 0
+    return ui_android.uses(target.target_id)
+
+
+def provenance(target: Target, since: int = 0) -> dict[str, Any]:
+    """Which Android backend served the reads and inputs of ``target``
+    after mark ``since`` (``provenance_mark``; 0: the whole invocation):
+    ``ui_backend``, ``input_backend``, ``fallback_reason``,
+    ``fallback_hint``; empty on iOS and when nothing was read or sent."""
+    if target.platform != ANDROID:
+        return {}
+    return ui_android.provenance(target.target_id, since)
 
 
 def _idb_screen_size(target: Target) -> tuple[int, int] | None:
@@ -873,12 +1105,67 @@ def _idb_screen_size(target: Target) -> tuple[int, int] | None:
     return None
 
 
-# The actuation verbs return the backend that delivered the input: "adb" on
-# Android; on iOS "idb", "axe" or "xcuitest" as `ui_ios` resolved it
+# The actuation verbs return the backend that delivered the input: on
+# Android "helper" (the on-device helper) or "adb"; on iOS "idb", "axe" or
+# "xcuitest" as `ui_ios` resolved it
 # (--ui-backend, AUTONOM_IOS_HID, AXe fallback), so a payload can say which
 # one ran. Callers that ignore the return value are unaffected.
 # `ui_ios.last_backend()` reports the same.
 ANDROID_BACKEND = "adb"
+
+# The Android helper's reply to this thread's latest input: the number of
+# that input among the thread's inputs (``inputs_sent``), its target, the
+# reply (with the settle block and, when the input was observed, the screen
+# it led to: AU-03) and when (``time.monotonic()``) the input ended (its
+# request written, then its gesture). Observe takes the screen from it
+# instead of reading, and counts its budget from that moment.
+_INPUT_REPLY = threading.local()
+
+
+def observe_inputs(target: Target, timeout_ms: int | None,
+                   quiet_ms: int = ui_android.READ_QUIET_MS) -> None:
+    """This command observes its inputs to ``target`` (AL-11): on Android
+    through the helper, each comes back with its settled screen in the same
+    round trip. ``timeout_ms`` None ends that. No device call."""
+    if target.platform == ANDROID:
+        ui_android.observe_inputs(target, timeout_ms, quiet_ms)
+
+
+def input_reply(target: Target, *, after: int = 0) -> dict[str, Any] | None:
+    """The Android helper's reply to this thread's latest input, when that
+    input went to ``target`` through the helper after input number
+    ``after`` (an ``inputs_sent()`` mark); None otherwise."""
+    held = _held_input(target, after)
+    return held[3] if held else None
+
+
+def input_ended(target: Target, *, after: int = 0) -> float | None:
+    """When (``time.monotonic()``) the input ``input_reply`` answers for
+    ended, so a caller that observes it counts its budget from there, the
+    helper's settle included (a helper start before it is not); None when
+    there is no such reply."""
+    held = _held_input(target, after)
+    return held[4] if held and held[3] is not None else None
+
+
+def _held_input(target: Target, after: int) -> tuple | None:
+    held = getattr(_INPUT_REPLY, "value", None)
+    if not held or held[0] <= after or (held[1], held[2]) != (target.platform, target.target_id):
+        return None
+    return held
+
+
+def _android_input(target: Target, send: Callable[..., tuple[str, Any]], *args: Any,
+                   observed: bool = True) -> str:
+    """One Android input through ``ui_android`` (helper or adb), its reply
+    kept for observe; returns the backend that delivered it."""
+    extra = ui_android.observed_settle(target) if observed else None
+    backend, reply = send(target, *args, extra=extra)
+    helper = backend == ui_android.HELPER
+    _INPUT_REPLY.value = (inputs_sent(), target.platform, target.target_id,
+                          reply if helper else None,
+                          ui_android.input_ended(target) if helper else None)
+    return backend
 
 
 def _pretest_guard(verb: str, target: Target, **kwargs: Any) -> None:
@@ -895,8 +1182,7 @@ def tap(target: Target, x: int, y: int, *, screen: tuple[int, int] | None = None
     _pretest_guard("tap", target, node=node, point=(x, y))
     _sending(target)
     if target.platform == ANDROID:
-        ui_android.tap(target.tool, target.target_id, x, y)
-        return ANDROID_BACKEND
+        return _android_input(target, ui_android.send_tap, x, y)
     # the node lets the XCUITest backend tap the element it resolved itself
     return _ios().tap(target, x, y, node=node)
 
@@ -907,8 +1193,7 @@ def long_press(target: Target, x: int, y: int, duration_ms: int = 600,
     _pretest_guard("long-press", target, node=node, point=(x, y))
     _sending(target)
     if target.platform == ANDROID:
-        ui_android.long_press(target.tool, target.target_id, x, y, duration_ms)
-        return ANDROID_BACKEND
+        return _android_input(target, ui_android.send_long_press, x, y, duration_ms)
     # through ui_ios, not idb directly: AXe or the XCUITest runner may carry it
     return _ios().tap(target, x, y, duration=duration_ms / 1000)
 
@@ -921,9 +1206,9 @@ def double_tap(target: Target, x: int, y: int,
     _sending(target)
     # Guard once, dispatch twice — the platform helpers skip the guard.
     if target.platform == ANDROID:
-        ui_android.tap(target.tool, target.target_id, x, y)
-        ui_android.tap(target.tool, target.target_id, x, y)
-        return ANDROID_BACKEND
+        # the first tap never waits for a settle, so the pair stays a double tap
+        _android_input(target, ui_android.send_tap, x, y, observed=False)
+        return _android_input(target, ui_android.send_tap, x, y)
     _ios().tap(target, x, y)
     # the second tap reports the backend that finished the gesture (a first
     # tap that fell back to AXe makes the second go straight to AXe)
@@ -937,26 +1222,117 @@ def swipe(target: Target, x1: int, y1: int, x2: int, y2: int, duration: float,
     _pretest_guard("swipe", target)
     _sending(target)
     if target.platform == ANDROID:
-        ui_android.swipe(target.tool, target.target_id, x1, y1, x2, y2, duration)
-        return ANDROID_BACKEND
+        return _android_input(target, ui_android.send_swipe, x1, y1, x2, y2, duration)
     return _ios().swipe(target, x1, y1, x2, y2, duration)
 
 
 def type_text(target: Target, text: str) -> str:
+    """Type ``text`` at the cursor of the focused field. On Android through
+    the helper any Unicode text (its reply, with ``method``, ``text_after``
+    and ``complete``, is ``input_reply``); the uiautomator/adb way takes
+    printable ASCII only and refuses other text with ``text_not_typable``
+    before anything is sent (``ui_android.send_text``)."""
     _pretest_guard("type", target)
     _sending(target)
     if target.platform == ANDROID:
-        ui_android.type_text(target.tool, target.target_id, text)
-        return ANDROID_BACKEND
+        return _android_input(target, ui_android.send_text, text)
     return _ios().type_text(target, text)
 
 
+def fill(target: Target, text: str, node: Mapping[str, Any], *, tap: bool,
+         relocate: Callable[[list[dict[str, Any]]], Mapping[str, Any] | None] | None = None,
+         ) -> tuple[str, dict[str, Any]]:
+    """Replace the whole text of the editable field ``node`` (from this
+    command's read) with ``text`` (AT-02); Android only (iOS:
+    ``unsupported_on_platform``). ``tap``: focus the field with a tap at its
+    centre first (a selector named it); else it has focus already.
+
+    Through the helper: the tap settles and reads the screen after it in the
+    same request, ``relocate`` finds the field in that read (the keyboard
+    may have moved it; the field keeps the bounds it had when it cannot be
+    found there), and `set_text` replaces the text only while the focused
+    field is at the field's bounds (``fill_target_mismatch`` otherwise). The
+    uiautomator/adb way: the text is checked first (printable ASCII only,
+    else ``text_not_typable`` before any input), then the tap,
+    `KEYCODE_MOVE_END`, one `KEYCODE_DEL` per character the tree shows in
+    the field (at least one) and `adb shell input text`.
+
+    Returns ``(backend, detail)``: ``detail`` holds the helper's `set_text`
+    reply (``reply``) and the bounds it was checked against
+    (``expect_bounds``), or, on the adb way, how many `KEYCODE_DEL` were
+    sent (``deleted``). No input is ever sent twice: one written to the
+    helper and not answered is ``ui_action_uncertain``."""
+    if target.platform != ANDROID:
+        raise errors.AutonomError(
+            errors.UNSUPPORTED_ON_PLATFORM,
+            f"ui fill is not supported on {target.platform} yet",
+            "Tap the field (ui tap), clear it if needed, then type with 'autonom ui type'.",
+            platform=target.platform)
+    x, y = center_of(node)
+    if tap:
+        _guard_point(target, x, y)
+        _pretest_guard("tap", target, node=node, point=(x, y))
+    _pretest_guard("type", target)
+    _sending(target)
+    point = (x, y) if tap else None
+    detail: dict[str, Any] = {}
+    reply: dict[str, Any] | None = None
+    if ui_android.text_route(target) == ui_android.HELPER:
+        bounds = node.get("bounds")
+        reachable = True  # the helper took the focusing tap, or there is none
+        if tap:
+            tapped = ui_android.send_focus_tap(target, x, y)
+            reachable = tapped is not None
+            if tapped is not None:
+                point = None  # the tap was sent: never again, by any route
+                bounds = _relocated_bounds(tapped, relocate) or bounds
+        if reachable:
+            detail["expect_bounds"] = bounds
+            reply = ui_android.send_set_text(target, text, bounds,
+                                             extra=ui_android.observed_settle(target))
+    if reply is not None:
+        detail["reply"] = reply
+        _INPUT_REPLY.value = (inputs_sent(), target.platform, target.target_id, reply,
+                              ui_android.input_ended(target))
+        return ui_android.HELPER, detail
+    # The adb way: the uiautomator choice, auto fell back before anything was
+    # sent, or (rare) the helper became unusable after the focusing tap it
+    # performed: then only the text part goes through adb.
+    detail.pop("expect_bounds", None)
+    ui_android.check_adb_typable(target, text, verb="fill")
+    detail["deleted"] = ui_android.adb_fill(target, text, point=point,
+                                            current_length=len(str(node.get("text") or "")))
+    _INPUT_REPLY.value = (inputs_sent(), target.platform, target.target_id, None, None)
+    return ui_android.ADB, detail
+
+
+def _relocated_bounds(reply: Mapping[str, Any],
+                      relocate: Callable[[list[dict[str, Any]]], Mapping[str, Any] | None] | None
+                      ) -> list[int] | None:
+    """The bounds of the fill's field in the screen a focusing tap read after
+    it (``reply["read"]``), as ``relocate`` finds it there; None when there
+    is no such read or the field is not an editable node in it."""
+    after = reply.get("read")
+    if relocate is None or not isinstance(after, dict) or not isinstance(after.get("xml"), str):
+        return None
+    try:
+        moved = relocate(nodes_from_payload(ANDROID, after["xml"]))
+    except Exception:  # noqa: BLE001 - an unreadable read keeps the bounds the field had
+        return None
+    if not moved or not is_editable(moved) or not moved.get("bounds"):
+        return None
+    return list(moved["bounds"])
+
+
 def press_key(target: Target, key: str) -> str:
+    if target.platform == ANDROID:
+        # AT-03/ODA-004: checked (a bare name gets KEYCODE_) before the
+        # pre-test guard and any device call, whoever sends the key
+        key = ui_android.android_key(key)
     _pretest_guard("key", target)
     _sending(target)
     if target.platform == ANDROID:
-        ui_android.press_key(target.tool, target.target_id, key)
-        return ANDROID_BACKEND
+        return _android_input(target, ui_android.send_key, key)
     return _ios().press_key(target, key)
 
 
@@ -1018,42 +1394,65 @@ def _guard_points(target: Target, points: tuple[tuple[int, int], ...],
 
     1. ``screen``, from a caller that already knows it (the flow executor
        caches it once per run);
-    2. on the iOS idb/AXe route, a size known without a device call — the
+    2. a size known without a device call. On the iOS idb/AXe route the
        root frame of the tree this thread just read (a selector tap's own
        read), else the geometry recorded for the target (``ui tree``, an
-       earlier lookup). On iOS a lookup is a whole accessibility dump, so
-       this is what keeps a tap at one read (AL-01). A point refused on such
-       a size is decided again on one fresh lookup, so a stale size (a
-       rotation, another app) never refuses a valid point (INV-2);
-    3. one lookup (``screen_size``) — always on Android and on the XCUITest
-       route, whose runner reports the screen it maps coordinates in. On
-       the iOS idb/AXe route that lookup is a whole accessibility read and
-       is kept as this thread's last snapshot (``_idb_screen_size``).
+       earlier lookup); on iOS a lookup is a whole accessibility dump, so
+       this is what keeps a tap at one read (AL-01). On Android (AU-04),
+       on both backends, the size of the read this command made (a
+       selector tap's own read: the helper read's display, or the root of
+       the uiautomator dump), else the geometry recorded by the latest read
+       of this invocation or of the session that owns the target (a helper
+       read, or the ``screen`` ``ui tree`` reported). A point refused on
+       such a size is decided again on one fresh lookup, so a stale size (a
+       rotation, another app) or a dump root smaller than the display (a
+       dialog) never refuses a valid point (INV-2). A size an earlier
+       command left in the session accepts a point only when the point
+       fits both that size and its transpose: the device may have turned
+       since, and a point off the turned screen must not be sent; any
+       other point is decided on one fresh lookup too;
+    3. one lookup (``_guard_lookup``): on Android the helper's display
+       info when the helper serves the target, else `wm size` and the
+       rotation sources; on the XCUITest route the runner, which reports
+       the screen it maps coordinates in. On the iOS idb/AXe route that
+       lookup is a whole accessibility read and is kept as this thread's
+       last snapshot (``_idb_screen_size``).
 
     All ``points`` (a swipe's two ends) are checked against the same size.
     """
     if screen is None:
         known = _known_screen(target)
         if known is not None:
-            if _outside(points, known) is None:
+            size, measured = known
+            if _outside(points, size) is None and (
+                    measured or _outside(points, (size[1], size[0])) is None):
                 return
-            # refused on a size nobody re-measured: measure once, then decide
-        screen = screen_size(target)
+            # refused on a size nobody re-measured, or accepted only by a size
+            # an earlier command recorded (the device may have turned since):
+            # measure once, then decide
+        screen = _guard_lookup(target)
     _check_points(target, points, screen)
 
 
-def _known_screen(target: Target) -> tuple[int, int] | None:
-    """The iOS screen size this process already has, without a device call:
+def _known_screen(target: Target) -> tuple[tuple[int, int], bool] | None:
+    """``(size, measured)``: the screen size this process already has,
+    without a device call, and whether this invocation measured it. iOS:
     the depth-0 application node of this thread's last read of ``target``,
-    else the geometry recorded for it. None on Android and on the XCUITest
-    route (they always look it up)."""
+    else the geometry recorded for it (both trusted, as before); None on
+    the XCUITest route (it always looks it up). Android: the geometry the
+    latest read of this invocation (a helper read's display, a uiautomator
+    dump's root; measured) or of the target's session recorded (not
+    measured: an earlier command's; ``ui_android.recorded_screen``)."""
+    if target.platform == ANDROID:
+        return ui_android.recorded_screen(target)
     if target.platform != IOS:
         return None
     ios = _ios()
     if ios.selected_backend(target) == "xcuitest":
         return None
     nodes = last_snapshot(target)
-    return (ios.screen_size_from_nodes(nodes) if nodes else None) or ios.recorded_screen_size(target)
+    size = (ios.screen_size_from_nodes(nodes) if nodes else None) or ios.recorded_screen_size(target)
+    return (size, True) if size else None
 
 
 def _outside(points: tuple[tuple[int, int], ...],

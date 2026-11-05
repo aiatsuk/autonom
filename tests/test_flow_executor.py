@@ -1186,6 +1186,32 @@ class PollCadenceTests(EnvSandboxMixin, unittest.TestCase):
         self.assertEqual(tap.call_args.kwargs.get("screen"), (1920, 1080))
         size.assert_called_once()
 
+    def test_an_unacknowledged_android_input_is_infrastructure_and_never_retried(self) -> None:
+        """RISK-019: a tap written to the Android helper and not acknowledged
+        is `ui_action_uncertain`; the step fails as infrastructure and the
+        tap is never sent again, not even by a retry block that names it."""
+        node = {"ref": "n1", "text": "Login", "bounds": [0, 0, 100, 50], "enabled": True}
+        runner, _sleeps = self._executor()
+        flow = self._build(
+            "- retry:\n"
+            "    maxAttempts: 3\n"
+            "    allowMutations: true\n"
+            "    onlyOn:\n      - ui_action_uncertain\n"
+            "    commands:\n"
+            "      - tapOn:\n"
+            "          selector:\n"
+            "            text: Login\n")
+        lost = errors.AutonomError(
+            errors.UI_ACTION_UNCERTAIN, "the tap was written to the Android helper and not "
+            "acknowledged", request_id="0" * 32, op="tap", backend="helper")
+        with mock.patch("autonom_lib.ui.snapshot", return_value=[node]), \
+             mock.patch("autonom_lib.ui.tap", side_effect=lost) as tap:
+            with self.assertRaises(errors.AutonomError) as caught:
+                runner.run(flow)
+        self.assertEqual(caught.exception.code, errors.UI_ACTION_UNCERTAIN)
+        self.assertEqual(caught.exception.extra["failure_class"], "infrastructure")
+        tap.assert_called_once()
+
     def test_backend_death_mid_poll_aborts_as_infrastructure(self) -> None:
         runner, _sleeps = self._executor()
         flow = self._build("- assertVisible:\n    selector:\n      id: x\n")

@@ -93,8 +93,13 @@ class _Cli(EnvSandboxMixin, unittest.TestCase):
 
 
 def _unreleased_changelog() -> str:
+    """The changelog text for these fixes: Unreleased until 0.37.0 shipped them."""
     text = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
-    return text.split("## [Unreleased]", 1)[1].split("\n## [", 1)[0]
+    sections = {}
+    for chunk in text.split("\n## [")[1:]:
+        name, _, body = chunk.partition("]")
+        sections[name] = body
+    return sections.get("Unreleased", "") + sections.get("0.37.0", "")
 
 
 # --- AL-05: never-idle screens ------------------------------------------------

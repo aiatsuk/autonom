@@ -11,3 +11,6 @@ dist/
 coverage/
 node_modules/
 .autonom/
+# Built on first use from native/android/helper; never committed or released.
+*.dex
+*.class

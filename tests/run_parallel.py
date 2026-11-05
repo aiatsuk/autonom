@@ -9,7 +9,12 @@ whole suite a second time. This runner does both jobs in one pass:
   first, twice `os.cpu_count()` at a time (`AUTONOM_TEST_JOBS` overrides) —
   most tests wait on fake devices and timeouts rather than burn CPU;
 - each worker gets its own scratch `AUTONOM_HOME`, so modules never share a
-  machine store;
+  machine store, `AUTONOM_IOS_DAEMON=off` unless the caller set it, so no
+  test starts a real iOS device daemon, and the harness default
+  `AUTONOM_ANDROID_UI_BACKEND=
+  uiautomator` (INV-5: Android UI verbs never build, push or reach the
+  on-device helper unless a test asks for it; a value already in the
+  environment is kept);
 - each worker loads `test_aa_env_snapshot` first and `test_zz_env_hygiene`
   last around its module, so the environment-restoration guard still sees
   every test;
@@ -71,6 +76,12 @@ SLOW_FIRST = (
     "test_follow",
 )
 
+# The harness defaults every worker starts with (tests/__init__.py sets the
+# Android one for direct `python3 -m unittest tests.test_x` runs).
+# AUTONOM_IOS_DAEMON=off: fake-idb tests never start a real iOS device daemon
+# (and its companion); the daemon tests opt in with a fake daemon.
+HARNESS_DEFAULTS = {"AUTONOM_ANDROID_UI_BACKEND": "uiautomator", "AUTONOM_IOS_DAEMON": "off"}
+
 RAN = re.compile(r"^Ran (\d+) tests? in", re.M)
 SKIPPED = re.compile(r"skipped=(\d+)")
 
@@ -104,9 +115,18 @@ def units(modules: list[str]) -> list[str]:
     return result
 
 
+def worker_env(home: str, base: dict[str, str] | None = None) -> dict[str, str]:
+    """A worker's environment: `base` (the process environment) with its own
+    `AUTONOM_HOME` and the harness defaults for keys `base` does not set."""
+    env = {**(os.environ if base is None else base), "AUTONOM_HOME": home}
+    for key, value in HARNESS_DEFAULTS.items():
+        env.setdefault(key, value)
+    return env
+
+
 def run_module(module: str) -> tuple[str, int, str, float]:
     home = tempfile.mkdtemp(prefix="autonom-test-")
-    env = {**os.environ, "AUTONOM_HOME": home}
+    env = worker_env(home)
     started = time.monotonic()
     try:
         proc = subprocess.run(

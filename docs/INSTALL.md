@@ -50,6 +50,45 @@ do and cover the traps the automation cannot decide for you.
 Android platform-tools on `PATH`, or pass `--adb /path/to/adb`
 (or set `AUTONOM_ADB`).
 
+#### Optional: a JDK and SDK build-tools for the on-device helper
+
+Android screen reads and input are fastest through Autonom's own helper, a
+small program that runs on the device (see
+[Android on-device helper](ARCHITECTURE.md#android-on-device-helper)). It
+ships as Java source only and is built on the host the first time an Android
+call needs it (a few seconds), then cached. The build needs:
+
+- a **JDK, 11 or newer** (17 or 21 recommended; `javac --release 8` needs 9,
+  and the `d8` of build-tools 35 and 36 runs on Java 11):
+  `$JAVA_HOME/bin/javac`, else `javac` on `PATH`. On macOS the
+  `/usr/bin/javac` stub counts only when `/usr/libexec/java_home` finds an
+  installed JDK, so point `JAVA_HOME` at a Homebrew JDK;
+- **Android SDK build-tools** (for `d8`) and an **SDK platform** (for
+  `android.jar`), the newest of each, found in the first of `$ANDROID_HOME`,
+  `$ANDROID_SDK_ROOT`, the SDK that holds your `adb`, `~/Library/Android/sdk`
+  and `~/Android/Sdk` that has them (a `d8` on `PATH` is never used).
+
+```bash
+brew install openjdk@21                                  # macOS; any JDK 11+ elsewhere
+export JAVA_HOME="$(brew --prefix openjdk@21)/libexec/openjdk.jdk/Contents/Home"
+sdkmanager "build-tools;36.0.0" "platforms;android-36"   # or Android Studio's SDK Manager
+autonom doctor     # capabilities.android_helper: the tools found and whether their build is cached
+```
+
+The device needs Android 8.0 (API 26) or newer. **Without these tools
+nothing breaks:** every Android call goes through `uiautomator dump` and
+`adb shell input` as before, and the device gets nothing from the helper.
+That way is slower (a read takes about 2 s instead of tens of milliseconds,
+and a screen that never goes idle cannot be read), types printable ASCII
+only (other text is refused with `text_not_typable`), reports no keyboard
+signal and makes full-size PNGs instead of agent JPEGs. Each such reply
+says so with `fallback_reason` (for example `javac not found`) and a
+`fallback_hint` naming what to install. A build that fails is remembered
+and not tried again until the sources or the tools change.
+`--ui-backend uiautomator` or `AUTONOM_ANDROID_UI_BACKEND=uiautomator` turns
+the helper off on purpose; `--ui-backend helper` makes a missing toolchain an
+`android_helper_unavailable` error instead of a fallback.
+
 #### Optional: scrcpy for the Mobile Canvas
 
 `autonom canvas serve` mirrors an Android target fastest through
@@ -183,6 +222,7 @@ Nothing lands in the project directory.
 | `~/.autonom/sessions/<id>/` | one run: `session.json`, `journal.ndjson`, shots, trees, logs, network flows, recordings, crashes, pulled files |
 | `~/.autonom/apps/<package>/` | per-app knowledge and flow runbooks (`mobile-memory`) |
 | `~/.local/state/autonom/` | mock registry, process registry, the mitmproxy CA (mode `0700`), and the snapshots `simulator … pin` takes so `clear`/`reset` can restore the device (`simulator-state/`, `simulator-prefs/`) — `$XDG_STATE_HOME/autonom` when that is set |
+| `~/.local/state/autonom/android-helper/` | the Android helper's build cache (`builds/<id>/classes.dex`, a `builds/<id>.failed` note for a build that failed, `build.lock`, `tool-versions.json`) and one record per device (`devices/<serial>.json` and its locks, mode `0700`). Deleting it costs one rebuild |
 
 Set `AUTONOM_HOME` to move all of it under one root. Session artifacts can hold
 screenshots, logs, and captured traffic: treat the directory as sensitive and
@@ -195,6 +235,15 @@ scrcpy-server file with `AUTONOM_SCRCPY_SERVER` or `SCRCPY_SERVER_PATH`.
 On an Android target, the Mobile Canvas scrcpy transport pushes its server
 to `/data/local/tmp/autonom-scrcpy-4.1.jar` and, while it streams, holds one
 `adb forward`, which it removes when it stops.
+
+The on-device helper is pushed as `/data/local/tmp/autonom-helper-<build>.dex`
+(about 50 KB; one build at a time, an older one is removed by name when a new
+build starts) and writes start and exit lines, never request content, to
+`/data/local/tmp/autonom-helper.log`. While it runs it is a process named
+`autonom-helper` holding the device's UiAutomation and one
+`adb forward tcp:<port> localabstract:autonom-helper`. It exits by itself
+after 2 minutes without a call; `autonom ui helper stop` and `session stop`
+end it at once and remove only that forward.
 
 ## Put `autonom` on PATH
 
@@ -251,7 +300,7 @@ in a new session. The default source follows the repository's default branch.
 Its matching release may not yet exist, in which case setup reports that and
 leaves the CLI intact until publication.
 
-For a reproducible **fresh** install, add `--ref v0.36.2` to the marketplace
+For a reproducible **fresh** install, add `--ref v0.37.0` to the marketplace
 registration command. A pinned tag stays pinned on upgrade. Changing an
 existing ref requires replacing the marketplace registration; adding the same
 marketplace with another ref is refused. Preserve installed options and scope
@@ -339,7 +388,10 @@ Optional prefix (default `autonom-`):
 ./scripts/run_checks.sh
 ```
 
-Checks do not need Flutter, the Android SDK, Xcode, idb, or mitmproxy. The suite
+Checks do not need Flutter, the Android SDK, a JDK, Xcode, idb, or mitmproxy. The
+suite sets `AUTONOM_ANDROID_UI_BACKEND=uiautomator`, so no test builds or starts the
+Android helper unless it asks for a fake one; `AUTONOM_REQUIRE_ANDROID_BUILD=1` runs
+the one test that builds the real helper with this machine's JDK and SDK. The suite
 includes a sweep that runs every CLI verb with an empty `PATH` and asserts each
 one fails with a single machine-readable `error_code` instead of a traceback, so
 "green on a bare machine" is an actual check rather than an assumption.

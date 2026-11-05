@@ -1,0 +1,681 @@
+{
+  "_about": "Windows lists as the helper's read reports them (TreeXml.windows), topmost layer first; see tests/test_android_signals.py. modal_dialog is the shape of the 2026-10-25 live run (Settings' Compose \"Force stop?\" dialog, API 36, 1080x2400): a modal dialog leaves the app window beneath it out of the list.",
+  "home": [
+    {
+      "id": 2,
+      "type": "system",
+      "type_id": 3,
+      "layer": 1,
+      "active": false,
+      "focused": false,
+      "title": "Status bar",
+      "package": "com.android.systemui",
+      "bounds": [
+        0,
+        0,
+        1080,
+        136
+      ]
+    },
+    {
+      "id": 3,
+      "type": "system",
+      "type_id": 3,
+      "layer": 1,
+      "active": false,
+      "focused": false,
+      "title": "Navigation bar",
+      "package": "com.android.systemui",
+      "bounds": [
+        0,
+        2337,
+        1080,
+        2400
+      ]
+    },
+    {
+      "id": 10,
+      "type": "application",
+      "type_id": 1,
+      "layer": 0,
+      "active": true,
+      "focused": true,
+      "title": "Settings",
+      "package": "com.android.settings",
+      "bounds": [
+        0,
+        0,
+        1080,
+        2400
+      ]
+    }
+  ],
+  "keyboard": [
+    {
+      "id": 50,
+      "type": "input_method",
+      "type_id": 2,
+      "layer": 2,
+      "active": false,
+      "focused": false,
+      "title": "English (US) (QWERTY)",
+      "package": "com.google.android.inputmethod.latin",
+      "bounds": [
+        0,
+        1580,
+        1080,
+        2337
+      ]
+    },
+    {
+      "id": 2,
+      "type": "system",
+      "type_id": 3,
+      "layer": 1,
+      "active": false,
+      "focused": false,
+      "title": "Status bar",
+      "package": "com.android.systemui",
+      "bounds": [
+        0,
+        0,
+        1080,
+        136
+      ]
+    },
+    {
+      "id": 3,
+      "type": "system",
+      "type_id": 3,
+      "layer": 1,
+      "active": false,
+      "focused": false,
+      "title": "Navigation bar",
+      "package": "com.android.systemui",
+      "bounds": [
+        0,
+        2337,
+        1080,
+        2400
+      ]
+    },
+    {
+      "id": 10,
+      "type": "application",
+      "type_id": 1,
+      "layer": 0,
+      "active": true,
+      "focused": true,
+      "title": "Settings",
+      "package": "com.android.settings",
+      "bounds": [
+        0,
+        0,
+        1080,
+        2400
+      ]
+    }
+  ],
+  "permission": [
+    {
+      "id": 2,
+      "type": "system",
+      "type_id": 3,
+      "layer": 1,
+      "active": false,
+      "focused": false,
+      "title": "Status bar",
+      "package": "com.android.systemui",
+      "bounds": [
+        0,
+        0,
+        1080,
+        136
+      ]
+    },
+    {
+      "id": 3,
+      "type": "system",
+      "type_id": 3,
+      "layer": 1,
+      "active": false,
+      "focused": false,
+      "title": "Navigation bar",
+      "package": "com.android.systemui",
+      "bounds": [
+        0,
+        2337,
+        1080,
+        2400
+      ]
+    },
+    {
+      "id": 60,
+      "type": "application",
+      "type_id": 1,
+      "layer": 1,
+      "active": true,
+      "focused": true,
+      "title": "Permission request",
+      "package": "com.google.android.permissioncontroller",
+      "bounds": [
+        0,
+        0,
+        1080,
+        2400
+      ]
+    },
+    {
+      "id": 30,
+      "type": "application",
+      "type_id": 1,
+      "layer": 0,
+      "active": false,
+      "focused": false,
+      "title": "Camera",
+      "package": "com.example.camera",
+      "bounds": [
+        0,
+        0,
+        1080,
+        2400
+      ]
+    }
+  ],
+  "alert": [
+    {
+      "id": 2,
+      "type": "system",
+      "type_id": 3,
+      "layer": 1,
+      "active": false,
+      "focused": false,
+      "title": "Status bar",
+      "package": "com.android.systemui",
+      "bounds": [
+        0,
+        0,
+        1080,
+        136
+      ]
+    },
+    {
+      "id": 3,
+      "type": "system",
+      "type_id": 3,
+      "layer": 1,
+      "active": false,
+      "focused": false,
+      "title": "Navigation bar",
+      "package": "com.android.systemui",
+      "bounds": [
+        0,
+        2337,
+        1080,
+        2400
+      ]
+    },
+    {
+      "id": 11,
+      "type": "application",
+      "type_id": 1,
+      "layer": 1,
+      "active": true,
+      "focused": true,
+      "title": null,
+      "package": "com.android.settings",
+      "bounds": [
+        66,
+        1003,
+        1014,
+        1397
+      ]
+    },
+    {
+      "id": 10,
+      "type": "application",
+      "type_id": 1,
+      "layer": 0,
+      "active": false,
+      "focused": false,
+      "title": "App info",
+      "package": "com.android.settings",
+      "bounds": [
+        0,
+        0,
+        1080,
+        2400
+      ]
+    }
+  ],
+  "compose_dialog": [
+    {
+      "id": 2,
+      "type": "system",
+      "type_id": 3,
+      "layer": 1,
+      "active": false,
+      "focused": false,
+      "title": "Status bar",
+      "package": "com.android.systemui",
+      "bounds": [
+        0,
+        0,
+        1080,
+        136
+      ]
+    },
+    {
+      "id": 3,
+      "type": "system",
+      "type_id": 3,
+      "layer": 1,
+      "active": false,
+      "focused": false,
+      "title": "Navigation bar",
+      "package": "com.android.systemui",
+      "bounds": [
+        0,
+        2337,
+        1080,
+        2400
+      ]
+    },
+    {
+      "id": 41,
+      "type": "application",
+      "type_id": 1,
+      "layer": 1,
+      "active": true,
+      "focused": true,
+      "title": null,
+      "package": "com.example.app",
+      "bounds": [
+        84,
+        900,
+        996,
+        1500
+      ]
+    },
+    {
+      "id": 40,
+      "type": "application",
+      "type_id": 1,
+      "layer": 0,
+      "active": false,
+      "focused": false,
+      "title": "Example",
+      "package": "com.example.app",
+      "bounds": [
+        0,
+        0,
+        1080,
+        2400
+      ]
+    }
+  ],
+  "split_screen": [
+    {
+      "id": 2,
+      "type": "system",
+      "type_id": 3,
+      "layer": 1,
+      "active": false,
+      "focused": false,
+      "title": "Status bar",
+      "package": "com.android.systemui",
+      "bounds": [
+        0,
+        0,
+        1080,
+        136
+      ]
+    },
+    {
+      "id": 3,
+      "type": "system",
+      "type_id": 3,
+      "layer": 1,
+      "active": false,
+      "focused": false,
+      "title": "Navigation bar",
+      "package": "com.android.systemui",
+      "bounds": [
+        0,
+        2337,
+        1080,
+        2400
+      ]
+    },
+    {
+      "id": 5,
+      "type": "split_screen_divider",
+      "type_id": 5,
+      "layer": 1,
+      "active": false,
+      "focused": false,
+      "title": null,
+      "package": null,
+      "bounds": [
+        0,
+        1180,
+        1080,
+        1220
+      ]
+    },
+    {
+      "id": 70,
+      "type": "application",
+      "type_id": 1,
+      "layer": 0,
+      "active": true,
+      "focused": true,
+      "title": "Example",
+      "package": "com.example.app",
+      "bounds": [
+        0,
+        0,
+        1080,
+        1200
+      ]
+    },
+    {
+      "id": 10,
+      "type": "application",
+      "type_id": 1,
+      "layer": 0,
+      "active": false,
+      "focused": false,
+      "title": "Settings",
+      "package": "com.android.settings",
+      "bounds": [
+        0,
+        1200,
+        1080,
+        2400
+      ]
+    }
+  ],
+  "modal_dialog": [
+    {
+      "id": 2,
+      "type": "system",
+      "type_id": 3,
+      "layer": 1,
+      "active": false,
+      "focused": false,
+      "title": "Status bar",
+      "package": "com.android.systemui",
+      "bounds": [
+        0,
+        0,
+        1080,
+        136
+      ]
+    },
+    {
+      "id": 3,
+      "type": "system",
+      "type_id": 3,
+      "layer": 1,
+      "active": false,
+      "focused": false,
+      "title": "Navigation bar",
+      "package": "com.android.systemui",
+      "bounds": [
+        0,
+        2337,
+        1080,
+        2400
+      ]
+    },
+    {
+      "id": 12,
+      "type": "application",
+      "type_id": 1,
+      "layer": 0,
+      "active": true,
+      "focused": true,
+      "title": null,
+      "package": "com.android.settings",
+      "bounds": [
+        0,
+        987,
+        1080,
+        1481
+      ]
+    }
+  ],
+  "app_clipped": [
+    {
+      "id": 2,
+      "type": "system",
+      "type_id": 3,
+      "layer": 1,
+      "active": false,
+      "focused": false,
+      "title": "Status bar",
+      "package": "com.android.systemui",
+      "bounds": [
+        0,
+        0,
+        1080,
+        136
+      ]
+    },
+    {
+      "id": 3,
+      "type": "system",
+      "type_id": 3,
+      "layer": 1,
+      "active": false,
+      "focused": false,
+      "title": "Navigation bar",
+      "package": "com.android.systemui",
+      "bounds": [
+        0,
+        2337,
+        1080,
+        2400
+      ]
+    },
+    {
+      "id": 10,
+      "type": "application",
+      "type_id": 1,
+      "layer": 0,
+      "active": true,
+      "focused": true,
+      "title": "Settings",
+      "package": "com.android.settings",
+      "bounds": [
+        0,
+        136,
+        1080,
+        2337
+      ]
+    }
+  ],
+  "keyboard_app_clipped": [
+    {
+      "id": 50,
+      "type": "input_method",
+      "type_id": 2,
+      "layer": 2,
+      "active": false,
+      "focused": false,
+      "title": "English (US) (QWERTY)",
+      "package": "com.google.android.inputmethod.latin",
+      "bounds": [
+        0,
+        1580,
+        1080,
+        2337
+      ]
+    },
+    {
+      "id": 2,
+      "type": "system",
+      "type_id": 3,
+      "layer": 1,
+      "active": false,
+      "focused": false,
+      "title": "Status bar",
+      "package": "com.android.systemui",
+      "bounds": [
+        0,
+        0,
+        1080,
+        136
+      ]
+    },
+    {
+      "id": 3,
+      "type": "system",
+      "type_id": 3,
+      "layer": 1,
+      "active": false,
+      "focused": false,
+      "title": "Navigation bar",
+      "package": "com.android.systemui",
+      "bounds": [
+        0,
+        2337,
+        1080,
+        2400
+      ]
+    },
+    {
+      "id": 10,
+      "type": "application",
+      "type_id": 1,
+      "layer": 0,
+      "active": true,
+      "focused": true,
+      "title": "Settings",
+      "package": "com.android.settings",
+      "bounds": [
+        0,
+        136,
+        1080,
+        2337
+      ]
+    }
+  ],
+  "launcher": [
+    {
+      "id": 2,
+      "type": "system",
+      "type_id": 3,
+      "layer": 1,
+      "active": false,
+      "focused": false,
+      "title": "Status bar",
+      "package": "com.android.systemui",
+      "bounds": [
+        0,
+        0,
+        1080,
+        136
+      ]
+    },
+    {
+      "id": 3,
+      "type": "system",
+      "type_id": 3,
+      "layer": 1,
+      "active": false,
+      "focused": false,
+      "title": "Navigation bar",
+      "package": "com.android.systemui",
+      "bounds": [
+        0,
+        2337,
+        1080,
+        2400
+      ]
+    },
+    {
+      "id": 20,
+      "type": "application",
+      "type_id": 1,
+      "layer": 0,
+      "active": true,
+      "focused": true,
+      "title": "Home",
+      "package": "com.google.android.apps.nexuslauncher",
+      "bounds": [
+        0,
+        0,
+        1080,
+        2400
+      ]
+    }
+  ],
+  "picture_in_picture": [
+    {
+      "id": 80,
+      "type": "application",
+      "type_id": 1,
+      "layer": 2,
+      "active": false,
+      "focused": false,
+      "title": "Player",
+      "package": "com.example.video",
+      "bounds": [
+        609,
+        1640,
+        1038,
+        1882
+      ]
+    },
+    {
+      "id": 2,
+      "type": "system",
+      "type_id": 3,
+      "layer": 1,
+      "active": false,
+      "focused": false,
+      "title": "Status bar",
+      "package": "com.android.systemui",
+      "bounds": [
+        0,
+        0,
+        1080,
+        136
+      ]
+    },
+    {
+      "id": 3,
+      "type": "system",
+      "type_id": 3,
+      "layer": 1,
+      "active": false,
+      "focused": false,
+      "title": "Navigation bar",
+      "package": "com.android.systemui",
+      "bounds": [
+        0,
+        2337,
+        1080,
+        2400
+      ]
+    },
+    {
+      "id": 10,
+      "type": "application",
+      "type_id": 1,
+      "layer": 0,
+      "active": true,
+      "focused": true,
+      "title": "Settings",
+      "package": "com.android.settings",
+      "bounds": [
+        0,
+        0,
+        1080,
+        2400
+      ]
+    }
+  ]
+}

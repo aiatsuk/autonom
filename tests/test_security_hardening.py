@@ -113,6 +113,26 @@ class CliBase(EnvSandboxMixin, unittest.TestCase):
 # --- SEC-001 ----------------------------------------------------------------
 
 
+class AndroidKeyNameTests(CliBase):
+    """AT-03: `ui key` text never reaches the device shell unchecked."""
+
+    def test_shell_text_in_a_key_is_refused_before_any_adb_call(self) -> None:
+        for key in ("KEYCODE_HOME; reboot", "KEYCODE_BACK && rm -rf /sdcard",
+                    "$(reboot)", "`id`", "4|sh", "KEYCODE_HOME\nreboot"):
+            with self.subTest(key=key):
+                self.log.unlink(missing_ok=True)
+                code, payload = self.run_cli("ui", "key", "--serial", SERIAL, "--", key)
+                self.assertEqual(code, 2, payload)
+                self.assertEqual(payload["error_code"], errors.INVALID_VALUE)
+                self.assertEqual(self.adb_argv(), [], "no adb call ran")
+
+    def test_valid_keys_reach_input_keyevent(self) -> None:
+        code, payload = self.run_cli("ui", "key", "--serial", SERIAL, "KEYCODE_ENTER")
+        self.assertEqual(code, 0, payload)
+        self.assertIn(["-s", SERIAL, "shell", "input", "keyevent", "KEYCODE_ENTER"],
+                      self.adb_argv())
+
+
 class DeviceShellQuotingTests(CliBase):
     """`adb shell` joins argv into one `sh -c` string on the device."""
 
@@ -159,6 +179,22 @@ class JournalRedactionTests(CliBase):
             self.assertNotIn(secret, blob)
         self.assertIn("<10 chars>", blob)
         self.assertIn(SERIAL, blob, "a target serial is not a secret")
+
+    def test_ui_fill_text_is_masked_like_ui_type(self) -> None:
+        # AT-02: `ui fill TEXT --sensitive` (and without --sensitive) keeps
+        # only the length, whatever happens to the fill itself
+        session_dir = self.start_session()
+        self.run_cli("ui", "fill", "--serial", SERIAL, "--sensitive", "FILLPOS1",
+                     "--resource-id", "com.example:id/pw")
+        self.run_cli("ui", "fill", "FILLPOS2", "--sensitive")
+        self.run_cli("ui", "fill", "--text", "Email", "--", "-FILLPOS3")
+        blob = self.journal_blob(session_dir)
+        self.assertIn('"verb": "ui fill"', blob)
+        for secret in ("FILLPOS1", "FILLPOS2", "FILLPOS3"):
+            self.assertNotIn(secret, blob)
+        self.assertIn("<8 chars>", blob)
+        self.assertIn("<9 chars>", blob)
+        self.assertIn("com.example:id/pw", blob, "a selector value is not a secret")
 
     def test_canvas_token_never_reaches_the_journal(self) -> None:
         session_dir = Path(self.tmp.name) / "session"
@@ -319,6 +355,11 @@ REVIEW_REPROS = [
     ["--plat", "android", "ui", "type", "LEAK_R4B"],
     ["--ser", "proof", "network", "mock", "add", "--url", "https://x/",
      "--head", "Authorization: Bearer LEAK_R4C", "--json", "{}"],
+    # Android typing round: `ui fill TEXT` is masked like `ui type TEXT`
+    ["ui", "fill", "--resource-id", "email", "--sensitive", "LEAK_F1A"],
+    ["ui", "fill", "LEAK_F1B", "--text", "Email"],
+    ["--ser", SERIAL, "ui", "fill", "--sens", "--", "-LEAK_F1C"],
+    ["ui", "fill", "--te=Email", "--mode", "regex", "LEAK_F1D x"],
 ]
 
 

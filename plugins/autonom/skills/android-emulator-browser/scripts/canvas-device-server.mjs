@@ -85,10 +85,19 @@ import {
   ERROR_CODE,
   IDB_CAPABILITY,
   IdbCompanion,
+  IdbCompanionClient,
   StructuredError,
   idbUnavailableError,
   resolveIdbCompanionBinary,
 } from "./ios-idb-companion.mjs";
+import {
+  CODE as DAEMON_CODE,
+  DaemonConnection,
+  DaemonError,
+  defaultStateBase,
+  ensureDaemon,
+  pidAlive,
+} from "./ios-device-daemon.mjs";
 import {
   BOUNDARY,
   BRIDGE_MAX_RESTARTS,
@@ -953,10 +962,17 @@ function idbStatus(context) {
     key_frames: stats?.keyFrames ?? 0,
     restarts: stats?.restarts ?? 0,
     companion_starts: stats?.companionStarts ?? 0,
+    // ID-14: "daemon" when the stream runs on the device daemon's companion, "private" on
+    // one this Canvas started (AUTONOM_IOS_DAEMON=off, or a daemon that could not start).
+    companion_source: stats?.companionSource ?? null,
+    daemon_attached: stats?.daemonAttached ?? false,
+    daemon_fallback: stats?.daemonFallback ?? null,
+    companion_attaches: stats?.companionAttaches ?? 0,
     streams_opened: stats?.streamsOpened ?? 0,
     stream_restarts: stats?.streamRestarts ?? 0,
     forced_key_frames: stats?.forcedKeyFrames ?? 0,
     hid_events: stats?.hidEvents ?? 0,
+    hid_lost: stats?.hidLost ?? 0,
     video_clients: context.videoClients.size,
     control_clients: context.controlClients.size,
     journal_pending: journalPending(context),
@@ -1234,15 +1250,100 @@ class FrameBroadcaster {
   }
 }
 
+/** How long the daemon may take to answer `attach` or `companion` (it waits up to 6 s for a restart). */
+const DAEMON_REPLY_MS = 10_000;
+/** How long a `detach` may take when the device leaves the Canvas. */
+const DAEMON_DETACH_MS = 1000;
+
 /**
- * The iOS Simulator fast transport (IOSF-001..006): one idb_companion owned by this Canvas,
- * one H.264 video stream on it that every tab shares through the scrcpy /ws/video messages,
- * and the companion's HID stream for input. States: idle → starting → streaming ↔
- * restarting → stopped. Events: state(name), session({width, height}), config(Buffer),
- * packet({keyFrame, pts, data}), orientation(name), error(Error).
+ * How long a session's first stream waits for a daemon that is there but cannot serve yet
+ * (its companion restarts, it is in its idle stop) before it runs a companion of its own.
+ */
+const DAEMON_FIRST_WAIT_MS = 20_000;
+/** A session on a companion of its own after a passing daemon failure tries the daemon again. */
+const DAEMON_RETRY_MIN_MS = 5000;
+const DAEMON_RETRY_MAX_MS = 60_000;
+/** daemon_start_failed reasons that trying again does not change: the setup has to change first. */
+const LASTING_START_REASONS = new Set([
+  "idb_missing", "socket_path_too_long", "socket_dir_invalid", "bad_arguments", "companion_not_on_socket",
+]);
+
+/** Errors after which the Canvas runs a companion of its own instead of the daemon's. */
+function daemonFallsBack(error) {
+  return error instanceof DaemonError
+    && (error.code === DAEMON_CODE.DAEMON_START_FAILED || error.code === DAEMON_CODE.COMPANION_TOO_OLD);
+}
+
+/** A daemon that is there but cannot answer now (companion restart, idle stop, lost connection). */
+function daemonPassing(error) {
+  return error instanceof DaemonError && error.code === DAEMON_CODE.DAEMON_UNREACHABLE;
+}
+
+/** A daemon failure that stays until the setup changes: a too old companion, no idb client, a bad socket path. */
+function daemonLasting(error) {
+  if (!(error instanceof DaemonError)) return false;
+  if (error.code === DAEMON_CODE.COMPANION_TOO_OLD) return true;
+  return error.code === DAEMON_CODE.DAEMON_START_FAILED && LASTING_START_REASONS.has(error.extra?.reason);
+}
+
+/**
+ * The companion the device daemon runs for this UDID, reached over its Unix socket with a
+ * gRPC session of the Canvas's own (video and HID). The Canvas never starts or stops this
+ * process: stop() closes only its own session, and the daemon restarts a companion it lost.
+ */
+class DaemonCompanion {
+  #pid;
+  #socketPath;
+  client;
+
+  constructor({ socketPath, pid }) {
+    this.#socketPath = socketPath;
+    this.#pid = Number.isInteger(pid) ? pid : null;
+    this.client = new IdbCompanionClient({ socketPath });
+  }
+
+  get pid() {
+    return this.#pid;
+  }
+
+  get running() {
+    return !this.client.closed && (this.#pid === null || pidAlive(this.#pid));
+  }
+
+  /** The same process at the same socket: idb reuses one socket path for each new companion. */
+  same(info) {
+    return info.socketPath === this.#socketPath && (info.pid ?? null) === this.#pid;
+  }
+
+  async start() {
+    return this.client;
+  }
+
+  async stop() {
+    await this.client.close().catch(() => {});
+  }
+
+  logTail() {
+    return [];
+  }
+}
+
+/**
+ * The iOS Simulator fast transport (IOSF-001..006): one idb_companion, one H.264 video stream
+ * on it that every tab shares through the scrcpy /ws/video messages, and the companion's HID
+ * stream for input. States: idle → starting → streaming ↔ restarting → stopped. Events:
+ * state(name), session({width, height}), config(Buffer), packet({keyFrame, pts, data}),
+ * orientation(name), error(Error).
+ *
+ * The companion (ID-14) is the device daemon's: the session attaches to the daemon (started
+ * when none runs), opens its own gRPC session on the companion the daemon names, asks the
+ * daemon again after a companion restart instead of starting one, and detaches on stop.
+ * With AUTONOM_IOS_DAEMON=off, or a daemon that cannot start or serve this companion, the
+ * session runs a companion of its own as before.
  *
  * Every stream ends with an explicit Stop (the client sends it); a stream that ended without
- * one may leave its encoder running in the companion, so the companion is restarted then.
+ * one may leave its encoder running in the companion, so a companion of the session's own is
+ * restarted then (on the daemon's, only the session's connection is replaced).
  * There is never a second stream: a late joiner waits for the periodic key frame, and a key
  * frame that does not come is forced with Stop and Start on the same stream (DEC-004).
  */
@@ -1251,6 +1352,20 @@ class IosFastSession extends EventEmitter {
   #xcrun;
   #binary;
   #video;
+  // ID-14: { stateBase, env } to find (or start) the device daemon and stream on its companion;
+  // null, or after a daemon that cannot serve, a companion of this session's own ("private").
+  #daemon;
+  #mode;
+  #daemonConnection = null;
+  #attached = false;
+  #attaching = null;
+  #daemonFallback = null;
+  // The fallback cannot pass by itself (daemonLasting): the daemon is not tried again.
+  #fallbackLasting = false;
+  #reattachTimer = null;
+  #reattachBackoff = IDB_RETRY_MIN_MS;
+  #daemonRetryBackoff = DAEMON_RETRY_MIN_MS;
+  #startedAt = 0;
   #companion = null;
   #stream = null;
   #state = "idle";
@@ -1276,17 +1391,22 @@ class IosFastSession extends EventEmitter {
   // that runs reports the watchdog's error to its run loop.
   #frameWatch = null;
   #streamFail = null;
+  /** HID streams whose `lost` event is reported (one listener per stream). */
+  #hidWatched = new WeakSet();
   #stats = {
     packets: 0, bytes: 0, keyFrames: 0, restarts: 0, companionStarts: 0, streamsOpened: 0,
-    streamRestarts: 0, forcedKeyFrames: 0, hidEvents: 0,
+    streamRestarts: 0, forcedKeyFrames: 0, hidEvents: 0, hidLost: 0,
+    companionAttaches: 0, daemonAttaches: 0, daemonLosses: 0, detaches: 0, daemonReturns: 0,
   };
 
-  constructor({ udid, xcrunPath, binary, video }) {
+  constructor({ udid, xcrunPath, binary, video, daemon = null }) {
     super();
     this.#udid = udid;
     this.#xcrun = xcrunPath;
     this.#binary = binary;
     this.#video = video;
+    this.#daemon = daemon;
+    this.#mode = daemon ? "daemon" : "private";
   }
 
   get state() {
@@ -1318,7 +1438,10 @@ class IosFastSession extends EventEmitter {
   }
 
   get stats() {
-    return { ...this.#stats, state: this.#state, points: this.#points, companionPid: this.#companion?.pid ?? null };
+    return {
+      ...this.#stats, state: this.#state, points: this.#points, companionPid: this.#companion?.pid ?? null,
+      companionSource: this.#mode, daemonAttached: this.#attached, daemonFallback: this.#daemonFallback,
+    };
   }
 
   /** Resolves with the first frame; rejects when the first attempt fails. Later restarts only emit. */
@@ -1326,6 +1449,7 @@ class IosFastSession extends EventEmitter {
     if (this.#stopped) return Promise.reject(new Error("idb session is stopped"));
     if (this.#loop) return Promise.reject(new Error("idb session already started"));
     this.#setState("starting");
+    this.#startedAt = performance.now();
     const first = new Promise((resolvePromise, reject) => {
       this.#first = { resolve: resolvePromise, reject };
     });
@@ -1335,13 +1459,32 @@ class IosFastSession extends EventEmitter {
     return first;
   }
 
-  /** One HID event on the companion's HID stream, in call order. */
+  /**
+   * One HID event on the companion's HID stream, in call order. The stream ends its call
+   * HID_IDLE_CLOSE_MS after the last event (longer while a press is held): the companion
+   * serves one `hid` call at a time, and on the daemon's companion an open call of the
+   * Canvas would block the daemon's input and `idb ui text`. The next event opens a new call.
+   * While another client holds the companion's call, an ended call waits to be served and
+   * later events queue behind it; events the companion never confirmed (the safety limit,
+   * a lost session) are counted in `hidLost` and reported as an `error`, never silently.
+   */
   hid(event) {
     try {
       const client = this.#companion?.client;
       if (!client || client.closed) throw new Error("the idb companion is not running");
       this.#stats.hidEvents += 1;
-      return client.hid().send(event);
+      const hid = client.hid();
+      if (!this.#hidWatched.has(hid)) {
+        this.#hidWatched.add(hid);
+        hid.on("lost", ({ events, error }) => {
+          this.#stats.hidLost += events;
+          if (this.listenerCount("error")) {
+            this.emit("error", new Error(`idb hid: ${events} input event${events === 1 ? "" : "s"} not confirmed by idb_companion, `
+              + `may not have reached the Simulator${error?.message ? ` (${error.message})` : ""}`));
+          }
+        });
+      }
+      return hid.send(event);
     } catch (error) {
       return Promise.reject(error);
     }
@@ -1385,13 +1528,17 @@ class IosFastSession extends EventEmitter {
     });
   }
 
-  /** Stop for good: Stop on the stream, then the companion and its process group. Idempotent. */
+  /**
+   * Stop for good: Stop on the stream, then the companion and its process group, or on the
+   * daemon's companion only this session's gRPC session and then `detach`. Idempotent.
+   */
   stop() {
     if (this.#stopPromise) return this.#stopPromise;
     this.#stopped = true;
     clearTimeout(this.#watchTimer);
     clearTimeout(this.#orientationTimer);
     clearTimeout(this.#keyFrameTimer);
+    clearTimeout(this.#reattachTimer);
     this.#clearFrameWatch();
     this.#wake?.();
     this.#setState("stopped");
@@ -1399,6 +1546,7 @@ class IosFastSession extends EventEmitter {
     this.#stopPromise = (async () => {
       await this.#stream?.stop().catch(() => {});
       await this.#stopCompanion();
+      await this.#detach();
     })();
     return this.#stopPromise;
   }
@@ -1429,16 +1577,33 @@ class IosFastSession extends EventEmitter {
     });
   }
 
+  get #firstWaitMs() {
+    return this.#daemon?.firstWaitMs ?? DAEMON_FIRST_WAIT_MS;
+  }
+
   async #run() {
     let backoff = IDB_RETRY_MIN_MS;
     while (!this.#stopped) {
       const result = await this.#streamOnce().catch((error) => ({ error, abnormal: true, ranMs: 0 }));
       if (this.#stopped) break;
+      // The daemon's companion exited under this attempt: the daemon is replacing it.
+      const companion = this.#companion;
+      result.daemonGone = companion instanceof DaemonCompanion && companion.pid !== null && !pidAlive(companion.pid);
       const error = result.error ?? new Error("the idb companion ended the video stream");
-      this.#settleFirst(error);
+      // A daemon that is there but cannot serve yet does not fail the first attempt: the
+      // daemon replaces its companion, so ask again. Past DAEMON_FIRST_WAIT_MS the session
+      // runs a companion of its own (and tries the daemon again later); that attempt decides.
+      if (this.#first && this.#mode === "daemon" && (daemonPassing(error) || result.daemonGone)) {
+        if (performance.now() - this.#startedAt >= this.#firstWaitMs) await this.#fallBackToPrivate(error);
+      } else {
+        this.#settleFirst(error);
+      }
+      if (this.#stopped) break;
       if (this.listenerCount("error")) this.emit("error", error);
       this.#setState("restarting");
-      // No Stop reached the companion, so its encoder may still run: start a new one.
+      // No Stop reached the companion, so its encoder may still run: start a new one. On the
+      // daemon's companion only this session's connection goes; the daemon replaces a lost
+      // companion and the next stream asks it where the new one listens.
       if (result.abnormal) await this.#stopCompanion();
       if (result.ranMs >= IDB_STABLE_MS) backoff = IDB_RETRY_MIN_MS;
       await this.#sleep(backoff);
@@ -1453,11 +1618,230 @@ class IosFastSession extends EventEmitter {
     await companion?.stop().catch(() => {});
   }
 
+  /**
+   * Points #companion at the daemon's companion: the one already in use while the daemon
+   * names the same process, else a new connection to the one it names now. A daemon that
+   * cannot start, or whose companion is too old for it, leaves this session on a companion
+   * of its own (#mode "private"), as the Canvas ran before the daemon.
+   */
+  async #useDaemonCompanion() {
+    let info;
+    try {
+      info = await this.#daemonCompanionInfo();
+    } catch (error) {
+      if (!daemonFallsBack(error) || this.#stopped) throw error;
+      await this.#fallBackToPrivate(error);
+      return;
+    }
+    if (this.#stopped) return;
+    // Named before the daemon's watch saw it exit: the daemon replaces it, ask again then.
+    if (info.pid !== null && !pidAlive(info.pid)) {
+      throw new DaemonError(DAEMON_CODE.DAEMON_UNREACHABLE, "the daemon's idb_companion exited and is being restarted");
+    }
+    if (this.#companion instanceof DaemonCompanion && this.#companion.same(info) && this.#companion.running) return;
+    await this.#stopCompanion();
+    this.#companion = new DaemonCompanion(info);
+    this.#stats.companionAttaches += 1;
+  }
+
+  /**
+   * A companion of this session's own from now on. A failure that can pass (a start lock
+   * held, a daemon that did not report or crashed while it started, a companion restart that
+   * outlasted the first wait) is followed by tries of the daemon, and the session returns to
+   * the daemon's companion once it attaches (#returnToDaemon); a lasting one (daemonLasting)
+   * keeps the session on its own companion.
+   */
+  async #fallBackToPrivate(error) {
+    const lasting = daemonLasting(error);
+    this.#mode = "private";
+    this.#daemonFallback = error.message;
+    this.#fallbackLasting = lasting;
+    await this.#stopCompanion();
+    await this.#detach();
+    if (this.listenerCount("error")) {
+      this.emit("error", new Error(`the iOS device daemon is unavailable, the Canvas runs its own idb_companion${
+        lasting ? "" : " until the daemon answers again"}: ${error.message}`));
+    }
+    if (!lasting && !this.#stopped) this.#scheduleReattach(error);
+  }
+
+  /**
+   * Attached again after a passing fallback: the session's own companion goes, so only the
+   * daemon's runs for the UDID; the stream on it ends and the run loop opens one on the
+   * companion the daemon names.
+   */
+  async #returnToDaemon() {
+    this.#mode = "daemon";
+    this.#daemonFallback = null;
+    this.#fallbackLasting = false;
+    this.#stats.daemonReturns += 1;
+    if (this.#companion instanceof DaemonCompanion) return;
+    await this.#stopCompanion();
+  }
+
+  /** `attach` on the first request of a daemon connection, `companion` after it; one at a time. */
+  #daemonCompanionInfo() {
+    this.#attaching ??= this.#askDaemon().finally(() => {
+      this.#attaching = null;
+    });
+    return this.#attaching;
+  }
+
+  async #askDaemon() {
+    const stopped = () => new Error("the idb session stopped");
+    let connection = this.#daemonConnection;
+    if (!connection?.open) {
+      this.#daemonConnection = null;
+      this.#attached = false;
+      // A live daemon from its registry, else one started now (ensureDaemon's start lock).
+      const registry = await ensureDaemon({
+        udid: this.#udid, stateBase: this.#daemon.stateBase, env: this.#daemon.env, timeoutMs: this.#daemon.startTimeoutMs,
+      });
+      if (this.#stopped) throw stopped();
+      if (typeof registry?.socket !== "string" || !registry.socket) {
+        throw new DaemonError(DAEMON_CODE.DAEMON_START_FAILED, "The iOS device daemon reported no socket.");
+      }
+      connection = await DaemonConnection.connect(registry.socket);
+      if (this.#stopped) {
+        connection.close();
+        throw stopped();
+      }
+      this.#daemonConnection = connection;
+      connection.closed.then(() => this.#onDaemonClosed(connection));
+    }
+    const op = this.#attached ? "companion" : "attach";
+    const reply = await connection.request({ op }, { timeoutMs: DAEMON_REPLY_MS });
+    // Stopped meanwhile: closing the connection detaches it on the daemon's side too.
+    if (this.#stopped) {
+      if (this.#daemonConnection === connection) this.#daemonConnection = null;
+      connection.close();
+      throw stopped();
+    }
+    if (!reply?.ok) {
+      const failure = reply?.error ?? {};
+      throw new DaemonError(failure.code ?? DAEMON_CODE.DAEMON_UNREACHABLE,
+        failure.message ?? `The iOS device daemon refused ${op}.`, { stage: failure.stage ?? undefined });
+    }
+    if (op === "attach" && this.#daemonConnection === connection) {
+      this.#attached = true;
+      this.#reattachBackoff = IDB_RETRY_MIN_MS;
+      this.#daemonRetryBackoff = this.#daemon.retryMinMs ?? DAEMON_RETRY_MIN_MS;
+      this.#stats.daemonAttaches += 1;
+    }
+    if (typeof reply.socket !== "string" || !reply.socket) {
+      throw new DaemonError(DAEMON_CODE.DAEMON_START_FAILED,
+        "The daemon's companion listens on no Unix socket the Canvas can open.", { reason: "companion_not_on_socket" });
+    }
+    return { socketPath: reply.socket, pid: Number.isInteger(reply.pid) ? reply.pid : null };
+  }
+
+  /**
+   * The daemon went away (it stopped or crashed): attach again, to the daemon that is started
+   * or already took over, so its idle stop keeps counting this Canvas. A stream on a companion
+   * that daemon no longer names is ended, and the run loop reconnects to the one it names.
+   */
+  #onDaemonClosed(connection) {
+    if (this.#daemonConnection !== connection) return;
+    this.#daemonConnection = null;
+    this.#attached = false;
+    if (this.#stopped || this.#mode !== "daemon") return;
+    this.#stats.daemonLosses += 1;
+    this.#reattachBackoff = IDB_RETRY_MIN_MS;
+    this.#scheduleReattach();
+  }
+
+  /**
+   * The next try to attach: soon after a lost connection (IDB_RETRY_MIN_MS doubling to
+   * IDB_RETRY_MAX_MS), slower after a daemon that failed to start (DAEMON_RETRY_MIN_MS doubling
+   * to DAEMON_RETRY_MAX_MS, each try may start a daemon), and at DAEMON_RETRY_MAX_MS after a
+   * lasting failure while the stream still runs on the daemon's companion.
+   */
+  #scheduleReattach(error = null) {
+    clearTimeout(this.#reattachTimer);
+    let delay;
+    if (daemonFallsBack(error)) {
+      const max = this.#daemon.retryMaxMs ?? DAEMON_RETRY_MAX_MS;
+      delay = daemonLasting(error) ? max : this.#daemonRetryBackoff;
+      this.#daemonRetryBackoff = Math.min(max, this.#daemonRetryBackoff * 2);
+    } else {
+      delay = this.#reattachBackoff;
+      this.#reattachBackoff = Math.min(IDB_RETRY_MAX_MS, delay * 2);
+    }
+    this.#reattachTimer = setTimeout(() => {
+      this.#reattachTimer = null;
+      this.#reattach();
+    }, delay);
+    this.#reattachTimer.unref?.();
+  }
+
+  /**
+   * One try to attach. In daemon mode it keeps the daemon counting this Canvas (and ends a
+   * stream on a companion the daemon no longer names); after a passing fallback it brings
+   * the session back to the daemon's companion. Every failure but a lasting one in private
+   * mode is tried again.
+   */
+  async #reattach() {
+    if (this.#stopped || this.#attached || !this.#daemon) return;
+    if (this.#mode === "private" && this.#fallbackLasting) return;
+    // The first stream on the session's own companion is still starting: let it settle first.
+    if (this.#mode === "private" && this.#first) {
+      this.#scheduleReattach();
+      return;
+    }
+    try {
+      const info = await this.#daemonCompanionInfo();
+      if (this.#stopped) return;
+      if (this.#mode === "private") {
+        if (!this.#fallbackLasting) await this.#returnToDaemon();
+        return;
+      }
+      const companion = this.#companion;
+      if (companion instanceof DaemonCompanion && !companion.same(info) && this.#companion === companion) {
+        await this.#stopCompanion();
+      }
+    } catch (error) {
+      if (this.#stopped || this.#attached) return;
+      if (this.#mode === "private" && this.#fallbackLasting) return;
+      if (this.listenerCount("error")) this.emit("error", new Error(`iOS device daemon attach failed: ${error.message}`));
+      if (this.#mode === "private" && daemonFallsBack(error)) {
+        this.#daemonFallback = error.message;
+        // Lasting now (an idb client removed, a companion downgraded): stay on the own companion.
+        if (daemonLasting(error)) {
+          this.#fallbackLasting = true;
+          await this.#detach();
+          return;
+        }
+      }
+      // A lasting failure in daemon mode leaves the stream on the daemon's companion it runs
+      // on; the run loop falls back when that stream ends. It is still tried now and then, so
+      // a daemon started later counts this Canvas before its idle stop.
+      this.#scheduleReattach(error);
+    }
+  }
+
+  /** The device leaves the Canvas: `detach`, then the connection closes. */
+  async #detach() {
+    clearTimeout(this.#reattachTimer);
+    this.#reattachTimer = null;
+    const connection = this.#daemonConnection;
+    const attached = this.#attached;
+    this.#daemonConnection = null;
+    this.#attached = false;
+    if (!connection) return;
+    if (attached && connection.open) {
+      await connection.request({ op: "detach" }, { timeoutMs: DAEMON_DETACH_MS }).catch(() => {});
+      this.#stats.detaches += 1;
+    }
+    connection.close();
+  }
+
   /** One stream on the current companion (started first when needed), until it ends. */
   async #streamOnce() {
     // A companion whose process is gone is replaced, even after a stream that ended with a
     // status: each process is one companion start.
     if (this.#companion && !this.#companion.running) await this.#stopCompanion();
+    if (this.#mode === "daemon") await this.#useDaemonCompanion();
+    if (this.#stopped) return { abnormal: false, ranMs: 0 };
     if (!this.#companion) {
       const companion = new IdbCompanion({ udid: this.#udid, binary: this.#binary });
       companion.on("exit", ({ code, signal, expected }) => {
@@ -1914,6 +2298,7 @@ function ensureSession(context) {
       udid: serial,
       xcrunPath: adbPath,
       binary: context.idb.path,
+      daemon: iosDaemonOptions(context),
       video: {
         ...DEFAULT_VIDEO_OPTIONS, fps: maxFps, avgBitrate: options.bitRate,
         ...(profile && profile.scaleFactor !== 1 ? { scaleFactor: profile.scaleFactor } : {}),
@@ -2004,6 +2389,24 @@ function ensureSession(context) {
       }
     });
   });
+}
+
+/** AUTONOM_IOS_DAEMON=off (also 0, false or no) keeps the Canvas on a companion of its own. */
+function iosDaemonEnabled(source = env) {
+  return !["off", "0", "false", "no"].includes(String(source.AUTONOM_IOS_DAEMON ?? "").trim().toLowerCase());
+}
+
+/**
+ * Where an iOS session finds the device daemon (ID-14): the state base the sessions use and
+ * the environment a daemon it has to start gets, or null when the daemon is switched off.
+ */
+function iosDaemonOptions(context) {
+  const source = context.server?.env ?? env;
+  if (!iosDaemonEnabled(source)) return null;
+  const daemonEnv = { ...source };
+  // The daemon reads the version of the same companion binary the Canvas resolved.
+  if (context.idb?.path && !daemonEnv.AUTONOM_IDB_COMPANION_BIN) daemonEnv.AUTONOM_IDB_COMPANION_BIN = context.idb.path;
+  return { stateBase: defaultStateBase(source), env: daemonEnv };
 }
 
 /** Print the scrcpy stream size once it is known, and again only when it changes. */
@@ -5490,4 +5893,4 @@ async function findExecutable(name) {
 }
 
 
-export { IosFastSession, authorize, broadcastState, chooseTransport, control, ensureSession, exchangeToken, fallbackReason, findAdb, findExecutable, handleRequest, handleUpgrade, iosHidWrite, isCanvasWebSocket, key, leaseStatus, normalizeOrigin, printHelp, readJsonBody, refreshSession, refusal, requestUrl, resolveIdbCompanion, resolveScrcpy, serveUpgradeAsRequest, sessionStoppedOf, stopSession, swipe, tap, text };
+export { IosFastSession, authorize, iosDaemonEnabled, broadcastState, chooseTransport, control, ensureSession, exchangeToken, fallbackReason, findAdb, findExecutable, handleRequest, handleUpgrade, iosHidWrite, isCanvasWebSocket, key, leaseStatus, normalizeOrigin, printHelp, readJsonBody, refreshSession, refusal, requestUrl, resolveIdbCompanion, resolveScrcpy, serveUpgradeAsRequest, sessionStoppedOf, stopSession, swipe, tap, text };

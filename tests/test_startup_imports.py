@@ -51,6 +51,10 @@ COMMAND_MODULES = (
     "autonom_lib.network.device_proxy_android", "autonom_lib.atlas.graph",
 )
 
+# The on-device Android helper's host client and build: imported by the
+# Android backend only inside a call that reads or sends through it.
+ANDROID_HELPER_MODULES = ("autonom_lib.android_helper", "autonom_lib.android_helper_build")
+
 
 def load(name: str, path: Path):
     spec = importlib.util.spec_from_file_location(name, path)
@@ -277,6 +281,11 @@ class UiTreeImportTests(unittest.TestCase):
 
     def test_command_modules_are_not_imported(self):
         self.assertEqual([name for name in COMMAND_MODULES if name in self.modules], [])
+
+    def test_the_android_helper_client_is_imported_only_when_used(self):
+        # the Android backend (ui_android) loads the helper client and its
+        # build module inside the calls that need them, never at start-up
+        self.assertEqual([name for name in ANDROID_HELPER_MODULES if name in self.modules], [])
 
 
 class LazyNamesTests(unittest.TestCase):

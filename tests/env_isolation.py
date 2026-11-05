@@ -50,6 +50,10 @@ class EnvSandboxMixin:
         # Fake device processes must not register real macOS launch jobs.
         if pairs.get("AUTONOM_FAKE_STATE"):
             pairs.setdefault("AUTONOM_EMULATOR_LAUNCH_MODE", "direct")
+            # nor start a real iOS device daemon over a fake idb; a test of
+            # the daemon passes AUTONOM_IOS_DAEMON itself
+            if "AUTONOM_IOS_DAEMON" not in os.environ:
+                pairs.setdefault("AUTONOM_IOS_DAEMON", "off")
         saved = getattr(self, "_env_sandbox_saved", None)
         if saved is None:
             saved = set()

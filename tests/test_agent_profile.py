@@ -5,7 +5,8 @@ record; `session show` and `session list` report it. In an agent-profile
 session `ui tree` prints the outline and the action verbs observe (AL-11);
 explicit flags win. A session started without `--profile`, with `--profile
 default`, or by an older version (a record without the key) behaves exactly
-as before.
+as before, except that its `session list` entry says `profile: "default"`
+(CO-01: every entry carries `profile`).
 
 Every CLI run is a subprocess against `tests/fakes/fake_adb.py` (and the iOS
 fakes for one case) in a private AUTONOM_HOME. No real device.
@@ -36,9 +37,10 @@ SECOND = "emulator-5622"
 UDID = "AAAAAAAA-1111-2222-3333-BBBBBBBBBBBB"
 BOOTED = {"devices": {"com.apple.CoreSimulator.SimRuntime.iOS-26-0": [
     {"udid": UDID, "name": "iPhone 17 Pro", "state": "Booted", "isAvailable": True}]}}
-# The keys of a `session list` entry before this change, in order.
+# The keys of every `session list` entry, in order: `profile` follows `live`
+# for every session, a default one and one an older version wrote included (CO-01).
 LIST_KEYS = ["session_id", "platform", "target_id", "label", "started_at", "stopped_at",
-             "started_by", "current", "live"]
+             "started_by", "current", "live", "profile"]
 
 sys.path.insert(0, str(ROOT / "scripts"))
 from autonom_lib import errors  # noqa: E402
@@ -130,7 +132,7 @@ class AgentProfileTests(ProfileCase):
         code, listed = self.cli("session", "list")
         self.assertEqual(code, 0, listed)
         [entry] = listed["sessions"]
-        self.assertEqual(list(entry), [*LIST_KEYS, "profile"])
+        self.assertEqual(list(entry), LIST_KEYS)
         self.assertEqual(entry["profile"], "agent")
         code, listed = self.cli("session", "list", "--all")
         self.assertEqual(listed["sessions"][0]["profile"], "agent")
@@ -193,6 +195,24 @@ class AgentProfileTests(ProfileCase):
         code, payload = self.android("ui", "tree")
         self.assertEqual(payload["format"], "outline")
 
+    def test_an_ios_session_refuses_an_android_ui_backend(self) -> None:  # AU-05
+        """An Android value would be stored as the session's choice, and its
+        iOS ui verbs could not use it: refused before the session exists."""
+        def ios(*argv: str) -> tuple[int, dict[str, Any]]:
+            return self.cli("--simctl", str(FAKE_SIMCTL), "--idb", str(FAKE_IDB),
+                            "--udid", UDID, *argv)
+        for value in ("helper", "uiautomator"):
+            code, envelope = ios("session", "start", "--ui-backend", value)
+            self.assertEqual(code, 2, envelope)
+            self.assertEqual(envelope["error_code"], errors.INVALID_VALUE)
+            self.assertIn("auto, idb, xcuitest", envelope["error"])
+        self.assertEqual(list((self.home / "sessions").glob("*/session.json")), [])
+        code, payload = ios("session", "start", "--ui-backend", "idb")
+        self.assertEqual(code, 0, payload)
+        self.assertEqual(payload["session"]["ui_backend_preference"], "idb")
+        code, payload = ios("ui", "tree")
+        self.assertEqual(code, 0, payload)
+
     def test_ios_agent_tree_is_the_outline(self) -> None:
         def ios(*argv: str) -> tuple[int, dict[str, Any]]:
             return self.cli("--simctl", str(FAKE_SIMCTL), "--idb", str(FAKE_IDB),
@@ -231,11 +251,22 @@ class DefaultProfileTests(ProfileCase):
                                          "platform", "target_id", "serial"])
         self.assertEqual(self.dumps(), 0)
 
-    def test_a_default_list_entry_keeps_its_keys(self) -> None:
-        self.start()
-        code, listed = self.cli("session", "list")
-        self.assertEqual(code, 0, listed)
-        self.assertEqual(list(listed["sessions"][0]), LIST_KEYS)
+    def test_a_default_list_entry_says_default(self) -> None:  # CO-01-S01
+        # without --profile, then with --profile default (the first one is
+        # stopped by then and listed by --all only)
+        for extra in ((), ("--profile", "default")):
+            with self.subTest(extra=extra):
+                session = self.start(*extra)
+                for scope in ((), ("--all",)):
+                    code, listed = self.cli("session", "list", *scope)
+                    self.assertEqual(code, 0, listed)
+                    live = [item["session_id"] for item in listed["sessions"] if item["live"]]
+                    self.assertEqual(live, [session["session_id"]])
+                    for entry in listed["sessions"]:
+                        self.assertEqual(list(entry), LIST_KEYS)
+                        self.assertEqual(entry["profile"], "default")
+                code, stopped = self.android("session", "stop")
+                self.assertEqual(code, 0, stopped)
 
     def test_outline_is_still_there_on_request(self) -> None:
         self.start()
@@ -260,6 +291,9 @@ class DefaultProfileTests(ProfileCase):
         self.assertEqual(self.dumps(), 0)
         code, listed = self.cli("session", "list")
         self.assertEqual(list(listed["sessions"][0]), LIST_KEYS)
+        self.assertEqual(listed["sessions"][0]["profile"], "default")
+        code, listed = self.cli("session", "list", "--all")
+        self.assertEqual(listed["sessions"][0]["profile"], "default")
         code, shown = self.android("session", "show")
         self.assertNotIn("profile", shown["session"])
 
