@@ -1279,10 +1279,10 @@ async function iosDaemonWorld(t) {
   await chmod(world.companion, 0o755);
   await writeFile(world.xcrun, `#!${process.execPath}\n${FAKE_SIMCTL.replace("__UDID__", IOS_UDID)}`);
   await chmod(world.xcrun, 0o755);
-  // What a daemon this test might start gets: no idb client, no real idb state, no real home.
+  // What a daemon this test might start gets: no idb client and no real home.
   world.daemonEnv = {
     PATH: bin, HOME: directory, TMPDIR: tmpdir(), AUTONOM_HOME: world.home,
-    AUTONOM_IDB_COMPANION_BIN: world.companion, AUTONOM_IDB_STATE_FILE: join(directory, "idb-state"),
+    AUTONOM_IDB_COMPANION_BIN: world.companion,
   };
   t.after(async () => {
     await Promise.allSettled(world.sessions.map((session) => session.stop()));

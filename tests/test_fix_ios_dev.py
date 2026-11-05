@@ -54,6 +54,25 @@ except ImportError:  # direct `python3 -m unittest tests.test_...` runs
     from tests.env_isolation import EnvSandboxMixin  # noqa: E402
 
 
+def _wait_exited(pid: int, timeout: float = 10.0) -> None:
+    """Wait for a child the code under test started and dropped. Its Popen
+    object may already have reaped it (Popen.__del__ polls a child that has
+    exited), so waitpid can fail with ECHILD; then poll until the pid is gone."""
+    try:
+        os.waitpid(pid, 0)
+        return
+    except ChildProcessError:
+        pass
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.02)
+    raise AssertionError(f"process {pid} did not exit within {timeout}s")
+
+
 def _fake_simctl_module():
     """The fake's own module, for its Xcode 27 help text."""
     spec = importlib.util.spec_from_file_location("autonom_fake_simctl", FAKE_SIMCTL)
@@ -363,7 +382,7 @@ class AppExecutableTests(Base):
         pid = ios_simctl.start_log_stream(str(FAKE_SIMCTL), UDID, destination,
                                           bundle_id=BUNDLE)
         self.assertIsNotNone(pid)
-        os.waitpid(pid, 0)
+        _wait_exited(pid)
         predicate = self.stream_predicate()
         # Before: `processImagePath CONTAINS "knit"`, which no Runner line has;
         # then `CONTAINS "Runner"`, which every Flutter app's line has. The
@@ -380,7 +399,7 @@ class AppExecutableTests(Base):
         destination = self.root / "logs" / "stream.ndjson"
         pid = ios_simctl.start_log_stream(str(FAKE_SIMCTL), UDID, destination,
                                           bundle_id=BUNDLE)
-        os.waitpid(pid, 0)
+        _wait_exited(pid)
         predicate = self.stream_predicate()
         self.assertIn('processImagePath ENDSWITH "/Runner"', predicate)
         self.assertNotIn("CONTAINS", predicate)
@@ -461,7 +480,7 @@ class AppExecutableTests(Base):
         destination = self.root / "stream.ndjson"
         pid = ios_simctl.start_log_stream(str(FAKE_SIMCTL), UDID, destination,
                                           bundle_id=BUNDLE, executable="Runner")
-        os.waitpid(pid, 0)
+        _wait_exited(pid)
         self.assertEqual(destination.read_text(encoding="utf-8").splitlines(), [record])
 
 
@@ -488,7 +507,7 @@ class NeverRaisesTests(Base):
         pid = ios_simctl.start_log_stream(str(FAKE_SIMCTL), UDID, self.root / "s.ndjson",
                                           bundle_id=BUNDLE)
         self.assertIsNotNone(pid)
-        os.waitpid(pid, 0)
+        _wait_exited(pid)
 
     def test_session_start_survives_a_malformed_plist(self) -> None:
         self.set_state(app_bundle=str(self.malformed_bundle()), installed=[BUNDLE])
@@ -514,7 +533,7 @@ class NeverRaisesTests(Base):
         pid = ios_simctl.start_log_stream(str(FAKE_SIMCTL), UDID, self.root / "s.ndjson",
                                           bundle_id=BUNDLE)
         self.assertIsNotNone(pid)
-        os.waitpid(pid, 0)
+        _wait_exited(pid)
 
     def test_a_wedged_help_falls_back_to_the_static_list(self) -> None:
         self.hang("simctl help")

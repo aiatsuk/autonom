@@ -13,10 +13,16 @@
  *   ensureDaemon() take it before they start a daemon).
  * - Socket: `$TMPDIR/autonom-iosd-<12 hex>/d.sock` in a 0700 directory, at most 103 bytes
  *   (macOS sun_path); a longer one refuses the start with `daemon_start_failed`.
- * - Companion: the one idb's state file (`/tmp/idb/state`, or AUTONOM_IDB_STATE_FILE)
- *   lists as live for the UDID is used as it is (not owned); otherwise the daemon runs
- *   `idb connect <UDID>` under the companion environment allowlist, so every `idb` process
- *   reuses the same companion, and marks it owned. Only an owned companion is stopped:
+ * - Companion: the live local companion idb started for the UDID is used as it is (not
+ *   owned). The daemon finds it in the process table (`ps -xwwo pid=,args=`), never in
+ *   idb's own files: an `idb_companion` whose arguments are `--udid <UDID>` and
+ *   `--grpc-domain-sock <dir>/<UDID>_companion.sock`, the way `idb connect` starts one
+ *   (see liveIdbCompanion). Otherwise the daemon runs `idb connect <UDID>` under the
+ *   companion environment allowlist, so every `idb` process reuses the same companion,
+ *   finds the companion it started the same way, and marks it owned only when the scan
+ *   before `idb connect` worked and did not list it (after a failed `ps`, the companion
+ *   idb connect may have reused is used, not owned; a companion that serves only TCP,
+ *   `--grpc-port`, is not used). Only an owned companion is stopped:
  *   `idb disconnect <UDID>`, SIGTERM, SIGKILL after 3 s. A lost companion is replaced
  *   through `idb connect` with the Canvas's backoff (0.5 s doubling to 5 s, reset after
  *   10 s of stable running); an input that was in flight is never sent again.
@@ -286,7 +292,6 @@ const TOOL_TIMEOUT_MS = 5000;
 const LOG_MAX_BYTES = 1024 * 1024;
 const TIMINGS_KEPT = 20;
 const UDID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9-]{0,63}$/;
-const IDB_STATE_FILE = "/tmp/idb/state";
 const CORESIMULATOR_PLIST = "/Library/Developer/PrivateFrameworks/CoreSimulator.framework/Versions/A/Resources/Info.plist";
 
 export const INPUT_OPS = Object.freeze(["tap", "swipe", "button", "key"]);
@@ -617,16 +622,6 @@ export function validateInput(request) {
   throw new DaemonError(CODE.INVALID_REQUEST, `input op must be one of ${INPUT_OPS.join(", ")}.`);
 }
 
-/** The companions idb's state file lists (fb-idb `json_data_companions`), or []. */
-export function readIdbState(path) {
-  try {
-    const payload = JSON.parse(readFileSync(path, "utf8"));
-    return Array.isArray(payload) ? payload.filter((entry) => entry && typeof entry === "object") : [];
-  } catch {
-    return [];
-  }
-}
-
 export function pidAlive(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try {
@@ -637,14 +632,71 @@ export function pidAlive(pid) {
   }
 }
 
-/** The live local companion idb lists for `udid`: `{ pid, endpoint }`, or null. */
-export function liveCompanionEntry(entries, udid) {
-  for (const entry of entries) {
-    if (entry.udid !== udid || entry.is_local !== true || !pidAlive(entry.pid)) continue;
-    if (typeof entry.path === "string" && entry.path) return { pid: entry.pid, endpoint: { socketPath: entry.path } };
-    if (entry.host && entry.port) return { pid: entry.pid, endpoint: { host: String(entry.host), port: Number(entry.port) } };
+/**
+ * The `idb_companion` processes in a `ps -xwwo pid=,args=` listing that serve `udid` on a
+ * domain socket the way idb starts them (fb-idb's `spawn_domain_sock_server`:
+ * `idb_companion --udid <UDID> --grpc-domain-sock <idb dir>/<UDID>_companion.sock ...`):
+ * `[{ pid, socketPath }]` in listing order. The executable is every word before the first
+ * one that starts with `-`, so a path with spaces stays whole, and its basename must be
+ * `idb_companion`. `--udid` must name exactly `udid`; `--grpc-domain-sock` takes the
+ * words up to the next `--` flag and its basename must be `<UDID>_companion.sock`, so the
+ * Canvas's own companion (`companion.sock` in a private directory) and a companion that
+ * serves only TCP (`--grpc-port`) never match. Lines that do not parse are skipped.
+ */
+export function idbCompanionProcesses(listing, udid) {
+  const found = [];
+  if (typeof listing !== "string" || !udid) return found;
+  for (const line of listing.split("\n")) {
+    const match = /^\s*(\d+)\s+(\S.*?)\s*$/.exec(line);
+    if (!match) continue;
+    const pid = Number.parseInt(match[1], 10);
+    if (!Number.isSafeInteger(pid) || pid <= 0) continue;
+    const words = match[2].split(" ");
+    const first = words.findIndex((word, index) => index > 0 && word.startsWith("-"));
+    if (first < 0) continue;
+    if (basename(words.slice(0, first).join(" ")) !== "idb_companion") continue;
+    const flags = words.slice(first);
+    const value = (flag) => {
+      const at = flags.indexOf(flag);
+      if (at < 0) return null;
+      const rest = [];
+      for (const word of flags.slice(at + 1)) {
+        if (word.startsWith("--")) break;
+        rest.push(word);
+      }
+      return rest.length ? rest.join(" ") : null;
+    };
+    if (value("--udid") !== udid) continue;
+    const socketPath = value("--grpc-domain-sock");
+    if (!socketPath || basename(socketPath) !== `${udid}_companion.sock`) continue;
+    found.push({ pid, socketPath });
   }
-  return null;
+  return found;
+}
+
+function isSocketFile(path) {
+  try {
+    return lstatSync(path).isSocket();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The live local companion idb started for `udid`, found in a `ps -xwwo pid=,args=`
+ * listing (idbCompanionProcesses): `{ pid, endpoint: { socketPath } }`, or null. A process
+ * that is gone by now is skipped. When several match (idb started a second one before the
+ * first exited), the one whose socket file exists wins, then the highest pid (the newest,
+ * barring pid wrap-around).
+ */
+export function liveIdbCompanion(listing, udid, { alive = pidAlive, socketExists = isSocketFile } = {}) {
+  const ranked = idbCompanionProcesses(listing, udid)
+    .filter(({ pid }) => alive(pid))
+    .map((entry) => ({ ...entry, socket: Boolean(socketExists(entry.socketPath)) }))
+    .sort((a, b) => Number(b.socket) - Number(a.socket) || b.pid - a.pid);
+  if (!ranked.length) return null;
+  const [best] = ranked;
+  return { pid: best.pid, endpoint: { socketPath: best.socketPath } };
 }
 
 function which(name, env = process.env) {
@@ -1143,7 +1195,6 @@ export class IosDeviceDaemon {
       companion: env.AUTONOM_IDB_COMPANION_BIN || which("idb_companion", env),
       xcrun: env.AUTONOM_SIMCTL || which("xcrun", env),
       ps: which("ps", env) ?? "/bin/ps",
-      stateFile: env.AUTONOM_IDB_STATE_FILE || IDB_STATE_FILE,
     };
     this.#serving = new Promise((resolve) => {
       this.#servingResolve = resolve;
@@ -1326,26 +1377,74 @@ export class IosDeviceDaemon {
   }
 
   /**
-   * Adopts the live companion idb lists for the UDID, else starts one with `idb connect`
+   * One look at the process table for the companion idb started for the UDID:
+   * `{ ok: true, entry, pids }` with the live companion (liveIdbCompanion, or null) and the
+   * pids of every matching idb_companion line (idbCompanionProcesses), or `{ ok: false,
+   * entry: null, pids: [] }` when `ps` failed (non-zero exit or timeout). A failed scan
+   * proves nothing about who started a companion found later.
+   */
+  async #findCompanion() {
+    const listing = await run(this.#tools.ps, ["-xwwo", "pid=,args="], { env: this.#env });
+    if (listing.code !== 0) {
+      this.log("companion_scan_failed", { code: listing.code });
+      return { ok: false, entry: null, pids: [] };
+    }
+    return {
+      ok: true,
+      entry: liveIdbCompanion(listing.stdout, this.udid),
+      pids: idbCompanionProcesses(listing.stdout, this.udid).map(({ pid }) => pid),
+    };
+  }
+
+  /** A companion this UDID's previous daemon (or this one, before a restart) started. */
+  #ownsAlready(pid) {
+    return Boolean(this.#inherited && this.#inherited.pid === pid) || Boolean(this.#companion?.owned && this.#companion.pid === pid);
+  }
+
+  /**
+   * Adopts the live companion idb started for the UDID, else starts one with `idb connect`
    * (owned), then opens the gRPC session, the quiet stream and the primed HID stream.
+   * The companion found after `idb connect` is owned only when the scan before it
+   * succeeded and did not list its pid: idb connect reuses a running companion, so after a
+   * failed first scan (ps timed out) the one found may be another session's, and it is
+   * used without being owned (never stopped), unless it is one this daemon already owns.
    */
   async #acquireCompanion({ initial = false } = {}) {
-    let entry = liveCompanionEntry(readIdbState(this.#tools.stateFile), this.udid);
+    const before = await this.#findCompanion();
+    let entry = before.entry;
     let owned = false;
     if (entry) {
       // A companion this UDID's previous daemon started and left behind stays ours.
-      owned = Boolean(this.#inherited && this.#inherited.pid === entry.pid) || Boolean(this.#companion?.owned && this.#companion.pid === entry.pid);
+      owned = this.#ownsAlready(entry.pid);
       this.log(owned ? "companion_inherited" : "companion_adopted", { pid: entry.pid });
     } else {
       if (!this.#tools.idb) throw new DaemonError(CODE.DAEMON_START_FAILED, "The idb client was not found (AUTONOM_IDB or PATH).", { reason: "idb_missing" });
       const t0 = performance.now();
       const result = await run(this.#tools.idb, ["connect", this.udid], { env: companionEnvironment(this.#env), timeoutMs: IDB_CONNECT_TIMEOUT_MS });
-      entry = liveCompanionEntry(readIdbState(this.#tools.stateFile), this.udid);
+      const after = await this.#findCompanion();
+      entry = after.entry;
       this.log("idb_connect", { code: result.code, ms: Math.round(performance.now() - t0), registered: Boolean(entry) });
-      if (!entry) {
-        throw new DaemonError(CODE.DAEMON_START_FAILED, `idb connect ${this.udid} registered no live companion (exit ${result.code}).`, { reason: "companion_start_failed" });
+      if (!entry && !after.ok) {
+        throw new DaemonError(CODE.DAEMON_START_FAILED,
+          `The process scan (ps) failed after idb connect ${this.udid} (exit ${result.code}), so the daemon cannot find its companion. `
+          + "Check that ps runs (the daemon log has companion_scan_failed), then retry.",
+          { reason: "companion_start_failed" });
       }
-      owned = true;
+      if (!entry) {
+        throw new DaemonError(CODE.DAEMON_START_FAILED,
+          `idb connect ${this.udid} left no live idb_companion serving this simulator on a domain socket (exit ${result.code}). `
+          + `The daemon uses only a local companion started as \`idb_companion --udid ${this.udid} --grpc-domain-sock <dir>/${this.udid}_companion.sock\`, `
+          + "as idb connect starts one; a companion that serves only TCP (--grpc-port) is not used. "
+          + `Check that idb_companion is installed and that \`idb connect ${this.udid}\` works, or stop a companion of this simulator that listens only on TCP.`,
+          { reason: "companion_start_failed" });
+      }
+      if (before.ok && !before.pids.includes(entry.pid)) {
+        owned = true;
+      } else {
+        // Already running before idb connect, or unknown (the first scan failed).
+        owned = this.#ownsAlready(entry.pid);
+        this.log(owned ? "companion_inherited" : "companion_adopted", { pid: entry.pid, after: "idb_connect", scan_failed: !before.ok });
+      }
     }
     this.#inherited = null;
     this.#companion = { pid: entry.pid, endpoint: entry.endpoint, owned, startedAt: performance.now() };

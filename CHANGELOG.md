@@ -7,6 +7,21 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
 
 ## [Unreleased]
 
+### Changed
+- **The iOS device daemon finds idb's companion in the process table.** It no
+  longer reads idb's state file (`/tmp/idb/state`) or `AUTONOM_IDB_STATE_FILE`
+  (the CLI still does): it uses the live `idb_companion` started with
+  `--udid <UDID> --grpc-domain-sock <dir>/<UDID>_companion.sock`, as
+  `idb connect` starts one (one whose socket file exists, then the highest
+  pid, when there are several; only the user's own processes are read),
+  else runs `idb connect` as before. A companion that serves only TCP (`--grpc-port`)
+  is not used; when `idb connect` leaves none on a domain socket, the start
+  fails with `companion_start_failed` and a message that says so (or that
+  the `ps` scan itself failed). When the
+  `ps` before `idb connect` fails, the companion found after it is used but
+  not owned (idb connect may have reused another session's), so the daemon
+  never stops it.
+
 ## [0.37.0] - 2026-11-05
 
 ### Added
