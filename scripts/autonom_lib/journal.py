@@ -157,6 +157,97 @@ def _is_ui_type(argv: list[str], args: Any = None) -> bool:
     return [argv[index] for index in words[:2]] == ["ui", "type"]
 
 
+# The verbs whose positional is text entered into a field, and the namespace
+# dest that holds it: `ui type TEXT` and `ui fill TEXT` (whose selector flags
+# already take `--text`, so its text is `fill_text`).
+_TEXT_VERBS = {"type": "text", "fill": "fill_text"}
+
+
+def _text_verb(argv: list[str], args: Any = None) -> str | None:
+    """`type` or `fill` when argv (or the parsed namespace) is `ui type` or
+    `ui fill`, whose text is masked like a password; else None."""
+    if args is not None and getattr(args, "command", None) == "ui":
+        verb = getattr(args, "ui_command", None)
+        return verb if verb in _TEXT_VERBS else None
+    words, _terminator = _bare_words(argv)
+    path = [argv[index] for index in words[:2]]
+    return path[1] if len(path) == 2 and path[0] == "ui" and path[1] in _TEXT_VERBS else None
+
+
+def _entered_text(args: Any, verb: str | None) -> str | None:
+    """The exact text a parsed `ui type`/`ui fill` namespace enters, or None."""
+    if args is None or verb not in _TEXT_VERBS:
+        return None
+    text = getattr(args, _TEXT_VERBS[verb], None)
+    return text if isinstance(text, str) and text else None
+
+
+# `ui fill`'s own options, as build_parser() declares them (the selector set
+# of `ui tap`, `--sensitive` and the observe flags): value-taking ones, and
+# switches. `tests/test_journal.py` checks them against the real parser.
+_FILL_VALUE_OPTIONS = frozenset({
+    "--text", "--desc", "--resource-id", "--class-name", "--package", "--role",
+    "--clickable", "--enabled", "--mode", "--index", "--observe-timeout-ms",
+})
+_FILL_SWITCHES = frozenset({"--case-sensitive", "--sensitive", "--observe", "--no-observe"})
+# Matched only when spelled in full, like argparse's exact-only options.
+_FILL_EXACT_ONLY = frozenset({"--observe", "--no-observe", "--observe-timeout-ms"})
+
+
+def _fill_option(name: str) -> str | None:
+    """How argparse reads the `--name` of a `ui fill` argv: "value" (it takes
+    the next token, or its `=value`), "switch", or None when the scan cannot
+    be sure (unknown, or a prefix of both kinds; argparse refuses those)."""
+    if name in _FILL_VALUE_OPTIONS or name in EXACT_ONLY_OPTIONS:
+        return "value"
+    if name in _FILL_SWITCHES or name == "--help":
+        return "switch"
+    kinds = set()
+    for option in _FILL_VALUE_OPTIONS | _FILL_SWITCHES | {"--help"}:
+        if option not in _FILL_EXACT_ONLY and option.startswith(name):
+            kinds.add("value" if option in _FILL_VALUE_OPTIONS else "switch")
+    if _target_flag(name):
+        kinds.add("value")
+    return kinds.pop() if len(kinds) == 1 else None
+
+
+def _fill_text_indexes(argv: list[str]) -> set[int]:
+    """Indexes of `ui fill` argv tokens that may be the entered text.
+
+    As for `ui type` (``_typed_text_indexes``), this errs toward masking:
+    after `fill`, every token is text unless it is a recognised option of
+    `ui fill` (any unambiguous abbreviation) or a target flag, with the
+    value such an option takes, and everything after `--` is text. A
+    selector's value (`--text Email`) names the field, not what is entered,
+    and stays."""
+    words, _terminator = _bare_words(argv)
+    if len(words) < 2:
+        return set()
+    indexes: set[int] = set()
+    literal = False
+    skip_value = False
+    for index in range(words[1] + 1, len(argv)):
+        token = argv[index]
+        if literal:
+            indexes.add(index)
+        elif skip_value:
+            skip_value = False
+        elif token == "--":
+            literal = True
+        elif token == "-h":
+            continue
+        elif token.startswith("--") and len(token) > 2:
+            name, equals, _value = token.partition("=")
+            kind = _fill_option(name)
+            if kind is None or (equals and kind == "switch"):
+                indexes.add(index)
+            elif kind == "value" and not equals:
+                skip_value = True
+        else:
+            indexes.add(index)
+    return indexes
+
+
 def _typed_text_indexes(argv: list[str]) -> set[int]:
     """Indexes of `ui type` argv tokens that may be the typed text.
 
@@ -405,10 +496,11 @@ def scrub_argv(argv: list[str], args: Any = None) -> list[str]:
     conservatively (see `_typed_text_indexes`).
     """
     typed: set[int] = set()
-    if _is_ui_type(argv, args):
-        typed = _typed_text_indexes(argv)
-        text = getattr(args, "text", None) if args is not None else None
-        if isinstance(text, str) and text:
+    verb = _text_verb(argv, args)
+    if verb is not None:
+        typed = _typed_text_indexes(argv) if verb == "type" else _fill_text_indexes(argv)
+        text = _entered_text(args, verb)
+        if text is not None:
             typed |= {index for index, token in enumerate(argv) if token == text}
     words, _terminator = _bare_words(argv)
     path = tuple(argv[index] for index in words[:3])
@@ -653,9 +745,8 @@ def scrub_canonical(parser: Any, argv: list[str], args: Any = None) -> list[str]
     resolved_path = tokens[-1].path if tokens else ()
     secrets = _namespace_secrets(args)
     typed_text = None
-    if resolved_path[:2] == ("ui", "type") and args is not None:
-        text = getattr(args, "text", None)
-        typed_text = text if isinstance(text, str) and text else None
+    if resolved_path[:1] == ("ui",) and resolved_path[1:2] in (("type",), ("fill",)):
+        typed_text = _entered_text(args, resolved_path[1])
 
     def secret_option(token: Token) -> bool:
         spelling = token.spelling or ""
@@ -698,8 +789,8 @@ def scrub_canonical(parser: Any, argv: list[str], args: Any = None) -> list[str]
                 out.append(scrubbed)
                 intact.append(scrubbed == token.raw)
             continue
-        if token.role == "positional" and token.path[:2] == ("ui", "type"):
-            # Whatever was typed into the focused field: only its length survives.
+        if token.role == "positional" and token.path[:2] in (("ui", "type"), ("ui", "fill")):
+            # Whatever was typed into the field: only its length survives.
             out.append(_mask(token.raw))
             intact.append(False)
             continue

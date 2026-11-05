@@ -35,6 +35,7 @@ BOOTED = {"devices": {"com.apple.CoreSimulator.SimRuntime.iOS-26-0": [
     {"udid": UDID, "name": "iPhone 17 Pro", "state": "Booted", "isAvailable": True}]}}
 
 sys.path.insert(0, str(ROOT / "scripts"))
+from autonom_lib import android_helper  # noqa: E402
 from autonom_lib import journal as journal_mod  # noqa: E402
 from autonom_lib import session as session_mod  # noqa: E402
 from autonom_lib import ui as ui_mod  # noqa: E402
@@ -345,6 +346,25 @@ class StaleSessionTests(CliCase):
         # and a new session starts once a target is back
         self.write_state()
         self.start_android()
+
+    def test_a_gone_target_drops_the_helper_record_without_a_new_warning(self) -> None:
+        # AH-07: the helper and its forward went with the device; only the
+        # record is dropped, and the stale-target warning stays the only one.
+        self.start_android()
+        record = android_helper.record_path(SERIAL)
+        record.parent.mkdir(parents=True, exist_ok=True)
+        record.write_text(json.dumps({"serial": SERIAL, "port": 45123, "pid": 4242,
+                                      "build": "0123456789abcdef"}), encoding="utf-8")
+        self.write_state(devices=[])
+        self.log.unlink(missing_ok=True)
+        code, payload = self.android("session", "stop")
+        self.assertEqual(code, 0, payload)
+        self.assertEqual([warning["code"] for warning in payload["warnings"]], ["stale_target"])
+        step = next(item for item in payload["teardown"] if item["action"] == "android_helper")
+        self.assertEqual(step["detail"], {"was_running": None, "skipped": "stale_target"})
+        self.assertFalse(record.exists())
+        self.assertFalse(any(argv[2:3] == ["forward"] or "kill" in argv
+                             for argv in self.calls("adb")))
 
     def test_stop_skips_the_device_proxy_restore_on_a_gone_device(self) -> None:
         self.start_android()

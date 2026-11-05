@@ -5,10 +5,15 @@ With observe on (`--observe`, or an agent-profile session), `ui tap`
 input. After it, the screen is given time to settle within the observe
 budget (`--observe-timeout-ms`, 3000 ms by default) the way `ui wait
 --settled` settles it: on the iOS idb route idb is asked whether the app is
-quiet and the tree is then read once; elsewhere the tree is polled until two
-reads match. The read the settle ended on is the new screen. It is saved to
-the session's tree history exactly as `ui tree` saves a tree, and the reply
-gains:
+quiet and the tree is then read once; on Android, when the on-device helper
+served the input, the input's own reply already carries the settled screen
+(the helper waited for the first accessibility event, at most 300 ms, then
+for 500 ms without events, at most 2000 ms after the input for the default
+budget, and read once: one round trip, AU-03), and when the helper serves
+the reads but not that input it waits for quiet in the one read it makes;
+elsewhere the tree is polled until two reads match. The read the settle
+ended on is the new screen. It is saved to the session's tree history
+exactly as `ui tree` saves a tree, and the reply gains:
 
 - ``screen``: ``outline`` (the `ui tree --format outline` lines), ``count``,
   ``truncated`` and, when it was written, ``saved`` (the history file);
@@ -36,7 +41,15 @@ gains:
 - ``foreground``: ``app`` and, when known, ``screen``. Android: the package
   most nodes of the read belong to, and the resumed activity `dumpsys`
   reports for it (best effort). iOS: the label of the application root and
-  the first heading.
+  the first heading;
+- ``settled`` and ``settle_ms`` when the Android helper settled the screen
+  (``screen_not_settled`` is warned only when ``settled`` is false);
+- on Android, ``screen.signals`` (AS-01, AS-02): ``keyboard`` (from the
+  helper's windows; null when an auto fall-back read with uiautomator) and
+  ``dialog`` (a permission dialog, a framework alert or another application
+  window over the app, with its buttons; null when none), reported only,
+  never acted on. The explicit uiautomator choice keeps today's reply,
+  without them (DEC-018).
 
 A node is the same node in both trees when its role, resource id, text,
 description and bounds agree; it is ``changed`` when its state words (the
@@ -87,7 +100,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from . import adb as adb_mod
-from . import errors, ios_idb, ui
+from . import errors, ios_idb, ui, ui_android
 from . import session as session_mod
 from .platform import ANDROID, IOS, Target
 
@@ -511,6 +524,30 @@ def masked(nodes: list[dict[str, Any]], secret: str | None) -> list[dict[str, An
     return out
 
 
+def masked_signals(signals: dict[str, Any], secret: str | None) -> dict[str, Any]:
+    """``signals`` as they may be reported and saved after `ui type
+    --sensitive` typed ``secret``: a dialog title or button label that may
+    show it (``shows_secret``) reads ``<N chars>``, like the nodes.
+
+    The title and labels are masked as plain text nodes (neither editable
+    nor focused) by this module's ``masked``, looked up when called: `ui do`
+    with several sensitive values swaps it for a mask of each value on its
+    own (``flow.inline.masking``), so the dialog then hides every one of
+    them, not only the ``secret`` it is given (the first)."""
+    dialog = signals.get("dialog")
+    if not secret or not isinstance(dialog, dict):
+        return signals
+    buttons = list(dialog.get("buttons") or [])
+    texts = [dialog.get("title"), *(button.get("label") if isinstance(button, dict) else None
+                                    for button in buttons)]
+    shown = [node.get("text") for node in masked([{"text": text} for text in texts], secret)]
+    dialog = dict(dialog)
+    dialog["title"] = shown[0]
+    dialog["buttons"] = [{**button, "label": label} if isinstance(button, dict) else button
+                         for button, label in zip(buttons, shown[1:])]
+    return {**signals, "dialog": dialog}
+
+
 def _scrubbed(error: dict[str, Any], secret: str | None) -> dict[str, Any]:
     """An observe error with ``secret`` cut out of its message and hint."""
     if not secret:
@@ -552,6 +589,8 @@ def _interrupted_error(verb: str, stage: str) -> dict[str, Any]:
 def after_action(target: Target, record: Mapping[str, Any] | None, *, verb: str,
                  baseline_payload: Any = None, timeout_ms: int = DEFAULT_TIMEOUT_MS,
                  quiet_ms: int = QUIET_MS, secret: str | None = None,
+                 input_reply: Mapping[str, Any] | None = None,
+                 input_ended: float | None = None,
                  ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """Observe after the input of ``verb``: ``(reply keys, warnings)``.
 
@@ -563,14 +602,26 @@ def after_action(target: Target, record: Mapping[str, Any] | None, *, verb: str,
     and a reply that said it failed would invite the caller to send the
     input again. ``baseline_payload`` is the command's own read before the
     input (``own_read``), or None; ``secret`` is a typed value to keep out
-    of everything observe reports or saves."""
+    of everything observe reports or saves; ``input_reply`` is the Android
+    helper's reply to the input (``ui.input_reply``): when it carries the
+    settled screen, that is the new screen and no read is made; when its
+    read failed (``read_error``), the read observe makes instead gets only
+    what is left of ``timeout_ms`` counted from ``input_ended`` (when the
+    input ended, ``ui.input_ended``), as the helper already spent part of
+    the budget settling; when an interrupt cut off the helper's settle
+    after the input was written (``ui_android.input_interrupted``), that
+    interrupt is reported as one during observe's own settle."""
+    if ui_android.input_interrupted(input_reply):
+        # the interrupt came while the Android helper settled after the input
+        # it had been sent (one round trip, AU-03): nothing was read
+        return {"observe_error": _interrupted_error(verb, STAGE_SETTLE)}, []
     progress: dict[str, Any] = {"stage": STAGE_SETTLE, "keys": {}, "warnings": []}
     act = ios_idb.take_act(target.target_id) if target.platform == IOS else None
     ios_idb.disarm_act()
     try:
         _observe(target, record, verb=verb, baseline_payload=baseline_payload,
                  timeout_ms=timeout_ms, quiet_ms=quiet_ms, secret=secret, progress=progress,
-                 act=act)
+                 act=act, input_reply=input_reply, input_ended=input_ended)
     except KeyboardInterrupt:
         keys = dict(progress["keys"])
         keys["observe_error"] = _interrupted_error(verb, progress["stage"])
@@ -634,10 +685,37 @@ def _settle_by_act(act: Mapping[str, Any], keys: dict[str, Any],
              "quiet_state": "quiet" if settled else "busy"}, payload)
 
 
+def _settled_after_input(input_reply: Mapping[str, Any] | None) -> str | None:
+    """The XML of the screen an Android helper input reply carries
+    (``read_after``), or None (no reply, or its read failed)."""
+    if not isinstance(input_reply, Mapping):
+        return None
+    after = input_reply.get("read")
+    if not isinstance(after, Mapping):
+        return None
+    xml = after.get("xml")
+    return xml if isinstance(xml, str) and "</hierarchy>" in xml else None
+
+
+def _budget_left(timeout_ms: int, input_reply: Mapping[str, Any] | None,
+                 input_ended: float | None) -> int:
+    """What the observe budget leaves for observe's own settle and read:
+    all of it after an input that went through adb or idb, and after an
+    Android helper input what is left counted from the end of the input (the
+    helper settled within the same budget before it answered); never more
+    than the whole budget."""
+    if not isinstance(input_reply, Mapping) or input_ended is None:
+        return timeout_ms
+    spent_ms = max(0, int((time.monotonic() - input_ended) * 1000))
+    return timeout_ms - spent_ms
+
+
 def _observe(target: Target, record: Mapping[str, Any] | None, *, verb: str,
              baseline_payload: Any, timeout_ms: int, quiet_ms: int,
              secret: str | None, progress: dict[str, Any],
-             act: Mapping[str, Any] | None = None) -> None:
+             act: Mapping[str, Any] | None = None,
+             input_reply: Mapping[str, Any] | None = None,
+             input_ended: float | None = None) -> None:
     """Fill ``progress`` (``keys`` and ``warnings`` of the reply, and the
     ``stage`` reached) as each part is obtained, so an interrupt keeps what
     came before it."""
@@ -651,22 +729,59 @@ def _observe(target: Target, record: Mapping[str, Any] | None, *, verb: str,
         held["read"] = (nodes, read_warnings, truncated)
         return nodes
 
-    # the AL-08 settle: idb quiet then one read on the iOS idb route, polling
-    # elsewhere; every read it makes is ours, so the last one is kept. A read
-    # of a settle that did not end is not reported: it may be mid-change.
-    # On the daemon route the input's own `act` already settled and read.
+    # AS-01/AS-02: the keyboard and dialog the new screen shows (None: no
+    # `signals` key, as for iOS and the explicit uiautomator choice)
+    signals: dict[str, Any] | None = None
+    # AU-03: the Android helper settled the screen after the input and read
+    # it in the same round trip; that read is the new screen
+    after_xml = _settled_after_input(input_reply)
+    # On the iOS daemon route the input's own `act` already settled and read.
     if act is not None:
         settled, payload = _settle_by_act(act, keys, warnings)
         held["read"] = _compact(target.platform, payload)
+    elif after_xml is not None:
+        assert input_reply is not None
+        nodes_after, read_warnings, truncated = _compact(target.platform, after_xml)
+        held["read"] = (nodes_after, read_warnings, truncated)
+        settled = ui_android.settle_report(input_reply, quiet_ms=quiet_ms)
+        if target.platform == ANDROID:
+            signals = ui_android.screen_signals(after_xml, input_reply["read"].get("windows"),
+                                                input_reply["read"].get("display"))
     else:
-        settled = ui.settle(target, timeout_ms=timeout_ms, quiet_ms=quiet_ms,
-                            snapshot_fn=read, quiet_signal=True)
+        # the AL-08 settle: idb quiet then one read on the iOS idb route, the
+        # helper's quiet wait in one read on Android when it serves the reads,
+        # polling elsewhere; every read it makes is ours, so the last one is
+        # kept. A read of a settle that did not end is not reported: it may be
+        # mid-change. After a helper input whose read failed only what the
+        # helper's settle left of the budget is spent (the budget holds)...
+        left_ms = _budget_left(timeout_ms, input_reply, input_ended)
+        if left_ms > 0:
+            settled = ui.settle(target, timeout_ms=left_ms, quiet_ms=quiet_ms,
+                                snapshot_fn=read, quiet_signal=True)
+        else:
+            # ...and with nothing left, one read that does not wait: the
+            # helper says whether the screen had been quiet for quiet_ms
+            with ui_android.read_limits(quiet_ms=quiet_ms, max_ms=0):
+                settled = ui.settle(target, timeout_ms=0, quiet_ms=quiet_ms,
+                                    snapshot_fn=read, quiet_signal=True)
+            helper_read = ui.helper_read(target)
+            if helper_read is not None:
+                settled = ui_android.settle_report(helper_read, quiet_ms=quiet_ms,
+                                                   elapsed_ms=settled.get("elapsed_ms"))
     if "read" not in held:
         read()  # the settle made no read of its own: one, and only one, more
+    if after_xml is None:
+        # the read kept last is this thread's latest read of the target
+        signals = ui.read_signals(target).get("signals")
     nodes, tree_warnings, truncated = held["read"]
     nodes = masked(nodes, secret)
     keys["screen"] = screen = {"outline": ui.outline(nodes), "count": len(nodes),
                                "truncated": truncated}
+    if signals is not None:
+        screen["signals"] = masked_signals(signals, secret)
+    if settled.get("method") == ui_android.HELPER:
+        keys["settled"] = bool(settled.get("settled"))
+        keys["settle_ms"] = settled.get("settle_ms")
     if not settled.get("settled"):
         error, hint = ui.unsettled_message(settled, timeout_ms, quiet_ms,
                                            timeout_name="--observe-timeout-ms")
@@ -706,6 +821,12 @@ def _observe(target: Target, record: Mapping[str, Any] | None, *, verb: str,
         }
         if truncated:
             tree_payload["truncated"] = True
+        for key in ("settled", "settle_ms"):
+            # as in the tree `ui tree` saves: the helper's word on this read
+            if key in keys:
+                tree_payload[key] = keys[key]
+        if "signals" in screen:
+            tree_payload["signals"] = screen["signals"]
         if target.platform == IOS:
             size = ui.screen_from_nodes(nodes)
             if size:

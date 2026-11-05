@@ -46,6 +46,33 @@ State keys (all optional):
                     ``am_wait_time`` shape the default report instead
 ``monkey_rotation`` false to stop ``monkey`` from resetting the rotation
                     settings the way the real tool does (freeze to 0, thaw)
+
+The on-device Android helper (``scripts/autonom_lib/android_helper.py``; the
+helper itself is ``tests/fakes/fake_android_helper.py``, which reads and
+writes the same state):
+
+``helper_port``     the port ``forward tcp:0 localabstract:autonom-helper``
+                    prints (the fake helper's port); 1 (nothing listens) when unset
+``forwards``        rows ``"<serial> tcp:<port> <remote>"`` that ``forward``
+                    adds, ``forward --list`` prints and ``forward --remove
+                    tcp:<port>`` removes (exit 1 for a port not listed)
+``device_files``    names in ``/data/local/tmp``: a ``push`` of an
+                    ``autonom-helper-*`` file there adds its name (other pushes
+                    are not tracked), ``shell ls /data/local/tmp`` lists them,
+                    ``shell rm -f /data/local/tmp/<name>`` removes one
+``helper_procs``    mapping of pid -> ``/proc/<pid>/cmdline`` (NUL separated):
+                    ``shell pidof autonom-helper`` lists the pids whose first
+                    word is ``autonom-helper``, ``shell cat /proc/<pid>/cmdline``
+                    prints the line (exit 1 "No such file" for any other pid),
+                    ``shell kill <pid>`` removes the pid
+``helper_running``  ``{"pid", "build"}`` of the helper serving the socket;
+                    set by the ``app_process`` start, cleared by a ``kill`` of
+                    its pid (and by the fake helper's ``quit``)
+``helper_starts``   every ``app_process`` start, in order: ``{"pid", "build",
+                    "classpath", "idle_ms", "socket", "nice_name"}`` plus
+                    ``exited`` (``no_dex`` when the class path was never pushed,
+                    ``socket_in_use`` when a helper already serves the socket)
+``helper_next_pid`` the pid the next start gets (default 4242, then counting up)
 """
 from __future__ import annotations
 
@@ -217,6 +244,135 @@ def _am_start(words: list[str], state: dict) -> str:
     )
 
 
+HELPER_PROCESS = "autonom-helper"
+DEVICE_TMP = "/data/local/tmp"
+
+
+def _helper_running_pid(state: dict) -> str | None:
+    running = state.get("helper_running") or {}
+    pid = str(running.get("pid")) if running.get("pid") is not None else None
+    return pid if pid and pid in (state.get("helper_procs") or {}) else None
+
+
+def _app_process_start(serial: str, words: list[str], state: dict) -> int:
+    """`CLASSPATH=<dex> nohup app_process /system/bin --nice-name=N <class>
+    --build B --idle-ms MS --socket S >log 2>&1 &` started detached."""
+    def value(flag: str) -> str | None:
+        return words[words.index(flag) + 1] if flag in words[:-1] else None
+
+    classpath = next((word.split("=", 1)[1] for word in words
+                      if word.startswith("CLASSPATH=")), "")
+    nice = next((word.split("=", 1)[1] for word in words
+                 if word.startswith("--nice-name=")), "")
+    pid = int(state.get("helper_next_pid", 4242))
+    state["helper_next_pid"] = pid + 1
+    start = {"pid": pid, "build": value("--build"), "classpath": classpath,
+             "idle_ms": value("--idle-ms"), "socket": value("--socket"),
+             "nice_name": nice, "serial": serial}
+    if Path(classpath).name not in (state.get("device_files") or []):
+        start["exited"] = "no_dex"  # app_process: ClassNotFoundException
+    elif _helper_running_pid(state) is not None:
+        start["exited"] = "socket_in_use"  # the helper's own refusal
+    else:
+        state.setdefault("helper_procs", {})[str(pid)] = (
+            f"{nice}\0dev.autonom.helper.Main\0")
+        state["helper_running"] = {"pid": pid, "build": start["build"]}
+    state.setdefault("helper_starts", []).append(start)
+    write_state(state)
+    return 0
+
+
+def _helper_command(argv: list[str], args: list[str], state: dict) -> int | None:
+    """The adb calls of the helper client; None for every other command."""
+    serial = argv[1] if argv[:1] == ["-s"] and len(argv) >= 2 else ""
+    if args[:1] == ["forward"]:
+        rows = list(state.get("forwards") or [])
+        if args[1:2] == ["--list"]:
+            for row in rows:
+                sys.stdout.write(row + "\n")
+            return 0
+        if args[1:2] == ["--remove"] and len(args) > 2:
+            kept = [row for row in rows if row.split()[1:2] != [args[2]]]
+            if len(kept) == len(rows):
+                sys.stdout.write(f"adb: error: listener '{args[2]}' not found\n")
+                return 1
+            state["forwards"] = kept
+            write_state(state)
+            return 0
+        if args[1:2] == ["--remove-all"]:
+            state["forwards"] = []
+            write_state(state)
+            return 0
+        if len(args) >= 3:
+            local = args[1]
+            if local == "tcp:0":
+                port = int(state.get("helper_port") or 1)
+                local = f"tcp:{port}"
+                sys.stdout.write(f"{port}\n")
+            rows = [row for row in rows if row.split()[1:2] != [local]]
+            rows.append(f"{serial} {local} {args[2]}")
+            state["forwards"] = rows
+            write_state(state)
+            return 0
+        return 0
+    if args[:1] == ["push"] and len(args) > 2:
+        destination = args[2]
+        # Only the helper's own files are tracked, so other pushes (a CA
+        # copy, a locale dex) leave the state file as it was.
+        if destination.startswith(f"{DEVICE_TMP}/{HELPER_PROCESS}-"):
+            files = list(state.get("device_files") or [])
+            name = destination[len(DEVICE_TMP) + 1:]
+            if name not in files:
+                files.append(name)
+            state["device_files"] = files
+            write_state(state)
+        return 0
+    if args[:1] != ["shell"] or len(args) < 2:
+        return None
+    try:
+        words = shlex.split(" ".join(args[1:]))
+    except ValueError:
+        return None
+    if "app_process" in words and any(word.startswith("--nice-name=") for word in words):
+        return _app_process_start(serial, words, state)
+    procs = state.get("helper_procs") or {}
+    if words[:2] == ["pidof", HELPER_PROCESS]:
+        pids = [pid for pid, line in procs.items()
+                if str(line).split("\0", 1)[0] == HELPER_PROCESS]
+        if not pids:
+            return 1  # pidof finds nothing: exit 1, no output
+        sys.stdout.write(" ".join(pids) + "\n")
+        return 0
+    if (len(words) == 2 and words[0] == "cat"
+            and re.fullmatch(r"/proc/\d+/cmdline", words[1])):
+        pid = words[1].split("/")[2]
+        if pid not in procs:
+            sys.stdout.write(f"cat: {words[1]}: No such file or directory\n")
+            return 1
+        sys.stdout.write(str(procs[pid]))
+        return 0
+    if len(words) == 2 and words[0] == "kill" and words[1].isdigit() and words[1] in procs:
+        procs.pop(words[1])
+        state["helper_procs"] = procs
+        if str((state.get("helper_running") or {}).get("pid")) == words[1]:
+            state.pop("helper_running", None)
+        write_state(state)
+        return 0
+    if words == ["ls", DEVICE_TMP]:
+        for name in state.get("device_files") or []:
+            sys.stdout.write(name + "\n")
+        return 0
+    if (len(words) == 3 and words[:2] == ["rm", "-f"]
+            and words[2].startswith(DEVICE_TMP + "/")):
+        name = words[2][len(DEVICE_TMP) + 1:]
+        files = [entry for entry in (state.get("device_files") or []) if entry != name]
+        if files != (state.get("device_files") or []):
+            state["device_files"] = files
+            write_state(state)
+        return 0
+    return None
+
+
 def main(argv: list[str]) -> int:
     record(argv)
     state = load_state()
@@ -235,6 +391,13 @@ def main(argv: list[str]) -> int:
     if args[:1] == ["version"]:
         sys.stdout.write(state.get("adb_version", "Android Debug Bridge version 1.0.41") + "\n")
         return 0
+
+    # The helper client's calls (forward, push, the app_process start, pidof,
+    # /proc/<pid>/cmdline, kill, ls and rm in /data/local/tmp): before every
+    # generic branch below, the /proc reader and pidof included.
+    handled = _helper_command(argv, args, state)
+    if handled is not None:
+        return handled
 
     if args[:1] == ["devices"]:
         rows = state.get("devices", [["emulator-5554", "device", "product:sdk_gphone64_arm64"]])

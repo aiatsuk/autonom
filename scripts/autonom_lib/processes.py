@@ -60,6 +60,12 @@ HARNESS_OWNER = "harness"
 # The process name idb's client spawns per simulator when no companion is
 # connected; one survives every idb call, and every session, unless stopped.
 COMPANION_MARKER = "idb_companion"
+# Program names that run a script given as their first argument: when one is
+# argv[0], the program `ps` shows is argv[1] (`Python /x/idb_companion ...`,
+# a shebang script as the kernel starts it). macOS shows a framework Python
+# as `.../Python.app/Contents/MacOS/Python`.
+_INTERPRETER = re.compile(r"(?:[Pp]ython|pypy)[0-9.]*[a-z]?|node|bash|sh|zsh|dash|ksh"
+                          r"|perl[0-9.]*|ruby[0-9.]*")
 
 
 def registry_dir() -> Path:
@@ -327,13 +333,40 @@ def discover_proxies() -> list[dict[str, Any]]:
     return found
 
 
+def is_companion_command(command: str | None, udid: str | None) -> bool:
+    """Is `command` (a `ps` command line) an `idb_companion` serving
+    exactly simulator `udid`?
+
+    The program must be `idb_companion`: argv[0]'s base name, or argv[1]'s
+    when argv[0] is an interpreter (`_INTERPRETER`: a shebang companion
+    runs as `Python /path/idb_companion --udid ...`). And `--udid` must be
+    followed by exactly `udid` as a whole argument. A process whose command
+    line merely contains both strings (`python3 -c ... idb_companion --udid
+    <UDID>`, `echo idb_companion --udid <UDID>`) is not one, and neither is
+    the companion of a simulator whose UDID only starts with `udid`.
+
+    `ps` joins the arguments with spaces, so a program path that itself
+    holds whitespace is not recognised: such a process is never claimed,
+    never killed and never reported."""
+    if not command or not udid or COMPANION_MARKER not in command or udid not in command:
+        return False
+    words = command.split()
+    program = 1 if len(words) > 1 and _INTERPRETER.fullmatch(os.path.basename(words[0])) else 0
+    if os.path.basename(words[program]) != COMPANION_MARKER:
+        return False
+    arguments = words[program + 1:]
+    return any(flag == "--udid" and value == udid
+               for flag, value in zip(arguments, arguments[1:]))
+
+
 def discover_companions(udid: str | None) -> list[dict[str, Any]]:
-    """Running `idb_companion` processes serving simulator `udid`."""
+    """Running `idb_companion` processes serving simulator `udid`, by the
+    exact rule of `is_companion_command`."""
     if not udid:
         return []
     found = []
     for pid, command in _running_processes():
-        if COMPANION_MARKER in command and udid in command:
+        if is_companion_command(command, udid):
             found.append({"kind": "idb_companion", "pid": pid, "udid": udid,
                           "command": _discovered_command(command)})
     return found
@@ -652,8 +685,8 @@ def signature_matches(signature: Any, command: str) -> bool:
 
     A string must appear in the command line; a list is several marks that
     must all appear — an `idb_companion` row records the binary *and* the
-    simulator it serves, so another simulator's companion (or any process
-    that merely names the UDID) is never taken for it."""
+    simulator it serves. Substrings alone are not enough for such a row:
+    `entry_matches` also holds it to `is_companion_command`."""
     if not usable_signature(signature):
         return False
     marks = signature if isinstance(signature, (list, tuple)) else [signature]
@@ -663,13 +696,15 @@ def signature_matches(signature: Any, command: str) -> bool:
 def entry_matches(entry: dict[str, Any], command: str) -> bool:
     """Does `command` still carry registry row `entry`'s signature?
 
-    `signature_matches`, plus one stricter case: a log-stream row whose
-    signature is a plain string. Rows written before the writer's strict
+    `signature_matches`, plus two stricter cases. A log-stream row whose
+    signature is a plain string: rows written before the writer's strict
     signature (`logs.writer_signature`) recorded just the stream file's
     path, which `tail -f <stream>` or a writer of `<stream>.bak` carries
     too; such a row matches only the bounded writer of exactly that file
     (`logs.is_writer_command`: the writer's script line, and the path as a
-    whole argument followed by its cap)."""
+    whole argument followed by its cap). And an `idb_companion` row, which
+    matches only an `idb_companion` serving exactly the row's simulator
+    (`is_companion_command`), never a process that merely names both."""
     signature = entry.get("signature")
     if not signature_matches(signature, command):
         return False
@@ -677,7 +712,21 @@ def entry_matches(entry: dict[str, Any], command: str) -> bool:
         from . import logs  # late: logs imports this module lazily too
 
         return logs.is_writer_command(command, signature)
+    if entry.get("kind") == "idb_companion":
+        return is_companion_command(command, _companion_udid(entry))
     return True
+
+
+def _companion_udid(entry: dict[str, Any]) -> str | None:
+    """The simulator an `idb_companion` row serves: its `udid`, else the one
+    mark of its signature that is not the program name."""
+    udid = entry.get("udid")
+    if isinstance(udid, str) and udid:
+        return udid
+    signature = entry.get("signature")
+    marks = [mark for mark in (signature if isinstance(signature, (list, tuple)) else [])
+             if isinstance(mark, str) and mark and mark != COMPANION_MARKER]
+    return marks[0] if len(marks) == 1 else None
 
 
 def usable_signature(signature: Any) -> bool:

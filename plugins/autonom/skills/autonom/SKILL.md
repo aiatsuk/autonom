@@ -105,7 +105,7 @@ reads it back — the record you use to re-check or hand off a flow.
 
 Start the sessions you drive with `session start --profile agent`. In that
 session `ui tree` prints the compact outline, and `ui tap`, `ui type`,
-`ui swipe` and `ui key` wait for the screen to settle and return it in the same
+`ui fill`, `ui swipe` and `ui key` wait for the screen to settle and return it in the same
 reply: `screen.outline`, `changes` (what appeared, went or changed) and
 `foreground` (the app and screen now showing). Read the next step from that
 reply instead of calling `ui tree` after every action; an `observe_error` in
@@ -115,6 +115,26 @@ v1 steps on stdin) in one call and stops at the first failing step. Without the
 profile every command replies as before; `--observe` asks for the new screen
 on one command, `--no-observe` skips it. `mobile-screen` has the details.
 
+## Android: the on-device helper
+
+On Android, Autonom reads the screen and sends input through its own small
+helper program on the device, built on the first Android call from the local
+JDK and Android SDK and cached. A read takes tens of milliseconds instead of
+the ~2 s of `uiautomator dump`, a screen that never goes idle is still read
+(`settled: false`), any text can be typed (`ui type`, and `ui fill` to
+replace a field's text), reads report a keyboard or a dialog in `signals`
+(reporting only: nothing is clicked for you), and `screenshot --agent` makes a
+small JPEG whose `coordinates` note converts image pixels to `ui tap` values.
+
+- Without a JDK or SDK the same commands work through uiautomator and adb
+  input; the reply says so with `fallback_reason` and a `fallback_hint`.
+  `--ui-backend uiautomator` (or `AUTONOM_ANDROID_UI_BACKEND=uiautomator`)
+  opts out on purpose.
+- The helper holds the device's UiAutomation until 2 minutes after its last
+  call. Before uiautomator2, Appium or another UiAutomation tool uses the
+  device, run `autonom ui helper stop` (`ui helper status` says whether one
+  runs); `session stop` stops it too.
+
 ## What you can do (verb catalog)
 
 | Area | Verbs |
@@ -122,9 +142,9 @@ on one command, `--no-observe` skips it. `mobile-screen` has the details.
 | Discover | `doctor`, `devices`, `devices boot/shutdown` |
 | Session | `session start/show/list/stop/launch/force-stop/clear/uninstall` (`session start --label`, `session start --profile agent`, `session list [--all]`) |
 | Shared control | `control status/acquire/renew/release` — the device's control lease; claim it with `--control-holder`/`--control-generation` |
-| Screen | `ui tree/find/wait/tap/swipe/type/key/do` (`ui wait --settled`, `ui tree --format outline`, `--observe`/`--no-observe` on the actions, `ui do` for several Flow steps from stdin in one call); `find`/`tap` resolve on-screen matches first, and a node that is not on screen is `visible: false` in the tree and refused by `tap` (`element_offscreen`); `pinch/rotate/shake` are refused on both platforms; iOS input via idb or AXe, named in `backend` |
+| Screen | `ui tree/find/wait/tap/swipe/type/fill/key/do` (`ui wait --settled`, `ui tree --format outline`, `--observe`/`--no-observe` on the actions, `ui fill` to replace a field's text on Android, `ui do` for several Flow steps from stdin in one call); `find`/`tap` resolve on-screen matches first, and a node that is not on screen is `visible: false` in the tree and refused by `tap` (`element_offscreen`); `pinch/rotate/shake` are refused on both platforms; Android input via the on-device helper or adb, iOS input via idb or AXe, named in `backend`; `ui helper status/stop` for the Android helper |
 | First run | `tour` — overview, the workflow, this machine's targets, and `--run` to walk three screens into Settings: before/after screenshots, hierarchy, and device log attached to each tap or back, an assertion that the screen changed after each, an HTML/JUnit report, and a written account |
-| Evidence | `screenshot` (with `width`/`height`), `shots list/show`, `record start/stop`, `note add/list`, `journal` |
+| Evidence | `screenshot` (with `width`/`height`; `--agent` on Android: a small JPEG with `scale` and a tap-coordinate note), `shots list/show`, `record start/stop`, `note add/list`, `journal` |
 | Deterministic state | `simulator status-bar pin\|clear` (both platforms), `simulator keyboard pin\|reset\|show` (iOS), `simulator animations pin\|reset\|show` (Android) — remove clock, battery, animation, and autocorrect noise from before/after comparisons; `verified` only after a read-back |
 | Device state | `open` (deep link; Android names the activity that took it in `handled_by`), `permissions`, `location` (iOS + Android emulator), `media add`, `file ls/pull` |
 | Diagnostics | `logs tail`, `crash list/show` |
@@ -180,6 +200,14 @@ screenshot + UI tree + logs → profile / memory / network → before/after repl
 - **One explicit target.** With more than one device attached, pass `--target` /
   `--serial` / `--udid`; ambiguity is an error listing candidates, never a guess.
 - **iOS text lives in `desc`** (from `AXLabel`), not `text` — select with `--desc`.
+- **Signals report, they never act.** An Android `signals.dialog` names a
+  permission dialog, an alert or a dialog in its own window (`window`: a
+  popup, or a modal dialog such as a Compose one, seen from the active
+  window leaving the screen partly uncovered) over the app; deciding which
+  button to tap is your job, and Autonom never dismisses it for you.
+- **An agent screenshot is not in screen pixels.** Tap from the tree; when
+  you must tap something only the image shows, convert with the reply's
+  `coordinates` note.
 - **A person can take the device.** In the Mobile Canvas a person's first
   input on a device nobody holds takes its control lease; from then on your
   device-changing commands are refused `control_held` (exit 2, nothing ran)
@@ -197,7 +225,8 @@ screenshot + UI tree + logs → profile / memory / network → before/after repl
                             crashes, files, journal.ndjson, session.json,
                             flows/<run_id>/events.ndjson  (flow run evidence)
 ~/.autonom/apps/<package>/  per-app knowledge: app.md, flows/, bodies/  (mobile-memory)
-~/.local/state/autonom/     mocks registry, process registry, control/ leases  (machine-level, persistent)
+~/.local/state/autonom/     mocks registry, process registry, control/ leases, android-helper/
+                            (helper builds, per-device records)  (machine-level, persistent)
 ```
 Flow *files* are repository source (conventionally `.autonom/flows/` in the
 app repo — see `mobile-flow`); only run artifacts land under `~/.autonom`.
@@ -223,6 +252,11 @@ use builds and starts the helper. `--ui-backend xcuitest` selects it directly;
 `--ui-backend idb` isolates idb diagnosis. The option on `session start` persists the
 choice. `capabilities --probe` measures current UI readiness; without a recent read,
 `ui.accessibility` describes installed tooling only.
+
+On Android, `--ui-backend auto` uses the on-device helper and falls back to
+`uiautomator dump` and adb input with `fallback_reason`; `--ui-backend helper`
+refuses to fall back (`android_helper_unavailable`), `--ui-backend uiautomator`
+never builds, starts or asks the helper, and `session start` persists the choice.
 
 For duplicate labels use the observed identifier or add `--role button --mode exact`.
 A `stale_ui_element` refusal happened before input: refresh the tree and reselect.

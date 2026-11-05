@@ -466,6 +466,14 @@ def collect(args: Any = None) -> dict[str, Any]:
     }
     ios_state, ios_caps, checks, ios_warnings = _ios_state(tools)
     capabilities.update(ios_caps)
+    # The on-device Android helper (AH-02): the JDK and SDK tools found and
+    # whether their build is cached; never a build, never a device call. Not
+    # in `tools`, so it never gates `--strict`.
+    from . import android_helper  # noqa: PLC0415 - kept off quick verbs' import path
+
+    helper_cap, helper_warnings = android_helper.doctor_capability(
+        tools["adb"]["path"] if tools["adb"]["state"] == "ok" else None)
+    capabilities["android_helper"] = helper_cap
 
     # Optional profilers never gate `--strict` (is_healthy reads `tools` only):
     # a missing xctrace narrows what metrics can do, it does not break the host.
@@ -491,6 +499,7 @@ def collect(args: Any = None) -> dict[str, Any]:
 
     network_state, orphans, warnings = _runtime_state(record)
     warnings.extend(ios_warnings)
+    warnings.extend(helper_warnings)
 
     overrides, override_warnings = _overrides()
     warnings.extend(override_warnings)

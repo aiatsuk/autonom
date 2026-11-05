@@ -24,8 +24,209 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
   nothing changes. Measured about 53 fps while scrolling, not yet 60; a
   focus-profile switch can briefly restart control and refuse the first
   tap. See `docs/canvas-host-video.md`.
+- **Autonom's own Android helper, built on first use.**
+  `native/android/helper` is a small Java program (protocol 1, framework APIs
+  only) that runs on the device as the shell user, holds one UiAutomation
+  connection and answers JSON lines on the abstract socket `autonom-helper`:
+  uiautomator-compatible reads of the same window with a windows list,
+  touches and keys, Unicode typing and set-text, and scaled JPEG
+  screenshots; it exits after 120 s without a request. Only its source is in
+  the repository and the release. The first Android call that needs it
+  builds the dex on the host with the local JDK (`javac --release 8`) and the
+  newest SDK build-tools `d8` and platform `android.jar`, and caches it under
+  `<state>/android-helper/builds/<id>/` (the id hashes the sources and the
+  tool versions; one build at a time under a lock, published by rename; a
+  failed build is remembered and not tried again until the sources or tools
+  change). `docs/INSTALL.md` names what to install (a JDK 11 or newer, SDK
+  build-tools and a platform) and what happens without it: Android calls go
+  through uiautomator and adb as before and say why. `docs/ARCHITECTURE.md`
+  describes the build cache, the device files, the socket, the idle stop and
+  the teardown.
+- **Live check of the whole Android path.**
+  `tests/live/android_helper_live.py --serial emulator-<port> --avd NAME
+  [--boot] --evidence-dir DIR` drives one named emulator through the CLI in
+  a fresh `AUTONOM_HOME` and an agent-profile session: the first build, parity
+  with uiautomator, a never-idle page, a settled navigation tap without size
+  lookups, Unicode typing and `ui fill`, keyboard and dialog signals, an
+  agent screenshot whose `coordinates` tap the right row, a restart after a
+  kill, the replacement of a wrong-build helper, the idle stop, the fallback
+  without a JDK, and a `session stop` that removes only Autonom's forward. It
+  refuses a serial whose AVD name differs (also when another emulator takes
+  it during the boot), boots it cold only with `--boot` (and then stops it),
+  waits for a host load below 60 and for a quiet device (exit 3 when it never
+  quiets), contacts no other device (its cleanup sends commands only to the
+  AVD it confirmed on the serial), and writes one
+  JSON report, `android-helper-live.json`, with one check per step and
+  timings. `tests/live/android_helper_smoke.py` checks the helper's protocol
+  directly. Neither runs in `run_checks.sh`.
+- **The on-device Android helper has a host client.**
+  `scripts/autonom_lib/android_helper.py` starts Autonom's own helper on
+  first use (the dex built from `native/android/helper` is pushed as
+  `/data/local/tmp/autonom-helper-<build>.dex`, older builds there are
+  removed by exact name, and it runs detached as `autonom-helper`), reaches it
+  through `adb forward tcp:0 localabstract:autonom-helper`, and opens every
+  connection with `hello`: a helper of another build or protocol is quit and
+  replaced before anything is sent, a dead one is restarted once. Every
+  request has a unique id and a host timeout (12 s for typing, 8 s for other
+  inputs and reads); an input written to the helper and not answered is
+  `ui_action_uncertain` and is never sent again, a read is retried once on a
+  restarted helper (the restart ends only the helper that failed the read,
+  never one another caller started meanwhile), and a start that fails after
+  its launch ends only what its launch added. A helper no record names
+  (another state directory's, or one a record lost) that holds the socket
+  is replaced like a recorded one when it answers hello at once with
+  another build or protocol (quit, its verified pid killed only if it
+  stays, the expected build started; once per start); while it is in a
+  call (its hello stays queued for the whole 5 s start budget) it is left
+  running and the call fails with `helper_busy` (`helper_foreign_pids`). A
+  recorded forward port is used only while `adb forward --list` shows it
+  for the device's serial (read once per CLI process per device, again
+  after 30 s in a long-lived process such as the Canvas bridge); else a
+  fresh forward is made and the other one left alone, so after an adb
+  server restart no call reaches another device's helper. A process talks to a device's helper
+  only while it holds that device's use lock (an exclusive `flock` on
+  `<state>/android-helper/devices/<serial>.use.lock`, with the holder's pid
+  in `<serial>.use.owner`; the system lets it go when the holder dies):
+  from the connect through the hello, the request and its reply, and around
+  a stop. A caller waits up to 20 s for it, then gets `helper_busy` with the
+  holder's pid; holding it, a helper that does not answer hello within 2 s
+  is stuck, so it is stopped (its verified pid, its own forward) and started
+  once, and a read it leaves unanswered twice falls back (`auto`) or fails
+  (`--ui-backend helper`). The lock is per state directory while the
+  helper's socket is the device's: when `adb forward --list` shows another
+  host port forwarded to the helper (another Autonom state directory), a
+  silent hello may be that directory's call, so it is waited for up to 20 s
+  instead, then `helper_busy` (`helper_shared_forward`) with nothing sent or
+  stopped; a stop gives it the same wait before it ends the helper. The
+  device record and the host
+  toolchain are checked before any adb call, so a host without a JDK or SDK
+  sends the device nothing; a device where the helper cannot run is
+  remembered for its boot (`uiautomation_busy` for 60 s). New error code
+  `android_helper_unavailable` (with `reason` and a hint).
+  `autonom ui helper status` reports whether a helper runs (`running`,
+  `build`, `pid`, `port`, `idle_ms`); `autonom ui helper stop`, and a new
+  `session stop` teardown step `android_helper`, stop it: quit, a kill of its
+  pid only while `/proc/<pid>/cmdline` names `autonom-helper`, and
+  `forward --remove tcp:<its port>` only (never `--remove-all`). A session
+  with no helper record sends nothing for it. `doctor` adds the capability
+  `android_helper` (the tools found, whether their build is cached).
+  `AUTONOM_ANDROID_UI_BACKEND` (`auto`, `helper`, `uiautomator`) names the
+  preferred Android backend; the test harness defaults it to `uiautomator`.
+- **Android reads and inputs go through the on-device helper.** In the
+  default `auto` mode `ui tree`, `ui find` and every selector read come from
+  the helper's `read` (the same uiautomator XML and node schema, read after
+  500 ms without accessibility events, at most 2000 ms), so a screen that
+  never goes idle is read and marked `settled: false` instead of failing
+  with `ui_not_idle`; every read the helper served says so: `ui tree` and
+  `ui find` add `settled` and `settle_ms`, as do an observed action's and
+  `ui do`'s final `screen` and a Flow step event whose read the helper
+  served (a read uiautomator served, under the opt-out or after an `auto`
+  fall-back, adds neither). Tap, long
+  press, swipe and key are injected by the helper with the same argument
+  checks and coordinate guard (typing too: below). An observed action
+  through the helper takes one round trip: the
+  input comes back with its settled screen (first accessibility event at
+  most 300 ms, then 500 ms quiet, at most 2000 ms for the default budget),
+  and `ui wait --settled` lets the helper wait for quiet (`method:
+  helper`); `screen_not_settled` is warned only when `settled` is false.
+  Replies add `ui_backend`, `input_backend` and, when `auto` fell back to
+  uiautomator and adb (no JDK or SDK, a failed build, a device where the
+  helper cannot run, a read it failed), `fallback_reason` and
+  `fallback_hint`; Flow step events carry them too. An input the helper
+  did not acknowledge is `ui_action_uncertain` and is never sent again (a
+  Flow step fails as infrastructure). `--ui-backend` takes `auto`, `helper`
+  or `uiautomator` on Android; every verb that resolves a target (`ui`
+  verbs, `ui do`, `flow run`, `report serve` and the rest) refuses a value
+  of the other platform with `invalid_value` before any call to the device
+  itself (finding the target may list the attached devices first); only
+  `session start` on Android still stores an iOS value, as before. The
+  explicit `uiautomator` choice (flag, variable, a session started with it,
+  the test harness default) contacts no helper and keeps today's replies,
+  without the provenance keys; they appear whenever the helper or `auto` is
+  in play, an `auto` fall-back with its `fallback_reason` included. An
+  observed input whose read after it failed is read again only within
+  what is left of the observe budget. Before any `uiautomator dump` a live
+  helper is stopped; the stop and the dump hold the device's use lock
+  (above) together, so a stop never cuts another Autonom process's request
+  and no helper starts during the dump. A call that finds another
+  Autonom process using the helper past the wait fails with
+  `backend_failed` (`helper_busy`; `android_helper_unavailable` under
+  `--ui-backend helper`) and sends, stops and dumps nothing; `auto` does not
+  fall back on it. An interrupt while the helper settles after an observed
+  input it was sent is observe's interrupt (`ok: true` with `observe_error`
+  `interrupted`, journaled ok, exit 130), as under uiautomator; and
+  `screen_not_settled` says "still changing" only when an event came in the
+  last quiet window, not when the helper had no time to wait. A key the helper cannot take (a name Autonom cannot
+  number, `0`, a number above 283) and a gesture above 60000 ms go through
+  adb in `auto` mode with a `fallback_reason`; settle and read waits are
+  kept within the helper's 60000 ms per request (a longer `ui wait
+  --settled` budget is spent over several reads). A Flow step event names
+  only what served that step. Size lookups outside the coordinate guard
+  (Mobile Canvas's status poll, a Canvas recording on an emulator, the Flow
+  engine's cached size) stay on `wm size` and the rotation sources: they
+  never start, ask or wait for the helper. Mobile Canvas bridge actions
+  (taps, swipes, keys and text) follow the same backend choice as the CLI,
+  so in `auto` they use the helper, which stops 2 minutes after the last of
+  them; scrcpy video and streamed input are unchanged.
+- **Unicode typing and `ui fill` on Android.** Through the on-device helper
+  `ui type` puts any text at the cursor (accents, Cyrillic, CJK, emoji): key
+  events where the keyboard map has them, set-text insertion keeping the
+  text around the selection for the rest. The reply adds `method`,
+  `text_after` (null for a password field, `<N chars>` with `--sensitive`)
+  and `complete`; a part that does not show up stops the typing, nothing is
+  sent again, and the reply says `complete: false` with the warning
+  `text_incomplete`. Nothing focused is `no_focused_field`, and text that
+  needs set-text in a password field, whose text cannot be read, is the new
+  code `text_not_typable` instead of overwriting it; any other field that
+  shows no text counts as empty and is typed into (an empty field reports
+  no text the same way; a custom field that hides its text from
+  accessibility could have it replaced). The new
+  verb `autonom ui fill TEXT` replaces a field's whole text: the field named
+  by the selector flags of `ui tap`, or the focused one; `--sensitive` and
+  the observe flags as for `ui type`. A node that is not editable is
+  refused before any input. Through the helper it taps the field, finds it
+  again on the screen after the tap (the keyboard may move it), sets the
+  text only while that field has input focus (else the new code
+  `fill_target_mismatch`) and reads it back (`text_after`, `complete`,
+  `text_matches` except for a password field). The uiautomator/adb way taps
+  the field, deletes its text with `KEYCODE_MOVE_END` and one `KEYCODE_DEL`
+  per character the tree shows, and types with `adb shell input text`. iOS
+  answers `unsupported_on_platform` (use `ui type`). A fill is journaled and
+  masked like `ui type`, is a mutating verb under the control lease, and a
+  recorded fill compiles to `tapOn`, `eraseText` and `inputText`.
+- **Android reads say when a keyboard or a dialog shows.** `ui tree`, an
+  observed action's `screen` and `ui do`'s final `screen` add
+  `signals: {keyboard, dialog}`. `keyboard` comes from the helper's windows
+  (`visible`, `package`, `bounds`) and is null, unknown, for a read
+  uiautomator served in an `auto` fall-back. `dialog` names a runtime
+  permission dialog (`permission`), a framework alert (`alert`) or a dialog
+  in its own window (`window`): another application window over the app,
+  or a modal dialog such as a Compose one, seen from the active window
+  leaving the screen partly uncovered (Android leaves the app's window
+  beneath a modal dialog out of the windows list), with its `package`,
+  `title` and `buttons`; null when none. Reporting
+  only: nothing is clicked. The explicit `uiautomator` choice keeps today's
+  reply without `signals`.
+- **Small screenshots for agents.** `autonom screenshot --agent
+  [--max-edge N]`, and a plain `screenshot` in an agent-profile session on
+  Android, ask the on-device helper for a JPEG (quality 80) whose long edge
+  is at most N pixels (default 1000, never upscaled), saved as `.jpg`. The
+  reply adds `format`, `screen`, `scale` and a `coordinates` note that turns
+  image pixels into `ui tap --x/--y` values (a 1080x2400 screen gives a
+  450x1000 image and `scale` 2.4). Without the helper it is today's PNG with
+  `scale` 1 and `fallback_reason`; an `--out x.jpg` (or `.jpeg`) is then
+  written as `x.png`, the reply's `path`/`copies` name that file, and a
+  warning `out_renamed` gives `requested` and `written`. `--no-agent` keeps
+  the PNG in an agent session, and so does a plain `screenshot --out
+  NAME.png` there; an agent screenshot whose `--out` does not end in
+  `.jpg`/`.jpeg` is `invalid_value` before any capture. No image is written
+  under another format's suffix.
+  Other screenshots, iOS and Flow `takeScreenshot` are unchanged.
+  `shots show` reads a JPEG's size, and shot numbers count `.jpg` files
+  too.
 
 ### Changed
+
 - **The iOS device daemon finds idb's companion in the process table.** It no
   longer reads idb's state file (`/tmp/idb/state`) or `AUTONOM_IDB_STATE_FILE`
   (the CLI still does): it uses the live `idb_companion` started with
@@ -39,6 +240,78 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
   `ps` before `idb connect` fails, the companion found after it is used but
   not owned (idb connect may have reused another session's), so the daemon
   never stops it.
+- **Every `session list` entry carries `profile`.** It reads `default` for a
+  session started without `--profile` and for one an older version started;
+  before, only a non-default session had the key.
+- **Android key names are checked.** Every Android key — `ui key`, a Flow
+  `pressKey` (in `flow run` and `ui do`) and a Mobile Canvas bridge key — is
+  a `KEYCODE_[A-Z0-9_]+` name, a bare upper-case name (`[A-Z][A-Z0-9_]*`,
+  such as `BACK` or `HOME`, sent as `KEYCODE_BACK`, `KEYCODE_HOME`) or a
+  decimal key number of 1 to 4 digits (up to 9999, above every Android key
+  code); anything else (shell text, spaces, lower case, punctuation, an
+  empty word, a longer number) is `invalid_value` before any call to the
+  device itself (without `--serial`, finding the target may list the
+  attached devices first).
+  Before, the word reached the device shell unquoted. iOS keys are
+  unchanged.
+- **Android typing the adb way refuses what it cannot type.** Under
+  `--ui-backend uiautomator` (the test harness default) or after an `auto`
+  fall-back, `ui type`, `ui fill`, a Flow `inputText`/`pasteText` and Mobile
+  Canvas text take printable ASCII only: other text is `text_not_typable`
+  with a hint (the helper types it) before any input, instead of being
+  dropped or mangled by `adb shell input text`.
+- **No per-tap size lookups on Android.** The coordinate guard takes the
+  screen size from the read the command made (the helper read's display, or
+  the root node of the `uiautomator dump`, which uiautomator clips to the
+  display as it is now), else from the geometry the latest read recorded
+  (in the command, or the session's new `android_geometry`, written by a
+  helper read and by `ui tree`), else from one lookup (the helper's
+  display, else `wm size` and the rotation sources). A point refused on a
+  size it did not look up is decided again on one fresh lookup, so a
+  rotation since the read, or a dialog whose root covers less than the
+  display, never refuses a valid point; a size an earlier command left in
+  the session accepts a point without a lookup only when the point also
+  fits that size turned, so a rotation since never sends a point off the
+  screen. On both backends a selector tap
+  makes no `wm size`, `dumpsys` or `settings get` call (its own read gives
+  the size). A tap after `ui tree` in the same session makes none for a
+  point inside both the recorded size and that size turned (inside
+  1080x1080 for a recorded 1080x2400); any other point is decided on one
+  fresh lookup, which is one `display` request through the helper and `wm
+  size` and the rotation sources on the uiautomator path. A coordinate tap
+  with no read and nothing recorded still looks up once.
+- **The skills teach the on-device Android helper.** `mobile-screen` has
+  sections on the helper (what serves a reply, the fallback with
+  `fallback_reason` and its hint, the `--ui-backend uiautomator` opt-out and
+  `--ui-backend helper`, `ui helper status|stop` to free the device for
+  uiautomator2, Appium or a raw dump, `ui_action_uncertain` and
+  `helper_busy`), on typing and `ui fill` (`text_after`, `complete`,
+  `text_matches`, `text_not_typable`, `fill_target_mismatch`), on the
+  keyboard and dialog `signals` (reporting only: deciding which button to tap
+  is the agent's job) and on `screenshot --agent` with its coordinate note.
+  Its `screen_not_settled` guidance now fits the helper path: the helper
+  waits for the input's first event and then for 500 ms of quiet, at most
+  2 s, so the warning means the screen really kept changing, and a screen
+  that never goes quiet stays `settled: false` however long one waits; the
+  note that the warning is common, where one read takes about 2 s, is kept
+  for the uiautomator fallback. The `autonom` start-here skill names the
+  helper, `ui fill`, `ui helper stop` and agent screenshots in its map and
+  verb catalog.
+
+### Fixed
+
+- **A literal `%s` typed on Android arrives as `%s`.** `adb shell input
+  text` reads `%s` as a space; the text is now sent in two calls cut
+  between the `%` and the `s`.
+- **Only a real idb companion counts as one.** A process is taken for a
+  simulator's `idb_companion` only when its program is `idb_companion` (or a
+  script of that name an interpreter runs) and `--udid` is followed by
+  exactly that UDID. Before, any process whose command line contained both
+  strings counted: it made the companion an idb call started look as if it
+  had been running already, so that companion was never registered and
+  `session stop` left it running, and a registry row whose pid such a
+  process had taken over could be signalled. Such a process is now never
+  registered, reported or stopped.
 
 ## [0.37.0] - 2026-11-05
 

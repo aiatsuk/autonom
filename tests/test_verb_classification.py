@@ -96,7 +96,7 @@ class VerbClassificationTests(unittest.TestCase):
                           "canvas serve", "cleanup", "control acquire", "control release",
                           "control renew"),
             "host": ("network start", "network mock add", "network mock clear"),
-            "mutating": ("devices shutdown", "ui tap", "ui type", "open", "media add",
+            "mutating": ("devices shutdown", "ui tap", "ui type", "ui fill", "open", "media add",
                          "network attach", "network detach", "network stop",
                          "metrics memory warn", "session clear", "location clear"),
             "flow": ("flow run", "proof", "replay", "ci run", "teach approve",
@@ -107,6 +107,7 @@ class VerbClassificationTests(unittest.TestCase):
                 with self.subTest(verb=verb):
                     self.assertIn(verb, self.tables[name])
         self.assertEqual(self.cli._CONTROL_BY_ACTION["ui accessibility"], {"status"})
+        self.assertEqual(self.cli._CONTROL_BY_ACTION["ui helper"], {"status"})
         self.assertEqual(self.cli._CONTROL_BY_ACTION["simulator clipboard"], {"get"})
         self.assertEqual(self.cli._CONTROL_BY_ACTION["simulator keyboard"], {"show"})
         self.assertEqual(self.cli._CONTROL_BY_ACTION["simulator animations"], {"show"})
@@ -122,6 +123,10 @@ class VerbClassificationTests(unittest.TestCase):
             (("ui", "accessibility", "status"), "readonly"),
             (("ui", "accessibility", "enable"), "mutating"),
             (("ui", "accessibility", "reset"), "mutating"),
+            (("ui", "helper", "status"), "readonly"),
+            (("ui", "helper", "stop"), "mutating"),
+            (("ui", "fill", "x", "--resource-id", "email"), "mutating"),
+            (("ui", "fill", "x"), "mutating"),
             (("simulator", "clipboard", "get"), "readonly"),
             (("simulator", "clipboard", "set"), "mutating"),
             (("simulator", "keyboard", "show"), "readonly"),
