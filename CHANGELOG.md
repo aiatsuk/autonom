@@ -251,11 +251,18 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
 ### Changed
 - **Canvas workspace tiles keep the device page's controls.** Each tile has
   its own Settings and Inspector again; Capture keeps screenshots, recording
-  and the gallery, and input, clipboard paste and device actions sit in
-  Inspector. Theme and display are grouped in general settings. The network
-  inspector shows Pretty and Raw bodies and copies a complete redacted body
-  (previews stay redacted and capped at 2 KB; full redacted bodies up to
-  4 MiB are kept privately with the session's artifacts).
+  and the gallery (with a button that opens the captures folder in Finder),
+  and input, clipboard paste and device actions sit in Inspector. The
+  Actions dock is on the single-device Canvas too. Theme and display are
+  grouped in general settings. Inspector adds a device language menu (on
+  iOS it asks before the restart a language change needs), text-size and animation simulations,
+  and biometric enroll and status. Saved locations can be edited and
+  deleted, and recent deep links are offered again. Network has one-step
+  Start capturing (start and attach). The network inspector shows Pretty
+  and Raw bodies and copies a complete redacted body, also without
+  `--capture-bodies` (previews stay redacted and capped at 2 KB; full
+  redacted bodies up to 4 MiB are kept privately with the session's
+  artifacts).
 - **Original device frames.** Frames use the locally installed Android SDK
   skins and iOS DeviceKit artwork for the selected model, the same geometry
   in the preview and in PNG and MP4 exports; missing artwork is reported
@@ -265,14 +272,19 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
   1280 px long side at 30 fps (explicit settings and hardware defaults are
   kept), and emulator recordings are bounded to a 1280 px long side at
   4 Mbps.
-- **Steadier Android emulator launch on macOS.** The Canvas starts an
-  emulator as an owned, single-run launchd job with the host GPU and a cold
-  boot, so it no longer inherits a background caller's scheduling policy;
-  the job is removed on shutdown or failure. Linux and the compatibility
-  mode launch directly as before.
+- **Emulator boots on macOS run as a launchd job (all callers).** On macOS
+  every emulator boot, `autonom devices boot --avd` and `autonom tour` as
+  well as the Canvas picker, now starts the emulator as an owned, single-run
+  Interactive launchd job with `-no-window -no-snapshot -gpu host`, so it no
+  longer inherits a background caller's scheduling policy; the job is
+  removed on shutdown or failure. This changes the old behavior: there is
+  no emulator window and every boot is a cold boot. A launchd error is a
+  `backend_failed` error with no silent fallback, which happens without a
+  logged-in desktop session (for example over SSH).
+  `AUTONOM_EMULATOR_LAUNCH_MODE=direct` keeps the previous direct launch.
+  Linux is unchanged.
 - **Paste into the emulator.** Clipboard text is inserted with one Ctrl+V
   after the clipboard is acknowledged, keeping queued input in order.
-
 - **`session stop` leaves the daemon's companion alone.** A companion a live
   iOS device daemon started is stopped by the daemon's idle rule; `session
   stop` no longer kills it or names it in `companion_left_running`.
