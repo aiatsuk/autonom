@@ -389,7 +389,7 @@ test("inputs are validated before anything is sent", () => {
   }
 });
 
-// The process table as `ps -axwwo pid=,args=` prints it: one `<pid> <argv joined by spaces>` per line.
+// The process table as `ps -xwwo pid=,args=` prints it: one `<pid> <argv joined by spaces>` per line.
 const IDB_SOCK = `/tmp/idb/${UDID}_companion.sock`;
 const psLine = (pid, args) => `${String(pid).padStart(5)} ${args}`;
 
@@ -777,7 +777,7 @@ if (args[0] === "simctl" && args[1] === "spawn" && args[3] === "notifyutil" && a
 process.exit(1);
 `;
 
-// `ps -axo comm=` lists a fixed set (plus Device Hub with ps.deviceHub). `ps -axwwo pid=,args=`
+// `ps -axo comm=` lists a fixed set (plus Device Hub with ps.deviceHub). `ps -xwwo pid=,args=`
 // lists this world's live fake companions as macOS lists a real one (the node interpreter
 // that runs the fake script left out), then ps.extra lines; ps.failArgs makes it fail,
 // ps.failArgsFirst makes only the first that many listings fail.
@@ -796,7 +796,7 @@ if (args.includes("pid=,args=")) {
     if (listings < config.failArgsFirst) process.exit(1);
   }
   const companion = ${JSON.stringify(paths.companion)};
-  const lines = execFileSync("/bin/ps", ["-axwwo", "pid=,args="], { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 })
+  const lines = execFileSync("/bin/ps", ["-xwwo", "pid=,args="], { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 })
     .split("\\n").filter((line) => line.includes(" " + companion + " "))
     .map((line) => { const [, pid, rest] = /^\\s*(\\d+)\\s+(.*)$/.exec(line); return pid + " " + rest.slice(rest.indexOf(companion)); });
   console.log([...lines, ...(config.extra ?? [])].join("\\n"));
@@ -1191,7 +1191,7 @@ test("the daemon ignores idb's state file, a TCP-only companion and the Canvas's
 test("a ps that fails counts as no companion: idb connect runs and, with still none found, the start fails clearly", async (t) => {
   const world = harness(t, { ps: { failArgs: true } });
   await assert.rejects(world.start(), (error) => error instanceof DaemonError && error.code === CODE.DAEMON_START_FAILED
-    && error.extra.reason === "companion_start_failed");
+    && error.extra.reason === "companion_start_failed" && /process scan \(ps\) failed/.test(error.message));
   assert.deepEqual(world.idbCalls().map((c) => c.argv[0]), ["connect"], "idb connect ran after the failed scan");
   const log = readFileSync(daemonPaths(world.paths.base, UDID).log, "utf8");
   assert.equal([...log.matchAll(/"event":"companion_scan_failed"/g)].length, 2, "both scans failed and were logged");

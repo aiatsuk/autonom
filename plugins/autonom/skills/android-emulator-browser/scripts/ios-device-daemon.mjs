@@ -14,7 +14,7 @@
  * - Socket: `$TMPDIR/autonom-iosd-<12 hex>/d.sock` in a 0700 directory, at most 103 bytes
  *   (macOS sun_path); a longer one refuses the start with `daemon_start_failed`.
  * - Companion: the live local companion idb started for the UDID is used as it is (not
- *   owned). The daemon finds it in the process table (`ps -axwwo pid=,args=`), never in
+ *   owned). The daemon finds it in the process table (`ps -xwwo pid=,args=`), never in
  *   idb's own files: an `idb_companion` whose arguments are `--udid <UDID>` and
  *   `--grpc-domain-sock <dir>/<UDID>_companion.sock`, the way `idb connect` starts one
  *   (see liveIdbCompanion). Otherwise the daemon runs `idb connect <UDID>` under the
@@ -633,9 +633,9 @@ export function pidAlive(pid) {
 }
 
 /**
- * The `idb_companion` processes in a `ps -axwwo pid=,args=` listing that serve `udid` on a
+ * The `idb_companion` processes in a `ps -xwwo pid=,args=` listing that serve `udid` on a
  * domain socket the way idb starts them (fb-idb's `spawn_domain_sock_server`:
- * `idb_companion --udid <UDID> --grpc-domain-sock /tmp/idb/<UDID>_companion.sock ...`):
+ * `idb_companion --udid <UDID> --grpc-domain-sock <idb dir>/<UDID>_companion.sock ...`):
  * `[{ pid, socketPath }]` in listing order. The executable is every word before the first
  * one that starts with `-`, so a path with spaces stays whole, and its basename must be
  * `idb_companion`. `--udid` must name exactly `udid`; `--grpc-domain-sock` takes the
@@ -683,7 +683,7 @@ function isSocketFile(path) {
 }
 
 /**
- * The live local companion idb started for `udid`, found in a `ps -axwwo pid=,args=`
+ * The live local companion idb started for `udid`, found in a `ps -xwwo pid=,args=`
  * listing (idbCompanionProcesses): `{ pid, endpoint: { socketPath } }`, or null. A process
  * that is gone by now is skipped. When several match (idb started a second one before the
  * first exited), the one whose socket file exists wins, then the highest pid (the newest,
@@ -1384,7 +1384,7 @@ export class IosDeviceDaemon {
    * proves nothing about who started a companion found later.
    */
   async #findCompanion() {
-    const listing = await run(this.#tools.ps, ["-axwwo", "pid=,args="], { env: this.#env });
+    const listing = await run(this.#tools.ps, ["-xwwo", "pid=,args="], { env: this.#env });
     if (listing.code !== 0) {
       this.log("companion_scan_failed", { code: listing.code });
       return { ok: false, entry: null, pids: [] };
@@ -1421,8 +1421,15 @@ export class IosDeviceDaemon {
       if (!this.#tools.idb) throw new DaemonError(CODE.DAEMON_START_FAILED, "The idb client was not found (AUTONOM_IDB or PATH).", { reason: "idb_missing" });
       const t0 = performance.now();
       const result = await run(this.#tools.idb, ["connect", this.udid], { env: companionEnvironment(this.#env), timeoutMs: IDB_CONNECT_TIMEOUT_MS });
-      entry = (await this.#findCompanion()).entry;
+      const after = await this.#findCompanion();
+      entry = after.entry;
       this.log("idb_connect", { code: result.code, ms: Math.round(performance.now() - t0), registered: Boolean(entry) });
+      if (!entry && !after.ok) {
+        throw new DaemonError(CODE.DAEMON_START_FAILED,
+          `The process scan (ps) failed after idb connect ${this.udid} (exit ${result.code}), so the daemon cannot find its companion. `
+          + "Check that ps runs (the daemon log has companion_scan_failed), then retry.",
+          { reason: "companion_start_failed" });
+      }
       if (!entry) {
         throw new DaemonError(CODE.DAEMON_START_FAILED,
           `idb connect ${this.udid} left no live idb_companion serving this simulator on a domain socket (exit ${result.code}). `
