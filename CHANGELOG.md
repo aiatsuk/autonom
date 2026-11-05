@@ -251,15 +251,16 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
 ### Changed
 - **Canvas workspace tiles keep the device page's controls.** Each tile has
   its own Settings and Inspector again; Capture keeps screenshots, recording
-  and the gallery (with a button that opens the captures folder in Finder),
-  and input, clipboard paste and device actions sit in Inspector. The
-  Actions dock is on the single-device Canvas too. Theme and display are
-  grouped in general settings. Inspector adds a device language menu (on
-  iOS it asks before the restart a language change needs), text-size and animation simulations,
-  and biometric enroll and status. Saved locations can be edited and
-  deleted, and recent deep links are offered again. Network has one-step
-  Start capturing (start and attach). The network inspector shows Pretty
-  and Raw bodies and copies a complete redacted body, also without
+  and the gallery (on macOS with a button that opens the captures folder in
+  Finder), and input, clipboard paste and device actions sit in Inspector.
+  The Actions dock is on the single-device Canvas too. Theme and display are
+  grouped in general settings, and Device settings adds a device language
+  menu (on iOS it asks before the restart a language change needs). The
+  Tools drawer's Simulate tab adds text-size and (Android) animation
+  simulations and biometric enroll and status; its App tab can edit and
+  delete saved locations and newly lists recent deep links. Network has
+  one-step Start capturing (start and attach). The network inspector shows
+  Pretty and Raw bodies and copies a complete redacted body, also without
   `--capture-bodies` (previews stay redacted and capped at 2 KB; full
   redacted bodies up to 4 MiB are kept privately with the session's
   artifacts).
