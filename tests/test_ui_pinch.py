@@ -89,6 +89,24 @@ class PinchContractTests(unittest.TestCase):
                 send.assert_called_once_with(target, x=200, y=400, scale=2.0,
                                              duration=0.4, radius=99, width=400, height=800)
 
+    def test_ios_xcuitest_or_axe_refuses_before_any_device_call(self):
+        target = Target("ios", "SIM", "tool")
+        for backend, hid in (("xcuitest", "idb"), ("idb", "axe")):
+            fake_ios = mock.Mock()
+            fake_ios.selected_backend.return_value = backend
+            fake_ios.hid_mode.return_value = hid
+            with self.subTest(backend=backend, hid=hid), \
+                 mock.patch.object(ui, "_ios", return_value=fake_ios), \
+                 mock.patch.object(ui, "screen_size") as measure, \
+                 mock.patch.object(ui, "_sending") as sending, \
+                 mock.patch("autonom_lib.pinch.dispatch") as send:
+                with self.assertRaises(errors.AutonomError) as caught:
+                    ui.pinch(target, 100, 200, scale=2.0, duration=0.4)
+                self.assertEqual(caught.exception.code, errors.UNSUPPORTED_CAPABILITY)
+                measure.assert_not_called()
+                sending.assert_not_called()
+                send.assert_not_called()
+
     def test_bridge_failures_preserve_action_uncertainty(self):
         from autonom_lib import pinch
         target = Target("android", "emulator-5554", "adb")

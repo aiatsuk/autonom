@@ -398,7 +398,8 @@ duration is 0.4 seconds. The center is in Android pixels or iOS points; the
 command measures the screen and chooses a radius that fits. Android needs
 scrcpy 4.1, resolved as for Canvas (`AUTONOM_SCRCPY_SERVER`,
 `SCRCPY_SERVER_PATH`, or installed scrcpy). iOS uses idb_companion directly,
-not the idb CLI; an explicitly selected AXe or XCUITest backend is refused.
+not the idb CLI; on the AXe or XCUITest route (chosen, or fallen back to)
+pinch is refused with `unsupported_capability` before any device call.
 Both paths require Node.js. Scale is the ratio of finger separation, not a
 promise of an exact app zoom: gesture thresholds and zoom limits can change
 the effect. A `ui_action_uncertain` result means input may

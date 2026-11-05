@@ -114,7 +114,9 @@ export async function performAndroid(request, dependencies = {}) {
       try { await writeTouch(session, touch(request, 1, pointer, x)); } catch { /* best effort */ }
     }
   };
-  activeCleanup = async () => { await release(); await session.stop(); };
+  // Set by an interrupt: the gesture loop sends nothing more once cleanup began.
+  let aborted = false;
+  activeCleanup = async () => { aborted = true; await release(); await session.stop(); };
   const sleep = dependencies.delay ?? delay;
   let sent = false;
   // An EventEmitter error between writes must not crash the process.
@@ -124,6 +126,7 @@ export async function performAndroid(request, dependencies = {}) {
     await session.start();
     const write = async (action, pointer, x) => {
       if (failure) throw failure;
+      if (aborted) throw new Error("pinch interrupted");
       // Mark uncertainty immediately before handing bytes to the socket.
       sent = true;
       if (action === 1) down.delete(pointer); else down.set(pointer, x);

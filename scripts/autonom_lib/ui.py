@@ -1341,14 +1341,9 @@ def pinch(target: Target, x: int, y: int, *, scale: float, duration: float) -> d
     from . import pinch as pinch_mod
 
     pinch_mod.check_values(scale, duration)
-    size = screen_size(target)
-    if not size or min(size) <= 0:
-        raise errors.AutonomError(
-            errors.DISPLAY_GEOMETRY_UNAVAILABLE, "Could not measure the screen for pinch",
-            "Read the device's screen geometry and retry; no input was sent.")
-    width, height = size
-    radius = pinch_mod.radius_for(x, y, width, height, scale)
     if target.platform == IOS:
+        # refused before any device work: measuring the screen on the XCUITest
+        # route would start (or build) its runner first
         ios = _ios()
         if ios.selected_backend(target) == "xcuitest" or ios.hid_mode(target) == "axe":
             raise errors.AutonomError(
@@ -1356,6 +1351,13 @@ def pinch(target: Target, x: int, y: int, *, scale: float, duration: float) -> d
                 "Use --ui-backend idb --ios-hid idb and a compatible idb_companion; "
                 "AXe and the XCUITest runner do not provide this pinch path.",
                 capability="ui.pinch")
+    size = screen_size(target)
+    if not size or min(size) <= 0:
+        raise errors.AutonomError(
+            errors.DISPLAY_GEOMETRY_UNAVAILABLE, "Could not measure the screen for pinch",
+            "Read the device's screen geometry and retry; no input was sent.")
+    width, height = size
+    radius = pinch_mod.radius_for(x, y, width, height, scale)
     _pretest_guard("gesture", target)
     _sending(target)
     backend = pinch_mod.dispatch(target, x=x, y=y, scale=scale, duration=duration,
