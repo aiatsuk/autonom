@@ -54,7 +54,7 @@ polling, validation and destructive confirmation remain domain behavior.
 
 ## Verification
 
-    node --test tests/canvas-ui.test.mjs tests/canvas-dropdown.test.mjs tests/canvas-theme-page.test.mjs tests/canvas-tools-page.test.mjs tests/canvas-actions.test.mjs tests/canvas-workspace-page.test.mjs
+    node --test tests/canvas-ui.test.mjs tests/canvas-dropdown.test.mjs tests/canvas-theme-page.test.mjs tests/canvas-tools-page.test.mjs tests/canvas-actions.test.mjs tests/canvas-workspace-page.test.mjs tests/canvas-mock-form.test.mjs
     node --test tests/canvas-shortcuts.test.mjs tests/canvas-display-menu.test.mjs
     node --test --test-name-pattern='^(page:|display: the Android page)' tests/browser-scrcpy.test.mjs
     make check
@@ -206,3 +206,53 @@ the tab, drawer or browser tab is hidden, and an item that becomes OK ticks
 without a click; Check again stays. When the workspace has no device and a
 needed Android or iOS tool is not OK, the empty view says so and offers Set up,
 which opens the same checklist there.
+
+### Mocks form
+
+The Tools drawer's Mocks form (`canvas-mock-form.mjs`) adds and edits a mock
+rule. Its pure half (`mockFormCore`: empty form, a stored rule as form values,
+form values as a checked `mocks.add` / `mocks.update` payload, the list row
+summary) runs the same in node tests and in the page; the DOM half
+(`mockFormController`) owns the rows, the mode and the messages. It uses the
+drawer's tokens and adds no colors.
+
+Two modes, chosen at the top: **Fake response** (the app gets this response;
+the server is not asked) and **Edit real response** (the request reaches the
+server and the edits change its answer).
+
+- **Match request**: URL glob, method, host, Ignore query string, then
+  condition rows added with + Query (name, value), + Header (name, value),
+  + Body text and + JSON field (path, value). An empty Query or Header value
+  means "present, with any value". Each row has a remove button; removing a row moves focus to
+  its add button.
+- **Response** (Fake) or **Edit response** (Edit): Status, Timing and the
+  headers. Timing is None, Delay (a Seconds field, above 0 and up to 120) or
+  Hang; Hang is hidden in Edit mode. In Edit mode an empty Status keeps the
+  real one, Headers become Set headers, + Remove header rows appear, and Body
+  is a choice: Keep the real body, Replace it whole (New body), or Edit fields
+  or text with + Set field, + Remove field and + Replace text rows. Each mode
+  keeps its own status text when you switch.
+- A JSON value is typed as on the CLI: it is JSON when it parses, else text,
+  and a stored text that would parse is shown quoted.
+
+Every field is checked in the page before anything is sent, with the limits
+the tools process checks too: 20 rows per kind, 2048 characters per value, a header name without
+spaces, a dotted path without empty parts, a body up to 32 KB that parses when
+it starts like JSON, and conditions and edits up to 32 KB together. Each
+message shows beside its field, the field gets `aria-invalid`, the first one
+takes focus, and typing in the field clears its mark. Rows that do not apply
+to the chosen mode or body choice are not sent.
+
+Edit fills every field and row from `mocks.list`, where secret values arrive
+masked. Save without changes sends only the base fields (id, URL glob,
+method, host, Ignore query string, note and a status that is set), so the
+stored rule, secrets included, stays the same; a changed list is sent whole,
+and a masked value in it keeps the stored secret. Clearing Status on an edit
+rule sends `clear_status`; on an edit rule with a stored whole body, Keep the
+real body or Edit fields or text sends `clear_body`. A saved delay cannot be
+removed here. Mock this from a request fills a new fake response for its URL,
+method, host and status.
+
+The list row shows an Edit badge for an edit rule, the method and glob, then
+the status ("Real status" when it is kept), the condition summary
+(`page=2 · +1 header`), the edit count and the hits.

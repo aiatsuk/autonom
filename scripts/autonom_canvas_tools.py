@@ -31,7 +31,8 @@ Every operation uses the same `autonom_lib` functions (and the same shared
 Canvas's own; operations that need an Autonom session use the current one
 only when it is on this target, the rule `autonom_canvas_bridge` journals by.
 Every mutating operation is journaled there with its origin, never with a mock
-body, push payload text or log text (lengths only).
+body, a mock condition or edit value, push payload text or log text (lengths
+and counts only).
 
 The device actions of the Canvas Actions drawer (screenshot, recording,
 install, launch, open URL, app language), the captures gallery and tool health
@@ -160,6 +161,22 @@ PERMISSION_ACTIONS = ("grant", "revoke", "reset")
 MAX_PUSH_PAYLOAD = 4 * 1024
 # A mock body travels inside a JSON request that must fit the 64 KiB body limit.
 MAX_MOCK_BODY = 32 * 1024
+# The request conditions and rewrite edits share the other half of that limit.
+MAX_MOCK_LISTS = 32 * 1024
+# The list keys of `mocks.add` / `mocks.update`: what one entry is (a JSON
+# object or a string), an example for the refusal, and the word counting the
+# entries in the journal (the names `mocks.condition_counts` / `edit_counts` use).
+MOCK_LISTS = {
+    "query": (dict, '{"name": "page", "value": "2"} (value may be null)', "query"),
+    "request_headers": (dict, '{"name": "X-Client", "value": "ios*"} (value may be null)',
+                        "request_header"),
+    "body_contains": (str, '"needle"', "body_contains"),
+    "body_json": (dict, '{"path": "user.role", "value": "admin"}', "body_json"),
+    "remove_headers": (str, '"ETag"', "remove_headers"),
+    "json_set": (dict, '{"path": "user.plan", "value": "pro"}', "json_set"),
+    "json_remove": (str, '"user.trial_ends"', "json_remove"),
+    "replace": (dict, '{"find": "Free", "with": "Pro"}', "replace"),
+}
 MAX_MOCK_HEADERS = 64
 MAX_TEXT = 1024
 MAX_NOTE = 500
@@ -234,6 +251,39 @@ def _optional_bool(payload: dict[str, Any], name: str) -> bool | None:
 
 def _utf8_length(text: str) -> int:
     return len(text.encode("utf-8"))
+
+
+def _mock_lists(payload: dict[str, Any]) -> dict[str, list[Any]]:
+    """The condition and edit lists a mock payload sets, by key.
+
+    A key that is absent (or null) is not in the result: on `mocks.update`
+    that leaves the stored list alone. An empty list is in the result and
+    clears it. Entries must be the JSON shape `MOCK_LISTS` names (the CLI's
+    `NAME=VALUE` text is not accepted here); what an entry may hold, and how
+    many there may be, is `mocks.validate_conditions` / `validate_rewrite`'s
+    to decide when the rule is stored.
+    """
+    given: dict[str, list[Any]] = {}
+    for key, (kind, example, _word) in MOCK_LISTS.items():
+        value = payload.get(key)
+        if value is None:
+            continue
+        if not isinstance(value, list) or not all(isinstance(item, kind) for item in value):
+            raise _invalid(f"{key} must be a list of {'objects' if kind is dict else 'strings'}",
+                           f"Send {key} as a list such as [{example}]; an empty list clears it.")
+        given[key] = value
+    try:
+        size = _utf8_length(json.dumps(given, ensure_ascii=False))
+    except UnicodeEncodeError:
+        # A lone surrogate (a JSON "\ud800" escape) cannot be stored as text.
+        raise _invalid("conditions and edits must be text without lone surrogate characters",
+                       "Remove the unpaired \\ud800-\\udfff character.") from None
+    if size > MAX_MOCK_LISTS:
+        raise errors.AutonomError(
+            errors.INVALID_VALUE,
+            f"the conditions and edits are {size} bytes; at most {MAX_MOCK_LISTS} are allowed here",
+            "Keep fewer or shorter conditions and edits.")
+    return given
 
 
 def recording_size(width: int, height: int, max_size: int = 1280) -> tuple[int, int]:
@@ -474,7 +524,9 @@ class Tools:
         rules = mocks_mod.load()
         counts = mocks_mod.session_hit_counts(record) if record is not None else {}
         warnings = mocks_mod.annotate_hits(rules, counts)
-        result: dict[str, Any] = {"count": len(rules), "mocks": rules,
+        # Every stored field, with secret condition, edit and header values masked.
+        result: dict[str, Any] = {"count": len(rules),
+                                  "mocks": [mocks_mod.mask_rule(rule) for rule in rules],
                                   **mocks_mod.summary()}
         if warnings:
             result["warnings"] = warnings
@@ -631,7 +683,12 @@ class Tools:
         return result, [], {}
 
     def _mock_fields(self, payload: dict[str, Any], *, adding: bool) -> tuple[dict[str, Any], list[str]]:
-        """The mock fields the payload sets, checked; and their journal words."""
+        """The mock fields the payload sets, checked; and their journal words.
+
+        A key the payload does not carry is not in `fields`, so `mocks.update`
+        leaves what is stored. The words name conditions and edits and count
+        them (`query=2`, `json_set=1`); no value of theirs is ever a word.
+        """
         fields: dict[str, Any] = {}
         words: list[str] = []
         if adding or "url_glob" in payload:
@@ -657,14 +714,28 @@ class Tools:
             fields["host"] = host or ("" if not adding else None)
         if "ignore_query" in payload:
             fields["ignore_query"] = _optional_bool(payload, "ignore_query")
-        if adding or "status" in payload:
-            status = payload.get("status", 200 if adding else None)
-            if status is not None and not _is_int(status):
+        if payload.get("mode") is not None:
+            if not isinstance(payload["mode"], str):
+                raise _invalid("mode must be respond or rewrite")
+            fields["mode"] = mocks_mod.check_mode(payload["mode"])
+            words.append(f"mode={fields['mode']}")
+        status = payload.get("status")
+        if status is not None:
+            if not _is_int(status):
                 raise _invalid("status must be an integer HTTP status")
-            if status is not None:
-                mocks_mod.validate_response(status=int(status))
-                fields["status"] = int(status)
-                words.append(f"status={int(status)}")
+            mocks_mod.validate_response(status=int(status))
+            fields["status"] = int(status)
+            words.append(f"status={int(status)}")
+        elif adding and fields.get("mode", "respond") == "respond":
+            fields["status"] = 200  # a fake response; a rewrite keeps the real status
+            words.append("status=200")
+        if not adding:
+            # A rewrite rule goes back to the real status; a rule loses its stored
+            # body. Sent together with the value they clear, the update is refused.
+            for flag in ("clear_status", "clear_body"):
+                if _optional_bool(payload, flag):
+                    fields[flag] = True
+                    words.append(flag)
         if "headers" in payload and payload["headers"] is not None:
             headers = payload["headers"]
             if (not isinstance(headers, dict) or len(headers) > MAX_MOCK_HEADERS
@@ -689,18 +760,41 @@ class Tools:
             mocks_mod.validate_response(body_text=body)
             fields["body_text"] = body
             words.append(f"body_len={_utf8_length(body)}")
+        for key, items in _mock_lists(payload).items():
+            fields[key] = items
+            words.append(f"{MOCK_LISTS[key][2]}={len(items)}")
+        delay_s = payload.get("delay_s")
+        if delay_s is not None and not _is_number(delay_s):
+            raise _invalid("delay_s must be a number of seconds")
+        hang = _optional_bool(payload, "hang")
+        # One of the two, in (0, 120] seconds; a hang is refused with a rewrite
+        # when the rule is stored.
+        seconds = mocks_mod.validate_delay(delay_s, hang)
+        if seconds is not None:
+            fields["delay_s"] = seconds
+            words.append(f"delay_s={seconds:g}")
+        if hang is not None:
+            fields["hang"] = hang
+            words.append(f"hang={str(hang).lower()}")
         if "note" in payload:
             note = _optional_text(payload, "note", MAX_NOTE)
             fields["note"] = note or ("" if not adding else None)
         return fields, words
+
+    @staticmethod
+    def _mock_rule_args(fields: dict[str, Any]) -> dict[str, Any]:
+        """What `mocks.add` / `mocks.update` take beyond the base fields."""
+        return {key: fields.get(key) for key in ("mode", "delay_s", "hang", *MOCK_LISTS)}
 
     def _mock_id(self, payload: dict[str, Any]) -> str:
         return _required_text(payload, "id", 64)
 
     @staticmethod
     def _mock_result(rule: dict[str, Any], **extra: Any) -> dict[str, Any]:
-        # The mock itself, and under `mock` as the CLI reports it.
-        return {**rule, "mock": rule, **extra}
+        # The mock itself, and under `mock` as the CLI reports it; secret
+        # condition, edit and header values are masked like `mocks.list` does.
+        masked = mocks_mod.mask_rule(rule)
+        return {**masked, "mock": masked, **extra}
 
     def mocks_add(self, payload: dict[str, Any], record: dict[str, Any] | None):
         fields, words = self._mock_fields(payload, adding=True)
@@ -711,8 +805,8 @@ class Tools:
         rule = mocks_mod.add(
             url_glob=fields["url_glob"], method=fields.get("method"),
             host=fields.get("host"), ignore_query=bool(fields.get("ignore_query")),
-            status=fields["status"], headers=headers or {}, body_text=body,
-            note=fields.get("note"),
+            status=fields.get("status"), headers=headers or {}, body_text=body,
+            note=fields.get("note"), **self._mock_rule_args(fields),
         )
         return (self._mock_result(rule, registry=str(mocks_mod.registry_file())),
                 [rule["id"], *words], {})
@@ -725,6 +819,8 @@ class Tools:
             host=fields.get("host"), ignore_query=fields.get("ignore_query"),
             status=fields.get("status"), headers=fields.get("headers"),
             body_text=fields.get("body_text"), note=fields.get("note"),
+            clear_status=bool(fields.get("clear_status")),
+            clear_body=bool(fields.get("clear_body")), **self._mock_rule_args(fields),
         )
         return self._mock_result(rule), [identifier, *words], {}
 

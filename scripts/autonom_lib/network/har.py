@@ -40,6 +40,13 @@ def _mime(headers: dict[str, str] | None) -> str:
     return (headers or {}).get("content-type", "").split(";")[0] or "application/octet-stream"
 
 
+def _mock_kind(flow: dict[str, Any]) -> str | None:
+    """`respond` / `rewrite` for a mocked flow, else None."""
+    if not flow.get("mocked"):
+        return None
+    return "rewrite" if flow.get("mock_kind") == "rewrite" else "respond"
+
+
 def entry_for(flow: dict[str, Any]) -> dict[str, Any]:
     # Callers normally pass flows already scrubbed by the store; scrubbing again
     # is idempotent and keeps a HAR built from any other source safe.
@@ -86,6 +93,10 @@ def entry_for(flow: dict[str, Any]) -> dict[str, Any]:
         "_autonom": {"id": flow.get("id"), "mocked": bool(flow.get("mocked")),
                      "mock_id": flow.get("mock_id")},
     }
+    if "mock_kind" in flow:
+        # Records written since rewrite rules carry the kind; older ones keep
+        # their exact export.
+        entry["_autonom"]["mock_kind"] = _mock_kind(flow)
     if incomplete:
         entry["_autonom"]["completed"] = False
         entry["_autonom"]["error_kind"] = flow.get("error_kind")

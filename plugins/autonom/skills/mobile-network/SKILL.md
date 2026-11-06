@@ -1,6 +1,6 @@
 ---
 name: mobile-network
-description: Inspect and mock a mobile app's HTTP(S) traffic for AI agents — start a localhost MITM proxy, attach a device with explicit consent, filter recorded requests, force responses, and export HAR without leaking credentials.
+description: Inspect and mock a mobile app's HTTP(S) traffic for AI agents — start a localhost MITM proxy, attach a device with explicit consent, filter recorded requests, force or edit responses, and export HAR without leaking credentials.
 model: inherit
 ---
 
@@ -237,7 +237,7 @@ pinning disabled. Do not attempt to bypass pinning in a production build.
   "host": "api.example.com", "path": "/v1/login", "status": 401, "duration_ms": 42,
   "request_headers_preview": {"authorization": "<redacted>"},
   "request_body_preview": "{\"email\": \"a@b.c\", \"password\": \"<redacted>\"}",
-  "mocked": false, "mock_id": null,
+  "mocked": false, "mock_id": null, "mock_kind": null,
   "sizes": {"request_bytes": 120, "response_bytes": 80}
 }
 ```
@@ -283,17 +283,179 @@ autonom network mock clear               # deletes everything
 - `--url` matches the endpoint **exactly** and ignores the query string, so
   `…/12341` also matches `…/12341?ts=9` but never `…/123415`. `--match` takes a
   glob and leaves query handling to you.
-- Match on URL, plus optional method and host. **First enabled rule wins.**
-- A matched request **never reaches the origin** — the response is manufactured,
-  not rewritten after the fact.
+- Match on URL, plus optional method and host, plus optional request
+  conditions (below). **First enabled rule wins**, in the order the rules were
+  added; a new rule goes last. Explicit session fixtures (see the end of this
+  file) are checked before the machine-wide rules.
+- By default a matched request **never reaches the origin** — the response is
+  manufactured. A rule added with `--rewrite` is the exception: the request
+  goes to the real server and the rule edits its answer (see "Rewrite rules").
 - Rules reload without restarting the proxy, so they can be swapped mid-scenario;
   a corrupt registry keeps the last good set rather than dropping everything.
 - Mock CRUD needs **no session and no device** — rules can be prepared in advance.
 - Rules are validated when added or updated: a target (`--url` or `--match`)
   is required (`selector_required`), a body that looks like JSON must parse,
   `--status` must be 100..599, and each `--header` must be `Name: value`.
+  A malformed condition or edit is refused with `invalid_value` naming the
+  flag, and nothing is stored.
+- `--delay SECONDS` (0 < s ≤ 120) answers late without holding other
+  requests; `--hang` holds the request until the rule is removed or disabled
+  (then it goes upstream) or 120 s pass (then it is recorded incomplete). The
+  two exclude each other.
 - The registry lives outside any repository on purpose: a mock body is often a
   captured response, and a captured response often carries a token.
+
+### Request conditions
+
+Conditions narrow a rule beyond URL, method and host. Every condition must hold
+(AND, together with the URL, method and host). Each flag can be repeated.
+
+| Flag | Holds when |
+| --- | --- |
+| `--query NAME` | the URL's query has that parameter, with any value (`?debug`, `?debug=`, `?debug=1`) |
+| `--query NAME=GLOB` | one value of that parameter matches the glob. Names are exact; values are percent-decoded (`+` is a space) and the glob is case-sensitive. A repeated parameter matches when any of its values does. The `#fragment` is not query |
+| `--request-header 'Name'` | the request has that header |
+| `--request-header 'Name: GLOB'` | one field of that header matches the glob. The name ignores case; the value glob is case-sensitive; repeated fields are checked one by one |
+| `--body-contains TEXT` | the request body contains TEXT (plain text, case-sensitive) |
+| `--body-json PATH=VALUE` | the request body is JSON and the field at the dotted path (`user.role`, `items.0.qty`) equals VALUE |
+
+`--body-json` VALUE is read as JSON when it parses, else as text: `qty=2` wants
+the number 2 (not the string `"2"`; 2 equals 2.0), `active=true` wants `true`
+(a bool never equals a number), `role=admin` wants the string. A string VALUE
+is a case-sensitive glob over a string field. A missing field never equals
+`null`. A number segment indexes an array (`items.0`); an object key may be
+digits too.
+
+- Query conditions work with `--url` too: `--url` ignores the query for the
+  URL match, and the condition still reads the real query.
+- The request body is read only when a rule with a body condition is checked,
+  and at most once per request. It is decoded by its `Content-Encoding`
+  (gzip and the like). A body condition does not hold for a body over 1 MiB,
+  a body that is not UTF-8, an encoding that cannot be decoded, or (for
+  `--body-json`) a body that is not JSON.
+- Limits, checked when the rule is added or updated: at most 20 entries per
+  flag, and each name, path or value at most 2048 characters. A header name
+  must be a valid HTTP header name (no spaces). A JSON path has no empty
+  segment (`a..b`, `a.` are refused).
+- The new flags must be spelled in full (`--query`, not `--quer`); the older
+  short spellings (`--j` for `--json`, `--head` for `--header`) still work.
+- On `mock update`, a repeated flag that is given replaces that whole list
+  (`--query only=this` replaces every `--query`, and leaves headers and body
+  conditions alone). `--clear-conditions` removes every condition first.
+- A hand-edited rule whose conditions are malformed never matches and never
+  breaks the proxy.
+
+### Rewrite rules (edit the real response)
+
+`--rewrite` lets the request reach the real server and edits its answer before
+the app sees it. `--no-rewrite` (the default) fakes the whole answer.
+
+| Flag (with `--rewrite`) | Effect on the real response |
+| --- | --- |
+| `--status N` | sets the status; without it the real status is kept |
+| `--header 'Name: value'` | sets a header (replaces every field of that name) |
+| `--remove-header NAME` | removes every field of that header |
+| `--json-set PATH=VALUE` | sets a field of the JSON body (VALUE as for `--body-json`) |
+| `--json-remove PATH` | removes a field of the JSON body |
+| `--replace OLD NEW` | replaces every OLD with NEW in the body text (case-sensitive) |
+| `--json BODY` / `--body-file PATH` | replaces the body whole |
+| `--delay SECONDS` | holds the edited response that long after the real one arrives |
+
+- Order: status, removed headers, set headers, then the body: every
+  `--json-set`, then every `--json-remove`, then every `--replace`.
+- The body is decoded by its `Content-Encoding` before the edit and encoded
+  again after it; `Content-Length` follows. JSON edits write the body back as
+  compact JSON.
+- `--json-set` sets an existing field or adds a key to an existing object; the
+  parent must exist, and an array index must be in range. `--json-remove`
+  needs the field to exist.
+- **Body edits are all or nothing.** If any body edit cannot apply, the body
+  stays byte-identical to what the server sent, the status and header edits
+  still apply, and the flow records `rewrite.error`: `path_not_found: PATH`,
+  `not_json`, `not_text` (a `--replace` on a body that is not UTF-8),
+  `body_too_large` (over 8 MiB), `undecodable_encoding`, or `body_unreadable`
+  (a whole-body file that is gone). A hand-edited rule that is malformed
+  changes nothing and records `invalid_rule`.
+- The rule is read again when the response arrives. If it was removed,
+  disabled or switched to `--no-rewrite` in between, the real response passes
+  unchanged and records `rule_gone`. If the server cannot be reached, the
+  request is recorded incomplete (`upstream_error`) with the rule's
+  `mock_id`.
+- `--delay` runs after the real response, without holding other requests; a
+  client that hangs up during it is recorded incomplete (`client_abort`).
+  `--hang` with `--rewrite` is refused (`invalid_value`).
+- Refused with `invalid_value`: an edit flag without `--rewrite`; a whole body
+  together with body edits; `--hang` with `--rewrite`. On update, a new whole
+  body replaces stored body edits, and new body edits replace a stored body
+  (`--remove-header` stays either way). `--no-rewrite` on a rule that still has
+  edits needs `--clear-edits`; a rule without a stored status then answers
+  200 unless you give `--status`. `--clear-edits` keeps the mode and the
+  status.
+- A rule is still one rule: an earlier respond rule that matches wins over a
+  later rewrite rule.
+
+### What a mocked flow records
+
+Every recorded flow has `mocked`, `mock_id` and `mock_kind` (`respond`,
+`rewrite`, or `null` when no rule took it). A rewrite flow adds
+`upstream_status` (what the server sent) and `rewrite: {applied, error}`:
+`applied` names the edits that ran (`status`, `remove_headers`, `headers`,
+`body`, `json_set`, `json_remove`, `replace`) and `error` is `null` or one of
+the reasons above. These name edits only, never their values. `status` and the
+body preview are the edited response. `requests list --mocked true` shows both
+kinds. HAR export keeps the edited response and adds `_autonom.mock_kind` for
+records that carry it (older records export as before).
+
+### What list, show and the journal show
+
+- `mock add|update|list|show|enable|disable` print each rule with `mode`,
+  `conditions` (a count), and when there are any `condition_summary`
+  (`page=2 · +1 header`), `edits` (a count) and `edit_summary`
+  (`status 503 · -1 header · json_set×1`).
+- They mask secret values as `<redacted>`: request-header conditions on
+  sensitive headers (`Authorization`, `Cookie`, API-key headers), query
+  conditions whose name looks secret (`token`, `access_token`, …), `--body-json`
+  and `--json-set` values whose last path segment is a credential field
+  (`password`, `token`, …), and response headers with sensitive names. The
+  stored rule keeps the real value. Sending `<redacted>` back unchanged in an
+  update keeps the stored value.
+- `--body-contains` and `--replace` text are printed as stored; do not put a
+  secret there.
+- The session journal never keeps a condition or edit value: each flag stays
+  in the recorded command with its values masked, followed by a count word
+  per kind (`query=2`, `request_header=1`, `json_set=1`). The journaled
+  `mock list` result keeps ids, URL globs (query values masked), methods,
+  hosts, statuses, enabled flags, `mode` and the counts, never values,
+  headers, bodies or notes. Pre-test steps list `mode` for a rewrite rule and a
+  `conditions` count.
+
+### Worked examples
+
+A different answer for page 2 only. Add the narrow rule first: the first
+enabled rule that matches wins.
+
+```bash
+autonom network mock add --url 'https://api.example.com/v1/items' --query page=2 \
+  --status 500 --json '{"error":"boom"}' --note 'page 2 fails'
+autonom network mock add --url 'https://api.example.com/v1/items' --json '{"items":[]}'
+# ?page=2 gets the 500; ?page=1 and no page get the empty list
+autonom network requests list --mocked true --path '*/v1/items'
+```
+
+Make a real profile say the user is on the Pro plan, keeping everything else
+the server sends:
+
+```bash
+autonom network mock add --match '*/v1/profile' --method GET --rewrite \
+  --json-set 'user.plan="pro"' --json-remove user.trial_ends --remove-header ETag
+autonom network requests show f_0007
+# "status" is the server's own, "mock_kind": "rewrite",
+# "rewrite": {"applied": ["remove_headers", "json_set", "json_remove"], "error": null}
+```
+
+If the profile has no `user.trial_ends`, the body passes through unchanged
+and `rewrite.error` is `path_not_found: user.trial_ends`; the header removal
+still applies.
 
 ### The stale-rule hazard
 
@@ -305,7 +467,9 @@ report `mocks.active` and raise `persistent_mocks_active`.
 **Before trusting any network evidence, check `mocks.active` is what you expect.**
 If a response looks wrong or suspiciously convenient, run `network mock list`
 before concluding anything about the backend. `requests list --mocked true` shows
-exactly which flows were faked.
+exactly which flows were faked or edited (`mock_kind`), and a narrow rule
+(`--query`, `--request-header`, a body condition) fires only for the requests
+it names, so check its conditions too.
 
 ## Honest reporting
 
@@ -346,7 +510,8 @@ exactly which flows were faked.
 
 ## Explicit session fixtures
 An explicitly prepared `<session>/network/session-mocks/registry.json` is read
-before the machine-wide registry, using the same mock schema. It scopes fixture
+before the machine-wide registry, using the same mock schema (request
+conditions included). It scopes fixture
 responses to one session without editing standing mocks. Network start/status
 reports `session_mocks`; Canvas shows its active rule count. Keep host selectors
 specific. A session `network.preferred_proxy_port` makes Canvas reuse a fixed

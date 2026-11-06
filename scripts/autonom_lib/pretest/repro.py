@@ -22,7 +22,9 @@ Redaction, on top of the journal's own scrub:
 
 ``mocks_active`` lists the mock rules that were active (enabled) at that
 step, each with its state at that time (``id``, ``url`` or ``match``,
-``method``, ``host``, ``status`` after any ``mock update``, ``enabled``),
+``method``, ``host``, ``status`` after any ``mock update``, ``mode`` when the
+rule is a ``rewrite`` rule, ``conditions`` when it has request conditions (a
+count: query, request-header and body conditions together), ``enabled``),
 replayed in journal order. While a pre-test is active the CLI journals the
 whole registry as a ``mock_state`` entry after every ``network mock`` change
 and at ``pretest start`` (``mock_state_entry``); such an entry is the truth
@@ -32,6 +34,17 @@ mock`` actions themselves are replayed: ``add`` appends an enabled rule,
 ``update``/``enable``/``disable``/``remove`` act on the rule with that id
 (or on the only known rule when the id was never seen), ``--all`` on every
 rule, ``clear`` empties the list. A step with no active mock lists none.
+
+A ``network mock add|update`` step keeps its condition and edit flags
+(``--query``, ``--request-header``, ``--body-contains``, ``--body-json``,
+``--remove-header``, ``--json-set``, ``--json-remove``, ``--replace``) so the
+step still reads as the command that was run. The CLI journals their values
+already masked, with a count word per kind (``query=2``); a journal written
+some other way may hold the values, and they are shown only when they cannot
+be a credential: a query value unless its name looks secret, a header
+condition unless its header is sensitive, a JSON field unless its last path
+segment is a credential field. ``--body-contains`` text and ``--replace``
+text are always ``<redacted>``.
 
 ``for_finding`` cuts a finding's steps at its evidence: when its refs
 resolve to times (a screenshot's capture time, an action detail or tree
@@ -51,6 +64,7 @@ from typing import Any
 
 from .. import errors
 from .. import journal as journal_mod
+from ..network import mocks as mocks_mod
 from ..network import redact
 from . import store
 
@@ -80,7 +94,20 @@ MOCK_FLAGS = {"--url": "url", "--match": "match", "--method": "method",
 # Value-taking flags of `network mock add|update`: their values are never the
 # rule id.
 MOCK_VALUE_FLAGS = frozenset({"--url", "--match", "--method", "--host", "--status",
-                              "--header", "--json", "--body-file", "--note"})
+                              "--header", "--json", "--body-file", "--note", "--delay"})
+# Condition and edit flags of `network mock add|update`: option -> (count word,
+# values taken). They are spelled in full only (the CLI matches no abbreviation
+# of them), so they sit apart from the abbreviable tables above.
+MOCK_COUNTED_FLAGS = {
+    "--query": ("query", 1), "--request-header": ("request_header", 1),
+    "--body-contains": ("body_contains", 1), "--body-json": ("body_json", 1),
+    "--remove-header": ("remove_header", 1), "--json-set": ("json_set", 1),
+    "--json-remove": ("json_remove", 1), "--replace": ("replace", 2),
+}
+CONDITION_WORDS = ("query", "request_header", "body_contains", "body_json")
+# `query=2`: what the CLI journals for a kind of condition or edit.
+_COUNT_WORD = re.compile(r"\A(?P<word>query|request_header|body_contains|body_json|"
+                         r"remove_header|json_set|json_remove|replace)=(?P<count>\d{1,4})\Z")
 MOCK_STATE_KIND = "mock_state"
 _PAIR = re.compile(r"\A(?P<key>[A-Za-z_][A-Za-z0-9_.\-]{0,127}+)=")
 MAX_STEPS = 500
@@ -154,6 +181,51 @@ def _is_ui_type(verb: str, argv: list[str]) -> bool:
     return [argv[i] for i in words[:2]] == ["ui", "type"]
 
 
+def _query_text(value: str) -> str:
+    """``NAME`` or ``NAME=GLOB`` of a ``--query``: the value stays unless the
+    name looks like a credential."""
+    name, equals, _rest = value.partition("=")
+    if equals and redact.is_sensitive_query_key(name):
+        return f"{store.clip(name, 100)}={REDACTED}"
+    return store.clip(value, 300) or ""
+
+
+def _header_text(value: str) -> str:
+    """``Name`` or ``Name: GLOB`` of a ``--request-header``: the value stays
+    unless the header carries credentials."""
+    name, colon, _rest = value.partition(":")
+    lowered = name.strip().lower()
+    if colon and (lowered in redact.REDACTED_HEADERS or journal_mod.secret_header_name(name)):
+        return f"{store.clip(name, 100)}: {REDACTED}"
+    return store.clip(value, 300) or ""
+
+
+def _field_text(value: str) -> str:
+    """``PATH=VALUE`` of ``--body-json`` / ``--json-set``: the value stays
+    unless the last path segment is a credential field."""
+    path, equals, _rest = value.partition("=")
+    if equals and path.strip().rsplit(".", 1)[-1].lower() in redact.SENSITIVE_FIELDS:
+        return f"{store.clip(path, 100)}={REDACTED}"
+    return store.clip(value, 300) or ""
+
+
+def _mock_flag_values(flag: str, values: list[str]) -> list[str]:
+    """The values of a condition or edit flag as a step may show them.
+
+    Names and paths stay; values that cannot be ruled out as credentials are
+    ``<redacted>`` (``--body-contains`` and ``--replace`` text always is).
+    """
+    if flag == "--query":
+        return [_query_text(value) for value in values]
+    if flag == "--request-header":
+        return [_header_text(value) for value in values]
+    if flag in ("--body-json", "--json-set"):
+        return [_field_text(value) for value in values]
+    if flag in ("--remove-header", "--json-remove"):
+        return [store.clip(value, 300) or "" for value in values]
+    return [REDACTED for _value in values]  # --body-contains, --replace
+
+
 def redact_args(verb: str, argv: list[Any]) -> tuple[list[str], dict[str, Any]]:
     """(args, selector) of one journaled command, redacted; the verb's own
     words are dropped from the args."""
@@ -161,6 +233,7 @@ def redact_args(verb: str, argv: list[Any]) -> tuple[list[str], dict[str, Any]]:
     typed = _typed_indexes(tokens) if _is_ui_type(verb, tokens) else set()
     _rest, path = _command_path(tokens, verb)
     with_selector = verb.startswith("ui ") and verb != "ui type"
+    is_mock = verb == "network mock"
     args: list[str] = []
     selector: dict[str, Any] = {}
     index = 0
@@ -171,6 +244,21 @@ def redact_args(verb: str, argv: list[Any]) -> tuple[list[str], dict[str, Any]]:
             continue
         if index in typed:
             args.append(REDACTED)
+            index += 1
+            continue
+        if is_mock and token in MOCK_COUNTED_FLAGS:
+            width = MOCK_COUNTED_FLAGS[token][1]
+            values = tokens[index + 1:index + 1 + width]
+            args.extend([token, *_mock_flag_values(token, values)])
+            index += 1 + len(values)
+            continue
+        if is_mock and token.startswith("--") and token.partition("=")[0] in MOCK_COUNTED_FLAGS:
+            name, _, value = token.partition("=")
+            args.append(f"{name}={_mock_flag_values(name, [value])[0]}")
+            index += 1
+            continue
+        if is_mock and _COUNT_WORD.match(token):
+            args.append(token)  # `query=2`: a kind and its count, never a value
             index += 1
             continue
         if token.startswith("--") and "=" in token:
@@ -206,8 +294,40 @@ def _read_only(verb: str, rest: list[str]) -> bool:
     return verb == "network mock" and bool(rest) and rest[0] in ("list", "show")
 
 
+def _kind_counts(argv: list[str]) -> dict[str, int]:
+    """How many conditions and edits of each kind a ``network mock`` argv
+    gave: the CLI's count words (``query=2``) when they are there, else the
+    flags themselves, once each."""
+    words: dict[str, int] = {}
+    for token in argv:
+        match = _COUNT_WORD.match(token)
+        if match:
+            words[match.group("word")] = int(match.group("count"))
+    if words:
+        return words
+    flags: dict[str, int] = {}
+    for token in argv:
+        counted = MOCK_COUNTED_FLAGS.get(token.partition("=")[0]) if token.startswith("--") \
+            else None
+        if counted:
+            flags[counted[0]] = flags.get(counted[0], 0) + 1
+    return flags
+
+
 def _mock_rule(argv: list[str]) -> dict[str, Any]:
     rule: dict[str, Any] = {}
+    for token in argv:  # the CLI refuses both flags together
+        name = token.partition("=")[0] if token.startswith("--") else token
+        if name == "--rewrite":
+            rule["mode"] = "rewrite"
+        elif name == "--no-rewrite":
+            rule["mode"] = "respond"
+    given = _kind_counts(argv)
+    cleared = any(token == "--clear-conditions" for token in argv)
+    if cleared or any(given.get(word) for word in CONDITION_WORDS):
+        # A list that is given replaces the stored one; an update that names
+        # only some kinds is counted as if it named every kind it keeps.
+        rule["conditions"] = sum(given.get(word, 0) for word in CONDITION_WORDS)
     for index, token in enumerate(argv):
         name, value = token, None
         if token.startswith("--") and "=" in token:
@@ -228,18 +348,21 @@ def _mock_words(argv: list[str]) -> list[str]:
     """The bare words of a ``network mock`` argv, values of its own
     value-taking flags left out (``--status 404`` is no rule id)."""
     words: list[str] = []
-    skip = False
+    skip = 0
     for token in argv:
         if skip:
-            skip = False
+            skip -= 1
             continue
         if token == "--":
             continue
         if token.startswith("--"):
-            if "=" not in token and _flag(token, MOCK_VALUE_FLAGS):
-                skip = True
+            if "=" not in token:
+                if token in MOCK_COUNTED_FLAGS:
+                    skip = MOCK_COUNTED_FLAGS[token][1]
+                elif _flag(token, MOCK_VALUE_FLAGS):
+                    skip = 1
             continue
-        if token.startswith("-"):
+        if token.startswith("-") or _COUNT_WORD.match(token):
             continue
         words.append(token)
     return words
@@ -277,7 +400,9 @@ def _apply_mock(mocks: list[dict[str, Any]], argv: list[str], rest: list[str]) -
     action = rest[0] if rest else None
     all_flag = any(_flag(token.split("=", 1)[0], frozenset({"--all"})) for token in argv)
     if action == "add":
-        rule = {"id": None, "status": 200, **_mock_rule(argv), "enabled": True}
+        rule = {"id": None, **_mock_rule(argv), "enabled": True}
+        if rule.get("mode") != "rewrite":
+            rule.setdefault("status", 200)  # a rewrite rule keeps the real status
         mocks.append(rule)
     elif action == "clear":
         mocks.clear()
@@ -304,6 +429,11 @@ def _public_rule(rule: dict[str, Any]) -> dict[str, Any]:
     for key in ("url", "match", "method", "host", "status"):
         if rule.get(key) is not None:
             out[key] = rule[key]
+    if rule.get("mode") == "rewrite":
+        out["mode"] = "rewrite"  # a fake answer is the default and stays unnamed
+    conditions = rule.get("conditions")
+    if isinstance(conditions, int) and not isinstance(conditions, bool) and conditions > 0:
+        out["conditions"] = conditions
     out["enabled"] = True
     return out
 
@@ -323,7 +453,9 @@ def _glob_text(value: Any) -> str | None:
 def mock_state_entry(rules: Any) -> dict[str, Any]:
     """The ``mock_state`` journal entry for the registry ``rules``
     (``network.mocks.load()``): per rule its id, URL glob, method, host,
-    status and enabled flag; never headers, bodies or notes."""
+    status, enabled flag, ``mode`` (``rewrite`` rules only) and ``conditions``
+    (how many request conditions, when there are any); never headers, bodies,
+    notes, or the values of a condition or an edit."""
     mocks: list[dict[str, Any]] = []
     for rule in rules if isinstance(rules, list) else []:
         if not isinstance(rule, dict):
@@ -342,6 +474,11 @@ def mock_state_entry(rules: Any) -> dict[str, Any]:
         status = response.get("status")
         if isinstance(status, int) and not isinstance(status, bool):
             item["status"] = status
+        if mocks_mod.rule_mode(rule) == "rewrite":
+            item["mode"] = "rewrite"
+        conditions = sum(mocks_mod.condition_counts(rule).values())
+        if conditions:
+            item["conditions"] = conditions
         mocks.append(item)
     return {"kind": MOCK_STATE_KIND, "mocks": mocks}
 
@@ -351,7 +488,8 @@ def _from_state(entry: dict[str, Any]) -> list[dict[str, Any]]:
     for rule in entry.get("mocks") or []:
         if isinstance(rule, dict):
             out.append({key: rule.get(key) for key in
-                        ("id", "url", "match", "method", "host", "status", "enabled")
+                        ("id", "url", "match", "method", "host", "status", "mode",
+                         "conditions", "enabled")
                         if key in rule})
     return out
 
