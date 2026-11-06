@@ -225,8 +225,8 @@ class JournalAbbreviationTests(CliBase):
         # One-letter prefixes are accepted by argparse too.
         self.run_cli("simulator", "clipboard", "set", "--v", "text=VLEAK")
         self.run_cli("simulator", "clipboard", "set", "--j", '{"text":"JLEAK"}')
-        # `--j` is ambiguous on mock add since `--json-set`; `--json` is the
-        # spelling argparse still takes there
+        # the CLI still takes `--j` as `--json` on mock add, but argparse alone
+        # sees it next to `--json-set`; `--json` is the spelling both agree on
         code, payload = self.run_cli("network", "mock", "add", "--url", "https://x.example/",
                                      "--json", '{"msg":"MOCKLEAK"}')
         self.assertEqual(code, 0, payload)
@@ -298,9 +298,6 @@ class ParserWalkRedactionTests(unittest.TestCase):
         for expected in ((("simulator", "clipboard"), "--v"),
                          (("simulator", "clipboard"), "--j"),
                          (("network", "mock", "add"), "--json"),
-                         (("network", "mock", "add"), "--rep"),
-                         (("network", "mock", "update"), "--request-he"),
-                         (("network", "mock", "add"), "--body-j"),
                          (("network", "mock", "add"), "--head"),
                          (("canvas", "serve"), "--to"),
                          (("session", "launch"), "--setenv"),

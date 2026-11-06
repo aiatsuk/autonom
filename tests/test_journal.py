@@ -383,3 +383,22 @@ class FillJournalTests(JournalBase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MockValueFlagMaskingTests(unittest.TestCase):
+    """The `network mock` value flags are masked only spelled out in full: the
+    CLI refuses their abbreviations, so a prefix of them must not swallow the
+    values of other commands' flags (`--re` is `--resource-id`)."""
+
+    def test_mock_condition_and_edit_values_are_masked(self) -> None:
+        argv = ["network", "mock", "add", "--url", "x", "--request-header", "Authorization: Bearer abc123",
+                "--replace", "a", "SECRET1", "--body-json", "pw=SECRET2", "--query=token=SECRET3",
+                "--json-set", "a=SECRET4", "--body-contains", "SECRET5"]
+        out = journal_mod.scrub_argv(argv)
+        self.assertFalse(any("SECRET" in token or "abc123" in token for token in out), out)
+        self.assertEqual(out[out.index("--replace") + 1:out.index("--replace") + 3], ["***", "***"])
+
+    def test_short_spellings_of_other_flags_keep_their_values(self) -> None:
+        self.assertEqual(journal_mod.scrub_argv(["ui", "tap", "--re", "com.x:id/btn", "--index", "1"]),
+                         ["ui", "tap", "--re", "com.x:id/btn", "--index", "1"])
+        self.assertEqual(journal_mod.scrub_argv(["ui", "wait", "--q", "500"]), ["ui", "wait", "--q", "500"])

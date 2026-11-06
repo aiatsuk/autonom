@@ -1239,7 +1239,7 @@ class MockRuleFieldTests(ToolsCase):
 
     def test_a_rewrite_rule_without_a_status_keeps_the_real_status(self) -> None:
         rule = self.stored(self.add(mode="rewrite", json_set=[{"path": "a", "value": 1}])["id"])
-        self.assertIsNone(rule["response"]["status"])
+        self.assertIsNone(rule["response"].get("status"))
         # A fake response still defaults to 200, a null status included.
         self.assertEqual(self.stored(self.add()["id"])["response"]["status"], 200)
         self.assertEqual(self.stored(self.add(status=None)["id"])["response"]["status"], 200)
@@ -1374,7 +1374,7 @@ class MockRuleFieldTests(ToolsCase):
         rule = self.add(mode="rewrite", status=503, json_set=[{"path": "a", "value": 1}])
         self.assertEqual(self.stored(rule["id"])["response"]["status"], 503)
         self.ok("mocks.update", {"id": rule["id"], "clear_status": True})
-        self.assertIsNone(self.stored(rule["id"])["response"]["status"])
+        self.assertIsNone(self.stored(rule["id"])["response"].get("status"))
         # A status in the same update is a conflict; a fake response needs one.
         plain = self.add(status=201)
         before = self.registry_text()

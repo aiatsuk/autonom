@@ -39,11 +39,16 @@ JOURNAL_FILE = "journal.ndjson"
 _SENSITIVE_VALUE_FLAGS = {
     "--json", "--header", "--setenv", "--data", "--body", "--raw", "--value",
     "--token", "--secret", "--password",
-    # `network mock add|update` conditions and response edits: their values
-    # are request or response contents (a token in a query, a header, a body)
-    "--query", "--request-header", "--body-contains", "--body-json", "--json-set",
-    "--replace",
 }
+# `network mock add|update` conditions and response edits: their values are
+# request or response contents (a token in a query, a header, a body). The CLI
+# takes these flags only spelled out in full (`_MOCK_EXACT_FLAGS` in autonom.py
+# refuses an abbreviation before anything is journaled), so they match exactly
+# (or as `--flag=value`), never as a prefix: `--re` stays `--resource-id` and
+# `--q` stays `--quiet-ms` elsewhere.
+_EXACT_SENSITIVE_VALUE_FLAGS = frozenset({
+    "--query", "--request-header", "--body-contains", "--body-json", "--json-set", "--replace",
+})
 # Sensitive flags that take more than one value (argparse nargs); every one
 # of those values is masked.
 _SENSITIVE_VALUE_COUNTS: dict[str, int] = {"--replace": 2}
@@ -471,7 +476,7 @@ def _sensitive_flag(flag: str, path: tuple[str, ...]) -> bool:
     `path` is the leading bare words of argv (the command path), used only to
     honour `_EXACT_NON_SECRET_PREFIXES`.
     """
-    if flag in _SENSITIVE_VALUE_FLAGS:
+    if flag in _SENSITIVE_VALUE_FLAGS or flag in _EXACT_SENSITIVE_VALUE_FLAGS:
         return True
     if not flag.startswith("--") or len(flag) <= 2:
         return False
@@ -499,12 +504,9 @@ def _namespace_secrets(args: Any) -> set[str]:
 
 
 def _sensitive_value_count(flag: str) -> int:
-    """How many values follow a sensitive ``flag`` (an exact flag or the
-    argparse abbreviation of one): 1, or more for a multi-value flag."""
-    if flag in _SENSITIVE_VALUE_COUNTS:
-        return _SENSITIVE_VALUE_COUNTS[flag]
-    full = [name for name in _SENSITIVE_VALUE_FLAGS if name.startswith(flag)]
-    return max((_SENSITIVE_VALUE_COUNTS.get(name, 1) for name in full), default=1)
+    """How many values follow a sensitive ``flag``: 1, or more for an exact
+    multi-value flag (only spelled out in full, see _EXACT_SENSITIVE_VALUE_FLAGS)."""
+    return _SENSITIVE_VALUE_COUNTS.get(flag, 1)
 
 
 def scrub_argv(argv: list[str], args: Any = None) -> list[str]:

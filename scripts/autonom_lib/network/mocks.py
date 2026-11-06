@@ -958,7 +958,6 @@ def add(
             "ignore_query": bool(ignore_query),
         },
         "response": {
-            "status": int(status) if status is not None else None,
             "headers": headers or {},
             "body_path": body_path,
         },
@@ -966,6 +965,11 @@ def add(
         "note": note,
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
+    if status is not None:
+        # a rewrite rule without a status keeps the real one: the key is left
+        # out (not null), so an older release reading the registry answers its
+        # default 200 instead of failing on a null status
+        rule["response"]["status"] = int(status)
     if mode == "rewrite":
         rule["mode"] = "rewrite"
     _store_conditions(rule["match"], conditions)
@@ -1105,7 +1109,7 @@ def update(
     if status is not None:
         response["status"] = int(status)
     elif clear_status:
-        response["status"] = None
+        response.pop("status", None)
     implicit = response.get("content_type_implicit") is True
     current = dict(response.get("headers") or {})
     headers = _restore_masked_headers(headers, response.get("headers"))

@@ -256,7 +256,7 @@ class ReachRealServerTests(Base):
     def test_without_status_the_upstream_status_is_kept(self) -> None:
         added = mocks.add(url_glob="*", mode="rewrite", replace=[["a", "b"]],
                           registry=self.registry)
-        self.assertIsNone(added["response"]["status"])
+        self.assertIsNone(added["response"].get("status"))
         upstream = FakeResponse(404, b"a")
         self.run_flow(self.recorder(), FakeFlow(), upstream)
         self.assertEqual(upstream.status_code, 404)
@@ -762,7 +762,7 @@ class RegistryRewriteTests(Base):
         cleared = mocks.update(rid, clear_edits=True, registry=self.registry)
         self.assertNotIn("rewrite", cleared)
         kept_status = mocks.update(rid, clear_status=True, registry=self.registry)
-        self.assertIsNone(kept_status["response"]["status"])
+        self.assertIsNone(kept_status["response"].get("status"))
         fake = mocks.update(rid, mode="respond", registry=self.registry)
         self.assertNotIn("mode", fake)
         self.assertEqual(fake["response"]["status"], 200)  # a fake response needs one
