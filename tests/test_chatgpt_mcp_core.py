@@ -1182,7 +1182,7 @@ class RunnerTests(CoreCase):
                          ["ui", "key", "--operation-id", "op_0000000000000001", "--session-id", "s_1",
                           "--no-observe", "HOME"])
         self.assertEqual(cli.build_argv("screenshot", {"session_id": "s_1", "label": "-x"}),
-                         ["screenshot", "--session-id", "s_1", "--label=-x"])
+                         ["screenshot", "--session-id", "s_1", "--no-agent", "--label=-x"])
         for key in cli.ALLOWLIST:
             self.assertNotIn("takeover", " ".join(cli.ALLOWLIST[key].path))
 

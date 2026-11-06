@@ -394,7 +394,8 @@ def run_verb(key: str, args: List[str], claim: Dict[str, Optional[str]]) -> Tupl
             _write(root, "sessions.json", table)
         return 0, {"ok": True, "stopped": True, "session_id": record["session_id"]}
     if key == "screenshot":
-        flags = parse_flags(args, {"--session-id": True, "--label": True})
+        # `--no-agent` as the real CLI takes it: today's full-size PNG whatever the profile
+        flags = parse_flags(args, {"--session-id": True, "--label": True, "--no-agent": False})
         record = _session(root, flags.get("--session-id"), live=True)
         width, height = (int(item) for item in os.environ.get("FAKE_MCP_SHOT_SIZE", "4x8").split("x"))
         directory = Path(record["artifacts_dir"]) / "screenshots"

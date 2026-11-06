@@ -152,7 +152,10 @@ def _b_session_start(params: Mapping[str, Any]) -> List[str]:
 
 
 def _b_screenshot(params: Mapping[str, Any]) -> List[str]:
-    out = _sid(params)
+    # `--no-agent`: the full-size PNG get_screen inlines and get_artifact serves,
+    # even in an agent-profile session, whose default is the Android helper's
+    # small JPEG (a no-op on iOS)
+    out = _sid(params) + ["--no-agent"]
     if params.get("label") is not None:
         out += _opt("--label", _text(params["label"], "label"))
     return out

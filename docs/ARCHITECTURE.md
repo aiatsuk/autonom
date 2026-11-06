@@ -1060,8 +1060,8 @@ starts the server exactly as `.mcp.json` says and checks the full catalog, the
 fields of `tests/fixtures/chatgpt_mcp_ui_fields.json` and the page parsers.
 `tests/live/chatgpt_mcp_conformance.py` is a stdlib stand-in for MCP Inspector
 (protocol fault table, every tool's schema, the error-path table).
-`tests/live/chatgpt_mcp_live.py` is the live acceptance on emulator-5584 and the
-Simulator 45A342A1-AA2F-4F40-8EFD-F0D0C590ECE5 only; its results fill
+`tests/live/chatgpt_mcp_live.py` is the live acceptance on emulator-5584 (AVD
+AB_Bench_MCP_API36) and the Simulator 34A85293-39A2-436E-B669-12574874EC75 only; its results fill
 `docs/plans/CHATGPT_P3_RESULTS.md` as one generated block between two marker
 lines (`fill-doc`); `check-doc` renders the block again from the same files and
 compares it byte for byte, and refuses any table line outside it.

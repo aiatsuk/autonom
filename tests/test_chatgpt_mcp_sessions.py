@@ -514,7 +514,7 @@ class ReadTests(SessionsCase):
         self.assertEqual(base64.b64decode(content[1]["data"]), data)
         self.assertNotIn("_meta", self.last_result)
         shots = self.cli_calls("screenshot")
-        self.assertEqual(shots[0]["argv"], ["screenshot", "--session-id", session_id, "--label", "home"])
+        self.assertEqual(shots[0]["argv"], ["screenshot", "--session-id", session_id, "--no-agent", "--label", "home"])
         again = self.call_ok(server, "get_screen", self.ref(host, session_id))["screen"]
         self.assertNotEqual(again["artifact_id"], screen["artifact_id"])
 

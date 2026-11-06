@@ -189,13 +189,15 @@ def pick_tap_node(nodes: Any) -> Optional[Tuple[str, str]]:
     # the flat list is in document order with `depth`, so the open ancestors
     # are a stack.
     in_clickable: List[bool] = []
-    stack: List[Tuple[int, bool]] = []
+    in_toggle: List[bool] = []
+    stack: List[Tuple[int, bool, bool]] = []
     for node in nodes:
         depth = node.get("depth") if isinstance(node.get("depth"), int) else 0
         while stack and stack[-1][0] >= depth:
             stack.pop()
-        in_clickable.append(any(clickable for _, clickable in stack))
-        stack.append((depth, bool(node.get("clickable"))))
+        in_clickable.append(any(clickable for _, clickable, _ in stack))
+        in_toggle.append(any(checkable for _, _, checkable in stack))
+        stack.append((depth, bool(node.get("clickable")), bool(node.get("checkable"))))
     eligible = []
     for index, node in enumerate(nodes):
         key, value = node_label(node)
@@ -205,7 +207,7 @@ def pick_tap_node(nodes: Any) -> Optional[Tuple[str, str]]:
             continue
         if node.get("enabled") is False or node.get("visible") is False:
             continue
-        if node.get("checkable") or any(word in (value or "").lower() for word in RISKY_WORDS):
+        if node.get("checkable") or in_toggle[index] or any(word in (value or "").lower() for word in RISKY_WORDS):
             continue
         bounds = node.get("bounds")
         if isinstance(bounds, list) and len(bounds) == 4 and (bounds[2] <= bounds[0] or bounds[3] <= bounds[1]):
@@ -1476,13 +1478,18 @@ class DeviceRun:
 
     def step_media_focus(self) -> str:
         stop, counter = threading.Event(), [0]
-        mover = threading.Thread(target=self._mover, args=(stop, counter), daemon=True)
-        mover.start()
+        # only a real device is scrolled: a self-test world must not reach the
+        # host's adb or idb (no device commands in --self-test or --dry-run)
+        mover = (threading.Thread(target=self._mover, args=(stop, counter), daemon=True)
+                 if getattr(self.rt, "world", None) is None else None)
+        if mover is not None:
+            mover.start()
         try:
             meter = self._pull("focus", self.measure_s, 250)
         finally:
             stop.set()
-            mover.join(20)
+            if mover is not None:
+                mover.join(20)
         ok, detail = focus_verdict(meter)
         detail = "%s; %d scrolls during the measurement" % (detail, counter[0])
         expect(ok, detail)
