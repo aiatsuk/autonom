@@ -235,6 +235,38 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
   Other screenshots, iOS and Flow `takeScreenshot` are unchanged.
   `shots show` reads a JPEG's size, and shot numbers count `.jpg` files
   too.
+- **Mocks match on request contents and can edit the real response.**
+  `network mock add|update` take request conditions that must all hold,
+  together with URL, method and host: `--query NAME[=GLOB]` (decoded values,
+  case-sensitive glob), `--request-header 'NAME[: GLOB]'`, `--body-contains
+  TEXT` and `--body-json PATH=VALUE` (a dotted path such as `items.0.qty`;
+  VALUE is JSON when it parses, else text). Request bodies are read only for
+  a body condition, decoded by their encoding, and never match above 1 MiB.
+  `--rewrite` lets the request reach the real server and edits its answer:
+  `--status` (else the real status is kept), `--header` (set),
+  `--remove-header`, `--json-set PATH=VALUE`, `--json-remove PATH`,
+  `--replace OLD NEW`, or a whole `--json` / `--body-file`; `--delay` holds
+  the edited response, and `--hang` with `--rewrite` is refused. Body edits
+  are all or nothing: one that cannot apply leaves the body byte-identical,
+  keeps the status and header edits, and records `rewrite.error`
+  (`path_not_found: PATH`, `not_json`, `not_text`, `body_too_large` above
+  8 MiB, `undecodable_encoding`, `body_unreadable`); a rule removed or
+  disabled meanwhile (`rule_gone`) or malformed by hand (`invalid_rule`)
+  changes nothing. Each flag repeats up to 20 times with values up to 2048
+  characters; a malformed one is `invalid_value` and nothing is stored.
+  `update` replaces a list that is given and adds `--clear-conditions` and
+  `--clear-edits`. Flow records add `mock_kind` (`respond`, `rewrite`) and,
+  for an edited flow, `upstream_status` and `rewrite: {applied, error}`; HAR
+  adds `_autonom.mock_kind`. `mock list|show` add `mode`, `conditions`,
+  `condition_summary`, `edits` and `edit_summary`, and print secret
+  condition, JSON-set and header values as `<redacted>`. The session journal
+  masks the values of the new flags and keeps only their names and counts
+  (`query=2`); pre-test steps list `mode` and a `conditions` count. The
+  Canvas Mocks form gains Fake response and Edit real response modes,
+  condition and edit rows, timing and messages beside each invalid field.
+  The new flags must be spelled in full. Older releases ignore the new
+  fields: there a rule with conditions matches more requests, and a rewrite
+  rule is treated as a respond rule.
 
 ### Changed
 
