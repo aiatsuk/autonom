@@ -191,16 +191,27 @@ executable is reported in `fallback_reason`, not skipped. Install with
 without it (`tool_missing`, `capability: "canvas.idb"`); on Android it is
 refused.
 
-- **Video.** With the first page the Canvas starts its own idb_companion on a
-  private socket and opens one H.264 stream at 60 fps, full resolution
-  (1206x2622 on an iPhone 17), about 12 Mbit/s and a key frame every 2 s. The
-  page decodes it with WebCodecs exactly like scrcpy video (`/ws/video`
-  SESSION, CONFIG, PACKET), so the caption shows the rendered fps.
+- **Video.** With the first page the Canvas opens one H.264 stream from the
+  Simulator's companion (the iOS device daemon's, else its own on a private
+  socket), full resolution scaled to the tile (1206x2622 on an iPhone 17 at
+  full size), about 12 Mbit/s. By default it sends a frame only when the
+  screen changes ("On change", `stream_settings.fps: 0`), plus a key frame
+  for every page that joins, so a still screen costs almost nothing; a fixed
+  rate chosen in the Display menu is honored. The page decodes it with
+  WebCodecs exactly like scrcpy video (`/ws/video` SESSION, CONFIG, PACKET).
+- **Sized to the tile, stopped when unwatched.** Each page reports its tile's
+  size and whether it is visible (`{t:"watch", visible, width, height, dpr}`
+  on its video socket; a page that never says counts as a full-size tile). The stream follows the largest visible tile
+  (`/status` `stream_settings.scale_factor`, at most the Display choice; a resize burst is
+  one restart after it settles), stops within about 2 s once no tile is
+  visible (`idb.video_stopped`, input stays up), and a page shown again gets a
+  key frame within 1 s. Flaps shorter than 500 ms change nothing.
 - **One stream.** Every tab shares that stream; a second stream would halve
   the frame rate of both. A tab that joins later starts at the cached last
-  key frame. A tab that asks for a key frame waits for the next periodic one;
-  only when none comes within 2.5 s does the Canvas force one by Stop and
-  Start on the same stream, at most once every 5 s.
+  key frame. On change a key frame asked for comes at once by Stop and Start
+  on the same stream, at most once per interval; at a fixed rate a tab waits
+  for the next periodic one, and only when none comes within 2.5 s does the
+  Canvas force one, at most once every 5 s.
 - **No leaks.** Every stream ends with an explicit Stop. A stream that ends
   without one (a dropped connection, a crashed companion) may leave its
   encoder running inside the companion, so that companion is ended and a new
@@ -210,12 +221,21 @@ refused.
   last page leaves, and stopping the Canvas ends the companion. A Canvas
   killed with SIGKILL cannot end it: `pgrep -fl "idb_companion --udid"`
   shows one left behind, to be ended by hand.
-- **Restart and rotation.** The Canvas reads the Simulator state every 2 s
-  and restarts the frozen stream once the Simulator is Booted again. It reads
-  the orientation every second: the picture stays portrait when the
-  Simulator rotates, the `state` message and `/status` `idb` carry
+- **Restart and rotation, from events.** Boot state and orientation come as
+  events from the iOS device daemon (`subscribe`); the Canvas runs no timed
+  `simctl` or orientation reads (`/status` `idb.daemon_subscribed`). A
+  Simulator that shuts down shows "The Simulator is shut down" at once
+  (`idb.booted: false`, `idb.target_state`), and the stream restarts once it
+  is Booted again. The daemon reads the orientation only while a tile shows
+  the device. With a daemon from before events (or `AUTONOM_IOS_DAEMON=off`)
+  the session reads its own companion over gRPC while a tile shows the
+  device, and stops reading when none does. The picture stays portrait when
+  the Simulator rotates, the `state` message and `/status` `idb` carry
   `orientation` and `rotation` (clockwise degrees), and the page turns the
   picture upright. A finger down during a rotation is lifted.
+- **Capture.** The Capture button takes the picture through the daemon's
+  companion (`source: companion`, no simctl process); when no daemon runs for
+  the Simulator or it cannot serve it, `simctl io screenshot` does (`source: simctl`, `fallback_reason`).
 - **Input.** One finger: down, move and up reach the Simulator live over the
   companion's HID stream (a held finger moves by repeated touch-down at the
   new point), in logical points of the current orientation. A pointer from

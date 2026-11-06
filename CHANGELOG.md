@@ -9,6 +9,10 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
 
 ### Added
 
+- **Canvas screenshots of the iOS Simulator come through the companion.** The
+  Capture button asks the running iOS device daemon's companion for the
+  picture, so no `simctl` process starts; the reply says `source: companion`, or
+  `source: simctl` with `fallback_reason` when the daemon could not serve it.
 - **Opt-in macOS hardware video for the Android Canvas.** With an emulator
   listed in `~/.config/autonom/host-video.json` (AVD, serial, gRPC port),
   `autonom devices boot` starts that AVD with `-grpc <port> -grpc-use-token`
@@ -238,6 +242,17 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
 
 ### Changed
 
+- **The iOS Canvas streams on change, sized to the tile, and stops when
+  nobody watches.** Without a Display choice the iOS stream sends a frame
+  only when the screen changes, plus a key frame for every page that joins
+  (a still screen costs almost nothing; a fixed rate from the Display menu
+  is honored). Pages report their tile size and visibility: the stream is
+  scaled to the largest visible tile, stops within about 2 s when no tile is
+  visible and comes back with a key frame within 1 s. Boot state and
+  orientation come as events from the iOS device daemon, so the Canvas and
+  the workspace no longer run `simctl` or orientation reads on a timer for a
+  device that gets them; with an older daemon the session reads its own
+  companion only while a tile shows the device.
 - **The iOS device daemon finds idb's companion in the process table.** It no
   longer reads idb's state file (`/tmp/idb/state`) or `AUTONOM_IDB_STATE_FILE`
   (the CLI still does): it uses the live `idb_companion` started with

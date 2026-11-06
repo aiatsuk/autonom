@@ -811,7 +811,7 @@ class Tools:
         temp = captures.temp_path(directory, "png")
         created = time.time()
         try:
-            screenshot.capture_target(self.target, temp)
+            source, fallback_reason = self._capture_device(temp)
             warning = None
             try:
                 canvas_capture_frame.render(temp, frame, repository=self.frames)
@@ -823,12 +823,52 @@ class Tools:
         capture, pruned = captures.commit(temp, directory, "screenshot",
                                           meta=self._meta(created=created, duration_ms=None))
         result: dict[str, Any] = {"capture": capture, "pruned": pruned}
+        if source is not None:
+            result["source"] = source
+        if fallback_reason is not None:
+            result["fallback_reason"] = fallback_reason
         if warning:
             result["warning"] = warning
         if record is not None:
             self._file_in_session(result, directory / capture["name"], record, created)
         return (result, [capture["name"]],
                 {"size": capture["size"], "pruned": len(pruned) or None})
+
+    def _capture_device(self, temp: Path) -> tuple[str | None, str | None]:
+        """The device's screenshot into ``temp``: ``(source, fallback_reason)``.
+
+        On iOS the picture comes through the device daemon's companion
+        (``source: companion``, CU-05), which is already connected, so no idb or
+        simctl process starts; when the daemon cannot serve it (turned off,
+        not running for this Simulator, a companion without screenshots, a
+        failed read) the
+        usual `simctl io screenshot` path takes it (``source: simctl``) and
+        ``fallback_reason`` says why. A screenshot changes nothing on the
+        device, so trying the second way after the first is always safe.
+        Android is unchanged: ``(None, None)``."""
+        if self.target.platform != IOS:
+            screenshot.capture_target(self.target, temp)
+            return None, None
+        from autonom_lib import ios_daemon
+
+        if ios_daemon.disabled():
+            reason = "the iOS device daemon is turned off (AUTONOM_IOS_DAEMON)"
+        elif ios_daemon.live_registry(ios_daemon.state_base(), self.target.target_id) is None:
+            # a cold daemon start can take long enough to miss the Capture button's own
+            # deadline; the Canvas normally has one running, so only a running one is asked
+            reason = "no iOS device daemon is running for this Simulator"
+        else:
+            try:
+                shot = ios_daemon.screenshot(self.target.target_id, image_format="png")
+            except ios_daemon.Unavailable as exc:
+                reason = f"{exc.reason}: {exc.message}"
+            except Exception as exc:  # noqa: BLE001 - any daemon failure falls back
+                reason = f"daemon_unreachable: {exc}"
+            else:
+                temp.write_bytes(shot["image"])
+                return "companion", None
+        screenshot.capture_target(self.target, temp)
+        return "simctl", reason
 
     def _file_in_session(self, result: dict[str, Any], path: Path, record: dict[str, Any],
                          created: float) -> None:

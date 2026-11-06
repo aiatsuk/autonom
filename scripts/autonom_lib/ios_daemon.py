@@ -15,7 +15,8 @@ daemon's files and protocol:
   `processes.run_supervised(kind="iosd")` in a detached supervisor, so the
   pair is registered like every other long-lived child. The daemon prints
   one status line when it serves, refuses or fails; that line decides;
-- send one request line and read one reply line within a deadline;
+- send one request line and read one reply line within a deadline, and
+  take a screenshot through the daemon's companion (`screenshot`);
 - say why it was not used: `daemon_disabled` (AUTONOM_IOS_DAEMON=off),
   `node_missing`, `daemon_start_failed`, `companion_too_old` or
   `daemon_unreachable`. A reason is remembered for the rest of this
@@ -33,6 +34,7 @@ nothing here does either. Standard library only.
 """
 from __future__ import annotations
 
+import base64
 import itertools
 import json
 import os
@@ -70,8 +72,12 @@ START_TIMEOUT_S = 40.0
 # How long a client waits for another client's start lock.
 LOCK_TIMEOUT_S = 20.0
 CONNECT_TIMEOUT_S = 2.0
-# One reply line; a 3000-node tree is about 1.5 MB.
+# One reply line; a 3000-node tree is about 1.5 MB. Only a screenshot's may be longer.
 MAX_LINE_BYTES = 4 * 1024 * 1024
+# A screenshot's reply: the base64 of the companion's largest gRPC message (32 MiB).
+MAX_SCREENSHOT_LINE_BYTES = 48 * 1024 * 1024
+# The daemon waits up to 6 s for a companion being replaced, then 10 s for the image.
+SCREENSHOT_TIMEOUT_S = 20.0
 _LOCK_GRACE_S = 2.0
 
 # Supervisor: run_supervised in a detached interpreter. The daemon (its child)
@@ -378,12 +384,14 @@ def remember(udid: str, reason: str) -> None:
 # --- one request ----------------------------------------------------------------
 
 
-def request(socket_path: str, payload: dict[str, Any], *, timeout_s: float) -> dict[str, Any]:
+def request(socket_path: str, payload: dict[str, Any], *, timeout_s: float,
+            max_line_bytes: int = MAX_LINE_BYTES) -> dict[str, Any]:
     """Send ``payload`` (an ``id`` is added) and return the daemon's reply.
 
     Raises ``Unavailable`` (reason ``daemon_unreachable``): stage
     BEFORE_SEND when no connection was made, AFTER_SEND when the line may
-    have been written and no reply came back within ``timeout_s``."""
+    have been written and no reply came back within ``timeout_s`` or the
+    reply is longer than ``max_line_bytes``."""
     message = {**payload, "id": f"py{os.getpid()}-{next(_REQUEST_IDS)}"}
     line = (json.dumps(message, ensure_ascii=False) + "\n").encode("utf-8")
     deadline = time.monotonic() + max(timeout_s, 0.1)
@@ -403,8 +411,11 @@ def request(socket_path: str, payload: dict[str, Any], *, timeout_s: float) -> d
             raise Unavailable(DAEMON_UNREACHABLE,
                               f"the connection to the iOS device daemon broke while sending: {exc}",
                               stage=AFTER_SEND) from exc
-        data = b""
-        while b"\n" not in data:
+        # one screenshot's reply is tens of MiB in small chunks: only a new chunk
+        # can hold the newline, and joining once keeps this linear
+        chunks: list[bytes] = []
+        size = 0
+        while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise Unavailable(DAEMON_UNREACHABLE,
@@ -423,14 +434,17 @@ def request(socket_path: str, payload: dict[str, Any], *, timeout_s: float) -> d
                 raise Unavailable(DAEMON_UNREACHABLE,
                                   f"the iOS device daemon closed the connection before it "
                                   f"answered {payload.get('op')}", stage=AFTER_SEND)
-            data += chunk
-            if len(data) > MAX_LINE_BYTES:
+            chunks.append(chunk)
+            size += len(chunk)
+            if size > max_line_bytes:
                 raise Unavailable(DAEMON_UNREACHABLE, "the daemon's reply is too long",
                                   stage=AFTER_SEND)
+            if b"\n" in chunk:
+                break
     finally:
         client.close()
     try:
-        reply = json.loads(data.split(b"\n", 1)[0].decode("utf-8"))
+        reply = json.loads(b"".join(chunks).split(b"\n", 1)[0].decode("utf-8"))
     except ValueError as exc:
         raise Unavailable(DAEMON_UNREACHABLE, "the iOS device daemon's reply is not JSON",
                           stage=AFTER_SEND) from exc
@@ -438,3 +452,45 @@ def request(socket_path: str, payload: dict[str, Any], *, timeout_s: float) -> d
         raise Unavailable(DAEMON_UNREACHABLE, "the iOS device daemon answered another request",
                           stage=AFTER_SEND)
     return reply
+
+
+def screenshot(udid: str, *, image_format: str = "png", scale: float | None = None,
+               timeout_s: float = SCREENSHOT_TIMEOUT_S) -> dict[str, Any]:
+    """One image of ``udid`` through the daemon's companion: ``{"image":
+    bytes, "format", "width", "height", "source_width", "source_height",
+    "screen_scale"}``, the sizes null when the companion left them out.
+
+    ``image_format`` is ``png`` or ``jpeg``, ``scale`` a share of the full
+    size in (0, 1]. Raises ``Unavailable`` with the reason, so the caller can
+    take the picture another way and say why; a screenshot changes nothing
+    on the device, so that is safe at either stage. A failed screenshot says
+    nothing of the next one, so it is not remembered for this process."""
+    registry = ensure(udid)
+    payload: dict[str, Any] = {"op": "screenshot", "format": image_format}
+    if scale is not None:
+        payload["scale"] = scale
+    reply = request(str(registry["socket"]), payload, timeout_s=timeout_s,
+                    max_line_bytes=MAX_SCREENSHOT_LINE_BYTES)
+    if reply.get("ok") is not True:
+        error = reply.get("error") if isinstance(reply.get("error"), dict) else {}
+        code = str(error.get("code") or "") or None
+        stage = error.get("stage")
+        raise Unavailable(COMPANION_TOO_OLD if code == COMPANION_TOO_OLD else DAEMON_UNREACHABLE,
+                          str(error.get("message") or "the iOS device daemon refused screenshot"),
+                          stage=BEFORE_SEND if stage == BEFORE_SEND else AFTER_SEND,
+                          code=code, hint=error.get("hint"))
+    try:
+        image = base64.b64decode(str(reply.get("image_base64") or ""), validate=True)
+    except ValueError as exc:
+        raise Unavailable(DAEMON_UNREACHABLE, "the iOS device daemon's image is not base64",
+                          stage=AFTER_SEND) from exc
+    if not image:
+        raise Unavailable(DAEMON_UNREACHABLE, "the iOS device daemon sent no image",
+                          stage=AFTER_SEND)
+    if reply.get("format") != image_format:
+        raise Unavailable(DAEMON_UNREACHABLE,
+                          f"the iOS device daemon sent {reply.get('format')!r}, "
+                          f"not the {image_format!r} asked for", stage=AFTER_SEND)
+    return {"image": image, "format": image_format,
+            **{key: reply.get(key) for key in ("width", "height", "source_width", "source_height",
+                                               "screen_scale")}}

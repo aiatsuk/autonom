@@ -62,7 +62,7 @@ import {
 } from "./ws.mjs";
 import { DisplayChrome } from "./canvas-display-chrome.mjs";
 import { createCanvasTools, handleToolsRoute } from "./canvas-tools-server.mjs";
-import { profileVideo, splitDevicePath } from "./canvas-devices.mjs";
+import { ownFps, parseWatch, profileVideo, splitDevicePath, visibleTiles, watchScale } from "./canvas-devices.mjs";
 import {
   AUTO_ACQUIRE_WAIT_MS,
   CONTROL_GENERATION_STALE,
@@ -95,6 +95,7 @@ import {
   CODE as DAEMON_CODE,
   DaemonConnection,
   DaemonError,
+  DRAWN_ORIENTATIONS,
   defaultStateBase,
   ensureDaemon,
   pidAlive,
@@ -125,11 +126,12 @@ import {
   IDB_FIRST_FRAME_MS,
   IDB_FORCED_KEY_FRAME_MS,
   IDB_KEY_FRAME_WAIT_MS,
-  IDB_ORIENTATION_MS,
+  IDB_ON_CHANGE_KEY_FRAME_MS,
+  IDB_OWN_READ_MS,
   IDB_RETRY_MAX_MS,
   IDB_RETRY_MIN_MS,
-  IDB_SIMULATOR_WATCH_MS,
   IDB_STABLE_MS,
+  IDB_WATCH_SETTLE_MS,
   INJECTABLE_TEXT,
   IOS_BUTTONS,
   IOS_CLIPBOARD_MAX_BYTES,
@@ -944,6 +946,24 @@ function streamSizeInUse(context) {
   return { maxSize: screenrecordMaxSize(context.options), source, encoder: null, encoderName: null };
 }
 
+/**
+ * Whether the device's Simulator is booted, from the iOS daemon's events: true or false
+ * while the Canvas session is subscribed to them, null otherwise (no session, not iOS, not
+ * subscribed, or nothing said yet), when the caller has to ask simctl.
+ */
+export function daemonBootState(context) {
+  const session = context?.session instanceof IosFastSession ? context.session : null;
+  const stats = session?.stats;
+  if (!stats?.daemonSubscribed) return null;
+  // Only a daemon that is serving knows: while it has lost or restarts its companion
+  // (`companion_restarting`, boot state unknown) the Simulator may be gone, so ask simctl.
+  if (stats.daemonState !== "serving") return null;
+  // Serving again after a restart, the daemon says nothing of the Simulator until its next
+  // describe answers (target_state null): the last boot state may be stale, so ask simctl.
+  if (stats.targetState == null) return null;
+  return typeof session.booted === "boolean" ? session.booted : null;
+}
+
 /** The iOS fast transport in /status: where the companion came from and what the stream did. */
 function idbStatus(context) {
   if (!context.idb.available) return null;
@@ -959,6 +979,17 @@ function idbStatus(context) {
     points: stats?.points ?? null,
     orientation: session?.orientation ?? null,
     rotation: iosRotation(context),
+    // False once the daemon or the companion said the Simulator is down; target_state is
+    // what it said ("Booted", "Shutdown", ...), null while nothing is known.
+    booted: stats?.booted ?? null,
+    target_state: stats?.targetState ?? null,
+    // CU-01..CU-03: frames sent in the last second, the tiles showing the device, and whether
+    // the stream is stopped because none does.
+    frames_per_second: stats?.framesPerSecond ?? 0,
+    watchers: stats?.watchers ?? 0,
+    video_stopped: stats?.videoStopped ?? false,
+    video_stops: stats?.videoStops ?? 0,
+    daemon_subscribed: stats?.daemonSubscribed ?? false,
     packets: stats?.packets ?? 0,
     bytes: stats?.bytes ?? 0,
     key_frames: stats?.keyFrames ?? 0,
@@ -1265,6 +1296,10 @@ const DAEMON_DETACH_MS = 1000;
  * (its companion restarts, it is in its idle stop) before it runs a companion of its own.
  */
 const DAEMON_FIRST_WAIT_MS = 20_000;
+/** One `describe` or `get_orientation` of a session's own reads, as the daemon's read has. */
+const IDB_OWN_READ_TIMEOUT_MS = 2000;
+/** More than a stream can send in the second #framesPerSecond counts. */
+const MAX_FRAME_TIMES = 512;
 /** A session on a companion of its own after a passing daemon failure tries the daemon again. */
 const DAEMON_RETRY_MIN_MS = 5000;
 const DAEMON_RETRY_MAX_MS = 60_000;
@@ -1338,7 +1373,7 @@ class DaemonCompanion {
  * on it that every tab shares through the scrcpy /ws/video messages, and the companion's HID
  * stream for input. States: idle → starting → streaming ↔ restarting → stopped. Events:
  * state(name), session({width, height}), config(Buffer), packet({keyFrame, pts, data}),
- * orientation(name), error(Error).
+ * orientation(name), video-stopped, error(Error).
  *
  * The companion (ID-14) is the device daemon's: the session attaches to the daemon (started
  * when none runs), opens its own gRPC session on the companion the daemon names, asks the
@@ -1350,11 +1385,20 @@ class DaemonCompanion {
  * one may leave its encoder running in the companion, so a companion of the session's own is
  * restarted then (on the daemon's, only the session's connection is replaced).
  * There is never a second stream: a late joiner waits for the periodic key frame, and a key
- * frame that does not come is forced with Stop and Start on the same stream (DEC-004).
+ * frame that does not come is forced with Stop and Start on the same stream (DEC-004). A
+ * stream on change (fps 0) has no periodic key frame on a still screen, so there it is forced
+ * at once.
+ *
+ * The session is told which tiles show the device (setWatchers). The stream takes the scale
+ * its largest tile needs, in place, and stops once no tile shows the device: the session
+ * stays "streaming" and input goes on, only no encoder runs until a tile is back (CU-01..03).
+ *
+ * Nothing here runs a process on a timer (CU-04). Boot state and orientation come from the
+ * daemon's events on the attached connection; without those the session asks its own companion
+ * over gRPC, while a tile shows the device.
  */
 class IosFastSession extends EventEmitter {
   #udid;
-  #xcrun;
   #binary;
   #video;
   // ID-14: { stateBase, env } to find (or start) the device daemon and stream on its companion;
@@ -1386,12 +1430,35 @@ class IosFastSession extends EventEmitter {
   #points = null;
   #orientation = "PORTRAIT";
   #booted = true;
+  // What was last said of the Simulator ("Booted", "Shutdown", ...), null while nothing is known.
+  #targetState = null;
+  // The daemon's events on the attached connection: it answered `subscribe`, what it was last
+  // told of `watching`, and its own state (a change back to "serving" is a new companion).
+  #subscribed = false;
+  #watchingSent = null;
+  #daemonState = null;
+  // A read of this session's own companion while no daemon tells it (#syncOwnReads).
+  #ownReadTimer = null;
+  #ownReading = false;
+  // The tiles showing the device (setWatchers): null until told, and then the stream runs.
+  #tiles = null;
   #watchTimer = null;
-  #orientationTimer = null;
+  #fullSize = null;
+  // The settings the open stream runs with, and when it last got new ones.
+  #streamVideo = null;
+  #restartedAt = -Infinity;
+  // Nobody watches: Stop is on its way (#stopping), then no stream is open and the run loop
+  // waits (#held, ended by #releaseHold).
+  #stoppingVideo = false;
+  #held = false;
+  #holdEnd = null;
+  // Arrival times of the frames of the last second.
+  #frameTimes = [];
   #keyFrameWantedAt = null;
   #keyFrameTimer = null;
   #forcedKeyFrameAt = -Infinity;
-  #streamRestarting = false;
+  // The Stop and Start in flight, null when none: resolves once it ended, true when it worked.
+  #restarting = null;
   // The first-frame watchdog of the current stream: { stream, timer, since }, and how the stream
   // that runs reports the watchdog's error to its run loop.
   #frameWatch = null;
@@ -1402,12 +1469,12 @@ class IosFastSession extends EventEmitter {
     packets: 0, bytes: 0, keyFrames: 0, restarts: 0, companionStarts: 0, streamsOpened: 0,
     streamRestarts: 0, forcedKeyFrames: 0, hidEvents: 0, hidLost: 0,
     companionAttaches: 0, daemonAttaches: 0, daemonLosses: 0, detaches: 0, daemonReturns: 0,
+    videoStops: 0, ownReads: 0,
   };
 
-  constructor({ udid, xcrunPath, binary, video, daemon = null }) {
+  constructor({ udid, binary, video, daemon = null }) {
     super();
     this.#udid = udid;
-    this.#xcrun = xcrunPath;
     this.#binary = binary;
     this.#video = video;
     this.#daemon = daemon;
@@ -1446,7 +1513,19 @@ class IosFastSession extends EventEmitter {
     return {
       ...this.#stats, state: this.#state, points: this.#points, companionPid: this.#companion?.pid ?? null,
       companionSource: this.#mode, daemonAttached: this.#attached, daemonFallback: this.#daemonFallback,
+      booted: this.#booted, targetState: this.#targetState, daemonSubscribed: this.#subscribed, daemonState: this.#daemonState,
+      framesPerSecond: this.#framesPerSecond(), watchers: this.#tiles?.length ?? 0, videoStopped: this.#held,
     };
+  }
+
+  /** The Simulator is known to run, false once it was said not to. */
+  get booted() {
+    return this.#booted;
+  }
+
+  /** The scale the open stream runs at, else the one the next stream opens with. */
+  get scaleFactor() {
+    return (this.#streamVideo ?? this.#wantedVideo).scaleFactor;
   }
 
   /** Resolves with the first frame; rejects when the first attempt fails. Later restarts only emit. */
@@ -1459,8 +1538,7 @@ class IosFastSession extends EventEmitter {
       this.#first = { resolve: resolvePromise, reject };
     });
     this.#loop = this.#run();
-    this.#watchSimulator();
-    this.#watchOrientation();
+    this.#syncOwnReads();
     return first;
   }
 
@@ -1496,18 +1574,26 @@ class IosFastSession extends EventEmitter {
   }
 
   /**
-   * A tab needs a key frame. The companion sends one every few seconds; only one that does
+   * A tab needs a key frame. The companion sends one every few seconds, so only one that does
    * not arrive within IDB_KEY_FRAME_WAIT_MS is forced, by Stop and Start on the same stream.
+   * On change (fps 0) a still screen sends none, so it is forced at once; a stream that is
+   * about to open starts with one anyway.
    */
   requestKeyFrame() {
-    if (!this.connected) return;
+    if (!this.connected || !this.#stream || this.#stoppingVideo || this.#restarting || this.#frameWatch) return;
     this.#keyFrameWantedAt ??= performance.now();
-    if (!this.#keyFrameTimer) this.#armKeyFrameTimer(IDB_KEY_FRAME_WAIT_MS);
+    if (this.#keyFrameTimer) return;
+    this.#armKeyFrameTimer(this.#onChange
+      ? Math.max(0, this.#forcedKeyFrameAt + IDB_ON_CHANGE_KEY_FRAME_MS - performance.now()) : IDB_KEY_FRAME_WAIT_MS);
   }
 
   /**
-   * New frame rate and scale for the running stream (a workspace focus change): the stream
-   * is restarted on the same companion with them, and later streams open with them too.
+   * New frame rate and scale for the running stream (a workspace focus change, a Display
+   * choice): the stream is restarted on the same companion with them, and later streams open
+   * with them too. A scale here is the most the stream may use; its tiles can ask for less.
+   * True once the stream runs with them or, with no stream open, the next one will open with
+   * them; a restart in flight is waited for first. False once stopped for good, or when the
+   * restart this call made failed.
    */
   setVideo({ fps, scaleFactor } = {}) {
     this.#video = {
@@ -1515,22 +1601,118 @@ class IosFastSession extends EventEmitter {
       ...(fps !== undefined ? { fps } : {}),
       ...(scaleFactor !== undefined ? { scaleFactor } : {}),
     };
+    return this.#applyVideo("profile change");
+  }
+
+  /**
+   * The tiles that show the device now (visibleTiles): an empty list stops the stream once it
+   * settled, a tile that appears starts it at once, and the size they need sets its scale.
+   */
+  setWatchers(tiles) {
+    if (this.#stopped) return;
+    const before = this.#tiles === null ? null : JSON.stringify(this.#tiles);
+    if (before === JSON.stringify(tiles)) return;
+    this.#tiles = tiles;
+    if (this.#watched) {
+      this.#syncReaders();
+      this.#releaseHold();
+    }
+    this.#watchChanged();
+  }
+
+  get #watched() {
+    return this.#tiles === null || this.#tiles.length > 0;
+  }
+
+  get #onChange() {
+    return this.#video.fps === 0;
+  }
+
+  /** The settings a stream should run with: the profile's, at the scale its tiles need. */
+  get #wantedVideo() {
+    const most = this.#video.scaleFactor ?? 1;
+    return { ...this.#video, scaleFactor: Math.min(most, watchScale(this.#tiles, this.#fullSize)) };
+  }
+
+  get #videoCurrent() {
+    const running = this.#streamVideo;
+    const wanted = this.#wantedVideo;
+    return Boolean(running) && running.fps === wanted.fps && running.scaleFactor === wanted.scaleFactor;
+  }
+
+  #framesPerSecond() {
+    const since = performance.now() - 1000;
+    while (this.#frameTimes.length && this.#frameTimes[0] < since) this.#frameTimes.shift();
+    return this.#frameTimes.length;
+  }
+
+  /** Who watches changed: the stream reacts once that settled (IDB_WATCH_SETTLE_MS). */
+  #watchChanged(milliseconds = IDB_WATCH_SETTLE_MS) {
+    clearTimeout(this.#watchTimer);
+    this.#watchTimer = null;
+    if (this.#stopped) return;
+    this.#watchTimer = setTimeout(() => this.#applyWatch(), milliseconds);
+    this.#watchTimer.unref?.();
+  }
+
+  #applyWatch() {
+    this.#watchTimer = null;
+    if (this.#stopped) return;
+    this.#syncReaders();
+    if (!this.#watched) {
+      this.#stopVideo();
+      return;
+    }
+    if (this.#videoCurrent) return;
+    const wait = this.#restartedAt + IDB_WATCH_SETTLE_MS - performance.now();
+    if (wait > 0) this.#watchChanged(wait);
+    else this.#applyVideo("tile size");
+  }
+
+  /**
+   * Ends the stream with a clean Stop, as nobody watches: the run loop then holds until a tile
+   * is back. A stream still waiting for its first frame, or being restarted, goes next (the
+   * next frame or the end of that restart looks again), and a frozen one sends no frames anyway.
+   */
+  #stopVideo() {
     const stream = this.#stream;
-    if (this.#stopped || !stream || stream.done || this.#streamRestarting) return Promise.resolve(false);
-    this.#streamRestarting = true;
-    this.#stats.streamRestarts += 1;
-    return stream.restart({ options: this.#video }).then(() => {
-      this.#stats.streamsOpened += 1;
-      if (this.#stream === stream && !stream.done && !this.#stopped) this.#watchFirstFrame(stream);
-      return true;
-    }, (error) => {
-      if (!stream.abnormal && this.listenerCount("error")) {
-        this.emit("error", new Error(`idb stream restart (profile change) failed: ${error.message}`));
-      }
-      return false;
-    }).finally(() => {
-      this.#streamRestarting = false;
+    if (this.#state !== "streaming" || !stream || stream.done || this.#restarting || this.#stoppingVideo) return;
+    this.#stoppingVideo = true;
+    this.#keyFrameWantedAt = null;
+    clearTimeout(this.#keyFrameTimer);
+    this.#keyFrameTimer = null;
+    stream.stop().catch(() => {});
+  }
+
+  /** The run loop holds until a tile shows the device, or the session has to come back. */
+  #holdUnwatched() {
+    if (this.#watched || this.#stopped) return Promise.resolve();
+    this.#held = true;
+    this.#stats.videoStops += 1;
+    this.emit("video-stopped");
+    return new Promise((resolvePromise) => {
+      this.#holdEnd = resolvePromise;
     });
+  }
+
+  #releaseHold() {
+    const end = this.#holdEnd;
+    this.#held = false;
+    this.#holdEnd = null;
+    end?.();
+  }
+
+  /**
+   * Gives the running stream the settings it should have, by Stop and Start on the same
+   * companion, after the restart in flight if there is one. A stream that is opening, or the
+   * next one after a stopped or lost stream, opens with them by itself (#wantedVideo).
+   */
+  #applyVideo(reason) {
+    if (this.#stopped) return Promise.resolve(false);
+    const stream = this.#stream;
+    if (this.#held || this.#stoppingVideo || !stream || stream.done) return Promise.resolve(true);
+    if (this.#restarting) return this.#restarting.then(() => this.#applyVideo(reason));
+    return this.#videoCurrent ? Promise.resolve(true) : this.#restart(stream, reason);
   }
 
   /**
@@ -1541,11 +1723,12 @@ class IosFastSession extends EventEmitter {
     if (this.#stopPromise) return this.#stopPromise;
     this.#stopped = true;
     clearTimeout(this.#watchTimer);
-    clearTimeout(this.#orientationTimer);
+    clearTimeout(this.#ownReadTimer);
     clearTimeout(this.#keyFrameTimer);
     clearTimeout(this.#reattachTimer);
     this.#clearFrameWatch();
     this.#wake?.();
+    this.#releaseHold();
     this.#setState("stopped");
     this.#settleFirst(new Error("the idb session stopped"));
     this.#stopPromise = (async () => {
@@ -1591,6 +1774,14 @@ class IosFastSession extends EventEmitter {
     while (!this.#stopped) {
       const result = await this.#streamOnce().catch((error) => ({ error, abnormal: true, ranMs: 0 }));
       if (this.#stopped) break;
+      // Stopped because nobody watches, and the Stop was answered: not a failure.
+      const stoppedVideo = this.#stoppingVideo;
+      this.#stoppingVideo = false;
+      if (stoppedVideo && !result.abnormal && !result.error) {
+        backoff = IDB_RETRY_MIN_MS;
+        await this.#holdUnwatched();
+        continue;
+      }
       // The daemon's companion exited under this attempt: the daemon is replacing it.
       const companion = this.#companion;
       result.daemonGone = companion instanceof DaemonCompanion && companion.pid !== null && !pidAlive(companion.pid);
@@ -1682,6 +1873,7 @@ class IosFastSession extends EventEmitter {
     this.#stats.daemonReturns += 1;
     if (this.#companion instanceof DaemonCompanion) return;
     await this.#stopCompanion();
+    this.#releaseHold();
   }
 
   /** `attach` on the first request of a daemon connection, `companion` after it; one at a time. */
@@ -1732,12 +1924,123 @@ class IosFastSession extends EventEmitter {
       this.#reattachBackoff = IDB_RETRY_MIN_MS;
       this.#daemonRetryBackoff = this.#daemon.retryMinMs ?? DAEMON_RETRY_MIN_MS;
       this.#stats.daemonAttaches += 1;
+      this.#subscribe(connection);
     }
     if (typeof reply.socket !== "string" || !reply.socket) {
       throw new DaemonError(DAEMON_CODE.DAEMON_START_FAILED,
         "The daemon's companion listens on no Unix socket the Canvas can open.", { reason: "companion_not_on_socket" });
     }
     return { socketPath: reply.socket, pid: Number.isInteger(reply.pid) ? reply.pid : null };
+  }
+
+  /**
+   * Boot state and orientation come as events on this connection from now on (CU-04). A daemon
+   * from before events refuses the op, and the session goes on asking its own companion.
+   */
+  #subscribe(connection) {
+    const watching = this.#watched;
+    this.#watchingSent = watching;
+    connection.subscribe((event) => this.#onDaemonEvent(connection, event), { watching, timeoutMs: DAEMON_REPLY_MS }).then(
+      (reply) => reply?.ok === true, () => false,
+    ).then((subscribed) => {
+      if (this.#daemonConnection !== connection) return;
+      this.#subscribed = subscribed;
+      this.#syncReaders();
+    });
+  }
+
+  #onDaemonEvent(connection, event) {
+    if (this.#stopped || this.#daemonConnection !== connection) return;
+    try {
+      if (event.event === "orientation") {
+        this.#setOrientation(event.orientation);
+      } else if (event.event === "state") {
+        // A companion that served again after a restart is a new one, which a stopped stream
+        // would not notice: a stream on it brings the session back, input included.
+        const back = event.state === "serving" && this.#daemonState !== null && this.#daemonState !== "serving";
+        this.#daemonState = event.state;
+        this.#targetState = event.target_state ?? null;
+        if (typeof event.booted === "boolean") this.#setBooted(event.booted);
+        if (back) this.#releaseHold();
+      }
+    } catch (error) {
+      // A listener that throws must not end the connection's reader, nor the Canvas.
+      if (this.listenerCount("error")) this.emit("error", error);
+    }
+  }
+
+  /** What readers of the Simulator should do now that who watches, or who tells, changed. */
+  #syncReaders() {
+    this.#syncDaemonWatching();
+    this.#syncOwnReads();
+  }
+
+  /** The daemon polls only while a tile shows the device, and is told when that changes. */
+  #syncDaemonWatching() {
+    const connection = this.#daemonConnection;
+    const watching = this.#watched;
+    if (!this.#subscribed || !connection?.open || watching === this.#watchingSent) return;
+    this.#watchingSent = watching;
+    connection.subscribe((event) => this.#onDaemonEvent(connection, event), { watching, timeoutMs: DAEMON_REPLY_MS })
+      .catch(() => {});
+  }
+
+  /**
+   * Without daemon events the session reads its own companion, one read after another while
+   * a tile shows the device: calls on the open gRPC session, as the daemon's poll is.
+   */
+  #syncOwnReads() {
+    if (this.#stopped || this.#subscribed || !this.#watched) {
+      clearTimeout(this.#ownReadTimer);
+      this.#ownReadTimer = null;
+      return;
+    }
+    if (this.#ownReadTimer || this.#ownReading) return;
+    this.#ownReadTimer = setTimeout(() => this.#readOwnCompanion(), IDB_OWN_READ_MS);
+    this.#ownReadTimer.unref?.();
+  }
+
+  async #readOwnCompanion() {
+    this.#ownReadTimer = null;
+    const client = this.#companion?.client;
+    if (client && !client.closed && !this.#first && !this.#subscribed) {
+      this.#ownReading = true;
+      this.#stats.ownReads += 1;
+      // A failed read keeps what is known.
+      const state = await client.describe({ timeoutMs: IDB_OWN_READ_TIMEOUT_MS }).then(({ state: read }) => read, () => null);
+      try {
+        // A daemon that took over meanwhile knows better.
+        if (state && !this.#stopped && !this.#subscribed) {
+          this.#targetState = state;
+          this.#setBooted(/^booted$/i.test(state));
+        }
+        if (this.#booted && !this.#stopped) await this.#readOrientation(client);
+      } catch (error) {
+        // A listener that throws must not end the reads, nor the Canvas.
+        if (this.listenerCount("error")) this.emit("error", error);
+      } finally {
+        this.#ownReading = false;
+      }
+    }
+    this.#syncOwnReads();
+  }
+
+  /**
+   * A Simulator that shuts down freezes the stream; once it is Booted again the stream restarts.
+   * Every change is told ("booted"): a session already restarting has no state change to carry it.
+   */
+  #setBooted(booted) {
+    if (booted === this.#booted) return;
+    this.#booted = booted;
+    if (!booted) {
+      if (this.#state === "streaming") this.#setState("restarting");
+    } else if (this.#stream) {
+      this.#restartStream("the Simulator booted again");
+    } else {
+      // A stopped stream: one more brings the session back to "streaming", then it stops again.
+      this.#releaseHold();
+    }
+    this.emit("booted", booted);
   }
 
   /**
@@ -1749,6 +2052,9 @@ class IosFastSession extends EventEmitter {
     if (this.#daemonConnection !== connection) return;
     this.#daemonConnection = null;
     this.#attached = false;
+    this.#subscribed = false;
+    this.#daemonState = null;
+    this.#syncOwnReads();
     if (this.#stopped || this.#mode !== "daemon") return;
     this.#stats.daemonLosses += 1;
     this.#reattachBackoff = IDB_RETRY_MIN_MS;
@@ -1803,6 +2109,7 @@ class IosFastSession extends EventEmitter {
       const companion = this.#companion;
       if (companion instanceof DaemonCompanion && !companion.same(info) && this.#companion === companion) {
         await this.#stopCompanion();
+        this.#releaseHold();
       }
     } catch (error) {
       if (this.#stopped || this.#attached) return;
@@ -1832,6 +2139,9 @@ class IosFastSession extends EventEmitter {
     const attached = this.#attached;
     this.#daemonConnection = null;
     this.#attached = false;
+    this.#subscribed = false;
+    this.#daemonState = null;
+    this.#syncOwnReads();
     if (!connection) return;
     if (attached && connection.open) {
       await connection.request({ op: "detach" }, { timeoutMs: DAEMON_DETACH_MS }).catch(() => {});
@@ -1850,7 +2160,9 @@ class IosFastSession extends EventEmitter {
     if (!this.#companion) {
       const companion = new IdbCompanion({ udid: this.#udid, binary: this.#binary });
       companion.on("exit", ({ code, signal, expected }) => {
-        if (expected || !this.listenerCount("error")) return;
+        if (expected) return;
+        this.#releaseHold();
+        if (!this.listenerCount("error")) return;
         const tail = companion.logTail().slice(-3).join(" | ");
         this.emit("error", new Error(`idb_companion exited (${signal ?? `code ${code}`})${tail ? `: ${tail}` : ""}`));
       });
@@ -1862,9 +2174,13 @@ class IosFastSession extends EventEmitter {
     await this.#describe(client);
     await this.#readOrientation(client);
     if (this.#stopped) return { abnormal: false, ranMs: 0 };
-    const stream = await client.openVideoStream(this.#video);
+    const video = this.#wantedVideo;
+    const stream = await client.openVideoStream(video);
     this.#stream = stream;
+    this.#streamVideo = video;
     this.#stats.streamsOpened += 1;
+    // Asked for while this stream opened: it goes the way any other change goes.
+    if (!this.#videoCurrent) this.#watchChanged();
     const openedAt = performance.now();
     let error = null;
     this.#streamFail = (watchdog) => { error ??= watchdog; };
@@ -1876,7 +2192,10 @@ class IosFastSession extends EventEmitter {
     } finally {
       this.#clearFrameWatch();
       this.#streamFail = null;
-      if (this.#stream === stream) this.#stream = null;
+      if (this.#stream === stream) {
+        this.#stream = null;
+        this.#streamVideo = null;
+      }
     }
     const closed = await stream.closed;
     return { abnormal: closed.abnormal, error: error ?? closed.error ?? null, ranMs: performance.now() - openedAt };
@@ -1912,6 +2231,7 @@ class IosFastSession extends EventEmitter {
   async #describe(client) {
     try {
       const { screen } = await client.describe({ timeoutMs: 3000 });
+      if (screen?.width && screen?.height) this.#fullSize = { width: screen.width, height: screen.height };
       if (screen?.widthPoints && screen?.heightPoints) {
         this.#points = { width: screen.widthPoints, height: screen.heightPoints };
       } else if (screen?.width && screen?.height && screen?.density) {
@@ -1925,13 +2245,17 @@ class IosFastSession extends EventEmitter {
   async #readOrientation(client) {
     let name;
     try {
-      name = await client.getOrientation({ timeoutMs: 2000 });
+      name = await client.getOrientation({ timeoutMs: IDB_OWN_READ_TIMEOUT_MS });
     } catch {
       return;
     }
+    this.#setOrientation(name);
+  }
+
+  /** The picture stays portrait when the Simulator rotates; the page turns it (IOSF-006). */
+  #setOrientation(name) {
     // Face up or down and unknown keep the orientation the screen is drawn in.
-    if (!["PORTRAIT", "PORTRAIT_UPSIDE_DOWN", "LANDSCAPE_LEFT", "LANDSCAPE_RIGHT"].includes(name)) return;
-    if (name === this.#orientation) return;
+    if (!DRAWN_ORIENTATIONS.includes(name) || name === this.#orientation) return;
     this.#orientation = name;
     this.emit("orientation", name);
   }
@@ -1943,6 +2267,12 @@ class IosFastSession extends EventEmitter {
       if (frame.width && frame.height &&
         (frame.width !== this.#size?.width || frame.height !== this.#size?.height)) {
         this.#size = { width: frame.width, height: frame.height };
+        // Without a describe answer the full size follows from this stream's own scale.
+        if (!this.#fullSize) {
+          const scale = this.#streamVideo?.scaleFactor ?? 1;
+          this.#fullSize = { width: Math.round(frame.width / scale), height: Math.round(frame.height / scale) };
+          if (!this.#videoCurrent) this.#watchChanged();
+        }
         // Without a describe answer, an iPhone's picture is three pixels per point.
         this.#points ??= { width: Math.round(frame.width / 3), height: Math.round(frame.height / 3) };
         this.emit("session", { ...this.#size });
@@ -1955,6 +2285,8 @@ class IosFastSession extends EventEmitter {
       this.#setState("streaming");
       this.#settleFirst(null);
     }
+    // Nobody watches this stream: it stops once that settled, see #stopVideo.
+    if (!this.#watched && !this.#stoppingVideo && !this.#watchTimer) this.#watchChanged();
     // The CONFIG message carries SPS and PPS, which the page puts before each key frame.
     const data = frame.key && frame.config ? withoutParameterSets(frame.data) : frame.data;
     if (frame.key) {
@@ -1965,6 +2297,8 @@ class IosFastSession extends EventEmitter {
     }
     this.#stats.packets += 1;
     this.#stats.bytes += frame.data.length;
+    this.#frameTimes.push(performance.now());
+    if (this.#frameTimes.length > MAX_FRAME_TIMES) this.#frameTimes.shift();
     const pts = Math.max(0, Math.round((frame.receivedAt - this.#t0) * 1000));
     this.emit("packet", { keyFrame: frame.key, pts, data });
   }
@@ -1973,7 +2307,8 @@ class IosFastSession extends EventEmitter {
     this.#keyFrameTimer = setTimeout(() => {
       this.#keyFrameTimer = null;
       if (this.#keyFrameWantedAt === null || this.#stopped) return;
-      const wait = this.#forcedKeyFrameAt + IDB_FORCED_KEY_FRAME_MS - performance.now();
+      const gap = this.#onChange ? IDB_ON_CHANGE_KEY_FRAME_MS : IDB_FORCED_KEY_FRAME_MS;
+      const wait = this.#forcedKeyFrameAt + gap - performance.now();
       if (wait > 0) {
         this.#armKeyFrameTimer(wait);
         return;
@@ -1992,76 +2327,34 @@ class IosFastSession extends EventEmitter {
    */
   #restartStream(reason) {
     const stream = this.#stream;
-    if (!stream || stream.done || this.#streamRestarting) return;
-    this.#streamRestarting = true;
+    if (!stream || stream.done || this.#restarting || this.#stoppingVideo) return;
+    this.#restart(stream, reason);
+  }
+
+  /** The Start goes out with the settings wanted now; true once it did. */
+  #restart(stream, reason) {
+    const video = this.#wantedVideo;
+    this.#restartedAt = performance.now();
     this.#stats.streamRestarts += 1;
-    stream.restart().then(() => {
+    this.#restarting = stream.restart({ options: video }).then(() => {
       this.#stats.streamsOpened += 1;
-      if (this.#stream === stream && !stream.done && !this.#stopped) this.#watchFirstFrame(stream);
+      this.#restarting = null;
+      if (this.#stream !== stream || stream.done || this.#stopped) return true;
+      this.#streamVideo = video;
+      this.#watchFirstFrame(stream);
+      // Whatever changed during the restart goes next: a new size, or nobody watching any more.
+      if (!this.#watched || !this.#videoCurrent) this.#watchChanged();
+      return true;
     }, (error) => {
+      this.#restarting = null;
       // An abnormal end is reported by the run loop, with this same error.
-      if (stream.abnormal || !this.listenerCount("error")) return;
-      this.emit("error", new Error(`idb stream restart (${reason}) failed: ${error.message}`));
-    }).finally(() => {
-      this.#streamRestarting = false;
+      if (!stream.abnormal && this.listenerCount("error")) {
+        this.emit("error", new Error(`idb stream restart (${reason}) failed: ${error.message}`));
+      }
+      return false;
     });
+    return this.#restarting;
   }
-
-  /** A Simulator that shuts down freezes the stream; once it is Booted again the stream restarts. */
-  #watchSimulator() {
-    const tick = async () => {
-      this.#watchTimer = null;
-      if (this.#stopped) return;
-      const state = await simulatorState(this.#xcrun, this.#udid).catch(() => null);
-      if (this.#stopped) return;
-      try {
-        if (state !== null) {
-          const booted = state === "Booted";
-          if (!booted && this.#booted) {
-            this.#booted = false;
-            if (this.#state === "streaming") this.#setState("restarting");
-          } else if (booted && !this.#booted) {
-            this.#booted = true;
-            this.#restartStream("the Simulator booted again");
-          }
-        }
-      } catch (error) {
-        // A listener that throws must not end the watch, nor the Canvas.
-        if (this.listenerCount("error")) this.emit("error", error);
-      }
-      this.#watchTimer = setTimeout(tick, IDB_SIMULATOR_WATCH_MS);
-      this.#watchTimer.unref?.();
-    };
-    this.#watchTimer = setTimeout(tick, IDB_SIMULATOR_WATCH_MS);
-    this.#watchTimer.unref?.();
-  }
-
-  /** The picture stays portrait when the Simulator rotates; the page turns it (IOSF-006). */
-  #watchOrientation() {
-    const tick = async () => {
-      this.#orientationTimer = null;
-      if (this.#stopped) return;
-      const client = this.#companion?.client;
-      try {
-        if (client && !client.closed && this.#state === "streaming" && this.#booted) await this.#readOrientation(client);
-      } catch (error) {
-        if (this.listenerCount("error")) this.emit("error", error);
-      }
-      if (this.#stopped) return;
-      this.#orientationTimer = setTimeout(tick, IDB_ORIENTATION_MS);
-      this.#orientationTimer.unref?.();
-    };
-    this.#orientationTimer = setTimeout(tick, IDB_ORIENTATION_MS);
-    this.#orientationTimer.unref?.();
-  }
-}
-
-/** The state `simctl` reports for one Simulator ("Booted", "Shutdown", ...), "Unknown" when it is gone. */
-async function simulatorState(xcrunPath, udid) {
-  const { stdout } = await execFileAsync(xcrunPath, ["simctl", "list", "devices", "--json"],
-    { timeout: 5000, encoding: "utf8" });
-  const devices = Object.values(JSON.parse(stdout).devices ?? {}).flat();
-  return devices.find((device) => device.udid === udid)?.state ?? "Unknown";
 }
 
 const ANNEX_B_START = Buffer.from([0, 0, 0, 1]);
@@ -2170,6 +2463,8 @@ function stateMessage(context) {
     ...(isIosCanvas(context)
       ? {
         orientation: context.session?.orientation ?? null, rotation: iosRotation(context),
+        // False once the Simulator was said to be down, so a tile can say so.
+        booted: context.session instanceof IosFastSession ? context.session.booted : null,
         // Whether paste and clipboard-get reach the Simulator clipboard (simctl on this Mac).
         clipboard: iosClipboardRefusal(context) === null,
       }
@@ -2271,13 +2566,22 @@ function streamSettings(context) {
   const ios = isIosCanvas(context);
   const profile = context.profile ?? null;
   const fast = FAST_TRANSPORTS.has(chooseTransport(context));
-  const fastFps = profile ? profile.fps : context.options.fpsExplicit ? context.options.fps : DEFAULT_SCRCPY_MAX_FPS;
+  // On iOS the tiles can ask for less than the profile: what the stream runs at is reported.
+  const scale = context.session instanceof IosFastSession ? context.session.scaleFactor : profile?.scaleFactor ?? 1;
   return {
     choice: context.displayChoice ? { ...context.displayChoice } : null,
-    fps: fast ? fastFps : multipartFps(context),
+    fps: fast ? fastStreamFps(context) : multipartFps(context),
     max_size: ios ? null : Number.isFinite(profile?.maxSize) ? profile.maxSize : streamSizeInUse(context)?.maxSize ?? null,
-    scale_factor: ios ? profile?.scaleFactor ?? 1 : null,
+    scale_factor: ios ? scale : null,
   };
+}
+
+/** The frame rate of a fast stream: the profile's, else --fps, else the platform's own. */
+function fastStreamFps(context) {
+  const { options, profile } = context;
+  if (profile) return profile.fps;
+  if (isIosCanvas(context)) return ownFps("ios", options);
+  return options.fpsExplicit ? options.fps : DEFAULT_SCRCPY_MAX_FPS;
 }
 
 /** Start the device server (or companion) for the first WebSocket client; at most one per Canvas. */
@@ -2290,7 +2594,7 @@ function ensureSession(context) {
   // A workspace device streams with its focus profile (contract 3.7): its frame rate, and
   // in the background a smaller Android size or iOS scale.
   const profile = context.profile ?? null;
-  const maxFps = profile ? profile.fps : options.fpsExplicit ? options.fps : DEFAULT_SCRCPY_MAX_FPS;
+  const maxFps = fastStreamFps(context);
   const profileSize = Number.isFinite(profile?.maxSize) ? profile.maxSize : null;
   if (profileSize !== null && transport === "scrcpy") {
     context.state.streamSize = { maxSize: profileSize, source: "profile", encoder: null, encoderName: null };
@@ -2301,7 +2605,6 @@ function ensureSession(context) {
   const session = transport === "idb"
     ? new IosFastSession({
       udid: serial,
-      xcrunPath: adbPath,
       binary: context.idb.path,
       daemon: iosDaemonOptions(context),
       video: {
@@ -2336,7 +2639,7 @@ function ensureSession(context) {
   if (transport === "scrcpy") logStreamSize(context);
   if (context.server?.mode === "workspace") {
     logEvent(context.server, { device: context.id, kind: "stream", name: "start", origin: "system",
-      summary: `${transport} up to ${maxFps} fps` }, { ok: true });
+      summary: maxFps === 0 ? `${transport} on change` : `${transport} up to ${maxFps} fps` }, { ok: true });
   }
   context.session = session;
   session.on("orientation", () => {
@@ -2377,9 +2680,11 @@ function ensureSession(context) {
   const current = (handler) => (value) => {
     if (context.session === session) handler(context, value);
   };
+  session.on("booted", current(broadcastState));
   session.on("session", current(onVideoSession));
   session.on("config", current(onVideoConfig));
   session.on("packet", current(onVideoPacket));
+  session.on("video-stopped", current(onVideoStopped));
   session.on("device-message", current(onDeviceMessage));
   const previous = context.sessionStopping ?? Promise.resolve();
   previous.then(() => {
@@ -2400,6 +2705,21 @@ function ensureSession(context) {
       }
     });
   });
+  syncVideoWatchers(context);
+}
+
+/** Tells an iOS session which tiles show the device now; other sessions have no use for it. */
+function syncVideoWatchers(context) {
+  if (context.session instanceof IosFastSession) context.session.setWatchers(visibleTiles(context.videoClients));
+}
+
+/**
+ * Nothing streams now, so what is cached may be stale when it is shown again: a client that
+ * joins waits for the key frame the next stream starts with.
+ */
+function onVideoStopped(context) {
+  context.video.cache = [];
+  context.video.cacheBytes = 0;
 }
 
 /** AUTONOM_IOS_DAEMON=off (also 0, false or no) keeps the Canvas on a companion of its own. */
@@ -2488,17 +2808,30 @@ function openVideoClient(context, ws, socket) {
   // needs-key → live → dropping (backlog over the limit) → live at the next key frame.
   const client = {
     ws, mode: "needs-key", keyRequested: false, stateStale: false, pendingSession: null, pendingConfig: null,
+    // What the page says it shows of the device (parseWatch); null until it says.
+    watch: null,
   };
   context.videoClients.add(client);
-  ws.on("message", () => {});
-  socket.on("drain", () => catchUpState(context, client));
+  // The only message a video client sends: anything else is ignored.
+  ws.on("message", (data, isBinary) => {
+    const watch = isBinary ? null : parseWatch(data);
+    if (!watch) return;
+    client.watch = watch;
+    syncVideoWatchers(context);
+  });
+  socket.on("drain", () => {
+    catchUpState(context, client);
+    askKeyFrameOnDrain(context, client);
+  });
   ws.on("close", () => {
     context.videoClients.delete(client);
+    syncVideoWatchers(context);
     broadcastState(context);
     scheduleIdleStop(context);
     watchDisplay(context);
   });
   ensureSession(context);
+  syncVideoWatchers(context);
   const video = context.video;
   if (video.sessionMessage) ws.send(video.sessionMessage);
   if (video.configMessage) ws.send(video.configMessage);
@@ -2513,6 +2846,16 @@ function openVideoClient(context, ws, socket) {
   }
   broadcastState(context);
   watchDisplay(context);
+}
+
+/**
+ * A client whose backlog has gone and that still waits for a key frame. The next packet asks
+ * for it (deliverPacket), but on iOS a still screen sends none, so the drain itself has to.
+ */
+function askKeyFrameOnDrain(context, client) {
+  if (!(context.session instanceof IosFastSession) || client.mode === "live" || client.keyRequested) return;
+  client.keyRequested = true;
+  context.session.requestKeyFrame();
 }
 
 function onVideoSession(context, size) {
@@ -2605,7 +2948,8 @@ function deliverPacket(context, client, keyFrame, message) {
       client.ws.send(message);
       client.mode = "live";
     }
-    // Still behind at this key frame: ask again once the backlog has drained.
+    // Still behind at this key frame: ask again once the backlog has drained (a next packet
+    // when there is one, else askKeyFrameOnDrain).
     client.keyRequested = false;
     return;
   }

@@ -2,9 +2,9 @@
 // client, a fake xcrun and a fake process list, each test in its own temporary state base.
 // No real companion, simulator or idb client is used.
 import assert from "node:assert/strict";
-import { execFileSync, spawn } from "node:child_process";
+import { execFile, execFileSync, spawn } from "node:child_process";
 import {
-  chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync,
+  chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, writeFileSync,
 } from "node:fs";
 import { connect as netConnect } from "node:net";
 import { tmpdir } from "node:os";
@@ -35,6 +35,7 @@ import {
   DAEMON_SCRIPT,
   DEFAULT_HID_WAIT_MS,
   DEFAULT_IDLE_MS,
+  DRAWN_ORIENTATIONS,
   DTUHIDD_FLAG,
   DaemonConnection,
   DaemonError,
@@ -66,18 +67,25 @@ import {
   MIN_IDLE_MS,
   OBSERVE_TIMEOUT_MS,
   OPS,
+  ORIENTATION_POLL_MS,
   PRIMING_KEYCODE,
+  QUIET_END_READ_MS,
   QUIET_WARM_MS,
   QUIET_WINDOW_MS,
   RESTART_WAIT_MS,
+  SCREENSHOT_FORMATS,
+  SCREENSHOT_TIMEOUT_MS,
   STAGE,
   STATUS_BAR_PT,
+  TARGET_READ_TIMEOUT_MS,
   WEB_CONTENT_APP_NAMES,
   WEB_CONTENT_BUNDLES,
   chooseReadBackend,
   companionVersionFrom,
   daemonPaths,
+  decodeScreenshotResponse,
   deviceHubIn,
+  encodeScreenshotRequest,
   ensureDaemon,
   frameCoverage,
   freshSilentRun,
@@ -96,6 +104,7 @@ import {
   stuckRestartGap,
   stuckRestartInterval,
   validateInput,
+  validateScreenshot,
   versionAtLeast,
 } from "../plugins/autonom/skills/android-emulator-browser/scripts/ios-device-daemon.mjs";
 import {
@@ -164,7 +173,13 @@ test("the design constants are pinned", () => {
   assert.equal(PRIMING_KEYCODE, 225);
   assert.equal(DTUHIDD_FLAG, "com.apple.coredevice.dtuhidd.active");
   assert.equal(IOSD_SCHEMA, "autonom-iosd/v1");
-  assert.deepEqual([...OPS], ["tree", "tap", "swipe", "button", "key", "quiet", "act", "companion", "attach", "detach", "status", "stop"]);
+  assert.deepEqual([...OPS], ["tree", "tap", "swipe", "button", "key", "quiet", "act", "companion", "attach", "detach", "status", "stop", "subscribe", "screenshot"]);
+  assert.equal(ORIENTATION_POLL_MS, 1000);
+  assert.equal(TARGET_READ_TIMEOUT_MS, 2000);
+  assert.equal(QUIET_END_READ_MS, 5000);
+  assert.deepEqual([...DRAWN_ORIENTATIONS], ["PORTRAIT", "PORTRAIT_UPSIDE_DOWN", "LANDSCAPE_LEFT", "LANDSCAPE_RIGHT"]);
+  assert.equal(SCREENSHOT_TIMEOUT_MS, 10_000);
+  assert.deepEqual([...SCREENSHOT_FORMATS], ["png", "jpeg"]);
   assert.deepEqual([...INPUT_OPS], ["tap", "swipe", "button", "key"]);
   for (const code of [CODE.DISPLAY_NOT_LIT, CODE.INPUT_UNCONFIRMED, CODE.INPUT_BLOCKED, CODE.COMPANION_TOO_OLD]) assert.ok(HINT[code]);
   assert.equal(HID_WAIT_ENV, "AUTONOM_IOSD_HID_WAIT_MS");
@@ -471,10 +486,44 @@ const FAKE_COMPANION = (paths) => `#!${process.execPath}
 import * as http2 from "node:http2";
 import { appendFileSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import {
-  GrpcMessageParser, decodeAccessibilityInfoRequest, decodeHidEvent, encodeAccessibilityInfoResponse,
+  GrpcMessageParser, ORIENTATION_NAMES, decodeAccessibilityInfoRequest, decodeHidEvent, encodeAccessibilityInfoResponse,
   encodeAccessibilityQuiescenceResponse, grpcFrame,
 } from ${JSON.stringify(COMPANION_MODULE)};
 const config = JSON.parse(readFileSync(${JSON.stringify(paths.config)}, "utf8"));
+// What describe and get_orientation answer, read on each call: { state, orientation,
+// describeError, orientationError, describeHang, orientationHang (logged, never answered),
+// readDelayMs (answered that much later), quietEndCode (the gRPC status a quiet call ends
+// with) } (a test changes it with world.setTarget).
+const target = () => {
+  try {
+    return JSON.parse(readFileSync(${JSON.stringify(paths.target)}, "utf8"));
+  } catch {
+    return {};
+  }
+};
+// Enough of the protobuf wire format for those answers and for a screenshot's.
+const varint = (value) => {
+  const out = [];
+  let rest = value;
+  while (rest >= 0x80) {
+    out.push((rest % 0x80) | 0x80);
+    rest = Math.floor(rest / 0x80);
+  }
+  out.push(rest);
+  return Buffer.from(out);
+};
+const field = (number, wire, body) => Buffer.concat([varint((number << 3) | wire), body]);
+const uintField = (number, value) => field(number, 0, varint(value));
+const lenField = (number, value) => {
+  const bytes = Buffer.from(value);
+  return field(number, 2, Buffer.concat([varint(bytes.length), bytes]));
+};
+const doubleField = (number, value) => {
+  const bytes = Buffer.alloc(8);
+  bytes.writeDoubleLE(value);
+  return field(number, 1, bytes);
+};
+const size = (width, height) => Buffer.concat([uintField(1, width), uintField(2, height)]);
 const log = (record) => appendFileSync(${JSON.stringify(paths.events)}, JSON.stringify({ pid: process.pid, ...record }) + "\\n");
 process.stdout.on("error", () => {});
 const args = process.argv.slice(2);
@@ -484,6 +533,11 @@ if (args.includes("--version")) {
 }
 const sock = args[args.indexOf("--grpc-domain-sock") + 1];
 const quietStreams = new Set();
+// world.endQuiet() (SIGCONT): each open quiet call ends now, as when the target goes away.
+const quietEnders = new Set();
+process.on("SIGCONT", () => {
+  for (const finish of [...quietEnders]) finish();
+});
 let quietCalls = 0;
 let hidActive = null;
 const hidWaiting = [];
@@ -645,13 +699,18 @@ server.on("stream", (stream, headers) => {
       else first();
     }
     // The frontmost app exits once: the companion finishes the call after target_exited.
-    if (config.quietEndMs && quietCalls === 1) {
-      setTimeout(() => {
-        send(encodeAccessibilityQuiescenceResponse({ type: "target_exited", pid: 77 }));
-        quietStreams.delete(send);
-        end(0);
-      }, config.quietEndMs);
-    }
+    const finish = () => {
+      if (!quietEnders.delete(finish)) return;
+      send(encodeAccessibilityQuiescenceResponse({ type: "target_exited", pid: 77 }));
+      quietStreams.delete(send);
+      const code = target().quietEndCode ?? 0;
+      end(code, code ? "the target went away" : "");
+    };
+    quietEnders.add(finish);
+    stream.on("close", () => quietEnders.delete(finish));
+    // quietEndEveryMs: every call ends that soon after it opened, not only the first.
+    const endMs = config.quietEndEveryMs ?? (quietCalls === 1 ? config.quietEndMs : undefined);
+    if (endMs) setTimeout(finish, endMs);
     return;
   }
   if (method === "hid") {
@@ -702,6 +761,52 @@ server.on("stream", (stream, headers) => {
         const failure = config.axError?.[request.backend];
         if (failure) return end(2, failure);
         send(encodeAccessibilityInfoResponse(config.ax?.[request.backend] ?? config.ax?.default ?? "[]"));
+        end(0);
+      }
+    });
+    return;
+  }
+  if (method === "describe" || method === "get_orientation") {
+    stream.on("data", (chunk) => {
+      for (const message of parser.push(chunk)) {
+        log({ k: method });
+        open();
+        const now = target();
+        if (method === "describe" ? now.describeHang : now.orientationHang) return;
+        const answer = () => {
+          if (method === "describe") {
+            if (now.describeError) return end(14, now.describeError);
+            send(lenField(1, Buffer.concat([lenField(1, "fake-udid"), lenField(4, now.state ?? "Booted")])));
+          } else {
+            if (now.orientationError) return end(14, now.orientationError);
+            send(uintField(1, Math.max(0, ORIENTATION_NAMES.indexOf(now.orientation ?? "PORTRAIT"))));
+          }
+          end(0);
+        };
+        if (now.readDelayMs) setTimeout(answer, now.readDelayMs);
+        else answer();
+      }
+    });
+    return;
+  }
+  if (method === "screenshot") {
+    // config.screenshot: { error, empty, format, noFormat, noSizes, bytes }.
+    stream.on("data", (chunk) => {
+      for (const message of parser.push(chunk)) {
+        const shot = config.screenshot ?? {};
+        log({ k: "screenshot", request: message.toString("hex") });
+        open();
+        if (shot.error) return end(2, shot.error);
+        const asked = message[0] === 0x08 && message[1] === 1 ? "jpeg" : "png";
+        const at = message.indexOf(0x21);
+        const scale = at >= 0 ? message.readDoubleLE(at + 1) : 1;
+        const parts = [];
+        if (!shot.empty) parts.push(lenField(1, Buffer.alloc(shot.bytes ?? 64, 0xab)));
+        if (!shot.noFormat) parts.push(lenField(2, shot.format ?? asked));
+        if (!shot.noSizes) {
+          parts.push(lenField(3, size(Math.round(1206 * scale), Math.round(2622 * scale))), lenField(4, size(1206, 2622)), doubleField(5, 3));
+        }
+        send(Buffer.concat(parts));
         end(0);
       }
     });
@@ -874,12 +979,22 @@ function harness(t, config = {}, { idleMs = 60_000 } = {}) {
     root, bin, sockets, base: join(root, "home"),
     config: join(root, "config.json"), events: join(root, "events.jsonl"), idbLog: join(root, "idb.jsonl"),
     xcrunLog: join(root, "xcrun.jsonl"), state: join(root, "idb-state.json"), load: join(root, "load"),
+    target: join(root, "target.json"),
     companion: join(bin, "idb_companion"), idb: join(bin, "idb"), xcrun: join(bin, "xcrun"),
   };
   const world = {
     paths,
     setConfig(next) {
       writeFileSync(paths.config, JSON.stringify(next));
+    },
+    // What the fake companion's describe and get_orientation answer from now on.
+    setTarget(next) {
+      writeFileSync(`${paths.target}.tmp`, JSON.stringify(next));
+      renameSync(`${paths.target}.tmp`, paths.target);
+    },
+    // Ends the open quiet calls of the running fake companion.
+    endQuiet() {
+      process.kill(world.companionPids().at(-1), "SIGCONT");
     },
     // The host's 1-minute load as the daemon reads it (0 unless a test says otherwise).
     setLoad(value) {
@@ -894,6 +1009,9 @@ function harness(t, config = {}, { idleMs = 60_000 } = {}) {
     events: () => jsonLines(paths.events),
     hid: () => jsonLines(paths.events).filter((r) => r.k === "hid").map((r) => r.e),
     reads: () => jsonLines(paths.events).filter((r) => r.k === "read"),
+    orientationReads: () => jsonLines(paths.events).filter((r) => r.k === "get_orientation"),
+    describeReads: () => jsonLines(paths.events).filter((r) => r.k === "describe"),
+    screenshots: () => jsonLines(paths.events).filter((r) => r.k === "screenshot"),
     companionPids: () => [...new Set(jsonLines(paths.events).filter((r) => r.k === "start").map((r) => r.pid))],
     idbCalls: () => jsonLines(paths.idbLog),
     xcrunCalls: () => jsonLines(paths.xcrunLog),
@@ -1409,7 +1527,7 @@ test("ID-04-S01: a 1.1.8 companion without accessibility_quiescence makes the da
   assert.equal(status.status, "unsupported");
   assert.equal(status.reason, "companion_too_old");
   assert.equal(status.companion_version, "1.1.8");
-  for (const op of ["tree", "tap", "swipe", "button", "key", "quiet", "act", "attach", "detach", "companion"]) {
+  for (const op of ["tree", "tap", "swipe", "button", "key", "quiet", "act", "attach", "detach", "companion", "subscribe", "screenshot"]) {
     const reply = await requestDaemon(status.socket, { id: op, op, x: 1, y: 1 });
     assert.equal(reply.ok, false, op);
     assert.equal(reply.error.code, "companion_too_old", op);
@@ -3033,6 +3151,769 @@ test("an act whose read fails after the input reports after_send with the input 
   assert.equal(reply.input_confirmed, true);
   assert.equal(reply.method, "quiet-stream");
   await assertRecorded(() => tapPairs(world.hid()), ["down@2,2", "up@2,2"]);
+});
+
+// ---------------------------------------------------------------------------
+// CU-04: subscribe, and the orientation poll that runs only while watched
+// ---------------------------------------------------------------------------
+
+/** A subscribed connection and the events it got, in order. */
+async function subscriber(t, world, status, options = {}) {
+  const connection = await world.connect(status);
+  const events = [];
+  const reply = await connection.subscribe((event) => events.push(event), options);
+  assert.equal(reply.ok, true);
+  return { connection, events, reply };
+}
+
+const until = (events, check, message) => waitFor(() => events.find(check), { timeoutMs: 8000, message });
+const statusOf = (status) => requestDaemon(status.socket, { id: "s", op: "status" });
+/** Reads start at least ORIENTATION_POLL_MS apart, so a span of `ms` holds at most this many. */
+const mostReads = (ms) => Math.floor(ms / ORIENTATION_POLL_MS) + 1;
+const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+/** CU-04-S02's 3 s includes the Canvas, so the daemon's push has to leave it some of them. */
+const SHUTDOWN_PUSH_MS = 2500;
+
+test("CU-04: subscribe answers first, then sends the current state and orientation, then what changes", async (t) => {
+  const world = harness(t);
+  world.setTarget({ orientation: "LANDSCAPE_LEFT" });
+  const status = await world.start();
+  const raw = await rawConnection(t, status.socket);
+  raw.socket.write(`${JSON.stringify({ id: "sub", op: "subscribe" })}\n`);
+  await waitFor(() => raw.lines.some((line) => line.event === "orientation"), { timeoutMs: 5000, message: "the first orientation" });
+  assert.deepEqual(raw.lines[0], { id: "sub", ok: true, subscribed: true, watching: true, subscribers: 1, watchers: 1 });
+  assert.deepEqual(raw.lines[1], { event: "state", udid: UDID, state: "serving", booted: null, target_state: null },
+    "the first event is the state as it is, nothing read yet");
+  assert.ok(raw.lines.some((line) => line.event === "state" && line.booted === true && line.target_state === "Booted"));
+  assert.ok(raw.lines.some((line) => line.event === "orientation" && line.orientation === "LANDSCAPE_LEFT" && line.udid === UDID));
+  const reply = await statusOf(status);
+  assert.deepEqual([reply.subscribers, reply.watchers, reply.booted, reply.target_state, reply.orientation],
+    [1, 1, true, "Booted", "LANDSCAPE_LEFT"]);
+  assert.ok(reply.orientation_reads >= 1);
+  assert.equal(reply.requests_by_op.subscribe, 1);
+
+  // A later subscriber gets all of it at once, with no read of its own.
+  const late = await rawConnection(t, status.socket);
+  late.socket.write(`${JSON.stringify({ id: "late", op: "subscribe", watching: false })}\n`);
+  await waitFor(() => late.lines.length >= 3, { timeoutMs: 5000, message: "the current state" });
+  assert.deepEqual(late.lines.map((line) => line.id ?? line.event), ["late", "state", "orientation"]);
+  assert.deepEqual([late.lines[1].booted, late.lines[2].orientation], [true, "LANDSCAPE_LEFT"]);
+  assert.deepEqual([late.lines[0].watching, late.lines[0].subscribers, late.lines[0].watchers], [false, 2, 1]);
+});
+
+test("CU-04: subscribe refuses a watching that is not true or false, and the connection does not subscribe", async (t) => {
+  const world = harness(t);
+  const status = await world.start();
+  const connection = await world.connect(status);
+  const reply = await connection.request({ op: "subscribe", watching: "yes" });
+  assert.deepEqual([reply.ok, reply.error.code, reply.error.stage], [false, "invalid_request", "before_send"]);
+  const after = await statusOf(status);
+  assert.deepEqual([after.subscribers, after.watchers], [0, 0]);
+});
+
+waitingTest("CU-04-S01: with nobody watching the daemon reads nothing on a timer, even with a subscriber that is not watching", async (t) => {
+  const world = harness(t);
+  const status = await world.start();
+  await new Promise((resolve) => setTimeout(resolve, ORIENTATION_POLL_MS + 200));
+  await subscriber(t, world, status, { watching: false });
+  await new Promise((resolve) => setTimeout(resolve, ORIENTATION_POLL_MS + 200));
+  assert.equal(world.orientationReads().length, 0);
+  assert.equal(world.describeReads().length, 0);
+  assert.equal((await statusOf(status)).orientation_reads, 0);
+});
+
+waitingTest("CU-04-S01: two watchers share one poll of at most one read a second, and it stops when the last one leaves; no process is started", { timeout: 30_000 }, async (t) => {
+  const world = harness(t);
+  const status = await world.start();
+  const idbBefore = world.idbCalls().length;
+  const t0 = Date.now();
+  const one = await subscriber(t, world, status);
+  const two = await subscriber(t, world, status);
+  await until(two.events, (event) => event.booted === true, "the first read");
+  await new Promise((resolve) => setTimeout(resolve, 3 * ORIENTATION_POLL_MS + 300));
+  const reads = world.orientationReads().length;
+  const spent = Date.now() - t0;
+  assert.ok(reads >= 2 && reads <= mostReads(spent), `${reads} reads in ${spent} ms`);
+  // One leaves: the other still watches.
+  await one.connection.subscribe(() => {}, { watching: false });
+  assert.equal((await statusOf(status)).watchers, 1);
+  const during = world.orientationReads().length;
+  await waitFor(() => world.orientationReads().length > during, { timeoutMs: 3000, message: "the poll going on" });
+  // The last one leaves: once a read in flight landed, nothing more.
+  const last = await two.connection.subscribe(() => {}, { watching: false });
+  assert.deepEqual([last.watching, last.subscribers, last.watchers], [false, 2, 0]);
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  const stopped = world.orientationReads().length;
+  await new Promise((resolve) => setTimeout(resolve, 2 * ORIENTATION_POLL_MS + 200));
+  assert.equal(world.orientationReads().length, stopped, "no read while nobody watches");
+  // No process was started for any of it.
+  assert.deepEqual(world.xcrunCalls(), []);
+  assert.equal(world.idbCalls().length, idbBefore);
+});
+
+waitingTest("CU-04: a connection that closes stops watching, and a flapping watcher never reads faster than the poll", { timeout: 30_000 }, async (t) => {
+  const world = harness(t);
+  const status = await world.start();
+  const t0 = Date.now();
+  const { connection } = await subscriber(t, world, status);
+  for (let i = 0; i < 12; i += 1) {
+    await connection.subscribe(() => {}, { watching: i % 2 === 1 });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  const reads = world.orientationReads().length;
+  const spent = Date.now() - t0;
+  assert.ok(reads >= 1 && reads <= mostReads(spent), `${reads} reads in ${spent} ms`);
+  connection.close();
+  await waitFor(async () => (await statusOf(status)).subscribers === 0, { timeoutMs: 3000, message: "the subscriber to leave" });
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  const stopped = world.orientationReads().length;
+  await new Promise((resolve) => setTimeout(resolve, 2 * ORIENTATION_POLL_MS + 200));
+  assert.equal(world.orientationReads().length, stopped);
+});
+
+waitingTest("CU-04: an orientation is pushed once when it changes; face up, face down, unknown and a failed read keep the last one", { timeout: 30_000 }, async (t) => {
+  const world = harness(t);
+  const status = await world.start();
+  const { events } = await subscriber(t, world, status);
+  const turns = () => events.filter((event) => event.event === "orientation").map((event) => event.orientation);
+  await until(events, (event) => event.orientation === "PORTRAIT", "the first orientation");
+  world.setTarget({ orientation: "LANDSCAPE_RIGHT" });
+  await until(events, (event) => event.orientation === "LANDSCAPE_RIGHT", "the turn");
+  for (const orientation of ["FACE_UP", "FACE_DOWN", "UNKNOWN"]) {
+    world.setTarget({ orientation });
+    const seen = world.orientationReads().length;
+    await waitFor(() => world.orientationReads().length >= seen + 2, { timeoutMs: 6000, message: `a read of ${orientation}` });
+  }
+  world.setTarget({ orientationError: "no orientation now" });
+  const seen = world.orientationReads().length;
+  await waitFor(() => world.orientationReads().length >= seen + 2, { timeoutMs: 6000, message: "a failed read" });
+  assert.deepEqual(turns(), ["PORTRAIT", "LANDSCAPE_RIGHT"]);
+  assert.equal((await statusOf(status)).orientation, "LANDSCAPE_RIGHT");
+});
+
+waitingTest("CU-04-S02: a simulator that shuts down is pushed from describe within 3 s, the orientation is not read then, and a boot is pushed too", { timeout: 30_000 }, async (t) => {
+  const world = harness(t);
+  const status = await world.start();
+  const { events } = await subscriber(t, world, status);
+  await until(events, (event) => event.booted === true, "the first read");
+  const t0 = Date.now();
+  world.setTarget({ state: "Shutdown" });
+  const down = await until(events, (event) => event.booted === false, "the shutdown");
+  assert.ok(Date.now() - t0 < 3000, `pushed after ${Date.now() - t0} ms`);
+  assert.deepEqual(down, { event: "state", udid: UDID, state: "serving", booted: false, target_state: "Shutdown" });
+  // The read in flight lands; after it only describe runs.
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  const seen = world.orientationReads().length;
+  const described = world.describeReads().length;
+  await waitFor(() => world.describeReads().length >= described + 2, { timeoutMs: 6000, message: "describe going on" });
+  assert.equal(world.orientationReads().length, seen);
+  world.setTarget({ state: "Booted" });
+  await waitFor(() => events.findLast((event) => event.event === "state").booted === true, { timeoutMs: 4000, message: "the boot" });
+  const again = world.orientationReads().length;
+  await waitFor(() => world.orientationReads().length > again, { timeoutMs: 4000, message: "orientation reads again" });
+  assert.equal(events.filter((event) => event.target_state === "Shutdown").length, 1, "one event per change");
+});
+
+waitingTest("CU-04: a failed describe keeps the last boot state", { timeout: 30_000 }, async (t) => {
+  const world = harness(t);
+  const status = await world.start();
+  const { events } = await subscriber(t, world, status);
+  await until(events, (event) => event.booted === true, "the first read");
+  world.setTarget({ describeError: "busy" });
+  const seen = world.describeReads().length;
+  await waitFor(() => world.describeReads().length >= seen + 2, { timeoutMs: 6000, message: "failed reads" });
+  assert.equal((await statusOf(status)).booted, true);
+  assert.equal(events.filter((event) => event.event === "state").at(-1).booted, true);
+});
+
+waitingTest("CU-04-S02: a get_orientation that hangs from the shutdown on does not hold back the describe that answered", { timeout: 30_000 }, async (t) => {
+  const world = harness(t);
+  const status = await world.start();
+  const { events } = await subscriber(t, world, status);
+  await until(events, (event) => event.booted === true, "the first read");
+  const t0 = Date.now();
+  world.setTarget({ state: "Shutdown", orientationHang: true });
+  await until(events, (event) => event.booted === false, "the shutdown");
+  assert.ok(Date.now() - t0 < SHUTDOWN_PUSH_MS, `pushed after ${Date.now() - t0} ms`);
+});
+
+waitingTest("CU-04-S02: a shutdown that lands during a get_orientation that hangs is pushed by the next describe", { timeout: 30_000 }, async (t) => {
+  const world = harness(t);
+  const status = await world.start();
+  const { events } = await subscriber(t, world, status);
+  await until(events, (event) => event.booted === true, "the first read");
+  world.setTarget({ orientationHang: true });
+  const seen = world.orientationReads().length;
+  await waitFor(() => world.orientationReads().length > seen, { timeoutMs: 4000, message: "a read that hangs" });
+  const t0 = Date.now();
+  world.setTarget({ state: "Shutdown", orientationHang: true });
+  await until(events, (event) => event.booted === false, "the shutdown");
+  assert.ok(Date.now() - t0 < SHUTDOWN_PUSH_MS, `pushed after ${Date.now() - t0} ms`);
+  // That read still ends by its timeout, and then nothing more is asked of a shut down device.
+  await pause(TARGET_READ_TIMEOUT_MS + 200);
+  const reads = world.orientationReads().length;
+  await pause(2 * ORIENTATION_POLL_MS + 200);
+  assert.equal(world.orientationReads().length, reads);
+});
+
+waitingTest("CU-04: while get_orientation hangs, describe keeps its pace, one orientation read waits for the last, and answers resume", { timeout: 30_000 }, async (t) => {
+  const world = harness(t);
+  const status = await world.start();
+  const { events } = await subscriber(t, world, status);
+  await until(events, (event) => event.orientation === "PORTRAIT", "the first orientation");
+  world.setTarget({ orientationHang: true });
+  const turned = world.orientationReads().length;
+  const described = world.describeReads().length;
+  const t0 = Date.now();
+  await pause(3 * ORIENTATION_POLL_MS + 600);
+  const spent = Date.now() - t0;
+  const describes = world.describeReads().length - described;
+  const reads = world.orientationReads().length - turned;
+  assert.ok(describes >= 3, `${describes} describes in ${spent} ms: the poll waited for the hanging read`);
+  assert.ok(reads <= Math.floor(spent / TARGET_READ_TIMEOUT_MS) + 1, `${reads} orientation reads in ${spent} ms: they stacked up`);
+  world.setTarget({ orientation: "LANDSCAPE_LEFT" });
+  await until(events, (event) => event.orientation === "LANDSCAPE_LEFT", "an answer after the hang");
+});
+
+waitingTest("CU-04: a describe that hangs does not hold back the orientation sent with it, holds the next read to its timeout, and keeps the last boot state", { timeout: 30_000 }, async (t) => {
+  const world = harness(t);
+  const status = await world.start();
+  const { events } = await subscriber(t, world, status);
+  await until(events, (event) => event.orientation === "PORTRAIT", "the first orientation");
+  const t0 = Date.now();
+  world.setTarget({ describeHang: true, orientation: "LANDSCAPE_LEFT" });
+  await until(events, (event) => event.orientation === "LANDSCAPE_LEFT", "the turn");
+  assert.ok(Date.now() - t0 < TARGET_READ_TIMEOUT_MS - 100, `pushed after ${Date.now() - t0} ms`);
+  // The first hung read went out at t0 or later, so the next one cannot leave before t0 + the timeout.
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  const seen = world.describeReads().length;
+  await new Promise((resolve) => setTimeout(resolve, Math.max(0, t0 + TARGET_READ_TIMEOUT_MS - 200 - Date.now())));
+  assert.equal(world.describeReads().length, seen, "no second describe while the first hangs");
+  await waitFor(() => world.describeReads().length > seen, { timeoutMs: 5000, message: "the read after the timeout" });
+  assert.equal((await statusOf(status)).booted, true);
+});
+
+waitingTest("CU-04: once the last subscriber left, status and a later subscriber say unknown, never a stale value", { timeout: 30_000 }, async (t) => {
+  const world = harness(t);
+  const status = await world.start();
+  const first = await subscriber(t, world, status);
+  const second = await subscriber(t, world, status, { watching: false });
+  await until(second.events, (event) => event.booted === true, "the boot state");
+  await until(second.events, (event) => event.orientation === "PORTRAIT", "the orientation");
+  first.connection.close();
+  await waitFor(async () => (await statusOf(status)).subscribers === 1, { timeoutMs: 3000, message: "one subscriber to leave" });
+  const kept = await statusOf(status);
+  assert.deepEqual([kept.booted, kept.target_state, kept.orientation], [true, "Booted", "PORTRAIT"], "a subscriber is still there");
+  second.connection.close();
+  await waitFor(async () => (await statusOf(status)).subscribers === 0, { timeoutMs: 3000, message: "the last subscriber to leave" });
+  const gone = await statusOf(status);
+  assert.deepEqual([gone.booted, gone.target_state, gone.orientation], [null, null, null]);
+
+  // The simulator shuts down with nobody listening: the next subscriber is told nothing wrong.
+  world.setTarget({ state: "Shutdown" });
+  const late = await rawConnection(t, status.socket);
+  late.socket.write(`${JSON.stringify({ id: "late", op: "subscribe", watching: false })}\n`);
+  await waitFor(() => late.lines.length >= 2, { timeoutMs: 3000, message: "the current state" });
+  await pause(200);
+  assert.deepEqual(late.lines.slice(1), [{ event: "state", udid: UDID, state: "serving", booted: null, target_state: null }]);
+  // Once it watches it learns the truth.
+  late.socket.write(`${JSON.stringify({ id: "watch", op: "subscribe", watching: true })}\n`);
+  await waitFor(() => late.lines.some((line) => line.booted === false), { timeoutMs: 3000, message: "the shutdown" });
+});
+
+waitingTest("CU-04: answers that land after the last subscriber left are not kept", { timeout: 30_000 }, async (t) => {
+  const world = harness(t);
+  const status = await world.start();
+  const { connection, events } = await subscriber(t, world, status);
+  await until(events, (event) => event.booted === true, "the first read");
+  world.setTarget({ readDelayMs: 600 });
+  const seen = world.describeReads().length;
+  await waitFor(() => world.describeReads().length > seen, { timeoutMs: 3000, message: "a read on its way" });
+  connection.close();
+  await waitFor(async () => (await statusOf(status)).subscribers === 0, { timeoutMs: 400, stepMs: 10, message: "the subscriber to leave" });
+  await pause(800);
+  const after = await statusOf(status);
+  assert.deepEqual([after.booted, after.target_state, after.orientation], [null, null, null]);
+});
+
+waitingTest("CU-04: the poll keeps its pace while the companion is replaced, with nothing to read, and never spins", { timeout: 30_000 }, async (t) => {
+  const world = harness(t, { idb: { laterConnectDelayMs: 1500 } });
+  const status = await world.start();
+  const { events } = await subscriber(t, world, status);
+  await until(events, (event) => event.booted === true, "the first read");
+  const before = (await statusOf(status)).target_polls;
+  const [pid] = world.companionPids();
+  const t0 = Date.now();
+  process.kill(pid, "SIGKILL");
+  const lost = await until(events, (event) => event.state === "companion_restarting", "the loss");
+  const lostAt = Date.now();
+  await until(events, (event) => events.indexOf(event) > events.indexOf(lost) && event.state === "serving", "the replacement");
+  const restarting = Date.now() - lostAt;
+  const polls = (await statusOf(status)).target_polls - before;
+  const spent = Date.now() - t0;
+  assert.ok(restarting >= ORIENTATION_POLL_MS, `the restart took only ${restarting} ms, too short to prove anything`);
+  assert.ok(polls >= 1 && polls <= mostReads(spent) + 1, `${polls} ticks in ${spent} ms`);
+});
+
+waitingTest("CU-04: a lost companion is pushed with its boot state unknown, the replacement too, and the poll goes on through it", { timeout: 30_000 }, async (t) => {
+  const world = harness(t);
+  const status = await world.start();
+  const { events } = await subscriber(t, world, status);
+  await until(events, (event) => event.booted === true, "the first read");
+  const [pid] = world.companionPids();
+  process.kill(pid, "SIGKILL");
+  const lost = await until(events, (event) => event.state === "companion_restarting", "the loss");
+  assert.deepEqual([lost.booted, lost.target_state], [null, null], "nothing is known without a companion");
+  await until(events, (event) => events.indexOf(event) > events.indexOf(lost) && event.state === "serving" && event.booted === null, "the replacement");
+  await until(events, (event) => events.indexOf(event) > events.indexOf(lost) && event.state === "serving" && event.booted === true, "the boot state again");
+  await waitFor(() => world.companionPids().length === 2 && world.orientationReads().some((read) => read.pid !== pid),
+    { timeoutMs: 5000, message: "the poll on the new companion" });
+});
+
+waitingTest("CU-04: with nobody watching, a quiet stream that ends gets one describe, so a shutdown still reaches a subscriber", { timeout: 30_000 }, async (t) => {
+  const world = harness(t, { quietEndMs: 4000 });
+  const status = await world.start();
+  const { events } = await subscriber(t, world, status, { watching: false });
+  world.setTarget({ state: "Shutdown" });
+  const down = await until(events, (event) => event.booted === false, "the shutdown");
+  assert.equal(down.target_state, "Shutdown");
+  assert.equal(world.orientationReads().length, 0, "still no orientation read");
+  assert.equal(world.describeReads().length, 1);
+});
+
+// Late enough to land after a read sent behind it, and inside TARGET_READ_TIMEOUT_MS.
+const SLOW_READ_MS = 1500;
+
+/** Waits until a `describe` that will answer Booted, SLOW_READ_MS later, is on its way. */
+async function slowBootedRead(world, start = () => {}) {
+  world.setTarget({ readDelayMs: SLOW_READ_MS });
+  const seen = world.describeReads().length;
+  start();
+  await waitFor(() => world.describeReads().length > seen, { timeoutMs: 3000, stepMs: 10, message: "a slow read on its way" });
+}
+
+/** The newer Shutdown holds after the older Booted landed, and that answer was dropped, not lost. */
+async function assertStaysShutdown(world, status, events) {
+  const down = await until(events, (event) => event.booted === false, "the shutdown");
+  await pause(SLOW_READ_MS + 200);
+  const states = events.filter((event) => event.event === "state");
+  assert.deepEqual(states.slice(states.indexOf(down)).filter((event) => event.booted !== false), [], "no event went back");
+  const after = await statusOf(status);
+  assert.deepEqual([after.target_state, after.booted], ["Shutdown", false]);
+  assert.deepEqual(logged(world, "target_read_stale").map((record) => record.target_state), ["Booted"]);
+}
+
+waitingTest("CU-04: while watched, a slow Booted from the poll never undoes the newer Shutdown read when a stream ended", { timeout: 30_000 }, async (t) => {
+  const world = harness(t);
+  const status = await world.start();
+  const { events } = await subscriber(t, world, status);
+  await until(events, (event) => event.booted === true, "the first read");
+  await slowBootedRead(world);
+  world.setTarget({ state: "Shutdown" });
+  world.endQuiet();
+  await assertStaysShutdown(world, status, events);
+});
+
+waitingTest("CU-04: a slow Booted never undoes a newer Shutdown after the subscriber stopped watching, when no later read would mend it", { timeout: 30_000 }, async (t) => {
+  const world = harness(t);
+  const status = await world.start();
+  const { connection, events } = await subscriber(t, world, status);
+  await until(events, (event) => event.booted === true, "the first read");
+  await slowBootedRead(world);
+  const reply = await connection.subscribe((event) => events.push(event), { watching: false });
+  assert.equal(reply.watchers, 0);
+  world.setTarget({ state: "Shutdown" });
+  world.endQuiet();
+  await assertStaysShutdown(world, status, events);
+});
+
+waitingTest("CU-04: a slow Booted from a stream ending never undoes the newer Shutdown of the poll", { timeout: 30_000 }, async (t) => {
+  const world = harness(t);
+  const status = await world.start();
+  const { connection, events } = await subscriber(t, world, status, { watching: false });
+  await slowBootedRead(world, () => world.endQuiet());
+  world.setTarget({ state: "Shutdown" });
+  await connection.subscribe((event) => events.push(event), { watching: true });
+  await assertStaysShutdown(world, status, events);
+});
+
+waitingTest("CU-04: a read sent before the last subscriber left is not handed to the next one", { timeout: 30_000 }, async (t) => {
+  const world = harness(t);
+  const status = await world.start();
+  const { connection, events } = await subscriber(t, world, status);
+  await until(events, (event) => event.orientation === "PORTRAIT", "the first orientation");
+  await slowBootedRead(world);
+  connection.close();
+  await waitFor(async () => (await statusOf(status)).subscribers === 0, { timeoutMs: 1000, stepMs: 10, message: "the subscriber to leave" });
+  world.setTarget({ state: "Shutdown" });
+  const late = await subscriber(t, world, status, { watching: false });
+  await pause(SLOW_READ_MS + 200);
+  assert.deepEqual(late.events.filter((event) => event.target_state || event.orientation), []);
+  const after = await statusOf(status);
+  assert.deepEqual([after.subscribers, after.booted, after.target_state, after.orientation], [1, null, null, null]);
+});
+
+// How long past QUIET_END_READ_MS a read of streams ending at once may take: the ending
+// that finds it due comes one reopen later, and the machine may be busy.
+const ENDING_READ_SLACK_MS = 3000;
+const ENDING_READ_MS = QUIET_END_READ_MS + ENDING_READ_SLACK_MS;
+/** Reads of endings at once start at least QUIET_END_READ_MS apart: what a span of `ms` holds at most. */
+const mostEndingReads = (ms) => Math.floor(ms / QUIET_END_READ_MS) + 1;
+
+/** Waits until an event says this, or the limit on a read of streams ending at once has passed. */
+function endingReadBrings(events, check, message) {
+  return waitFor(() => events.find(check), { timeoutMs: ENDING_READ_MS, stepMs: 10, message });
+}
+
+const quietOpens = (world) => world.events().filter((event) => event.k === "quiet_open").length;
+
+/** Waits until the quiet stream was opened `count` more times. */
+async function reopens(world, count) {
+  const from = quietOpens(world);
+  await waitFor(() => quietOpens(world) >= from + count, { timeoutMs: (count + 2) * 2000, message: `${count} reopens` });
+}
+
+waitingTest("CU-04: streams that keep ending at once are read once per QUIET_END_READ_MS, not once per reopen", { timeout: 40_000 }, async (t) => {
+  const world = harness(t, { quietEndEveryMs: 50 });
+  world.setTarget({ state: "Shutdown" });
+  const status = await world.start();
+  const t0 = Date.now();
+  const { events } = await subscriber(t, world, status, { watching: false });
+  await until(events, (event) => event.booted === false, "the shutdown");
+  const from = quietOpens(world);
+  await reopens(world, Math.ceil(QUIET_END_READ_MS / 1000) + 2);
+  const reads = world.describeReads().length;
+  assert.ok(reads >= 2, `${reads} reads: an ending always leads to one`);
+  assert.ok(reads <= mostEndingReads(Date.now() - t0), `${reads} reads in ${Date.now() - t0} ms`);
+  assert.ok(quietOpens(world) - from > reads, `${reads} reads in ${quietOpens(world) - from} reopens`);
+  assert.equal(world.orientationReads().length, 0);
+  const after = await statusOf(status);
+  assert.equal(after.orientation_reads, 0);
+});
+
+waitingTest("CU-04: when streams keep ending at once on a Booted answer, a later Shutdown still reaches an unwatched subscriber and status", { timeout: 40_000 }, async (t) => {
+  const world = harness(t, { quietEndEveryMs: 50 });
+  const status = await world.start();
+  const t0 = Date.now();
+  const { events } = await subscriber(t, world, status, { watching: false });
+  // Endings with nobody subscribed sent no read, so the first one here has none to wait for.
+  await until(events, (event) => event.booted === true, "the boot");
+  assert.ok(Date.now() - t0 < SHUTDOWN_PUSH_MS, `the first read came after ${Date.now() - t0} ms`);
+  await waitFor(() => world.describeReads().length >= 2, { timeoutMs: ENDING_READ_MS, message: "a second read that finds nothing new" });
+  const asked = Date.now();
+  world.setTarget({ state: "Shutdown" });
+  const down = await endingReadBrings(events, (event) => event.booted === false, "the shutdown");
+  assert.equal(down.target_state, "Shutdown");
+  assert.ok(Date.now() - asked <= ENDING_READ_MS, `pushed after ${Date.now() - asked} ms`);
+  const after = await statusOf(status);
+  assert.deepEqual([after.target_state, after.booted], ["Shutdown", false]);
+  const reads = world.describeReads().length;
+  assert.ok(reads <= mostEndingReads(Date.now() - t0), `${reads} reads in ${Date.now() - t0} ms`);
+});
+
+waitingTest("CU-04: a describe with an empty state settles nothing and tells nobody, and the Booted and Shutdown after it still arrive", { timeout: 50_000 }, async (t) => {
+  const world = harness(t, { quietEndEveryMs: 50 });
+  world.setTarget({ state: "" });
+  const status = await world.start();
+  const t0 = Date.now();
+  const { events } = await subscriber(t, world, status, { watching: false });
+  const [first] = await loggedAtLeast(world, "quiet_end_read");
+  assert.equal(first.settled, false, "an answer with no state told nobody anything");
+  assert.equal((await statusOf(status)).booted, null);
+  assert.deepEqual(events.filter((event) => event.target_state), []);
+
+  world.setTarget({ state: "Booted" });
+  await endingReadBrings(events, (event) => event.booted === true, "the boot");
+  world.setTarget({ state: "Shutdown" });
+  const down = await endingReadBrings(events, (event) => event.booted === false, "the shutdown");
+  assert.equal(down.target_state, "Shutdown");
+  const after = await statusOf(status);
+  assert.deepEqual([after.target_state, after.booted], ["Shutdown", false]);
+  await waitFor(() => logged(world, "quiet_end_read").some((record) => record.settled), { timeoutMs: 1000, message: "a settled read in the log" });
+  const reads = world.describeReads().length;
+  assert.ok(reads <= mostEndingReads(Date.now() - t0), `${reads} reads in ${Date.now() - t0} ms`);
+});
+
+waitingTest("CU-04: an ending inside the limit gets its describe even when no other stream ends after it", { timeout: 30_000 }, async (t) => {
+  const world = harness(t);
+  const status = await world.start();
+  const { events } = await subscriber(t, world, status, { watching: false });
+  const endAndReopen = async () => {
+    const from = quietOpens(world);
+    world.endQuiet();
+    await waitFor(() => quietOpens(world) > from, { timeoutMs: 4000, message: "the stream to reopen" });
+  };
+  await endAndReopen();
+  await until(events, (event) => event.booted === true, "the first ending's read");
+  world.setTarget({ state: "Shutdown" });
+  await endAndReopen();
+  // The stream stays open from here on.
+  await endingReadBrings(events, (event) => event.booted === false, "the shutdown");
+  assert.equal(world.describeReads().length, 2);
+  await pause(ENDING_READ_SLACK_MS);
+  assert.equal(world.describeReads().length, 2, "an ending is one read, and nothing reads after it");
+});
+
+waitingTest("CU-04: an ending during an ending's read gets the next read, sent once that one settled, never beside it", { timeout: 30_000 }, async (t) => {
+  const world = harness(t);
+  const status = await world.start();
+  const { events } = await subscriber(t, world, status, { watching: false });
+  // Both streams run, so both endings read at once and the limit plays no part. The first
+  // read answers Booted late, from before the shutdown.
+  await pause(1100);
+  const opened = quietOpens(world);
+  world.setTarget({ readDelayMs: TARGET_READ_TIMEOUT_MS - 100 });
+  world.endQuiet();
+  await waitFor(() => world.describeReads().length === 1 && quietOpens(world) > opened, { timeoutMs: 1500, stepMs: 10, message: "the slow read and the new stream" });
+  // Slow enough for the check below to see a second read on its way.
+  world.setTarget({ state: "Shutdown", readDelayMs: 500 });
+  await pause(1100);
+  world.endQuiet();
+  const beside = [];
+  const down = await waitFor(() => {
+    // In this order: a read that settles between the two counts for it.
+    const sent = world.describeReads().length;
+    if (sent > logged(world, "quiet_end_read").length + 1) beside.push(sent);
+    return events.find((event) => event.booted === false);
+  }, { timeoutMs: SHUTDOWN_PUSH_MS, stepMs: 10, message: "the shutdown" });
+  assert.deepEqual(beside, [], "two ending reads at the same time");
+  assert.equal(down.target_state, "Shutdown");
+  assert.equal(world.describeReads().length, 2);
+});
+
+waitingTest("CU-04: a describe that failed at an ending is asked again at the next one, so the shutdown still arrives", { timeout: 30_000 }, async (t) => {
+  const world = harness(t, { quietEndEveryMs: 50 });
+  world.setTarget({ state: "Shutdown", describeError: "busy" });
+  const status = await world.start();
+  const { events } = await subscriber(t, world, status, { watching: false });
+  await waitFor(() => world.describeReads().length >= 2, { timeoutMs: ENDING_READ_MS, message: "reads that fail" });
+  assert.equal((await statusOf(status)).booted, null);
+  assert.equal(logged(world, "quiet_end_read")[0].settled, false);
+  world.setTarget({ state: "Shutdown" });
+  await endingReadBrings(events, (event) => event.booted === false, "the shutdown");
+});
+
+waitingTest("CU-04: a stream that ran is read at once, whatever the limit on endings at once, so an app quit just before a shutdown hides nothing", { timeout: 30_000 }, async (t) => {
+  const world = harness(t);
+  const status = await world.start();
+  const { events } = await subscriber(t, world, status, { watching: false });
+  const endAndReopen = async () => {
+    const from = quietOpens(world);
+    world.endQuiet();
+    await waitFor(() => quietOpens(world) > from, { timeoutMs: 4000, message: "the stream to reopen" });
+  };
+  await endAndReopen();
+  await until(events, (event) => event.booted === true, "the first ending's read");
+  // Ends at once, so its read waits out the limit; the next stream runs.
+  await endAndReopen();
+  await pause(1100);
+  assert.equal(world.describeReads().length, 1);
+  world.setTarget({ state: "Shutdown" });
+  const t0 = Date.now();
+  world.endQuiet();
+  await until(events, (event) => event.booted === false, "the shutdown");
+  assert.ok(Date.now() - t0 < SHUTDOWN_PUSH_MS, `pushed after ${Date.now() - t0} ms`);
+  assert.equal(world.companionPids().length, 1, "the read came from the ending, not from a new companion");
+});
+
+waitingTest("CU-04: a subscriber that connects during the start hears the daemon come up", async (t) => {
+  const world = harness(t, { idb: { connectDelayMs: 1500 } });
+  const starting = world.start();
+  const socketPath = socketPathFor(world.paths.base, UDID).path;
+  const connection = await waitFor(() => DaemonConnection.connect(socketPath).catch(() => null), { timeoutMs: 8000, message: "the socket" });
+  t.after(() => connection.close());
+  const events = [];
+  const reply = await connection.subscribe((event) => events.push(event));
+  assert.equal(reply.ok, true);
+  await starting;
+  assert.equal(events[0].state, "starting");
+  await until(events, (event) => event.state === "serving" && event.booted === true, "the first read after the start");
+});
+
+waitingTest("CU-04: a subscriber keeps the daemon past the idle limit, and it stops once that connection closes", { timeout: 30_000 }, async (t) => {
+  const world = harness(t, {}, { idleMs: 1000 });
+  const status = await world.start();
+  const { connection } = await subscriber(t, world, status, { watching: false });
+  await new Promise((resolve) => setTimeout(resolve, 1500));
+  assert.ok(pidAlive(status.pid));
+  connection.close();
+  await waitFor(() => !pidAlive(status.pid), { timeoutMs: 5000, message: "idle stop after the subscriber left" });
+});
+
+test("CU-04: a daemon that stops says so, then the closing line ends the events", async (t) => {
+  const world = harness(t);
+  const status = await world.start();
+  const raw = await rawConnection(t, status.socket);
+  raw.socket.write(`${JSON.stringify({ id: "sub", op: "subscribe" })}\n`);
+  await waitFor(() => raw.lines.some((line) => line.event === "orientation"), { timeoutMs: 5000, message: "the first orientation" });
+  await requestDaemon(status.socket, { id: "stop", op: "stop" });
+  await waitFor(() => raw.closed, { timeoutMs: 8000, message: "the connection to close" });
+  assert.equal(raw.lines.at(-1).closing, true, "nothing comes after the closing line");
+  assert.deepEqual(raw.lines.at(-2), { event: "state", udid: UDID, state: "stopping", booted: true, target_state: "Booted" });
+});
+
+test("CU-04: DaemonConnection hands event lines to its listener, never to a request or to replies, and keeps few replies", async (t) => {
+  const world = harness(t);
+  const status = await world.start();
+  const connection = await world.connect(status);
+  const lines = [];
+  const reply = await connection.subscribe((event) => lines.push(event));
+  assert.equal(reply.subscribed, true);
+  const during = await connection.request({ op: "status" });
+  assert.equal(during.ok, true);
+  await until(lines, (event) => event.event === "orientation", "the first orientation");
+  assert.ok(connection.replies.every((line) => line.event === undefined));
+  for (let i = 0; i < 40; i += 1) await connection.request({ op: "status" });
+  assert.ok(connection.replies.length <= 32, `${connection.replies.length} replies kept`);
+});
+
+// ---------------------------------------------------------------------------
+// CU-05: the screenshot op
+// ---------------------------------------------------------------------------
+
+// Serialized with fb-idb 1.6.5's idb_pb2.
+const SCREENSHOT_GOLDEN = {
+  jpeg: "0801",
+  half: "21000000000000e03f",
+  jpegThird: "080121555555555555d53f",
+  response: "0a0489504e471203706e671a0608db04109f0a220608b60910be14290000000000000840",
+  oldResponse: "0a0489504e47",
+};
+
+test("CU-05: the screenshot request and response match idb's wire format", () => {
+  assert.equal(encodeScreenshotRequest({ format: "png", scale: null }).length, 0, "a plain PNG is an empty message");
+  assert.equal(encodeScreenshotRequest({ format: "png", scale: 1 }).length, 0, "full size is the default");
+  assert.equal(encodeScreenshotRequest().length, 0);
+  assert.equal(encodeScreenshotRequest({ format: "jpeg" }).toString("hex"), SCREENSHOT_GOLDEN.jpeg);
+  assert.equal(encodeScreenshotRequest({ format: "png", scale: 0.5 }).toString("hex"), SCREENSHOT_GOLDEN.half);
+  assert.equal(encodeScreenshotRequest({ format: "jpeg", scale: 1 / 3 }).toString("hex"), SCREENSHOT_GOLDEN.jpegThird);
+  const shot = decodeScreenshotResponse(Buffer.from(SCREENSHOT_GOLDEN.response, "hex"));
+  assert.equal(shot.data.toString("hex"), "89504e47");
+  assert.deepEqual({ ...shot, data: null }, { data: null, format: "png", width: 603, height: 1311, sourceWidth: 1206, sourceHeight: 2622, screenScale: 3 });
+  const old = decodeScreenshotResponse(Buffer.from(SCREENSHOT_GOLDEN.oldResponse, "hex"));
+  assert.deepEqual({ ...old, data: null }, { data: null, format: "", width: null, height: null, sourceWidth: null, sourceHeight: null, screenScale: null });
+  assert.equal(decodeScreenshotResponse(Buffer.alloc(0)).data.length, 0);
+});
+
+test("CU-05: screenshot options are checked before the companion is asked", async (t) => {
+  assert.deepEqual(validateScreenshot({}), { format: "png", scale: null });
+  assert.deepEqual(validateScreenshot(), { format: "png", scale: null });
+  assert.deepEqual(validateScreenshot({ format: "jpeg", scale: 0.25 }), { format: "jpeg", scale: 0.25 });
+  assert.deepEqual(validateScreenshot({ format: null, scale: null }), { format: "png", scale: null });
+  assert.deepEqual(validateScreenshot({ scale: 1 }), { format: "png", scale: 1 });
+  const world = harness(t);
+  const status = await world.start();
+  assert.throws(() => validateScreenshot({ scale: Number.NaN }), (error) => error.code === CODE.INVALID_REQUEST);
+  for (const request of [{ format: "tiff" }, { format: 1 }, { scale: 0 }, { scale: -1 }, { scale: 1.5 }, { scale: "0.5" }]) {
+    const reply = await requestDaemon(status.socket, { id: "x", op: "screenshot", ...request });
+    assert.deepEqual([reply.ok, reply.error.code, reply.error.stage], [false, "invalid_request", "before_send"], JSON.stringify(request));
+  }
+  assert.deepEqual(world.screenshots(), []);
+});
+
+test("CU-05-S01: a screenshot is one companion call at full size, a PNG, and starts no process", async (t) => {
+  const world = harness(t);
+  const status = await world.start();
+  const idbBefore = world.idbCalls().length;
+  const reply = await requestDaemon(status.socket, { id: "a", op: "screenshot" });
+  assert.equal(reply.ok, true);
+  assert.deepEqual([reply.format, reply.bytes, reply.width, reply.height, reply.source_width, reply.source_height, reply.screen_scale],
+    ["png", 64, 1206, 2622, 1206, 2622, 3]);
+  assert.deepEqual(Buffer.from(reply.image_base64, "base64"), Buffer.alloc(64, 0xab));
+  assert.deepEqual(world.screenshots().map((record) => record.request), [""]);
+  assert.deepEqual(world.xcrunCalls(), []);
+  assert.equal(world.idbCalls().length, idbBefore);
+  const log = readFileSync(daemonPaths(world.paths.base, UDID).log, "utf8");
+  assert.match(log, /"op":"screenshot"/);
+  assert.ok(!log.includes(reply.image_base64.slice(0, 40)), "the image is not logged");
+});
+
+test("CU-05: format and scale reach the companion, and the reply reports the scaled size", async (t) => {
+  const world = harness(t);
+  const status = await world.start();
+  const reply = await requestDaemon(status.socket, { id: "a", op: "screenshot", format: "jpeg", scale: 1 / 3 });
+  assert.deepEqual([reply.ok, reply.format, reply.width, reply.height, reply.source_width], [true, "jpeg", 402, 874, 1206]);
+  assert.deepEqual(world.screenshots().map((record) => record.request), [SCREENSHOT_GOLDEN.jpegThird]);
+});
+
+test("CU-05: a companion error fails the screenshot with its gRPC status, and the daemon goes on", async (t) => {
+  const world = harness(t, { screenshot: { error: "no display" } });
+  const status = await world.start();
+  const reply = await requestDaemon(status.socket, { id: "a", op: "screenshot" });
+  assert.equal(reply.ok, false);
+  assert.deepEqual([reply.error.code, reply.error.stage, reply.error.grpc_status], ["backend_failed", "after_send", 2]);
+  assert.match(reply.error.message, /screenshot failed: no display/);
+  assert.equal(reply.image_base64, undefined);
+  assert.equal((await statusOf(status)).status, "serving");
+});
+
+test("CU-05: an answer with no image, or not what was asked for, is a failure and never an image", async (t) => {
+  const empty = harness(t, { screenshot: { empty: true } });
+  const none = await requestDaemon((await empty.start()).socket, { id: "a", op: "screenshot" });
+  assert.deepEqual([none.ok, none.error.code, none.error.stage], [false, "backend_failed", "after_send"]);
+  assert.match(none.error.message, /no image data/);
+
+  const wrong = harness(t, { screenshot: { format: "tiff" } });
+  const other = await requestDaemon((await wrong.start()).socket, { id: "a", op: "screenshot", format: "jpeg" });
+  assert.deepEqual([other.ok, other.error.code], [false, "backend_failed"]);
+  assert.match(other.error.message, /encoding it as tiff/);
+});
+
+test("CU-05: a companion that reports no format gives a plain PNG only; asked for more it fails, as idb's client does", async (t) => {
+  const world = harness(t, { screenshot: { noFormat: true, noSizes: true } });
+  const status = await world.start();
+  const plain = await requestDaemon(status.socket, { id: "a", op: "screenshot", scale: 1 });
+  assert.deepEqual([plain.ok, plain.format, plain.width, plain.height, plain.screen_scale], [true, "png", null, null, null]);
+  for (const request of [{ format: "jpeg" }, { scale: 0.5 }]) {
+    const reply = await requestDaemon(status.socket, { id: "b", op: "screenshot", ...request });
+    assert.deepEqual([reply.ok, reply.error.code], [false, "backend_failed"], JSON.stringify(request));
+    assert.match(reply.error.message, /reported no format/);
+  }
+});
+
+test("CU-05: a screenshot waits for a companion being replaced, like the other reads", async (t) => {
+  const world = harness(t);
+  const status = await world.start();
+  const [pid] = world.companionPids();
+  process.kill(pid, "SIGKILL");
+  await waitFor(() => world.registry()?.state === "companion_restarting", { timeoutMs: 3000, stepMs: 5, message: "the loss" });
+  const reply = await requestDaemon(status.socket, { id: "a", op: "screenshot" });
+  assert.equal(reply.ok, true);
+  assert.equal(world.screenshots().length, 1);
+  assert.notEqual(world.screenshots()[0].pid, pid);
+});
+
+test("CU-05: the Python client gets every field of an image longer than the line limit from the real daemon", async (t) => {
+  const bytes = MAX_LINE_BYTES + 1024 * 1024;
+  const world = harness(t, { screenshot: { bytes } });
+  const status = await world.start();
+  const code = [
+    "import hashlib, json, sys",
+    "sys.path.insert(0, sys.argv[1])",
+    "from autonom_lib import ios_daemon",
+    "shot = ios_daemon.screenshot(sys.argv[2], image_format='jpeg', scale=0.5)",
+    "image = shot.pop('image')",
+    "print(json.dumps({**shot, 'size': len(image), 'first': image[0], 'last': image[-1]}))",
+  ].join("\n");
+  const scripts = new URL("../scripts", import.meta.url).pathname;
+  const stdout = await new Promise((resolve, reject) => {
+    execFile("python3", ["-c", code, scripts, UDID], {
+      env: { PATH: process.env.PATH, HOME: world.env.HOME, AUTONOM_HOME: world.paths.base, PYTHONDONTWRITEBYTECODE: "1" }, maxBuffer: 1024 * 1024,
+    }, (error, out, err) => (error ? reject(new Error(`${error.message}\n${err}`)) : resolve(out)));
+  });
+  assert.deepEqual(JSON.parse(stdout), {
+    format: "jpeg", width: 603, height: 1311, source_width: 1206, source_height: 2622, screen_scale: 3, size: bytes, first: 0xab, last: 0xab,
+  });
+  assert.deepEqual(world.screenshots().map((record) => record.request), [`${SCREENSHOT_GOLDEN.jpeg}${SCREENSHOT_GOLDEN.half}`]);
+});
+
+test("CU-05: the daemon answers a screenshot before the Python client stops waiting", () => {
+  const source = readFileSync(new URL("../scripts/autonom_lib/ios_daemon.py", import.meta.url), "utf8");
+  const seconds = Number(/^SCREENSHOT_TIMEOUT_S = ([0-9.]+)$/m.exec(source)?.[1]);
+  const limit = Number(/^MAX_SCREENSHOT_LINE_BYTES = (\d+) \* 1024 \* 1024$/m.exec(source)?.[1]) * 1024 * 1024;
+  assert.ok(RESTART_WAIT_MS + SCREENSHOT_TIMEOUT_MS + 1000 < seconds * 1000, `${RESTART_WAIT_MS} + ${SCREENSHOT_TIMEOUT_MS} < ${seconds} s`);
+  // The companion's largest gRPC message (32 MiB) in base64, with the reply's other fields.
+  assert.ok(Math.ceil((32 * 1024 * 1024) / 3) * 4 + 4096 < limit);
 });
 
 test("a failing idb connect refuses the start with daemon_start_failed and leaves no files", async (t) => {

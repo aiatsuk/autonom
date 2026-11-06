@@ -636,6 +636,28 @@ Codes added (in `scripts/autonom_lib/errors.py`):
 | Companion lifetime | each `idb` call could start a companion; the Canvas ran its own | one companion per Simulator: the live one idb started for it, found in the process table (`idb_companion --udid <UDID> --grpc-domain-sock <dir>/<UDID>_companion.sock`; used, never stopped by the daemon; the daemon reads none of idb's files, and a companion that serves only TCP is not used), else one the daemon starts with `idb connect` and restarts after a crash (0.5 s growing to 5 s). The daemon stops after 5 minutes with no request and no Canvas attached, and then ends only a companion it started (`idb disconnect`, SIGTERM, SIGKILL after 3 s) |
 | Canvas idb transport | its own companion on a private socket | the daemon's companion (`attach`, then its own gRPC session for video; `detach` when the device leaves); a private companion only with `AUTONOM_IOS_DAEMON=off` or a daemon that cannot serve. `/status` `idb` adds `companion_source` (`daemon` or `private`), `daemon_attached`, `daemon_fallback`, `companion_attaches` and `hid_lost` (input events the companion never confirmed, each also reported as an error). The Canvas, too, ends each `hid` call 250 ms after its last event (10 s while a press is held) |
 
+### iOS Canvas on the daemon (Unreleased)
+
+Additive, except the default iOS Canvas frame rate: a Canvas without a Display
+choice now streams "On change" (`stream_settings.fps: 0`) instead of 60 fps; a
+fixed rate chosen in the Display menu is honored as before. Pinned by
+`tests/canvas-ios-unify.test.mjs`, `tests/ios-device-daemon.test.mjs`,
+`tests/test_ios_daemon_client.py` and `tests/test_canvas_actions.py`.
+
+- `/status` `idb` adds `booted`, `target_state`, `frames_per_second`,
+  `watchers`, `video_stopped`, `video_stops` and `daemon_subscribed`;
+  `stream_settings.scale_factor` now follows the largest visible tile (the
+  workspace device summary's `scale_factor` is still the profile's limit).
+- The video socket (`/ws/video`) accepts a page message `{t:"watch",
+  visible, width, height, dpr}`; a page that never sends it counts as a
+  visible tile at full size (as before).
+- The iOS device daemon adds the ops `subscribe` (lines `{event: "state" |
+  "orientation", ...}`) and `screenshot {format, scale}`; a daemon that
+  refuses `subscribe` keeps working, with the Canvas reading its own
+  companion while a tile shows the device.
+- The Canvas tools `capture.screenshot` reply adds `source` (`companion` or
+  `simctl`, iOS only) and `fallback_reason` when `simctl` took the picture.
+
 ### Android helper: lifecycle and `ui helper` (Unreleased)
 
 Autonom's own on-device helper (`native/android/helper`, protocol 1) is
