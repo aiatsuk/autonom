@@ -659,6 +659,28 @@ makes no sense, is `invalid_value` naming the flag, and nothing is stored.
 | Pre-test `mock_state` and `mocks_active` | `id`, URL glob, `method`, `host`, `status`, `enabled` | additive `mode` (rewrite rules only) and `conditions` (a count, when there are any) |
 | Older releases reading this registry | — | they ignore `mode`, conditions and edits: a rule with conditions matches more requests there, and a rewrite rule acts as a respond rule (it fakes the answer instead of editing the real one). Disable such rules before going back to an older release |
 
+### iOS Canvas on the daemon (Unreleased)
+
+Additive, except the default iOS Canvas frame rate: a Canvas without a Display
+choice now streams "On change" (`stream_settings.fps: 0`) instead of 60 fps; a
+fixed rate chosen in the Display menu is honored as before. Pinned by
+`tests/canvas-ios-unify.test.mjs`, `tests/ios-device-daemon.test.mjs`,
+`tests/test_ios_daemon_client.py` and `tests/test_canvas_actions.py`.
+
+- `/status` `idb` adds `booted`, `target_state`, `frames_per_second`,
+  `watchers`, `video_stopped`, `video_stops` and `daemon_subscribed`;
+  `stream_settings.scale_factor` now follows the largest visible tile (the
+  workspace device summary's `scale_factor` is still the profile's limit).
+- The video socket (`/ws/video`) accepts a page message `{t:"watch",
+  visible, width, height, dpr}`; a page that never sends it counts as a
+  visible tile at full size (as before).
+- The iOS device daemon adds the ops `subscribe` (lines `{event: "state" |
+  "orientation", ...}`) and `screenshot {format, scale}`; a daemon that
+  refuses `subscribe` keeps working, with the Canvas reading its own
+  companion while a tile shows the device.
+- The Canvas tools `capture.screenshot` reply adds `source` (`companion` or
+  `simctl`, iOS only) and `fallback_reason` when `simctl` took the picture.
+
 ### Android helper: lifecycle and `ui helper` (Unreleased)
 
 Autonom's own on-device helper (`native/android/helper`, protocol 1) is

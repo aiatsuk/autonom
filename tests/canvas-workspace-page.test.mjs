@@ -1044,6 +1044,21 @@ describe("tiles", () => {
     assert.equal(page.tile(0).querySelector(".picker-title").textContent, "Add a device", "the slot is empty after detach");
   });
 
+  test("autonom:state saying the Simulator is shut down shows on the tile until it boots (CU-04-S02)", async () => {
+    const page = await started({ server: twoTabServer() });
+    const [, second] = page.iframes();
+    const alertOf = () => page.tile(1).querySelector(".tile-alert");
+    assert.equal(alertOf().hidden, true);
+    page.message(second, { type: "autonom:state", id: IOS, live: false, session: "restarting", booted: false, fps: 0, width: 603, height: 1311 });
+    assert.equal(alertOf().hidden, false);
+    assert.match(alertOf().textContent, /Simulator is shut down/);
+    page.message(second, { type: "autonom:state", id: IOS, live: true, session: "streaming", booted: true, fps: 0, width: 603, height: 1311 });
+    assert.equal(alertOf().hidden, true);
+    // A tile that never says (Android, an older page) shows nothing.
+    page.message(second, { type: "autonom:state", id: IOS, live: true, session: "streaming", booted: "no" });
+    assert.equal(alertOf().hidden, true);
+  });
+
   test("autonom:state from a tile updates its diagnostics; other origins, sources and ids are ignored", async () => {
     const page = await started({ server: twoTabServer() });
     const [first, second] = page.iframes();

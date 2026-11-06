@@ -62,8 +62,42 @@
  *   connection the daemon writes one closing line `{id: null, ok: false, closing: true,
  *   error}`; it runs no request read after that line, so a client may treat every
  *   request still waiting then as `before_send`.
- * - Idle stop after 5 minutes without a request while no Canvas is attached
- *   (AUTONOM_IOSD_IDLE_MS shortens it for tests, minimum 1000 ms).
+ * - Idle stop after 5 minutes without a request while no Canvas is attached and no client
+ *   is subscribed (AUTONOM_IOSD_IDLE_MS shortens it for tests, minimum 1000 ms).
+ * - Events: `{id, op: "subscribe", watching}` (`watching` defaults to true) turns the
+ *   connection into a subscriber until it closes. The reply comes first, then the current
+ *   state as event lines, then every change. Event lines have no id: `{event: "state",
+ *   udid, state, booted, target_state}` and `{event: "orientation", udid, orientation}`.
+ *   `state` is the daemon's own (`starting`, `serving`, `companion_restarting`,
+ *   `unsupported`, `stopping`). `target_state` is what the companion's `describe` said
+ *   ("Booted", "Shutdown", ...) and `booted` the same as true or false; both are null
+ *   while nothing is known, as during a companion restart. `orientation` is the one the
+ *   screen is drawn in, so face up, face down and unknown keep the last one. It is sent
+ *   once the first read knows it and on each change. Once the last subscriber has left
+ *   nothing reads the simulator any more, so all three go back to null.
+ * - Polling: `watching: true` says a tile shows this simulator; sending `subscribe` again
+ *   on the connection changes that. While at least one subscriber is watching, one loop
+ *   per simulator reads `describe` and `get_orientation` over the open gRPC session at most
+ *   once per ORIENTATION_POLL_MS (the orientation is skipped while the simulator is known
+ *   not to be booted). Each answer is published as it lands, unless a `describe` sent
+ *   later was already applied: that stale answer is dropped, whichever read it came from.
+ *   A `get_orientation` that hangs holds back only the next `get_orientation`: `describe`
+ *   keeps its pace. A `describe` that hangs holds back the next read of both, but not the
+ *   `get_orientation` sent with it. Either read ends at TARGET_READ_TIMEOUT_MS. With no
+ *   watcher nothing is polled. A companion that starts serving gets one `describe` for the
+ *   subscribers; apart from that one, the only read an unwatched subscriber causes is the
+ *   `describe` after a quiet stream ended, and it happens only on stream endings. Every
+ *   ending leads to one: at once for a stream that ran, and at most one per
+ *   QUIET_END_READ_MS for streams that end at once, so the reopen loop on a simulator that
+ *   is shut down is no read a second, and a later change is still found within that time.
+ *   Only one of these reads is in flight at a time: an ending during one gets the next,
+ *   sent after that one settled, as an answer sent before the ending may be older than
+ *   what ended the stream. A failed read is asked again at the next ending, never by itself.
+ * - Screenshots: `{id, op: "screenshot", format, scale}` (`png` or `jpeg`, default png;
+ *   `scale` in (0, 1], default full size) is the companion's own screenshot call. The
+ *   reply holds `format`, `image_base64`, `bytes`, `width`, `height`, `source_width`,
+ *   `source_height` and `screen_scale`. This one reply may pass MAX_LINE_BYTES, up to the
+ *   base64 of the companion's largest gRPC message.
  * - A companion older than 1.6.4, or one without `accessibility_quiescence`, puts the
  *   daemon in state `unsupported`: every request then fails with `companion_too_old`.
  *
@@ -86,6 +120,7 @@ import { fileURLToPath } from "node:url";
 import { IDB_RETRY_MAX_MS, IDB_RETRY_MIN_MS, IDB_STABLE_MS } from "./canvas-runtime.mjs";
 import {
   GrpcError, HID_BUTTON, HidUnconfirmedError, IdbCompanionClient, STREAM_STOP_TIMEOUT_MS, companionEnvironment,
+  decodeProtoFields,
 } from "./ios-idb-companion.mjs";
 
 export const IOSD_SCHEMA = "autonom-iosd/v1";
@@ -123,7 +158,7 @@ export const INPUT_REPLY_SLACK_MS = STREAM_STOP_TIMEOUT_MS + 1000;
 export const ACT_REPLY_MARGIN_MS = 20_000;
 /** sun_path is 104 bytes on macOS, including the terminating NUL. */
 export const MAX_SOCKET_PATH_BYTES = 103;
-/** One request or reply line; a 3000-node tree is about 1.5 MB. */
+/** One request or reply line; a 3000-node tree is about 1.5 MB. Only a screenshot's reply may be longer. */
 export const MAX_LINE_BYTES = 4 * 1024 * 1024;
 /** The first companion with `accessibility_quiescence` and the read backend field. */
 export const MIN_COMPANION_VERSION = Object.freeze([1, 6, 4]);
@@ -260,6 +295,17 @@ export const HOST_LOAD_RECHECK_MS = 10_000;
 export const HOST_LOAD_FILE_ENV = "AUTONOM_IOSD_LOAD_FILE";
 /** Of an input's deadline, what the wait for a cold quiet stream always leaves for the input. */
 export const ARM_WAIT_SPARE_MS = 1000;
+/** At most one `get_orientation` (and `describe`) per simulator in this time, only while watched (CU-04). */
+export const ORIENTATION_POLL_MS = 1000;
+/** One `describe` or `get_orientation` of that poll, as the Canvas's own read had. */
+export const TARGET_READ_TIMEOUT_MS = 2000;
+/** Quiet streams that end at once get one `describe` in this time, however many end (CU-04). */
+export const QUIET_END_READ_MS = 5000;
+/** The orientations the screen can be drawn in: face up, face down and unknown keep the last one. */
+export const DRAWN_ORIENTATIONS = Object.freeze(["PORTRAIT", "PORTRAIT_UPSIDE_DOWN", "LANDSCAPE_LEFT", "LANDSCAPE_RIGHT"]);
+/** The companion's screenshot call. With RESTART_WAIT_MS it stays inside ios_daemon.SCREENSHOT_TIMEOUT_S. */
+export const SCREENSHOT_TIMEOUT_MS = 10_000;
+export const SCREENSHOT_FORMATS = Object.freeze(["png", "jpeg"]);
 /** One retry of an "unlit display" read, after this pause (ID-13). */
 export const UNLIT_RETRY_MS = 300;
 /** ID-09: an `ax` read covering less than this share of the rows below the status bar is incomplete. */
@@ -291,12 +337,14 @@ const IDB_DISCONNECT_TIMEOUT_MS = 10_000;
 const TOOL_TIMEOUT_MS = 5000;
 const LOG_MAX_BYTES = 1024 * 1024;
 const TIMINGS_KEPT = 20;
+const REPLIES_KEPT = 32;
 const UDID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9-]{0,63}$/;
 const CORESIMULATOR_PLIST = "/Library/Developer/PrivateFrameworks/CoreSimulator.framework/Versions/A/Resources/Info.plist";
 
 export const INPUT_OPS = Object.freeze(["tap", "swipe", "button", "key"]);
 export const OPS = Object.freeze([
   "tree", "tap", "swipe", "button", "key", "quiet", "act", "companion", "attach", "detach", "status", "stop",
+  "subscribe", "screenshot",
 ]);
 export const STAGE = Object.freeze({ BEFORE_SEND: "before_send", AFTER_SEND: "after_send" });
 export const CODE = Object.freeze({
@@ -622,6 +670,53 @@ export function validateInput(request) {
   throw new DaemonError(CODE.INVALID_REQUEST, `input op must be one of ${INPUT_OPS.join(", ")}.`);
 }
 
+/** A validated `screenshot` request `{ format, scale }` (scale null: full size) or an invalid_request error. */
+export function validateScreenshot(request = {}) {
+  const format = request.format ?? "png";
+  if (!SCREENSHOT_FORMATS.includes(format)) {
+    throw new DaemonError(CODE.INVALID_REQUEST, `format must be one of ${SCREENSHOT_FORMATS.join(", ")}.`);
+  }
+  const scale = request.scale ?? null;
+  if (scale !== null && !(typeof scale === "number" && scale > 0 && scale <= 1)) {
+    throw new DaemonError(CODE.INVALID_REQUEST, "scale must be a number above 0 and at most 1.");
+  }
+  return { format, scale };
+}
+
+/**
+ * idb.proto ScreenshotRequest: format (field 1, enum: PNG 0, JPEG 1) and scale_factor
+ * (field 4, double). Only what differs from the defaults is written, like the reference
+ * library. The compression quality stays the companion's default (0.8).
+ */
+export function encodeScreenshotRequest({ format = "png", scale = null } = {}) {
+  const parts = [];
+  if (format === "jpeg") parts.push(Buffer.from([(1 << 3) | 0, 1]));
+  if (scale !== null && scale < 1) {
+    const field = Buffer.alloc(9);
+    field[0] = (4 << 3) | 1;
+    field.writeDoubleLE(scale, 1);
+    parts.push(field);
+  }
+  return Buffer.concat(parts);
+}
+
+/** idb.proto ScreenshotResponse. Sizes and the screen scale are null when the companion left them out. */
+export function decodeScreenshotResponse(buf) {
+  const shot = { data: Buffer.alloc(0), format: "", width: null, height: null, sourceWidth: null, sourceHeight: null, screenScale: null };
+  const size = (value) => {
+    const fields = new Map(decodeProtoFields(value).map((record) => [record.field, Number(record.value)]));
+    return [fields.get(1) || null, fields.get(2) || null];
+  };
+  for (const { field, wire, value } of decodeProtoFields(buf)) {
+    if (field === 1 && wire === 2) shot.data = value;
+    else if (field === 2 && wire === 2) shot.format = value.toString("utf8").toLowerCase();
+    else if (field === 3 && wire === 2) [shot.width, shot.height] = size(value);
+    else if (field === 4 && wire === 2) [shot.sourceWidth, shot.sourceHeight] = size(value);
+    else if (field === 5 && wire === 1) shot.screenScale = value.readDoubleLE(0) || null;
+  }
+  return shot;
+}
+
 export function pidAlive(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try {
@@ -859,9 +954,12 @@ export class DaemonConnection {
   #pending = new Map();
   #buffer = "";
   #next = 0;
+  /** The last replies, for tests: a subscriber's connection lives as long as its Canvas. */
   replies = [];
   /** The daemon's closing line once it arrived, else null. */
   closing = null;
+  /** Called with each event line (see subscribe()); events without a listener are dropped. */
+  onEvent = null;
   closed;
 
   constructor(socket) {
@@ -883,7 +981,12 @@ export class DaemonConnection {
           this.#onClosing(reply);
           continue;
         }
+        if (typeof reply?.event === "string" && (reply.id === undefined || reply.id === null)) {
+          this.onEvent?.(reply);
+          continue;
+        }
         this.replies.push(reply);
+        if (this.replies.length > REPLIES_KEPT) this.replies.shift();
         const key = reply?.id === undefined || reply.id === null ? null : String(reply.id);
         const waiter = key !== null ? this.#pending.get(key) : this.#pending.get("__next_null__");
         if (waiter) {
@@ -950,6 +1053,15 @@ export class DaemonConnection {
       });
       this.#socket.write(`${JSON.stringify(message)}\n`);
     });
+  }
+
+  /**
+   * Subscribes this connection (see the file's header): `listener` gets every event line,
+   * the current state first. Called again, it changes `watching`. Resolves with the reply.
+   */
+  subscribe(listener, { watching = true, timeoutMs } = {}) {
+    this.onEvent = listener;
+    return this.request({ op: "subscribe", watching }, timeoutMs === undefined ? {} : { timeoutMs });
   }
 
   /** Writes a raw line (tests of malformed input); resolves with the next reply without an id. */
@@ -1105,7 +1217,7 @@ export class IosDeviceDaemon {
   paths;
   socket;
   idleMs;
-  state = "starting";
+  #state = "starting";
   #env;
   #tools;
   #server = null;
@@ -1169,6 +1281,31 @@ export class IosDeviceDaemon {
   #restarts = 0;
   quiet = { state: null, busySignals: [], pid: null, touches: 0, events: 0, lastEventAt: null };
   #watchers = new Set();
+  /** What the last `describe` said ("Booted", "Shutdown", ...); null while nothing is known. */
+  #targetState = null;
+  /** The orientation the screen is drawn in, once a read knew it. */
+  #orientation = null;
+  #orientationReads = 0;
+  /** A `get_orientation` is on its way; the poll does not stack another one on it. */
+  #orientationReading = false;
+  /** The watched poll's next read; null when none is planned. */
+  #targetTimer = null;
+  #targetPolling = false;
+  #targetPolls = 0;
+  #targetReadAt = -Infinity;
+  /** The last number given to a `describe`, in the order they were sent. */
+  #describesSent = 0;
+  /** The number of the newest `describe` applied: an answer older than this is stale. */
+  #describeApplied = 0;
+  /** Goes up when the last subscriber leaves: a read sent before that answers nobody. */
+  #subscriberRound = 0;
+  /** When a quiet stream ending's `describe` is due; null when no ending waits for one. */
+  #endingDue = null;
+  /** Fires at #endingDue when that is still to come. */
+  #endingTimer = null;
+  /** A quiet stream ending's `describe` is on its way. */
+  #endingReading = false;
+  #endingReadAt = -Infinity;
   /** Touch inputs written and not yet confirmed, oldest first (see #expectTouch). */
   #touchQueue = [];
   #starting = null;
@@ -1199,6 +1336,19 @@ export class IosDeviceDaemon {
     this.#serving = new Promise((resolve) => {
       this.#servingResolve = resolve;
     });
+  }
+
+  get state() {
+    return this.#state;
+  }
+
+  /** The daemon's state: subscribers hear every change, and no companion means no boot state. */
+  set state(value) {
+    if (value === this.#state) return;
+    this.#state = value;
+    if (value !== "serving") this.#targetState = null;
+    this.#publishState();
+    if (value === "serving") this.#refreshTarget();
   }
 
   log(event, fields = {}) {
@@ -1572,9 +1722,12 @@ export class IosDeviceDaemon {
         }
       }
       if (gone()) return;
+      const atOnce = performance.now() - openedAt < 1000;
+      // Nothing else tells an unwatched subscriber that the simulator went away.
+      if (current) this.#readAfterEnding({ atOnce });
       // The stream ended (target exited, dropped): reopen it while the companion lives;
       // one that ends at once is retried slowly rather than in a tight loop.
-      await sleep(performance.now() - openedAt < 1000 ? 1000 : 200);
+      await sleep(atOnce ? 1000 : 200);
       if (gone()) return;
       if (!pidAlive(this.#companion?.pid)) {
         this.#companionLost("quiet_stream_ended");
@@ -2067,7 +2220,9 @@ export class IosDeviceDaemon {
   // --- connections and requests ---------------------------------------------
 
   #onConnection(socket) {
-    this.#connections.set(socket, { inflight: 0, closing: false, noticed: false, attachChain: Promise.resolve() });
+    this.#connections.set(socket, {
+      inflight: 0, closing: false, noticed: false, attachChain: Promise.resolve(), subscribed: false, watching: false,
+    });
     const tooLong = () => new DaemonError(CODE.INVALID_REQUEST, `A request line is longer than ${MAX_LINE_BYTES} bytes.`).toJSON();
     let buffer = Buffer.alloc(0);
     let discarding = false;
@@ -2095,11 +2250,21 @@ export class IosDeviceDaemon {
     });
     socket.on("error", () => {});
     socket.on("close", () => {
+      const subscribed = this.#connections.get(socket)?.subscribed;
       this.#connections.delete(socket);
-      if (this.#attachments.delete(socket)) {
-        this.log("detach", { reason: "connection_closed", attached: this.#attachedCount() });
-        this.#armIdle();
+      const attached = this.#attachments.delete(socket);
+      if (attached) this.log("detach", { reason: "connection_closed", attached: this.#attachedCount() });
+      if (subscribed) {
+        this.log("unsubscribe", { reason: "connection_closed", subscribers: this.#subscriberCount(), watchers: this.#watcherCount() });
+        // Nothing is read for nobody, so what is known now could only go stale.
+        if (this.#subscriberCount() === 0) {
+          this.#targetState = null;
+          this.#orientation = null;
+          this.#subscriberRound += 1;
+        }
+        this.#syncTargetPoll();
       }
+      if (attached || subscribed) this.#armIdle();
     });
   }
 
@@ -2182,6 +2347,8 @@ export class IosDeviceDaemon {
     this.#inflight -= 1;
     if (connection) connection.inflight -= 1;
     this.#reply(socket, reply);
+    // After the reply, so that a subscriber's first event never comes before it.
+    if (op === "subscribe" && reply.ok) this.#sendCurrent(socket);
     if (connection?.closing && connection.inflight === 0) this.#closeConnection(socket, connection);
     if (op === "stop") {
       this.stop("stop_request");
@@ -2212,6 +2379,13 @@ export class IosDeviceDaemon {
         return this.#quietWait(request);
       case "act":
         return this.#act(request);
+      case "subscribe":
+        return this.#subscribe(socket, request);
+      case "screenshot": {
+        const options = validateScreenshot(request);
+        await this.#ready();
+        return this.#screenshot(options);
+      }
       default: {
         const input = validateInput(request);
         // The deadline counts from arrival: see DEFAULT_HID_WAIT_MS.
@@ -2273,7 +2447,217 @@ export class IosDeviceDaemon {
       hid_lost: this.#hid?.lostEvents ?? 0,
       hid_open: this.#hid?.isOpen ?? false,
       app_state: this.quiet.state,
+      subscribers: this.#subscriberCount(),
+      watchers: this.#watcherCount(),
+      target_state: this.#targetState,
+      booted: this.#booted(),
+      orientation: this.#orientation,
+      orientation_reads: this.#orientationReads,
+      target_polls: this.#targetPolls,
     };
+  }
+
+  // --- events -----------------------------------------------------------------
+
+  #subscriberCount() {
+    let count = 0;
+    for (const connection of this.#connections.values()) count += connection.subscribed ? 1 : 0;
+    return count;
+  }
+
+  #watcherCount() {
+    let count = 0;
+    for (const connection of this.#connections.values()) count += connection.subscribed && connection.watching ? 1 : 0;
+    return count;
+  }
+
+  /** What `describe` said as true or false; null while nothing is known. */
+  #booted() {
+    return this.#targetState ? /^booted$/i.test(this.#targetState) : null;
+  }
+
+  #stateEvent(state = this.#state) {
+    return { event: "state", udid: this.udid, state, booted: this.#booted(), target_state: this.#targetState };
+  }
+
+  #orientationEvent() {
+    return { event: "orientation", udid: this.udid, orientation: this.#orientation };
+  }
+
+  /** One event line to every subscriber whose connection has not had its closing line. */
+  #publish(event) {
+    const line = `${JSON.stringify(event)}\n`;
+    for (const [socket, connection] of this.#connections) {
+      if (connection.subscribed && !connection.noticed && !socket.destroyed && socket.writable) socket.write(line);
+    }
+  }
+
+  #publishState() {
+    this.#publish(this.#stateEvent());
+  }
+
+  /** The current state as event lines, so a new subscriber needs no other read. */
+  #sendCurrent(socket) {
+    if (this.#connections.get(socket)?.noticed) return;
+    this.#reply(socket, this.#stateEvent());
+    if (this.#orientation) this.#reply(socket, this.#orientationEvent());
+  }
+
+  #subscribe(socket, request) {
+    const watching = request.watching ?? true;
+    if (typeof watching !== "boolean") throw new DaemonError(CODE.INVALID_REQUEST, "watching must be true or false.");
+    const connection = this.#connections.get(socket);
+    // A connection that closed before it got here subscribes nothing: its close already ran.
+    if (connection) {
+      connection.subscribed = true;
+      connection.watching = watching;
+      clearTimeout(this.#idleTimer);
+      this.log("subscribe", { watching, subscribers: this.#subscriberCount(), watchers: this.#watcherCount() });
+      this.#syncTargetPoll();
+    }
+    return { subscribed: Boolean(connection), watching, subscribers: this.#subscriberCount(), watchers: this.#watcherCount() };
+  }
+
+  /**
+   * Starts or stops the one poll of this simulator: running while someone watches, and
+   * never above one read per ORIENTATION_POLL_MS, however often watching flips.
+   */
+  #syncTargetPoll() {
+    if (this.#watcherCount() === 0 || this.#stopping || this.#unsupported) {
+      clearTimeout(this.#targetTimer);
+      this.#targetTimer = null;
+      return;
+    }
+    if (this.#targetTimer !== null || this.#targetPolling) return;
+    const wait = Math.max(0, ORIENTATION_POLL_MS - (performance.now() - this.#targetReadAt));
+    this.#targetTimer = setTimeout(() => this.#pollTarget(), wait);
+    this.#targetTimer.unref?.();
+  }
+
+  async #pollTarget() {
+    this.#targetTimer = null;
+    this.#targetPolling = true;
+    this.#targetPolls += 1;
+    // Set even with nothing to read below: a tick is what keeps the poll to its pace.
+    this.#targetReadAt = performance.now();
+    try {
+      // While the companion is replaced there is nothing to read; the poll goes on after it.
+      if (this.state === "serving") await this.#readTarget({ orientation: true });
+    } catch (error) {
+      this.log("target_read_failed", { message: String(error?.message ?? error).slice(0, 200) });
+    } finally {
+      this.#targetPolling = false;
+    }
+    this.#syncTargetPoll();
+  }
+
+  /** One `describe` for the subscribers, outside the watched poll. Resolves as #readTarget. */
+  #refreshTarget() {
+    if (this.#subscriberCount() === 0) return Promise.resolve(false);
+    return this.#readTarget({ orientation: false }).catch((error) => {
+      this.log("target_read_failed", { message: String(error?.message ?? error).slice(0, 200) });
+      return false;
+    });
+  }
+
+  /**
+   * A quiet stream ended, so a `describe` is due (see the header): at once for a stream
+   * that ran, otherwise QUIET_END_READ_MS after the last one.
+   */
+  #readAfterEnding({ atOnce }) {
+    this.#endingDue = Math.min(this.#endingDue ?? Infinity, atOnce ? this.#endingReadAt + QUIET_END_READ_MS : 0);
+    this.#sendEndingRead();
+  }
+
+  /** Sends the `describe` that is due, or plans it; one at a time, and it settles by itself. */
+  async #sendEndingRead() {
+    if (this.#endingDue === null || this.#endingReading) return;
+    clearTimeout(this.#endingTimer);
+    this.#endingTimer = null;
+    const wait = this.#endingDue - performance.now();
+    if (wait > 0) {
+      this.#endingTimer = setTimeout(() => this.#sendEndingRead(), wait);
+      this.#endingTimer.unref?.();
+      return;
+    }
+    this.#endingDue = null;
+    // Nobody to tell, or no companion to ask (serving again reads by itself): no read
+    // goes out, so the next ending does not have to wait for one.
+    if (this.#stopping || this.#subscriberCount() === 0 || this.state !== "serving") return;
+    this.#endingReading = true;
+    this.#endingReadAt = performance.now();
+    const settled = await this.#refreshTarget();
+    this.#endingReading = false;
+    this.log("quiet_end_read", { settled });
+    this.#sendEndingRead();
+  }
+
+  /**
+   * Reads over the open session and publishes each answer as it lands; a failed read keeps
+   * the last value. This waits for `describe` only, so that a `get_orientation` that hangs
+   * cannot hold back a shutdown. True once `describe` told the subscribers something.
+   *
+   * The poll and #refreshTarget can both have a `describe` in flight, and answers can land
+   * out of order: each one is numbered as it is sent, and an answer older than the newest
+   * one applied is dropped. Without that an older Booted could undo a newer Shutdown, for
+   * good if nobody watches.
+   */
+  async #readTarget({ orientation }) {
+    const client = this.#client;
+    if (!client) return false;
+    const options = { timeoutMs: TARGET_READ_TIMEOUT_MS };
+    // An answer of a connection that is gone says nothing of the next one, and one sent
+    // before the last subscriber left would be kept with nobody reading on, or handed to
+    // a later subscriber as what it asked for.
+    const round = this.#subscriberRound;
+    const wanted = () => client === this.#client && !this.#stopping && this.state === "serving" && round === this.#subscriberRound;
+    if (orientation && this.#booted() !== false && !this.#orientationReading) this.#readOrientation(client, options, wanted);
+    this.#describesSent += 1;
+    const sent = this.#describesSent;
+    let description;
+    try {
+      description = await client.describe(options);
+    } catch {
+      return false;
+    }
+    if (!wanted()) return false;
+    const state = description.state || null;
+    if (state === null) return false;
+    if (sent < this.#describeApplied) {
+      this.log("target_read_stale", { target_state: state, sent, applied: this.#describeApplied });
+      return true;
+    }
+    this.#describeApplied = sent;
+    this.#setTargetState(state);
+    return true;
+  }
+
+  /** One `get_orientation` at most at a time. It settles by itself, so nothing awaits it. */
+  async #readOrientation(client, options, wanted) {
+    this.#orientationReading = true;
+    this.#orientationReads += 1;
+    try {
+      const turned = await client.getOrientation(options);
+      if (wanted() && DRAWN_ORIENTATIONS.includes(turned)) this.#setOrientation(turned);
+    } catch {
+      // The last value stands.
+    } finally {
+      this.#orientationReading = false;
+    }
+  }
+
+  #setTargetState(value) {
+    if (value === null || value === this.#targetState) return;
+    this.#targetState = value;
+    this.log("target_state", { target_state: value });
+    this.#publishState();
+  }
+
+  #setOrientation(value) {
+    if (value === this.#orientation) return;
+    this.#orientation = value;
+    this.log("orientation", { orientation: value });
+    this.#publish(this.#orientationEvent());
   }
 
   // --- reads ------------------------------------------------------------------
@@ -2343,6 +2727,32 @@ export class IosDeviceDaemon {
         stage, grpc_status: error?.code ?? null, reads: counter.reads,
       });
     }
+  }
+
+  /** One image through the companion's screenshot call. */
+  async #screenshot(options) {
+    const client = this.#client;
+    if (!client) throw new DaemonError(CODE.DAEMON_UNREACHABLE, "No companion connection.");
+    let shot;
+    try {
+      shot = decodeScreenshotResponse(await client.unary("screenshot", encodeScreenshotRequest(options), { timeoutMs: SCREENSHOT_TIMEOUT_MS }));
+    } catch (error) {
+      throw new DaemonError(CODE.BACKEND_FAILED, `screenshot failed: ${error?.details || error?.message}`, {
+        stage: unreachable(error) ? STAGE.BEFORE_SEND : STAGE.AFTER_SEND, grpc_status: error?.code ?? null,
+      });
+    }
+    const failed = (message) => new DaemonError(CODE.BACKEND_FAILED, message, { stage: STAGE.AFTER_SEND });
+    if (shot.data.length === 0) throw failed("The companion's screenshot has no image data.");
+    // A companion that reports no format ignored the request's fields: a plain full-size PNG is all it can be.
+    const plain = options.format === "png" && (options.scale === null || options.scale === 1);
+    if (shot.format ? shot.format !== options.format : !plain) {
+      throw failed(`Asked for a ${options.format} screenshot, but the companion reported ${shot.format ? `encoding it as ${shot.format}` : "no format"}.`);
+    }
+    return {
+      format: options.format, image_base64: shot.data.toString("base64"), bytes: shot.data.length,
+      width: shot.width, height: shot.height, source_width: shot.sourceWidth, source_height: shot.sourceHeight,
+      screen_scale: shot.screenScale,
+    };
   }
 
   /** `ui wait --settled` on the open quiet stream. */
@@ -2739,7 +3149,7 @@ export class IosDeviceDaemon {
 
   #armIdle() {
     clearTimeout(this.#idleTimer);
-    if (this.#stopping || this.#inflight > 0 || this.#attachedCount() > 0) return;
+    if (this.#stopping || this.#inflight > 0 || this.#attachedCount() > 0 || this.#subscriberCount() > 0) return;
     this.#idleTimer = setTimeout(() => this.stop("idle"), this.idleMs);
   }
 
@@ -2750,8 +3160,13 @@ export class IosDeviceDaemon {
       this.log("stopping", { reason });
       clearTimeout(this.#idleTimer);
       clearTimeout(this.#stuckTimer);
+      clearTimeout(this.#targetTimer);
+      this.#targetTimer = null;
+      clearTimeout(this.#endingTimer);
+      this.#endingTimer = null;
       clearInterval(this.#pollTimer);
       this.#server?.close();
+      this.#publish(this.#stateEvent("stopping"));
       // A connection with nothing in flight closes now; one with a request in flight
       // closes after that reply. Requests arriving meanwhile get a before_send reply.
       for (const [socket, connection] of this.#connections) {
