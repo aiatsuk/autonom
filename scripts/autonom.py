@@ -3156,6 +3156,13 @@ def cmd_processes(_: argparse.Namespace) -> int:
     return emit({"ok": True, **processes_mod.scan()}, as_json=True)
 
 
+def cmd_host_info(_: argparse.Namespace) -> int:
+    """This machine state base's stable host id and what the host offers
+    (read-only; the id is minted once, on the first call)."""
+    from autonom_lib import host as host_mod  # noqa: PLC0415 - only this verb needs it
+    return emit({"ok": True, **host_mod.info()}, as_json=True)
+
+
 def cmd_network_stop(args: argparse.Namespace) -> int:
     record = session_mod.require_current()
     return emit(network_stop_payload(record, lambda: _target(args)), as_json=True)
@@ -6914,7 +6921,8 @@ _ATLAS_VERBS = ("update", "show", "coverage", "paths", "export", "diff")
 _CONTROL_READONLY: frozenset[str] = frozenset({
     "version", "devices", "devices list", "session outputs", "session show", "session list",
     "ui tree", "ui find", "ui wait", "screenshot", "note add", "note list", "journal",
-    "shots list", "shots show", "doctor", "capabilities", "processes", "location get",
+    "shots list", "shots show", "doctor", "capabilities", "processes", "host info",
+    "location get",
     "crash list", "crash show", "file ls", "file pull", "record start", "record stop",
     "flow check", "flow fmt", "flow list", "flow create", "flow import", "flow export",
     "teach start", "teach mark", "teach stop", "teach show", "teach compile",
@@ -7570,6 +7578,12 @@ def build_parser() -> argparse.ArgumentParser:
     # `--p` keeps meaning --platform here
     p.exact_only_options = journal_mod.EXACT_ONLY_OPTIONS | {"--probe"}
     p.set_defaults(func=cmd_capabilities)
+
+    host = sub.add_parser("host", help="this machine's Autonom host identity")
+    host_sub = host.add_subparsers(dest="host_command", required=True)
+    p = host_sub.add_parser("info", help="the stable host id (minted once per state base), "
+                                         "name, version, platform and capabilities")
+    p.set_defaults(func=cmd_host_info)
 
     p = sub.add_parser("processes", help="list Autonom-spawned processes machine-wide")
     p.set_defaults(func=cmd_processes)

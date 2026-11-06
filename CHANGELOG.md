@@ -9,6 +9,28 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
 
 ### Added
 
+- **`autonom host info`** prints this machine's host identity as JSON:
+  `host_id` (`h_` + 26 base32 characters, minted once per state base into
+  `<state base>/host.json`, 0600, and never overwritten), `name`,
+  `autonom_version`, `platform` and `capabilities`. READONLY. A damaged file
+  is refused with `host_identity_invalid` (exit 2) and left as it is.
+- **Development MCP adapter for ChatGPT desktop** (`integrations/chatgpt/autonom-chatgpt`,
+  "Autonom (dev)" 0.1.0; not in the release bundle or the root marketplaces).
+  A stdlib Python MCP server over stdio with 28 tools: hosts, devices and
+  sessions by explicit `{host_id, session_id}` references, the screen and UI
+  tree, semantic taps, typing and keys under the agent control lease
+  (`chatgpt-agent:<host_id>`), operation lookup in the journal, flow runs
+  with cancel, artifacts by id, and bridge-only device video and input for
+  its workspace page (H.264 packets pulled with `get_frames`; Pause and
+  Resume as the Canvas human holder). Every result carries the
+  `autonom.mcp/v1` envelope with `operation_id` and `outcome`
+  (`completed`, `rejected`, `failed`, `outcome_unknown`); a mutation never
+  repeats its CLI call. `integrations/chatgpt/scripts/install_workspace.py
+  install|uninstall|status` installs it into the personal marketplace.
+  `tests/live/chatgpt_mcp_conformance.py` checks the protocol, every tool's
+  schema and the error paths; `tests/live/chatgpt_mcp_live.py` is the live
+  acceptance on emulator-5584 and the test Simulator, recorded in
+  `docs/plans/CHATGPT_P3_RESULTS.md`.
 - **Opt-in macOS hardware video for the Android Canvas.** With an emulator
   listed in `~/.config/autonom/host-video.json` (AVD, serial, gRPC port),
   `autonom devices boot` starts that AVD with `-grpc <port> -grpc-use-token`

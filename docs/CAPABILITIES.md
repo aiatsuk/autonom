@@ -387,6 +387,7 @@ autonom control acquire [--holder ID] [--kind agent|human] [--label TEXT] [--ttl
 autonom control release [--holder ID] [--generation N]
 autonom control renew [--holder ID] [--generation N] [--ttl SECONDS]
 
+autonom host info                # stable host id of this state base, name, version, platform
 autonom processes
 autonom cleanup [--dry-run] [--all]
 ```

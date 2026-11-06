@@ -1,0 +1,20 @@
+{
+  "name": "autonom-chatgpt",
+  "version": "0.1.0",
+  "description": "Development adapter that connects ChatGPT desktop to the local Autonom CLI and Canvas through a real MCP server: sessions, screen reads, semantic input, control lease, flow runs, artifacts and bridge-only device video. Not the Autonom release plugin.",
+  "author": {"name": "Andrei Iatsuk", "url": "https://github.com/aiatsuk"},
+  "homepage": "https://github.com/aiatsuk/autonom",
+  "repository": "https://github.com/aiatsuk/autonom",
+  "license": "MIT",
+  "keywords": ["autonom", "chatgpt", "mcp", "mobile"],
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Autonom (dev)",
+    "shortDescription": "Drive local Android emulators and iOS Simulators with Autonom",
+    "longDescription": "A development-only plugin that runs the Autonom MCP adapter on this computer: list hosts, devices and sessions, start and stop sessions, read the screen and UI tree, tap, type and press keys under the Autonom control lease, run flows and fetch their artifacts, and watch device video in the workspace page through the MCP bridge. Requires a local Autonom checkout or install and Python 3.",
+    "developerName": "Andrei Iatsuk",
+    "category": "Developer Tools",
+    "capabilities": ["Interactive", "Read", "Write"],
+    "defaultPrompt": ["Open Autonom and list my devices."]
+  }
+}
