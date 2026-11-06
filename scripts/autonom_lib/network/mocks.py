@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .. import errors
+from . import redact
 
 BODY_INLINE_LIMIT = 1_048_576  # 1 MiB — an inline --json body beyond this is a file
 # A delayed or held response never waits longer than this; the addon applies
@@ -454,6 +455,437 @@ def url_to_match(url: str) -> dict[str, Any]:
     return {"url_glob": base, "method": None, "host": host, "ignore_query": True}
 
 
+# --- request conditions and rewrite edits (MR-01..MR-11) ----------------------
+
+MODES = ("respond", "rewrite")
+# Per kind: at most this many conditions (or edits), each value at most this long.
+MAX_CONDITIONS = 20
+MAX_CONDITION_VALUE = 2048
+_HEADER_TOKEN = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
+CONDITION_KEYS = ("query", "request_headers", "body_contains", "body_json")
+EDIT_KEYS = ("remove_headers", "json_set", "json_remove", "replace")
+BODY_EDIT_KEYS = ("json_set", "json_remove", "replace")
+# The registry spelling of each list.
+_EDIT_FLAGS = {"remove_headers": "--remove-header", "json_set": "--json-set",
+               "json_remove": "--json-remove", "replace": "--replace"}
+
+
+def _invalid(message: str, hint: str) -> errors.AutonomError:
+    return errors.AutonomError(errors.INVALID_VALUE, message, hint)
+
+
+def rule_mode(rule: dict[str, Any] | None) -> str:
+    """`rewrite` for a rewrite rule; `respond` otherwise (absent included)."""
+    return "rewrite" if (rule or {}).get("mode") == "rewrite" else "respond"
+
+
+def check_mode(mode: Any) -> str | None:
+    """None (not given), `respond` or `rewrite`; anything else is refused."""
+    if mode is None:
+        return None
+    if mode not in MODES:
+        raise _invalid(f"mode {mode!r} is neither 'respond' nor 'rewrite'",
+                       "Pass --rewrite to edit the real response, --no-rewrite to fake it.")
+    return mode
+
+
+def _check_count(items: list[Any], flag: str) -> None:
+    if len(items) > MAX_CONDITIONS:
+        raise _invalid(f"{flag} given {len(items)} times; at most {MAX_CONDITIONS} are allowed",
+                       f"Keep {flag} to {MAX_CONDITIONS} entries or fewer.")
+
+
+def _check_length(text: str, flag: str, what: str = "value") -> None:
+    if len(text) > MAX_CONDITION_VALUE:
+        raise _invalid(f"{flag} {what} is longer than {MAX_CONDITION_VALUE} characters",
+                       f"Shorten the {flag} {what}, or use a glob such as 'prefix*'.")
+
+
+def _check_header_name(name: Any, flag: str) -> str:
+    if not isinstance(name, str) or not name.strip():
+        raise _invalid(f"{flag} has an empty header name", f"Pass {flag} 'Name: value'.")
+    name = name.strip()
+    if not _HEADER_TOKEN.fullmatch(name):
+        raise _invalid(f"{flag} header name {name!r} is not a valid HTTP header name",
+                       f"A {flag} name uses letters, digits and !#$%&'*+-.^_`|~ only, "
+                       "no spaces.")
+    _check_length(name, flag, "name")
+    return name
+
+
+def validate_json_path(path: Any, flag: str) -> str:
+    """A dotted path such as `user.id` or `items.0.id` (DEC-004)."""
+    if not isinstance(path, str) or not path:
+        raise _invalid(f"{flag} has an empty JSON path",
+                       f"Pass {flag} with a dotted path such as user.id or items.0.id.")
+    if any(segment == "" for segment in path.split(".")):
+        raise _invalid(f"{flag} path {path!r} has an empty segment",
+                       f"Pass {flag} with a dotted path such as user.id or items.0.id.")
+    _check_length(path, flag, "path")
+    return path
+
+
+def _reject_constant(name: str) -> Any:
+    raise ValueError(name)
+
+
+def parse_json_value(text: str) -> Any:
+    """`2` -> 2, `"pro"` -> "pro", `true` -> True; anything else stays text."""
+    try:
+        return json.loads(text, parse_constant=_reject_constant)
+    except (ValueError, RecursionError):
+        return text
+
+
+def parse_query_arg(raw: str) -> dict[str, Any]:
+    """`--query NAME[=GLOB]`: `page=2`, or `debug` for "present with any value"."""
+    name, equals, value = str(raw).partition("=")
+    if not name.strip():
+        raise _invalid(f"malformed --query {raw!r}: the parameter name is empty",
+                       "Pass --query NAME or --query NAME=GLOB, e.g. --query page=2.")
+    return {"name": name.strip(), "value": value if equals else None}
+
+
+def parse_header_condition(raw: str) -> dict[str, Any]:
+    """`--request-header 'Name[: GLOB]'`; a bare name means "present"."""
+    name, colon, value = str(raw).partition(":")
+    return {"name": _check_header_name(name, "--request-header"),
+            "value": value.strip() if colon else None}
+
+
+def parse_path_value(raw: str, flag: str = "--body-json") -> dict[str, Any]:
+    """`PATH=VALUE`, VALUE read as JSON when it parses, else as text."""
+    path, equals, value = str(raw).partition("=")
+    if not equals:
+        raise _invalid(f"malformed {flag} {raw!r}: expected PATH=VALUE",
+                       f"Pass {flag} PATH=VALUE, e.g. {flag} user.role=admin.")
+    return {"path": validate_json_path(path.strip(), flag), "value": parse_json_value(value)}
+
+
+def parse_replace(pair: Any) -> dict[str, str]:
+    """`--replace OLD NEW` as `{"find": OLD, "with": NEW}`."""
+    if isinstance(pair, dict):
+        return {"find": pair.get("find"), "with": pair.get("with")}  # type: ignore[dict-item]
+    if isinstance(pair, (list, tuple)) and len(pair) == 2:
+        return {"find": pair[0], "with": pair[1]}
+    raise _invalid(f"malformed --replace {pair!r}: expected OLD NEW",
+                   "Pass --replace OLD NEW, e.g. --replace Free Pro.")
+
+
+def _named_list(items: Any, flag: str, *, header: bool) -> list[dict[str, Any]] | None:
+    if items is None:
+        return None
+    if not isinstance(items, (list, tuple)):
+        raise _invalid(f"{flag} must be a list", f"Pass {flag} once per condition.")
+    _check_count(list(items), flag)
+    result = []
+    for item in items:
+        if isinstance(item, str):
+            item = parse_header_condition(item) if header else parse_query_arg(item)
+        if not isinstance(item, dict):
+            raise _invalid(f"{flag} entry {item!r} is not a name/value pair",
+                           f"Pass {flag} as NAME or NAME=GLOB.")
+        name, value = item.get("name"), item.get("value")
+        if header:
+            name = _check_header_name(name, flag)
+        else:
+            if not isinstance(name, str) or not name.strip():
+                raise _invalid(f"{flag} has an empty name",
+                               f"Pass {flag} NAME or NAME=GLOB, e.g. page=2.")
+            name = name.strip()
+            _check_length(name, flag, "name")
+        if value is not None:
+            if not isinstance(value, str):
+                raise _invalid(f"{flag} value for {name!r} must be text",
+                               f"Pass {flag} with a text value or glob.")
+            _check_length(value, flag)
+        result.append({"name": name, "value": value})
+    return result
+
+
+def _path_value_list(items: Any, flag: str) -> list[dict[str, Any]] | None:
+    if items is None:
+        return None
+    if not isinstance(items, (list, tuple)):
+        raise _invalid(f"{flag} must be a list", f"Pass {flag} once per field.")
+    _check_count(list(items), flag)
+    result = []
+    for item in items:
+        if isinstance(item, str):
+            item = parse_path_value(item, flag)
+        if not isinstance(item, dict) or "value" not in item:
+            raise _invalid(f"{flag} entry {item!r} is not PATH=VALUE",
+                           f"Pass {flag} PATH=VALUE, e.g. {flag} user.role=admin.")
+        path = validate_json_path(item.get("path"), flag)
+        try:
+            encoded = json.dumps(item["value"], allow_nan=False)
+        except (TypeError, ValueError):
+            raise _invalid(f"{flag} value for {path!r} is not a JSON value",
+                           f"Pass {flag} PATH=VALUE with a JSON value or plain text.") from None
+        _check_length(encoded, flag)
+        result.append({"path": path, "value": json.loads(encoded)})
+    return result
+
+
+def _text_list(items: Any, flag: str, *, what: str) -> list[str]:
+    if not isinstance(items, (list, tuple)):
+        raise _invalid(f"{flag} must be a list", f"Pass {flag} once per {what}.")
+    _check_count(list(items), flag)
+    for item in items:
+        if not isinstance(item, str) or not item:
+            raise _invalid(f"{flag} has an empty {what}", f"Pass {flag} with a non-empty {what}.")
+        _check_length(item, flag, what)
+    return list(items)
+
+
+def validate_conditions(*, query: Any = None, request_headers: Any = None,
+                        body_contains: Any = None, body_json: Any = None) -> dict[str, Any]:
+    """Checked request conditions (MR-05); a None entry means "not given".
+
+    Entries may be structured (`{"name", "value"}`, `{"path", "value"}`) or
+    the flag text (`page=2`, `X-Client: ios*`, `user.role=admin`).
+    """
+    return {
+        "query": _named_list(query, "--query", header=False),
+        "request_headers": _named_list(request_headers, "--request-header", header=True),
+        "body_contains": (None if body_contains is None
+                          else _text_list(body_contains, "--body-contains", what="text")),
+        "body_json": _path_value_list(body_json, "--body-json"),
+    }
+
+
+def validate_rewrite(*, remove_headers: Any = None, json_set: Any = None,
+                     json_remove: Any = None, replace: Any = None) -> dict[str, Any]:
+    """Checked rewrite edits; a None entry means "not given"."""
+    removed = None
+    if remove_headers is not None:
+        if not isinstance(remove_headers, (list, tuple)):
+            raise _invalid("--remove-header must be a list",
+                           "Pass --remove-header once per header.")
+        _check_count(list(remove_headers), "--remove-header")
+        removed = [_check_header_name(name, "--remove-header") for name in remove_headers]
+    removals = None
+    if json_remove is not None:
+        removals = [validate_json_path(path, "--json-remove")
+                    for path in _text_list(json_remove, "--json-remove", what="path")]
+    replacements = None
+    if replace is not None:
+        if not isinstance(replace, (list, tuple)):
+            raise _invalid("--replace must be a list", "Pass --replace OLD NEW per edit.")
+        _check_count(list(replace), "--replace")
+        replacements = []
+        for pair in replace:
+            item = parse_replace(pair)
+            if not isinstance(item["find"], str) or not item["find"]:
+                raise _invalid("--replace has empty text to find",
+                               "Pass --replace OLD NEW with a non-empty OLD.")
+            if not isinstance(item["with"], str):
+                raise _invalid("--replace replacement must be text",
+                               "Pass --replace OLD NEW.")
+            _check_length(item["find"], "--replace", "text")
+            _check_length(item["with"], "--replace", "replacement")
+            replacements.append({"find": item["find"], "with": item["with"]})
+    return {"remove_headers": removed, "json_set": _path_value_list(json_set, "--json-set"),
+            "json_remove": removals, "replace": replacements}
+
+
+def _check_rule_shape(mode: str, edits: dict[str, list[Any]], *, whole_body: bool,
+                      hang: bool, edits_given: bool) -> None:
+    """The combinations a rule may not have (MR-07, MR-09, MR-11)."""
+    named = [_EDIT_FLAGS[key] for key in EDIT_KEYS if edits.get(key)]
+    body_named = [_EDIT_FLAGS[key] for key in BODY_EDIT_KEYS if edits.get(key)]
+    if mode == "respond" and named:
+        raise _invalid(f"{', '.join(named)} edit(s) a real response and need --rewrite",
+                       "Add --rewrite, or drop the edit flags (--clear-edits on update).")
+    if mode == "rewrite" and hang:
+        raise _invalid("--hang cannot be used with --rewrite",
+                       "A rewrite rule waits for the real response; use --delay SECONDS.")
+    if mode == "rewrite" and whole_body and body_named and edits_given:
+        raise _invalid("a whole body (--json or --body-file) and body edits "
+                       f"({', '.join(body_named)}) exclude each other",
+                       "Replace the body whole, or edit it with --json-set, "
+                       "--json-remove and --replace.")
+
+
+def _store_conditions(match: dict[str, Any], conditions: dict[str, Any]) -> None:
+    """Write given condition lists; an empty list removes that kind."""
+    for key, stored in (("query", "query"), ("request_headers", "headers")):
+        value = conditions.get(key)
+        if value is None:
+            continue
+        if value:
+            match[stored] = value
+        else:
+            match.pop(stored, None)
+    body = dict(match.get("body") or {}) if isinstance(match.get("body"), dict) else {}
+    for key, stored in (("body_contains", "contains"), ("body_json", "json")):
+        value = conditions.get(key)
+        if value is None:
+            continue
+        if value:
+            body[stored] = value
+        else:
+            body.pop(stored, None)
+    if body:
+        match["body"] = body
+    else:
+        match.pop("body", None)
+
+
+def _stored_edits(rule: dict[str, Any]) -> dict[str, list[Any]]:
+    rewrite = rule.get("rewrite") if isinstance(rule.get("rewrite"), dict) else {}
+    return {key: list(rewrite.get(key) or []) for key in EDIT_KEYS}
+
+
+def _store_edits(rule: dict[str, Any], edits: dict[str, list[Any]]) -> None:
+    kept = {key: edits[key] for key in EDIT_KEYS if edits.get(key)}
+    if kept:
+        rule["rewrite"] = kept
+    else:
+        rule.pop("rewrite", None)
+
+
+def _restore_masked(given: list[dict[str, Any]] | None, stored: Any, key: str
+                    ) -> list[dict[str, Any]] | None:
+    """A value shown masked and sent back unchanged keeps the stored secret.
+
+    `mocks.list` masks secret condition values; a form that saves what it was
+    shown must not overwrite the real value with the placeholder.
+    """
+    if not given or not isinstance(stored, list):
+        return given
+    pool = [item for item in stored if isinstance(item, dict)]
+    result = []
+    for item in given:
+        if item.get("value") == redact.PLACEHOLDER:
+            for index, old in enumerate(pool):
+                if old.get(key) == item.get(key):
+                    item = {**item, "value": old.get("value")}
+                    pool.pop(index)
+                    break
+        result.append(item)
+    return result
+
+
+def _restore_masked_headers(given: dict[str, str] | None, stored: Any
+                            ) -> dict[str, str] | None:
+    """Response headers shown masked and sent back unchanged keep the stored value.
+
+    Header names compare without case; a placeholder with no stored header of
+    that name is kept as given.
+    """
+    if not given or not isinstance(stored, dict):
+        return given
+    by_name = {str(name).lower(): value for name, value in stored.items()}
+    return {name: (by_name[name.lower()]
+                   if value == redact.PLACEHOLDER and name.lower() in by_name else value)
+            for name, value in given.items()}
+
+
+def _sensitive_path(path: Any) -> bool:
+    return isinstance(path, str) and path.rsplit(".", 1)[-1].lower() in redact.SENSITIVE_FIELDS
+
+
+def mask_rule(rule: dict[str, Any]) -> dict[str, Any]:
+    """A copy safe to print: secret condition, header and JSON-set values masked (MR-12).
+
+    Masked: request-header conditions on sensitive headers (Authorization,
+    Cookie, API keys), response headers with those names (a rewrite rule's
+    set headers and a fake response's headers alike), query conditions whose
+    names look secret, and JSON values whose last path segment is a
+    credential field. Never raises on a hand-edited rule.
+    """
+    copy = json.loads(json.dumps(rule, default=str))
+    match = copy.get("match") if isinstance(copy.get("match"), dict) else {}
+    for key, secret in (("query", redact.is_sensitive_query_key),
+                        ("headers", lambda name: name.lower() in redact.REDACTED_HEADERS)):
+        for item in match.get(key) or [] if isinstance(match.get(key), list) else []:
+            if isinstance(item, dict) and isinstance(item.get("name"), str) \
+                    and item.get("value") is not None and secret(item["name"]):
+                item["value"] = redact.PLACEHOLDER
+    body = match.get("body") if isinstance(match.get("body"), dict) else {}
+    rewrite = copy.get("rewrite") if isinstance(copy.get("rewrite"), dict) else {}
+    for items in (body.get("json"), rewrite.get("json_set")):
+        for item in items if isinstance(items, list) else []:
+            if isinstance(item, dict) and _sensitive_path(item.get("path")):
+                item["value"] = redact.PLACEHOLDER
+    response = copy.get("response") if isinstance(copy.get("response"), dict) else {}
+    headers = response.get("headers")
+    if isinstance(headers, dict):
+        for name, value in headers.items():
+            if value is not None and str(name).lower() in redact.REDACTED_HEADERS:
+                headers[name] = redact.PLACEHOLDER
+    return copy
+
+
+def condition_counts(rule: dict[str, Any]) -> dict[str, int]:
+    """How many conditions of each kind a rule has (journal words use counts)."""
+    match = rule.get("match") if isinstance(rule.get("match"), dict) else {}
+    body = match.get("body") if isinstance(match.get("body"), dict) else {}
+
+    def count(value: Any) -> int:
+        return len(value) if isinstance(value, list) else 0
+
+    return {"query": count(match.get("query")), "request_header": count(match.get("headers")),
+            "body_contains": count(body.get("contains")), "body_json": count(body.get("json"))}
+
+
+def edit_counts(rule: dict[str, Any]) -> dict[str, int]:
+    rewrite = rule.get("rewrite") if isinstance(rule.get("rewrite"), dict) else {}
+    return {key: len(rewrite[key]) if isinstance(rewrite.get(key), list) else 0
+            for key in EDIT_KEYS}
+
+
+def _plural(count: int, word: str) -> str:
+    return f"+{count} {word}" + ("" if count == 1 else "s")
+
+
+def describe(rule: dict[str, Any]) -> dict[str, Any]:
+    """Mode and a short masked summary of a rule's conditions and edits.
+
+    `summary` reads like `page=2 · +1 header`; `edits` like
+    `status 503 · -1 header · json_set×1`. Secret values never appear.
+    """
+    masked = mask_rule(rule)
+    match = masked.get("match") if isinstance(masked.get("match"), dict) else {}
+    counts = condition_counts(masked)
+    parts = []
+    query = match.get("query") if isinstance(match.get("query"), list) else []
+    shown = [item for item in query if isinstance(item, dict)][:2]
+    for item in shown:
+        name, value = item.get("name"), item.get("value")
+        parts.append(f"{name}" if value is None else f"{name}={value}")
+    if counts["query"] > len(shown):
+        parts.append(_plural(counts["query"] - len(shown), "query param"))
+    if counts["request_header"]:
+        parts.append(_plural(counts["request_header"], "header"))
+    if counts["body_contains"]:
+        parts.append(_plural(counts["body_contains"], "body text"))
+    if counts["body_json"]:
+        parts.append(_plural(counts["body_json"], "body field"))
+    mode = rule_mode(rule)
+    edits: list[str] = []
+    if mode == "rewrite":
+        response = masked.get("response") if isinstance(masked.get("response"), dict) else {}
+        if response.get("status") is not None:
+            edits.append(f"status {response['status']}")
+        stored = edit_counts(masked)
+        if stored["remove_headers"]:
+            edits.append(f"-{stored['remove_headers']} header"
+                         + ("" if stored["remove_headers"] == 1 else "s"))
+        headers = response.get("headers") if isinstance(response.get("headers"), dict) else {}
+        if headers:
+            edits.append(_plural(len(headers), "header"))
+        if response.get("body_path"):
+            edits.append("whole body")
+        for key in ("json_set", "json_remove", "replace"):
+            if stored[key]:
+                edits.append(f"{key}×{stored[key]}")
+    return {"mode": mode, "conditions": sum(counts.values()),
+            "edits": sum(edit_counts(rule).values()), "summary": " · ".join(parts),
+            "edit_summary": " · ".join(edits)}
+
+
 # --- CRUD ---------------------------------------------------------------------
 
 
@@ -463,18 +895,49 @@ def add(
     method: str | None = None,
     host: str | None = None,
     ignore_query: bool = False,
-    status: int = 200,
+    status: int | None = None,
     headers: dict[str, str] | None = None,
     body_file: Path | None = None,
     body_text: str | None = None,
     note: str | None = None,
     delay_s: float | None = None,
     hang: bool = False,
+    mode: str | None = None,
+    query: list[Any] | None = None,
+    request_headers: list[Any] | None = None,
+    body_contains: list[str] | None = None,
+    body_json: list[Any] | None = None,
+    remove_headers: list[str] | None = None,
+    json_set: list[Any] | None = None,
+    json_remove: list[str] | None = None,
+    replace: list[Any] | None = None,
     registry: Path | None = None,
 ) -> dict[str, Any]:
+    """Add a rule. `status` defaults to 200 for a fake response; a `rewrite`
+    rule without one keeps the real server's status.
+
+    Request conditions (`query`, `request_headers`, `body_contains`,
+    `body_json`) narrow any rule; `remove_headers`, `json_set`, `json_remove`
+    and `replace` edit the real body and need `mode="rewrite"`. In rewrite
+    mode `headers` are headers to set and a body replaces the real one whole.
+    Everything is checked before anything is written.
+    """
     require_target(url_glob)
+    mode = check_mode(mode) or "respond"
     validate_response(status=status, body_text=body_text)
     delay_s = validate_delay(delay_s, hang)
+    conditions = validate_conditions(query=query, request_headers=request_headers,
+                                     body_contains=body_contains, body_json=body_json)
+    given = validate_rewrite(remove_headers=remove_headers, json_set=json_set,
+                             json_remove=json_remove, replace=replace)
+    edits = {key: given[key] or [] for key in EDIT_KEYS}
+    _check_rule_shape(mode, edits, hang=bool(hang), edits_given=True,
+                      whole_body=body_file is not None or body_text is not None)
+    if mode == "rewrite":
+        for name in headers or {}:
+            _check_header_name(name, "--header")
+    if status is None and mode == "respond":
+        status = 200
     # A type the author did not name is marked implicit, so a later body
     # change can replace it while an explicit `--header` type always stays.
     implicit = None if has_content_type(headers) else implicit_content_type(body_file, body_text)
@@ -486,7 +949,7 @@ def add(
     body_path = _store_body(
         identifier, body_file=body_file, body_text=body_text, registry=registry
     )
-    rule = {
+    rule: dict[str, Any] = {
         "id": identifier,
         "match": {
             "url_glob": url_glob,
@@ -495,7 +958,7 @@ def add(
             "ignore_query": bool(ignore_query),
         },
         "response": {
-            "status": int(status),
+            "status": int(status) if status is not None else None,
             "headers": headers or {},
             "body_path": body_path,
         },
@@ -503,6 +966,10 @@ def add(
         "note": note,
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
+    if mode == "rewrite":
+        rule["mode"] = "rewrite"
+    _store_conditions(rule["match"], conditions)
+    _store_edits(rule, edits)
     if implicit:
         rule["response"]["content_type_implicit"] = True
     _apply_timing(rule, delay_s, hang or None)
@@ -543,6 +1010,19 @@ def update(
     note: str | None = None,
     delay_s: float | None = None,
     hang: bool | None = None,
+    mode: str | None = None,
+    query: list[Any] | None = None,
+    request_headers: list[Any] | None = None,
+    body_contains: list[str] | None = None,
+    body_json: list[Any] | None = None,
+    remove_headers: list[str] | None = None,
+    json_set: list[Any] | None = None,
+    json_remove: list[str] | None = None,
+    replace: list[Any] | None = None,
+    clear_conditions: bool = False,
+    clear_edits: bool = False,
+    clear_status: bool = False,
+    clear_body: bool = False,
     registry: Path | None = None,
 ) -> dict[str, Any]:
     """Partial update. Only the fields actually supplied are touched.
@@ -555,11 +1035,49 @@ def update(
     header-only update that names no Content-Type. A new body (`body_file` or
     `body_text`) replaces an implicit type with the new body's own; a
     Content-Type the author gave explicitly is never replaced by a body change.
+
+    Conditions and edits: a list that is given replaces that whole list (an
+    empty list clears it); `clear_conditions` / `clear_edits` drop them all
+    first. A condition value, JSON-set value or response header value equal to
+    the masked placeholder keeps the stored value. `mode` switches between `respond` and `rewrite`; `clear_status`
+    makes a rewrite rule keep the real status; `clear_body` drops a stored
+    body. In rewrite mode a new body replaces stored body edits and new body
+    edits replace a stored body; giving both at once is refused.
     """
     validate_response(status=status, body_text=body_text)
     delay_s = validate_delay(delay_s, hang)
+    mode = check_mode(mode)
+    conditions = validate_conditions(query=query, request_headers=request_headers,
+                                     body_contains=body_contains, body_json=body_json)
+    given = validate_rewrite(remove_headers=remove_headers, json_set=json_set,
+                             json_remove=json_remove, replace=replace)
+    if clear_status and status is not None:
+        raise _invalid("--status and clearing the status both given",
+                       "Pass one of them.")
+    new_body = body_file is not None or body_text is not None
+    if clear_body and new_body:
+        raise _invalid("a new body and clearing the body both given", "Pass one of them.")
     payload = _read_payload(registry)
     rule = _find(payload["mocks"], identifier)
+
+    # The final shape is checked before anything (a body file included) is written.
+    final_mode = mode or rule_mode(rule)
+    edits = {key: [] if clear_edits else stored
+             for key, stored in _stored_edits(rule).items()}
+    body_edits_given = any(given[key] is not None for key in BODY_EDIT_KEYS)
+    for key in EDIT_KEYS:
+        if given[key] is not None:
+            edits[key] = given[key]
+    final_hang = bool(hang) if hang is not None else (
+        rule.get("hang") is True and delay_s is None)
+    _check_rule_shape(final_mode, edits, hang=final_hang, edits_given=body_edits_given,
+                      whole_body=new_body)
+    if final_mode == "respond" and clear_status:
+        raise _invalid("a fake response needs a status",
+                       "Pass --status, or --rewrite to keep the real status.")
+    if final_mode == "rewrite":
+        for name in headers or {}:
+            _check_header_name(name, "--header")
 
     match = rule.setdefault("match", {})
     if url_glob is not None:
@@ -570,12 +1088,27 @@ def update(
         match["host"] = host or None
     if ignore_query is not None:
         match["ignore_query"] = bool(ignore_query)
+    if clear_conditions:
+        _store_conditions(match, {key: [] for key in CONDITION_KEYS})
+    body_stored = match.get("body") if isinstance(match.get("body"), dict) else {}
+    conditions["query"] = _restore_masked(conditions["query"], match.get("query"), "name")
+    conditions["request_headers"] = _restore_masked(
+        conditions["request_headers"], match.get("headers"), "name")
+    conditions["body_json"] = _restore_masked(conditions["body_json"], body_stored.get("json"),
+                                              "path")
+    _store_conditions(match, conditions)
+    if given["json_set"] is not None:
+        edits["json_set"] = _restore_masked(given["json_set"],
+                                            _stored_edits(rule)["json_set"], "path") or []
 
     response = rule.setdefault("response", {})
     if status is not None:
         response["status"] = int(status)
+    elif clear_status:
+        response["status"] = None
     implicit = response.get("content_type_implicit") is True
     current = dict(response.get("headers") or {})
+    headers = _restore_masked_headers(headers, response.get("headers"))
     if headers is not None:
         kept = _content_type_value(current) if implicit else None
         current = dict(headers)
@@ -585,7 +1118,9 @@ def update(
             current["Content-Type"] = kept  # header-only update keeps it
         else:
             implicit = False
-    if body_file is not None or body_text is not None:
+    drop_body = clear_body or (final_mode == "rewrite" and body_edits_given
+                               and any(edits[key] for key in BODY_EDIT_KEYS))
+    if new_body:
         response["body_path"] = _store_body(
             identifier, body_file=body_file, body_text=body_text, registry=registry
         )
@@ -596,12 +1131,29 @@ def update(
             implicit = new_type is not None
             if new_type:
                 current["Content-Type"] = new_type
-    if headers is not None or body_file is not None or body_text is not None:
+        if final_mode == "rewrite" and not body_edits_given:
+            # A whole new body replaces stored body edits (one body choice).
+            for key in BODY_EDIT_KEYS:
+                edits[key] = []
+    elif drop_body and response.get("body_path"):
+        _unlink_body(response.get("body_path"))
+        response["body_path"] = None
+        if implicit:
+            current = _without_content_type(current)
+            implicit = False
+    if headers is not None or new_body or drop_body:
         response["headers"] = current
         if implicit:
             response["content_type_implicit"] = True
         else:
             response.pop("content_type_implicit", None)
+    if final_mode == "respond" and response.get("status") is None:
+        response["status"] = 200
+    if final_mode == "rewrite":
+        rule["mode"] = "rewrite"
+    else:
+        rule.pop("mode", None)
+    _store_edits(rule, edits)
     if note is not None:
         rule["note"] = note or None
     _apply_timing(rule, delay_s, hang)
@@ -609,6 +1161,14 @@ def update(
     rule["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     _write_payload(payload, registry)
     return rule
+
+
+def _unlink_body(body_path: Any) -> None:
+    if body_path:
+        try:
+            Path(body_path).unlink()
+        except OSError:
+            pass
 
 
 def remove(identifier: str, registry: Path | None = None) -> dict[str, Any]:

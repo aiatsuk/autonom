@@ -39,7 +39,14 @@ JOURNAL_FILE = "journal.ndjson"
 _SENSITIVE_VALUE_FLAGS = {
     "--json", "--header", "--setenv", "--data", "--body", "--raw", "--value",
     "--token", "--secret", "--password",
+    # `network mock add|update` conditions and response edits: their values
+    # are request or response contents (a token in a query, a header, a body)
+    "--query", "--request-header", "--body-contains", "--body-json", "--json-set",
+    "--replace",
 }
+# Sensitive flags that take more than one value (argparse nargs); every one
+# of those values is masked.
+_SENSITIVE_VALUE_COUNTS: dict[str, int] = {"--replace": 2}
 # argparse accepts any unambiguous prefix, down to one letter (`--j`, `--v`,
 # `--head`, `--tok`), so ANY `--x` token that is a prefix of a sensitive flag
 # counts as that flag. Masking an ambiguous prefix argparse would reject
@@ -59,7 +66,8 @@ _EXACT_NON_SECRET_PREFIXES: dict[tuple[str, ...], frozenset[str]] = {
 }
 # Namespace dests whose exact string values are secrets wherever they appear.
 _SENSITIVE_DESTS = ("token", "secret", "password", "header", "value", "json",
-                    "setenv", "data", "body", "raw")
+                    "setenv", "data", "body", "raw", "query", "request_header",
+                    "body_contains", "body_json", "json_set", "replace")
 # Target flags that take a value (global and per-verb). In the argv-only
 # fallback these, and every argparse abbreviation of them (`--ser`, `--plat`),
 # are skipped together with their value when looking for the command path or
@@ -483,8 +491,20 @@ def _namespace_secrets(args: Any) -> set[str]:
     for dest in _SENSITIVE_DESTS:
         value = getattr(args, dest, None)
         values = value if isinstance(value, (list, tuple)) else [value]
-        found |= {item for item in values if isinstance(item, str) and item}
+        # an appended multi-value flag (`--replace OLD NEW`) is a list of lists
+        flat = [inner for item in values
+                for inner in (item if isinstance(item, (list, tuple)) else [item])]
+        found |= {item for item in flat if isinstance(item, str) and item}
     return found
+
+
+def _sensitive_value_count(flag: str) -> int:
+    """How many values follow a sensitive ``flag`` (an exact flag or the
+    argparse abbreviation of one): 1, or more for a multi-value flag."""
+    if flag in _SENSITIVE_VALUE_COUNTS:
+        return _SENSITIVE_VALUE_COUNTS[flag]
+    full = [name for name in _SENSITIVE_VALUE_FLAGS if name.startswith(flag)]
+    return max((_SENSITIVE_VALUE_COUNTS.get(name, 1) for name in full), default=1)
 
 
 def scrub_argv(argv: list[str], args: Any = None) -> list[str]:
@@ -506,11 +526,11 @@ def scrub_argv(argv: list[str], args: Any = None) -> list[str]:
     path = tuple(argv[index] for index in words[:3])
     secrets = _namespace_secrets(args)
     out: list[str] = []
-    skip_next = False
+    skip_next = 0
     for index, token in enumerate(argv):
         if skip_next:
             out.append("***")
-            skip_next = False
+            skip_next -= 1
             continue
         if index in typed:
             # Whatever was entered into the focused field is exactly where a
@@ -519,7 +539,7 @@ def scrub_argv(argv: list[str], args: Any = None) -> list[str]:
             continue
         if _sensitive_flag(token, path):
             out.append(token)
-            skip_next = True
+            skip_next = _sensitive_value_count(token)
             continue
         flag, equals, value = token.partition("=")
         if equals and (_sensitive_flag(flag, path) or (flag.startswith("-") and value in secrets)):

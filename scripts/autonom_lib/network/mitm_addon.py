@@ -210,16 +210,311 @@ def glob_match(pattern: str, value: str) -> bool:
     return fnmatch.fnmatch(value, pattern)
 
 
-def rule_matches(rule: dict, method: str, url: str, host: str) -> bool:
+def _glob_case(value: str, pattern: str) -> bool:
+    import fnmatch
+
+    return fnmatch.fnmatchcase(value, pattern)
+
+
+# --- request conditions (match.query / match.headers / match.body) ------------
+
+# Bodies above this never satisfy a body condition (DEC-006); rewrite edits
+# give up on bodies above REWRITE_BODY_LIMIT and pass them through unchanged.
+MATCH_BODY_LIMIT = 1024 * 1024
+REWRITE_BODY_LIMIT = 8 * 1024 * 1024
+_MISSING = object()
+_INDEX = re.compile(r"[0-9]+")
+
+
+def percent_decode(text: str) -> str:
+    """`a%20b+c` -> `a b c`; bytes are joined before UTF-8 decoding.
+
+    A regex rather than `urllib`: the addon may import only a fixed stdlib set.
+    """
+    raw = str(text).replace("+", " ").encode("utf-8", "surrogatepass")
+    raw = re.sub(rb"%([0-9A-Fa-f]{2})", lambda m: bytes([int(m.group(1), 16)]), raw)
+    return raw.decode("utf-8", "replace")
+
+
+def query_pairs(url) -> list:
+    """Decoded `(name, value)` pairs of the URL's query; `?a` reads as `a=""`."""
+    base = str(url or "").split("#", 1)[0]
+    if "?" not in base:
+        return []
+    pairs = []
+    for part in base.split("?", 1)[1].split("&"):
+        if not part:
+            continue
+        name, _equals, value = part.partition("=")
+        pairs.append((percent_decode(name), percent_decode(value)))
+    return pairs
+
+
+def header_pairs(headers) -> list:
+    """`(lower-case name, value)` for every header field, repeats kept.
+
+    mitmproxy's `Headers.items()` joins repeated fields; `items(multi=True)`
+    keeps them apart. Plain mappings (the unit fakes) take no keyword.
+    """
+    if headers is None:
+        return []
+    try:
+        if hasattr(headers, "items"):
+            try:
+                items = headers.items(multi=True)
+            except TypeError:
+                items = headers.items()
+        else:
+            items = headers
+        return [(str(name).lower(), str(value)) for name, value in items]
+    except Exception:  # noqa: BLE001 - never break a flow on odd headers
+        return []
+
+
+def decoded_body(message, limit: int):
+    """A message body decoded per Content-Encoding, or None.
+
+    None when it is over `limit` (before or after decoding), the encoding
+    cannot be decoded, or the body is not available (streamed).
+    """
+    raw = getattr(message, "raw_content", None)
+    if isinstance(raw, (bytes, bytearray)) and len(raw) > limit:
+        return None
+    getter = getattr(message, "get_content", None)
+    try:
+        content = getter(strict=True) if callable(getter) else getattr(message, "content", None)
+    except Exception:  # noqa: BLE001 - mitmproxy raises ValueError on a bad encoding
+        return None
+    if content is None:
+        return None
+    if isinstance(content, str):
+        content = content.encode("utf-8")
+    if not isinstance(content, (bytes, bytearray)) or len(content) > limit:
+        return None
+    return bytes(content)
+
+
+class RequestFacts:
+    """What request conditions look at, each part computed at most once per flow.
+
+    The body is read only when a rule with a body condition asks for it
+    (RISK-001); `body_reads` counts the reads for the tests.
+    """
+
+    def __init__(self, url="", headers=None, body=None, body_loader=None) -> None:
+        self.url = url or ""
+        self._header_source = headers
+        self._body = body
+        self._body_loader = body_loader
+        self._query = None
+        self._headers = None
+        self._text = _MISSING
+        self._json = _MISSING
+        self.body_reads = 0
+
+    @classmethod
+    def from_flow(cls, flow) -> "RequestFacts":
+        request = flow.request
+        return cls(getattr(request, "pretty_url", "") or "", getattr(request, "headers", None),
+                   body_loader=lambda: decoded_body(request, MATCH_BODY_LIMIT))
+
+    def query(self) -> list:
+        if self._query is None:
+            self._query = query_pairs(self.url)
+        return self._query
+
+    def headers(self) -> list:
+        if self._headers is None:
+            self._headers = header_pairs(self._header_source)
+        return self._headers
+
+    def body_text(self):
+        """The UTF-8 body text, or None (too big, undecodable, not UTF-8)."""
+        if self._text is _MISSING:
+            self.body_reads += 1
+            try:
+                content = self._body_loader() if self._body_loader else self._body
+            except Exception:  # noqa: BLE001
+                content = None
+            if isinstance(content, str):
+                content = content.encode("utf-8", "surrogatepass")
+            text = None
+            if content is None and self._body_loader is None:
+                content = b""
+            if isinstance(content, (bytes, bytearray)) and len(content) <= MATCH_BODY_LIMIT:
+                try:
+                    text = bytes(content).decode("utf-8")
+                except UnicodeDecodeError:
+                    text = None
+            self._text = text
+        return self._text
+
+    def body_json(self):
+        """`(True, document)` when the body is JSON, else `(False, None)`."""
+        if self._json is _MISSING:
+            text = self.body_text()
+            result = (False, None)
+            if text is not None:
+                try:
+                    result = (True, json.loads(text))
+                except (ValueError, RecursionError):
+                    result = (False, None)
+            self._json = result
+        return self._json
+
+
+def json_path_segments(path):
+    """`user.items.0` -> segments; None for a path that is not usable."""
+    if not isinstance(path, str) or not path:
+        return None
+    segments = path.split(".")
+    if any(segment == "" for segment in segments):
+        return None
+    return segments
+
+
+def json_lookup(document, segments):
+    """`(True, value)` when the dotted path resolves, else `(False, None)`."""
+    current = document
+    for segment in segments:
+        if isinstance(current, dict):
+            if segment not in current:
+                return False, None
+            current = current[segment]
+        elif isinstance(current, list):
+            if not _INDEX.fullmatch(segment) or int(segment) >= len(current):
+                return False, None
+            current = current[int(segment)]
+        else:
+            return False, None
+    return True, current
+
+
+def json_equal(left, right) -> bool:
+    """JSON equality: a bool never equals a number, 2 equals 2.0."""
+    if isinstance(left, bool) or isinstance(right, bool):
+        return isinstance(left, bool) and isinstance(right, bool) and left == right
+    if left is None or right is None:
+        return left is None and right is None
+    if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+        return left == right
+    if isinstance(left, str) and isinstance(right, str):
+        return left == right
+    if isinstance(left, list) and isinstance(right, list):
+        return len(left) == len(right) and all(json_equal(a, b) for a, b in zip(left, right))
+    if isinstance(left, dict) and isinstance(right, dict):
+        return left.keys() == right.keys() and all(json_equal(left[k], right[k]) for k in left)
+    return False
+
+
+def json_value_matches(field, expected) -> bool:
+    """A string condition is a case-sensitive glob over a string field."""
+    if isinstance(expected, str):
+        return isinstance(field, str) and _glob_case(field, expected)
+    return json_equal(field, expected)
+
+
+def _named_conditions_hold(conditions, pairs, *, fold_case: bool) -> bool:
+    if conditions is None or conditions == []:
+        return True
+    if not isinstance(conditions, list):
+        return False
+    for condition in conditions:
+        if not isinstance(condition, dict):
+            return False
+        name = condition.get("name")
+        value = condition.get("value")
+        if not isinstance(name, str) or not name or (
+                value is not None and not isinstance(value, str)):
+            return False
+        key = name.lower() if fold_case else name
+        values = [item for found, item in pairs if found == key]
+        if not values:
+            return False
+        if value is not None and not any(_glob_case(item, value) for item in values):
+            return False
+    return True
+
+
+def _body_conditions_hold(body, facts: RequestFacts) -> bool:
+    if body is None or body == {}:
+        return True
+    if not isinstance(body, dict):
+        return False
+    contains = body.get("contains") or []
+    wanted = body.get("json") or []
+    if not isinstance(contains, list) or not isinstance(wanted, list):
+        return False
+    if not contains and not wanted:
+        return True
+    # Shape first, so a malformed rule never costs a body read.
+    if any(not isinstance(item, str) or not item for item in contains):
+        return False
+    paths = []
+    for item in wanted:
+        segments = json_path_segments(item.get("path")) if isinstance(item, dict) else None
+        if segments is None or "value" not in item:
+            return False
+        paths.append((segments, item["value"]))
+    text = facts.body_text()
+    if text is None:
+        return False
+    if any(item not in text for item in contains):
+        return False
+    if paths:
+        parsed, document = facts.body_json()
+        if not parsed:
+            return False
+        for segments, expected in paths:
+            found, field = json_lookup(document, segments)
+            if not found or not json_value_matches(field, expected):
+                return False
+    return True
+
+
+def conditions_hold(match, facts: RequestFacts) -> bool:
+    """All of a rule's query, header and body conditions (AND); malformed = False."""
+    query = match.get("query")
+    headers = match.get("headers")
+    body = match.get("body")
+    if not query and not headers and not body:
+        return True
+    try:
+        return (_named_conditions_hold(query, facts.query(), fold_case=False)
+                and _named_conditions_hold(headers, facts.headers(), fold_case=True)
+                and _body_conditions_hold(body, facts))
+    except Exception:  # noqa: BLE001 - a hand-edited rule never breaks a flow
+        return False
+
+
+def rule_mode(rule) -> str | None:
+    """`respond` (also when absent), `rewrite`, or None for an unknown mode."""
+    mode = (rule or {}).get("mode")
+    if mode is None or mode == "respond":
+        return "respond"
+    if mode == "rewrite":
+        return "rewrite"
+    return None
+
+
+def rule_matches(rule: dict, method: str, url: str, host: str, request=None) -> bool:
     """First-enabled-wins matching on url glob, optional method, optional host.
 
     `ignore_query` (set by `--url`) compares against the query-stripped URL, so
     `…/update/12341` also matches `…/update/12341?ts=1699`. It is opt-in per
     rule: a hand-written `--match` glob keeps exact control over the query.
+
+    `request` (a `RequestFacts`) feeds the query, header and body conditions;
+    without it the query still comes from `url` and header or body
+    conditions do not hold. Every condition must hold (AND).
     """
-    if not rule.get("enabled", True):
+    if not isinstance(rule, dict) or not rule.get("enabled", True):
+        return False
+    if rule_mode(rule) is None:
         return False
     match = rule.get("match") or {}
+    if not isinstance(match, dict):
+        return False
     wanted_method = match.get("method")
     if wanted_method and wanted_method.upper() != (method or "").upper():
         return False
@@ -233,14 +528,257 @@ def rule_matches(rule: dict, method: str, url: str, host: str) -> bool:
             candidate = candidate.split("?", 1)[0]
         if not glob_match(url_glob, candidate):
             return False
+    if match.get("query") or match.get("headers") or match.get("body"):
+        return conditions_hold(match, request if request is not None else RequestFacts(url))
     return True
 
 
-def select_rule(rules, method: str, url: str, host: str):
+def select_rule(rules, method: str, url: str, host: str, request=None):
+    facts = request
     for rule in rules or []:
-        if rule_matches(rule, method, url, host):
+        if facts is None and isinstance(rule, dict) and isinstance(rule.get("match"), dict) \
+                and any(rule["match"].get(key) for key in ("query", "headers", "body")):
+            facts = RequestFacts(url)
+        if rule_matches(rule, method, url, host, facts):
             return rule
     return None
+
+
+# --- response rewrite -------------------------------------------------------------
+
+
+class RewriteError(Exception):
+    """A rewrite step that cannot apply; `reason` goes to `rewrite.error`."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+_HEADER_NAME = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
+
+
+def _copy_json(value):
+    """A private copy, so edits never touch the cached rule."""
+    return json.loads(json.dumps(value))
+
+
+def rewrite_plan(rule) -> dict:
+    """The rule's checked rewrite edits; `RewriteError('invalid_rule')` if malformed."""
+    def bad():
+        return RewriteError("invalid_rule")
+
+    response = rule.get("response") or {}
+    rewrite = rule.get("rewrite") or {}
+    if not isinstance(response, dict) or not isinstance(rewrite, dict):
+        raise bad()
+    status = response.get("status")
+    if status is not None and (isinstance(status, bool) or not isinstance(status, int)
+                               or not 100 <= status <= 599):
+        raise bad()
+    headers = response.get("headers") or {}
+    if not isinstance(headers, dict):
+        raise bad()
+    set_headers = []
+    for name, value in headers.items():
+        if not isinstance(name, str) or not _HEADER_NAME.fullmatch(name.strip()) \
+                or not isinstance(value, (str, int, float)) or isinstance(value, bool):
+            raise bad()
+        set_headers.append((name.strip(), str(value)))
+    body_path = response.get("body_path")
+    if body_path is not None and not isinstance(body_path, str):
+        raise bad()
+    lists = {}
+    for key in ("remove_headers", "json_set", "json_remove", "replace"):
+        value = rewrite.get(key) or []
+        if not isinstance(value, list):
+            raise bad()
+        lists[key] = value
+    if any(not isinstance(name, str) or not _HEADER_NAME.fullmatch(name.strip())
+           for name in lists["remove_headers"]):
+        raise bad()
+    json_set = []
+    for item in lists["json_set"]:
+        if not isinstance(item, dict) or json_path_segments(item.get("path")) is None \
+                or "value" not in item:
+            raise bad()
+        json_set.append((item["path"], item["value"]))
+    if any(json_path_segments(path) is None for path in lists["json_remove"]):
+        raise bad()
+    replace = []
+    for item in lists["replace"]:
+        if not isinstance(item, dict) or not isinstance(item.get("find"), str) \
+                or not item["find"] or not isinstance(item.get("with"), str):
+            raise bad()
+        replace.append((item["find"], item["with"]))
+    if body_path and (json_set or lists["json_remove"] or replace):
+        raise bad()
+    return {
+        "status": status,
+        "remove_headers": [name.strip() for name in lists["remove_headers"]],
+        "set_headers": set_headers,
+        "body_path": body_path or None,
+        "json_set": json_set,
+        "json_remove": list(lists["json_remove"]),
+        "replace": replace,
+    }
+
+
+def _status_reason(status: int) -> str:
+    try:
+        from mitmproxy.net.http import status_codes  # noqa: PLC0415
+
+        return status_codes.RESPONSES.get(status, "")
+    except Exception:  # noqa: BLE001 - outside mitmproxy, or a moved table
+        return ""
+
+
+def _remove_header(headers, name: str) -> None:
+    lowered = name.lower()
+    for key in [key for key in list(headers.keys()) if str(key).lower() == lowered]:
+        if key in headers:
+            del headers[key]
+
+
+def rewrite_status_headers(response, plan: dict) -> list:
+    """Status, then removed headers, then set headers. Returns the edit names."""
+    applied = []
+    if plan.get("status") is not None:
+        response.status_code = plan["status"]
+        try:
+            response.reason = _status_reason(plan["status"])
+        except Exception:  # noqa: BLE001
+            pass
+        applied.append("status")
+    if plan.get("remove_headers"):
+        for name in plan["remove_headers"]:
+            _remove_header(response.headers, name)
+        applied.append("remove_headers")
+    if plan.get("set_headers"):
+        for name, value in plan["set_headers"]:
+            _remove_header(response.headers, name)
+            response.headers[name] = value
+        applied.append("headers")
+    return applied
+
+
+def _json_set(document, path: str, value) -> None:
+    segments = path.split(".")
+    found, parent = json_lookup(document, segments[:-1])
+    last = segments[-1]
+    if found and isinstance(parent, dict):
+        parent[last] = _copy_json(value)
+    elif found and isinstance(parent, list) and _INDEX.fullmatch(last) \
+            and int(last) < len(parent):
+        parent[int(last)] = _copy_json(value)
+    else:
+        raise RewriteError("path_not_found: " + path)
+
+
+def _json_remove(document, path: str) -> None:
+    segments = path.split(".")
+    found, parent = json_lookup(document, segments[:-1])
+    last = segments[-1]
+    if found and isinstance(parent, dict) and last in parent:
+        del parent[last]
+    elif found and isinstance(parent, list) and _INDEX.fullmatch(last) \
+            and int(last) < len(parent):
+        del parent[int(last)]
+    else:
+        raise RewriteError("path_not_found: " + path)
+
+
+def rewrite_body(content: bytes, plan: dict) -> bytes:
+    """Apply JSON sets, JSON removals, then text replacements, all or nothing.
+
+    Works on the decoded body; raises `RewriteError` (`body_too_large`,
+    `not_json`, `not_text`, `path_not_found: PATH`) without a partial result.
+    """
+    if content is None:
+        raise RewriteError("body_unavailable")
+    if len(content) > REWRITE_BODY_LIMIT:
+        raise RewriteError("body_too_large")
+    if plan.get("json_set") or plan.get("json_remove"):
+        try:
+            document = json.loads(bytes(content).decode("utf-8"))
+        except (UnicodeDecodeError, ValueError, RecursionError):
+            raise RewriteError("not_json") from None
+        for path, value in plan.get("json_set") or []:
+            _json_set(document, path, value)
+        for path in plan.get("json_remove") or []:
+            _json_remove(document, path)
+        text = json.dumps(document, ensure_ascii=False, separators=(",", ":"))
+    else:
+        try:
+            text = bytes(content).decode("utf-8")
+        except UnicodeDecodeError:
+            raise RewriteError("not_text") from None
+    for find, replacement in plan.get("replace") or []:
+        text = text.replace(find, replacement)
+    return text.encode("utf-8")
+
+
+def _set_body(message, content: bytes) -> None:
+    """Re-encode with the message's Content-Encoding; Content-Length follows."""
+    setter = getattr(message, "set_content", None)
+    if callable(setter):
+        setter(content)
+    else:
+        message.content = content
+
+
+def _resolve_body_path(directory: str, body_path: str) -> str:
+    if os.path.isabs(body_path):
+        return body_path
+    return os.path.join(directory or ".", os.path.relpath(body_path, "network")
+                        if body_path.startswith("network/") else body_path)
+
+
+def apply_rewrite(flow, rule, directory: str = "") -> dict:
+    """Edit `flow.response` per the rule: `{"applied": [...], "error": str|None}`.
+
+    Status and header edits always apply; a body edit that cannot apply
+    leaves the body exactly as the server sent it (DEC-007). Never raises.
+    """
+    outcome = {"applied": [], "error": None}
+    try:
+        plan = rewrite_plan(rule)
+    except RewriteError as exc:
+        outcome["error"] = exc.reason
+        return outcome
+    response = flow.response
+    try:
+        outcome["applied"] = rewrite_status_headers(response, plan)
+    except Exception:  # noqa: BLE001
+        outcome["error"] = "invalid_rule"
+        return outcome
+    try:
+        if plan["body_path"]:
+            try:
+                with open(_resolve_body_path(directory, plan["body_path"]), "rb") as handle:
+                    content = handle.read()
+            except OSError:
+                raise RewriteError("body_unreadable") from None
+            _set_body(response, content)
+            outcome["applied"].append("body")
+        elif plan["json_set"] or plan["json_remove"] or plan["replace"]:
+            raw = getattr(response, "raw_content", None)
+            if isinstance(raw, (bytes, bytearray)) and len(raw) > REWRITE_BODY_LIMIT:
+                raise RewriteError("body_too_large")
+            getter = getattr(response, "get_content", None)
+            try:
+                content = getter(strict=True) if callable(getter) else response.content
+            except Exception:  # noqa: BLE001 - mitmproxy raises ValueError
+                raise RewriteError("undecodable_encoding") from None
+            edited = rewrite_body(content, plan)
+            _set_body(response, edited)
+            outcome["applied"] += [name for name in ("json_set", "json_remove", "replace")
+                                   if plan[name]]
+    except RewriteError as exc:
+        outcome["error"] = exc.reason
+    except Exception:  # noqa: BLE001 - INV-2: never out of a hook
+        outcome["error"] = "internal_error"
+    return outcome
 
 
 def flow_id(counter: int) -> str:
@@ -402,7 +940,8 @@ def incomplete_record(flow, identifier: str, error_kind: str, *, now=None,
     started = getattr(request, "timestamp_start", None) or None
     error = getattr(flow, "error", None)
     ended = ended or getattr(error, "timestamp", None) or now
-    mock_id = (getattr(flow, "metadata", None) or {}).get("autonom_mock_id")
+    metadata = getattr(flow, "metadata", None) or {}
+    mock_id = metadata.get("autonom_mock_id")
     record = {
         "id": identifier,
         "completed": False,
@@ -416,12 +955,33 @@ def incomplete_record(flow, identifier: str, error_kind: str, *, now=None,
         "status": None,
         "mocked": bool(mock_id),
         "mock_id": mock_id,
+        "mock_kind": mock_kind_of(metadata),
         "client_ip": client_ip(flow),
     }
+    record.update(rewrite_fields(metadata))
     if started:
         record["finished_at_ms"] = int(ended * 1000)
         record["duration_ms"] = max(0, int((ended - started) * 1000))
     return record
+
+
+def mock_kind_of(metadata) -> str | None:
+    """`respond` / `rewrite` for a flow a rule answered or edited, else None."""
+    if not metadata.get("autonom_mock_id"):
+        return None
+    return "rewrite" if metadata.get("autonom_mock_kind") == "rewrite" else "respond"
+
+
+def rewrite_fields(metadata) -> dict:
+    """`upstream_status` and `rewrite` (edit names and error, never values)."""
+    outcome = metadata.get("autonom_rewrite")
+    if not metadata.get("autonom_mock_id") or not isinstance(outcome, dict):
+        return {}
+    return {
+        "upstream_status": outcome.get("upstream_status"),
+        "rewrite": {"applied": list(outcome.get("applied") or []),
+                    "error": outcome.get("error")},
+    }
 
 
 # --- addon --------------------------------------------------------------------
@@ -442,6 +1002,7 @@ class AutonomRecorder:
         # Seams for the unit tests; mitmproxy never touches them.
         self._sleep = asyncio.sleep
         self._clock = time.monotonic
+        self._wall = time.time
         self.hang_cap_s = HANG_CAP_S
         self.hang_poll_s = HANG_POLL_S
 
@@ -482,24 +1043,41 @@ class AutonomRecorder:
         waits returns a coroutine instead: mitmproxy awaits an awaitable hook
         result on the event loop (its addon manager accepts sync and async
         hooks alike), so a delayed or held flow never stalls any other flow.
+
+        A `rewrite` rule only marks the flow: the request goes upstream
+        unchanged and the `response` hook edits the real answer.
         """
         # Host-based rules match the requested name, never the CONNECT IP.
         rule = select_rule(
-            self._load_rules(), flow.request.method, flow.request.pretty_url, flow_host(flow)
+            self._load_rules(), flow.request.method, flow.request.pretty_url, flow_host(flow),
+            RequestFacts.from_flow(flow),
         )
         if not rule:
+            return None
+        if rule_mode(rule) == "rewrite":
+            self._mark_rewrite(flow, rule)
             return None
         if rule_hangs(rule) or rule_delay(rule):
             return self._wait_then_serve(flow, rule)
         self._serve(flow, rule)
         return None
 
+    @staticmethod
+    def _mark_rewrite(flow, rule) -> None:
+        flow.metadata["autonom_mock_id"] = rule.get("id")
+        flow.metadata["autonom_mock_kind"] = "rewrite"
+
     async def _wait_then_serve(self, flow, rule) -> None:
         # Marked before any wait, so an abort meanwhile records `mocked`.
         flow.metadata["autonom_mock_id"] = rule.get("id")
+        flow.metadata["autonom_mock_kind"] = "respond"
         if rule_hangs(rule):
             rule = await self._hold(flow, rule)
             if rule is None:
+                return
+            if rule_mode(rule) == "rewrite":
+                # Switched to a rewrite rule while held: go upstream, edit later.
+                self._mark_rewrite(flow, rule)
                 return
         delay = rule_delay(rule)
         if delay:
@@ -552,6 +1130,7 @@ class AutonomRecorder:
             if current is None or not current.get("enabled", True):
                 # Released: the request continues to the real server.
                 flow.metadata.pop("autonom_mock_id", None)
+                flow.metadata.pop("autonom_mock_kind", None)
                 return None
             if not rule_hangs(current):
                 return current
@@ -586,21 +1165,19 @@ class AutonomRecorder:
         body = b""
         body_path = response.get("body_path")
         if body_path:
-            resolved = body_path if os.path.isabs(body_path) else os.path.join(
-                self.directory or ".", os.path.relpath(body_path, "network")
-                if body_path.startswith("network/") else body_path
-            )
             try:
-                with open(resolved, "rb") as handle:
+                with open(_resolve_body_path(self.directory, body_path), "rb") as handle:
                     body = handle.read()
             except OSError:
                 body = b""
+        status = response.get("status")
         flow.response = self._make_response(
-            int(response.get("status", 200)),
+            200 if status is None else int(status),
             body,
             {str(k): str(v) for k, v in (response.get("headers") or {}).items()},
         )
         flow.metadata["autonom_mock_id"] = rule.get("id")
+        flow.metadata["autonom_mock_kind"] = "respond"
 
     @staticmethod
     def _make_response(status: int, body: bytes, headers: dict):
@@ -620,7 +1197,54 @@ class AutonomRecorder:
         self.counter += 1
         self._append(incomplete_record(flow, flow_id(self.counter), kind))
 
-    def response(self, flow) -> None:
+    def response(self, flow):
+        """Record the flow; a flow marked by a rewrite rule is edited first.
+
+        The rule is read again by id now: one removed, disabled or switched to
+        answering meanwhile leaves the real response untouched (`rule_gone`).
+        A rewrite `delay_s` returns a coroutine that holds the edited response
+        without blocking other flows, and ends early when the client leaves.
+        """
+        metadata = flow.metadata
+        if metadata.get("autonom_mock_kind") == "rewrite" and "autonom_rewrite" not in metadata \
+                and getattr(flow, "response", None) is not None:
+            delay = self._rewrite(flow)
+            if delay:
+                return self._delay_then_record(flow, delay)
+        self._record(flow)
+        return None
+
+    def _current_rewrite_rule(self, identifier):
+        for rule in self._load_rules():
+            if isinstance(rule, dict) and rule.get("id") == identifier \
+                    and rule.get("enabled", True) and rule_mode(rule) == "rewrite":
+                return rule
+        return None
+
+    def _rewrite(self, flow) -> float | None:
+        """Apply the edits; the delay to hold the edited response for, or None."""
+        upstream = getattr(flow.response, "status_code", None)
+        delay = None
+        try:
+            rule = self._current_rewrite_rule(flow.metadata.get("autonom_mock_id"))
+            if rule is None:
+                outcome = {"applied": [], "error": "rule_gone"}
+            else:
+                outcome = apply_rewrite(flow, rule, self.directory)
+                delay = rule_delay(rule)
+        except Exception:  # noqa: BLE001 - INV-2: never out of a hook
+            outcome = {"applied": [], "error": "internal_error"}
+        flow.metadata["autonom_rewrite"] = {"upstream_status": upstream, **outcome}
+        return delay
+
+    async def _delay_then_record(self, flow, delay: float) -> None:
+        if not await self._wait(flow, delay):
+            return
+        # The hold is part of the flow's time, as for a delayed fake response.
+        flow.metadata["autonom_held_until"] = self._wall()
+        self._record(flow)
+
+    def _record(self, flow) -> None:
         if not self.directory:
             return
         self.counter += 1
@@ -628,6 +1252,9 @@ class AutonomRecorder:
         flow.metadata["autonom_recorded"] = True
         started = getattr(flow.request, "timestamp_start", None) or time.time()
         ended = getattr(flow.response, "timestamp_end", None) or time.time()
+        held_until = flow.metadata.get("autonom_held_until")
+        if isinstance(held_until, (int, float)) and held_until > ended:
+            ended = held_until
 
         record = {
             "id": identifier,
@@ -652,6 +1279,7 @@ class AutonomRecorder:
             "response_body_preview": preview(flow.response.content),
             "mocked": bool(flow.metadata.get("autonom_mock_id")),
             "mock_id": flow.metadata.get("autonom_mock_id"),
+            "mock_kind": mock_kind_of(flow.metadata),
             # Who sent it: `network status` counts a flow as the target's only
             # when its client is the target (a host curl is a flow too).
             "client_ip": client_ip(flow),
@@ -660,6 +1288,8 @@ class AutonomRecorder:
                 "response_bytes": len(flow.response.content or b""),
             },
         }
+
+        record.update(rewrite_fields(flow.metadata))
 
         connected_ip = server_ip(flow)
         if connected_ip:

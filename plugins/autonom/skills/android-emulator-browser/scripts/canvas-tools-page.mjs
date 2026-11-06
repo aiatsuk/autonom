@@ -1,4 +1,5 @@
 import { canvasIcon as svg, canvasIconData, canvasTabList, canvasTabPanel, canvasDomScript } from "./canvas-ui.mjs";
+import { mockFormMarkup, mockFormScript, mockFormStyles } from "./canvas-mock-form.mjs";
 // The Tools drawer of the Mobile Canvas page (contract section 3 of run canvas-web-controls):
 // permissions and location (App), device simulations, network capture, network mocks and the
 // live device log. Four pure functions return strings that renderPage inlines: the header
@@ -8,7 +9,6 @@ import { canvasIcon as svg, canvasIconData, canvasTabList, canvasTabPanel, canva
 const LOG_ROW_LIMIT = 2000;
 const REQUEST_ROW_LIMIT = 500;
 const PUSH_PAYLOAD_LIMIT = 4096;
-const MOCK_BODY_LIMIT = 32 * 1024;
 
 export const TOOLS_TABS = Object.freeze([
   Object.freeze({ id: "app", label: "App" }),
@@ -202,26 +202,7 @@ function mocksPanel() {
         `<button type="button" class="btn danger" id="tools-mock-clear-go" data-mutate>Remove all</button></div>` +
       `</div>` +
     `</div>` +
-    `<form class="tools-group" id="tools-mock-form" novalidate aria-labelledby="tools-mock-form-title">` +
-      `<h3 id="tools-mock-form-title">New mock</h3>` +
-      `<input id="tools-mock-glob" aria-label="URL glob" title="URL pattern to match" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="URL pattern · */api/items*">` +
-      `<div class="tools-pair tools-mock-match">` +
-        `<select id="tools-mock-method" aria-label="Method" title="HTTP method">${methodOptions("Any method")}</select>` +
-        `<div class="tools-inline-field"><label for="tools-mock-status">Status</label><input id="tools-mock-status" type="text" inputmode="numeric" autocomplete="off" value="200"></div>` +
-      `</div>` +
-      `<label class="tools-label" for="tools-mock-body">Response body</label>` +
-      `<textarea id="tools-mock-body" rows="3" spellcheck="false" title="Response body, up to 32 KB"></textarea>` +
-      `<details class="tools-options" id="tools-mock-options"><summary>Options</summary>` +
-      `<label class="tools-label" for="tools-mock-host">Host</label>` +
-      `<input id="tools-mock-host" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Any host">` +
-      `<label class="tools-check"><input id="tools-mock-ignore-query" type="checkbox"> Ignore query string</label>` +
-      `<label class="tools-label" for="tools-mock-headers">Headers</label>` +
-      `<textarea id="tools-mock-headers" rows="2" spellcheck="false" title="One Name: value header per line" placeholder="Content-Type: application/json"></textarea>` +
-      `<label class="tools-label" for="tools-mock-note">Note</label>` +
-      `<input id="tools-mock-note" type="text" autocomplete="off" placeholder="Optional"></details>` +
-      `<div class="tools-actions"><button type="submit" class="btn primary" id="tools-mock-save" data-mutate>Add mock</button>` +
-      `<button type="button" class="btn" id="tools-mock-cancel-edit" hidden>Cancel editing</button></div>` +
-    `</form>`);
+    mockFormMarkup(methodOptions("Any method")));
 }
 
 function logsPanel(ios) {
@@ -297,7 +278,7 @@ body.tools-open aside.side{display:none}
 .tools-options summary{cursor:pointer;font-size:12px;color:var(--text-2);padding:4px 0}
 .tools-inline-field{display:flex;align-items:center;gap:6px;min-width:0}
 .tools-inline-field label{font-size:12px;color:var(--text-2)}
-#tools-mock-form .tools-mock-match{margin-top:8px;grid-template-columns:repeat(2,minmax(0,1fr))}
+${mockFormStyles().trim()}
 .tools-log-filters{display:grid;gap:6px}
 .tools-log-search{display:grid;grid-template-columns:minmax(100px,1fr) minmax(0,2fr);gap:6px}
 .tools-filters{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin-bottom:10px}
@@ -467,7 +448,7 @@ html:root #tools-net-body>.tools-requests-group{display:flex;flex-direction:colu
 export function toolsScript() {
   return `(function(){
 "use strict";
-const LOG_LIMIT=${LOG_ROW_LIMIT},REQUEST_LIMIT=${REQUEST_ROW_LIMIT},PUSH_LIMIT=${PUSH_PAYLOAD_LIMIT},BODY_LIMIT=${MOCK_BODY_LIMIT};
+const LOG_LIMIT=${LOG_ROW_LIMIT},REQUEST_LIMIT=${REQUEST_ROW_LIMIT},PUSH_LIMIT=${PUSH_PAYLOAD_LIMIT};
 const drawer=$("tools"),toggle=$("tools-toggle");
 if(!drawer||!toggle)return;
 const PLATFORM=drawer.getAttribute("data-platform")==="ios"?"ios":"android";
@@ -482,6 +463,7 @@ const state={open:false,tab:"app",context:null,contextBusy:false,lockTimer:null,
 
 function text(id,value){const node=$(id);if(node&&node.textContent!==value)node.textContent=value}
 ${canvasDomScript()}
+${mockFormScript()}
 function capital(value){return value.charAt(0).toUpperCase()+value.slice(1)}
 function utf8(value){return new TextEncoder().encode(value).length}
 function hasCsrf(){return typeof csrf!=="undefined"&&csrf}
@@ -644,17 +626,16 @@ $("tools-req-detail").addEventListener("cancel",event=>{event.preventDefault();c
 $("tools-req-detail").addEventListener("click",event=>{if(event.target===$("tools-req-detail"))closeRequest(true)});
 $("tools-req-mock").addEventListener("click",()=>{const item=state.net.selected&&state.net.requests.get(state.net.selected);if(!item)return;fillMockFromRequest(item);selectTab("mocks",false);$("tools-mock-glob").focus();showOk("mocks","Filled from request "+(item.id||state.net.selected)+". Set the response, then add the mock.")});
 
-// Mocks: the machine-wide registry; hits count only this device's session.
-function resetMockForm(){state.mocks.editing=null;$("tools-mock-options").removeAttribute("open");for(const id of ["tools-mock-glob","tools-mock-host","tools-mock-headers","tools-mock-body","tools-mock-note"])$(id).value="";$("tools-mock-method").value="";$("tools-mock-status").value="200";$("tools-mock-ignore-query").checked=false;$("tools-mock-body").placeholder="";text("tools-mock-form-title","New mock");text("tools-mock-save","Add mock");$("tools-mock-cancel-edit").hidden=true}
-function fillMockFromRequest(item){resetMockForm();const address=String(item.url||""),query=address.indexOf("?");$("tools-mock-glob").value=query>=0?address.slice(0,query):address;$("tools-mock-ignore-query").checked=query>=0;$("tools-mock-method").value=HTTP_METHOD(item.method);$("tools-mock-host").value=item.host?String(item.host):"";if(item.status)$("tools-mock-status").value=String(item.status);if(query>=0||item.host)$("tools-mock-options").setAttribute("open","")}
-function HTTP_METHOD(value){const method=String(value||"").toUpperCase();return["GET","POST","PUT","PATCH","DELETE","HEAD","OPTIONS"].includes(method)?method:""}
-function parseHeaders(raw){const headers={};for(const line of raw.split(/\\r?\\n/)){if(!line.trim())continue;const colon=line.indexOf(":");if(colon<1)throw localError("Each header line needs a name, a colon and a value.","invalid_value");headers[line.slice(0,colon).trim()]=line.slice(colon+1).trim()}return headers}
-function mockPayload(){const glob=$("tools-mock-glob").value.trim(),statusText=$("tools-mock-status").value.trim(),status=Number(statusText),body=$("tools-mock-body").value,editing=state.mocks.editing;if(!glob)throw localError("Enter a URL glob, for example */api/items*.","selector_required");if(!/^[0-9]+$/.test(statusText)||status<100||status>599)throw localError("The status must be a whole number from 100 to 599.","invalid_value");if(utf8(body)>BODY_LIMIT)throw localError("The body is larger than 32 KB.","invalid_value");const payload={url_glob:glob,status,ignore_query:$("tools-mock-ignore-query").checked,headers:parseHeaders($("tools-mock-headers").value)};const method=$("tools-mock-method").value,host=$("tools-mock-host").value.trim(),note=$("tools-mock-note").value.trim();if(method||editing)payload.method=method;if(host||editing)payload.host=host;if(note||editing)payload.note=note;if(body||!editing)payload.body=body;if(editing)payload.id=editing;return payload}
+// Mocks: the machine-wide registry; hits count only this device's session. The form's fields, rows and
+// checks are canvas-mock-form.mjs (MOCK_FORM and mockFormController above).
+const mockForm=mockFormController({$,el,makeButton,text,core:MOCK_FORM});
+function resetMockForm(){state.mocks.editing=null;mockForm.reset()}
+function fillMockFromRequest(item){state.mocks.editing=null;mockForm.fillFromRequest(item)}
 async function loadMocks(){try{renderMocks((await call("mocks.list")).mocks||[]);return null}catch(error){showError("mocks",error);return error}}
-function renderMocks(items){state.mocks.items=Array.isArray(items)?items:[];const list=$("tools-mocks");list.replaceChildren();$("tools-mocks-empty").hidden=state.mocks.items.length>0;for(const mock of state.mocks.items){const match=mock.match||{},response=mock.response||{},id=String(mock.id),enabled=mock.enabled!==false,row=el("li","tools-item"),title=el("div","tools-item-name");title.appendChild(el("b",null,(match.method?match.method+" ":"")+(match.url_glob||"")));title.title=(match.url_glob||"")+" · #"+id+(match.host?" · "+match.host:"")+(mock.note?" · "+mock.note:"");title.appendChild(el("small",null,(response.status||"—")+" · "+(Number(mock.hits)||0)+" hits"));row.appendChild(title);const toggleButton=makeButton(enabled?"On":"Off","btn small tools-switch",{"data-mutate":"","data-mock":id,"data-mock-action":enabled?"disable":"enable","aria-pressed":String(enabled),"aria-label":"Mock "+id+" enabled"});row.appendChild(toggleButton);const actions=el("div","tools-item-actions");actions.appendChild(makeButton("","btn small tools-mock-icon tools-mock-edit",{"data-mock":id,"data-mock-action":"edit","aria-label":"Edit mock "+id,title:"Edit mock "+id}));actions.appendChild(makeButton("","btn small tools-mock-icon tools-mock-remove",{"data-mutate":"","data-mock":id,"data-mock-action":"remove","aria-label":"Remove mock "+id,title:"Remove mock "+id}));row.appendChild(actions);list.appendChild(row)}syncLock()}
-function editMock(id){const mock=state.mocks.items.find(item=>String(item.id)===id);if(!mock)return;resetMockForm();const match=mock.match||{},response=mock.response||{},headers=response.headers&&typeof response.headers==="object"?response.headers:{};state.mocks.editing=id;$("tools-mock-glob").value=match.url_glob||"";$("tools-mock-method").value=HTTP_METHOD(match.method);$("tools-mock-host").value=match.host||"";$("tools-mock-ignore-query").checked=match.ignore_query===true;$("tools-mock-status").value=String(response.status||200);$("tools-mock-headers").value=Object.keys(headers).map(key=>key+": "+headers[key]).join("\\n");$("tools-mock-note").value=mock.note||"";if(match.host||match.ignore_query||Object.keys(headers).length||mock.note)$("tools-mock-options").setAttribute("open","");$("tools-mock-body").placeholder="Leave empty to keep the current body";text("tools-mock-form-title","Edit mock "+id);text("tools-mock-save","Save changes");$("tools-mock-cancel-edit").hidden=false;$("tools-mock-glob").focus()}
+function renderMocks(items){state.mocks.items=Array.isArray(items)?items:[];const list=$("tools-mocks");list.replaceChildren();$("tools-mocks-empty").hidden=state.mocks.items.length>0;for(const mock of state.mocks.items){const info=MOCK_FORM.summary(mock),id=String(mock.id),enabled=mock.enabled!==false,row=el("li","tools-item"),title=el("div","tools-item-name"),line=el("div","tools-mock-line");if(info.rewrite){const badge=el("span","tools-badge tools-mock-badge","Edit");badge.title="Edits the real response";line.appendChild(badge)}line.appendChild(el("b",null,info.title));title.appendChild(line);title.title=info.tooltip;title.appendChild(el("small",null,info.detail));row.appendChild(title);const toggleButton=makeButton(enabled?"On":"Off","btn small tools-switch",{"data-mutate":"","data-mock":id,"data-mock-action":enabled?"disable":"enable","aria-pressed":String(enabled),"aria-label":"Mock "+id+" enabled"});row.appendChild(toggleButton);const actions=el("div","tools-item-actions");actions.appendChild(makeButton("","btn small tools-mock-icon tools-mock-edit",{"data-mock":id,"data-mock-action":"edit","aria-label":"Edit mock "+id,title:"Edit mock "+id}));actions.appendChild(makeButton("","btn small tools-mock-icon tools-mock-remove",{"data-mutate":"","data-mock":id,"data-mock-action":"remove","aria-label":"Remove mock "+id,title:"Remove mock "+id}));row.appendChild(actions);list.appendChild(row)}syncLock()}
+function editMock(id){const mock=state.mocks.items.find(item=>String(item.id)===id);if(!mock)return;state.mocks.editing=id;mockForm.fill(mock);$("tools-mock-glob").focus()}
 $("tools-mocks").addEventListener("click",async event=>{const control=event.target&&event.target.closest?event.target.closest("[data-mock-action]"):null;if(!control||control.disabled)return;const id=control.getAttribute("data-mock"),action=control.getAttribute("data-mock-action");if(action==="edit"){editMock(id);return}const result=await mutate("mocks",control,"mocks."+action,{id});if(!result)return;if(action==="remove"&&state.mocks.editing===id)resetMockForm();showOk("mocks","Mock "+id+(action==="remove"?" removed.":action==="enable"?" enabled.":" disabled."));loadMocks()});
-$("tools-mock-form").addEventListener("submit",async event=>{event.preventDefault();const save=$("tools-mock-save");if(save.disabled)return;let payload;try{payload=mockPayload()}catch(error){showError("mocks",error);return}const editing=state.mocks.editing,result=await mutate("mocks",save,editing?"mocks.update":"mocks.add",payload);if(!result)return;showOk("mocks",editing?"Mock "+editing+" saved.":"Mock "+(result.id||"")+" added.");resetMockForm();loadMocks()});
+$("tools-mock-form").addEventListener("submit",async event=>{event.preventDefault();const save=$("tools-mock-save");if(save.disabled)return;const built=mockForm.build();if(!built.payload){const first=built.errors[0]||{};showError("mocks",localError(first.message||"Check the marked fields.",first.code||"invalid_value"));return}const editing=state.mocks.editing,result=await mutate("mocks",save,editing?"mocks.update":"mocks.add",built.payload);if(!result)return;showOk("mocks",editing?"Mock "+editing+" saved.":"Mock "+(result.id||"")+" added.");resetMockForm();loadMocks()});
 $("tools-mock-cancel-edit").addEventListener("click",()=>{resetMockForm();message("mocks")});
 $("tools-mock-clear").addEventListener("click",()=>{$("tools-mock-confirm").hidden=false;syncLock();$("tools-mock-cancel").focus()});
 $("tools-mock-cancel").addEventListener("click",()=>{$("tools-mock-confirm").hidden=true;$("tools-mock-clear").focus()});

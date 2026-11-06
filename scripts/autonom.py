@@ -3572,6 +3572,79 @@ def _annotate_hits(rules: list[dict[str, Any]]) -> list[dict[str, str]]:
     return mocks_mod.annotate_hits(rules, _mock_hit_counts())
 
 
+# Flags of `network mock add|update` added after `--j`, `--b` and `--he...`
+# were in use for `--json`, `--body-file` and `--header`: matched only when
+# spelled in full, so every older abbreviation keeps its meaning.
+_MOCK_EXACT_FLAGS = frozenset({
+    "--query", "--request-header", "--body-contains", "--body-json", "--rewrite",
+    "--no-rewrite", "--remove-header", "--json-set", "--json-remove", "--replace",
+})
+
+# Condition and edit flags: option -> (journal word, how many values it takes).
+# The journal names such a flag and counts it; the values (a token in an
+# `Authorization` condition, a field value in `--json-set`) never reach it.
+_MOCK_COUNTED_FLAGS = {
+    "--query": ("query", 1),
+    "--request-header": ("request_header", 1),
+    "--body-contains": ("body_contains", 1),
+    "--body-json": ("body_json", 1),
+    "--remove-header": ("remove_header", 1),
+    "--json-set": ("json_set", 1),
+    "--json-remove": ("json_remove", 1),
+    "--replace": ("replace", 2),
+}
+
+
+def _mock_rule_fields(args: argparse.Namespace) -> dict[str, Any]:
+    """The mode, condition and edit arguments of `mocks.add` / `mocks.update`.
+
+    A flag that was not given is None, so `update` keeps the stored value; a
+    repeatable flag that was given is the whole list and replaces the stored
+    one. The registry library checks every value and refuses a combination
+    that makes no sense (an edit flag without `--rewrite`, `--hang` with it).
+    """
+    rewrite = getattr(args, "rewrite", None)
+    return {
+        "mode": None if rewrite is None else ("rewrite" if rewrite else "respond"),
+        "query": getattr(args, "query", None),
+        "request_headers": getattr(args, "request_header", None),
+        "body_contains": getattr(args, "body_contains", None),
+        "body_json": getattr(args, "body_json", None),
+        "remove_headers": getattr(args, "remove_header", None),
+        "json_set": getattr(args, "json_set", None),
+        "json_remove": getattr(args, "json_remove", None),
+        "replace": getattr(args, "replace", None),
+    }
+
+
+def _mock_view(rule: dict[str, Any]) -> dict[str, Any]:
+    """A rule as the CLI prints it: secret values masked, plus its mode and
+    a short summary of its conditions and edits.
+
+    A request-header condition on `Authorization`, a secret-looking query
+    name, a credential JSON field and a sensitive response header come out as
+    the redaction placeholder; `mock update` treats a placeholder sent back
+    unchanged as "keep the stored value". Never raises on a hand-edited rule.
+    """
+    from autonom_lib.network import mocks as mocks_mod
+
+    try:
+        view = mocks_mod.mask_rule(rule)
+        described = mocks_mod.describe(rule)
+    except Exception:  # noqa: BLE001 — a damaged rule is still listed, minus its detail
+        kept = {key: rule[key] for key in ("id", "enabled", "note", "hits") if key in rule}
+        return {**kept, "mode": "respond", "conditions": 0}
+    view["mode"] = described["mode"]
+    view["conditions"] = described["conditions"]
+    if described["summary"]:
+        view["condition_summary"] = described["summary"]
+    if described["edits"]:
+        view["edits"] = described["edits"]
+    if described["edit_summary"]:
+        view["edit_summary"] = described["edit_summary"]
+    return view
+
+
 def cmd_network_mock_add(args: argparse.Namespace) -> int:
     from autonom_lib.network import mocks as mocks_mod
 
@@ -3581,35 +3654,67 @@ def cmd_network_mock_add(args: argparse.Namespace) -> int:
     # No Content-Type of the author's own: the library types the body (a
     # --body-file by its extension, JSON-looking --json as application/json)
     # and marks the type implicit, so an explicit --header always wins (A.5).
+    # A fake answer without --status is 200; a rewrite rule without one keeps
+    # the real server's status.
     rule = mocks_mod.add(
         url_glob=selector["url_glob"],
         method=selector.get("method"),
         host=selector.get("host"),
         ignore_query=selector.get("ignore_query", False),
-        status=args.status if args.status is not None else 200,
+        status=args.status,
         headers=_mock_headers(args),
         body_file=body_file,
         body_text=body_text,
         note=getattr(args, "note", None),
         delay_s=getattr(args, "delay", None),
         hang=bool(getattr(args, "hang", None)),
+        **_mock_rule_fields(args),
     )
-    return emit({"ok": True, "mock": rule, "registry": str(mocks_mod.registry_file())},
-                as_json=True)
+    return emit({"ok": True, "mock": _mock_view(rule),
+                 "registry": str(mocks_mod.registry_file())}, as_json=True)
+
+
+def _mock_journal_view(view: dict[str, Any]) -> dict[str, Any]:
+    """What the journal keeps of a listed rule: which rule it is, how it is
+    switched and how many conditions and edits it has; no condition or edit
+    value, header, body or note, and the URL glob with its query values masked."""
+    from autonom_lib.network import redact as redact_mod
+
+    match = view.get("match") if isinstance(view.get("match"), dict) else {}
+    response = view.get("response") if isinstance(view.get("response"), dict) else {}
+    out: dict[str, Any] = {key: view[key] for key in
+                           ("id", "enabled", "mode", "conditions", "edits", "hits",
+                            "delay_s", "hang") if key in view}
+    kept = {key: match[key] for key in ("url_glob", "method", "host", "ignore_query")
+            if key in match}
+    glob = kept.get("url_glob")
+    if isinstance(glob, str) and "://" in glob:
+        kept["url_glob"] = redact_mod.scrub_url(glob) or glob
+    out["match"] = kept
+    if "status" in response:
+        out["status"] = response["status"]
+    return out
 
 
 def cmd_network_mock_list(args: argparse.Namespace) -> int:
+    global _LAST_EMIT
     from autonom_lib.network import mocks as mocks_mod
 
     rules = mocks_mod.load()
     if not getattr(args, "all", False):
         rules = [rule for rule in rules if rule.get("enabled", True)]
     warnings = _annotate_hits(rules)
-    payload: dict[str, Any] = {"ok": True, "count": len(rules), "mocks": rules,
+    shown = [_mock_view(rule) for rule in rules]
+    payload: dict[str, Any] = {"ok": True, "count": len(rules), "mocks": shown,
                                **mocks_mod.summary()}
     if warnings:
         payload["warnings"] = warnings
-    return emit(payload, as_json=True)
+    code = emit(payload, as_json=True)
+    # The listing is printed with its conditions (secrets masked); the journal
+    # entry of the same call records the rules without them (MR-12).
+    if isinstance(_LAST_EMIT, dict):
+        _LAST_EMIT = {**_LAST_EMIT, "mocks": [_mock_journal_view(view) for view in shown]}
+    return code
 
 
 def cmd_network_mock_show(args: argparse.Namespace) -> int:
@@ -3617,7 +3722,7 @@ def cmd_network_mock_show(args: argparse.Namespace) -> int:
     from autonom_lib.network import redact as redact_mod
 
     rule = mocks_mod.get(args.id)
-    payload: dict[str, Any] = {"ok": True, "mock": rule}
+    payload: dict[str, Any] = {"ok": True, "mock": _mock_view(rule)}
     body_path = (rule.get("response") or {}).get("body_path")
     if body_path and Path(body_path).exists():
         # A mock body is frequently a captured response, so it gets the same
@@ -3647,22 +3752,32 @@ def cmd_network_mock_update(args: argparse.Namespace) -> int:
         note=getattr(args, "note", None),
         delay_s=getattr(args, "delay", None),
         hang=getattr(args, "hang", None),
+        clear_conditions=bool(getattr(args, "clear_conditions", False)),
+        clear_edits=bool(getattr(args, "clear_edits", False)),
+        **_mock_rule_fields(args),
     )
-    return emit({"ok": True, "mock": rule}, as_json=True)
+    return emit({"ok": True, "mock": _mock_view(rule)}, as_json=True)
+
+
+def _mock_toggled(detail: dict[str, Any]) -> dict[str, Any]:
+    """`set_enabled`'s answer with the rule it names printed masked."""
+    if isinstance(detail.get("mock"), dict):
+        return {**detail, "mock": _mock_view(detail["mock"])}
+    return detail
 
 
 def cmd_network_mock_enable(args: argparse.Namespace) -> int:
     from autonom_lib.network import mocks as mocks_mod
 
     detail = mocks_mod.set_enabled(args.id, True, all_rules=args.all)
-    return emit({"ok": True, **detail}, as_json=True)
+    return emit({"ok": True, **_mock_toggled(detail)}, as_json=True)
 
 
 def cmd_network_mock_disable(args: argparse.Namespace) -> int:
     from autonom_lib.network import mocks as mocks_mod
 
     detail = mocks_mod.set_enabled(args.id, False, all_rules=args.all)
-    return emit({"ok": True, **detail}, as_json=True)
+    return emit({"ok": True, **_mock_toggled(detail)}, as_json=True)
 
 
 def cmd_network_mock_remove(args: argparse.Namespace) -> int:
@@ -8335,7 +8450,41 @@ def build_parser() -> argparse.ArgumentParser:
         parser.add_argument("--hang", action="store_true", default=None,
                             help="hold the request until the mock is removed or disabled "
                                  "(then it goes upstream) or 120 s pass (then it is "
-                                 "recorded incomplete); not with --delay")
+                                 "recorded incomplete); not with --delay or --rewrite")
+        # Request conditions (all of them must hold) and rewrite edits. On
+        # `update` a repeatable flag that is given replaces that whole list.
+        parser.add_argument("--query", action="append", metavar="QUERY",
+                            help="require a query parameter: NAME (present) or NAME=GLOB "
+                                 "(one value matches the case-sensitive glob); repeatable")
+        parser.add_argument("--request-header", action="append", metavar="HEADER",
+                            help="require a request header: 'Name' (present) or "
+                                 "'Name: GLOB'; repeatable")
+        parser.add_argument("--body-contains", action="append", metavar="TEXT",
+                            help="require the request body to contain TEXT; repeatable")
+        parser.add_argument("--body-json", action="append", metavar="PATH=VALUE",
+                            help="require a JSON request body field, e.g. user.role=admin "
+                                 "or items.0.qty=2 (VALUE is JSON, else a glob); repeatable")
+        shape = parser.add_mutually_exclusive_group()
+        shape.add_argument("--rewrite", dest="rewrite", action="store_const", const=True,
+                           default=None,
+                           help="let the request reach the real server and edit its answer "
+                                "(--status, --header, --json, --body-file, --delay and the "
+                                "edit flags below) instead of faking it")
+        shape.add_argument("--no-rewrite", dest="rewrite", action="store_const", const=False,
+                           default=None, help="fake the whole answer (the default)")
+        parser.add_argument("--remove-header", action="append", metavar="NAME",
+                            help="rewrite: drop a header of the real response; repeatable")
+        parser.add_argument("--json-set", action="append", metavar="PATH=VALUE",
+                            help="rewrite: set a field of the real JSON body, e.g. "
+                                 "user.plan=pro (VALUE is JSON, else text); repeatable")
+        parser.add_argument("--json-remove", action="append", metavar="PATH",
+                            help="rewrite: remove a field of the real JSON body; repeatable")
+        parser.add_argument("--replace", action="append", nargs=2, metavar=("OLD", "NEW"),
+                            help="rewrite: replace every OLD with NEW in the real body; "
+                                 "repeatable")
+        # These came after `--j`, `--b` and `--he...` were in use (`--json`,
+        # `--body-file`, `--header`): matched only when spelled in full.
+        parser.exact_only_options = journal_mod.EXACT_ONLY_OPTIONS | _MOCK_EXACT_FLAGS
         return parser
 
     p = mock_shape(mock_sub.add_parser("add", parents=[target_flags]))
@@ -8348,6 +8497,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_network_mock_show)
     p = mock_shape(mock_sub.add_parser("update", parents=[target_flags]))
     p.add_argument("id")
+    p.add_argument("--clear-conditions", action="store_true",
+                   help="remove every query, request-header and body condition")
+    p.add_argument("--clear-edits", action="store_true",
+                   help="remove every rewrite edit (--remove-header, --json-set, "
+                        "--json-remove, --replace)")
+    p.exact_only_options = p.exact_only_options | {"--clear-conditions", "--clear-edits"}
     p.set_defaults(func=cmd_network_mock_update)
     p = mock_sub.add_parser("enable", parents=[target_flags])
     p.add_argument("id", nargs="?")
@@ -8549,6 +8704,7 @@ def _journal_command(args: argparse.Namespace, argv: list[str], ok: bool,
     if not session:
         return
     argv, args = _redact_pair_values(args, argv)
+    argv = _mock_condition_words(args, argv)
     # The invocation's operation id, only when the verb was admitted under a
     # lease or a claim (its `control` object was emitted) or a lease refused
     # it: entries of verbs on targets without a lease keep their shape.
@@ -8591,6 +8747,49 @@ def _journal_mock_state(session: dict[str, Any], args: argparse.Namespace) -> No
         journal_mod.append(session, pretest_repro.mock_state_entry(mocks_mod.load()))
     except Exception:  # noqa: BLE001 — journaling is best-effort
         pass
+
+
+def _mock_condition_words(args: argparse.Namespace, argv: list[str]) -> list[str]:
+    """The journal's argv for `network mock add|update` without condition or edit values.
+
+    Each condition and edit flag stays where it was typed, its values masked
+    as `<redacted>`, and a count word per kind (`query=2`, `request_header=1`,
+    `json_set=1`) follows the argv. A condition may carry a credential (an
+    `Authorization` header, a `token` query value) and an edit may write one
+    into a body, so names and counts are all the journal keeps; the pre-test
+    repro reads these words back. Any other verb is returned unchanged.
+    """
+    if not (getattr(args, "command", None) == "network"
+            and getattr(args, "network_command", None) == "mock"
+            and getattr(args, "mock_command", None) in ("add", "update")):
+        return argv
+    from autonom_lib.network import redact as redact_mod
+
+    placeholder = redact_mod.PLACEHOLDER
+    out: list[str] = []
+    counts: dict[str, int] = {}
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token == "--":  # everything after it is a positional
+            out.extend(argv[index:])
+            break
+        flag, equals, _inline = token.partition("=")
+        counted = _MOCK_COUNTED_FLAGS.get(flag)
+        if counted is None:
+            out.append(token)
+            index += 1
+            continue
+        word, width = counted
+        counts[word] = counts.get(word, 0) + 1
+        if equals:
+            out.append(f"{flag}={placeholder}")
+            index += 1
+        else:
+            out.extend([flag, *[placeholder] * width])
+            index += 1 + width
+    order = [word for word, _width in _MOCK_COUNTED_FLAGS.values()]
+    return out + [f"{word}={counts[word]}" for word in order if word in counts]
 
 
 _PAIR_FLAGS = ("--env", "--setenv")

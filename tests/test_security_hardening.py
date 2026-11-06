@@ -225,11 +225,13 @@ class JournalAbbreviationTests(CliBase):
         # One-letter prefixes are accepted by argparse too.
         self.run_cli("simulator", "clipboard", "set", "--v", "text=VLEAK")
         self.run_cli("simulator", "clipboard", "set", "--j", '{"text":"JLEAK"}')
+        # `--j` is ambiguous on mock add since `--json-set`; `--json` is the
+        # spelling argparse still takes there
         code, payload = self.run_cli("network", "mock", "add", "--url", "https://x.example/",
-                                     "--j", '{"msg":"MOCKLEAK"}')
+                                     "--json", '{"msg":"MOCKLEAK"}')
         self.assertEqual(code, 0, payload)
         code, payload = self.run_cli("network", "mock", "add", "--url", "https://y.example/",
-                                     '--j={"msg":"MOCKLEAK2"}')
+                                     '--json={"msg":"MOCKLEAK2"}')
         self.assertEqual(code, 0, payload)
         blob = self.journal_blob(session_dir)
         self.assertIn('"verb": "network mock"', blob)
@@ -295,7 +297,10 @@ class ParserWalkRedactionTests(unittest.TestCase):
         # The walk must actually reach the flags the review reproduced.
         for expected in ((("simulator", "clipboard"), "--v"),
                          (("simulator", "clipboard"), "--j"),
-                         (("network", "mock", "add"), "--j"),
+                         (("network", "mock", "add"), "--json"),
+                         (("network", "mock", "add"), "--rep"),
+                         (("network", "mock", "update"), "--request-he"),
+                         (("network", "mock", "add"), "--body-j"),
                          (("network", "mock", "add"), "--head"),
                          (("canvas", "serve"), "--to"),
                          (("session", "launch"), "--setenv"),
@@ -348,7 +353,7 @@ REVIEW_REPROS = [
     # round 3: one-letter abbreviations
     ["simulator", "clipboard", "set", "--v", "text=LEAK_R3A"],
     ["simulator", "clipboard", "set", "--j", '{"text":"LEAK_R3B"}'],
-    ["network", "mock", "add", "--url", "https://x/", "--j", '{"msg":"LEAK_R3C"}'],
+    ["network", "mock", "add", "--url", "https://x/", "--json", '{"msg":"LEAK_R3C"}'],
     ["network", "mock", "add", "--url", "https://x/", '--j={"msg":"LEAK_R3D"}'],
     # round 4: abbreviated global target flags and a spoofed command path
     ["--ser", SERIAL, "ui", "type", "LEAK_R4A"],
@@ -577,7 +582,7 @@ class CanonicalArgvTests(unittest.TestCase):
 
     def test_canonical_argv_expands_spellings_and_resolves_the_path(self) -> None:
         tokens = journal_mod.canonical_argv(
-            self.parser, ["--ser", "proof", "network", "mock", "add", "--hea=X: y", "--j", "{}"])
+            self.parser, ["--ser", "proof", "network", "mock", "add", "--hea=X: y", "--json", "{}"])
         self.assertEqual([t.role for t in tokens],
                          ["option", "value", "command", "command", "command", "option",
                           "option", "value"])

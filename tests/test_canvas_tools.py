@@ -1133,6 +1133,592 @@ class MockTests(ToolsCase):
         self.assertEqual(self.journal(other), [])
 
 
+# --- mock conditions, rewrite edits and timing (MR-12, MR-13) ------------------------
+
+REWRITE_RULE = {
+    "url_glob": "*/profile*", "mode": "rewrite", "method": "get", "host": "api.example.com",
+    "status": 503, "headers": {"Retry-After": "5"}, "note": "edit the profile",
+    "query": [{"name": "page", "value": "2"}, {"name": "debug", "value": None}],
+    "request_headers": [{"name": "X-Client", "value": "ios*"}],
+    "body_contains": ["needle"],
+    "body_json": [{"path": "user.role", "value": "admin"}],
+    "remove_headers": ["ETag"],
+    "json_set": [{"path": "user.plan", "value": "pro"}],
+    "json_remove": ["user.trial_ends"],
+    "replace": [{"find": "Free", "with": "Pro"}],
+    "delay_s": 1.5,
+}
+# Where a stored rule keeps each list key.
+LIST_KEYS = {
+    "query": ("match", "query"), "request_headers": ("match", "headers"),
+    "body_contains": ("match", "body", "contains"), "body_json": ("match", "body", "json"),
+    "remove_headers": ("rewrite", "remove_headers"), "json_set": ("rewrite", "json_set"),
+    "json_remove": ("rewrite", "json_remove"), "replace": ("rewrite", "replace"),
+}
+
+
+def stored_at(rule: dict, path: tuple[str, ...]) -> object:
+    for step in path:
+        rule = rule.get(step) if isinstance(rule, dict) else None
+    return rule
+
+
+class MockRuleFieldTests(ToolsCase):
+    """`mocks.add` / `mocks.update` keys beyond the response: mode, request
+    conditions, rewrite edits and timing; the absent-key rule on update;
+    masking in every reply; counts-only journal words."""
+
+    def add(self, **payload: object) -> dict:
+        payload.setdefault("url_glob", "*/autonom-tools-test*")
+        return self.ok("mocks.add", payload)
+
+    def add_full(self) -> dict:
+        return self.add(**{**REWRITE_RULE})
+
+    def registry(self) -> list[dict]:
+        return mocks_mod.load()
+
+    def stored(self, identifier: str) -> dict:
+        (rule,) = [rule for rule in self.registry() if rule["id"] == identifier]
+        return rule
+
+    def registry_text(self) -> str:
+        return mocks_mod.registry_file().read_text(encoding="utf-8")
+
+    def without_stamp(self, rule: dict) -> dict:
+        return {key: value for key, value in rule.items() if key != "updated_at"}
+
+    # --- add: every key ---------------------------------------------------------
+
+    def test_add_stores_every_key(self) -> None:
+        reply = self.add_full()
+        rule = self.stored(reply["id"])
+        self.assertEqual(rule["mode"], "rewrite")
+        self.assertEqual(rule["match"]["method"], "GET")
+        self.assertEqual(rule["match"]["host"], "api.example.com")
+        self.assertEqual(rule["response"]["status"], 503)
+        self.assertEqual(rule["response"]["headers"], {"Retry-After": "5"})
+        self.assertEqual(rule["match"]["query"], REWRITE_RULE["query"])
+        self.assertEqual(rule["match"]["headers"], REWRITE_RULE["request_headers"])
+        self.assertEqual(rule["match"]["body"],
+                         {"contains": ["needle"], "json": REWRITE_RULE["body_json"]})
+        self.assertEqual(rule["rewrite"], {
+            "remove_headers": ["ETag"], "json_set": REWRITE_RULE["json_set"],
+            "json_remove": ["user.trial_ends"], "replace": REWRITE_RULE["replace"]})
+        self.assertEqual(rule["delay_s"], 1.5)
+        self.assertNotIn("hang", rule)
+        self.assertEqual(reply["mock"]["mode"], "rewrite")
+
+    def test_each_key_alone(self) -> None:
+        cases = [
+            ({"query": [{"name": "page", "value": "2"}]}, ("match", "query"),
+             [{"name": "page", "value": "2"}]),
+            ({"query": [{"name": "debug", "value": None}]}, ("match", "query"),
+             [{"name": "debug", "value": None}]),
+            ({"request_headers": [{"name": "X-Client", "value": None}]}, ("match", "headers"),
+             [{"name": "X-Client", "value": None}]),
+            ({"body_contains": ["a", "b"]}, ("match", "body", "contains"), ["a", "b"]),
+            ({"body_json": [{"path": "items.0.id", "value": 7}]}, ("match", "body", "json"),
+             [{"path": "items.0.id", "value": 7}]),
+            ({"mode": "rewrite", "remove_headers": [" ETag "]}, ("rewrite", "remove_headers"),
+             ["ETag"]),
+            ({"mode": "rewrite", "json_set": [{"path": "a.b", "value": {"c": [1, None]}}]},
+             ("rewrite", "json_set"), [{"path": "a.b", "value": {"c": [1, None]}}]),
+            ({"mode": "rewrite", "json_remove": ["a.0"]}, ("rewrite", "json_remove"), ["a.0"]),
+            ({"mode": "rewrite", "replace": [{"find": "x", "with": ""}]}, ("rewrite", "replace"),
+             [{"find": "x", "with": ""}]),
+            ({"mode": "rewrite"}, ("mode",), "rewrite"),
+            ({"mode": "respond"}, ("mode",), None),
+            ({"delay_s": 2}, ("delay_s",), 2.0),
+            ({"hang": True}, ("hang",), True),
+        ]
+        for extra, path, expected in cases:
+            with self.subTest(extra=extra):
+                rule = self.stored(self.add(**extra)["id"])
+                self.assertEqual(stored_at(rule, path), expected)
+
+    def test_a_rewrite_rule_without_a_status_keeps_the_real_status(self) -> None:
+        rule = self.stored(self.add(mode="rewrite", json_set=[{"path": "a", "value": 1}])["id"])
+        self.assertIsNone(rule["response"]["status"])
+        # A fake response still defaults to 200, a null status included.
+        self.assertEqual(self.stored(self.add()["id"])["response"]["status"], 200)
+        self.assertEqual(self.stored(self.add(status=None)["id"])["response"]["status"], 200)
+        self.assertEqual(self.stored(self.add(mode="respond")["id"])["response"]["status"], 200)
+
+    def test_a_rule_without_the_new_keys_is_stored_as_before(self) -> None:
+        rule = self.stored(self.add(status=418, body="x")["id"])
+        for absent in ("mode", "rewrite", "delay_s", "hang"):
+            self.assertNotIn(absent, rule)
+        self.assertEqual(set(rule["match"]),
+                         {"url_glob", "method", "host", "ignore_query"})
+        listed = self.ok("mocks.list")["mocks"][0]
+        self.assertEqual({key: value for key, value in listed.items() if key != "hits"}, rule)
+
+    def test_null_and_empty_conditions_store_nothing(self) -> None:
+        rule = self.stored(self.add(query=None, request_headers=[], body_contains=[],
+                                    body_json=None)["id"])
+        self.assertEqual(set(rule["match"]),
+                         {"url_glob", "method", "host", "ignore_query"})
+
+    # --- update: the absent-key rule -------------------------------------------
+
+    def test_update_keeps_conditions_when_only_the_status_is_sent(self) -> None:
+        """MR-13-S01."""
+        rule = self.add(query=[{"name": "a", "value": "1"}, {"name": "b", "value": "2"}],
+                        body_json=[{"path": "user.id", "value": 7}])
+        before = self.stored(rule["id"])
+        updated = self.ok("mocks.update", {"id": rule["id"], "status": 503})
+        self.assertEqual(updated["response"]["status"], 503)
+        stored = self.stored(rule["id"])
+        self.assertEqual(stored["match"]["query"], before["match"]["query"])
+        self.assertEqual(stored["match"]["body"], before["match"]["body"])
+        self.assertEqual(len(stored["match"]["query"]) + len(stored["match"]["body"]["json"]), 3)
+
+    def test_update_without_a_key_changes_nothing_else(self) -> None:
+        rule = self.add_full()
+        updates = [({"status": 504}, ("response", "status"), 504),
+                   ({"note": "n"}, ("note",), "n"),
+                   ({"method": "post"}, ("match", "method"), "POST"),
+                   ({"headers": {"X-A": "1"}}, ("response", "headers"), {"X-A": "1"}),
+                   ({"ignore_query": True}, ("match", "ignore_query"), True)]
+        for extra, path, value in updates:
+            with self.subTest(extra=extra):
+                before = self.without_stamp(self.stored(rule["id"]))
+                self.ok("mocks.update", {"id": rule["id"], **extra})
+                after = self.without_stamp(self.stored(rule["id"]))
+                expected = json.loads(json.dumps(before))
+                target = expected
+                for step in path[:-1]:
+                    target = target[step]
+                target[path[-1]] = value
+                self.assertEqual(after, expected)
+
+    def test_a_null_list_or_timing_is_the_same_as_absent(self) -> None:
+        rule = self.add_full()
+        before = self.without_stamp(self.stored(rule["id"]))
+        self.ok("mocks.update", {"id": rule["id"], "mode": None, "delay_s": None, "hang": None,
+                                 **{key: None for key in LIST_KEYS}})
+        self.assertEqual(self.without_stamp(self.stored(rule["id"])), before)
+
+    def test_an_empty_list_clears_only_that_list(self) -> None:
+        for key, path in LIST_KEYS.items():
+            with self.subTest(key=key):
+                rule = self.add_full()
+                before = self.without_stamp(self.stored(rule["id"]))
+                self.assertTrue(stored_at(before, path), key)
+                self.ok("mocks.update", {"id": rule["id"], key: []})
+                after = self.without_stamp(self.stored(rule["id"]))
+                self.assertIsNone(stored_at(after, path), key)
+                for other, other_path in LIST_KEYS.items():
+                    if other != key:
+                        self.assertEqual(stored_at(after, other_path),
+                                         stored_at(before, other_path), (key, other))
+                self.assertEqual(after["mode"], "rewrite")
+                self.assertEqual(after["delay_s"], 1.5)
+                self.ok("mocks.remove", {"id": rule["id"]})
+
+    def test_clearing_every_edit_leaves_no_rewrite_block_and_no_empty_body_block(self) -> None:
+        rule = self.add_full()
+        self.ok("mocks.update", {"id": rule["id"], "body_contains": [], "body_json": [],
+                                 "remove_headers": [], "json_set": [], "json_remove": [],
+                                 "replace": []})
+        stored = self.stored(rule["id"])
+        self.assertNotIn("rewrite", stored)
+        self.assertNotIn("body", stored["match"])
+
+    def test_a_list_that_is_sent_replaces_the_whole_list(self) -> None:
+        rule = self.add_full()
+        self.ok("mocks.update", {"id": rule["id"], "query": [{"name": "sort", "value": "asc"}],
+                                 "json_set": [{"path": "n", "value": 2}]})
+        stored = self.stored(rule["id"])
+        self.assertEqual(stored["match"]["query"], [{"name": "sort", "value": "asc"}])
+        self.assertEqual(stored["rewrite"]["json_set"], [{"path": "n", "value": 2}])
+        self.assertEqual(stored["rewrite"]["remove_headers"], ["ETag"])
+
+    def test_update_can_narrow_a_rule_with_a_condition_later(self) -> None:
+        """MR-11-S01 through Canvas."""
+        rule = self.add(url_glob="*/items*", query=[{"name": "page", "value": "2"}], status=500)
+        self.ok("mocks.update", {"id": rule["id"],
+                                 "request_headers": [{"name": "X-Client", "value": "ios*"}]})
+        stored = self.stored(rule["id"])
+        self.assertEqual(stored["match"]["query"], [{"name": "page", "value": "2"}])
+        self.assertEqual(stored["match"]["headers"], [{"name": "X-Client", "value": "ios*"}])
+        self.assertEqual(stored["response"]["status"], 500)
+
+    # --- update: mode, status and body ------------------------------------------
+
+    def test_mode_switches_with_the_edits_it_needs(self) -> None:
+        rule = self.add(status=200)
+        self.ok("mocks.update", {"id": rule["id"], "mode": "rewrite",
+                                 "json_set": [{"path": "a", "value": 1}]})
+        stored = self.stored(rule["id"])
+        self.assertEqual(stored["mode"], "rewrite")
+        self.assertEqual(stored["rewrite"]["json_set"], [{"path": "a", "value": 1}])
+        before = self.registry_text()
+        # Back to a fake response with the edits still stored: refused, unchanged.
+        self.refused("mocks.update", {"id": rule["id"], "mode": "respond"}, errors.INVALID_VALUE)
+        self.assertEqual(self.registry_text(), before)
+        self.ok("mocks.update", {"id": rule["id"], "mode": "respond", "json_set": []})
+        stored = self.stored(rule["id"])
+        self.assertNotIn("mode", stored)
+        self.assertNotIn("rewrite", stored)
+
+    def test_update_edits_need_the_stored_or_sent_rewrite_mode(self) -> None:
+        rule = self.add()
+        before = self.registry_text()
+        self.refused("mocks.update", {"id": rule["id"], "replace": [{"find": "a", "with": "b"}]},
+                     errors.INVALID_VALUE)
+        self.assertEqual(self.registry_text(), before)
+
+    def test_clear_status_returns_a_rewrite_rule_to_the_real_status(self) -> None:
+        rule = self.add(mode="rewrite", status=503, json_set=[{"path": "a", "value": 1}])
+        self.assertEqual(self.stored(rule["id"])["response"]["status"], 503)
+        self.ok("mocks.update", {"id": rule["id"], "clear_status": True})
+        self.assertIsNone(self.stored(rule["id"])["response"]["status"])
+        # A status in the same update is a conflict; a fake response needs one.
+        plain = self.add(status=201)
+        before = self.registry_text()
+        self.refused("mocks.update", {"id": rule["id"], "status": 500, "clear_status": True},
+                     errors.INVALID_VALUE)
+        self.refused("mocks.update", {"id": plain["id"], "clear_status": True},
+                     errors.INVALID_VALUE)
+        self.assertEqual(self.registry_text(), before)
+        self.assertEqual(self.stored(plain["id"])["response"]["status"], 201)
+
+    def test_clear_body_drops_a_stored_body(self) -> None:
+        rule = self.add(mode="rewrite", body="whole")
+        path = Path(self.stored(rule["id"])["response"]["body_path"])
+        self.assertTrue(path.exists())
+        self.ok("mocks.update", {"id": rule["id"], "clear_body": True})
+        self.assertIsNone(self.stored(rule["id"])["response"]["body_path"])
+        self.assertFalse(path.exists())
+        self.refused("mocks.update", {"id": rule["id"], "body": "x", "clear_body": True},
+                     errors.INVALID_VALUE)
+        for flag in ("clear_status", "clear_body"):
+            self.refused("mocks.update", {"id": rule["id"], flag: "yes"},
+                         errors.FLOW_COMMAND_INVALID)
+
+    def test_a_new_body_and_new_body_edits_exclude_each_other(self) -> None:
+        rule = self.add(mode="rewrite", json_set=[{"path": "a", "value": 1}])
+        before = self.registry_text()
+        self.refused("mocks.update", {"id": rule["id"], "body": "{}",
+                                      "json_remove": ["a"]}, errors.INVALID_VALUE)
+        self.assertEqual(self.registry_text(), before)
+        # A whole body alone replaces the stored body edits.
+        self.ok("mocks.update", {"id": rule["id"], "body": "{}"})
+        self.assertNotIn("rewrite", self.stored(rule["id"]))
+
+    # --- timing ----------------------------------------------------------------
+
+    def test_delay_and_hang_replace_each_other_on_update(self) -> None:
+        rule = self.add(delay_s=2.5)
+        self.assertEqual(self.stored(rule["id"])["delay_s"], 2.5)
+        self.ok("mocks.update", {"id": rule["id"], "hang": True})
+        stored = self.stored(rule["id"])
+        self.assertIs(stored["hang"], True)
+        self.assertNotIn("delay_s", stored)
+        self.ok("mocks.update", {"id": rule["id"], "delay_s": 3})
+        stored = self.stored(rule["id"])
+        self.assertEqual(stored["delay_s"], 3.0)
+        self.assertNotIn("hang", stored)
+        self.ok("mocks.update", {"id": rule["id"], "hang": True})
+        self.ok("mocks.update", {"id": rule["id"], "hang": False})
+        stored = self.stored(rule["id"])
+        self.assertNotIn("hang", stored)
+        self.assertNotIn("delay_s", stored)
+        self.ok("mocks.update", {"id": rule["id"], "delay_s": 1})
+        self.ok("mocks.update", {"id": rule["id"], "note": "x"})
+        self.assertEqual(self.stored(rule["id"])["delay_s"], 1.0)
+
+    def test_a_rewrite_rule_takes_a_delay_but_never_a_hang(self) -> None:
+        rule = self.add(mode="rewrite", delay_s=0.5)
+        self.assertEqual(self.stored(rule["id"])["delay_s"], 0.5)
+        held = self.add(hang=True)
+        before = self.registry_text()
+        self.refused("mocks.update", {"id": rule["id"], "hang": True}, errors.INVALID_VALUE)
+        self.refused("mocks.add", {"url_glob": "*/x", "mode": "rewrite", "hang": True},
+                     errors.INVALID_VALUE)
+        # A held rule cannot become a rewrite rule without releasing the hang.
+        self.refused("mocks.update", {"id": held["id"], "mode": "rewrite"}, errors.INVALID_VALUE)
+        self.assertEqual(self.registry_text(), before)
+        self.ok("mocks.update", {"id": held["id"], "mode": "rewrite", "hang": False})
+        self.assertNotIn("hang", self.stored(held["id"]))
+        self.assertEqual(self.stored(held["id"])["mode"], "rewrite")
+
+    # --- refusals ---------------------------------------------------------------
+
+    def test_refusals_leave_the_registry_and_bodies_unchanged(self) -> None:
+        self.add(note="keep")
+        before = self.registry_text()
+        edit = {"path": "a", "value": 1}
+        too_long = "x" * 2049
+        shape, value = errors.FLOW_COMMAND_INVALID, errors.INVALID_VALUE
+        cases = [
+            ({"mode": 5}, shape),
+            ({"mode": "both"}, value),
+            ({"query": "page=2"}, shape),
+            ({"query": ["page=2"]}, shape),
+            ({"query": [{"name": "a"}, 5]}, shape),
+            ({"query": [{"name": "", "value": "1"}]}, value),
+            ({"query": [{"name": "a", "value": 2}]}, value),
+            ({"query": [{"name": f"p{n}"} for n in range(21)]}, value),
+            ({"query": [{"name": "a", "value": too_long}]}, value),
+            ({"request_headers": {"name": "X"}}, shape),
+            ({"request_headers": [{"name": "bad name", "value": None}]}, value),
+            ({"request_headers": [{"name": "", "value": "x"}]}, value),
+            ({"body_contains": "needle"}, shape),
+            ({"body_contains": [5]}, shape),
+            ({"body_contains": [""]}, value),
+            ({"body_contains": [too_long]}, value),
+            ({"body_json": ["a=1"]}, shape),
+            ({"body_json": [{"path": "a"}]}, value),
+            ({"body_json": [{"path": "a..b", "value": 1}]}, value),
+            ({"body_json": [{"path": "", "value": 1}]}, value),
+            ({"mode": "rewrite", "json_set": ["a=1"]}, shape),
+            ({"mode": "rewrite", "json_set": [{"path": "a.", "value": 1}]}, value),
+            ({"mode": "rewrite", "json_set": [{"path": "a", "value": float("nan")}]}, value),
+            ({"mode": "rewrite", "json_set": [{"path": "a", "value": too_long}]}, value),
+            ({"mode": "rewrite", "remove_headers": [{"name": "ETag"}]}, shape),
+            ({"mode": "rewrite", "remove_headers": ["bad name"]}, value),
+            ({"mode": "rewrite", "json_remove": "a.b"}, shape),
+            ({"mode": "rewrite", "json_remove": [""]}, value),
+            ({"mode": "rewrite", "replace": [["a", "b"]]}, shape),
+            ({"mode": "rewrite", "replace": [{"find": "", "with": "x"}]}, value),
+            ({"mode": "rewrite", "replace": [{"find": "a", "with": 5}]}, value),
+            ({"mode": "rewrite", "replace": [{"find": "a"}]}, value),
+            ({"mode": "rewrite", "headers": {"bad name": "1"}}, value),
+            ({"remove_headers": ["ETag"]}, value),
+            ({"json_set": [edit]}, value),
+            ({"json_remove": ["a"]}, value),
+            ({"mode": "respond", "replace": [{"find": "a", "with": "b"}]}, value),
+            ({"mode": "rewrite", "body": "{}", "json_set": [edit]}, value),
+            ({"mode": "rewrite", "hang": True}, value),
+            ({"delay_s": "2"}, shape),
+            ({"delay_s": True}, shape),
+            ({"delay_s": float("nan")}, shape),
+            ({"delay_s": float("inf")}, shape),
+            ({"delay_s": 0}, value),
+            ({"delay_s": -1}, value),
+            ({"delay_s": 120.5}, value),
+            ({"delay_s": 2, "hang": True}, value),
+            ({"hang": "yes"}, shape),
+            ({"hang": 1}, shape),
+        ]
+        for extra, code in cases:
+            with self.subTest(extra=str(extra)[:100]):
+                self.refused("mocks.add", {"url_glob": "*/x*", **extra}, code)
+        self.assertEqual(self.registry_text(), before)
+        self.assertEqual(len(list(mocks_mod.bodies_dir().iterdir())), 0)
+
+    def test_update_refusals_leave_the_stored_rule_unchanged(self) -> None:
+        rule = self.add_full()
+        before = self.registry_text()
+        for extra, code in [({"query": [{"name": "a", "value": 1}]}, errors.INVALID_VALUE),
+                            ({"query": "a=1"}, errors.FLOW_COMMAND_INVALID),
+                            ({"mode": "respond"}, errors.INVALID_VALUE),
+                            ({"delay_s": 999}, errors.INVALID_VALUE),
+                            ({"hang": True}, errors.INVALID_VALUE),
+                            ({"json_set": [{"path": "", "value": 1}]}, errors.INVALID_VALUE),
+                            ({"status": 99, "query": []}, errors.INVALID_VALUE)]:
+            with self.subTest(extra=extra):
+                self.refused("mocks.update", {"id": rule["id"], **extra}, code)
+        self.assertEqual(self.registry_text(), before)
+
+    def test_a_refusal_never_echoes_a_condition_or_edit_value(self) -> None:
+        record = self.start_session()
+        response = self.refused(
+            "mocks.add",
+            {"url_glob": "*/x", "query": [{"name": "token", "value": SECRET}],
+             "json_set": [{"path": "auth.token", "value": SECRET}],
+             "replace": [{"find": SECRET, "with": SECRET}]},
+            errors.INVALID_VALUE)  # edits need --rewrite
+        self.assertNotIn(SECRET, json.dumps(response))
+        self.refused("mocks.add", {"url_glob": "*/x", "mode": "rewrite",
+                                   "query": [{"name": "token", "value": 5}],
+                                   "request_headers": [{"name": "Authorization", "value": SECRET}]},
+                     errors.INVALID_VALUE)
+        self.assertNotIn(SECRET, self.journal_text(record))
+        self.assertEqual([entry["ok"] for entry in self.journal(record)], [False, False])
+
+    def test_the_lists_share_a_32_kib_limit_and_the_body_keeps_its_own(self) -> None:
+        big = [{"name": f"p{n}", "value": "v" * 2000} for n in range(20)]  # ~40 KB
+        self.add(note="keep")
+        before = self.registry_text()
+        response = self.refused("mocks.add", {"url_glob": "*/x", "query": big}, errors.INVALID_VALUE)
+        self.assertIn("32768", response["error"])
+        self.assertEqual(self.registry_text(), before)
+        self.add(query=big[:12])  # ~24 KB
+        # Text counts in UTF-8 bytes (2 per "é"), not as \\u escapes.
+        wide = [{"name": f"p{n}", "value": "é" * 800} for n in range(20)]  # ~32.6 KB
+        self.add(query=wide)
+        wide = [{"name": f"p{n}", "value": "é" * 1000} for n in range(20)]  # ~40.6 KB
+        self.refused("mocks.add", {"url_glob": "*/x", "query": wide}, errors.INVALID_VALUE)
+        # The 32 KiB body limit is unchanged, with conditions beside it.
+        self.add(body="a" * (32 * 1024), query=big[:12])
+        self.refused("mocks.add", {"url_glob": "*/x", "body": "é" * 16385, "query": big[:1]},
+                     errors.INVALID_VALUE)
+
+    def test_a_lone_surrogate_is_refused_not_a_backend_failure(self) -> None:
+        self.add(note="keep")
+        before = self.registry_text()
+        bad = "\ud800"
+        for extra in ({"query": [{"name": "a", "value": bad}]},
+                      {"request_headers": [{"name": "X", "value": bad}]},
+                      {"body_contains": [bad]},
+                      {"body_json": [{"path": "a", "value": bad}]},
+                      {"mode": "rewrite", "json_set": [{"path": "a", "value": bad}]},
+                      {"mode": "rewrite", "replace": [{"find": bad, "with": "x"}]}):
+            with self.subTest(extra=extra):
+                self.refused("mocks.add", {"url_glob": "*/x", **extra}, errors.FLOW_COMMAND_INVALID)
+        self.assertEqual(self.registry_text(), before)
+        self.assertEqual([path.name for path in mocks_mod.registry_dir().iterdir()
+                          if path.name.endswith(".tmp")], [])
+
+    def test_the_new_keys_need_an_existing_rule(self) -> None:
+        self.refused("mocks.update", {"id": "m_999", "query": []}, errors.MOCK_NOT_FOUND)
+        self.refused("mocks.update", {"query": []}, errors.FLOW_COMMAND_INVALID)
+
+    # --- list and replies: masking and the round trip ---------------------------
+
+    def secret_rule(self) -> dict:
+        return self.add(
+            url_glob="*/login*", mode="rewrite", status=401,
+            headers={"Set-Cookie": "sid=" + SECRET, "X-Plain": "visible"},
+            query=[{"name": "token", "value": SECRET}, {"name": "page", "value": "2"}],
+            request_headers=[{"name": "Authorization", "value": "Bearer " + SECRET},
+                             {"name": "X-Client", "value": "ios*"}],
+            body_json=[{"path": "user.password", "value": SECRET},
+                       {"path": "user.role", "value": "admin"}],
+            json_set=[{"path": "auth.token", "value": SECRET},
+                      {"path": "user.plan", "value": "pro"}],
+            remove_headers=["ETag"], delay_s=1.5)
+
+    def test_list_returns_every_stored_field_with_secrets_masked(self) -> None:
+        reply = self.secret_rule()
+        stored = self.stored(reply["id"])
+        self.assertIn(SECRET, self.registry_text())
+        listed = self.ok("mocks.list")
+        (rule,) = listed["mocks"]
+        self.assertNotIn(SECRET, json.dumps(listed))
+        placeholder = "<redacted>"
+        self.assertEqual(rule["match"]["query"],
+                         [{"name": "token", "value": placeholder}, {"name": "page", "value": "2"}])
+        self.assertEqual(rule["match"]["headers"],
+                         [{"name": "Authorization", "value": placeholder},
+                          {"name": "X-Client", "value": "ios*"}])
+        self.assertEqual(rule["match"]["body"]["json"],
+                         [{"path": "user.password", "value": placeholder},
+                          {"path": "user.role", "value": "admin"}])
+        self.assertEqual(rule["rewrite"]["json_set"],
+                         [{"path": "auth.token", "value": placeholder},
+                          {"path": "user.plan", "value": "pro"}])
+        self.assertEqual(rule["response"]["headers"],
+                         {"Set-Cookie": placeholder, "X-Plain": "visible"})
+        # Everything else is the stored rule, and the hits count is added.
+        unmasked = {key: value for key, value in rule.items()
+                    if key not in ("match", "rewrite", "response", "hits")}
+        self.assertEqual(unmasked, {key: value for key, value in stored.items()
+                                    if key not in ("match", "rewrite", "response")})
+        self.assertEqual(rule["hits"], 0)
+        self.assertEqual(rule["rewrite"]["remove_headers"], ["ETag"])
+        self.assertEqual(rule["delay_s"], 1.5)
+        self.assertEqual(rule["mode"], "rewrite")
+
+    def test_replies_mask_secrets_too(self) -> None:
+        reply = self.secret_rule()
+        self.assertNotIn(SECRET, json.dumps(reply))
+        self.assertEqual(reply["mock"], {key: value for key, value in reply.items()
+                                         if key not in ("mock", "registry")})
+        updated = self.ok("mocks.update", {"id": reply["id"], "note": "n"})
+        self.assertNotIn(SECRET, json.dumps(updated))
+        for op in ("mocks.disable", "mocks.enable"):
+            self.assertNotIn(SECRET, json.dumps(self.ok(op, {"id": reply["id"]})))
+        self.assertIn(SECRET, self.registry_text())  # the proxy still gets the real value
+
+    def test_a_list_saved_back_unchanged_stores_the_same_rule(self) -> None:
+        """MR-14-S02 at the bridge: what the form was shown, sent back, changes nothing."""
+        rule = self.secret_rule()
+        self.ok("mocks.update", {"id": rule["id"], "json_remove": ["user.t"],
+                                 "replace": [{"find": "Free", "with": "Pro"}],
+                                 "body_contains": ["needle"]})
+        before = self.stored(rule["id"])
+        (shown,) = self.ok("mocks.list")["mocks"]
+        payload = {
+            "id": shown["id"], "url_glob": shown["match"]["url_glob"],
+            "method": shown["match"]["method"] or "", "host": shown["match"]["host"] or "",
+            "ignore_query": shown["match"]["ignore_query"], "mode": shown["mode"],
+            "status": shown["response"]["status"], "headers": shown["response"]["headers"],
+            "query": shown["match"]["query"], "request_headers": shown["match"]["headers"],
+            "body_contains": shown["match"]["body"]["contains"],
+            "body_json": shown["match"]["body"]["json"],
+            **{key: shown["rewrite"][key] for key in
+               ("remove_headers", "json_set", "json_remove", "replace")},
+            "delay_s": shown["delay_s"], "note": shown["note"] or "",
+        }
+        self.ok("mocks.update", payload)
+        after = self.stored(rule["id"])
+        self.assertEqual(self.without_stamp(after), self.without_stamp(before))
+        self.assertIn(SECRET, json.dumps(after))
+        self.assertEqual(after["match"]["headers"][0]["value"], "Bearer " + SECRET)
+        self.assertEqual(after["response"]["headers"]["Set-Cookie"], "sid=" + SECRET)
+
+    def test_a_hand_edited_rule_still_lists(self) -> None:
+        rule = self.add(query=[{"name": "page", "value": "2"}])
+        rules = self.registry()
+        rules[0]["match"]["query"] = "not-a-list"
+        rules[0]["match"]["body"] = 5
+        rules[0]["rewrite"] = ["bad"]
+        mocks_mod.save(rules)
+        (listed,) = self.ok("mocks.list")["mocks"]
+        self.assertEqual(listed["id"], rule["id"])
+
+    # --- journal ----------------------------------------------------------------
+
+    def test_journal_words_are_names_and_counts_only(self) -> None:
+        record = self.start_session()
+        reply = self.add(
+            url_glob="*/login*", mode="rewrite", status=401, delay_s=1.5,
+            headers={"X-Plain": SECRET},
+            query=[{"name": "token", "value": SECRET}, {"name": SECRET, "value": None}],
+            request_headers=[{"name": "Authorization", "value": SECRET}],
+            body_contains=[SECRET], body_json=[{"path": "a", "value": SECRET}],
+            remove_headers=["ETag", "Server"],
+            json_set=[{"path": "auth.token", "value": SECRET}], json_remove=["x"],
+            replace=[{"find": SECRET, "with": SECRET}], note=SECRET)
+        self.ok("mocks.update", {"id": reply["id"], "query": [], "json_set": [], "status": 500,
+                                 "clear_body": True, "delay_s": 2})
+        self.ok("mocks.update", {"id": reply["id"], "mode": "respond", "remove_headers": [],
+                                 "json_remove": [], "replace": [], "hang": True})
+        self.refused("mocks.add", {"url_glob": "*/x", "query": [{"name": "a", "value": SECRET}],
+                                   "replace": [{"find": SECRET, "with": SECRET}]},
+                     errors.INVALID_VALUE)
+        entries = self.journal(record)
+        self.assertEqual([entry["verb"] for entry in entries],
+                         ["canvas mocks.add", "canvas mocks.update", "canvas mocks.update",
+                          "canvas mocks.add"])
+        argv = entries[0]["argv"]
+        for word in ("query=2", "request_header=1", "body_contains=1", "body_json=1",
+                     "remove_headers=2", "json_set=1", "json_remove=1", "replace=1",
+                     "mode=rewrite", "status=401", "delay_s=1.5", "headers=1", reply["id"]):
+            self.assertIn(word, argv)
+        # Clearing a list records the count 0, never what it held.
+        self.assertIn("query=0", entries[1]["argv"])
+        self.assertIn("json_set=0", entries[1]["argv"])
+        self.assertIn("clear_body", entries[1]["argv"])
+        self.assertIn("delay_s=2", entries[1]["argv"])
+        self.assertIn("mode=respond", entries[2]["argv"])
+        self.assertIn("hang=true", entries[2]["argv"])
+        self.assertFalse(entries[3]["ok"])
+        self.assertEqual(entries[3]["error_code"], errors.INVALID_VALUE)
+        self.assertNotIn(SECRET, self.journal_text(record))
+
+    def test_the_mock_ops_keep_their_origins(self) -> None:
+        record = self.start_session()
+        reply = self.add(query=[{"name": "a", "value": "1"}])
+        self.ok("mocks.update", {"id": reply["id"], "query": []}, origin="agent")
+        self.assertEqual([entry["origin"] for entry in self.journal(record)], ["human", "agent"])
+
+
 # --- journal (wc-007) ----------------------------------------------------------------
 
 
