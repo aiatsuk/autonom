@@ -20,7 +20,14 @@ import {
   displayChoiceNeedsRestart,
   halfMaxSize,
   parseDeviceId,
+  IOS_ON_CHANGE_FPS,
+  IOS_SCALE_STEP,
+  ownFps,
+  parseWatch,
   profileVideo,
+  tileScale,
+  visibleTiles,
+  watchScale,
   splitDevicePath,
 } from "../plugins/autonom/skills/android-emulator-browser/scripts/canvas-devices.mjs";
 
@@ -57,7 +64,9 @@ test("focus profiles: focused runs full rate, background caps fps, size and scal
   assert.deepEqual(profileVideo({ platform: "android", focused: false, options: {} }),
     { profile: "background", fps: 30, maxSize: 1024, scaleFactor: 1 });
   assert.deepEqual(profileVideo({ platform: "ios", focused: false, options: {} }),
-    { profile: "background", fps: 30, maxSize: undefined, scaleFactor: 0.5 });
+    { profile: "background", fps: 0, maxSize: undefined, scaleFactor: 1 });
+  assert.deepEqual(profileVideo({ platform: "ios", focused: true, options: {} }),
+    { profile: "focused", fps: IOS_ON_CHANGE_FPS, maxSize: undefined, scaleFactor: 1 });
   // An explicit --fps is the focused rate, and the background never runs faster than it.
   assert.equal(profileVideo({ platform: "android", focused: true, options: { fps: 20, fpsExplicit: true } }).fps, 20);
   assert.equal(profileVideo({ platform: "android", focused: false, options: { fps: 20, fpsExplicit: true } }).fps, 20);
@@ -390,13 +399,14 @@ test("display choice (QW-04, QW-05): focused uses the choice, background the low
     baseMaxSize: 2400 }).maxSize, 1024, "half of 2400 is above the background cap");
   assert.equal(android(false, { fps: 60, size: "half" }, { maxSize: 480, maxSizeExplicit: true }).maxSize, 480);
   assert.equal(ios(false, { fps: 60, size: "half" }).scaleFactor, 0.5);
-  assert.equal(ios(false, { fps: 60, size: "full" }).scaleFactor, 0.5);
+  assert.equal(ios(false, { fps: 60, size: "full" }).scaleFactor, 1, "the tiles set the size of an iOS stream");
   // fps null (a Size picked alone) keeps the configured frame rate: 60, or --fps.
   assert.deepEqual(android(true, { fps: null, size: "half" }), { profile: "focused", fps: 60, maxSize: 640, scaleFactor: 1 });
   assert.equal(android(true, { fps: null, size: "half" }, { fps: 24, fpsExplicit: true }).fps, 24);
   assert.equal(android(false, { fps: null, size: "half" }, { fps: 24, fpsExplicit: true }).fps, 24);
-  assert.equal(ios(false, { fps: null, size: "full" }).fps, 30);
-  assert.deepEqual(ios(true, { fps: null, size: "half" }), { profile: "focused", fps: 60, maxSize: undefined, scaleFactor: 0.5 });
+  assert.equal(ios(false, { fps: null, size: "full" }).fps, 0, "fps null keeps the stream's own rate: on change");
+  assert.deepEqual(ios(true, { fps: null, size: "half" }), { profile: "focused", fps: 0, maxSize: undefined, scaleFactor: 0.5 });
+  assert.equal(ios(false, { fps: null, size: "full" }, { fps: 45, fpsExplicit: true }).fps, 30);
 });
 
 test("display choice bookkeeping: a restart is needed for a new choice, or to retry one no restart applied", () => {
@@ -473,4 +483,66 @@ test("focus: refresh restarts with the same profile, at once and then at most on
   clock.advance(100);
   assert.equal(held.length, 1);
   assert.equal(held[0][2], "focused");
+});
+
+test("frame rate without a choice (CU-01): --fps, else on change on iOS and 60 on Android", () => {
+  assert.equal(ownFps("ios", {}), IOS_ON_CHANGE_FPS);
+  assert.equal(IOS_ON_CHANGE_FPS, 0, "idb's variable frame rate");
+  assert.equal(ownFps("android", {}), 60);
+  assert.equal(ownFps("ios", { fps: 24, fpsExplicit: true }), 24);
+  assert.equal(ownFps("ios", { fps: 24 }), 0, "a default --fps value is no choice");
+});
+
+test("watch report (CU-02, CU-03): a valid report is normalized, anything else is no report", () => {
+  assert.deepEqual(parseWatch('{"t":"watch","visible":true,"width":300,"height":650,"dpr":2,"extra":1}'),
+    { visible: true, width: 300, height: 650, dpr: 2 });
+  assert.deepEqual(parseWatch('{"t":"watch","visible":false,"width":0,"height":0,"dpr":1}'),
+    { visible: false, width: 0, height: 0, dpr: 1 });
+  for (const text of ["", "not json", "null", "[]", '{"t":"other","visible":true,"width":1,"height":1,"dpr":1}',
+    '{"t":"watch","width":1,"height":1,"dpr":1}', '{"t":"watch","visible":"yes","width":1,"height":1,"dpr":1}',
+    '{"t":"watch","visible":true,"width":-1,"height":1,"dpr":1}', '{"t":"watch","visible":true,"width":1,"height":1e9,"dpr":1}',
+    '{"t":"watch","visible":true,"width":"1","height":1,"dpr":1}', '{"t":"watch","visible":true,"width":1,"height":1,"dpr":0}',
+    '{"t":"watch","visible":true,"width":1,"height":1,"dpr":99}', '{"t":"watch","visible":true,"width":1,"height":1}']) {
+    assert.equal(parseWatch(text), null, text);
+  }
+});
+
+test("visible tiles (CU-03): hidden and empty tiles show nothing; a client that said nothing counts at full size", () => {
+  const shown = { visible: true, width: 300, height: 650, dpr: 2 };
+  assert.deepEqual(visibleTiles([]), []);
+  assert.deepEqual(visibleTiles([{ watch: null }]), [null]);
+  assert.deepEqual(visibleTiles([{ watch: shown }]), [{ width: 300, height: 650, dpr: 2 }]);
+  assert.deepEqual(visibleTiles([{ watch: { ...shown, visible: false } }]), []);
+  assert.deepEqual(visibleTiles([{ watch: { ...shown, width: 0 } }, { watch: { ...shown, height: 0 } }]), []);
+  assert.deepEqual(visibleTiles([{ watch: { ...shown, visible: false } }, { watch: shown }, { watch: null }]),
+    [{ width: 300, height: 650, dpr: 2 }, null]);
+});
+
+test("tile scale (CU-02): CSS size times devicePixelRatio over the picture, capped at 1, in steps, at least one step", () => {
+  const iphone = { width: 1206, height: 2622 };
+  assert.equal(tileScale({ width: 300, height: 652, dpr: 2 }, iphone), 0.5, "CU-02-S01");
+  // About 300 CSS px stays in the same step.
+  assert.equal(tileScale({ width: 310, height: 674, dpr: 2 }, iphone), 0.5);
+  assert.equal(tileScale({ width: 290, height: 630, dpr: 2 }, iphone), 0.5);
+  assert.equal(tileScale({ width: 603, height: 1311, dpr: 1 }, iphone), 0.5);
+  assert.equal(tileScale({ width: 402, height: 874, dpr: 3 }, iphone), 1);
+  assert.equal(tileScale({ width: 2000, height: 4000, dpr: 2 }, iphone), 1, "capped at full size");
+  assert.equal(tileScale({ width: 20, height: 40, dpr: 1 }, iphone), IOS_SCALE_STEP, "never below one step");
+  assert.equal(tileScale({ width: 450, height: 978, dpr: 2 }, iphone), 0.75);
+  // A rotated tile is as big as the upright one: the stream stays portrait.
+  assert.equal(tileScale({ width: 652, height: 300, dpr: 2 }, iphone), 0.5);
+  // The side that needs more decides.
+  assert.equal(tileScale({ width: 150, height: 1311, dpr: 1 }, iphone), 0.5);
+  // A size that is not known needs full size.
+  assert.equal(tileScale(null, iphone), 1);
+  assert.equal(tileScale({ width: 300, height: 652, dpr: 2 }, null), 1);
+  assert.equal(tileScale({ width: 300, height: 652, dpr: 2 }, { width: 0, height: 0 }), 1);
+});
+
+test("stream scale (CU-02): the largest visible tile decides; no tile or an unknown one needs full size", () => {
+  const iphone = { width: 1206, height: 2622 };
+  assert.equal(watchScale([{ width: 150, height: 326, dpr: 2 }, { width: 300, height: 652, dpr: 2 }], iphone), 0.5);
+  assert.equal(watchScale([{ width: 300, height: 652, dpr: 2 }, null], iphone), 1);
+  assert.equal(watchScale([], iphone), 1);
+  assert.equal(watchScale(null, iphone), 1);
 });

@@ -524,11 +524,44 @@ class FramedCaptureTests(ActionsCase):
 class IosScreenshotTests(ActionsCase):
     platform = "ios"
 
-    def test_ios_screenshots_come_from_simctl(self) -> None:
-        capture = self.ok("capture.screenshot", {})["capture"]
-        self.assertEqual(capture["platform"], "ios")
-        self.assertTrue(any(argv[:3] == ["simctl", "io", UDID] and "screenshot" in argv
-                            for argv in self.calls()))
+    def simctl_shots(self) -> list[list[str]]:
+        return [argv for argv in self.calls()
+                if argv[:3] == ["simctl", "io", UDID] and "screenshot" in argv]
+
+    def test_with_the_daemon_off_ios_screenshots_come_from_simctl_and_say_why(self) -> None:
+        self.set_env(AUTONOM_IOS_DAEMON="off")
+        result = self.ok("capture.screenshot", {})
+        self.assertEqual(result["capture"]["platform"], "ios")
+        self.assertEqual(result["source"], "simctl")
+        self.assertIn("AUTONOM_IOS_DAEMON", result["fallback_reason"])
+        self.assertTrue(self.simctl_shots())
+
+    def test_ios_screenshots_come_through_the_daemon_companion(self) -> None:
+        from autonom_lib import ios_daemon
+
+        self.set_env(AUTONOM_IOS_DAEMON=None)
+        png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
+        shot = {"image": png, "format": "png", "width": 1, "height": 1, "source_width": None,
+                "source_height": None, "screen_scale": None}
+        with mock.patch.object(ios_daemon, "screenshot", return_value=shot) as daemon_shot:
+            result = self.ok("capture.screenshot", {})
+        daemon_shot.assert_called_once_with(UDID, image_format="png")
+        self.assertEqual(result["source"], "companion")
+        self.assertNotIn("fallback_reason", result)
+        self.assertEqual(self.simctl_shots(), [], "no simctl process for the picture")
+        saved = self.captures_root.rglob(result["capture"]["name"])
+        self.assertEqual(next(saved).read_bytes(), png)
+
+    def test_a_daemon_that_cannot_serve_falls_back_to_simctl_with_the_reason(self) -> None:
+        from autonom_lib import ios_daemon
+
+        self.set_env(AUTONOM_IOS_DAEMON=None)
+        refused = ios_daemon.Unavailable("companion_too_old", "the companion has no screenshot")
+        with mock.patch.object(ios_daemon, "screenshot", side_effect=refused):
+            result = self.ok("capture.screenshot", {})
+        self.assertEqual(result["source"], "simctl")
+        self.assertEqual(result["fallback_reason"], "companion_too_old: the companion has no screenshot")
+        self.assertTrue(self.simctl_shots())
 
 
 # --- recording -------------------------------------------------------------------------

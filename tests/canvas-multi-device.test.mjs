@@ -1308,6 +1308,10 @@ function companionEvents(world) {
  */
 class FakeIosDaemon {
   ops = [];
+  /** The `watching` of each `subscribe`, in order; it is not in `ops`. */
+  subscribes = [];
+  /** How `subscribe` answers: a daemon from before events refuses it. */
+  refuseSubscribe = false;
   state = "serving";
   companion = null;
   /** How many more `attach` requests are answered daemon_unreachable (Infinity: all of them). */
@@ -1315,6 +1319,7 @@ class FakeIosDaemon {
   #world;
   #attachments = new Map();
   #connections = new Set();
+  #subscribers = new Set();
   #waiters = [];
   #server = null;
 
@@ -1420,11 +1425,28 @@ class FakeIosDaemon {
     });
     socket.on("close", () => {
       this.#connections.delete(socket);
+      this.#subscribers.delete(socket);
       this.#attachments.delete(socket);
     });
   }
 
+  /** One event line to every subscribed connection, as the daemon writes them. */
+  publish(event) {
+    for (const socket of this.#subscribers) socket.write(`${JSON.stringify({ udid: IOS_UDID, ...event })}\n`);
+  }
+
   async #handle(socket, request) {
+    if (request.op === "subscribe") {
+      this.subscribes.push(request.watching);
+      if (this.refuseSubscribe) {
+        socket.write(`${JSON.stringify({ id: request.id, ok: false, error: { code: "invalid_request", message: "Unknown op.", stage: "before_send" } })}\n`);
+        return;
+      }
+      this.#subscribers.add(socket);
+      socket.write(`${JSON.stringify({ id: request.id, ok: true, subscribed: true, watching: request.watching })}\n`);
+      socket.write(`${JSON.stringify({ event: "state", udid: IOS_UDID, state: this.state, booted: true, target_state: "Booted" })}\n`);
+      return;
+    }
     this.ops.push(request.op);
     let reply;
     const companion = () => ({ socket: this.companion.socketPath, pid: this.companion.pid, owned: true });
@@ -1453,7 +1475,6 @@ class FakeIosDaemon {
 function iosSession(world, { daemon = true, daemonOptions = {} } = {}) {
   const session = new IosFastSession({
     udid: IOS_UDID,
-    xcrunPath: world.xcrun,
     binary: world.companion,
     video: { ...DEFAULT_VIDEO_OPTIONS, fps: 60 },
     daemon: daemon ? { stateBase: world.home, env: world.daemonEnv, ...daemonOptions } : null,
@@ -1616,6 +1637,31 @@ test("iOS reconnect (ID-14-S02): a companion the daemon restarts is reconnected 
   assert.equal(daemon.attached, 0);
   assert.equal(daemon.ops.at(-1), "detach");
   assert.equal(pidAlive(after), true);
+});
+
+test("iOS attach (CU-04): the attached connection subscribes, reads no state on a timer, and a daemon without events changes nothing else", async (t) => {
+  const world = await iosDaemonWorld(t);
+  const daemon = await new FakeIosDaemon(world).start();
+  const session = iosSession(world);
+  await session.start();
+  await waitFor(() => session.stats.daemonSubscribed, 5000, "the subscription");
+  assert.deepEqual(daemon.subscribes, [true]);
+  daemon.publish({ event: "state", state: "serving", booted: false, target_state: "Shutdown" });
+  await waitFor(() => session.state === "restarting", 2000, "the shutdown event");
+  assert.equal(session.stats.targetState, "Shutdown");
+  daemon.publish({ event: "state", state: "serving", booted: true, target_state: "Booted" });
+  await waitFor(() => session.state === "streaming", 5000, "the stream back");
+  await session.stop();
+  assert.deepEqual(daemon.ops, ["attach", "detach"]);
+
+  const old = await new FakeIosDaemon(world).start();
+  old.refuseSubscribe = true;
+  const second = iosSession(world);
+  await second.start();
+  await waitFor(() => old.subscribes.length === 1, 5000, "the refused subscribe");
+  assert.equal(second.stats.daemonSubscribed, false);
+  assert.equal(second.state, "streaming");
+  assert.equal(second.stats.companionSource, "daemon");
 });
 
 test("iOS attach: a daemon that goes away is attached to again through the daemon that took over, on the same companion", async (t) => {

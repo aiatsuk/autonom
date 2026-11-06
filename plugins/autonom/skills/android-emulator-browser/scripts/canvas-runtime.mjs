@@ -144,10 +144,17 @@ export const IDB_FIRST_FRAME_MS = 10_000;
 // forced with Stop and Start on the same stream, at most once per IDB_FORCED_KEY_FRAME_MS.
 export const IDB_KEY_FRAME_WAIT_MS = 2500;
 export const IDB_FORCED_KEY_FRAME_MS = 5000;
-// The Simulator state is read this often while the fast stream runs, so a reboot restarts
-// the frozen stream (IOSF-006); the orientation is read this often for rotated pictures.
-export const IDB_SIMULATOR_WATCH_MS = 2000;
-export const IDB_ORIENTATION_MS = 1000;
+// A stream on change (fps 0) has no periodic key frame on a still screen, so one asked for is
+// forced at once, at most once per this time: a tile joining it sees a picture within 1 s (CU-01).
+export const IDB_ON_CHANGE_KEY_FRAME_MS = 1000;
+// Who watches a device settles this long before the stream reacts: a stop for nobody watching
+// and a new scale wait for it, so visibility flaps and resize bursts cost nothing; a new scale
+// goes out at most once per this time (CU-02, CU-03). A tile shown again restarts at once.
+export const IDB_WATCH_SETTLE_MS = 500;
+// Without daemon events (AUTONOM_IOS_DAEMON=off, a fallback, a daemon without them) a session
+// asks its own companion for state and orientation this often while a tile shows the device:
+// calls on the open gRPC session, never a process (CU-04).
+export const IDB_OWN_READ_MS = 1000;
 export const IDB_RETRY_MIN_MS = 500;
 export const IDB_RETRY_MAX_MS = 5000;
 // A stream that ran this long resets the restart backoff.
