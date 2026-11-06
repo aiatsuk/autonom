@@ -821,6 +821,13 @@ test("daemonBootState: the workspace poll skips simctl only while the session fo
   world.daemon.publishState({ booted: false });
   await until(() => session.booted === false, 500, "the shutdown");
   assert.equal(daemonBootState({ session }), false);
+  world.daemon.publishState({ state: "serving", booted: true });
+  await until(() => session.booted === true, 500, "booted again");
+  assert.equal(daemonBootState({ session }), true);
+  world.daemon.publishState({ state: "companion_restarting", booted: null });
+  await until(() => session.stats.daemonState === "companion_restarting", 500, "the restart event");
+  assert.equal(session.booted, true, "the session keeps its last boot state");
+  assert.equal(daemonBootState({ session }), null, "but the workspace asks simctl while the companion is lost");
   const old = await makeWorld(t, { subscribe: false });
   const own = await streaming(old);
   assert.equal(daemonBootState({ session: own }), null, "a daemon from before events: simctl is asked");

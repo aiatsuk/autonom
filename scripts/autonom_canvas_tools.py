@@ -852,6 +852,10 @@ class Tools:
 
         if ios_daemon.disabled():
             reason = "the iOS device daemon is turned off (AUTONOM_IOS_DAEMON)"
+        elif ios_daemon.live_registry(ios_daemon.state_base(), self.target.target_id) is None:
+            # a cold daemon start can take long enough to miss the Capture button's own
+            # deadline; the Canvas normally has one running, so only a running one is asked
+            reason = "no iOS device daemon is running for this Simulator"
         else:
             try:
                 shot = ios_daemon.screenshot(self.target.target_id, image_format="png")

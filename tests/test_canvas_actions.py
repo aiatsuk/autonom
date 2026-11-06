@@ -540,6 +540,9 @@ class IosScreenshotTests(ActionsCase):
         from autonom_lib import ios_daemon
 
         self.set_env(AUTONOM_IOS_DAEMON=None)
+        running = mock.patch.object(ios_daemon, "live_registry", return_value={"socket": "/tmp/x"})
+        running.start()
+        self.addCleanup(running.stop)
         png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
         shot = {"image": png, "format": "png", "width": 1, "height": 1, "source_width": None,
                 "source_height": None, "screen_scale": None}
@@ -552,10 +555,24 @@ class IosScreenshotTests(ActionsCase):
         saved = self.captures_root.rglob(result["capture"]["name"])
         self.assertEqual(next(saved).read_bytes(), png)
 
+    def test_without_a_running_daemon_a_capture_starts_none_and_uses_simctl(self) -> None:
+        from autonom_lib import ios_daemon
+
+        self.set_env(AUTONOM_IOS_DAEMON=None)
+        with mock.patch.object(ios_daemon, "live_registry", return_value=None), \
+             mock.patch.object(ios_daemon, "screenshot") as daemon_shot:
+            result = self.ok("capture.screenshot", {})
+        daemon_shot.assert_not_called()
+        self.assertEqual(result["source"], "simctl")
+        self.assertIn("no iOS device daemon is running", result["fallback_reason"])
+
     def test_a_daemon_that_cannot_serve_falls_back_to_simctl_with_the_reason(self) -> None:
         from autonom_lib import ios_daemon
 
         self.set_env(AUTONOM_IOS_DAEMON=None)
+        running = mock.patch.object(ios_daemon, "live_registry", return_value={"socket": "/tmp/x"})
+        running.start()
+        self.addCleanup(running.stop)
         refused = ios_daemon.Unavailable("companion_too_old", "the companion has no screenshot")
         with mock.patch.object(ios_daemon, "screenshot", side_effect=refused):
             result = self.ok("capture.screenshot", {})

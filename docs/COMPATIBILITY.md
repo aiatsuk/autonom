@@ -646,7 +646,8 @@ fixed rate chosen in the Display menu is honored as before. Pinned by
 
 - `/status` `idb` adds `booted`, `target_state`, `frames_per_second`,
   `watchers`, `video_stopped`, `video_stops` and `daemon_subscribed`;
-  `scale_factor` now follows the largest visible tile.
+  `stream_settings.scale_factor` now follows the largest visible tile (the
+  workspace device summary's `scale_factor` is still the profile's limit).
 - The video socket (`/ws/video`) accepts a page message `{t:"watch",
   visible, width, height, dpr}`; a page that never sends it counts as a
   visible tile at full size (as before).

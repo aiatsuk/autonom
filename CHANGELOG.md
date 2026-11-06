@@ -10,8 +10,8 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
 ### Added
 
 - **Canvas screenshots of the iOS Simulator come through the companion.** The
-  Capture button asks the iOS device daemon's companion for the picture, so
-  no `simctl` process starts; the reply says `source: companion`, or
+  Capture button asks the running iOS device daemon's companion for the
+  picture, so no `simctl` process starts; the reply says `source: companion`, or
   `source: simctl` with `fallback_reason` when the daemon could not serve it.
 - **Opt-in macOS hardware video for the Android Canvas.** With an emulator
   listed in `~/.config/autonom/host-video.json` (AVD, serial, gRPC port),

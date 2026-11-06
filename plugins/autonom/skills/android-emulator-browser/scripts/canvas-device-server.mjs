@@ -953,7 +953,11 @@ function streamSizeInUse(context) {
  */
 export function daemonBootState(context) {
   const session = context?.session instanceof IosFastSession ? context.session : null;
-  if (!session || !session.stats?.daemonSubscribed) return null;
+  const stats = session?.stats;
+  if (!stats?.daemonSubscribed) return null;
+  // Only a daemon that is serving knows: while it has lost or restarts its companion
+  // (`companion_restarting`, boot state unknown) the Simulator may be gone, so ask simctl.
+  if (stats.daemonState !== "serving") return null;
   return typeof session.booted === "boolean" ? session.booted : null;
 }
 
@@ -1506,7 +1510,7 @@ class IosFastSession extends EventEmitter {
     return {
       ...this.#stats, state: this.#state, points: this.#points, companionPid: this.#companion?.pid ?? null,
       companionSource: this.#mode, daemonAttached: this.#attached, daemonFallback: this.#daemonFallback,
-      booted: this.#booted, targetState: this.#targetState, daemonSubscribed: this.#subscribed,
+      booted: this.#booted, targetState: this.#targetState, daemonSubscribed: this.#subscribed, daemonState: this.#daemonState,
       framesPerSecond: this.#framesPerSecond(), watchers: this.#tiles?.length ?? 0, videoStopped: this.#held,
     };
   }

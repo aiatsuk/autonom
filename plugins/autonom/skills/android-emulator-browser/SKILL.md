@@ -202,7 +202,7 @@ refused.
 - **Sized to the tile, stopped when unwatched.** Each page reports its tile's
   size and whether it is visible (`{t:"watch", visible, width, height, dpr}`
   on its video socket; a page that never says counts as a full-size tile). The stream follows the largest visible tile
-  (`/status` `idb.scale_factor`, at most the Display choice; a resize burst is
+  (`/status` `stream_settings.scale_factor`, at most the Display choice; a resize burst is
   one restart after it settles), stops within about 2 s once no tile is
   visible (`idb.video_stopped`, input stays up), and a page shown again gets a
   key frame within 1 s. Flaps shorter than 500 ms change nothing.
@@ -234,8 +234,8 @@ refused.
   `orientation` and `rotation` (clockwise degrees), and the page turns the
   picture upright. A finger down during a rotation is lifted.
 - **Capture.** The Capture button takes the picture through the daemon's
-  companion (`source: companion`, no simctl process); when the daemon cannot
-  serve it, `simctl io screenshot` does (`source: simctl`, `fallback_reason`).
+  companion (`source: companion`, no simctl process); when no daemon runs for
+  the Simulator or it cannot serve it, `simctl io screenshot` does (`source: simctl`, `fallback_reason`).
 - **Input.** One finger: down, move and up reach the Simulator live over the
   companion's HID stream (a held finger moves by repeated touch-down at the
   new point), in logical points of the current orientation. A pointer from
