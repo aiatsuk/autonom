@@ -149,10 +149,12 @@ def refuse_device(platform: str, value: str) -> None:
 
 
 def flow_text(platform: str, steps: int) -> str:
-    """A Flow v1 file that opens the Settings app and scrolls ``steps`` times."""
+    """A Flow v1 file that opens the Settings app on its first screen (stopped
+    first, so a page left open by an earlier run is not resumed) and scrolls
+    ``steps`` times."""
     name = "Settings open and scroll" if steps <= 2 else "Settings long scroll (%d steps)" % steps
     lines = ["schema: autonom.dev/flow/v1", "appId: %s" % SETTINGS_APP[platform], "name: %s" % name, "---",
-             "- launchApp"]
+             "- stopApp", "- launchApp"]
     lines += ["- scroll"] * steps
     if steps <= 2:
         lines.append("- takeScreenshot")
