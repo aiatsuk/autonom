@@ -154,6 +154,48 @@ was captured under an active mock, then disable the rule and confirm the real
 path still works.
 ```
 
+## Mock one request, or edit a real response
+
+```text
+Make only page 2 of the item list fail, and keep page 1 real. Then make the
+real profile say the user is on the Pro plan without faking the rest of it.
+Show from `network requests list --mocked true` which flows were faked and
+which were edited, and from `rewrite.error` whether every edit applied.
+```
+
+```bash
+# a condition narrows a rule; all conditions must hold (AND with URL, method, host)
+autonom network mock add --url 'https://api.example.com/v1/items' --query page=2 --status 500
+autonom network mock add --match '*/v1/orders' --method POST \
+  --request-header 'X-Client: ios*' --body-json user.role=admin --status 403
+autonom network mock add --match '*/v1/search*' --query debug --body-contains needle --status 418
+
+# --rewrite: the request reaches the server and its answer is edited
+autonom network mock add --match '*/v1/profile' --rewrite \
+  --json-set 'user.plan="pro"' --json-remove user.trial_ends --remove-header ETag
+autonom network mock add --match '*/v1/banner' --rewrite --replace Free Pro --delay 2
+autonom network mock add --match '*/v1/sync' --rewrite --status 503 --header 'Retry-After: 5'
+
+# update: a repeated flag that is given replaces that whole list
+autonom network mock update m_1 --query page=3
+autonom network mock update m_1 --clear-conditions
+autonom network mock update m_4 --clear-edits --no-rewrite --status 200
+autonom network mock list          # mode, conditions, condition_summary, edits, edit_summary
+```
+
+`--query NAME` asks only that the parameter is there; `NAME=GLOB` matches one
+of its decoded values. `--request-header 'Name'` asks only that the header is
+there. `--body-json` and `--json-set` read VALUE as JSON when it parses, else
+as text (`qty=2` is the number, `'plan="pro"'` and `plan=pro` the string).
+`--replace` takes two values, OLD and NEW. A rewrite rule without `--status`
+keeps the real status. The new flags must be spelled in full. An edit flag
+without `--rewrite`, `--hang` with `--rewrite`, and a whole body (`--json`,
+`--body-file`) with body edits are refused with `invalid_value`, and so is a
+malformed condition or edit, naming the flag. A body edit that cannot apply
+leaves the real body unchanged and records why in `rewrite.error`. `mock list`
+and `show` print secret condition values as `<redacted>`; the journal keeps
+only flag names and counts (`query=2`).
+
 ## Read a run back / hand it off
 
 ```text
@@ -234,6 +276,20 @@ mock; check the app's error state, then remove the mock, Detach and Stop
 capture. On Logs, filter to the app package and Warning level. Report each
 step's result line and any error code and hint; never paste request bodies
 or log text into the report.
+```
+
+## Edit a real response from the Canvas Mocks form
+
+```text
+In the Canvas Tools drawer, open Mocks and choose Edit real response. Enter
+the URL glob */v1/profile, leave Status empty to keep the real one, set Body
+to "Edit fields or text", press + Set field and enter user.plan and "pro".
+Add + Query with page and 2 under Match request. Add the mock, check that the
+list row shows the Edit badge and "page=2", use the app, then confirm with
+`autonom network requests list --mocked true` that the flow has `mock_kind:
+rewrite`. Then press Edit on the
+row, type a header name with a space under + Remove header and press Save:
+report the message shown beside the field.
 ```
 
 ## Work on several devices in one Canvas workspace

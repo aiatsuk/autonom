@@ -636,6 +636,51 @@ Codes added (in `scripts/autonom_lib/errors.py`):
 | Companion lifetime | each `idb` call could start a companion; the Canvas ran its own | one companion per Simulator: the live one idb started for it, found in the process table (`idb_companion --udid <UDID> --grpc-domain-sock <dir>/<UDID>_companion.sock`; used, never stopped by the daemon; the daemon reads none of idb's files, and a companion that serves only TCP is not used), else one the daemon starts with `idb connect` and restarts after a crash (0.5 s growing to 5 s). The daemon stops after 5 minutes with no request and no Canvas attached, and then ends only a companion it started (`idb disconnect`, SIGTERM, SIGKILL after 3 s) |
 | Canvas idb transport | its own companion on a private socket | the daemon's companion (`attach`, then its own gRPC session for video; `detach` when the device leaves); a private companion only with `AUTONOM_IOS_DAEMON=off` or a daemon that cannot serve. `/status` `idb` adds `companion_source` (`daemon` or `private`), `daemon_attached`, `daemon_fallback`, `companion_attaches` and `hid_lost` (input events the companion never confirmed, each also reported as an error). The Canvas, too, ends each `hid` call 250 ms after its last event (10 s while a press is held) |
 
+### Mock matching and response rewrite (Unreleased)
+
+Additive: a rule without the new fields is stored, matched, listed and
+exported exactly as before, and a missing `mode` means `respond`. Pinned by
+`tests/test_mock_match.py`, `tests/test_mock_rewrite.py`,
+`tests/test_mock_cli.py`, `tests/test_canvas_tools.py`,
+`tests/canvas-mock-form.test.mjs` and `tests/canvas-tools-page.test.mjs`. No
+error code is added: a malformed condition or edit, or a combination that
+makes no sense, is `invalid_value` naming the flag, and nothing is stored.
+
+| Surface | Before | Now |
+| --- | --- | --- |
+| `network mock add\|update` | URL, method, host, status, headers, body, note, `--delay`, `--hang` | additive `--query NAME[=GLOB]`, `--request-header 'NAME[: GLOB]'`, `--body-contains TEXT`, `--body-json PATH=VALUE`, `--rewrite` / `--no-rewrite`, `--remove-header NAME`, `--json-set PATH=VALUE`, `--json-remove PATH`, `--replace OLD NEW` (each repeatable, at most 20 per flag, 2048 characters per value); `update` adds `--clear-conditions` and `--clear-edits`. The new flags match only when spelled in full; `--j`, `--b`, `--he…` keep meaning `--json`, `--body-file`, `--header`. On `update` a repeated flag that is given replaces that whole list. `--hang` with `--rewrite`, an edit flag without `--rewrite`, and a whole body with body edits are `invalid_value` |
+| `network mock add --rewrite` without `--status` | — (a rule without `--status` answered 200) | the stored `response.status` is `null` and the real status is kept; a respond rule without `--status` is still 200 |
+| Registry rule (`registry.json`) | `id`, `enabled`, `match` (`url_glob`, `method`, `host`, `ignore_query`), `response`, `note`, timing | additive `mode: "rewrite"` (absent for a respond rule), `match.query` and `match.headers` (`[{name, value}]`, `value` null for "present"), `match.body` (`contains`: texts; `json`: `[{path, value}]`), `rewrite` (`remove_headers`, `json_set`, `json_remove`, `replace: [{find, with}]`), each written only when not empty. A hand-edited rule with malformed conditions never matches; a malformed rewrite rule changes nothing and records `invalid_rule`; an unknown `mode` never matches |
+| `network mock add\|update\|list\|show\|enable\|disable` output | the stored rule | the rule with secret values masked as `<redacted>` (request-header conditions on sensitive headers, secret-looking query names, `--body-json` / `--json-set` values under a credential field name, sensitive response headers), plus `mode` and `conditions`, and when not empty `condition_summary`, `edits` and `edit_summary`. The stored rule keeps the real values; `<redacted>` sent back unchanged in an update keeps the stored value |
+| Flow record (`flows.jsonl`, `network requests list\|show`) | `mocked`, `mock_id` | additive `mock_kind` (`respond`, `rewrite`, or `null`); a flow a rewrite rule edited adds `upstream_status` and `rewrite: {applied, error}` (edit names and an error reason, never values). `status` and the body preview are the edited response. A rewrite flow whose server failed is incomplete (`upstream_error`) with its `mock_id` and `mock_kind`, without `rewrite` |
+| HAR export | `_autonom`: `id`, `mocked`, `mock_id` | additive `_autonom.mock_kind` for records that carry `mock_kind`; older records export exactly as before |
+| Canvas `mocks.add` / `mocks.update` | URL glob, method, host, ignore query, status, headers, body, note | additive `mode`, `query`, `request_headers`, `body_contains`, `body_json`, `remove_headers`, `json_set`, `json_remove`, `replace` (JSON lists; absent or null keeps the stored list, `[]` clears it; at most 32 KiB together), `delay_s`, `hang`; `mocks.update` adds `clear_status` and `clear_body`. `mocks.add` without `status` in `rewrite` mode keeps the real status. `mocks.list` and the add and update answers mask secret values as the CLI does |
+| Session journal of `network mock add\|update` | values of `--json`, `--header` masked | the condition and edit flags stay, their values masked, followed by a count word per kind (`query=2`, `request_header=1`, `body_contains=1`, `body_json=1`, `remove_header=1`, `json_set=1`, `json_remove=1`, `replace=1`). The journaled `mock list` result keeps `id`, `enabled`, `mode`, `conditions`, `edits`, `hits`, `delay_s`, `hang`, the match without query values, and `status`; never condition or edit values, headers, bodies or notes. Canvas `mocks.add` / `mocks.update` journal words are counts too (`remove_headers=1`) |
+| Pre-test `mock_state` and `mocks_active` | `id`, URL glob, `method`, `host`, `status`, `enabled` | additive `mode` (rewrite rules only) and `conditions` (a count, when there are any) |
+| Older releases reading this registry | — | they ignore `mode`, conditions and edits: a rule with conditions matches more requests there, and a rewrite rule acts as a respond rule (it fakes the answer instead of editing the real one). Disable such rules before going back to an older release |
+
+### iOS Canvas on the daemon (Unreleased)
+
+Additive, except the default iOS Canvas frame rate: a Canvas without a Display
+choice now streams "On change" (`stream_settings.fps: 0`) instead of 60 fps; a
+fixed rate chosen in the Display menu is honored as before. Pinned by
+`tests/canvas-ios-unify.test.mjs`, `tests/ios-device-daemon.test.mjs`,
+`tests/test_ios_daemon_client.py` and `tests/test_canvas_actions.py`.
+
+- `/status` `idb` adds `booted`, `target_state`, `frames_per_second`,
+  `watchers`, `video_stopped`, `video_stops` and `daemon_subscribed`;
+  `stream_settings.scale_factor` now follows the largest visible tile (the
+  workspace device summary's `scale_factor` is still the profile's limit).
+- The video socket (`/ws/video`) accepts a page message `{t:"watch",
+  visible, width, height, dpr}`; a page that never sends it counts as a
+  visible tile at full size (as before).
+- The iOS device daemon adds the ops `subscribe` (lines `{event: "state" |
+  "orientation", ...}`) and `screenshot {format, scale}`; a daemon that
+  refuses `subscribe` keeps working, with the Canvas reading its own
+  companion while a tile shows the device.
+- The Canvas tools `capture.screenshot` reply adds `source` (`companion` or
+  `simctl`, iOS only) and `fallback_reason` when `simctl` took the picture.
+
 ### Android helper: lifecycle and `ui helper` (Unreleased)
 
 Autonom's own on-device helper (`native/android/helper`, protocol 1) is

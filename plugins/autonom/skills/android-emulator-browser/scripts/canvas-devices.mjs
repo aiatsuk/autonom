@@ -8,7 +8,6 @@ export const DEVICE_ID_PATTERN = /^(android|ios)~[A-Za-z0-9._:-]{1,128}$/;
 export const PROFILE = Object.freeze({
   BACKGROUND_FPS: 30,
   BACKGROUND_ANDROID_MAX_SIZE: 1024,
-  BACKGROUND_IOS_SCALE: 0.5,
   DEMOTE_AFTER_MS: 2000,
   RESTART_MIN_INTERVAL_MS: 3000,
 });
@@ -19,6 +18,13 @@ const RESTART_INPUT_POLL_MS = 100;
 export const ATTACH_CONCURRENCY = 2;
 export const DEVICE_STATES = Object.freeze(["attaching", "live", "offline", "failed", "detaching"]);
 const FOCUSED_FPS = 60;
+// An iOS stream without a choice sends frames on change only (idb variable frame rate, CU-01).
+export const IOS_ON_CHANGE_FPS = 0;
+// The steps of an iOS stream's scale, so that a small resize restarts nothing (CU-02).
+export const IOS_SCALE_STEP = 0.25;
+// The largest values a page's watch report may name; anything else is no report.
+const MAX_WATCH_SIDE = 100_000;
+const MAX_WATCH_DPR = 16;
 // Display menu "Half" (QW-04): iOS streams at half scale; Android at half the long side the
 // stream would use at full size, or of HALF_SIZE_FALLBACK_BASE when that is not known yet.
 export const HALF_IOS_SCALE = 0.5;
@@ -121,11 +127,18 @@ export function beginDisplayApply(context, choice) {
   };
 }
 
+/** The frame rate of a stream without a choice: --fps, else on change on iOS and 60 elsewhere. */
+export function ownFps(platform, options = {}) {
+  if (options.fpsExplicit) return options.fps;
+  return platform === "ios" ? IOS_ON_CHANGE_FPS : FOCUSED_FPS;
+}
+
 /**
- * The stream settings of a device. Focused: the configured frame rate (60 unless --fps),
- * the automatic size, full scale. Background: at most 30 fps, Android at most 1024 px on
- * the long side (or the explicit --max-size when smaller; 0 = native counts as unbounded),
- * iOS at half scale.
+ * The stream settings of a device. Focused: the configured frame rate (--fps, else 60 on
+ * Android and frames on change on iOS), the automatic size, full scale. Background: at most
+ * 30 fps, and Android at most 1024 px on the long side (or the explicit --max-size when
+ * smaller; 0 = native counts as unbounded). The size of an iOS stream follows its tiles
+ * instead (watchScale), in the background too; scaleFactor here is what that may not pass.
  *
  * A Display menu `choice` ({fps, size}, QW-05) replaces the configured frame rate (fps null
  * keeps it) and, with
@@ -135,7 +148,7 @@ export function beginDisplayApply(context, choice) {
  * no choice the result is exactly the one above.
  */
 export function profileVideo({ platform, focused, options = {}, choice = null, baseMaxSize = null }) {
-  const focusedFps = choice?.fps ?? (options.fpsExplicit ? options.fps : FOCUSED_FPS);
+  const focusedFps = choice?.fps ?? ownFps(platform, options);
   const half = choice?.size === "half";
   if (focused) {
     return {
@@ -146,8 +159,7 @@ export function profileVideo({ platform, focused, options = {}, choice = null, b
   }
   const fps = Math.min(PROFILE.BACKGROUND_FPS, focusedFps);
   if (platform === "ios") {
-    const scaleFactor = Math.min(PROFILE.BACKGROUND_IOS_SCALE, half ? HALF_IOS_SCALE : 1);
-    return { profile: "background", fps, maxSize: undefined, scaleFactor };
+    return { profile: "background", fps, maxSize: undefined, scaleFactor: half ? HALF_IOS_SCALE : 1 };
   }
   const auto = options.maxSizeExplicit ? options.maxSize : undefined;
   const effective = auto === undefined || auto === 0 ? Infinity : auto;
@@ -155,6 +167,60 @@ export function profileVideo({ platform, focused, options = {}, choice = null, b
   return {
     profile: "background", fps, maxSize: Math.min(effective, PROFILE.BACKGROUND_ANDROID_MAX_SIZE, chosen), scaleFactor: 1,
   };
+}
+
+/**
+ * A page's report of what it shows of a device, `{t: "watch", visible, width, height, dpr}`
+ * (CSS pixels of the picture and devicePixelRatio), as a JSON text: the normalized
+ * {visible, width, height, dpr}, or null for anything else.
+ */
+export function parseWatch(text) {
+  let message;
+  try {
+    message = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (message?.t !== "watch" || typeof message.visible !== "boolean") return null;
+  const side = (value) => Number.isFinite(value) && value >= 0 && value <= MAX_WATCH_SIDE;
+  const { visible, width, height, dpr } = message;
+  if (!side(width) || !side(height) || !Number.isFinite(dpr) || dpr <= 0 || dpr > MAX_WATCH_DPR) return null;
+  return { visible, width, height, dpr };
+}
+
+/**
+ * What the video clients of a device show (CU-02, CU-03): one entry per visible tile, its
+ * {width, height, dpr} or null for a client that sent no report (its size is not known, so
+ * it counts as visible at full size). A tile with no area shows nothing.
+ */
+export function visibleTiles(clients) {
+  const tiles = [];
+  for (const { watch } of clients) {
+    if (!watch) tiles.push(null);
+    else if (watch.visible && watch.width > 0 && watch.height > 0) {
+      tiles.push({ width: watch.width, height: watch.height, dpr: watch.dpr });
+    }
+  }
+  return tiles;
+}
+
+/**
+ * The scale a tile needs from a stream of `full` {width, height} device pixels: its CSS size
+ * times devicePixelRatio over the picture, side by side (long with long, as a rotated picture
+ * stays portrait in the stream), capped at 1 and rounded to steps of IOS_SCALE_STEP, at least
+ * one step. An unknown tile or picture size needs full size.
+ */
+export function tileScale(tile, full) {
+  if (!tile || !(full?.width > 0) || !(full?.height > 0)) return 1;
+  const needed = Math.max(
+    Math.min(tile.width, tile.height) * tile.dpr / Math.min(full.width, full.height),
+    Math.max(tile.width, tile.height) * tile.dpr / Math.max(full.width, full.height));
+  return Math.min(1, Math.max(IOS_SCALE_STEP, Math.round(needed / IOS_SCALE_STEP) * IOS_SCALE_STEP));
+}
+
+/** The scale of a stream: what its largest visible tile needs; full size when none reports one. */
+export function watchScale(tiles, full) {
+  return tiles?.length ? Math.max(...tiles.map((tile) => tileScale(tile, full))) : 1;
 }
 
 /**

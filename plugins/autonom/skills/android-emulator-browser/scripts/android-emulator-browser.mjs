@@ -58,6 +58,7 @@ import {
 import {
   IosFastSession,
   authorize,
+  daemonBootState,
   broadcastState,
   chooseTransport,
   closeDeviceContext,
@@ -1661,14 +1662,22 @@ async function pollTargets(server) {
   if (!entries.length && !absent.length) return;
   server.polling = true;
   try {
-    const ios = entries.some((entry) => entry.platform === "ios") || absent.some((ref) => ref.platform === "ios");
+    // An iOS device whose Canvas session follows the daemon's events already knows whether
+    // its Simulator is booted: simctl is listed only for the others (CU-04, no timed spawn).
+    const known = new Map();
+    for (const entry of entries) {
+      const booted = entry.platform === "ios" ? daemonBootState(entry.context) : null;
+      if (booted !== null) known.set(entry.id, booted);
+    }
+    const ios = entries.some((entry) => entry.platform === "ios" && !known.has(entry.id))
+      || absent.some((ref) => ref.platform === "ios");
     const { running, failed } = await listTargets(server, { ios });
     const ready = new Set(running.filter(isReady).map((item) => `${item.platform}~${item.target}`));
     for (const entry of entries) {
       // An attached device is never shown absent in its slot.
       if (server.registry.get(entry.id) === entry) server.workspace.setPresent(entry.id, true);
-      if (failed[entry.platform]) continue;
-      const here = ready.has(entry.id);
+      if (!known.has(entry.id) && failed[entry.platform]) continue;
+      const here = known.has(entry.id) ? known.get(entry.id) : ready.has(entry.id);
       if (entry.state === "live" && !here) {
         server.registry.setState(entry.id, "offline", { error: "The target is not running" });
         if (entry.context) stopSession(entry.context);

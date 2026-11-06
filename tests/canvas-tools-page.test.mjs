@@ -992,7 +992,7 @@ describe("toolsScript in the page context", () => {
     click($("tools-mocks").querySelector("[data-mock-action=edit]"));
     assert.equal($("tools-mock-form-title").textContent, "Edit mock 1");
     assert.equal($("tools-mock-headers").value, "X-A: 1");
-    assert.equal($("tools-mock-options").hasAttribute("open"), true);
+    assert.equal($("tools-mock-cancel-edit").hidden, false, "editing offers a way back");
     $("tools-mock-status").value = "600";
     fire($("tools-mock-form"), "submit");
     await flush();
@@ -1023,6 +1023,261 @@ describe("toolsScript in the page context", () => {
     await flush();
     assert.equal(ops("mocks.clear").length, 1);
     assert.match($("tools-msg-mocks").textContent, /Removed 2 mocks/);
+  });
+
+  // --- the Mocks form (MR-14): modes, rows, inline validation, round trip, list summary --------
+
+  const openMocks = async (page) => {
+    click(page.$("tools-toggle"));
+    await flush();
+    click(page.$("tools-tab-mocks"));
+    await flush();
+  };
+  const choose = (page, id, value) => { page.$(id).value = value; fire(page.$(id), "change"); };
+  const pickMode = (page, mode) => {
+    const radio = page.$(mode === "rewrite" ? "tools-mock-mode-rewrite" : "tools-mock-mode-respond");
+    radio.checked = true;
+    fire(radio, "change");
+  };
+  const addButton = (page, kind) => page.document.querySelector(`[data-mock-add="${kind}"]`);
+  const rowsOf = (page, container) => page.$(container).children;
+  const rowFields = (row) => row.querySelectorAll("input");
+
+  test("Mocks form: each mode shows its fields, and rows of every kind are added, labelled and removed", async () => {
+    const page = boot({ platform: "android" });
+    const { $, document } = page;
+    await openMocks(page);
+    assert.equal($("tools-mock-mode-respond").checked, true);
+    assert.equal($("tools-mock-status").value, "200");
+    for (const id of ["tools-mock-rewrite-headers", "tools-mock-body-choice", "tools-mock-body-edits", "tools-mock-delay-field"]) assert.equal($(id).hidden, true, id);
+    assert.equal($("tools-mock-body-field").hidden, false);
+    assert.equal($("tools-mock-timing-hang").hidden, false);
+    assert.equal($("tools-mock-response-title").textContent, "Response");
+    assert.match($("tools-mock-mode-hint").textContent, /server is not asked/);
+
+    choose(page, "tools-mock-timing", "delay");
+    assert.equal($("tools-mock-delay-field").hidden, false, "a delay asks for seconds");
+    choose(page, "tools-mock-timing", "hang");
+    assert.equal($("tools-mock-delay-field").hidden, true);
+
+    pickMode(page, "rewrite");
+    assert.equal($("tools-mock-mode-respond").checked, false);
+    assert.equal($("tools-mock-status").value, "", "an edit keeps the real status unless one is typed");
+    assert.equal($("tools-mock-status").placeholder, "Keep");
+    assert.equal($("tools-mock-timing").value, "none", "an edited response cannot hang");
+    assert.equal($("tools-mock-timing-hang").hidden, true);
+    assert.equal($("tools-mock-timing-hang").disabled, true);
+    assert.equal($("tools-mock-response-title").textContent, "Edit response");
+    assert.equal($("tools-mock-headers-label").textContent, "Set headers");
+    assert.equal($("tools-mock-rewrite-headers").hidden, false);
+    assert.equal($("tools-mock-body-choice").hidden, false);
+    assert.equal($("tools-mock-body-field").hidden, true, "Keep the real body needs no field");
+    choose(page, "tools-mock-body-mode", "replace");
+    assert.equal($("tools-mock-body-field").hidden, false);
+    assert.equal($("tools-mock-body-label").textContent, "New body");
+    choose(page, "tools-mock-body-mode", "edit");
+    assert.equal($("tools-mock-body-field").hidden, true);
+    assert.equal($("tools-mock-body-edits").hidden, false);
+
+    const expected = {
+      query: ["tools-mock-conditions", "Query", ["Query parameter name", "Query parameter value"]],
+      request_headers: ["tools-mock-conditions", "Header", ["Request header name", "Request header value"]],
+      body_contains: ["tools-mock-conditions", "Body", ["Text the request body contains"]],
+      body_json: ["tools-mock-conditions", "JSON", ["Request body JSON path", "Request body JSON value"]],
+      remove_headers: ["tools-mock-remove-headers", "Remove", ["Response header to remove"]],
+      json_set: ["tools-mock-edits", "Set", ["JSON path to set", "Value to set"]],
+      json_remove: ["tools-mock-edits", "Remove", ["JSON path to remove"]],
+      replace: ["tools-mock-edits", "Replace", ["Text to find", "Replacement text"]],
+    };
+    for (const [kind, [container, tag, labels]] of Object.entries(expected)) {
+      click(addButton(page, kind));
+      const row = rowsOf(page, container).at(-1);
+      assert.equal(row.getAttribute("data-kind"), kind);
+      assert.equal(row.querySelector(".tools-mock-tag").textContent, tag);
+      assert.equal(row.querySelector(".tools-mock-tag").getAttribute("aria-hidden"), "true");
+      assert.deepEqual(rowFields(row).map((input) => input.getAttribute("aria-label")), labels, kind);
+      assert.equal(document.activeElement, rowFields(row)[0], `${kind}: focus moves to the new row`);
+      const remove = row.querySelector("button");
+      assert.equal(remove.getAttribute("type"), "button");
+      assert.match(remove.getAttribute("aria-label"), /^Remove /);
+      assert.equal(remove.getAttribute("title"), remove.getAttribute("aria-label"));
+    }
+    assert.equal(rowsOf(page, "tools-mock-conditions").length, 4);
+    assert.equal(rowsOf(page, "tools-mock-remove-headers").length, 1);
+    assert.equal(rowsOf(page, "tools-mock-edits").length, 3);
+
+    const headerRow = rowsOf(page, "tools-mock-conditions")[1];
+    click(headerRow.querySelector("button"));
+    assert.equal(rowsOf(page, "tools-mock-conditions").length, 3);
+    assert.equal(headerRow.parentNode, null);
+    assert.equal(document.activeElement, addButton(page, "request_headers"), "focus returns to the add button");
+
+    pickMode(page, "respond");
+    assert.equal($("tools-mock-status").value, "200", "the fake response keeps its own status");
+    assert.equal($("tools-mock-rewrite-headers").hidden, true);
+    assert.equal($("tools-mock-body-edits").hidden, true);
+    assert.equal($("tools-mock-timing-hang").hidden, false);
+  });
+
+  test("Mocks form (MR-14-S01): an edit of the real response is added and listed with the Edit badge", async () => {
+    let mocks = [];
+    const page = boot({
+      platform: "android",
+      reply: ({ op, body }) => {
+        if (op === "mocks.list") return ok({ mocks });
+        if (op === "mocks.add") {
+          const { payload } = body;
+          mocks = [{ id: "m_1", mode: payload.mode, enabled: true, hits: 0, match: { url_glob: payload.url_glob, method: null, host: null, ignore_query: false },
+            response: { status: null, headers: {}, body_path: null }, rewrite: { json_set: payload.json_set } }];
+          return ok(mocks[0]);
+        }
+        return null;
+      },
+    });
+    const { $, ops } = page;
+    await openMocks(page);
+    pickMode(page, "rewrite");
+    $("tools-mock-glob").value = "*/profile";
+    choose(page, "tools-mock-body-mode", "edit");
+    click(addButton(page, "json_set"));
+    const [path, value] = rowFields(rowsOf(page, "tools-mock-edits")[0]);
+    path.value = "user.plan";
+    value.value = '"pro"';
+    fire($("tools-mock-form"), "submit");
+    await flush();
+    assert.deepEqual(ops("mocks.add").map((call) => call.body.payload), [{
+      url_glob: "*/profile", mode: "rewrite", ignore_query: false, headers: {}, json_set: [{ path: "user.plan", value: "pro" }],
+    }]);
+    assert.match($("tools-msg-mocks").textContent, /Mock m_1 added/);
+    const row = $("tools-mocks").children[0];
+    const badge = row.querySelector(".tools-mock-badge");
+    assert.equal(badge.textContent, "Edit");
+    assert.equal(badge.title, "Edits the real response");
+    assert.equal(row.querySelector("b").textContent, "*/profile");
+    assert.equal(row.querySelector("small").textContent, "Real status · 1 edit · 0 hits");
+    // The form is new again: a fake response with no rows.
+    assert.equal($("tools-mock-mode-respond").checked, true);
+    assert.equal($("tools-mock-status").value, "200");
+    assert.equal(rowsOf(page, "tools-mock-edits").length, 0);
+    assert.equal($("tools-mock-glob").value, "");
+  });
+
+  test("Mocks form: invalid values get a message beside the field, and nothing is sent", async () => {
+    const page = boot({ platform: "android" });
+    const { $, ops, document } = page;
+    await openMocks(page);
+    $("tools-mock-glob").value = "*/items*";
+    $("tools-mock-status").value = "700";
+    click(addButton(page, "request_headers"));
+    const [headerName, headerValue] = rowFields(rowsOf(page, "tools-mock-conditions")[0]);
+    headerName.value = "Bad Name";
+    headerValue.value = "x";
+    click(addButton(page, "body_json"));
+    const [jsonPath, jsonValue] = rowFields(rowsOf(page, "tools-mock-conditions")[1]);
+    jsonPath.value = "user..role";
+    jsonValue.value = "admin";
+    fire($("tools-mock-form"), "submit");
+    await flush();
+    assert.equal(ops("mocks.add").length, 0, "no call is made");
+
+    const status = $("tools-mock-status"), statusError = $("tools-mock-response-error");
+    assert.equal(statusError.hidden, false);
+    assert.match(statusError.textContent, /from 100 to 599/);
+    assert.equal(status.getAttribute("aria-invalid"), "true");
+    assert.equal(status.getAttribute("aria-describedby"), "tools-mock-response-error");
+    assert.equal(document.activeElement, status, "focus goes to the first problem");
+    for (const [input, pattern] of [[headerName, /valid header name/], [jsonPath, /empty part/]]) {
+      const slot = $(input.getAttribute("aria-describedby"));
+      assert.equal(input.getAttribute("aria-invalid"), "true");
+      assert.equal(slot.parentNode, input.parentNode, "the message sits in the row");
+      assert.equal(slot.hidden, false);
+      assert.match(slot.textContent, pattern);
+    }
+    assert.equal(headerValue.getAttribute("aria-invalid"), null);
+    assert.equal($("tools-msg-mocks").getAttribute("data-kind"), "error");
+    assert.match($("tools-msg-mocks").textContent, /from 100 to 599\. \(invalid_value\)/);
+
+    // Typing clears that field's mark and message; the others stay.
+    status.value = "201";
+    fire(status, "input");
+    assert.equal(status.getAttribute("aria-invalid"), null);
+    assert.equal(statusError.hidden, true);
+    assert.equal(headerName.getAttribute("aria-invalid"), "true");
+
+    headerName.value = "X-Client";
+    jsonPath.value = "user.role";
+    fire($("tools-mock-form"), "submit");
+    await flush();
+    assert.deepEqual(ops("mocks.add").map((call) => call.body.payload), [{
+      url_glob: "*/items*", status: 201, ignore_query: false, headers: {}, body: "",
+      request_headers: [{ name: "X-Client", value: "x" }], body_json: [{ path: "user.role", value: "admin" }],
+    }]);
+    assert.equal(document.querySelectorAll("[aria-invalid]").length, 0);
+  });
+
+  test("Mocks form (MR-14-S02): Edit fills every field and row; Save without changes sends only the base fields", async () => {
+    const rule = {
+      id: "m_3", enabled: true, mode: "rewrite", note: "edit the profile", hits: 2, delay_s: 1.5,
+      match: { url_glob: "*/profile*", method: "GET", host: "api.example.com", ignore_query: false,
+        query: [{ name: "page", value: "2" }, { name: "debug", value: null }, { name: "token", value: "<redacted>" }],
+        headers: [{ name: "X-Client", value: "ios*" }],
+        body: { contains: ["needle"], json: [{ path: "items.0.qty", value: 2 }] } },
+      response: { status: 503, headers: { "Retry-After": "5" }, body_path: null },
+      rewrite: { remove_headers: ["ETag"], json_set: [{ path: "user.plan", value: "pro" }], json_remove: ["user.trial_ends"], replace: [{ find: "Free", with: "Pro" }] },
+    };
+    const page = boot({ platform: "android", reply: ({ op }) => (op === "mocks.list" ? ok({ mocks: [rule] }) : op === "mocks.update" ? ok(rule) : null) });
+    const { $, ops } = page;
+    await openMocks(page);
+    assert.equal($("tools-mocks").querySelector("small").textContent, "503 · page=2 · debug · +1 query param · +1 header · +1 body text · +1 body field · 5 edits · 2 hits");
+    click($("tools-mocks").querySelector("[data-mock-action=edit]"));
+    assert.equal($("tools-mock-form-title").textContent, "Edit mock m_3");
+    assert.equal($("tools-mock-save").textContent, "Save changes");
+    assert.equal($("tools-mock-mode-rewrite").checked, true);
+    assert.deepEqual(["glob", "method", "host", "status", "headers", "timing", "delay", "body-mode", "note"].map((name) => $(`tools-mock-${name}`).value),
+      ["*/profile*", "GET", "api.example.com", "503", "Retry-After: 5", "delay", "1.5", "edit", "edit the profile"]);
+    assert.equal($("tools-mock-ignore-query").checked, false);
+    const values = (container) => rowsOf(page, container).map((row) => [row.getAttribute("data-kind"), ...rowFields(row).map((input) => input.value)]);
+    assert.deepEqual(values("tools-mock-conditions"), [
+      ["query", "page", "2"], ["query", "debug", ""], ["query", "token", "<redacted>"], ["request_headers", "X-Client", "ios*"],
+      ["body_contains", "needle"], ["body_json", "items.0.qty", "2"],
+    ]);
+    assert.deepEqual(values("tools-mock-remove-headers"), [["remove_headers", "ETag"]]);
+    assert.deepEqual(values("tools-mock-edits"), [["json_set", "user.plan", "pro"], ["json_remove", "user.trial_ends"], ["replace", "Free", "Pro"]]);
+    assert.equal($("tools-mock-body-edits").hidden, false);
+    assert.equal($("tools-mock-delay-field").hidden, false);
+
+    fire($("tools-mock-form"), "submit");
+    await flush();
+    assert.deepEqual(ops("mocks.update").map((call) => call.body.payload), [{
+      id: "m_3", url_glob: "*/profile*", status: 503, ignore_query: false, method: "GET", host: "api.example.com", note: "edit the profile", delay_s: 1.5,
+    }]);
+    assert.match($("tools-msg-mocks").textContent, /Mock m_3 saved/);
+    assert.equal($("tools-mock-form-title").textContent, "New mock");
+
+    // Edit again and turn it into a fake response: its edits are cleared, the status is kept.
+    click($("tools-mocks").querySelector("[data-mock-action=edit]"));
+    pickMode(page, "respond");
+    assert.equal($("tools-mock-status").value, "503");
+    rowFields(rowsOf(page, "tools-mock-conditions")[0])[1].value = "3";
+    fire($("tools-mock-form"), "submit");
+    await flush();
+    const second = ops("mocks.update")[1].body.payload;
+    assert.equal(second.mode, "respond");
+    assert.deepEqual(second.query, [{ name: "page", value: "3" }, { name: "debug", value: null }, { name: "token", value: "<redacted>" }]);
+    for (const key of ["remove_headers", "json_set", "json_remove", "replace"]) assert.deepEqual(second[key], [], key);
+    assert.equal("request_headers" in second, false);
+  });
+
+  test("Mocks form: a method the picker does not list survives Edit and Save", async () => {
+    const rule = { id: "9", match: { url_glob: "*/x", method: "TRACE" }, response: { status: 200, headers: {} }, enabled: true };
+    const page = boot({ platform: "android", reply: ({ op }) => (op === "mocks.list" ? ok({ mocks: [rule] }) : op === "mocks.update" ? ok(rule) : null) });
+    await openMocks(page);
+    click(page.$("tools-mocks").querySelector("[data-mock-action=edit]"));
+    assert.equal(page.$("tools-mock-method").value, "TRACE");
+    assert.ok(page.$("tools-mock-method").querySelectorAll("option").some((option) => option.getAttribute("value") === "TRACE"));
+    fire(page.$("tools-mock-form"), "submit");
+    await flush();
+    assert.equal(page.ops("mocks.update")[0].body.payload.method, "TRACE");
   });
 
   test("Logs follow while visible, cap the rows, filter, pause and stop when the drawer closes", async () => {

@@ -631,6 +631,7 @@ function updateDevice(tile,device){
   let alert="",kind="warn";
   if(state==="failed"){alert="Device failed"+(device.error?": "+errorText(device.error):".");kind="error"}
   else if(state==="offline")alert="Device is offline. It reconnects when the target is back.";
+  else if(status.booted===false)alert="The Simulator is shut down. The picture comes back when it boots.";
   else if(device.session_error)alert="No Autonom session: "+errorText(device.session_error);
   setText(parts.alertText,alert);parts.alert.hidden=!alert;setAttr(parts.alert,"data-kind",kind);
   parts.reconnect.disabled=busy.has("reconnect:"+tile.id);
@@ -837,7 +838,7 @@ window.addEventListener("message",event=>{
   if(data.type==="autonom:ready"){send(tile,{type:"autonom:focus",focused:tile.id===focusedId});const panel=panels.get(tile.id);if(panel&&panel.tools)send(tile,{type:"autonom:tools",open:true});for(const name of ["actions","settings","inspector"])if(panel&&panel[name])send(tile,{type:"autonom:panel",name,open:true})}
   else if(data.type==="autonom:panels"){const panel={};for(const name of ["tools","actions","settings","inspector"])panel[name]=data[name]===true;panels.set(tile.id,panel);updateTile(tile,tile.want)}
   else if(data.type==="autonom:focus-request")focusDevice(tile.id,false);
-  else if(data.type==="autonom:state"){live.set(tile.id,{live:Boolean(data.live),session:typeof data.session==="string"?data.session:null,transport:typeof data.transport==="string"?data.transport:null,owner:typeof data.owner==="string"?data.owner:undefined,paused:typeof data.paused==="boolean"?data.paused:undefined,fps:count(data.fps),width:count(data.width),height:count(data.height)});updateTile(tile,tile.want)}
+  else if(data.type==="autonom:state"){live.set(tile.id,{live:Boolean(data.live),session:typeof data.session==="string"?data.session:null,transport:typeof data.transport==="string"?data.transport:null,owner:typeof data.owner==="string"?data.owner:undefined,paused:typeof data.paused==="boolean"?data.paused:undefined,fps:count(data.fps),width:count(data.width),height:count(data.height),booted:typeof data.booted==="boolean"?data.booted:null});updateTile(tile,tile.want)}
   else if(data.type==="autonom:hotkey"){const key=String(data.key);runHotkey(/^[1-4]$/.test(key)?{tile:Number(key)}:key==="ArrowLeft"?{tab:-1}:key==="ArrowRight"?{tab:1}:null)}
 });
 

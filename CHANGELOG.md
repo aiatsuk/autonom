@@ -31,6 +31,10 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
   schema and the error paths; `tests/live/chatgpt_mcp_live.py` is the live
   acceptance on emulator-5584 and the test Simulator, recorded in
   `docs/plans/CHATGPT_P3_RESULTS.md`.
+- **Canvas screenshots of the iOS Simulator come through the companion.** The
+  Capture button asks the running iOS device daemon's companion for the
+  picture, so no `simctl` process starts; the reply says `source: companion`, or
+  `source: simctl` with `fallback_reason` when the daemon could not serve it.
 - **Opt-in macOS hardware video for the Android Canvas.** With an emulator
   listed in `~/.config/autonom/host-video.json` (AVD, serial, gRPC port),
   `autonom devices boot` starts that AVD with `-grpc <port> -grpc-use-token`
@@ -257,9 +261,52 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
   Other screenshots, iOS and Flow `takeScreenshot` are unchanged.
   `shots show` reads a JPEG's size, and shot numbers count `.jpg` files
   too.
+- **Mocks match on request contents and can edit the real response.**
+  `network mock add|update` take request conditions that must all hold,
+  together with URL, method and host: `--query NAME[=GLOB]` (decoded values,
+  case-sensitive glob), `--request-header 'NAME[: GLOB]'`, `--body-contains
+  TEXT` and `--body-json PATH=VALUE` (a dotted path such as `items.0.qty`;
+  VALUE is JSON when it parses, else text). Request bodies are read only for
+  a body condition, decoded by their encoding, and never match above 1 MiB.
+  `--rewrite` lets the request reach the real server and edits its answer:
+  `--status` (else the real status is kept), `--header` (set),
+  `--remove-header`, `--json-set PATH=VALUE`, `--json-remove PATH`,
+  `--replace OLD NEW`, or a whole `--json` / `--body-file`; `--delay` holds
+  the edited response, and `--hang` with `--rewrite` is refused. Body edits
+  are all or nothing: one that cannot apply leaves the body byte-identical,
+  keeps the status and header edits, and records `rewrite.error`
+  (`path_not_found: PATH`, `not_json`, `not_text`, `body_too_large` above
+  8 MiB, `undecodable_encoding`, `body_unreadable`); a rule removed or
+  disabled meanwhile (`rule_gone`) or malformed by hand (`invalid_rule`)
+  changes nothing. Each flag repeats up to 20 times with values up to 2048
+  characters; a malformed one is `invalid_value` and nothing is stored.
+  `update` replaces a list that is given and adds `--clear-conditions` and
+  `--clear-edits`. Flow records add `mock_kind` (`respond`, `rewrite`) and,
+  for an edited flow, `upstream_status` and `rewrite: {applied, error}`; HAR
+  adds `_autonom.mock_kind`. `mock list|show` add `mode`, `conditions`,
+  `condition_summary`, `edits` and `edit_summary`, and print secret
+  condition, JSON-set and header values as `<redacted>`. The session journal
+  masks the values of the new flags and keeps only their names and counts
+  (`query=2`); pre-test steps list `mode` and a `conditions` count. The
+  Canvas Mocks form gains Fake response and Edit real response modes,
+  condition and edit rows, timing and messages beside each invalid field.
+  The new flags must be spelled in full. Older releases ignore the new
+  fields: there a rule with conditions matches more requests, and a rewrite
+  rule is treated as a respond rule.
 
 ### Changed
 
+- **The iOS Canvas streams on change, sized to the tile, and stops when
+  nobody watches.** Without a Display choice the iOS stream sends a frame
+  only when the screen changes, plus a key frame for every page that joins
+  (a still screen costs almost nothing; a fixed rate from the Display menu
+  is honored). Pages report their tile size and visibility: the stream is
+  scaled to the largest visible tile, stops within about 2 s when no tile is
+  visible and comes back with a key frame within 1 s. Boot state and
+  orientation come as events from the iOS device daemon, so the Canvas and
+  the workspace no longer run `simctl` or orientation reads on a timer for a
+  device that gets them; with an older daemon the session reads its own
+  companion only while a tile shows the device.
 - **The iOS device daemon finds idb's companion in the process table.** It no
   longer reads idb's state file (`/tmp/idb/state`) or `AUTONOM_IDB_STATE_FILE`
   (the CLI still does): it uses the live `idb_companion` started with

@@ -15,6 +15,7 @@ a real node can be reached.
 """
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
@@ -832,6 +833,172 @@ class SessionStopTests(DaemonCase):
         result = processes.reap_session(record)
         self.assertEqual([item["pid"] for item in result["companion_left_running"]],
                          [process.pid])
+
+
+class ChunkedSocket:
+    """A connected socket that hands over the reply to the line it was sent
+    in pieces of ``piece`` bytes, as a Unix socket does with tens of MiB."""
+
+    def __init__(self, fields: bytes, piece: int, after: bytes = b"") -> None:
+        self.fields, self.piece, self.after = fields, piece, after
+        self.reply = memoryview(b"")
+        self.sent = 0
+
+    def settimeout(self, _timeout: float) -> None:
+        pass
+
+    def connect(self, _path: str) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+    def sendall(self, line: bytes) -> None:
+        name = json.dumps(json.loads(line)["id"]).encode()
+        self.reply = memoryview(b'{"id":%s,"ok":true,%s}\n%s' % (name, self.fields, self.after))
+
+    def recv(self, _size: int) -> bytes:
+        piece = bytes(self.reply[self.sent:self.sent + self.piece])
+        self.sent += len(piece)
+        return piece
+
+
+class ScreenshotTests(DaemonCase):
+    """`ios_daemon.screenshot` against the fake daemon (CU-05, CLI side)."""
+
+    IMAGE = b"\x89PNG\r\n\x1a\n" + b"pixels" * 10
+    FIELDS = {"format": "png", "width": 1206, "height": 2622, "source_width": 1206,
+              "source_height": 2622, "screen_scale": 3}
+
+    def shot_reply(self, image: bytes = IMAGE, **fields: Any) -> dict[str, Any]:
+        return {"image_base64": base64.b64encode(image).decode(), **self.FIELDS, **fields}
+
+    def test_every_field_of_the_reply_reaches_the_caller(self) -> None:
+        self.start_daemon(replies={"screenshot": self.shot_reply()})
+        self.assertEqual(ios_daemon.screenshot(UDID), {"image": self.IMAGE, **self.FIELDS})
+        self.assertEqual([{key: row[key] for key in row if key != "id"}
+                          for row in self.daemon_requests("screenshot")],
+                         [{"op": "screenshot", "format": "png"}])
+
+    def test_format_and_scale_are_sent(self) -> None:
+        self.start_daemon(replies={"screenshot": self.shot_reply(format="jpeg", width=603)})
+        shot = ios_daemon.screenshot(UDID, image_format="jpeg", scale=0.5)
+        self.assertEqual((shot["format"], shot["width"]), ("jpeg", 603))
+        row = self.daemon_requests("screenshot")[0]
+        self.assertEqual((row["format"], row["scale"]), ("jpeg", 0.5))
+
+    def test_sizes_the_companion_left_out_stay_none(self) -> None:
+        self.start_daemon(replies={"screenshot": {"image_base64": base64.b64encode(self.IMAGE).decode(),
+                                                  "format": "png", "width": None}})
+        shot = ios_daemon.screenshot(UDID)
+        self.assertEqual([shot[key] for key in ("width", "height", "screen_scale")], [None] * 3)
+
+    def assert_unavailable(self, reason: str, stage: str, **kwargs: Any) -> ios_daemon.Unavailable:
+        with self.assertRaises(ios_daemon.Unavailable) as caught:
+            ios_daemon.screenshot(UDID, **kwargs)
+        self.assertEqual((caught.exception.reason, caught.exception.stage), (reason, stage))
+        return caught.exception
+
+    def test_a_refused_screenshot_keeps_the_daemons_reason(self) -> None:
+        self.start_daemon(replies={"screenshot": {"ok": False, "error": {
+            "code": "backend_failed", "stage": "after_send", "hint": "try again",
+            "message": "screenshot failed: no display"}}})
+        failure = self.assert_unavailable(ios_daemon.DAEMON_UNREACHABLE, ios_daemon.AFTER_SEND)
+        self.assertEqual((failure.message, failure.code, failure.hint),
+                         ("screenshot failed: no display", "backend_failed", "try again"))
+
+    def test_a_failure_with_no_error_object_still_says_so(self) -> None:
+        self.start_daemon(replies={"screenshot": {"ok": False}})
+        failure = self.assert_unavailable(ios_daemon.DAEMON_UNREACHABLE, ios_daemon.AFTER_SEND)
+        self.assertIn("refused screenshot", failure.message)
+        self.assertIsNone(failure.code)
+
+    def test_a_failure_before_send_is_reported_as_that(self) -> None:
+        self.start_daemon(replies={"screenshot": {"ok": False, "error": {
+            "code": "daemon_unreachable", "stage": "before_send", "message": "stopping"}}})
+        self.assert_unavailable(ios_daemon.DAEMON_UNREACHABLE, ios_daemon.BEFORE_SEND)
+
+    def test_a_failed_screenshot_is_not_remembered(self) -> None:
+        status = self.start_daemon(close_on=["screenshot"])
+        self.assert_unavailable(ios_daemon.DAEMON_UNREACHABLE, ios_daemon.AFTER_SEND)
+        self.assertEqual(ios_daemon.ensure(UDID)["socket"], status["socket"])
+
+    def test_an_old_companion_is_named(self) -> None:
+        self.start_daemon(status="unsupported")
+        self.assert_unavailable(ios_daemon.COMPANION_TOO_OLD, ios_daemon.BEFORE_SEND)
+
+    def test_an_old_companion_answering_the_request_is_named(self) -> None:
+        self.start_daemon(replies={"screenshot": {"ok": False, "error": {
+            "code": ios_daemon.COMPANION_TOO_OLD, "stage": "before_send", "message": "old"}}})
+        failure = self.assert_unavailable(ios_daemon.COMPANION_TOO_OLD, ios_daemon.BEFORE_SEND)
+        self.assertEqual(failure.code, ios_daemon.COMPANION_TOO_OLD)
+
+    def test_daemon_turned_off_asks_nothing(self) -> None:
+        self.start_daemon(replies={"screenshot": self.shot_reply()})
+        self.set_env(AUTONOM_IOS_DAEMON="off")
+        self.assert_unavailable(ios_daemon.DAEMON_DISABLED, ios_daemon.BEFORE_SEND)
+        self.assertEqual(self.daemon_requests("screenshot"), [])
+
+    def test_an_image_that_is_not_base64_is_refused(self) -> None:
+        self.start_daemon(replies={"screenshot": self.shot_reply() | {"image_base64": "not base64!"}})
+        failure = self.assert_unavailable(ios_daemon.DAEMON_UNREACHABLE, ios_daemon.AFTER_SEND)
+        self.assertIn("not base64", failure.message)
+
+    def test_a_reply_without_an_image_is_refused(self) -> None:
+        self.start_daemon(replies={"screenshot": {**self.FIELDS, "image_base64": ""}})
+        failure = self.assert_unavailable(ios_daemon.DAEMON_UNREACHABLE, ios_daemon.AFTER_SEND)
+        self.assertIn("no image", failure.message)
+
+    def test_a_reply_in_another_format_is_refused(self) -> None:
+        self.start_daemon(replies={"screenshot": self.shot_reply(format="png")})
+        failure = self.assert_unavailable(ios_daemon.DAEMON_UNREACHABLE, ios_daemon.AFTER_SEND,
+                                          image_format="jpeg")
+        self.assertIn("'jpeg'", failure.message)
+
+    def test_a_reply_past_the_plain_line_limit_arrives_but_only_for_a_screenshot(self) -> None:
+        image = b"x" * (ios_daemon.MAX_LINE_BYTES + 1024)
+        status = self.start_daemon(replies={"screenshot": self.shot_reply(image)})
+        self.assertEqual(ios_daemon.screenshot(UDID)["image"], image)
+        with self.assertRaises(ios_daemon.Unavailable) as caught:
+            ios_daemon.request(status["socket"], {"op": "screenshot"}, timeout_s=10)
+        self.assertEqual(caught.exception.stage, ios_daemon.AFTER_SEND)
+        self.assertIn("too long", caught.exception.message)
+
+    def test_a_reply_past_the_screenshot_limit_is_refused(self) -> None:
+        self.start_daemon(replies={"screenshot": self.shot_reply()})
+        with mock.patch.object(ios_daemon, "MAX_SCREENSHOT_LINE_BYTES", 16):
+            failure = self.assert_unavailable(ios_daemon.DAEMON_UNREACHABLE, ios_daemon.AFTER_SEND)
+        self.assertIn("too long", failure.message)
+
+    def test_a_reply_of_the_largest_image_in_small_chunks_takes_no_part_of_the_budget(self) -> None:
+        # A reply of 31 MiB, close to the longest a screenshot can be. Rebuilding and
+        # rescanning the reply per chunk took 19 s of the 20 s budget.
+        image = "A" * (31 * 1024 * 1024)
+        fake = ChunkedSocket(b'"image_base64":"%s"' % image.encode(), 4096)
+        with mock.patch.object(ios_daemon.socket, "socket", return_value=fake):
+            started = time.monotonic()
+            reply = ios_daemon.request("unused.sock", {"op": "screenshot"},
+                                       timeout_s=ios_daemon.SCREENSHOT_TIMEOUT_S,
+                                       max_line_bytes=ios_daemon.MAX_SCREENSHOT_LINE_BYTES)
+            spent = time.monotonic() - started
+        self.assertEqual(reply["image_base64"], image)
+        self.assertLess(spent, ios_daemon.SCREENSHOT_TIMEOUT_S / 4)
+
+    def test_what_follows_the_newline_in_its_chunk_is_not_part_of_the_reply(self) -> None:
+        fake = ChunkedSocket(b'"state":"quiet"', 4096, after=b'{"event":"state"}\n')
+        with mock.patch.object(ios_daemon.socket, "socket", return_value=fake):
+            reply = ios_daemon.request("unused.sock", {"op": "quiet"}, timeout_s=5)
+        self.assertEqual(reply["state"], "quiet")
+
+    def test_a_newline_at_the_start_of_a_chunk_ends_the_reply(self) -> None:
+        fake = ChunkedSocket(b'"state":"quiet"', 1)
+        with mock.patch.object(ios_daemon.socket, "socket", return_value=fake):
+            reply = ios_daemon.request("unused.sock", {"op": "quiet"}, timeout_s=5)
+        self.assertEqual(reply["state"], "quiet")
+
+    def test_a_stuck_daemon_ends_at_the_deadline(self) -> None:
+        self.start_daemon(delay_on={"screenshot": 30})
+        self.assert_unavailable(ios_daemon.DAEMON_UNREACHABLE, ios_daemon.AFTER_SEND, timeout_s=0.3)
 
 
 class LiveScriptLogFilterTests(unittest.TestCase):

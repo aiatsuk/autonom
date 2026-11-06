@@ -3780,22 +3780,37 @@ test("shortcuts: tooltips name the chord and Device settings lists 10 Android an
  * each /status poll answers with the next of `statuses` (an Error is a failed request), timers
  * never fire on their own (`run("poll()")` polls again), and WebSockets are recorded by path.
  */
-async function runIosTile({ statuses, decoder = true }) {
-  const id = "ios~45A342A1-AA2F-4F40-8EFD-F0D0C590ECE5";
-  const html = renderPage({ serial: "45A342A1-AA2F-4F40-8EFD-F0D0C590ECE5", id, options: { platform: "ios" } },
+async function runIosTile({ statuses, decoder = true, platform = "ios", observers = false }) {
+  const id = `${platform}~45A342A1-AA2F-4F40-8EFD-F0D0C590ECE5`;
+  const html = renderPage({ serial: "45A342A1-AA2F-4F40-8EFD-F0D0C590ECE5", id, options: { platform } },
     { base: `/d/${id}`, embed: true });
   const document = fakeDocument(html);
   for (const element of document.elements) element.removeAttribute = (name) => element.attributes.delete(name);
+  document.visibilityState = "visible";
+  const size = { width: 300, height: 652 };
+  document.getElementById("device").getBoundingClientRect = () => ({ left: 0, top: 0, ...size });
   const sockets = [];
+  const open = [];
   class FakeWebSocket {
+    sent = [];
     constructor(url) {
       this.url = url;
       this.readyState = 0;
-      sockets.push(new URL(url).pathname.slice(`/d/${id}`.length));
+      this.path = new URL(url).pathname.slice(`/d/${id}`.length);
+      sockets.push(this.path);
+      open.push(this);
     }
-    send() {}
+    open() {
+      this.readyState = 1;
+      this.onopen?.();
+    }
+    send(text) { this.sent.push(JSON.parse(text)); }
     close() { this.readyState = 3; }
   }
+  // Observers and timers the watch tests fire by hand; other tests have neither observer.
+  const watching = { resize: [], intersect: [] };
+  const timers = [];
+  const posted = [];
   const queue = [...statuses];
   const json = (status, body) => Promise.resolve({ ok: status < 400, status, statusText: "", json: async () => body });
   const sandbox = {
@@ -3814,12 +3829,26 @@ async function runIosTile({ statuses, decoder = true }) {
     },
     WebSocket: FakeWebSocket,
     URL, URLSearchParams, TextEncoder,
-    setTimeout: () => 0, clearTimeout() {}, setInterval: () => 0, clearInterval() {},
+    setTimeout: (fn, ms) => {
+      const timer = { fn, ms };
+      timers.push(timer);
+      return timer;
+    },
+    clearTimeout(timer) {
+      const index = timers.indexOf(timer);
+      if (index >= 0) timers.splice(index, 1);
+    },
+    setInterval: () => 0, clearInterval() {},
     requestAnimationFrame: () => 0,
+    devicePixelRatio: 2,
     ...(decoder ? { VideoDecoder: function VideoDecoder() {}, EncodedVideoChunk: function EncodedVideoChunk() {} } : {}),
+    ...(observers ? {
+      ResizeObserver: class { constructor(fn) { this.fn = fn; } observe() { watching.resize.push(this.fn); } },
+      IntersectionObserver: class { constructor(fn) { this.fn = fn; } observe() { watching.intersect.push(this.fn); } },
+    } : {}),
   };
   sandbox.window = sandbox;
-  sandbox.parent = { postMessage() {} };
+  sandbox.parent = { postMessage: (message) => posted.push(message) };
   sandbox.addEventListener = () => {};
   const page = createContext(sandbox);
   const script = html.match(/<script>([\s\S]*)<\/script>/)[1];
@@ -3829,13 +3858,137 @@ async function runIosTile({ statuses, decoder = true }) {
     for (let i = 0; i < 10; i += 1) await new Promise((resolvePromise) => setImmediate(resolvePromise));
   };
   await settle();
-  return { run, settle, sockets, image: document.getElementById("screen") };
+  timers.length = 0;
+  return {
+    run, settle, sockets, timers, posted, image: document.getElementById("screen"),
+    socket: (path) => open.filter((socket) => socket.path === path).at(-1),
+    text: (element) => document.getElementById(element).textContent,
+    observed: () => watching.resize.length + watching.intersect.length,
+    resize(width, height) {
+      Object.assign(size, { width, height });
+      for (const fn of watching.resize) fn([]);
+    },
+    intersect(isIntersecting) {
+      for (const fn of watching.intersect) fn([{ isIntersecting }]);
+    },
+    fireTimers() {
+      for (const timer of timers.splice(0)) timer.fn();
+    },
+    setVisibility(state) {
+      document.visibilityState = state;
+      document.dispatch("visibilitychange");
+    },
+    setDpr(value) { sandbox.devicePixelRatio = value; },
+  };
 }
 
 const IOS_TILE_STATUS = {
   platform: "ios", transport: "idb", display: { width: 402, height: 874 }, control_owner: "shared",
   input_paused: false, frames_sent: 0, stream_clients: 0,
 };
+
+test("watch (CU-02, CU-03): an iOS page says what it shows over the video socket: on opening, on a hidden page, on leaving the view, on a settled resize, only when that changed", async () => {
+  const tile = await runIosTile({ statuses: [IOS_TILE_STATUS], observers: true });
+  const video = tile.socket("/ws/video");
+  const shown = { t: "watch", visible: true, width: 300, height: 652, dpr: 2 };
+  assert.deepEqual(video.sent, [], "nothing goes before the socket is open");
+  video.open();
+  assert.deepEqual(video.sent, [shown]);
+  // A report that says the same is not sent.
+  tile.run("render()");
+  tile.run("reportWatch()");
+  assert.equal(video.sent.length, 1);
+  // The page is hidden: at once, and hidden pages say so whatever the size.
+  tile.setVisibility("hidden");
+  assert.deepEqual(video.sent.at(-1), { ...shown, visible: false });
+  // Shown again: the page opens a new socket, which reports from scratch.
+  tile.setVisibility("visible");
+  assert.equal(tile.sockets.filter((path) => path === "/ws/video").length, 2);
+  const next = tile.socket("/ws/video");
+  next.open();
+  assert.deepEqual(next.sent, [shown]);
+  // Scrolled out of the top page's view, and back.
+  tile.intersect(false);
+  assert.deepEqual(next.sent.at(-1), { ...shown, visible: false });
+  tile.intersect(true);
+  assert.deepEqual(next.sent.at(-1), shown);
+  // A resize waits to settle: the observer fires, one timer runs, the last size goes.
+  const count = next.sent.length;
+  tile.resize(150, 326);
+  tile.resize(160, 348);
+  assert.equal(next.sent.length, count);
+  assert.equal(tile.timers.length, 1, "a resize burst keeps one timer");
+  assert.equal(tile.timers[0].ms, tile.run("WATCH_REPORT_MS"));
+  tile.fireTimers();
+  assert.deepEqual(next.sent.at(-1), { ...shown, width: 160, height: 348 });
+  // A tile with no area shows nothing, and a new screen's devicePixelRatio is a change.
+  tile.resize(0, 0);
+  tile.fireTimers();
+  assert.equal(next.sent.at(-1).visible, false);
+  tile.resize(160, 348);
+  tile.fireTimers();
+  tile.setDpr(3);
+  tile.run("render()");
+  assert.deepEqual(next.sent.at(-1), { ...shown, width: 160, height: 348, dpr: 3 });
+});
+
+test("watch (INV-4): an Android page sends no watch report and observes nothing", async () => {
+  const tile = await runIosTile({ statuses: [{ ...IOS_TILE_STATUS, platform: "android", transport: "scrcpy" }], platform: "android", observers: true });
+  const video = tile.socket("/ws/video");
+  video.open();
+  tile.run("render()");
+  tile.setVisibility("hidden");
+  assert.deepEqual(video.sent, []);
+  assert.equal(tile.observed(), 0);
+});
+
+test("watch: a browser without ResizeObserver or IntersectionObserver still reports its first size and a hidden page", async () => {
+  const tile = await runIosTile({ statuses: [IOS_TILE_STATUS] });
+  const video = tile.socket("/ws/video");
+  video.open();
+  assert.equal(video.sent.length, 1);
+  assert.equal(video.sent[0].visible, true);
+  tile.setVisibility("hidden");
+  assert.equal(video.sent.at(-1).visible, false);
+});
+
+test("key frame on a still screen (INV-2): a shown iOS tile that waits for a key frame keeps asking; one that decodes, or is hidden, does not", async () => {
+  const tile = await runIosTile({ statuses: [IOS_TILE_STATUS] });
+  const control = tile.socket("/ws/control");
+  control.open();
+  tile.run("applyState({t:\"state\",owner:\"shared\",paused:false,session:\"streaming\",clients:{video:1,control:1},transport:\"idb\"})");
+  tile.run("config=new Uint8Array(4);waitingKey=true;lastKeyFrameRequest=-Infinity");
+  control.sent.length = 0;
+  tile.run("render()");
+  assert.deepEqual(control.sent, [{ t: "system", op: "keyframe" }]);
+  tile.run("render()");
+  assert.equal(control.sent.length, 1, "at most one per second");
+  tile.run("lastKeyFrameRequest=-Infinity;waitingKey=false");
+  tile.run("render()");
+  assert.equal(control.sent.length, 1, "a tile that decodes asks for nothing");
+  tile.run("waitingKey=true");
+  tile.setVisibility("hidden");
+  tile.run("render()");
+  assert.equal(control.sent.length, 1, "a hidden tile asks for nothing");
+});
+
+test("shutdown (CU-04-S02): a state that says the Simulator is down shows on the page and goes to the shell; booted again clears it", async () => {
+  const tile = await runIosTile({ statuses: [IOS_TILE_STATUS] });
+  const state = (booted) => `applyState({t:"state",owner:"shared",paused:false,session:"restarting",clients:{video:1,control:1},transport:"idb",booted:${booted}})`;
+  tile.run(state(false));
+  tile.run("render()");
+  assert.equal(tile.text("caption"), "The Simulator is shut down");
+  assert.equal(tile.text("notice"), "The Simulator is shut down");
+  tile.run("tileState()");
+  assert.equal(tile.posted.at(-1).type, "autonom:state");
+  assert.equal(tile.posted.at(-1).booted, false);
+  tile.run(state(true));
+  tile.run("render()");
+  assert.notEqual(tile.text("caption"), "The Simulator is shut down");
+  assert.equal(tile.text("notice"), "");
+  tile.run("tileState()");
+  assert.equal(tile.posted.at(-1).booted, true);
+});
 
 test("video: a background iOS tile whose first status poll failed opens its video WebSocket once the transport is idb", async () => {
   // The first poll fails (a Simulator still booting answers /status late or not at all), so the
@@ -6458,7 +6611,7 @@ const KEY_EVERY = Number(process.env.FAKE_IDB_KEY_EVERY ?? 50);
 const INTERVAL_MS = Number(process.env.FAKE_IDB_INTERVAL_MS ?? 10);
 let seq = 0;
 const frame = (key) => {
-  const body = Buffer.alloc(5);
+  const body = Buffer.alloc(Math.max(5, Number(control("frame-bytes") ?? 0)));
   body[0] = key ? 0x65 : 0x41;
   body.writeUInt32BE(seq++, 1);
   return key ? Buffer.concat([SC, SPS, SC, PPS, SC, body]) : Buffer.concat([SC, body]);
@@ -6484,6 +6637,11 @@ server.on("stream", (stream, headers) => {
           quality: request.compressionQuality, avgBitrate: request.avgBitrate, scale: request.scaleFactor });
         if (request.type === "start") {
           running = true;
+          // A still screen on change (CU-01): the key frame of the Start and no more.
+          if (request.fps === 0 && control("still")) {
+            setTimeout(() => { if (running) stream.write(grpcFrame(encodeVideoStreamResponse({ data: frame(true) }))); }, 20);
+            continue;
+          }
           timer = setInterval(() => {
             if (control("rst") === "now") {
               record({ type: "rst", call });
@@ -6514,7 +6672,7 @@ server.on("stream", (stream, headers) => {
       for (const message of parser.push(chunk)) {
         if (method === "describe") {
           const screen = Buffer.concat([uint(1, 1206), uint(2, 2622), dbl(3, 3), uint(4, ${IOS_POINTS.width}), uint(5, ${IOS_POINTS.height})]);
-          stream.write(grpcFrame(len(1, Buffer.concat([str(1, arg("--udid")), str(2, "Autonom-Fast-Test"), len(3, screen), str(4, "Booted")]))));
+          stream.write(grpcFrame(len(1, Buffer.concat([str(1, arg("--udid")), str(2, "Autonom-Fast-Test"), len(3, screen), str(4, control("sim-state") ?? "Booted")]))));
         } else if (method === "get_orientation") {
           const name = control("orientation") ?? "PORTRAIT";
           stream.write(grpcFrame(uint(1, Math.max(0, ORIENTATIONS.indexOf(name)))));
@@ -6655,7 +6813,7 @@ async function hidAtLeast(world, count) {
 
 const touchAt = (direction, x, y) => ({ touch: { x, y }, direction });
 
-test("ios: auto picks idb when idb_companion is on PATH; its frames reach /ws/video as SESSION, CONFIG and PACKET, the Start asks for 60 fps, quality 0.5 and 2 s key frames", async (t) => {
+test("ios: auto picks idb when idb_companion is on PATH; its frames reach /ws/video as SESSION, CONFIG and PACKET, the Start asks for frames on change, quality 0.5 and 2 s key frames", async (t) => {
   const { world, canvas, auth } = await iosCanvas(t);
   assert.match(canvas.output(), /Transport: idb/);
   const before = await status(canvas);
@@ -6686,7 +6844,7 @@ test("ios: auto picks idb when idb_companion is on PATH; its frames reach /ws/vi
   const starts = events.filter((event) => event.type === "start");
   assert.equal(starts.length, 1);
   assert.deepEqual({ ...starts[0], pid: undefined, call: undefined },
-    { type: "start", pid: undefined, call: undefined, fps: 60, format: 0, keyFrameRate: 2, quality: 0.5, avgBitrate: 12_000_000, scale: 1 });
+    { type: "start", pid: undefined, call: undefined, fps: 0, format: 0, keyFrameRate: 2, quality: 0.5, avgBitrate: 12_000_000, scale: 1 });
   const body = await status(canvas);
   assert.equal(body.idb.session_state, "streaming");
   assert.deepEqual(body.idb.points, IOS_POINTS);
@@ -6715,8 +6873,8 @@ test("ios: auto picks idb when idb_companion is on PATH; its frames reach /ws/vi
   await stopCanvas(canvas);
 });
 
-test("ios: tabs share one companion stream; a late joiner starts at a recent key frame and a tab that asks for one waits for the periodic key frame, never a second stream", async (t) => {
-  const { world, canvas, auth } = await iosCanvas(t, { env: { FAKE_IDB_KEY_EVERY: "100", FAKE_IDB_INTERVAL_MS: "10" } });
+test("ios: tabs share one companion stream; at a fixed rate a late joiner starts at a recent key frame and a tab that asks for one waits for the periodic key frame, never a second stream", async (t) => {
+  const { world, canvas, auth } = await iosCanvas(t, { args: ["--fps", "60"], env: { FAKE_IDB_KEY_EVERY: "100", FAKE_IDB_INTERVAL_MS: "10" } });
   const first = await pageSocket(canvas, auth, "/ws/video");
   await waitFor(() => first.packets().length >= 30, 10_000, "the first tab's packets");
   const late = await pageSocket(canvas, auth, "/ws/video");
@@ -6747,9 +6905,9 @@ test("ios: tabs share one companion stream; a late joiner starts at a recent key
   await stopCanvas(canvas);
 });
 
-waitingTest("ios: a key frame asked for that does not come within 2.5 s is forced by Stop and Start on the same companion, at most once per 5 s", async (t) => {
+waitingTest("ios: at a fixed rate a key frame asked for that does not come within 2.5 s is forced by Stop and Start on the same companion, at most once per 5 s", async (t) => {
   // A key frame only every 100 s: the periodic one never comes during the test.
-  const { world, canvas, auth } = await iosCanvas(t, { env: { FAKE_IDB_KEY_EVERY: "10000", FAKE_IDB_INTERVAL_MS: "10" } });
+  const { world, canvas, auth } = await iosCanvas(t, { args: ["--fps", "60"], env: { FAKE_IDB_KEY_EVERY: "10000", FAKE_IDB_INTERVAL_MS: "10" } });
   const tab = await pageSocket(canvas, auth, "/ws/video");
   await waitFor(() => tab.packets().length >= 10, 10_000, "packets");
   const control = await pageSocket(canvas, auth, "/ws/control");
@@ -6809,7 +6967,7 @@ test("ios: a forced restart whose Stop the companion does not answer replaces th
   await stopCanvas(canvas);
 });
 
-waitingTest("ios: SIGTERM stops the stream with Stop and ends the companion; the last tab leaving does the same 15 s later", async (t) => {
+waitingTest("ios: SIGTERM stops the stream with Stop and ends the companion; the last tab leaving stops the video at once and the companion 15 s later", async (t) => {
   const { world, canvas, auth } = await iosCanvas(t);
   const tab = await pageSocket(canvas, auth, "/ws/video");
   await waitFor(() => tab.packets().length >= 5, 10_000, "packets");
@@ -6817,9 +6975,10 @@ waitingTest("ios: SIGTERM stops the stream with Stop and ends the companion; the
   assert.ok(alive(pid));
   tab.close();
   await tab.closed;
-  await sleep(13_000);
+  // Nobody watches: the video goes within 2 s (CU-03), the companion stays for the next tab.
+  await waitFor(() => idbEventsNow(world).filter((event) => event.type === "stop").length === 1, 2000, "the video to stop");
+  await sleep(11_000);
   assert.ok(alive(pid), "the companion stopped before 15 s without clients");
-  assert.equal(idbEventsNow(world).filter((event) => event.type === "stop").length, 0);
   await waitFor(() => !alive(pid), 5000, "the idle stop");
   let events = idbEventsNow(world);
   assert.deepEqual(events.filter((event) => ["start", "stop", "term", "leak"].includes(event.type)).map((event) => event.type),
@@ -6894,10 +7053,12 @@ waitingTest("ios: a Simulator that shuts down and boots again gets its stream re
   await waitFor(() => tab.packets().length >= 5, 10_000, "packets");
   const pid = (await status(canvas)).idb.companion_pid;
   // Shut down: the stream freezes on its last picture.
-  writeFileSync(world.simState, "Shutdown");
+  idbControl(world, "sim-state", "Shutdown");
   idbControl(world, "freeze", "1");
-  await tab.next((message) => message.json?.t === "state" && message.json.session === "restarting", 6000);
-  writeFileSync(world.simState, "Booted");
+  const down = await tab.next((message) => message.json?.t === "state" && message.json.session === "restarting", 6000);
+  assert.equal(down.json.booted, false, "the state says the Simulator is down");
+  assert.equal((await status(canvas)).idb.target_state, "Shutdown");
+  idbControl(world, "sim-state", "Booted");
   idbControl(world, "freeze", null);
   const bootedAt = Date.now();
   await waitFor(() => idbEventsNow(world).filter((event) => event.type === "start").length === 2, 8000, "the stream restart");
@@ -7154,7 +7315,9 @@ test("ios: the wheel never taps: tiny deltas still move past the tap slop, a poi
 });
 
 test("ios: rotation is reported in state messages and /status, and touches map to rotated logical points", async (t) => {
-  const { world, canvas, control } = await iosControl(t);
+  const { world, canvas, auth, control } = await iosControl(t);
+  // The orientation is read while a tile shows the device.
+  await pageSocket(canvas, auth, "/ws/video");
   control.send({ t: "touch", a: "down", id: 1, x: 0.5, y: 0.5 });
   await allHandled(control);
   idbControl(world, "orientation", "LANDSCAPE_LEFT");
@@ -7182,6 +7345,183 @@ test("ios: rotation is reported in state messages and /status, and touches map t
   idbControl(world, "orientation", "UNKNOWN");
   await sleep(1500);
   assert.equal((await status(canvas)).idb.orientation, "PORTRAIT_UPSIDE_DOWN");
+  await stopCanvas(canvas);
+});
+
+waitingTest("ios: no simctl process on a timer (CU-04-S01): a Canvas that streams for longer than the old 2 s poll runs none", async (t) => {
+  const { world, canvas, auth } = await iosCanvas(t);
+  const tab = await pageSocket(canvas, auth, "/ws/video");
+  await waitFor(() => tab.packets().length >= 5, 10_000, "packets");
+  const before = (await adbCalls(world)).length;
+  await sleep(2500);
+  assert.deepEqual((await adbCalls(world)).slice(before), [], "a process ran while the screen streamed");
+  await stopCanvas(canvas);
+});
+
+test("ios: a still screen on change (CU-01): one key frame, /status says on change, and a second tab sees a picture within 1 s without a new Start", async (t) => {
+  const { world, canvas, auth } = await iosCanvas(t);
+  idbControl(world, "still", "1");
+  const tab = await pageSocket(canvas, auth, "/ws/video");
+  await waitFor(() => tab.packets().length === 1, 10_000, "the key frame");
+  await sleep(300);
+  assert.equal(tab.packets().length, 1, "frames on a still screen");
+  const body = await status(canvas);
+  assert.equal(body.stream_settings.fps, 0);
+  assert.equal(body.idb.watchers, 1);
+  assert.equal(body.idb.video_stopped, false);
+  const joined = Date.now();
+  const second = await pageSocket(canvas, auth, "/ws/video");
+  await waitFor(() => second.packets().length === 1, 1000, "a frame for the second tab");
+  assert.equal(second.packets()[0].keyFrame, true);
+  assert.ok(Date.now() - joined < 1000);
+  assert.equal(idbEventsNow(world).filter((event) => event.type === "start").length, 1);
+  assert.equal((await status(canvas)).idb.watchers, 2);
+  await stopCanvas(canvas);
+});
+
+test("ios: a tab whose cached picture is gone (CU-01-S02) gets a forced key frame at once on a still screen", async (t) => {
+  const { world, canvas, auth, control } = await iosControl(t);
+  idbControl(world, "still", "1");
+  const tab = await pageSocket(canvas, auth, "/ws/video");
+  await waitFor(() => idbEventsNow(world).some((event) => event.type === "start"), 5000, "a stream");
+  const asked = Date.now();
+  control.send({ t: "system", op: "keyframe" });
+  await waitFor(() => tab.packets().filter((packet) => packet.keyFrame).length >= 1, 1000, "a key frame");
+  assert.ok(Date.now() - asked < 1000);
+  await stopCanvas(canvas);
+});
+
+waitingTest("ios: a viewer that fell behind gets a key frame when its backlog drains, on a screen that went still meanwhile", async (t) => {
+  const { world, canvas, auth } = await iosCanvas(t, { env: { FAKE_IDB_KEY_EVERY: "10000", FAKE_IDB_INTERVAL_MS: "5" } });
+  const tab = await pageSocket(canvas, auth, "/ws/video");
+  await waitFor(() => tab.packets().length >= 1, 10_000, "packets");
+  const behind = await pageSocket(canvas, auth, "/ws/video");
+  await waitFor(() => behind.packets().length >= 1, 5000, "the second viewer's packets");
+  behind.socket.pause();
+  // An animation of large frames: more than the 4 MiB backlog plus what kernel buffers hold.
+  const frameBytes = 48 * 1024;
+  idbControl(world, "frame-bytes", String(frameBytes));
+  const seen = tab.packets().length;
+  await waitFor(() => tab.packets().length - seen >= 20 * 1024 * 1024 / frameBytes, 15_000, "the animation");
+  // The animation ends: the key frames it forces still find the viewer behind, the last Start
+  // sends one and no more.
+  idbControl(world, "still", "1");
+  await waitFor(async () => {
+    const before = tab.packets().length;
+    await sleep(300);
+    return tab.packets().length === before;
+  }, 10_000, "the still screen");
+  const last = tab.packets().at(-1);
+  assert.equal(last.keyFrame, true);
+  const { forced_key_frames: forced } = (await status(canvas)).idb;
+  behind.socket.resume();
+  await waitFor(() => behind.packets().at(-1)?.keyFrame === true && behind.packets().at(-1).seq > last.seq, 5000,
+    "the key frame after the backlog drained");
+  assert.equal(behind.packets().at(-1).seq, tab.packets().at(-1).seq, "the viewer shows what the screen shows");
+  assert.equal((await status(canvas)).idb.forced_key_frames, forced + 1, "one key frame was asked for");
+  await stopCanvas(canvas);
+});
+
+waitingTest("ios: a shutdown learned while the session is already restarting still reaches the page (CU-04-S02)", async (t) => {
+  const { world, canvas, auth } = await iosCanvas(t);
+  const tab = await pageSocket(canvas, auth, "/ws/video");
+  await waitFor(() => tab.packets().length >= 5, 10_000, "packets");
+  // The video call fails first and the next stream stays silent, so no state changes after it.
+  idbControl(world, "freeze", "1");
+  idbControl(world, "rst", "now");
+  await tab.next((message) => message.json?.t === "state" && message.json.session === "restarting", 5000);
+  idbControl(world, "rst", null);
+  idbControl(world, "sim-state", "Shutdown");
+  const down = await tab.next((message) => message.json?.t === "state" && message.json.booted === false, 8000);
+  assert.equal(down.json.session, "restarting");
+  assert.equal((await status(canvas)).idb.booted, false);
+  await stopCanvas(canvas);
+});
+
+test("ios: watch messages (CU-02, CU-03): the tile size sets the stream scale in /status, a hidden page stops the video, showing it restarts it with a key frame, input goes on", async (t) => {
+  const { world, canvas, auth, control } = await iosControl(t);
+  const typed = (type) => idbEventsNow(world).filter((event) => event.type === type);
+  const tab = await pageSocket(canvas, auth, "/ws/video");
+  await waitFor(() => tab.packets().length >= 5, 10_000, "packets");
+  const scaleBefore = (await status(canvas)).stream_settings.scale_factor;
+  assert.equal(scaleBefore, 1);
+  // CU-02-S01: 300 CSS px on a 2x screen of a 1206 px wide picture.
+  tab.send(JSON.stringify({ t: "watch", visible: true, width: 300, height: 652, dpr: 2 }));
+  await waitFor(() => typed("start").at(-1)?.scale === 0.5, 2000, "half scale");
+  assert.equal(typed("spawn").length, 1, "the same companion streams on");
+  await waitFor(async () => (await status(canvas)).stream_settings.scale_factor === 0.5, 2000, "the scale in /status");
+  // Anything else on the video socket is ignored, as before.
+  tab.send("not json");
+  tab.send(JSON.stringify({ t: "watch", visible: true, width: -1, height: 1, dpr: 1 }));
+  tab.send(JSON.stringify({ t: "other" }));
+  // CU-03-S01: hidden.
+  const stopsBefore = typed("stop").length;
+  tab.send(JSON.stringify({ t: "watch", visible: false, width: 300, height: 652, dpr: 2 }));
+  await waitFor(() => typed("stop").length === stopsBefore + 1, 2000, "the Stop");
+  await waitFor(async () => (await status(canvas)).idb.video_stopped, 1000, "stopped in /status");
+  let body = await status(canvas);
+  assert.equal(body.idb.watchers, 0);
+  assert.equal(body.idb.session_state, "streaming");
+  assert.equal(body.idb.leaks, undefined);
+  const packets = tab.packets().length;
+  // HID still reaches the companion.
+  control.send({ t: "touch", a: "down", id: 1, x: 0.5, y: 0.5 });
+  control.send({ t: "touch", a: "up", id: 1, x: 0.5, y: 0.5 });
+  await hidAtLeast(world, 2);
+  // Visible again: a key frame within 1 s, no new companion.
+  const shownAt = Date.now();
+  tab.send(JSON.stringify({ t: "watch", visible: true, width: 300, height: 652, dpr: 2 }));
+  await waitFor(() => tab.packets().slice(packets).some((packet) => packet.keyFrame), 1000, "the key frame after showing");
+  assert.ok(Date.now() - shownAt < 1000);
+  assert.equal(typed("spawn").length, 1);
+  assert.equal(typed("leak").length, 0);
+  body = await status(canvas);
+  assert.equal(body.idb.video_stopped, false);
+  assert.equal(body.idb.video_stops, 1);
+  await stopCanvas(canvas);
+});
+
+test("ios: a joiner of a stopped stream brings it back, and the stale picture is not replayed to it", async (t) => {
+  const { world, canvas, auth } = await iosCanvas(t, { env: { FAKE_IDB_KEY_EVERY: "100" } });
+  const typed = (type) => idbEventsNow(world).filter((event) => event.type === type);
+  const tab = await pageSocket(canvas, auth, "/ws/video");
+  await waitFor(() => tab.packets().length >= 5, 10_000, "packets");
+  tab.send(JSON.stringify({ t: "watch", visible: false, width: 300, height: 652, dpr: 2 }));
+  await waitFor(async () => (await status(canvas)).idb.video_stopped, 2000, "the stop");
+  const joinedAt = Date.now();
+  const late = await pageSocket(canvas, auth, "/ws/video");
+  await waitFor(() => late.packets().length >= 1, 1000, "a frame for the joiner");
+  assert.ok(Date.now() - joinedAt < 1000);
+  assert.equal(late.packets()[0].keyFrame, true);
+  assert.equal(typed("start").length, 2, "the joiner's stream");
+  await stopCanvas(canvas);
+});
+
+test("ios: a page that goes away with its tile keeps nothing watching: the video stops within 2 s while the control socket stays", async (t) => {
+  const { world, canvas, auth } = await iosControl(t);
+  const tab = await pageSocket(canvas, auth, "/ws/video");
+  await waitFor(() => tab.packets().length >= 5, 10_000, "packets");
+  tab.close();
+  await tab.closed;
+  await waitFor(() => idbEventsNow(world).filter((event) => event.type === "stop").length === 1, 2000, "the Stop");
+  assert.equal((await status(canvas)).idb.session_state, "streaming");
+  await stopCanvas(canvas);
+});
+
+test("ios: a companion that dies while nobody watches comes back, so input does not stay refused", async (t) => {
+  const { world, canvas, control } = await iosControl(t);
+  await waitFor(async () => (await status(canvas)).idb.video_stopped, 2000, "the stop: only a control socket is open");
+  const pid = (await status(canvas)).idb.companion_pid;
+  process.kill(pid, "SIGKILL");
+  await waitFor(async () => {
+    const body = (await status(canvas)).idb;
+    return body.companion_pid !== pid && body.companion_starts === 2 && body.session_state === "streaming";
+  }, 10_000, "a new companion");
+  await waitFor(async () => (await status(canvas)).idb.video_stopped, 3000, "stopped again");
+  const hid = hidEvents(world).length;
+  control.send({ t: "touch", a: "down", id: 1, x: 0.5, y: 0.5 });
+  control.send({ t: "touch", a: "up", id: 1, x: 0.5, y: 0.5 });
+  await hidAtLeast(world, hid + 2);
   await stopCanvas(canvas);
 });
 
@@ -8321,7 +8661,7 @@ test("display: Frame rate 15 on iOS changes the companion stream in place, one S
   const { world, canvas, auth, control } = await iosControl(t);
   const tab = await pageSocket(canvas, auth, "/ws/video");
   await waitFor(() => tab.packets().length >= 5, 10_000, "packets");
-  assert.deepEqual((await status(canvas)).stream_settings, { choice: null, fps: 60, max_size: null, scale_factor: 1 });
+  assert.deepEqual((await status(canvas)).stream_settings, { choice: null, fps: 0, max_size: null, scale_factor: 1 });
   const typed = (type) => idbEventsNow(world).filter((event) => event.type === type);
   assert.equal(typed("start").length, 1);
   control.send({ t: "stream", fps: 15, size: "full" });
