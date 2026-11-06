@@ -840,7 +840,8 @@ class Tools:
         On iOS the picture comes through the device daemon's companion
         (``source: companion``, CU-05), which is already connected, so no idb or
         simctl process starts; when the daemon cannot serve it (turned off,
-        not startable, a companion without screenshots, a failed read) the
+        not running for this Simulator, a companion without screenshots, a
+        failed read) the
         usual `simctl io screenshot` path takes it (``source: simctl``) and
         ``fallback_reason`` says why. A screenshot changes nothing on the
         device, so trying the second way after the first is always safe.

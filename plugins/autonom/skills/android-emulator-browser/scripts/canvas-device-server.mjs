@@ -958,6 +958,9 @@ export function daemonBootState(context) {
   // Only a daemon that is serving knows: while it has lost or restarts its companion
   // (`companion_restarting`, boot state unknown) the Simulator may be gone, so ask simctl.
   if (stats.daemonState !== "serving") return null;
+  // Serving again after a restart, the daemon says nothing of the Simulator until its next
+  // describe answers (target_state null): the last boot state may be stale, so ask simctl.
+  if (stats.targetState == null) return null;
   return typeof session.booted === "boolean" ? session.booted : null;
 }
 
