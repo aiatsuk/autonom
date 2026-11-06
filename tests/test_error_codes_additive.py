@@ -103,6 +103,11 @@ ANDROID_TEXT_CODES = {
 NEW_CODES.update(ANDROID_TEXT_CODES)
 ANDROID_TEXT_SECTION = "### Android typing, `ui fill` and key names (Unreleased)"
 
+# Host identity (run ws-p3-mcp-adapter, contract 1.1).
+NEW_CODES.update({
+    "HOST_IDENTITY_INVALID": "host_identity_invalid",
+})
+
 EXISTING_CODES = {
     "FLOW_NOT_FOUND": "flow_not_found",
     "FLOW_FILE_NOT_FOUND": "flow_file_not_found",

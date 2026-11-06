@@ -233,6 +233,9 @@ DAEMON_UNREACHABLE = "daemon_unreachable"  # the device daemon did not answer be
 # interrupt after the input was sent is the same word.
 INTERRUPTED = "interrupted"
 
+# --- Host identity (P3) -------------------------------------------------------
+HOST_IDENTITY_INVALID = "host_identity_invalid"  # <state base>/host.json is not a valid identity; left unchanged
+
 
 class AutonomError(RuntimeError):
     """An expected failure with a stable code and an actionable hint."""

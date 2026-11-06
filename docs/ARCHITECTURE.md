@@ -914,12 +914,176 @@ Autonom never changes host network settings — a test asserts `networksetup` an
 `SECURITY.md` carries the full model, including what teardown does and does not
 restore.
 
+## ChatGPT adapter (development)
+
+`integrations/chatgpt/autonom-chatgpt` is a development plugin ("Autonom (dev)",
+version 0.1.0) that connects ChatGPT desktop to this computer's Autonom CLI and
+Canvas through a real MCP server. It is not part of the release bundle or the
+root marketplaces; `integrations/chatgpt/scripts/install_workspace.py` installs
+it into the personal marketplace (`integrations/chatgpt/README.md`, section
+"Autonom MCP adapter (development)"). The server is stdlib Python 3.9 or newer
+(`server/mcp_*.py`, each module parses with `feature_version=(3, 9)` and imports
+only the standard library and its siblings); `bin/launch.sh` picks the Python
+(`AUTONOM_MCP_PYTHON` first) and `.mcp.json` starts it over stdio. The CLI it
+drives is found as `AUTONOM_CLI`, the `autonom_cli` config key, or `autonom` on
+the PATH resolved to `scripts/autonom.py`, and needs Python 3.11 or newer.
+
+Media is bridge-only (the P0 decision, `docs/plans/CHATGPT_P0_RESULTS.md`): the
+page never opens a network connection. Video and input go through tool calls.
+
+```text
+ChatGPT desktop
+  model ------------------ tools/call ------------------+
+  workspace page (MCP App) -- postMessage bridge only --+
+                                                        v
+                         stdio JSON-RPC 2.0 --> mcp_server.py (16 workers)
+                                                  |            |
+                allowlisted argv, --session-id,   |            | one workspace Canvas "chatgpt"
+                --operation-id, claim env          v            v (started here, token in memory)
+                                         scripts/autonom.py   /d/<id>/ws/video (WebSocket client)
+                                         (host, devices,      /d/<id>/ws/control (key-frame requests,
+                                          session, ui, flow,     focus presence)
+                                          control, journal)   /d/<id>/tap|swipe|key|text|control (human)
+                                                  |            |
+                                                  +--> device <+
+  page <-- get_frames: H.264 packets (base64 in _meta) <-- per-stream buffer
+```
+
+### Tool families
+
+`tools/list` returns 28 tools in this order (`server/mcp_catalog.py` asserts
+the set at startup). App-only tools carry `ui.visibility: ["app"]` and are not
+offered to the model.
+
+| Family | Tools | Module |
+| --- | --- | --- |
+| Hosts and page | `list_hosts`, `open_workspace` (the page entrypoint, global and thread), `save_diagnostics` (app) | `mcp_core_tools` |
+| Sessions | `list_devices`, `list_sessions`, `get_session`, `start_session`, `stop_session` | `mcp_sessions` |
+| Reads | `get_screen` (PNG artifact id, inline image up to 1 MiB), `get_ui_tree` (compact nodes) | `mcp_sessions` |
+| Semantic input | `tap_element` (selector, no coordinates), `type_text`, `press_key` | `mcp_sessions` |
+| Control | `acquire_control`, `release_control`, `get_operation` | `mcp_sessions` |
+| Runs and artifacts | `list_flows`, `start_flow_run`, `get_run`, `cancel_run`, `list_artifacts`, `get_artifact` | `mcp_runs` |
+| Media (app) | `open_stream`, `get_frames`, `close_stream`, `send_input`, `pause_session`, `resume_session` | `mcp_media`, `mcp_ws` |
+
+Every session-scoped tool takes an explicit reference `{host_id, session_id}`;
+no plugin call reads or writes the `current.json` pointer, and every CLI call
+passes `--session-id`. `allowed_targets` in the config narrows which devices a
+session may be started on or used with.
+
+### Envelope and outcomes
+
+Every `tools/call` result has `structuredContent` with `schema_version`
+`autonom.mcp/v1`, a fresh `operation_id` (`op_` + 16 hex), `tool`, `ok`,
+`outcome`, `host_id`, `warnings` and `session`, then the tool's fields; a
+failure adds `error_code`, `error`, `hint` and `retry_safe` (true only for
+`rejected` outcomes and read-only tools), and when known `cli_error_code`,
+`capability` and the lease view `control`. `content` is the sorted JSON dump,
+`isError` is `not ok`, and the server validates every result against the
+tool's `outputSchema` before sending it (a violation becomes
+`schema_violation`).
+
+| `outcome` | Meaning |
+| --- | --- |
+| `completed` | the action happened or the read succeeded |
+| `rejected` | refused before any device or session effect (arguments, unknown host or session, `allowed_targets`, `session_busy`, a lease refusal, a CLI code raised before input) |
+| `failed` | a read or job query ran and failed |
+| `outcome_unknown` | a mutation may or may not have reached the device (timeout after spawn, crash, malformed output, an unknown CLI code, a lost HTTP answer) |
+
+A mutation never repeats its CLI call or HTTP request. `get_operation` finds a
+semantic mutation in the session journal by its operation id when the CLI
+process ended (a call killed on timeout leaves no entry); for anything else the
+hint says to check the screen before acting again.
+
+### Identity and holders
+
+`autonom host info` (READONLY) mints the host id once per state base
+(`<state base>/host.json`, `h_` + 26 base32 characters, 0600) and the adapter
+reads it at its first call; a host id other than the local one is
+`host_not_found` (remote hosts come in P3b), and a CLI without `host info` makes
+the host `host_unavailable`. The adapter drives devices as the agent holder
+`chatgpt-agent:<host_id>` (kind `agent`): `LeaseKeeper` (`mcp_control.py`)
+acquires the P2 lease before the first semantic mutation, reuses it while more
+than 10 s are left, renews it during flow runs and never uses `--takeover`; a
+lease refusal drops the cached generation. The person in ChatGPT is the holder
+of the server's own workspace Canvas (`canvas:<port>:<pid>`, kind `human`):
+`pause_session` is the Canvas takeover and `resume_session` its hand back, so
+the agent's next mutation is refused until the person resumes or the human
+lease ends (after `control_idle_s` without human input, or 30 s after no focus
+stream keeps presence any more). A
+per-session guard serialises the agent's own mutations and flow runs
+(`session_busy`); `send_input`, `pause_session` and `resume_session` never take
+it.
+
+### Media path and budgets
+
+The server starts one workspace Canvas (`canvas serve --workspace chatgpt
+--ephemeral --bootable-only --port 0 --control-idle N`, where `chatgpt` is the
+`canvas_workspace` default and N is `control_idle_s`) or reuses a live one.
+With `--ephemeral` the workspace neither reads nor saves tabs, so it never
+attaches devices from an earlier run again, and `--bootable-only` keeps a
+Canvas started here from offering Boot for every AVD and Simulator of the
+machine; a live Canvas it reuses keeps the flags it was started with. The
+server keeps the Canvas token in memory only and names `X-Autonom-Origin` on
+every request (`human` for input and control). Each
+stream reads `/d/<id>/ws/video` as a WebSocket client into a buffer of at most
+`stream_buffer_bytes` (16 MiB) and 2000 packets, oldest evicted; a new video
+session clears it and increments `epoch`. A focus stream opens a control
+connection with `origin=human` (presence), a thumb stream one with
+`origin=agent`; the only message sent on either is the key-frame request, at
+most once per second.
+
+| Budget (config key) | Default |
+| --- | --- |
+| `get_frames` bytes per call (`frame_budget_bytes`) | 512 KiB (at least one packet; hard cap 4 MiB) |
+| `get_frames` wait | 250 ms (0 to 1000) |
+| thumb delivery | the newest key frame, at most one per second |
+| open streams (`max_streams`) | 4 |
+| idle stream closes after (`stream_idle_s`) | 30 s without a pull |
+| inline screenshot (`inline_image_max_bytes`) | 1 MiB |
+| flow runs (`max_runs`, `run_max_s`) | 2 at a time, 1800 s each |
+
+`get_frames` answers `resync: true` from the newest key frame when the asked
+packets were evicted or the epoch changed, with the config; the page prepends
+the config to every key frame and decodes with WebCodecs. Discrete input
+(`send_input`: tap, swipe, key, text, system button; one event per call) goes
+to the Canvas HTTP input routes as human input under the P2 lease. Everything
+the adapter keeps lives in `<state base>/chatgpt-mcp/` (0700): `config.json`,
+`artifact-key`, `runs/`, `diagnostics/`. Artifacts are served by HMAC ids,
+never by path.
+
+### Testing and acceptance
+
+The suites run the real server against `tests/fakes/fake_mcp_cli.py` and
+`tests/fakes/fake_mcp_canvas.mjs` with temporary `HOME`, `AUTONOM_HOME` and
+`XDG_STATE_HOME` and never touch a device. `tests/test_chatgpt_mcp_package.py`
+starts the server exactly as `.mcp.json` says and checks the full catalog, the
+fields of `tests/fixtures/chatgpt_mcp_ui_fields.json` and the page parsers.
+`tests/live/chatgpt_mcp_conformance.py` is a stdlib stand-in for MCP Inspector
+(protocol fault table, every tool's schema, the error-path table).
+`tests/live/chatgpt_mcp_live.py` is the live acceptance on emulator-5584 (AVD
+AB_Bench_MCP_API36) and the Simulator 34A85293-39A2-436E-B669-12574874EC75 only; its results fill
+`docs/plans/CHATGPT_P3_RESULTS.md` as one generated block between two marker
+lines (`fill-doc`); `check-doc` renders the block again from the same files and
+compares it byte for byte, and refuses any table line outside it.
+
+### Not done yet
+
+- P3b: remote hosts, URL attachment, a credential store and the legacy Canvas
+  handshake.
+- P4: the workspace UI (this page is a diagnostics page), final media budgets
+  from the P3 measurements, live pointer streaming, a friendlier label for the
+  human holder and a reference-counted Canvas lifetime shared by several
+  adapter processes.
+- P5: fan-out across devices and per-session queues.
+- P6: packaging the adapter into the shipped plugin.
+
 ## Related docs
 
 - `docs/CAPABILITIES.md` — shipped vs planned matrix, CLI surface, limitations closed
 - `docs/INSTALL.md` — multi-agent install and per-platform prerequisites
 - `docs/USAGE.md` — prompts and workflows
 - `docs/plans/` — phase plans and spike verdicts
+- `integrations/chatgpt/README.md` - the ChatGPT probe and the development MCP adapter: install, config, tools
 - `SECURITY.md` — the enforced security model
 
 ### Optional XCUITest backend
