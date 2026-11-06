@@ -7,6 +7,8 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
 
 ## [Unreleased]
 
+## [0.38.0] - 2026-11-06
+
 ### Added
 
 - **`autonom host info`** prints this machine's host identity as JSON:

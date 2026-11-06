@@ -416,7 +416,7 @@ def _unreleased(changelog: str) -> str:
     for chunk in changelog.split("\n## [")[1:]:
         name, _, body = chunk.partition("]")
         sections[name] = body
-    return " ".join(sections.get("Unreleased", "").split())
+    return " ".join((sections.get("Unreleased", "") + sections.get("0.38.0", "")).split())
 
 
 class AndroidHelperDocsTests(unittest.TestCase):
