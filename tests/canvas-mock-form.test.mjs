@@ -515,7 +515,7 @@ describe("round trip through the real tools process (MR-14-S02, RISK-005)", () =
     result = core.payload({ ...structuredClone(values), mode: "rewrite", status: "", timing: "none" }, values);
     await tools.ok("mocks.update", result.payload);
     after = await tools.stored(held.id);
-    assert.deepEqual([after.mode, after.response.status, "hang" in after], ["rewrite", null, false]);
+    assert.deepEqual([after.mode, "status" in after.response, "hang" in after], ["rewrite", false, false]);
     assert.ok(after.response.body_path, "the whole body stays");
 
     values = core.fill(await tools.listed(held.id));

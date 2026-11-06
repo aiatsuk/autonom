@@ -167,7 +167,7 @@ class FlagsTests(CliBase):
         shown = self.add("--match", "*/profile", "--rewrite", "--json-set", "user.plan=pro")
         rule = self.stored()
         self.assertEqual(rule["mode"], "rewrite")
-        self.assertIsNone(rule["response"]["status"])
+        self.assertIsNone(rule["response"].get("status"))
         self.assertEqual(shown["mode"], "rewrite")
         self.update("m_1", "--status", "203")
         self.assertEqual(self.stored()["response"]["status"], 203)
