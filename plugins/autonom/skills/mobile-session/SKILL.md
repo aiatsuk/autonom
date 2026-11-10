@@ -117,7 +117,7 @@ Everything a session does is appended to `<session>/journal.ndjson`: every verb
 the agent writes. Read it back for analytics or a handoff:
 
 ```bash
-python3 <autonom-root>/scripts/autonom.py journal                     # whole timeline
+python3 <autonom-root>/scripts/autonom.py journal --max 50            # the last 50 entries (default: the last 100)
 python3 <autonom-root>/scripts/autonom.py journal --kind note         # only notes
 python3 <autonom-root>/scripts/autonom.py journal --verb 'ui tap'     # only taps
 python3 <autonom-root>/scripts/autonom.py note add "login screen renders; password field visible" --task login

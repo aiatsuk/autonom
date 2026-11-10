@@ -255,7 +255,8 @@ pinning disabled. Do not attempt to bypass pinning in a production build.
   and is off deliberately: bodies are the densest source of secrets and personal
   data. `requests show --full` needs it and warns when used.
 - Listing is capped (default 50) and reports `total_matched` and `truncated`, so a
-  partial view is never mistaken for the whole story.
+  partial view is never mistaken for the whole story. `--max N` changes the cap and
+  `--since-id F` lists only flows recorded after an id you already read.
 
 ## Mock semantics
 

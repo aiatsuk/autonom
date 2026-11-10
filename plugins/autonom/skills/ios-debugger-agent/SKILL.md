@@ -1,7 +1,7 @@
 ---
 name: ios-debugger-agent
 description: Build, run, and debug iOS apps on the Simulator for AI agents — resolve the scheme and destination, install and launch, then climb an evidence ladder through accessibility trees, screenshots, logs, and crash reports.
-model: opus
+model: inherit
 effort: high
 ---
 
@@ -91,7 +91,7 @@ python3 <autonom-root>/scripts/autonom.py ui find --desc "Log In" --mode exact
 python3 <autonom-root>/scripts/autonom.py screenshot --out /tmp/before.png
 python3 <autonom-root>/scripts/autonom.py ui tap --desc "Log In" --mode exact
 python3 <autonom-root>/scripts/autonom.py screenshot --out /tmp/after.png
-python3 <autonom-root>/scripts/autonom.py logs tail --package <bundle-id> --since 60
+python3 <autonom-root>/scripts/autonom.py logs tail --package <bundle-id> --since 60 --max-lines 200   # add --grep '<pattern>' once you know what to look for
 python3 <autonom-root>/scripts/autonom.py crash list --app-id <bundle-id>
 ```
 

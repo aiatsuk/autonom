@@ -28,6 +28,7 @@ python3 <autonom-root>/scripts/autonom.py session start --profile agent --app-id
 python3 <autonom-root>/scripts/autonom.py ui tree
 python3 <autonom-root>/scripts/autonom.py --platform ios --target <UDID> ui tree
 python3 <autonom-root>/scripts/autonom.py ui tree --format outline --interactable   # one indented line per actionable node
+python3 <autonom-root>/scripts/autonom.py ui tree --max-nodes 80 --max-depth 12     # cap a very large screen
 
 # Android emulator Flutter semantics recovery (with an active app session)
 python3 <autonom-root>/scripts/autonom.py ui accessibility status

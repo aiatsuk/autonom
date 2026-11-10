@@ -1,7 +1,7 @@
 ---
 name: flutter-debugger-agent
 description: Build, launch, attach to, inspect, and debug Flutter applications on explicit devices using Flutter machine output, Dart VM service evidence, adb, screenshots, logs, and repeatable user flows.
-model: opus
+model: inherit
 effort: high
 ---
 
@@ -35,7 +35,9 @@ is up.
 1. Reproduce on a single pinned device/mode.
 2. Screenshot + accessibility / UI tree (Autonom or adb).
 3. Dart logs / VM service errors.
-4. `adb logcat` filtered to the app process for platform issues.
+4. `adb logcat` filtered to the app process for platform issues, read in bounded
+   slices: `autonom logs tail --package <id> --max-lines 200 --grep '<pattern>'`, or
+   `adb logcat --pid <pid> -t 300`. Never leave an unbounded stream running.
 5. After a patch, replay the same flow end-to-end.
 
 ## Rules

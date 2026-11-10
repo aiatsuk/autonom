@@ -1,7 +1,7 @@
 ---
 name: android-memory-leaks
 description: Investigate Android Java, Kotlin, native, and process memory using repeatable flows, meminfo, heap dumps, retaining paths, heapprofd, and before-after evidence without confusing growth with proof.
-model: opus
+model: inherit
 effort: high
 ---
 

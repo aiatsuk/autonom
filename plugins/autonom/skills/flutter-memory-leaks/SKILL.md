@@ -1,7 +1,7 @@
 ---
 name: flutter-memory-leaks
 description: Investigate Flutter and Android memory growth using Dart retaining paths, DevTools snapshots, disposal and lifecycle review, native heap evidence, and comparable before-after flows.
-model: opus
+model: inherit
 effort: high
 ---
 

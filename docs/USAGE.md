@@ -694,6 +694,35 @@ Run Autonom doctor and tell me which platforms are usable here, what is missing,
 and the exact command to fix each gap.
 ```
 
+## Choose the model and effort for a job
+
+The skills never switch the model. A host applies a skill's model for one turn
+only, and only when you type the skill yourself; every later turn, and every
+skill the agent loads on its own, runs on the session's model. A one-turn switch
+also makes the host read the whole conversation again and can drop the earlier
+reasoning. So pick the model when you start the session and keep it:
+
+| Job | Start the session on | Effort |
+| --- | --- | --- |
+| Debugging, memory and performance work, ticket pre-test: long device loops over screens and logs | the host's main general model (Claude Code: Opus) | the skill asks for `high` |
+| Scoped work from a clear brief: tests, a platform channel, release validation | a mid-tier model is enough (Claude Code: Sonnet) | the skill asks for `high` |
+| Install, update, routing, reading device state | any model | the session's own |
+| Helper agents that only read a long log, a HAR or a trace report | the smallest fast model (Claude Code: Haiku) | its default |
+
+A skill names an effort only where the job needs `high`. A skill the agent loads
+mid-task sets the effort for the rest of that turn, so no skill names a lower
+level. When a result is not good enough, first give the agent a check it can run
+itself (a flow, a test, a before/after screenshot), then raise the effort one
+level, and only then move to a stronger model. To change model, start a fresh
+session: the session journal and artifacts are on disk, and `autonom journal
+--max 50` brings a new session up to date.
+
+```text
+Continue the login investigation in a fresh session: read the last 50 journal
+entries of session <id>, summarize what was tried and what failed, then go on
+from the open hypothesis. Read logs and network lists in bounded slices.
+```
+
 ## Generic harness prompt
 
 ```text
