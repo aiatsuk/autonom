@@ -7,6 +7,8 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
 
 ## [Unreleased]
 
+## [0.38.1] - 2026-11-10
+
 ### Changed
 
 - **Skills keep the session's model.** Every skill's frontmatter now says
