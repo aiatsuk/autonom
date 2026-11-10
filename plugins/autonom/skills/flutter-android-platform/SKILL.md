@@ -1,7 +1,7 @@
 ---
 name: flutter-android-platform
 description: Implement and debug the Android platform layer of Flutter apps including Gradle, manifests, flavors, permissions, platform channels, plugins, app links, notifications, and native lifecycle behavior.
-model: sonnet
+model: inherit
 effort: high
 ---
 

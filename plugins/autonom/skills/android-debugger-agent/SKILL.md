@@ -1,7 +1,7 @@
 ---
 name: android-debugger-agent
 description: Build, install, launch, inspect, and debug Android apps on explicit adb targets using Gradle or Flutter builds, screenshots, robust UI Automator selectors, input events, and focused logcat evidence.
-model: opus
+model: inherit
 effort: high
 ---
 
@@ -60,9 +60,14 @@ matches must be narrowed or indexed — never silently tap the first hit.
 ```bash
 adb -s <serial> logcat -c
 PID="$(adb -s <serial> shell pidof -s "$PACKAGE" | tr -d '\r')"
-adb -s <serial> logcat --pid "$PID"
-adb -s <serial> logcat -b crash -d
+adb -s <serial> logcat --pid "$PID" -t 300
+adb -s <serial> logcat -b crash -t 100
 ```
+
+Read logs in bounded slices: `-t N` prints the last N lines and exits. A bare
+`logcat --pid` streams without end and fills the conversation. With an Autonom
+session, prefer `autonom logs tail --package "$PACKAGE" --since 60 --max-lines 200
+--grep '<pattern>'`.
 
 ## 6. Replay
 

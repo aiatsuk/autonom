@@ -92,7 +92,7 @@ autonom screenshot --task login --label "500 error state"
 autonom note add "login shows the generic error banner on 500; retry works" --task login
 
 # 6. Read the run back, then clean up
-autonom journal                                    # the full timeline of this session
+autonom journal --max 50                           # the last 50 entries of this session's timeline
 autonom session stop                               # tears down proxy/stream best-effort
 ```
 
@@ -183,6 +183,24 @@ claim needs, and say which rung the evidence reached:
 code → unit/widget test → integration on an explicit target →
 screenshot + UI tree + logs → profile / memory / network → before/after replay
 ```
+
+## Keep the conversation small
+
+Every reply you read is carried through the rest of the session, so read in slices:
+
+- **Bound every read.** `logs tail --max-lines N --grep P`, `logs follow --max-seconds S
+  --max-lines N`, `journal --max N` (or `--kind` / `--verb` / `--grep`), `network requests
+  list --max N --since-id F`, `ui tree --format outline --interactable` (`--max-nodes` /
+  `--max-depth` on a very large screen).
+- **Big artifacts stay on disk.** A HAR, a heap dump, a trace report or a full log is cited by
+  path or evidence ref; open only the part a finding needs.
+- **Hand bulk reading to a helper** when the host can start one: give a long log, a HAR or a
+  trace report to a small, fast model and take back the lines that matter with file and line.
+  A wrong summary is cheap to check against the file. Taps, edits and judgement stay with the
+  main agent.
+- **Pick the model once.** These skills ask for an effort level, never for a model: start the
+  session on the model the job needs and keep it. Switching mid-session makes the host re-read
+  the whole conversation and can drop earlier reasoning.
 
 ## Rules that keep the work honest
 

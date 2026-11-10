@@ -7,6 +7,29 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
 
 ## [Unreleased]
 
+### Changed
+
+- **Skills keep the session's model.** Every skill's frontmatter now says
+  `model: inherit`. A host applies a skill's model for one turn only, and only
+  when the user types the skill: a skill the agent loaded mid-task never
+  changed the model, and a typed one moved a single turn to another model,
+  which makes the host read the whole conversation again and can drop earlier
+  reasoning. Start the session on the model the job needs; `docs/USAGE.md` has
+  the table ("Choose the model and effort for a job").
+- **An effort only where a job needs `high`.** The debugger, memory-leak,
+  performance, ticket pre-test, Flutter platform, release-validation and
+  testing skills keep `effort: high`. `autonom-setup` (was `low`) and
+  `android-app-actions` (was `medium`) no longer name one: a skill loaded
+  mid-task sets the effort for the rest of the turn, so a lower setting could
+  quietly weaken a debugging turn that loaded it.
+- **Bounded reads in the skills.** The debugger skills read logs in slices
+  (`logs tail --max-lines`, `logcat -t`) instead of an open stream, the map
+  and session skills read the journal with `--max`, the screen and network
+  skills name `ui tree --max-nodes/--max-depth` and `network requests list
+  --max/--since-id`, and the start-here skill gains "Keep the conversation
+  small": bound every read, keep big artifacts on disk, hand bulk reading to a
+  small helper model, pick the model once.
+
 ## [0.38.0] - 2026-11-06
 
 ### Added

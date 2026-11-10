@@ -1,7 +1,7 @@
 ---
 name: flutter-performance-audit
 description: Audit Flutter runtime performance from code and profile evidence, separating UI-thread build cost, raster cost, startup, memory pressure, image work, and native Android bottlenecks.
-model: opus
+model: inherit
 effort: high
 ---
 
