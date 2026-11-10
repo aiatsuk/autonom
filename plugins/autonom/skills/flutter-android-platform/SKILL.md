@@ -36,7 +36,7 @@ Use `toolchain-doctor` / `toolchain_snapshot.py` for SDK and AGP pins.
 flutter build apk --debug --flavor <flavor>
 adb -s <serial> install -r <apk>
 adb -s <serial> shell am start -W -n <package>/<activity>
-adb -s <serial> logcat --pid "$(adb -s <serial> shell pidof -s <package> | tr -d '\r')"
+adb -s <serial> logcat --pid "$(adb -s <serial> shell pidof -s <package> | tr -d '\r')" -t 300   # the last 300 lines, then exit
 ```
 
 ## Boundaries

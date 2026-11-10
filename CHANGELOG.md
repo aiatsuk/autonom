@@ -24,8 +24,8 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
   `android-app-actions` (was `medium`) no longer name one: a skill loaded
   mid-task sets the effort for the rest of the turn, so a lower setting could
   quietly weaken a debugging turn that loaded it.
-- **Bounded reads in the skills.** The debugger skills read logs in slices
-  (`logs tail --max-lines`, `logcat -t`) instead of an open stream, the map
+- **Bounded reads in the skills.** The debugger and Flutter platform skills read
+  logs in slices (`logs tail --max-lines`, `logcat -t`) instead of an open stream, the map
   and session skills read the journal with `--max`, the screen and network
   skills name `ui tree --max-nodes/--max-depth` and `network requests list
   --max/--since-id`, and the start-here skill gains "Keep the conversation

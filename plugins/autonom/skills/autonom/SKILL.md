@@ -198,9 +198,9 @@ Every reply you read is carried through the rest of the session, so read in slic
   trace report to a small, fast model and take back the lines that matter with file and line.
   A wrong summary is cheap to check against the file. Taps, edits and judgement stay with the
   main agent.
-- **Pick the model once.** These skills ask for an effort level, never for a model: start the
-  session on the model the job needs and keep it. Switching mid-session makes the host re-read
-  the whole conversation and can drop earlier reasoning.
+- **Pick the model once.** These skills never ask for a model (some ask for high effort): start
+  the session on the model the job needs and keep it. Switching mid-session makes the host
+  re-read the whole conversation and can drop earlier reasoning.
 
 ## Rules that keep the work honest
 
