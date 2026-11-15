@@ -154,6 +154,14 @@ def take(target: Target, *, runner: Runner = run_host) -> dict[str, Any]:
     memory = parse_top(runner(["top", "-l", "1", "-stats", "pid,mem"]).stdout or "")
     limitations = list(LIMITATIONS)
     measured = [pid for pid in pids if pid in memory]
+    if not measured:
+        # a sum of nothing would read as "this simulator uses 0 bytes"
+        raise errors.AutonomError(
+            errors.BACKEND_FAILED,
+            f"host 'top' reported no memory for the {len(pids)} processes of "
+            f"simulator {udid}",
+            "Check that 'top -l 1 -stats pid,mem' prints a PID and MEM column on "
+            "this host, then retry.", target_id=udid, processes=len(pids))
     if len(measured) < len(pids):
         limitations.append(f"{len(pids) - len(measured)} of {len(pids)} processes had "
                            "no footprint in the top sample (started or ended between "

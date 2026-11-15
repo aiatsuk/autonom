@@ -440,6 +440,9 @@ class SuggestTests(SuggestBase):
         self.assertEqual(reply["written"], str(out))
         self.assertEqual(ios_slim.load_profile(out), reply["profile"])
         self.assertTrue(reply["next"].endswith(f"--value profile={out}"))
+        spaced = self.root / "my profiles" / "p.json"
+        self.assertTrue(self.suggest(app=str(self.app), write=str(spaced))["next"]
+                        .endswith(f"--value 'profile={spaced}'"))
         # round trip: every field the resolver reads survives the file
         self.assertEqual(ios_slim.resolve(ios_slim.load_profile(out)),
                          ios_slim.resolve(reply["profile"]))
@@ -477,6 +480,12 @@ class SuggestTests(SuggestBase):
         self.assertEqual(self.error().code, errors.INVALID_VALUE)
         self.assertEqual(self.error(app=" ").code, errors.INVALID_VALUE)
         self.assertEqual(self.error(app="com.example.shop").code, errors.NO_TARGET)
+        # a bundle id that ends in ".app" is still a bundle id, not a path
+        self.assertFalse(simulator_slim.app_is_path({"app": "com.example.app"}))
+        self.assertEqual(self.error(app="com.example.app").code, errors.NO_TARGET)
+        self.assertTrue(simulator_slim.app_is_path({"app": "build/Runner.app"}))
+        self.assertTrue(simulator_slim.app_is_path({"app": "~/Runner.app"}))
+        self.assertFalse(simulator_slim.app_is_path({"app": 5}))
         self.assertEqual(self.error(app=str(self.app), prest="minimal").code,
                          errors.SLIM_PROFILE_INVALID)
 
@@ -490,6 +499,12 @@ class SuggestTests(SuggestBase):
                  (self.root / "log.jsonl").read_text().splitlines()]
         self.assertIn(["simctl", "get_app_container", UDID, "com.example.shop", "app"],
                       calls)
+
+    def test_bundle_id_ending_in_app_is_resolved_on_the_simulator(self) -> None:
+        self.state.write_text(json.dumps({**json.loads(self.state.read_text()),
+                                          "app_bundle": str(self.app)}), encoding="utf-8")
+        reply = self.suggest(self.target, app="com.example.app")
+        self.assertEqual(reply["app"]["path"], str(self.app))
 
     def test_bundle_id_not_installed(self) -> None:
         error = self.error(self.target, app="com.example.absent")

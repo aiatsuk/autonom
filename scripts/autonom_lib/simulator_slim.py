@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import tempfile
 from pathlib import Path
 from typing import Any, Iterable
@@ -307,7 +308,9 @@ def app_is_path(values: dict[str, Any]) -> bool:
     if not isinstance(app, str) or not app.strip():
         return False
     app = app.strip()
-    return "/" in app or app.endswith(".app") or Path(app).expanduser().exists()
+    # `com.example.app` is a bundle id that ends in ".app": only a separator
+    # or a file that is there makes it a path
+    return "/" in app or app.startswith("~") or Path(app).exists()
 
 
 def _app_bundle(target: Target | None, app: str) -> Path:
@@ -327,7 +330,8 @@ def _app_bundle(target: Target | None, app: str) -> Path:
     if target is None:
         raise errors.AutonomError(
             errors.NO_TARGET,
-            f"app={app} is a bundle id; a simulator is needed to find the installed app",
+            f"app={app} is no path on disk, so it is read as a bundle id; a simulator "
+            "is needed to find the installed app",
             "Add --udid <UDID>, or pass app=<path to the .app bundle>.")
     udid, _state = _device(target)
     container = ios_simctl.app_container(target.tool, udid, app, "app")
@@ -400,7 +404,7 @@ def _suggest(target: Target | None, values: dict[str, Any]) -> dict[str, Any]:
         _write_profile(out, body["profile"])
     udid = target.target_id if target is not None else "<UDID>"
     if out is not None:
-        settings = f"--value profile={out}"
+        settings = "--value " + shlex.quote(f"profile={out}")
     else:
         settings = f"--value preset={body['profile']['preset']}"
         if body["need"]:

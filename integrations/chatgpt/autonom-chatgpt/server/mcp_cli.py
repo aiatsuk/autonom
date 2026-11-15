@@ -51,7 +51,7 @@ REJECTED_CLI_CODES = frozenset({
     # Android helper and typing refusals: nothing was sent or typed.
     "android_helper_unavailable", "text_not_typable", "fill_target_mismatch",
     # Simulator slimming: refused before anything is written.
-    "slim_profile_invalid", "slim_unsupported_runtime",
+    "simulator_service_disabled", "slim_profile_invalid", "slim_unsupported_runtime",
 })
 
 UNKNOWN_CLI_CODES = frozenset({

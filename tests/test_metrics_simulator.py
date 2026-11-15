@@ -196,6 +196,13 @@ class TakeTests(EnvSandboxMixin, unittest.TestCase):
         error = self.error(runner=runner_for(pgrep="not-a-pid\n"))
         self.assertEqual(error.code, errors.UNSUPPORTED_CAPABILITY)
 
+    def test_top_without_a_usable_sample_is_an_error_not_zero_bytes(self) -> None:
+        for top in ("", "PID MEM\n", "PID MEM\n900 8G\n"):
+            with self.subTest(top=top):
+                error = self.error(runner=runner_for(top=top))
+                self.assertEqual(error.code, errors.BACKEND_FAILED)
+                self.assertEqual(error.extra["processes"], 5)
+
     def test_root_gone_between_pgrep_and_ps(self) -> None:
         error = self.error(runner=runner_for(pgrep="4242\n"))
         self.assertEqual(error.code, errors.UNSUPPORTED_CAPABILITY)
