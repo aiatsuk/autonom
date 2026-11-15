@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -207,10 +208,11 @@ class MessageTests(unittest.TestCase):
         self.assertEqual(push_message.payload_bytes(payload),
                          len(json.dumps(payload, ensure_ascii=False,
                                         separators=(",", ":")).encode("utf-8")))
-        compose = push_message.compose({"body": "x" * 4100})
+        compose = push_message.compose({"body": "x" * 4100, "platform": "ios"})
         self.assertTrue(compose["ios"]["over_limit"])
         self.assertGreater(compose["ios"]["bytes"], push_message.IOS_PAYLOAD_LIMIT)
         self.assertEqual([item["code"] for item in compose["warnings"]], ["push_payload_large"])
+        self.assertEqual(compose["warnings"][0]["platform"], "ios")
         small = push_message.compose({"body": "x"})
         self.assertFalse(small["ios"]["over_limit"])
         self.assertEqual(small["warnings"], [])
@@ -321,17 +323,39 @@ class SchemaTests(unittest.TestCase):
         self.assertEqual(self.props["schema"]["const"], push_message.SCHEMA)
         self.assertNotIn("required", self.schema)
 
+    @staticmethod
+    def matches(pattern: str, text: str) -> bool:
+        """A JSON Schema `pattern` (ECMA-262: unanchored search, `$` only at
+        the very end) checked with Python's `re`."""
+        return re.search(pattern.replace("$", r"\Z"), text) is not None
+
+    def accepts(self, raw: dict) -> bool:
+        try:
+            push_message.normalize(raw)
+        except errors.AutonomError as exc:
+            self.assertEqual(exc.code, errors.INVALID_VALUE)
+            return False
+        return True
+
     def test_types_match_the_validator(self) -> None:
+        samples = ("a", " a ", "two words", "", "  ", "\t\n", "a\x00b", "\x00", "é", "line\nbreak",
+                   "ab\n")
         for name in push_message.TEXT_FIELDS:
             with self.subTest(field=name):
                 self.assertEqual(self.props[name]["type"], "string")
-                self.assertEqual(self.props[name]["pattern"],
-                                 r"^\S+$" if name == "message_id" else r"\S")
+                pattern = self.props[name]["pattern"]
+                for text in samples:
+                    raw = {"title": "t", name: text} if name != "title" else {"title": text}
+                    self.assertEqual(self.matches(pattern, text), self.accepts(raw),
+                                     f"{name}={text!r}")
         for bad in ("my id", " lead", "tail "):
             invalid(self, push_message.normalize, {"title": "t", "message_id": bad})
         for name in push_message.LABEL_FIELDS:
-            self.assertEqual(self.props[name], {"type": "string"} | {
-                key: value for key, value in self.props[name].items() if key == "description"})
+            with self.subTest(field=name):
+                self.assertEqual(self.props[name]["type"], "string")
+                for text in samples:
+                    self.assertEqual(self.matches(self.props[name]["pattern"], text),
+                                     self.accepts({"title": "t", name: text}), f"{name}={text!r}")
         for name in push_message.BOOL_FIELDS:
             self.assertEqual(self.props[name]["type"], "boolean")
         self.assertEqual(self.props["fcm"]["default"], True)
@@ -339,7 +363,60 @@ class SchemaTests(unittest.TestCase):
                          ("integer", 0))
         for name in ("data", "ios", "android"):
             self.assertEqual(self.props[name]["type"], "object")
-        self.assertEqual(self.props["android"]["additionalProperties"], {"type": "string"})
+        self.assertEqual(self.props["android"]["additionalProperties"]["type"], "string")
+
+    def test_json_types_are_not_text_in_a_file_or_json(self) -> None:
+        # the schema says integer and boolean; "3" and "true" are refused by both
+        for raw, field in (({"title": "t", "badge": "3"}, "badge"),
+                           ({"title": "t", "badge": "0"}, "badge"),
+                           ({"title": "t", "silent": "false"}, "silent"),
+                           ({"silent": "true"}, "silent"),
+                           ({"title": "t", "fcm": "false"}, "fcm"),
+                           ({"title": "t", "fcm": 0}, "fcm")):
+            with self.subTest(raw=raw):
+                self.assertEqual(invalid(self, push_message.normalize, raw).extra["field"], field)
+        # an integer with a zero fraction is an integer in JSON Schema
+        self.assertEqual(push_message.normalize({"title": "t", "badge": 3.0})["badge"], 3)
+        invalid(self, push_message.normalize, {"title": "t", "badge": 2.5})
+
+    def test_nul_is_refused_in_every_string_by_both(self) -> None:
+        any_text = r"^[^\u0000]*$"
+        names = self.props["data"]["propertyNames"]
+        self.assertEqual(names["pattern"], any_text)
+        android = self.props["android"]
+        self.assertEqual(android["propertyNames"]["pattern"], any_text)
+        self.assertEqual(android["additionalProperties"]["pattern"], any_text)
+        self.assertEqual(self.props["ios"]["propertyNames"]["pattern"], any_text)
+        for ref in (self.props["data"]["additionalProperties"],
+                    self.props["ios"]["additionalProperties"]):
+            self.assertEqual(ref, {"$ref": "#/$defs/value"})
+        value = self.schema["$defs"]["value"]["anyOf"]
+        self.assertEqual(value[1], {"type": "string", "pattern": any_text})
+        self.assertEqual(value[2]["items"], {"$ref": "#/$defs/value"})
+        self.assertEqual(value[3]["propertyNames"], {"pattern": any_text})
+        self.assertEqual(value[3]["additionalProperties"], {"$ref": "#/$defs/value"})
+        for raw, field in (({"title": "t", "name": "a\x00"}, "name"),
+                           ({"title": "t", "description": "\x00"}, "description"),
+                           ({"data": {"k": "a\x00"}}, "data.k"),
+                           ({"data": {"k": {"deep": ["x", "a\x00"]}}}, "data.k"),
+                           ({"data": {"k": {"a\x00": 1}}}, "data.k"),
+                           ({"data": {"a\x00": "v"}}, "data"),
+                           ({"title": "t", "ios": {"aps": {"sound": "a\x00"}}}, "ios"),
+                           ({"title": "t", "ios": {"a\x00": 1}}, "ios"),
+                           ({"title": "t", "android": {"k": "a\x00"}}, "android"),
+                           ({"title": "t", "android": {"a\x00": "v"}}, "android")):
+            with self.subTest(raw=repr(raw)):
+                error = invalid(self, push_message.normalize, raw)
+                self.assertEqual(error.extra["field"], field)
+                self.assertNotIn("\x00", json.dumps(error.as_dict(), ensure_ascii=False))
+
+    def test_an_empty_key_in_data_or_android_is_refused_by_both(self) -> None:
+        self.assertEqual(self.props["data"]["propertyNames"]["minLength"], 1)
+        self.assertEqual(self.props["android"]["propertyNames"]["minLength"], 1)
+        for raw, field in (({"data": {"": "v"}}, "data"),
+                           ({"title": "t", "android": {"": "v"}}, "android")):
+            with self.subTest(raw=raw):
+                self.assertEqual(invalid(self, push_message.normalize, raw).extra["field"], field)
 
     def test_reserved_data_keys_match(self) -> None:
         names = self.props["data"]["propertyNames"]
@@ -951,6 +1028,336 @@ class AndroidCliTests(CliBase):
         phone = providers.LocalDeviceSession(self.android_target("R58M123ABC"), {}).capabilities()
         self.assertEqual({item.name: item.state for item in phone.capabilities}["simulator.push"],
                          "unavailable")
+
+
+# --- what would fail after a send is refused before it ----------------------------------
+
+
+def nested(levels: int, leaf: object = "x", *, lists: bool = False) -> object:
+    """`levels` objects (or arrays) inside one another around `leaf`."""
+    value = leaf
+    for _ in range(levels):
+        value = [value] if lists else {"k": value}
+    return value
+
+
+class MessageLimitTests(unittest.TestCase):
+    """Deep nesting, lone surrogates, non-finite numbers and size: refused
+    by `normalize`, naming the field, before anything renders or is sent."""
+
+    def test_nesting_is_capped_at_32_levels(self) -> None:
+        cap = push_message.MAX_DEPTH
+        self.assertEqual(cap, 32)
+        # `data` and `ios` are level 1: a data value holds 31 more, ios 32 in all
+        for lists in (False, True):
+            with self.subTest(lists=lists):
+                push_message.normalize({"data": {"deep": nested(cap - 1, lists=lists)}})
+                error = invalid(self, push_message.normalize,
+                                {"data": {"ok": "1", "deep": nested(cap, lists=lists)}})
+                self.assertEqual(error.extra["field"], "data.deep")
+                self.assertIn("32 levels", error.message)
+                push_message.normalize({"title": "t", "ios": nested(cap, lists=False)})
+                ios = {"title": "t", "ios": {"aps": nested(cap, lists=lists)}}
+                self.assertEqual(invalid(self, push_message.normalize, ios).extra["field"], "ios")
+
+    def test_nesting_that_would_exhaust_the_stack_is_refused_not_raised(self) -> None:
+        # data and ios share a key path: rendering deep-merges them level by level
+        deep = nested(1500)
+        for label, raw in (("data and ios, 1500 levels", {"data": {"k": deep}, "ios": {"k": deep}}),
+                           ("ios, 100000 levels", {"title": "t", "ios": nested(100_000)})):
+            with self.subTest(label):
+                error = invalid(self, push_message.normalize, raw)
+                self.assertIn(error.extra["field"], ("data.k", "ios"))
+                invalid(self, push_message.compose, raw)
+
+    def test_text_utf8_cannot_hold_is_refused_naming_the_field(self) -> None:
+        lone = "a\ud800b"
+        cases = [({"title": lone}, "title"), ({"body": lone}, "body"),
+                 ({"title": "t", "subtitle": lone}, "subtitle"),
+                 ({"title": "t", "sound": lone}, "sound"),
+                 ({"title": "t", "category": lone}, "category"),
+                 ({"title": "t", "thread": lone}, "thread"),
+                 ({"title": "t", "channel": lone}, "channel"),
+                 ({"title": "t", "image": lone}, "image"),
+                 ({"title": "t", "message_id": lone}, "message_id"),
+                 ({"title": "t", "name": lone}, "name"),
+                 ({"title": "t", "description": lone}, "description"),
+                 ({"data": {"k": lone}}, "data.k"),
+                 ({"data": {"k": {"a": [1, lone]}}}, "data.k"),
+                 ({"data": {"k": {lone: 1}}}, "data.k"),
+                 ({"data": {lone: "v"}}, "data"),
+                 ({"title": "t", "ios": {"aps": {"sound": lone}}}, "ios"),
+                 ({"title": "t", "ios": {lone: 1}}, "ios"),
+                 ({"title": "t", "android": {"k": lone}}, "android"),
+                 ({"title": "t", "android": {lone: "v"}}, "android")]
+        for raw, field in cases:
+            with self.subTest(field=field, raw=repr(raw)[:40]):
+                error = invalid(self, push_message.normalize, raw)
+                self.assertEqual(error.extra["field"], field)
+                # the error itself can always be written out
+                json.dumps(error.as_dict(), ensure_ascii=False).encode("utf-8")
+        for key in ("file", "write"):
+            with self.subTest(path=key):
+                values = {"title": "t", key: "p\udc00.json"}
+                call = push_message.compose if key == "write" else push_message.from_values
+                self.assertEqual(invalid(self, call, values).extra["field"], key)
+
+    def test_numbers_that_are_not_finite_are_refused(self) -> None:
+        for number in (float("nan"), float("inf"), float("-inf")):
+            for raw, field in (({"data": {"n": number}}, "data.n"),
+                               ({"data": {"n": {"list": [1, number]}}}, "data.n"),
+                               ({"title": "t", "ios": {"aps": {"x": number}}}, "ios")):
+                with self.subTest(number=number, field=field):
+                    error = invalid(self, push_message.normalize, raw)
+                    self.assertEqual(error.extra["field"], field)
+                    self.assertIn("finite", error.message)
+        self.assertEqual(push_message.normalize({"data": {"n": 1.5}})["data"], {"n": 1.5})
+
+    def test_deep_json_text_is_refused_not_raised(self) -> None:
+        text = '{"k":' + "[" * 1_000_000 + "]" * 1_000_000 + "}"
+        error = invalid(self, push_message.from_values, {"data": text})
+        self.assertEqual(error.extra["field"], "data")
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "deep.json"
+            path.write_text('{"title": "t", "data": ' + text + "}", encoding="utf-8")
+            error = invalid(self, push_message.from_values, {"file": str(path)})
+            self.assertEqual(error.extra["path"], str(path))
+            self.assertIn("nested too deeply", error.message)
+
+    def test_android_extras_above_4096_bytes_warn_like_ios(self) -> None:
+        # the android escape hatch is not in the APNs payload: only Android is over
+        compose = push_message.compose({"title": "t", "android": {"big": "é" * 2100}})
+        self.assertFalse(compose["ios"]["over_limit"])
+        (warning,) = compose["warnings"]
+        extras = compose["android"]["extras"]
+        self.assertEqual((warning["code"], warning["platform"], warning["limit"]),
+                         ("push_payload_large", "android", 4096))
+        self.assertEqual(warning["bytes"], sum(len(key.encode()) + len(value.encode())
+                                               for key, value in extras.items()))
+        self.assertIn("FCM", warning["error"])
+        self.assertTrue(warning["hint"])
+        both = push_message.compose({"body": "x" * 4100})
+        self.assertEqual([(item["code"], item["platform"]) for item in both["warnings"]],
+                         [("push_payload_large", "ios"), ("push_payload_large", "android")])
+        only = push_message.compose({"body": "x" * 4100, "platform": "android"})
+        self.assertEqual([item["platform"] for item in only["warnings"]], ["android"])
+        fits = push_message.compose({"body": "x" * 3800, "platform": "android"})
+        self.assertEqual(fits["warnings"], [])
+
+    def test_a_render_over_64_kb_is_refused(self) -> None:
+        limit = push_message.MAX_RENDERED_BYTES
+        self.assertEqual(limit, 65536)
+        for raw, platform in (({"body": "x" * limit}, "ios"),
+                              ({"title": "t", "android": {"k": "x" * limit}}, "android"),
+                              ({"data": {"k": "é" * (limit // 2)}}, "ios")):
+            with self.subTest(platform=platform):
+                error = invalid(self, push_message.normalize, raw)
+                self.assertEqual((error.extra["platform"], error.extra["limit"]),
+                                 (platform, limit))
+                self.assertGreater(error.extra["bytes"], limit)
+                self.assertNotIn("xxxx", error.message)
+        push_message.normalize({"body": "x" * 60000})  # large, but under the cap
+
+    def test_silent_composes_with_an_ios_note(self) -> None:
+        notes = push_message.compose({"silent": True, "data": {"k": "v"}})["notes"]
+        (note,) = [item for item in notes if "silent" in item]
+        self.assertTrue(note.startswith("ios: "))
+        self.assertIn("no visible content", note)
+        self.assertEqual(push_message.compose({"silent": True, "platform": "android"})["notes"], [])
+        self.assertFalse(any("silent" in item
+                             for item in push_message.compose({"title": "t"})["notes"]))
+
+
+class ValueTextTests(CliBase):
+    """`--value` is text and parsed; `--json` keeps JSON types, as a file and
+    the schema do."""
+
+    def compose(self, *argv: str) -> tuple[int, dict]:
+        code, payload, _ = self.run_cli("simulator", "push", "compose", *argv)
+        return code, payload
+
+    def test_json_values_keep_their_types(self) -> None:
+        for body, field in (({"title": "t", "badge": "3"}, "badge"),
+                            ({"title": "t", "silent": "false"}, "silent"),
+                            ({"title": "t", "fcm": "no"}, "fcm"),
+                            ({"title": "t", "data": '{"a": 1}'}, "data")):
+            with self.subTest(body=body):
+                code, payload = self.compose("--json", json.dumps(body))
+                self.assertEqual((code, payload["error_code"], payload["field"]),
+                                 (2, errors.INVALID_VALUE, field))
+                self.assertTrue(payload["hint"])
+        code, payload = self.compose("--json", '{"title": "t", "badge": 3, "fcm": false}')
+        self.assertEqual(code, 0, payload)
+        self.assertEqual((payload["message"]["badge"], payload["message"]["fcm"]), (3, False))
+
+    def test_value_text_is_parsed(self) -> None:
+        code, payload = self.compose("--value", "title=t", "--value", "badge=3",
+                                     "--value", "fcm=no", "--value", 'data={"a": 1}')
+        self.assertEqual(code, 0, payload)
+        self.assertEqual((payload["message"]["badge"], payload["message"]["fcm"],
+                          payload["message"]["data"]), (3, False, {"a": 1}))
+        # --value wins over the same key in --json, and is text
+        code, payload = self.compose("--json", '{"title": "t", "badge": "x"}',
+                                     "--value", "badge=4")
+        self.assertEqual((code, payload["message"]["badge"]), (0, 4))
+
+    def test_a_file_keeps_json_types(self) -> None:
+        path = self.root / "p.json"
+        path.write_text(json.dumps({"title": "t", "badge": "3"}), encoding="utf-8")
+        code, payload = self.compose("--value", f"file={path}")
+        self.assertEqual((code, payload["field"]), (2, "badge"))
+        code, payload = self.compose("--value", f"file={path}", "--value", "badge=5")
+        self.assertEqual((code, payload["message"]["badge"]), (0, 5))
+
+    def test_the_reply_is_always_strict_json(self) -> None:
+        def strict(text: str) -> dict:
+            def refuse(word: str) -> None:
+                raise AssertionError(f"non-strict JSON constant {word}")
+            return json.loads(text, parse_constant=refuse)
+
+        for body in ('{"data": {"x": NaN}}', '{"data": {"x": [Infinity]}}',
+                     '{"title": "t", "ios": {"aps": {"x": -Infinity}}}'):
+            with self.subTest(body=body):
+                completed = subprocess.run(
+                    [sys.executable, str(CLI), "simulator", "push", "compose", "--json", body],
+                    capture_output=True, text=True, env=self.env, timeout=120, cwd=self.tmp.name)
+                self.assertEqual(completed.returncode, 2, completed.stdout)
+                error = strict(completed.stderr)
+                self.assertEqual(error["error_code"], errors.INVALID_VALUE)
+                self.assertIn(error["field"], ("data.x", "ios"))
+                self.assertEqual(completed.stdout, "")
+
+    def test_a_lone_surrogate_is_named_not_a_codec_error(self) -> None:
+        code, payload = self.compose("--json", '{"title": "\\ud800 hi"}')
+        self.assertEqual((code, payload["error_code"], payload["field"]),
+                         (2, errors.INVALID_VALUE, "title"))
+        self.assertNotIn("codec", payload["error"])
+
+
+class AndroidSendLimitTests(AndroidBase):
+    def test_device_output_that_is_not_utf8_never_fails_a_sent_push(self) -> None:
+        # the shade prints text in Latin-1: \xe9 and \xff are not UTF-8
+        self.patch_fake(app_posts_notifications=True, notification_encoding="latin-1")
+        # the record appears after the broadcast: its title cannot be read
+        # back, so the push is not confirmed, and the reply is never an error
+        result = self.send({"app_id": PKG, "title": "Café open"})
+        self.assertEqual((result["verified"], result["verification"]), (False, "not_in_shade"))
+        # another app's unreadable record does not spoil the read-back
+        self.patch_fake(notifications=[{"pkg": "com.other", "id": 1, "tag": "t",
+                                        "title": "café ÿ", "text": None}])
+        result = self.send({"app_id": PKG, "title": "Hello"})
+        self.assertEqual((result["verified"], result["verification"]), (True, "read_back"))
+        self.assertEqual(len(self.broadcasts()), 2)
+
+    def test_device_output_that_is_not_utf8_through_the_cli(self) -> None:
+        self.patch_fake(app_posts_notifications=True, notification_encoding="latin-1",
+                        notifications=[{"pkg": PKG, "id": 1, "tag": "old",
+                                        "title": "ÿþ", "text": None}])
+        code, payload, _ = self.android_cli("simulator", "push", "send", "--value",
+                                            f"app_id={PKG}", "--value", "title=Hi")
+        self.assertEqual(code, 0, payload)
+        self.assertTrue(payload["verified"])
+
+    def test_a_failed_api_level_lookup_never_stops_the_push(self) -> None:
+        for failure in (errors.AutonomError(errors.BACKEND_FAILED, "adb shell getprop did not "
+                                            "answer within 15 s"),
+                        ValueError("odd getprop answer")):
+            with self.subTest(failure=type(failure).__name__):
+                with mock.patch.object(android_push, "api_level", side_effect=failure):
+                    result = self.send({"app_id": PKG, "title": "t"})
+                self.assertEqual(result["receiver_result"], -1)
+                self.assertNotIn("warnings", result)
+        self.assertEqual(len(self.broadcasts()), 2)
+
+    def test_extras_above_4096_bytes_are_sent_with_a_warning(self) -> None:
+        result = self.send({"app_id": PKG, "data.blob": "x" * 4100})
+        (warning,) = result["warnings"]
+        self.assertEqual((warning["code"], warning["platform"]), ("push_payload_large", "android"))
+        self.assertEqual(warning["bytes"], sum(len(key) + len(value) for key, value
+                                               in self.broadcasts()[0]["extras"].items()))
+        self.assertNotIn("warnings", self.send({"app_id": PKG, "data.blob": "x" * 3000}))
+
+    def test_a_render_over_64_kb_never_reaches_adb(self) -> None:
+        for values in ({"app_id": PKG, "body": SECRET + "x" * 70000},
+                       {"body": SECRET + "x" * 70000, "delivery": "shade"}):
+            with self.subTest(delivery=values.get("delivery", "app")):
+                error = self.refused(values, errors.INVALID_VALUE)
+                self.assertEqual(error.extra["limit"], push_message.MAX_RENDERED_BYTES)
+        self.assertEqual(self.calls("adb"), [])
+
+
+class IosSendLimitTests(CliBase):
+    NO_CONTENT = ("An error was encountered processing the command (domain=UNErrorDomain, "
+                  "code=1401):\nSimulator device failed to complete the requested operation.\n"
+                  "Underlying error (domain=UNErrorDomain, code=1401):\n"
+                  "\tNotification has no user visible content")
+    NO_ALERT = ("An error was encountered processing the command (domain=UNErrorDomain, "
+                "code=2002):\nUnderlying error (domain=UNErrorDomain, code=2002):\n"
+                "\tRepository could not save notification. No content that needs to alert.")
+
+    def fail_push(self, text: str) -> None:
+        self.patch_fake(simctl_fail={f"simctl push {UDID}": [1, text]})
+
+    def send(self, values: dict) -> dict:
+        return simulator.apply(self.ios_target(), "push", "send", values, session={})
+
+    def test_no_visible_content_is_push_not_delivered(self) -> None:
+        for text in (self.NO_CONTENT, self.NO_ALERT):
+            for values in ({"app_id": BUNDLE, "silent": True, "data.k": "v"},
+                           {"app_id": BUNDLE, "silent": True, "badge": 1},
+                           {"app_id": BUNDLE, "payload": {"aps": {"content-available": 1}}}):
+                with self.subTest(code=text[60:64], values=list(values)):
+                    self.fail_push(text)
+                    error = invalid(self, self.send, values, code=errors.PUSH_NOT_DELIVERED)
+                    self.assertEqual(error.message,
+                                     "the Simulator refused a push with no alert text")
+                    self.assertEqual(error.hint,
+                                     "simctl on this iOS runtime delivers only pushes that show "
+                                     "something: add a title or body. A silent "
+                                     "(content-available) push cannot be tested through the "
+                                     "Simulator here; on Android it works (a data message).")
+                    self.assertEqual((error.extra["reason"], error.extra["capability"],
+                                      error.extra["app_id"]),
+                                     ("no_visible_content", "simulator.push", BUNDLE))
+
+    def test_other_simctl_failures_are_unchanged(self) -> None:
+        for text in ("An error was encountered processing the command (domain=com.apple."
+                     "CoreSimulator.SimError, code=405):\nUnable to lookup in current state: "
+                     "Shutdown",
+                     "Underlying error (domain=UNErrorDomain, code=1):\n\tnot allowed",
+                     "Underlying error (domain=UNErrorDomain, code=14010)"):
+            with self.subTest(text=text[-20:]):
+                self.fail_push(text)
+                error = invalid(self, self.send, {"app_id": BUNDLE, "payload": {"aps": {}}},
+                                code=errors.BACKEND_FAILED)
+                self.assertEqual(error.message, text.strip())
+                self.assertEqual(error.hint, "Run 'autonom doctor' to check the Xcode toolchain.")
+
+    def test_no_visible_content_through_the_cli(self) -> None:
+        self.fail_push(self.NO_CONTENT)
+        code, payload, _ = self.run_cli("--simctl", str(FAKE_SIMCTL), "--udid", UDID,
+                                        "simulator", "push", "send", "--value", f"app_id={BUNDLE}",
+                                        "--value", "silent=true")
+        self.assertEqual((code, payload["error_code"], payload["reason"]),
+                         (2, errors.PUSH_NOT_DELIVERED, "no_visible_content"))
+
+    def test_an_accepted_silent_push_is_unconfirmed(self) -> None:
+        result = self.send({"app_id": BUNDLE, "silent": True, "data.k": "v"})
+        (warning,) = result["warnings"]
+        self.assertEqual(warning["code"], "push_silent_unconfirmed")
+        self.assertEqual(warning["error"], "simctl accepted the silent push; whether the app ran "
+                                           "its background handler is not known")
+        self.assertTrue(warning["hint"])
+        self.assertNotIn("warnings", self.send({"app_id": BUNDLE, "title": "t"}))
+        # the raw path is untouched: the same reply, no new warning
+        raw = self.send({"app_id": BUNDLE, "payload": {"aps": {"content-available": 1}}})
+        self.assertEqual(raw, {"control": "push", "app_id": BUNDLE, "app_id_source": "value",
+                               "verified": False, "verification": "unavailable"})
+
+    def test_a_render_over_64_kb_never_reaches_simctl(self) -> None:
+        error = invalid(self, self.send, {"app_id": BUNDLE, "body": "x" * 70000})
+        self.assertEqual(error.extra["platform"], "ios")
+        self.assertFalse(any(argv[:2] == ["simctl", "push"] for argv in self.calls("simctl")))
 
 
 if __name__ == "__main__":

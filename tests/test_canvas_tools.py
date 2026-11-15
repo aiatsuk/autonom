@@ -773,6 +773,41 @@ class AndroidSimulateTests(ToolsCase):
         self.assertIn("4096", big["error"])
         self.assertEqual(self.calls(), [])
 
+    def test_push_text_utf8_cannot_hold_is_refused_naming_the_field(self) -> None:
+        # a lone surrogate, typed or as a JSON escape, and numbers JSON has no
+        # strict form for: invalid_value naming the field, before the device
+        lone = "a\ud800b"
+        cases = [({"title": lone}, "title"),
+                 ({"title": "t", "data": {"k": {"deep": [lone]}}}, "data.k"),
+                 (json.dumps({"title": "t", "data": {"k": lone}}), "data.k"),
+                 ('{"title": "t", "data": {"k": "a\\ud800b"}}', "data.k"),
+                 ({"title": "t", "data": {"n": float("nan")}}, "data.n"),
+                 ({"title": "t", "ios": {"aps": {"x": float("inf")}}}, "ios")]
+        for message, field in cases:
+            for op, payload in (("simulate", {"control": "push", "action": "send",
+                                              "values": {"app_id": APP, "message": message}}),
+                                ("push.compose", {"message": message})):
+                with self.subTest(op=op, field=field, kind=type(message).__name__):
+                    response = self.refused(op, payload, errors.INVALID_VALUE)
+                    self.assertEqual(response["field"], field)
+        self.assertEqual(self.calls(), [])
+
+    def test_a_push_message_nested_too_deeply_is_refused(self) -> None:
+        text = '{"title": "t", "data": {"k": ' + "[" * 1990 + "]" * 1990 + "}}"
+        self.assertLessEqual(len(text), tools_mod.MAX_PUSH_PAYLOAD)
+        response = self.refused("simulate", {"control": "push", "action": "send",
+                                             "values": {"app_id": APP, "message": text}},
+                                errors.INVALID_VALUE)
+        # parsed and capped by the model, or too deep for this Python to parse
+        self.assertIn(response["field"], ("data.k", "message"))
+        deep: object = "x"
+        for _ in range(40):
+            deep = {"k": deep}
+        response = self.refused("push.compose", {"message": {"title": "t", "ios": deep}},
+                                errors.INVALID_VALUE)
+        self.assertEqual(response["field"], "ios")
+        self.assertEqual(self.calls(), [])
+
     def test_compose_through_simulate_points_to_the_read_op(self) -> None:
         self.refused("simulate", {"control": "push", "action": "compose",
                                   "values": {"message": {"title": "x"}}},
@@ -869,6 +904,16 @@ class IosSimulateTests(ToolsCase):
         self.refused("simulate", {"control": "push", "action": "send",
                                   "values": {"app_id": "bad id", "payload": {}}},
                      errors.INVALID_VALUE)
+        self.assertEqual(self.calls(), [])
+
+    def test_a_push_payload_utf8_cannot_hold_never_reaches_simctl(self) -> None:
+        lone = {"aps": {"alert": "a\ud800b"}}
+        for payload in (lone, json.dumps(lone), '{"aps": {"alert": "a\\ud800b"}}'):
+            with self.subTest(kind=type(payload).__name__):
+                response = self.refused("simulate", {
+                    "control": "push", "action": "send",
+                    "values": {"app_id": APP, "payload": payload}}, errors.INVALID_VALUE)
+                self.assertEqual(response["field"], "payload")
         self.assertEqual(self.calls(), [])
 
     def test_push_without_an_app_is_the_library_refusal(self) -> None:

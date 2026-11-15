@@ -81,6 +81,9 @@ live API 37 google_apis emulator printed):
                     record stays hidden for (it appears about 1 s late on API 29)
 ``notification_format`` ``api29`` prints the API 29 record line and ``posting:``
                     (default: the API 37 format and ``posting for user 0:``)
+``notification_encoding`` the encoding ``dumpsys notification`` writes its text in
+                    (default UTF-8); ``latin-1`` prints bytes that are not UTF-8,
+                    as a title another app set can
 
 The on-device Android helper (``scripts/autonom_lib/android_helper.py``; the
 helper itself is ``tests/fakes/fake_android_helper.py``, which reads and
@@ -551,6 +554,12 @@ def _push_shell(words: list[str], state: dict) -> int | None:
             lines.extend(_notification_lines(item, style))
         if changed:
             write_state(state)
+        encoding = state.get("notification_encoding")
+        if encoding:
+            sys.stdout.flush()
+            sys.stdout.buffer.write(("\n".join(lines) + "\n").encode(encoding, "replace"))
+            sys.stdout.buffer.flush()
+            return 0
         sys.stdout.write("\n".join(lines) + "\n")
         return 0
     if words[:3] == ["cmd", "notification", "post"]:

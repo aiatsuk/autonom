@@ -14,10 +14,16 @@ optionally laid over a saved file (`file=<path>`, convention
 
 Errors never quote a field's text: a notification title or body can hold
 anything a tester typed, and errors are journaled and logged.
+
+`normalize` refuses up front what would fail later, after a send: text with a
+NUL or a lone surrogate (it cannot be written as UTF-8), numbers that are not
+finite (no strict JSON for them), objects nested deeper than `MAX_DEPTH`, and
+a message whose render is larger than `MAX_RENDERED_BYTES` on either platform.
 """
 from __future__ import annotations
 
 import json
+import math
 import os
 import secrets
 import shlex
@@ -25,7 +31,7 @@ import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Collection
 
 from . import errors
 
@@ -53,10 +59,19 @@ SEND_KEYS = ("app_id", "payload", "file", "delivery", "receiver", "action", "inc
 PLATFORMS = ("ios", "android")
 DELIVERIES = ("app", "shade")
 IOS_PAYLOAD_LIMIT = 4096  # bytes; APNs refuses a larger payload
+ANDROID_EXTRAS_LIMIT = 4096  # bytes of keys plus values; FCM refuses a larger message
+# A render this large is refused before anything is sent: far above what
+# APNs or FCM take, and a body that size would make an over-long adb line.
+MAX_RENDERED_BYTES = 64 * 1024
+# How deep `data`, `ios` and `android` may nest objects and arrays (the
+# field's own object is level 1).
+MAX_DEPTH = 32
 FCM_SENDER = "autonom"
 FCM_TTL_SECONDS = "3600"
 FILE_CONVENTION = ".autonom/pushes/<name>.json"
 
+BADGE_HINT = ("In a file or --json badge is a JSON number, e.g. \"badge\": 3; --value badge=3 "
+              "takes text.")
 MESSAGE_HINT = (
     "Describe the push with message fields, e.g. --value title=Hello --value body='From Autonom' "
     "--value data.order_id=42 (or --json '{\"title\": \"Hello\", \"data\": {\"order_id\": 42}}'), "
@@ -72,7 +87,10 @@ def _field_hint(field: str) -> str:
     if name in LABEL_FIELDS:
         return f"Pass {name} as text."
     if name in BOOL_FIELDS:
-        return f"Pass {name}=true or {name}=false."
+        return (f"In a file or --json {name} is a JSON boolean (true or false); "
+                f"--value {name}=true takes text.")
+    if name == "badge":
+        return BADGE_HINT
     if name == "data":
         return ("Pass data as a JSON object, e.g. --json '{\"data\": {\"order_id\": 42}}', "
                 "or one key with --value data.<key>=<text>.")
@@ -106,7 +124,9 @@ def _boolean_words() -> dict[str, bool]:
 
 
 def parse_boolean(key: str, value: Any) -> bool:
-    """A boolean from JSON or from `--value` text; anything else is refused."""
+    """A boolean from JSON or from `--value` text (the action values such as
+    `include_stopped`); anything else is refused. A message's `silent` and
+    `fcm` take text only from `--value` (`_command_line_field`)."""
     if isinstance(value, bool):
         return value
     if isinstance(value, str):
@@ -118,28 +138,99 @@ def parse_boolean(key: str, value: Any) -> bool:
                    "Booleans: " + ", ".join(sorted(_boolean_words())) + ".", field=key)
 
 
+def _badge_text(value: str) -> int:
+    """`--value badge=<text>`: a whole number 0 or more."""
+    try:
+        number = int(value.strip())
+    except ValueError:
+        raise _invalid("badge must be a whole number 0 or more", BADGE_HINT,
+                       field="badge") from None
+    return _badge(number)
+
+
 def _badge(value: Any) -> int:
-    if isinstance(value, str):
-        try:
-            value = int(value.strip())
-        except ValueError:
-            raise _invalid("badge must be a whole number 0 or more",
-                           "Pass --value badge=3.", field="badge") from None
+    """A JSON badge: an integer 0 or more (3.0 is an integer in JSON Schema
+    too); text is refused here, as in the schema."""
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        raise _invalid("badge must be a whole number 0 or more", "Pass --value badge=3.",
-                       field="badge")
+        raise _invalid("badge must be a whole number 0 or more", BADGE_HINT, field="badge")
     return value
+
+
+def _json_boolean(key: str, value: Any) -> bool:
+    """A JSON boolean: `"true"` in a file or `--json` is refused, as in the
+    schema (`--value` text is parsed before `normalize`)."""
+    if not isinstance(value, bool):
+        raise _invalid(f"{key} must be true or false", field=key)
+    return value
+
+
+def _bad_text(value: str) -> str | None:
+    """Why text cannot travel in a push (it is written as UTF-8 to a file, an
+    adb line and a JSON reply), or None."""
+    if "\x00" in value:
+        return "must not contain a NUL character"
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return "must be valid Unicode text (it holds a lone surrogate)"
+    return None
 
 
 def _text(key: str, value: Any) -> str:
     if not isinstance(value, str) or not value.strip():
         raise _invalid(f"{key} must be non-empty text", field=key)
-    if "\x00" in value:
-        raise _invalid(f"{key} must not contain a NUL character", field=key)
+    problem = _bad_text(value)
+    if problem:
+        raise _invalid(f"{key} {problem}", field=key)
     if key == "message_id" and (value != value.strip() or len(value.split()) != 1):
         # it names the shade notification's tag, which a read-back matches
         raise _invalid("message_id must be one word without spaces", field=key)
     return value
+
+
+def _label(key: str, value: Any) -> str:
+    if not isinstance(value, str):
+        raise _invalid(f"{key} must be text", field=key)
+    problem = _bad_text(value)
+    if problem:
+        raise _invalid(f"{key} {problem}", field=key)
+    return value
+
+
+def _check_json(field: str, value: Any, level: int) -> None:
+    """One JSON value a message carries (`data.<key>`, `ios`): text without a
+    NUL that UTF-8 can hold (keys too), finite numbers, and objects and
+    arrays at most `MAX_DEPTH` levels deep, `level` being the one `value`
+    sits at. Refused as `invalid_value` naming `field`, never quoting it.
+    The recursion stops at `MAX_DEPTH`, so no input can exhaust the stack."""
+    if value is None or isinstance(value, (bool, int)):
+        return
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise _invalid(f"{field} must hold finite numbers (no NaN or Infinity)", field=field)
+        return
+    if isinstance(value, str):
+        problem = _bad_text(value)
+        if problem:
+            raise _invalid(f"{field} {problem}", field=field)
+        return
+    if not isinstance(value, (dict, list)):
+        raise _invalid(f"{field} must hold JSON values only", field=field)
+    if level > MAX_DEPTH:
+        raise _invalid(f"{field} is nested more than {MAX_DEPTH} levels deep",
+                       f"Keep data, ios and android at most {MAX_DEPTH} levels of objects and "
+                       "arrays deep.", field=field)
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if not isinstance(key, str) or _bad_text(key):
+                raise _invalid(f"{field} must have text keys without a NUL character, valid "
+                               "as Unicode", field=field)
+            _check_json(field, item, level + 1)
+    else:
+        for item in value:
+            _check_json(field, item, level + 1)
 
 
 def _path(key: str, value: Any, hint: str) -> Path:
@@ -147,8 +238,9 @@ def _path(key: str, value: Any, hint: str) -> Path:
     (`~nosuchuser/...`, a NUL byte)."""
     if not isinstance(value, str) or not value.strip():
         raise _invalid(f"{key} needs a path", hint, field=key)
-    if "\x00" in value:
-        raise _invalid(f"{key} must not contain a NUL character", hint, field=key)
+    problem = _bad_text(value)
+    if problem:
+        raise _invalid(f"{key} {problem}", hint, field=key)
     try:
         return Path(value.strip()).expanduser()
     except (RuntimeError, ValueError, OSError):
@@ -171,8 +263,10 @@ def _data(value: Any) -> dict[str, Any]:
     for key, item in data.items():
         if not isinstance(key, str) or not key:
             raise _invalid("every data key must be non-empty text", field="data")
-        if "\x00" in key or (isinstance(item, str) and "\x00" in item):
-            raise _invalid(f"data.{key} must not contain a NUL character", field=f"data.{key}")
+        if _bad_text(key):
+            # the key itself is not named: it may hold what cannot be printed
+            raise _invalid("every data key must be text without a NUL character, valid as "
+                           "Unicode", field="data")
         if reserved_data_key(key):
             raise _invalid(
                 f"data key {key!r} is reserved",
@@ -180,18 +274,26 @@ def _data(value: Any) -> dict[str, Any]:
                 "starting with " + " or ".join(RESERVED_DATA_PREFIXES) + "; rename it. The key "
                 "an app reads a deep link from is app-specific (link, url, route, ...).",
                 field=f"data.{key}")
+        _check_json(f"data.{key}", item, 2)  # `data` itself is level 1
     return dict(data)
 
 
 def _android(value: Any) -> dict[str, str]:
     extras = _object("android", value)
     for key, item in extras.items():
-        if not key or not isinstance(item, str):
+        if not isinstance(key, str) or not key or not isinstance(item, str):
             raise _invalid("android must map non-empty keys to text (FCM extras are strings)",
                            field="android")
-        if "\x00" in key or "\x00" in item:
-            raise _invalid("android extras must not contain a NUL character", field="android")
+        if _bad_text(key) or _bad_text(item):
+            raise _invalid("android extras must be text without a NUL character, valid as "
+                           "Unicode", field="android")
     return dict(extras)
+
+
+def _ios(value: Any) -> dict[str, Any]:
+    payload = _object("ios", value)
+    _check_json("ios", payload, 1)
+    return dict(payload)
 
 
 def normalize(raw: Any) -> dict[str, Any]:
@@ -214,18 +316,17 @@ def normalize(raw: Any) -> dict[str, Any]:
         if key in TEXT_FIELDS:
             value = _text(key, value)
         elif key in LABEL_FIELDS:
-            if not isinstance(value, str):
-                raise _invalid(f"{key} must be text", field=key)
+            value = _label(key, value)
         elif key == "badge":
             value = _badge(value)
         elif key in BOOL_FIELDS:
-            value = parse_boolean(key, value)
+            value = _json_boolean(key, value)
         elif key == "data":
             value = _data(value)
             if not value:
                 continue  # an empty data object says nothing
         elif key == "ios":
-            value = dict(_object("ios", value))
+            value = _ios(value)
         elif key == "android":
             value = _android(value)
         message[key] = value
@@ -237,7 +338,23 @@ def normalize(raw: Any) -> dict[str, Any]:
             or message.get("silent") is True):
         raise _invalid("a push message needs at least one of title, body, data or silent=true",
                        MESSAGE_HINT, missing=["title", "body", "data", "silent"])
+    _check_rendered_size(message)
     return message
+
+
+def _check_rendered_size(message: dict[str, Any]) -> None:
+    """Refuse, before anything is sent, a message whose render is larger
+    than `MAX_RENDERED_BYTES` on either platform (APNs and FCM take 4096)."""
+    message_id = message_id_of(message)
+    sizes = (("ios", payload_bytes(render_ios(message, message_id))),
+             ("android", extras_bytes(render_android(message, message_id))))
+    for platform, size in sizes:
+        if size > MAX_RENDERED_BYTES:
+            raise _invalid(
+                f"the push renders to {size} bytes on {platform}, above the "
+                f"{MAX_RENDERED_BYTES}-byte limit for a push",
+                f"APNs and FCM take at most {IOS_PAYLOAD_LIMIT} bytes: shorten the body or "
+                "the data.", bytes=size, limit=MAX_RENDERED_BYTES, platform=platform)
 
 
 def new_message_id() -> str:
@@ -300,6 +417,12 @@ def payload_bytes(payload: dict[str, Any]) -> int:
     return len(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
 
 
+def extras_bytes(extras: dict[str, str]) -> int:
+    """The size FCM counts: every key plus every value, UTF-8."""
+    return sum(len(key.encode("utf-8")) + len(value.encode("utf-8"))
+               for key, value in extras.items())
+
+
 def ios_kind(message: dict[str, Any]) -> str:
     return "notification" if any(name in message for name in ALERT_FIELDS) else "data"
 
@@ -344,6 +467,10 @@ def notes(message: dict[str, Any], platform: str | None = None) -> list[str]:
     """Short lines on what one platform leaves out or changes."""
     ios: list[str] = []
     android: list[str] = []
+    if message.get("silent") is True:
+        ios.append("ios: simctl may refuse a silent push as having no visible content (it did on "
+                   "iOS 27.2); where it takes one, whether the app ran its background handler is "
+                   "not known")
     if "channel" in message:
         ios.append("ios: channel is not used (Android only)")
     if "android" in message:
@@ -407,6 +534,10 @@ def load_file(path: Any) -> tuple[str, dict[str, Any], Path]:
                  if isinstance(exc, json.JSONDecodeError) else "")
         raise _invalid(f"push file {resolved} is not valid JSON{where}",
                        "A push file holds one JSON object.", path=str(resolved)) from None
+    except RecursionError:
+        raise _invalid(f"push file {resolved} is nested too deeply to read",
+                       f"A push message nests at most {MAX_DEPTH} levels.",
+                       path=str(resolved)) from None
     if not isinstance(content, dict):
         raise _invalid(f"push file {resolved} does not hold a JSON object",
                        "A push file holds one JSON object: a push message, or a raw APNs "
@@ -420,7 +551,7 @@ def _command_line_field(key: str, value: Any) -> Any:
     if not isinstance(value, str):
         return value
     if key == "badge":
-        return _badge(value)
+        return _badge_text(value)
     if key in BOOL_FIELDS:
         return parse_boolean(key, value)
     if key in ("data", "ios", "android"):
@@ -428,13 +559,22 @@ def _command_line_field(key: str, value: Any) -> Any:
             parsed = json.loads(value)
         except ValueError:
             raise _invalid(f"{key} must be a JSON object", field=key) from None
+        except RecursionError:
+            raise _invalid(f"{key} is nested more than {MAX_DEPTH} levels deep",
+                           field=key) from None
         return _object(key, parsed)
     return value
 
 
-def from_values(values: dict[str, Any]) -> PushInput:
+def from_values(values: dict[str, Any],
+                text_keys: Collection[str] | None = None) -> PushInput:
     """Split the values of one push action into the message (or raw
     payload) and the action's own values.
+
+    `text_keys` names the values that came as `--value` text: only those
+    are parsed (`badge=3`, `silent=true`, `data={...}`); a `--json` value
+    must already have its JSON type, as in a file and the schema. None (a
+    library caller that does not say) parses every text value.
 
     `payload=` keeps the original `push send` path exactly: values that are
     neither message fields nor action values are ignored there, as before.
@@ -490,7 +630,8 @@ def from_values(values: dict[str, Any]) -> PushInput:
         base = content
     merged = dict(base)
     for key, value in fields.items():
-        parsed = _command_line_field(key, value)
+        text = text_keys is None or key in text_keys
+        parsed = _command_line_field(key, value) if text else value
         if key == "data" and isinstance(parsed, dict) and isinstance(merged.get("data"), dict):
             parsed = {**merged["data"], **parsed}
         merged[key] = parsed
@@ -561,10 +702,11 @@ def _write_target(options: dict[str, Any]) -> Path | None:
     return out
 
 
-def compose(values: dict[str, Any]) -> dict[str, Any]:
+def compose(values: dict[str, Any], text_keys: Collection[str] | None = None) -> dict[str, Any]:
     """`simulator push compose`: the message and what each platform gets.
-    Read-only (it writes only the file `write=` names) and needs no device."""
-    push = from_values(values)
+    Read-only (it writes only the file `write=` names) and needs no device.
+    `text_keys`: the values that came as `--value` text (`from_values`)."""
+    push = from_values(values, text_keys)
     refuse_other_values(push.options, COMPOSE_KEYS, "compose")
     if push.raw:
         raise _invalid("push compose builds a push from message fields; a raw APNs payload "
@@ -592,8 +734,11 @@ def compose(values: dict[str, Any]) -> dict[str, Any]:
         if size > IOS_PAYLOAD_LIMIT:
             warnings.append(large_payload_warning(size))
     if platform in (None, "android"):
-        reply["android"] = {"extras": render_android(message, message_id),
-                            "kind": android_kind(message)}
+        extras = render_android(message, message_id)
+        reply["android"] = {"extras": extras, "kind": android_kind(message)}
+        size = extras_bytes(extras)
+        if size > ANDROID_EXTRAS_LIMIT:
+            warnings.append(large_payload_warning(size, "android"))
     reply["notes"] = notes(message, platform)
     reply["warnings"] = warnings
     if out is not None:
@@ -604,10 +749,32 @@ def compose(values: dict[str, Any]) -> dict[str, Any]:
     return reply
 
 
-def large_payload_warning(size: int) -> dict[str, Any]:
+def large_payload_warning(size: int, platform: str = "ios") -> dict[str, Any]:
+    """`push_payload_large`: the render is above what APNs (iOS payload) or
+    FCM (Android extras, keys plus values) take; the emulator or simctl may
+    still take it."""
+    if platform == "android":
+        return {"code": "push_payload_large",
+                "error": f"the FCM extras are {size} bytes (keys plus values), above the "
+                         f"{ANDROID_EXTRAS_LIMIT}-byte limit FCM enforces",
+                "hint": "Shorten the body or the data; the emulator still takes it, a real "
+                        "FCM send would not.",
+                "bytes": size, "limit": ANDROID_EXTRAS_LIMIT, "platform": "android"}
     return {"code": "push_payload_large",
             "error": f"the APNs payload is {size} bytes, above the {IOS_PAYLOAD_LIMIT}-byte "
                      "limit APNs enforces",
             "hint": "Shorten the body or the data; simctl may still accept it, a real APNs "
                     "send would not.",
-            "bytes": size, "limit": IOS_PAYLOAD_LIMIT}
+            "bytes": size, "limit": IOS_PAYLOAD_LIMIT, "platform": "ios"}
+
+
+def silent_unconfirmed_warning() -> dict[str, Any]:
+    """`push_silent_unconfirmed`: simctl took a silent (content-available)
+    push; nothing on the Simulator says whether the app's background handler
+    ran (on iOS 26.4 it was not seen to)."""
+    return {"code": "push_silent_unconfirmed",
+            "error": "simctl accepted the silent push; whether the app ran its background "
+                     "handler is not known",
+            "hint": "Check the app's own log for its background handler, or add a title or a "
+                    "body to see the push arrive. On Android a silent push is a data message "
+                    "the app's receiver is seen to take."}

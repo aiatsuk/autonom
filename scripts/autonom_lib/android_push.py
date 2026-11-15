@@ -63,19 +63,32 @@ def _not_delivered(reason: str, message: str, hint: str, **extra: Any) -> errors
                                capability="simulator.push", **extra)
 
 
+def _decode(data: Any) -> str:
+    """Device output as text. Never strict: a notification another app
+    posted may print bytes that are not UTF-8, and the push was sent before
+    the shade is read; such bytes become U+FFFD."""
+    if isinstance(data, bytes):
+        return data.decode("utf-8", errors="replace")
+    return data if isinstance(data, str) else ""
+
+
 def _shell(target: Target, words: list[str], *, timeout: float = 30) -> tuple[int, str]:
     """One `adb shell` line: (exit code, output). A timeout or a missing adb
-    is an error naming the command only, never its arguments."""
+    is an error naming the command only, never its arguments. The output is
+    read as bytes and decoded here (`_decode`); adb's own messages (stderr)
+    come first, as they do on the terminal."""
     try:
         completed = adb_mod.run_adb(target.tool, ["shell", *words], serial=target.target_id,
-                                    timeout=timeout, check=False)
+                                    timeout=timeout, check=False, binary=True)
     except subprocess.TimeoutExpired:
         name = " ".join(word for word in words[:3] if not word.startswith("'"))
         raise errors.AutonomError(
             errors.BACKEND_FAILED, f"adb shell {name} did not answer within {int(timeout)} s",
             "Check the emulator with 'adb devices'.") from None
-    text = completed.stdout if isinstance(completed.stdout, str) else ""
-    return completed.returncode, text
+    errors_text, text = _decode(completed.stderr), _decode(completed.stdout)
+    if errors_text and not errors_text.endswith("\n"):
+        errors_text += "\n"
+    return completed.returncode, errors_text + text
 
 
 def _last_line(text: str) -> str:
@@ -219,10 +232,11 @@ def _notifications_warning(target: Target, package: str, api: int | None) -> dic
 
 def _records_or_none(target: Target) -> list[dict[str, Any]] | None:
     """A read of the shade that never fails the push: it was sent already
-    (or is about to be), so a read that times out only loses the read-back."""
+    (or is about to be), so a read that times out or cannot be parsed only
+    loses the read-back ("not confirmed", never an error)."""
     try:
         return notification_records(target)
-    except errors.AutonomError:
+    except Exception:  # noqa: BLE001 - see the docstring
         return None
 
 
@@ -305,11 +319,18 @@ def _app(target: Target, message: dict[str, Any], options: dict[str, Any], app_i
             "of your own, or delivery=shade for a plain notification in the shade.",
             app_id=app_id)
     warnings: list[dict[str, Any]] = []
+    size = push_message.extras_bytes(extras)
+    if size > push_message.ANDROID_EXTRAS_LIMIT:
+        # the emulator takes it; real FCM would refuse it
+        warnings.append(push_message.large_payload_warning(size, "android"))
     # what the app's records showed before the send: a record counts as this
     # push's only when it is new, or when a replaced one shows other text
     before: dict[tuple[Any, ...], tuple[Any, Any]] = {}
     if kind == "notification":
-        warning = _notifications_warning(target, app_id, api_level(target))
+        try:
+            warning = _notifications_warning(target, app_id, api_level(target))
+        except Exception:  # noqa: BLE001 - a failed lookup means no warning, never no push
+            warning = None
         if warning:
             warnings.append(warning)
         before = {_identity(record): (record.get("title"), record.get("text"))

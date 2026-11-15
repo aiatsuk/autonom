@@ -6053,6 +6053,9 @@ def cmd_simulator(args: argparse.Namespace) -> int:
             raise errors.AutonomError(errors.FLOW_COMMAND_INVALID,
                                       "--json must be an object")
         values.update(parsed)
+    # the values given as text: a push parses only these (badge=3, silent=true);
+    # a --json value keeps its JSON type, as in a push file
+    text_keys: set[str] = set()
     for pair in args.value or []:
         if "=" not in pair:
             # never echo the value: it may be a push title or other text
@@ -6061,6 +6064,7 @@ def cmd_simulator(args: argparse.Namespace) -> int:
                                       "Pass --value KEY=VALUE, e.g. --value title=Hello.")
         key, value = pair.split("=", 1)
         values[key] = value
+        text_keys.add(key)
     if args.control == "slim" and args.action == "presets":
         # the catalog is the same for every simulator: no device is resolved
         from autonom_lib import simulator_slim
@@ -6068,7 +6072,8 @@ def cmd_simulator(args: argparse.Namespace) -> int:
                     as_json=True)
     if args.control == "push" and args.action == "compose":
         # a push is described and rendered for both platforms without a device
-        return emit({"ok": True, **simulator_mod.push_compose(values)}, as_json=True)
+        return emit({"ok": True, **simulator_mod.push_compose(values, text_keys)},
+                    as_json=True)
     if (args.control == "slim" and args.action == "suggest"
             and not _explicit_target_flags(args)):
         # an app bundle on disk is read without a simulator; a bundle id
@@ -6080,7 +6085,7 @@ def cmd_simulator(args: argparse.Namespace) -> int:
     target = _target(args)
     # the session record defaults come from (the app `push send` addresses)
     result = simulator_mod.apply(target, args.control, args.action, values,
-                                 session=session_mod.load_current())
+                                 session=session_mod.load_current(), text_keys=text_keys)
     payload = {"ok": True, **result, **target.identity()}
     code = emit(payload, as_json=True)
     # a failed check (`slim verify` with drift) answers on stdout with

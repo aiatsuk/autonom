@@ -256,16 +256,27 @@ def _utf8_length(text: str) -> int:
     return len(text.encode("utf-8"))
 
 
+def _push_text_length(text: str) -> int:
+    """The UTF-8 length of push text, counting a lone surrogate as UTF-8
+    would write it: the length check never fails on text the message model
+    then refuses, naming the field (`push_message.normalize`)."""
+    return len(text.encode("utf-8", "surrogatepass"))
+
+
 def _push_message(value: Any) -> tuple[dict[str, Any], int]:
     """A checked push message (an object or its JSON text) and the length of
     its text, which is all the journal may say about it."""
     example = "Send one JSON object, e.g. {\"title\": \"Hello\", \"data\": {\"order_id\": 42}}."
-    if isinstance(value, str):
-        size = _utf8_length(value)
-    elif isinstance(value, dict):
-        size = _utf8_length(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
-    else:
-        raise _invalid("push message must be a JSON object or its JSON text", example)
+    try:
+        if isinstance(value, str):
+            size = _push_text_length(value)
+        elif isinstance(value, dict):
+            size = _push_text_length(json.dumps(value, ensure_ascii=False,
+                                                separators=(",", ":")))
+        else:
+            raise _invalid("push message must be a JSON object or its JSON text", example)
+    except RecursionError:
+        raise _too_deep("message") from None
     if size > MAX_PUSH_PAYLOAD:
         raise _invalid(f"push message is {size} bytes; at most {MAX_PUSH_PAYLOAD} are allowed",
                        "Shorten the body or the data.")
@@ -274,9 +285,45 @@ def _push_message(value: Any) -> tuple[dict[str, Any], int]:
             value = json.loads(value)
         except ValueError:
             raise _invalid("push message is not valid JSON", example) from None
+        except RecursionError:
+            raise _too_deep("message") from None
         if not isinstance(value, dict):
             raise _invalid("push message must be a JSON object", example)
     return push_message.normalize(value), size
+
+
+def _too_deep(field: str) -> errors.AutonomError:
+    return errors.AutonomError(
+        errors.INVALID_VALUE, f"push {field} is nested more than {push_message.MAX_DEPTH} "
+        "levels deep", f"Keep data, ios and android at most {push_message.MAX_DEPTH} levels of "
+        "objects and arrays deep.", field=field)
+
+
+def _push_payload_length(value: Any) -> int:
+    """The UTF-8 length of a raw APNs payload (an object or its JSON text).
+    Text UTF-8 cannot hold, typed or escaped (`\\ud800` in the JSON text), is
+    `invalid_value` here: simctl gets the payload as a UTF-8 file."""
+    unicode_error = errors.AutonomError(
+        errors.INVALID_VALUE, "push payload must be valid Unicode text (it holds a lone "
+        "surrogate)", "Send text UTF-8 can hold.", field="payload")
+    try:
+        if isinstance(value, str):
+            text = value
+            try:
+                parsed = json.loads(value)
+            except ValueError:
+                parsed = None  # the library refuses text that is not a JSON object
+            if parsed is not None:
+                json.dumps(parsed, ensure_ascii=False).encode("utf-8")
+        elif isinstance(value, dict):
+            text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        else:
+            raise _invalid("push payload must be a JSON object")
+        return _utf8_length(text)
+    except RecursionError:
+        raise _too_deep("payload") from None
+    except UnicodeEncodeError:
+        raise unicode_error from None
 
 
 def _mock_lists(payload: dict[str, Any]) -> dict[str, list[Any]]:
@@ -610,13 +657,7 @@ class Tools:
         checked = dict(values)
         for key, value in values.items():
             if control == "push" and key == "payload":
-                if isinstance(value, str):
-                    size = _utf8_length(value)
-                elif isinstance(value, dict):
-                    size = _utf8_length(json.dumps(value, ensure_ascii=False,
-                                                   separators=(",", ":")))
-                else:
-                    raise _invalid("push payload must be a JSON object")
+                size = _push_payload_length(value)
                 if size > MAX_PUSH_PAYLOAD:
                     raise _invalid(f"push payload is {size} bytes; at most "
                                    f"{MAX_PUSH_PAYLOAD} are allowed")

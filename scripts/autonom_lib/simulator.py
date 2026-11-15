@@ -25,7 +25,7 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Collection
 
 from . import adb as adb_mod
 from . import errors, ios_prefs, ios_simctl
@@ -194,14 +194,17 @@ def _simctl(target: Target, args: list[str]) -> str:
 
 
 def apply(target: Target, control: str, action: str,
-          values: dict[str, Any], *, session: dict[str, Any] | None = None) -> dict[str, Any]:
+          values: dict[str, Any], *, session: dict[str, Any] | None = None,
+          text_keys: Collection[str] | None = None) -> dict[str, Any]:
     """Run one control. ``session`` is the record defaults come from (the
-    app `push send` addresses); None reads the current session."""
+    app `push send` addresses); None reads the current session.
+    ``text_keys`` names the values given as ``--value`` text: a push parses
+    only those (``badge=3``); None parses every text value."""
     if control not in CONTROLS:
         raise errors.AutonomError(errors.UNSUPPORTED_CAPABILITY,
                                   f"unknown simulator control {control!r}")
     if control == "push" and action == "compose":
-        return push_compose(values)  # read-only, needs no device
+        return push_compose(values, text_keys)  # read-only, needs no device
     _require_simulator(target)
     _require_action(control, action)
     if control in ("status-bar", "animations") and target.platform == ANDROID:
@@ -228,7 +231,7 @@ def apply(target: Target, control: str, action: str,
     if control == "network":
         return _network(target, action, values)
     if control == "push":
-        return _push(target, values, session)
+        return _push(target, values, session, text_keys)
     if control in ("sms", "call"):
         return _telephony(target, control, action, values)
     if control == "biometric":
@@ -841,12 +844,13 @@ def _current_session() -> dict[str, Any] | None:
         return None
 
 
-def push_compose(values: dict[str, Any]) -> dict[str, Any]:
+def push_compose(values: dict[str, Any],
+                 text_keys: Collection[str] | None = None) -> dict[str, Any]:
     """`simulator push compose`: the push message and what each platform
     gets (see push_message.py). Read-only; no device is involved."""
     from . import push_message  # noqa: PLC0415
 
-    return push_message.compose(values)
+    return push_message.compose(values, text_keys)
 
 
 def _push_app_id(target: Target, values: dict[str, Any],
@@ -863,10 +867,11 @@ def _push_app_id(target: Target, values: dict[str, Any],
 
 
 def _push(target: Target, values: dict[str, Any],
-          session: dict[str, Any] | None = None) -> dict[str, Any]:
+          session: dict[str, Any] | None = None,
+          text_keys: Collection[str] | None = None) -> dict[str, Any]:
     from . import push_message  # noqa: PLC0415 - kept off the other controls' import path
 
-    push = push_message.from_values(values)
+    push = push_message.from_values(values, text_keys)
     app_id, source = _push_app_id(target, values, session)
     if target.platform != IOS:
         from . import android_push  # noqa: PLC0415
@@ -895,6 +900,10 @@ def _push(target: Target, values: dict[str, Any],
     result.update(composed=True, message_id=message_id, kind=push_message.ios_kind(message),
                   payload_bytes=size)
     _push_result(target, result, source)
+    if message.get("silent") is True:
+        # simctl took it (iOS 26.4 does; 27.2 refuses it, see _simctl_push),
+        # but nothing says the app's background handler ran
+        result.setdefault("warnings", []).insert(0, push_message.silent_unconfirmed_warning())
     if size > push_message.IOS_PAYLOAD_LIMIT:
         result.setdefault("warnings", []).insert(0, push_message.large_payload_warning(size))
     return result
@@ -921,12 +930,31 @@ def _push_raw(target: Target, push: Any, app_id: str, source: str) -> dict[str, 
     return result
 
 
+# What simctl prints when the Simulator will not deliver a push that shows
+# nothing (seen on iOS 27.2): code 1401 "Notification has no user visible
+# content" for a bare content-available, 2002 "No content that needs to
+# alert" when only a badge or a sound sits next to it.
+_NO_VISIBLE_CONTENT = re.compile(r"UNErrorDomain,\s*code=(?:1401|2002)\b")
+
+
 def _simctl_push(target: Target, app_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     rendered = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     with tempfile.NamedTemporaryFile(mode="w", suffix=".apns", encoding="utf-8") as handle:
         handle.write(rendered)
         handle.flush()
-        _simctl(target, ["push", target.target_id, app_id, handle.name])
+        try:
+            _simctl(target, ["push", target.target_id, app_id, handle.name])
+        except errors.AutonomError as exc:
+            if exc.code == errors.BACKEND_FAILED and _NO_VISIBLE_CONTENT.search(exc.message or ""):
+                raise errors.AutonomError(
+                    errors.PUSH_NOT_DELIVERED,
+                    "the Simulator refused a push with no alert text",
+                    "simctl on this iOS runtime delivers only pushes that show something: add a "
+                    "title or body. A silent (content-available) push cannot be tested through "
+                    "the Simulator here; on Android it works (a data message).",
+                    reason="no_visible_content", capability="simulator.push",
+                    app_id=app_id) from None
+            raise
     return {"control": "push", "app_id": app_id}
 
 

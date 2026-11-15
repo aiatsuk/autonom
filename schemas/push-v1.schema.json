@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://autonom.dev/schemas/push-v1.schema.json",
   "title": "Autonom Push Message v1",
-  "description": "One push notification described once: 'autonom simulator push compose' renders it as an APNs payload for the iOS Simulator (simctl push) and as FCM extras for an Android emulator, 'autonom simulator push send' delivers it, and write=<path> saves it (convention .autonom/pushes/<name>.json) for file=<path>. A message needs a title, a body, a non-empty data object or silent: true. Field values never appear in errors or the journal.",
+  "description": "One push notification described once: 'autonom simulator push compose' renders it as an APNs payload for the iOS Simulator (simctl push) and as FCM extras for an Android emulator, 'autonom simulator push send' delivers it, and write=<path> saves it (convention .autonom/pushes/<name>.json) for file=<path>. A message needs a title, a body, a non-empty data object or silent: true. Every string, key or value, has no NUL character; data, ios and android nest at most 32 levels of objects and arrays (the field's own object is level 1). The validator also refuses what JSON Schema cannot say: text with a lone surrogate, and a message whose render is over 65536 bytes on either platform. Field values never appear in errors or the journal.",
   "type": "object",
   "additionalProperties": false,
   "properties": {
@@ -11,25 +11,27 @@
     },
     "name": {
       "type": "string",
+      "pattern": "^[^\\u0000]*$",
       "description": "A short name for a saved push; carried in files only."
     },
     "description": {
       "type": "string",
+      "pattern": "^[^\\u0000]*$",
       "description": "What the push is for; carried in files only."
     },
     "title": {
       "type": "string",
-      "pattern": "\\S",
+      "pattern": "^[^\\u0000]*[^\\s\\u0000][^\\u0000]*$",
       "description": "iOS aps.alert.title; Android gcm.notification.title. A title or body makes an Android notification message."
     },
     "subtitle": {
       "type": "string",
-      "pattern": "\\S",
+      "pattern": "^[^\\u0000]*[^\\s\\u0000][^\\u0000]*$",
       "description": "iOS aps.alert.subtitle; not used on Android."
     },
     "body": {
       "type": "string",
-      "pattern": "\\S",
+      "pattern": "^[^\\u0000]*[^\\s\\u0000][^\\u0000]*$",
       "description": "iOS aps.alert.body (or the plain alert string without title and subtitle); Android gcm.notification.body."
     },
     "badge": {
@@ -39,27 +41,27 @@
     },
     "sound": {
       "type": "string",
-      "pattern": "\\S",
+      "pattern": "^[^\\u0000]*[^\\s\\u0000][^\\u0000]*$",
       "description": "iOS aps.sound; Android gcm.notification.sound."
     },
     "category": {
       "type": "string",
-      "pattern": "\\S",
+      "pattern": "^[^\\u0000]*[^\\s\\u0000][^\\u0000]*$",
       "description": "iOS aps.category; Android gcm.notification.click_action."
     },
     "thread": {
       "type": "string",
-      "pattern": "\\S",
+      "pattern": "^[^\\u0000]*[^\\s\\u0000][^\\u0000]*$",
       "description": "iOS aps.thread-id; not used on Android."
     },
     "channel": {
       "type": "string",
-      "pattern": "\\S",
+      "pattern": "^[^\\u0000]*[^\\s\\u0000][^\\u0000]*$",
       "description": "Android gcm.notification.android_channel_id; not used on iOS."
     },
     "image": {
       "type": "string",
-      "pattern": "\\S",
+      "pattern": "^[^\\u0000]*[^\\s\\u0000][^\\u0000]*$",
       "description": "A URL. iOS fcm_options.image with aps.mutable-content 1; Android gcm.notification.image."
     },
     "silent": {
@@ -71,6 +73,7 @@
       "description": "Custom keys: at the top level of the APNs payload (JSON types kept), and Android string extras (a non-string value is sent as JSON text). The key an app reads a deep link from is app-specific.",
       "propertyNames": {
         "minLength": 1,
+        "pattern": "^[^\\u0000]*$",
         "not": {
           "anyOf": [
             {
@@ -86,11 +89,14 @@
             }
           ]
         }
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/value"
       }
     },
     "message_id": {
       "type": "string",
-      "pattern": "^\\S+$",
+      "pattern": "^[^\\s\\u0000]+$",
       "description": "One word without spaces. Android google.message_id; iOS gcm.message_id when fcm is true; the shade notification's tag is autonom_push_<message_id>. Generated at send time (autonom-<epoch ms>-<6 hex>) when left out."
     },
     "fcm": {
@@ -100,14 +106,58 @@
     },
     "ios": {
       "type": "object",
-      "description": "Escape hatch: deep-merged over the rendered APNs payload."
+      "description": "Escape hatch: deep-merged over the rendered APNs payload.",
+      "propertyNames": {
+        "pattern": "^[^\\u0000]*$"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/value"
+      }
     },
     "android": {
       "type": "object",
-      "additionalProperties": {
-        "type": "string"
+      "description": "Escape hatch: merged over the rendered Android extras.",
+      "propertyNames": {
+        "minLength": 1,
+        "pattern": "^[^\\u0000]*$"
       },
-      "description": "Escape hatch: merged over the rendered Android extras."
+      "additionalProperties": {
+        "type": "string",
+        "pattern": "^[^\\u0000]*$"
+      }
+    }
+  },
+  "$defs": {
+    "value": {
+      "description": "A JSON value inside data or ios: its strings and keys have no NUL character.",
+      "anyOf": [
+        {
+          "type": [
+            "number",
+            "boolean",
+            "null"
+          ]
+        },
+        {
+          "type": "string",
+          "pattern": "^[^\\u0000]*$"
+        },
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/value"
+          }
+        },
+        {
+          "type": "object",
+          "propertyNames": {
+            "pattern": "^[^\\u0000]*$"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/value"
+          }
+        }
+      ]
     }
   },
   "anyOf": [
