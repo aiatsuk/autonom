@@ -7,7 +7,8 @@ import { canvasIconData } from "./canvas-ui.mjs";
 //                         line, the status line of a reply, the preview text and the state
 //                         remembered in this browser.
 //   pushFormController()  the DOM wiring: data rows that can be added and removed, Silent,
-//                         Edit as JSON, the Android delivery choice, Reset and the preview box.
+//                         Edit as JSON, the Android delivery choice, Reset, the preview box and
+//                         the result line under the footer's Send.
 // Both are plain functions that toolsScript() inlines with Function.prototype.toString, so they
 // avoid backticks and never write HTML; node tests import the same code.
 
@@ -218,22 +219,29 @@ export function pushFormCore() {
   const WARNINGS = {
     push_notifications_denied: "Notifications are not allowed for this app: grant them on the App tab.",
     push_payload_large: "The payload is larger than 4 KB: the Simulator may take it, a real APNs send would not.",
+    push_silent_unconfirmed: "The Simulator took the silent push; whether the app ran its background code is not known.",
   };
   /** The status line after Send: {text, hint}; hint holds every warning in plain words. */
   function status(reply, platform) {
     const result = isObject(reply) ? reply : {};
-    let text;
+    const warnings = (Array.isArray(result.warnings) ? result.warnings : []).filter(isObject);
+    const denied = warnings.some((item) => item.code === "push_notifications_denied");
+    let text, said = "push_shade_only"; // a warning the line itself already says
     if (platform === "ios") text = result.verified === true ? "Push sent and confirmed on the device." : "Push sent (the device cannot confirm it).";
     else if (result.delivery === "shade") {
       text = result.verified === true ? "Notification shown in the shade. The app’s code did not run."
         : "Notification posted, but it was not found in the shade. The app’s code did not run.";
     } else if (result.verified === true) text = "Push delivered. It is in the notification shade.";
-    else if (result.verification === "not_in_shade") text = "Push delivered to the app. Nothing in the shade: an app that is open handles it itself.";
+    else if (result.verification === "not_in_shade" && denied) {
+      // nothing is in the shade because the app may not post it, not because it is open
+      text = "Push delivered to the app. Notifications are not allowed for this app, so nothing is shown: grant them on the App tab.";
+      said = "push_notifications_denied";
+    } else if (result.verification === "not_in_shade") text = "Push delivered to the app. Nothing in the shade: an app that is open handles it itself.";
     else if (result.verification === "receiver_accepted") text = "Data push delivered to the app.";
     else text = "Push sent.";
     const notes = [];
-    for (const item of Array.isArray(result.warnings) ? result.warnings : []) {
-      if (!isObject(item) || item.code === "push_shade_only") continue; // the line already says it
+    for (const item of warnings) {
+      if (item.code === "push_shade_only" || item.code === said) continue; // the line already says it
       let words = WARNINGS[item.code];
       if (item.code === "slim_push_off") words = "Push is switched off on this Simulator (simulator slim), so it may not show." + (filled(item.hint) ? " " + item.hint : "");
       if (!words) words = string(item.error) || string(item.code);
@@ -314,7 +322,8 @@ export function pushFormCore() {
 /**
  * The DOM half: env brings the page's $, el, makeButton and text helpers, the core, the
  * platform, and read(key) / write(key, value) for this browser's storage (both never throw).
- * It owns the fields, the rows, the JSON switch and the preview box; the page owns Send.
+ * It owns the fields, the rows, the JSON switch, the preview box and the result line under the
+ * footer; the page owns both Send buttons (the row's and the footer's) and what they show.
  */
 export function pushFormController(env) {
   const $ = env.$, el = env.el, makeButton = env.makeButton, text = env.text, core = env.core;
@@ -403,7 +412,21 @@ export function pushFormController(env) {
   }
   function save() { env.write(KEY, core.snapshot(read(), options(), details.open === true)); }
   function clearPreview() { previewSeq += 1; $("tools-push-preview").hidden = true; }
-  function changed() { sync(); clearPreview(); save(); }
+  /**
+   * The result line under the footer buttons, for a Send pressed there: the same text and hint
+   * as the Simulate panel's status line (the page writes both). Cleared when the message is edited.
+   */
+  function showStatus(kind, value, hint) {
+    const node = $("tools-push-status");
+    node.replaceChildren();
+    if (!value) { node.hidden = true; node.removeAttribute("data-kind"); return; }
+    node.setAttribute("data-kind", kind || "ok");
+    node.appendChild(el("p", "tools-msg-text", value));
+    if (hint) node.appendChild(el("p", "tools-msg-hint", hint));
+    node.hidden = false;
+  }
+  function clearStatus() { showStatus(); }
+  function changed() { sync(); clearPreview(); clearStatus(); save(); }
   function setProblem(value) { text("tools-push-json-problem", value); $("tools-push-json-problem").hidden = !value; }
 
   /** The fields of form (rows rebuilt); the JSON text and mode are set apart. */
@@ -480,6 +503,7 @@ export function pushFormController(env) {
     clearMarks();
     load(core.defaults());
     clearPreview();
+    clearStatus();
     save();
   }
 
@@ -540,7 +564,7 @@ export function pushFormController(env) {
   load(saved.form);
   details.open = saved.open;
 
-  return Object.freeze({ build, previewRequest, showPreview, showRaw, reset, read, options, addRow, mode: () => (jsonMode ? "json" : "fields") });
+  return Object.freeze({ build, previewRequest, showPreview, showRaw, showStatus, clearStatus, reset, read, options, addRow, mode: () => (jsonMode ? "json" : "fields") });
 }
 
 /** The page code: the core as PUSH_FORM and the controller factory, inside the drawer's scope. */
@@ -585,8 +609,12 @@ export function pushFormMarkup(platform) {
         `<p class="tools-note" id="tools-push-delivery-note">Runs the app’s own push code. Needs an emulator image without Play Store.</p>` +
         `<div id="tools-push-stopped-field"><label class="tools-check"><input id="tools-push-stopped" type="checkbox"> Reach a stopped app</label></div>`) +
       `<label class="tools-check"><input id="tools-push-json-mode" type="checkbox"> Edit as JSON</label>` +
-      `<div class="tools-actions"><button type="button" class="btn" id="tools-push-preview-run">Preview</button>` +
+      // A second Send where the form ends (the open form is taller than the drawer): the page
+      // sends it exactly as the row's Send (data-sim, data-mutate) and shows its result below.
+      `<div class="tools-actions"><button type="button" class="btn primary" id="tools-push-send" data-mutate data-sim="push" data-action="send" data-push-footer aria-label="Send push" title="Send push">Send</button>` +
+        `<button type="button" class="btn" id="tools-push-preview-run">Preview</button>` +
         `<button type="button" class="btn small tools-push-reset" id="tools-push-reset">Reset</button></div>` +
+      `<div class="tools-msg tools-push-status" id="tools-push-status" role="status" aria-live="polite" hidden></div>` +
       `<div class="tools-push-preview" id="tools-push-preview" aria-live="polite" hidden><p class="tools-note" id="tools-push-preview-head"></p>` +
         `<pre class="tools-pre" id="tools-push-preview-body"></pre><p class="tools-note" id="tools-push-preview-notes" hidden></p></div>` +
     `</div>` +
@@ -618,5 +646,6 @@ export function pushFormStyles() {
 #tools-push-form .tools-push-problem{color:var(--t-danger)}
 #tools-push-form [aria-invalid=true]{border-color:var(--t-danger)}
 #tools-push-form .tools-push-preview .tools-pre{margin-top:6px}
+#tools-push-form .tools-push-status{margin:8px 0 0}
 `;
 }

@@ -49,11 +49,19 @@ describe("markup, styles and script", () => {
       assert.match(markup, /id="tools-push-reset">Reset<\/button>/);
       assert.match(markup, /<pre class="tools-pre" id="tools-push-preview-body">/);
       assert.match(markup, /<details class="tools-sim-details tools-push-details" id="tools-push-details"><summary>/);
-      assert.doesNotMatch(markup, /data-sim=|data-mutate/, "Send stays the row's only leased control");
+      // A second primary Send in the footer, left of Preview and Reset, sent by the page exactly as
+      // the row's Send (data-sim, data-mutate); its result line sits right under the buttons.
+      assert.match(markup, new RegExp('<div class="tools-actions"><button type="button" class="btn primary" id="tools-push-send" data-mutate data-sim="push" ' +
+        'data-action="send" data-push-footer aria-label="Send push" title="Send push">Send</button>' +
+        '<button type="button" class="btn" id="tools-push-preview-run">Preview</button>' +
+        '<button type="button" class="btn small tools-push-reset" id="tools-push-reset">Reset</button></div>' +
+        '<div class="tools-msg tools-push-status" id="tools-push-status" role="status" aria-live="polite" hidden></div>'));
+      assert.equal((markup.match(/data-mutate/g) || []).length, 1, "the footer Send is the form's only leased control");
+      assert.equal((markup.match(/data-sim=/g) || []).length, 1);
       // Visual order is tab order: the fields, then the delivery, the JSON switch and the actions.
       const order = ["tools-push-app", "tools-push-title", "tools-push-body", "tools-push-badge", "tools-push-sound", "tools-push-silent",
         "tools-push-data-add", "tools-push-payload", ...(platform === "android" ? ["tools-push-delivery", "tools-push-stopped"] : []),
-        "tools-push-json-mode", "tools-push-preview-run", "tools-push-reset"].map((id) => markup.indexOf(`id="${id}"`));
+        "tools-push-json-mode", "tools-push-send", "tools-push-preview-run", "tools-push-reset", "tools-push-status"].map((id) => markup.indexOf(`id="${id}"`));
       assert.deepEqual(order, [...order].sort((a, b) => a - b), platform);
       assert.ok(order.every((at) => at >= 0));
     }
@@ -280,8 +288,27 @@ describe("status line", () => {
     assert.equal(line(null).text, "Push sent.");
   });
 
+  test("notifications denied: the line says why nothing is shown, and the warning is not repeated", () => {
+    const denied = { code: "push_notifications_denied", error: "not granted", hint: "autonom permissions grant notifications x" };
+    assert.deepEqual(core.status({ delivery: "app", verified: false, verification: "not_in_shade", warnings: [denied] }, "android"), {
+      text: "Push delivered to the app. Notifications are not allowed for this app, so nothing is shown: grant them on the App tab.", hint: "" });
+    const other = core.status({ delivery: "app", verified: false, verification: "not_in_shade", warnings: [denied, { code: "push_payload_large", error: "x" }] }, "android");
+    assert.match(other.text, /so nothing is shown/);
+    assert.equal(other.hint, "The payload is larger than 4 KB: the Simulator may take it, a real APNs send would not.");
+    // without the warning the app was in front; with a read-back the warning stays a hint
+    assert.equal(core.status({ delivery: "app", verified: false, verification: "not_in_shade" }, "android").text,
+      "Push delivered to the app. Nothing in the shade: an app that is open handles it itself.");
+    assert.deepEqual(core.status({ delivery: "app", verified: true, verification: "read_back", warnings: [denied] }, "android"),
+      { text: "Push delivered. It is in the notification shade.", hint: "Notifications are not allowed for this app: grant them on the App tab." });
+  });
+
+  test("a silent push the Simulator took is said to be unconfirmed", () => {
+    assert.deepEqual(core.status({ verified: false, verification: "unavailable", warnings: [{ code: "push_silent_unconfirmed", error: "simctl accepted the silent push" }] }, "ios"),
+      { text: "Push sent (the device cannot confirm it).", hint: "The Simulator took the silent push; whether the app ran its background code is not known." });
+  });
+
   test("every warning is added once, in plain words", () => {
-    const { hint } = core.status({ verified: false, verification: "not_in_shade", warnings: [
+    const { hint } = core.status({ verified: true, verification: "read_back", warnings: [
       { code: "push_notifications_denied", error: "not granted", hint: "autonom permissions grant notifications x" },
       { code: "push_notifications_denied", error: "again" },
       { code: "slim_push_off", error: "com.apple.apsd is switched off", hint: "Switch it back on with 'autonom simulator slim enable --value ids=com.apple.apsd'." },

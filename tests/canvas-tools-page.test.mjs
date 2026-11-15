@@ -406,7 +406,8 @@ describe("toolsButton and toolsMarkup", () => {
   test("Android shows push without Subtitle, hides Clear, and shows read-back and network simulation", () => {
     const document = parseMarkup(toolsMarkup({ platform: "android" }));
     assert.equal(document.getElementById("tools-perms-note"), null);
-    assert.equal(document.querySelectorAll("[data-sim=push]").length, 1);
+    // the row's Send and the form footer's
+    assert.deepEqual(document.querySelectorAll("[data-sim=push]").map((button) => button.id), ["", "tools-push-send"]);
     assert.ok(document.getElementById("tools-push-payload"), "the JSON textarea keeps its id");
     assert.equal(document.getElementById("tools-push-subtitle") === null, true, "Subtitle is iOS only");
     assert.ok(document.getElementById("tools-push-delivery"));
@@ -718,7 +719,7 @@ describe("toolsScript in the page context", () => {
     await flush();
     const visible = (page) => page.document.querySelectorAll("[data-sim]").filter((button) => !button.hidden && !button.closest("[hidden]"))
       .map((button) => `${button.getAttribute("data-sim")}:${button.getAttribute("data-action")}`);
-    assert.deepEqual(visible(android), ["push:send", "biometric:match", "biometric:nonmatch", "biometric:settings", "battery:set", "battery:reset", "network:online", "network:offline", "appearance:light", "appearance:dark", "text-size:0.85", "text-size:1.0", "text-size:1.3", "text-size:1.5", "text-size:2.0", "animations:pin", "animations:reset"]);
+    assert.deepEqual(visible(android), ["push:send", "push:send", "biometric:match", "biometric:nonmatch", "biometric:settings", "battery:set", "battery:reset", "network:online", "network:offline", "appearance:light", "appearance:dark", "text-size:0.85", "text-size:1.0", "text-size:1.3", "text-size:1.5", "text-size:2.0", "animations:pin", "animations:reset"]);
     click(android.document.querySelector("[data-sim=appearance][data-action=dark]"));
     await flush();
     assert.deepEqual(android.ops("simulate").map((call) => call.body.payload), [{ control: "appearance", action: "dark", values: {} }]);
@@ -728,7 +729,7 @@ describe("toolsScript in the page context", () => {
     click(ios.$("tools-toggle"));
     click(ios.$("tools-tab-simulate"));
     await flush();
-    assert.deepEqual(visible(ios), ["push:send", "biometric:match", "biometric:nonmatch", "biometric:enroll", "biometric:unenroll",
+    assert.deepEqual(visible(ios), ["push:send", "push:send", "biometric:match", "biometric:nonmatch", "biometric:enroll", "biometric:unenroll",
       "battery:set", "battery:reset", "appearance:light", "appearance:dark", "text-size:small", "text-size:large", "text-size:extra-extra-extra-large", "text-size:accessibility-extra-extra-extra-large"]);
     click(ios.document.querySelector("[data-sim=push]"));
     await flush();
@@ -2300,8 +2301,7 @@ describe("Push form", () => {
     ]) });
     await openSimulate(android);
     await send(android);
-    assert.equal(status(android), "Push delivered to the app. Nothing in the shade: an app that is open handles it itself." +
-      "Notifications are not allowed for this app: grant them on the App tab.");
+    assert.equal(status(android), "Push delivered to the app. Notifications are not allowed for this app, so nothing is shown: grant them on the App tab.");
     assert.equal(android.$("tools-msg-simulate").getAttribute("data-kind"), "ok");
     await send(android);
     assert.equal(status(android), "Notification shown in the shade. The app’s code did not run.");
@@ -2471,5 +2471,104 @@ describe("Push form", () => {
     assert.equal(page.$("tools-push-delivery").value, "shade");
     assert.equal(page.$("tools-push-summary").textContent, "Autonom — Hello from the Canvas");
     assert.equal(JSON.parse(saved.getItem("autonom.canvas.push.v1:android")).form.title, "Autonom");
+  });
+
+  // The open form is taller than the drawer: a second Send sits in its footer, and its result
+  // shows under the footer, where it was pressed.
+  const footerSend = (page) => page.$("tools-push-send");
+  const footerStatus = (page) => page.$("tools-push-status");
+
+  test("the footer Send sends what the row's Send sends and shows the result under the footer, errors and hints too", async () => {
+    const page = boot({ platform: "android", reply: replies([
+      ok({ delivery: "app", verified: true, verification: "read_back" }),
+      ok({ delivery: "app", verified: true, verification: "read_back", warnings: [{ code: "push_payload_large", error: "x" }] }),
+      { status: 409, body: { ok: false, error: "the push was not delivered", error_code: "push_not_delivered", hint: "launch it once", reason: "not_received", capability: "simulator.push" } },
+      { status: 504, body: { ok: false, error: "no answer", error_code: "timeout" } },
+      ok({ delivery: "app", verified: true, verification: "read_back" }),
+      ok({ delivery: "app", verified: true, verification: "read_back" }),
+    ]) });
+    await openSimulate(page);
+    type(page, "tools-push-title", "Order shipped");
+    await send(page);
+    const fromRow = sent(page);
+    assert.equal(footerStatus(page).hidden, true, "the row's Send writes the panel line only");
+
+    click(footerSend(page));
+    await flush();
+    assert.equal(page.ops("simulate").length, 2);
+    assert.deepEqual(page.ops("simulate")[1].body.payload, { control: "push", action: "send", values: fromRow });
+    assert.equal(footerStatus(page).getAttribute("role"), "status");
+    assert.equal(footerStatus(page).hidden, false);
+    assert.equal(footerStatus(page).getAttribute("data-kind"), "ok");
+    assert.equal(footerStatus(page).textContent, "Push delivered. It is in the notification shade." +
+      "The payload is larger than 4 KB: the Simulator may take it, a real APNs send would not.");
+    assert.equal(footerStatus(page).textContent, status(page), "the same text as the panel line");
+
+    click(footerSend(page));
+    await flush();
+    assert.equal(footerStatus(page).getAttribute("data-kind"), "error");
+    assert.equal(footerStatus(page).textContent, "the push was not delivered (push_not_delivered)" +
+      "The app is stopped or was never started. Open the app once, or tick “Reach a stopped app”.");
+    assert.equal(footerStatus(page).textContent, status(page));
+
+    click(footerSend(page));
+    await flush();
+    assert.match(footerStatus(page).textContent, /^No answer within 60 s, so the outcome is unknown/);
+    assert.equal(footerStatus(page).textContent, status(page));
+
+    type(page, "tools-push-body", "Edited");
+    assert.equal(footerStatus(page).hidden, true, "editing the message clears the footer line");
+    assert.equal(footerStatus(page).textContent, "");
+    assert.match(status(page), /No answer within 60 s/, "the panel line stays");
+
+    click(footerSend(page));
+    await flush();
+    assert.equal(footerStatus(page).hidden, false);
+    await send(page);
+    assert.equal(footerStatus(page).hidden, true, "a Send from the row leaves no older line under the footer");
+    assert.equal(status(page), "Push delivered. It is in the notification shade.");
+  });
+
+  test("a refusal in the page is shown under the footer too, and Reset clears it", async () => {
+    const page = boot({ platform: "android" });
+    await openSimulate(page);
+    page.$("tools-app-id").value = "";
+    click(footerSend(page));
+    await flush();
+    assert.equal(page.ops("simulate").length, 0);
+    assert.equal(footerStatus(page).getAttribute("data-kind"), "error");
+    assert.match(footerStatus(page).textContent, /^Enter a package here or on the App tab\. \(invalid_value\)$/);
+    assert.equal(page.$("tools-push-app").getAttribute("aria-invalid"), "true");
+    click(page.$("tools-push-reset"));
+    assert.equal(footerStatus(page).hidden, true);
+  });
+
+  test("both Sends are busy together while a push is on its way, and both follow the control rule", async () => {
+    let release;
+    const page = boot({ platform: "ios", reply: ({ op }) => op === "simulate" ? new Promise((resolve) => { release = () => resolve(ok({ verified: false, verification: "unavailable" })); }) : null });
+    await openSimulate(page);
+    click(footerSend(page));
+    await flush();
+    for (const button of [sendButton(page), footerSend(page)]) {
+      assert.equal(button.disabled, true);
+      assert.equal(button.getAttribute("aria-busy"), "true");
+    }
+    click(sendButton(page));
+    click(footerSend(page));
+    await flush();
+    assert.equal(page.ops("simulate").length, 1, "no second push while one is on its way");
+    release();
+    await flush();
+    for (const button of [sendButton(page), footerSend(page)]) {
+      assert.equal(button.disabled, false);
+      assert.equal(button.getAttribute("aria-busy"), null);
+    }
+    assert.equal(footerStatus(page).textContent, "Push sent (the device cannot confirm it).");
+
+    const locked = boot({ platform: "ios", canSend: () => false });
+    await openSimulate(locked);
+    assert.equal(sendButton(locked).disabled, true);
+    assert.equal(footerSend(locked).disabled, true);
+    assert.equal(locked.$("tools-push-preview-run").disabled, false, "Preview changes nothing on the device");
   });
 });
