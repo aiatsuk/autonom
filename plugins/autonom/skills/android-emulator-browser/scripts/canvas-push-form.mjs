@@ -221,6 +221,7 @@ export function pushFormCore() {
     push_payload_large: "The payload is larger than 4 KB: the Simulator may take it, a real APNs send would not.",
     push_silent_unconfirmed: "The Simulator took the silent push; whether the app ran its background code is not known.",
   };
+  const PAYLOAD_LARGE_ANDROID = "The message is larger than 4 KB: the emulator takes it, a real FCM send would not.";
   /** The status line after Send: {text, hint}; hint holds every warning in plain words. */
   function status(reply, platform) {
     const result = isObject(reply) ? reply : {};
@@ -243,6 +244,8 @@ export function pushFormCore() {
     for (const item of warnings) {
       if (item.code === "push_shade_only" || item.code === said) continue; // the line already says it
       let words = WARNINGS[item.code];
+      // the same code on Android is about the FCM extras, not the Simulator and APNs
+      if (item.code === "push_payload_large" && (string(item.platform) || platform) === "android") words = PAYLOAD_LARGE_ANDROID;
       if (item.code === "slim_push_off") words = "Push is switched off on this Simulator (simulator slim), so it may not show." + (filled(item.hint) ? " " + item.hint : "");
       if (!words) words = string(item.error) || string(item.code);
       if (words && !notes.includes(words)) notes.push(words);

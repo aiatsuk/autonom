@@ -2501,7 +2501,7 @@ describe("Push form", () => {
     assert.equal(footerStatus(page).hidden, false);
     assert.equal(footerStatus(page).getAttribute("data-kind"), "ok");
     assert.equal(footerStatus(page).textContent, "Push delivered. It is in the notification shade." +
-      "The payload is larger than 4 KB: the Simulator may take it, a real APNs send would not.");
+      "The message is larger than 4 KB: the emulator takes it, a real FCM send would not.");
     assert.equal(footerStatus(page).textContent, status(page), "the same text as the panel line");
 
     click(footerSend(page));

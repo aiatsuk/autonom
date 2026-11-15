@@ -294,7 +294,12 @@ describe("status line", () => {
       text: "Push delivered to the app. Notifications are not allowed for this app, so nothing is shown: grant them on the App tab.", hint: "" });
     const other = core.status({ delivery: "app", verified: false, verification: "not_in_shade", warnings: [denied, { code: "push_payload_large", error: "x" }] }, "android");
     assert.match(other.text, /so nothing is shown/);
-    assert.equal(other.hint, "The payload is larger than 4 KB: the Simulator may take it, a real APNs send would not.");
+    assert.equal(other.hint, "The message is larger than 4 KB: the emulator takes it, a real FCM send would not.");
+    // the size warning speaks about the platform it is for: the reply's own platform wins over the page's
+    const large = { code: "push_payload_large", error: "x" };
+    assert.equal(core.status({ verified: false, warnings: [large] }, "ios").hint, "The payload is larger than 4 KB: the Simulator may take it, a real APNs send would not.");
+    assert.equal(core.status({ verified: false, warnings: [{ ...large, platform: "android" }] }, "ios").hint, "The message is larger than 4 KB: the emulator takes it, a real FCM send would not.");
+    assert.equal(core.status({ delivery: "app", verified: true, warnings: [{ ...large, platform: "ios" }] }, "android").hint, "The payload is larger than 4 KB: the Simulator may take it, a real APNs send would not.");
     // without the warning the app was in front; with a read-back the warning stays a hint
     assert.equal(core.status({ delivery: "app", verified: false, verification: "not_in_shade" }, "android").text,
       "Push delivered to the app. Nothing in the shade: an app that is open handles it itself.");
@@ -319,7 +324,7 @@ describe("status line", () => {
     ] }, "android");
     assert.equal(hint, "Notifications are not allowed for this app: grant them on the App tab. " +
       "Push is switched off on this Simulator (simulator slim), so it may not show. Switch it back on with 'autonom simulator slim enable --value ids=com.apple.apsd'. " +
-      "The payload is larger than 4 KB: the Simulator may take it, a real APNs send would not. A new warning. bare_code");
+      "The message is larger than 4 KB: the emulator takes it, a real FCM send would not. A new warning. bare_code");
   });
 
   test("push_not_delivered says what to do for each reason; anything else keeps the server's hint", () => {
