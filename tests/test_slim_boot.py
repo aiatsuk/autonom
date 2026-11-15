@@ -140,6 +140,30 @@ class BootTests(BootBase):
         self.patch_fake(slim_overrides_lost=True)
         error = self.boot_error("minimal")
         self.assertEqual(error.code, errors.SLIM_NOT_PERSISTED)
+        self.assertIs(error.extra["store_written"], True)
+        self.assertEqual(error.extra["state_file"], str(self.state_file()))
+        self.assertEqual(self.saved()["status"], "not_persisted")
+
+    def test_a_boot_that_fails_after_the_write_says_so(self) -> None:
+        self.set_device("Shutdown")
+        self.patch_fake(simctl_fail={"simctl bootstatus": [1, "Unable to boot device"]})
+        error = self.boot_error("minimal")
+        self.assertEqual(error.code, errors.IOS_BOOT_FAILED)
+        self.assertIs(error.extra["store_written"], True)
+        self.assertEqual(error.extra["state_file"], str(self.state_file()))
+        self.assertEqual(error.extra["simulator_state"], "Shutdown")
+        self.assertIn(f"autonom devices boot --platform ios --udid {UDID}", error.hint)
+        self.assertIn("autonom simulator slim restore", error.hint)
+        self.assertEqual(ios_slim.disabled_in(self.store()), set(MINIMAL))
+        # a retry finds the store as it should be and says it wrote nothing new
+        error = self.boot_error("minimal")
+        self.assertIs(error.extra["store_written"], False)
+        self.assertEqual(error.extra["state_file"], str(self.state_file()))
+        # and once the boot works, the plain retry the hint names is enough
+        self.patch_fake(simctl_fail={})
+        booted, block = simulator_slim.boot(self.target, "minimal")
+        self.assertTrue(booted and block["verified"])
+        self.assertEqual(block["state"], "slim")
 
     def test_android_is_unsupported(self) -> None:
         error = self.boot_error("minimal", Target(ANDROID, "emulator-5554", "adb", {}))
@@ -168,6 +192,25 @@ class CliTests(BootBase):
         self.assertNotEqual(code, 0)
         self.assertEqual(payload["error_code"], errors.SIMULATOR_MUST_BE_SHUTDOWN)
         self.assertTrue(payload["hint"])
+
+    def test_a_failed_boot_names_the_written_store_through_the_cli(self) -> None:
+        self.patch_fake(simctl_fail={"simctl bootstatus": [1, "Unable to boot device"]})
+        commands = (("devices", "boot", "--slim", "minimal"),
+                    ("session", "start", "--slim", "minimal"))
+        for index, command in enumerate(commands):
+            with self.subTest(command=command[:2]):
+                self.set_device("Shutdown")
+                code, payload = self.run_cli("--simctl", str(FAKE_SIMCTL), "--udid", UDID,
+                                             *command)
+                self.assertNotEqual(code, 0)
+                self.assertEqual(payload["error_code"], errors.IOS_BOOT_FAILED)
+                self.assertIs(payload["store_written"], index == 0)
+                self.assertEqual(payload["state_file"], str(self.state_file()))
+                self.assertEqual(payload["simulator_state"], "Shutdown")
+                self.assertIn("autonom devices boot", payload["hint"])
+                self.assertIn("autonom simulator slim restore", payload["hint"])
+        code, payload = self.run_cli("session", "status")
+        self.assertNotEqual(payload.get("ok"), True, payload)
 
     def test_devices_boot_without_slim_changes_nothing(self) -> None:
         self.set_device("Shutdown")

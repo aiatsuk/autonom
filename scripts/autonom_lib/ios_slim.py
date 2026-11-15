@@ -35,6 +35,9 @@ from .ios_slim_catalog import (CATALOG_SOURCE, CATEGORIES, FEATURES, FORBIDDEN_L
 
 PROFILE_SCHEMA = "autonom.slim-profile/v1"
 STATE_SCHEMA = "autonom.slim-state/v1"
+STATUS_APPLIED = "applied"
+STATUS_NOT_PERSISTED = "not_persisted"
+STATE_STATUSES = (STATUS_APPLIED, STATUS_NOT_PERSISTED)
 TMP_ROOT_ENV = "AUTONOM_SIMDEVICE_TMP_ROOT"
 DEFAULT_TMP_ROOT = "/private/var/tmp"
 STORE_DIR_PREFIX = "com.apple.CoreSimulator.SimDevice."
@@ -521,36 +524,101 @@ def state_path(udid: str) -> Path:
     return ios_prefs.state_root() / "simulator-slim" / f"{require_udid(udid)}.json"
 
 
-def read_state(udid: str) -> dict[str, Any] | None:
+def same_entry(left: Any, right: Any) -> bool:
+    """Whether two store values are the same entry (None: no entry). `True`
+    and `1` are different entries."""
+    return type(left) is type(right) and left == right
+
+
+def load_state(udid: str) -> tuple[dict[str, Any] | None, str | None]:
+    """(state, problem). No file is (None, None); a file that is there and
+    cannot be used is (None, what is wrong with it), so a caller can tell
+    "nothing to undo" from "cannot tell what to undo"."""
     path = state_path(udid)
     try:
-        loaded = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
-        return None
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None, None
+    except (OSError, UnicodeDecodeError) as exc:
+        return None, f"cannot be read: {getattr(exc, 'strerror', None) or exc}"
+    try:
+        loaded = json.loads(text)
+    except json.JSONDecodeError as exc:
+        return None, f"is not valid JSON: {exc}"
     if not isinstance(loaded, dict) or loaded.get("schema") != STATE_SCHEMA:
-        return None
+        return None, f"is not an {STATE_SCHEMA} file"
     if not isinstance(loaded.get("disabled"), list) or not isinstance(
             loaded.get("previous"), dict):
-        return None
+        return None, "has no usable 'disabled' list and 'previous' map"
     if not all(isinstance(label, str) for label in loaded["disabled"]):
-        return None
+        return None, "names something that is not a label under 'disabled'"
     live = loaded.get("live") if isinstance(loaded.get("live"), dict) else {}
     loaded["live"] = {key: [label for label in (live.get(key) or ())
                             if isinstance(label, str)]
                       if isinstance(live.get(key), list) else []
                       for key in ("enabled", "disabled")}
-    return loaded
+    # A file written before `written` existed recorded disabled labels only.
+    off = set(loaded["disabled"])
+    written = loaded.get("written") if isinstance(loaded.get("written"), dict) else {}
+    loaded["previous"] = {**{label: None for label in off}, **loaded["previous"]}
+    loaded["written"] = {label: written[label] if label in written else label in off
+                         for label in loaded["previous"]}
+    if loaded.get("status") not in STATE_STATUSES:
+        loaded["status"] = STATUS_APPLIED
+    return loaded, None
 
 
-def new_state(udid: str, profile: dict[str, Any] | None, disabled: Iterable[str],
-              previous: dict[str, Any], live: dict[str, list[str]] | None = None,
-              ) -> dict[str, Any]:
-    labels = sorted(set(disabled) & CATALOG_LABELS)
+def read_state(udid: str) -> dict[str, Any] | None:
+    """The state file, or None when there is none or it cannot be used (a
+    command that rewrites it anyway). `load_state` tells the two apart."""
+    return load_state(udid)[0]
+
+
+def changes_of(state: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
+    """label -> {previous, written} for every catalog label the state file
+    says Autonom changed."""
+    if not state:
+        return {}
+    return {label: {"previous": previous, "written": state["written"].get(label)}
+            for label, previous in state["previous"].items()
+            if isinstance(label, str) and label in CATALOG_LABELS}
+
+
+def record_change(changes: dict[str, dict[str, Any]], label: str, before: Any,
+                  after: Any) -> None:
+    """Note that Autonom took the store entry of `label` from `before` to
+    `after` (None: no entry). The first value seen is the one restore puts
+    back; an entry someone else changed since Autonom's last write starts
+    over from their value; an entry that is back where it started is no
+    longer Autonom's."""
+    known = changes.get(label)
+    if known is not None and not same_entry(known["written"], before):
+        known = None
+    previous = known["previous"] if known is not None else before
+    if not isinstance(previous, (bool, int, float, str)):
+        previous = None
+    if same_entry(previous, after):
+        changes.pop(label, None)
+    else:
+        changes[label] = {"previous": previous, "written": after}
+
+
+def new_state(udid: str, profile: dict[str, Any] | None,
+              changes: dict[str, dict[str, Any]],
+              live: dict[str, Iterable[str]] | None = None,
+              status: str = STATUS_APPLIED) -> dict[str, Any]:
+    labels = sorted(set(changes) & CATALOG_LABELS)
     return {
         "schema": STATE_SCHEMA, "udid": udid, "profile": profile,
-        "disabled": labels,
-        # label -> the store entry before Autonom disabled it (null: no entry)
-        "previous": {label: previous.get(label) for label in labels},
+        # applied: read back or written for the next boot; not_persisted: the
+        # runtime did not keep the overrides after a reboot
+        "status": status,
+        # the labels Autonom disabled
+        "disabled": [label for label in labels if changes[label]["written"] is True],
+        # label -> the store entry before Autonom changed it, in either
+        # direction (null: no entry), and the entry Autonom wrote last
+        "previous": {label: changes[label]["previous"] for label in labels},
+        "written": {label: changes[label]["written"] for label in labels},
         "live": {"enabled": sorted(set((live or {}).get("enabled") or ())),
                  "disabled": sorted(set((live or {}).get("disabled") or ()))},
         "applied_at": utc_now(),

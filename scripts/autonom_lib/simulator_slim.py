@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import subprocess
 import tempfile
 from pathlib import Path
 from typing import Any, Iterable
@@ -32,7 +33,6 @@ from .platform import ANDROID, Target
 CONTROL = "slim"
 ACTIONS = ("presets", "show", "suggest", "apply", "verify", "enable", "disable", "restore")
 READONLY_ACTIONS = frozenset({"presets", "show", "suggest", "verify"})
-_JSON_SCALARS = (bool, int, float, str)
 
 
 def run(target: Target | None, action: str, values: dict[str, Any]) -> dict[str, Any]:
@@ -162,29 +162,51 @@ def _boot_back(target: Target, udid: str) -> None:
         pass
 
 
-def _scalar(value: Any) -> Any:
-    return value if isinstance(value, _JSON_SCALARS) else None
-
-
-def _state_block(udid: str, state: dict[str, Any] | None) -> dict[str, Any]:
-    block: dict[str, Any] = {"exists": state is not None,
+def _state_block(udid: str, state: dict[str, Any] | None,
+                 problem: str | None = None) -> dict[str, Any]:
+    block: dict[str, Any] = {"exists": state is not None or problem is not None,
                              "path": str(ios_slim.state_path(udid))}
-    if state is not None:
-        block.update({"profile": state.get("profile"),
+    if problem is not None:
+        # there and unusable is not the same as absent
+        block.update({"readable": False, "problem": problem})
+    elif state is not None:
+        block.update({"readable": True, "status": state.get("status"),
+                      "profile": state.get("profile"),
                       "disabled": len(state.get("disabled") or ()),
+                      "changed": len(state.get("previous") or ()),
                       "live": state.get("live"),
                       "applied_at": state.get("applied_at")})
     return block
 
 
+def _state_unreadable(udid: str, problem: str, hint: str) -> errors.AutonomError:
+    path = ios_slim.state_path(udid)
+    return errors.AutonomError(
+        errors.BACKEND_FAILED, f"the slim state file {path} {problem}", hint,
+        target_id=udid, state_file=str(path))
+
+
+def _names(labels: Iterable[str], limit: int = 8) -> str:
+    labels = list(labels)
+    more = len(labels) - limit
+    return ", ".join(labels[:limit]) + (f" and {more} more" if more > 0 else "")
+
+
 def _commit(udid: str, entries: dict[str, Any], planned: dict[str, Any],
-            state: dict[str, Any] | None) -> None:
+            state: dict[str, Any] | None, *, revert_to: dict[str, Any] | None = None,
+            live_changed: tuple[str, list[str]] | None = None) -> None:
     """Write the store, then the state file that describes it (None deletes
     it). A store that could not be written leaves the state file as it was; a
     state file that could not be written puts the store back, so the state
     file never claims a change that is not in the store and the store never
-    holds a change restore knows nothing about."""
+    holds a change restore knows nothing about.
+
+    A live `enable`/`disable` has changed the running simulator by then:
+    ``revert_to`` is the store before its `launchctl` calls, ``live_changed``
+    (what happened, the labels) is named in the error, because putting the
+    store back does not put the running services back."""
     existed = ios_slim.store_path(udid).exists()
+    before = entries if revert_to is None else revert_to
     if planned != entries:
         ios_slim.write_store(udid, planned)
     try:
@@ -194,10 +216,10 @@ def _commit(udid: str, entries: dict[str, Any], planned: dict[str, Any],
             ios_slim.write_state(udid, state)
     except OSError as exc:
         reverted = True
-        if planned != entries:
+        if planned != before:
             try:
                 if existed:
-                    ios_slim.write_store(udid, entries)
+                    ios_slim.write_store(udid, before)
                 else:
                     ios_slim.store_path(udid).unlink()
             except (OSError, errors.AutonomError):
@@ -207,11 +229,69 @@ def _commit(udid: str, entries: dict[str, Any], planned: dict[str, Any],
                 "Check that the Autonom state directory is writable. The simulator's "
                 f"override store {ios_slim.store_path(udid)} could NOT be put back and "
                 "holds the new entries; 'simulator slim show' reads what it says now.")
+        extra: dict[str, Any] = {"store_reverted": reverted}
+        if live_changed and live_changed[1]:
+            what, labels = live_changed
+            hint = ("Check that the Autonom state directory is writable. "
+                    + ("The override store was put back as it was, so the next boot "
+                       "is unchanged" if reverted else
+                       f"The override store {ios_slim.store_path(udid)} could NOT be "
+                       "put back and holds the new entries")
+                    + f", but the running services were already changed: {len(labels)} "
+                      f"service(s) {what} for this boot ({_names(labels)}). Run the "
+                      "command again once the state directory is writable, or reboot "
+                      "the simulator to bring it back to what the store says.")
+            extra.update({"live_changed": True, f"live_{what}": labels})
         raise errors.AutonomError(
             errors.BACKEND_FAILED,
             f"cannot write the slim state file {ios_slim.state_path(udid)}: "
             f"{exc.strerror or exc}",
-            hint, store_reverted=reverted) from exc
+            hint, **extra) from exc
+
+
+def _after_write(target: Target, udid: str, exc: errors.AutonomError, *,
+                 written: bool, undo: str = "") -> errors.AutonomError:
+    """The error of a boot that failed after the store was written: the same
+    code and message, plus what was written and both ways out. Without it a
+    failed boot reads as if nothing had happened to the simulator."""
+    try:
+        found = ios_simctl.find_simulator(target.tool, udid)
+        sim_state = found.state if found is not None else None
+    except Exception:  # noqa: BLE001 - the boot failure is the error to report
+        sim_state = None
+    state_file = ios_slim.state_path(udid)
+    extra = {**exc.extra, "target_id": udid, "store_written": written,
+             "store": str(ios_slim.store_path(udid)),
+             "state_file": str(state_file) if state_file.exists() else None,
+             "simulator_state": sim_state}
+    hint = exc.hint
+    if exc.code != errors.SLIM_NOT_PERSISTED:
+        device = f"--platform ios --udid {udid}"
+        hint = ((exc.hint + " ") if exc.hint else "") + (
+            ("The launchd override store of this simulator was already written"
+             if written else
+             "The launchd override store of this simulator already holds these overrides")
+            + f" and the simulator is {sim_state or 'in an unknown state'}. Two ways "
+              f"out: retry the boot with 'autonom devices boot {device}' and check it "
+              f"with 'autonom simulator slim verify {device}', or put the store back "
+              f"with 'autonom simulator slim restore {device}{undo}'.")
+    return errors.AutonomError(exc.code, exc.message, hint, **extra)
+
+
+def _converge_written(target: Target, udid: str, *, written: bool, undo: str = "",
+                      **kwargs: Any) -> dict[str, Any]:
+    """`_converge` for a store that is already written (see `_after_write`)."""
+    try:
+        return _converge(target, udid, **kwargs)
+    except errors.AutonomError as exc:
+        raise _after_write(target, udid, exc, written=written, undo=undo) from exc
+    except subprocess.TimeoutExpired as exc:
+        # the same envelope the CLI gives a backend that stopped answering
+        timed_out = errors.AutonomError(
+            errors.BACKEND_FAILED,
+            f"backend timed out: {' '.join(map(str, exc.cmd or []))[:200]}",
+            "The device or tool stopped responding; check 'autonom doctor' and retry.")
+        raise _after_write(target, udid, timed_out, written=written, undo=undo) from exc
 
 
 def _converge(target: Target, udid: str, *, want_disabled: Iterable[str],
@@ -238,6 +318,14 @@ def _converge(target: Target, udid: str, *, want_disabled: Iterable[str],
     still_missing, still_extra = lost()
     if still_missing or still_extra:
         labels = sorted({*still_missing, *still_extra})
+        # the file stays (restore needs it) and stops claiming the profile
+        state = ios_slim.read_state(udid)
+        if state is not None:
+            try:
+                ios_slim.write_state(
+                    udid, {**state, "status": ios_slim.STATUS_NOT_PERSISTED})
+            except OSError:
+                pass
         raise errors.AutonomError(
             errors.SLIM_NOT_PERSISTED,
             f"{len(labels)} launchd override(s) did not survive the reboot of "
@@ -262,13 +350,13 @@ def _show(target: Target, values: dict[str, Any]) -> dict[str, Any]:
     udid, sim_state = _device(target)
     runtime, persistent = _runtime(target, udid)
     disabled, source = _actual(target, udid, sim_state)
-    state = ios_slim.read_state(udid)
+    state, problem = ios_slim.load_state(udid)
     summary = ios_slim.summarize(
         disabled, ios_slim.expected_disabled(state) if state else None)
     return {"control": CONTROL, "action": "show", **summary, "source": source,
             "simulator_state": sim_state, "runtime": runtime, "persistent": persistent,
             "core_keep": {label: label not in disabled for label in ios_slim.CORE_KEEP},
-            "state_file": _state_block(udid, state),
+            "state_file": _state_block(udid, state, problem),
             "verified": True,
             "verification": "read_back" if source == "launchctl" else "store_read"}
 
@@ -281,7 +369,14 @@ def _verify(target: Target, values: dict[str, Any]) -> dict[str, Any]:
         desired = ios_slim.resolve(profile)
         result.update({"compared_with": "settings", "profile": profile})
     else:
-        state = ios_slim.read_state(udid)
+        state, problem = ios_slim.load_state(udid)
+        if problem is not None:
+            raise _state_unreadable(
+                udid, problem,
+                "Without it there is nothing to compare with. Pass the settings "
+                "(--value preset=... or profile=<path>) to compare with a profile, or "
+                "run 'autonom simulator slim restore --value all=true' to re-enable "
+                "every catalog service and drop the file.")
         desired = ios_slim.expected_disabled(state)
         if state is None:
             result.update({"compared_with": "stock", "profile": None,
@@ -289,7 +384,8 @@ def _verify(target: Target, values: dict[str, Any]) -> dict[str, Any]:
                                    "compared with stock; pass preset=... to compare "
                                    "with a profile"})
         else:
-            result.update({"compared_with": "state_file", "profile": state.get("profile")})
+            result.update({"compared_with": "state_file", "profile": state.get("profile"),
+                           "status": state.get("status")})
     disabled, source = _actual(target, udid, sim_state)
     result.update(ios_slim.compare(disabled, desired))
     result.update({"expected_disabled": len(desired), "source": source,
@@ -442,9 +538,11 @@ def _apply(target: Target, values: dict[str, Any]) -> dict[str, Any]:
         to_disable, to_enable = ios_slim.delta(_live_disabled(target, udid), desired)
         if not to_disable and not to_enable:
             # Already there: nothing is written and nothing is rebooted.
-            if old is not None and (old.get("profile") != profile or any(
-                    (old.get("live") or {}).values())):
+            if old is not None and (
+                    old.get("profile") != profile or any((old.get("live") or {}).values())
+                    or old.get("status") != ios_slim.STATUS_APPLIED):
                 ios_slim.write_state(udid, {**old, "profile": profile,
+                                            "status": ios_slim.STATUS_APPLIED,
                                             "live": {"enabled": [], "disabled": []}})
             result.update({"changed": 0, "disabled_now": 0, "enabled_now": 0,
                            "rebooted": False, "state_file": str(ios_slim.state_path(udid))
@@ -455,20 +553,22 @@ def _apply(target: Target, values: dict[str, Any]) -> dict[str, Any]:
     try:
         entries = ios_slim.read_store(udid)
         to_disable, to_enable = ios_slim.delta(ios_slim.disabled_in(entries), desired)
-        owned_before = set(old["disabled"]) if old else set()
-        previous_before = old["previous"] if old else {}
+        # What Autonom changed so far. An entry someone else changed since is
+        # theirs now: it is no longer tracked.
+        changes = {label: change for label, change in ios_slim.changes_of(old).items()
+                   if ios_slim.same_entry(change["written"], entries.get(label))}
         # A label Autonom disabled earlier goes back to what it was; any other
         # label that must be on gets an explicit `false`.
-        put_back = {label: previous_before.get(label) for label in to_enable
-                    if label in owned_before and previous_before.get(label) is not True}
+        put_back = {label: changes[label]["previous"] for label in to_enable
+                    if label in changes and changes[label]["previous"] is not True}
         planned = ios_slim.merged_entries(
             entries, disable=to_disable,
             enable=[label for label in to_enable if label not in put_back],
             restore=put_back)
-        owned = (owned_before & desired) | set(to_disable)
-        previous = {label: previous_before[label] if label in previous_before
-                    else _scalar(entries.get(label)) for label in owned}
-        state = ios_slim.new_state(udid, profile, owned, previous) if owned else None
+        # every flip, in either direction, is recorded so restore can undo it
+        for label in (*to_disable, *to_enable):
+            ios_slim.record_change(changes, label, entries.get(label), planned.get(label))
+        state = ios_slim.new_state(udid, profile, changes) if changes else None
         _commit(udid, entries, planned, state)
     except BaseException:
         if booted:
@@ -487,8 +587,9 @@ def _apply(target: Target, values: dict[str, Any]) -> dict[str, Any]:
         result["verified"] = False
         result["verification"] = "store_written" if planned != entries else "store_matches"
         return result
-    result.update(_converge(target, udid, want_disabled=desired,
-                            want_enabled=ios_slim.CATALOG_LABELS - desired))
+    result.update(_converge_written(
+        target, udid, written=planned != entries, want_disabled=desired,
+        want_enabled=ios_slim.CATALOG_LABELS - desired))
     simulator._checked(result, True)
     _finish_reboot(target, result)
     return result
@@ -499,8 +600,14 @@ def _restore(target: Target, values: dict[str, Any]) -> dict[str, Any]:
     everything = simulator._bool(values, "all", False)
     udid, sim_state = _device(target)
     result: dict[str, Any] = {"control": CONTROL, "action": "restore"}
-    state = ios_slim.read_state(udid)
-    result["state_file_found"] = state is not None
+    state, problem = ios_slim.load_state(udid)
+    if problem is not None and not everything:
+        raise _state_unreadable(
+            udid, problem,
+            "It cannot say what Autonom changed, so nothing was restored. Pass "
+            "--value all=true to re-enable every catalog service that is disabled; "
+            "that also removes the file.")
+    result["state_file_found"] = state is not None or problem is not None
     if state is None and not everything:
         result.update({"changed": 0, "restored": 0, "rebooted": False, "verified": True,
                        "verification": "nothing_to_restore",
@@ -512,19 +619,29 @@ def _restore(target: Target, values: dict[str, Any]) -> dict[str, Any]:
     booted = sim_state == "Booted"
     entries = ios_slim.read_store(udid)
     live = _live_disabled(target, udid) if booted else frozenset()
-    put_back = {label: (state["previous"].get(label))
-                for label in (state["disabled"] if state else ())
-                if label in ios_slim.CATALOG_LABELS}
+    # Exactly what Autonom changed goes back: the value before, or no entry.
+    # An entry that no longer holds what Autonom wrote was changed by someone
+    # else since, and is left alone.
+    put_back: dict[str, Any] = {}
+    skipped: list[str] = []
+    for label, change in sorted(ios_slim.changes_of(state).items()):
+        if ios_slim.same_entry(change["written"], entries.get(label)):
+            put_back[label] = change["previous"]
+        else:
+            skipped.append(label)
     others: list[str] = []
     if everything:
         off = (ios_slim.disabled_in(entries) | live) & ios_slim.CATALOG_LABELS
         others = sorted(off - set(put_back))
+        skipped = [label for label in skipped if label not in others]
+    result["skipped_changed"] = skipped
     planned = ios_slim.merged_entries(entries, enable=others, restore=put_back)
     # what must read enabled afterwards (a label that was disabled before
-    # Autonom touched it goes back to disabled, and is not expected on)
+    # Autonom touched it goes back to disabled, and must read disabled)
     expect_on = {label for label, value in put_back.items() if value is not True}
     expect_on |= set(others)
-    if planned == entries and not (live & expect_on):
+    expect_off = {label for label, value in put_back.items() if value is True}
+    if planned == entries and not (live & expect_on) and not (booted and expect_off - live):
         _commit(udid, entries, entries, None)
         result.update({"changed": 0, "restored": 0, "rebooted": False})
         if booted:
@@ -548,7 +665,9 @@ def _restore(target: Target, values: dict[str, Any]) -> dict[str, Any]:
     if not booted:
         result.update({"verified": False, "verification": "store_written"})
         return result
-    result.update(_converge(target, udid, want_disabled=(), want_enabled=expect_on))
+    result.update(_converge_written(
+        target, udid, written=planned != entries, undo=" --value all=true",
+        want_disabled=expect_off, want_enabled=expect_on))
     simulator._checked(result, True)
     _finish_reboot(target, result)
     return result
@@ -611,9 +730,10 @@ def boot(target: Target, value: str, *, timeout: float = 120) -> tuple[bool, dic
                       "note": "already booted with this slim state; nothing changed"})
         return False, block
     applied = _apply(target, values)
-    converged = _converge(target, udid, want_disabled=desired,
-                          want_enabled=ios_slim.CATALOG_LABELS - desired,
-                          boot_timeout=timeout)
+    converged = _converge_written(
+        target, udid, written=applied.get("verification") == "store_written",
+        want_disabled=desired, want_enabled=ios_slim.CATALOG_LABELS - desired,
+        boot_timeout=timeout)
     summary = ios_slim.summarize(_live_disabled(target, udid), desired)
     block.update({"state": summary["state"], "disabled": summary["disabled"],
                   "verified": True, "verification": "read_back",
@@ -652,6 +772,7 @@ def _enable(target: Target, values: dict[str, Any]) -> dict[str, Any]:
     _require_booted(udid, sim_state, "enable")
     tool = target.tool
     before = _live_disabled(target, udid)
+    entries_before = ios_slim.read_store(udid)
     loaded = ios_simctl.launchctl_loaded_labels(tool, udid)
     root = ios_simctl.runtime_root(tool, ios_simctl.device_runtime_identifier(tool, udid))
     started: list[str] = []
@@ -682,17 +803,24 @@ def _enable(target: Target, values: dict[str, Any]) -> dict[str, Any]:
     # the next boot must agree: flip the store entries too
     entries = ios_slim.read_store(udid)
     flip = [label for label in enabled if entries.get(label) is True]
-    state = ios_slim.read_state(udid)
-    if state is not None:
+    planned = ios_slim.merged_entries(entries, enable=flip)
+    old = ios_slim.read_state(udid)
+    changes = ios_slim.changes_of(old)
+    for label in enabled:
+        if not ios_slim.same_entry(entries_before.get(label), planned.get(label)):
+            ios_slim.record_change(changes, label, entries_before.get(label),
+                                   planned.get(label))
+    state = None
+    if changes or old is not None:
         gone = set(enabled)
-        live = state.get("live") or {}
-        state = {**state,
-                 "disabled": [label for label in state["disabled"] if label not in gone],
-                 "previous": {label: value for label, value in state["previous"].items()
-                              if label not in gone},
-                 "live": {"enabled": sorted(set(live.get("enabled") or ()) | gone),
-                          "disabled": sorted(set(live.get("disabled") or ()) - gone)}}
-    _commit(udid, entries, ios_slim.merged_entries(entries, enable=flip), state)
+        live = (old.get("live") or {}) if old else {}
+        state = ios_slim.new_state(
+            udid, old.get("profile") if old else None, changes,
+            {"enabled": set(live.get("enabled") or ()) | gone,
+             "disabled": set(live.get("disabled") or ()) - gone},
+            old.get("status") if old else ios_slim.STATUS_APPLIED)
+    _commit(udid, entries, planned, state, revert_to=entries_before,
+            live_changed=("enabled", sorted(set(enabled) & (before | set(started)))))
     result: dict[str, Any] = {
         "control": CONTROL, "action": "enable", "labels": len(labels),
         "started": sorted(started), "not_started": not_started,
@@ -735,21 +863,23 @@ def _disable(target: Target, values: dict[str, Any]) -> dict[str, Any]:
     not_disabled = sorted(set(todo) - after)
     entries = ios_slim.read_store(udid)
     flip = [label for label in stopped if entries.get(label) is not True]
+    planned = ios_slim.merged_entries(entries, disable=flip)
     old = ios_slim.read_state(udid)
-    owned = set(old["disabled"]) if old else set()
-    previous = dict(old["previous"]) if old else {}
+    changes = ios_slim.changes_of(old)
     for label in stopped:
-        if label not in owned and entries_before.get(label) is not True:
-            owned.add(label)
-            previous[label] = _scalar(entries_before.get(label))
+        if not ios_slim.same_entry(entries_before.get(label), planned.get(label)):
+            ios_slim.record_change(changes, label, entries_before.get(label),
+                                   planned.get(label))
     live = (old.get("live") or {}) if old else {}
     state = None
-    if owned or old is not None:
+    if changes or old is not None:
         state = ios_slim.new_state(
-            udid, old.get("profile") if old else None, owned, previous,
+            udid, old.get("profile") if old else None, changes,
             {"enabled": set(live.get("enabled") or ()) - set(stopped),
-             "disabled": set(live.get("disabled") or ()) | set(stopped)})
-    _commit(udid, entries, ios_slim.merged_entries(entries, disable=flip), state)
+             "disabled": set(live.get("disabled") or ()) | set(stopped)},
+            old.get("status") if old else ios_slim.STATUS_APPLIED)
+    _commit(udid, entries, planned, state, revert_to=entries_before,
+            live_changed=("disabled", stopped))
     result: dict[str, Any] = {
         "control": CONTROL, "action": "disable", "labels": len(labels),
         "stopped": stopped,

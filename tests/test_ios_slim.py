@@ -642,6 +642,23 @@ class ApplyTests(SlimBase):
         # the store does hold the entries, and the state file says so: restore can undo it
         self.assertEqual(self.saved()["disabled"], MDM)
         self.assertEqual(ios_slim.disabled_in(self.store()), set(MDM))
+        # ... but it no longer claims the profile took
+        self.assertEqual(self.saved()["status"], "not_persisted")
+        self.assertIs(error.extra["store_written"], True)
+        self.assertEqual(error.extra["simulator_state"], "Booted")
+        self.assertIn("simulator slim restore", error.hint)
+        self.assertEqual(self.slim("show")["state_file"]["status"], "not_persisted")
+        drift = self.slim("verify")
+        self.assertEqual((drift["ok"], drift["compared_with"], drift["missing"]),
+                         (False, "state_file", MDM))
+        self.assertEqual(drift["status"], "not_persisted")
+        # an apply that does take says so again
+        self.patch_fake(slim_overrides_lost=False)
+        self.slim("apply", reboot="true", **SMALL)
+        self.assertEqual(self.saved()["status"], "applied")
+        self.assertEqual(self.slim("show")["state_file"]["status"], "applied")
+        self.slim("restore", reboot="true")
+        self.assertEqual(self.store(), {})
 
     def test_unsupported_runtime_is_refused_before_anything_is_written(self) -> None:
         old = "com.apple.CoreSimulator.SimRuntime.iOS-18-3"
@@ -724,8 +741,31 @@ class ApplyTests(SlimBase):
         self.patch_fake(simctl_fail={"simctl bootstatus": [1, "Unable to boot device"]})
         error = self.slim_error("apply", reboot="true", **SMALL)
         self.assertEqual(error.code, errors.IOS_BOOT_FAILED)
+        self.assertIn("Unable to boot device", error.message)
         self.assertEqual(self.saved()["disabled"], MDM)
         self.assertEqual(ios_slim.disabled_in(self.store()), set(MDM))
+        # the failure says the store was written, where, and both ways out
+        self.assertIs(error.extra["store_written"], True)
+        self.assertEqual(error.extra["state_file"], str(self.state_file()))
+        self.assertEqual(error.extra["store"], str(self.store_path()))
+        self.assertEqual(error.extra["simulator_state"], "Shutdown")
+        self.assertEqual(error.extra["target_id"], UDID)
+        self.assertIn(f"autonom devices boot --platform ios --udid {UDID}", error.hint)
+        self.assertIn(f"autonom simulator slim restore --platform ios --udid {UDID}",
+                      error.hint)
+
+    def test_a_boot_that_times_out_after_the_write_says_so(self) -> None:
+        self.set_device("Booted")
+        boom = subprocess.TimeoutExpired(["xcrun", "simctl", "bootstatus", UDID, "-b"], 120)
+        with mock.patch.object(ios_simctl, "boot", side_effect=boom):
+            error = self.slim_error("apply", reboot="true", **SMALL)
+        self.assertEqual(error.code, errors.BACKEND_FAILED)
+        self.assertIn("timed out", error.message)
+        self.assertIs(error.extra["store_written"], True)
+        self.assertEqual(error.extra["state_file"], str(self.state_file()))
+        self.assertEqual(error.extra["simulator_state"], "Shutdown")
+        self.assertIn("autonom devices boot", error.hint)
+        self.assertIn("simulator slim restore", error.hint)
 
     def test_a_shutdown_that_did_nothing_writes_nothing(self) -> None:
         self.set_device("Booted")
@@ -757,18 +797,119 @@ class ApplyTests(SlimBase):
 
 
 class RestoreTests(SlimBase):
-    def test_restore_puts_back_exactly_what_autonom_disabled(self) -> None:
+    def test_restore_puts_back_exactly_what_autonom_changed(self) -> None:
         self.write_store({MDM[0]: False, SEARCH[0]: True, "com.example.foreign": True})
         self.slim("apply", preset="stock", disable="mdm", keep=SEARCH[0])
         # someone else disables a label after the apply: not Autonom's to undo
         self.write_store({**self.store(), SEARCH[1]: True})
         result = self.slim("restore", details="true")
         self.assertTrue(result["state_file_found"])
-        self.assertEqual((result["changed"], result["restored_labels"]), (3, MDM))
+        # the apply enabled SEARCH[0] (it was disabled, the profile wants it on):
+        # that goes back too
+        self.assertEqual((result["changed"], result["restored_labels"]),
+                         (4, sorted([*MDM, SEARCH[0]])))
+        self.assertEqual(result["skipped_changed"], [])
         self.assertEqual(result["verification"], "store_written")
         self.assertFalse(self.state_file().exists())
-        self.assertEqual(self.store(), {MDM[0]: False, SEARCH[0]: False, SEARCH[1]: True,
+        self.assertEqual(self.store(), {MDM[0]: False, SEARCH[0]: True, SEARCH[1]: True,
                                         "com.example.foreign": True})
+
+    def test_a_foreign_disable_the_profile_lifted_is_back_after_restore(self) -> None:
+        # `optimized` keeps search on, so the apply enables a label someone
+        # else had disabled; restore must not leave it enabled
+        self.write_store({SEARCH[0]: True})
+        self.slim("apply", preset="optimized")
+        self.assertIs(self.store()[SEARCH[0]], False)
+        saved = self.saved()
+        self.assertNotIn(SEARCH[0], saved["disabled"])
+        self.assertIs(saved["previous"][SEARCH[0]], True)
+        self.assertIs(saved["written"][SEARCH[0]], False)
+        self.assertEqual(saved["status"], "applied")
+        self.slim("restore")
+        self.assertEqual(self.store(), {SEARCH[0]: True})
+        # on a booted simulator it is read back as disabled again
+        self.set_device("Booted")
+        self.set_launchd(disabled=[SEARCH[0]])
+        self.slim("apply", reboot="true", preset="optimized")
+        self.assertNotIn(SEARCH[0], self.launchd_disabled())
+        result = self.slim("restore", reboot="true")
+        self.assertTrue(result["verified"])
+        self.assertEqual(self.launchd_disabled(), {SEARCH[0]})
+        self.assertEqual(self.store(), {SEARCH[0]: True})
+
+    def test_a_live_enable_leaves_no_explicit_false_behind_after_restore(self) -> None:
+        self.set_device("Booted")
+        self.slim("apply", reboot="true", preset="minimal")
+        health = sorted(ios_slim.category_labels("health"))
+        self.slim("enable", ids="health")
+        self.assertEqual({self.store()[label] for label in health}, {False})
+        saved = self.saved()
+        self.assertEqual({saved["previous"][label] for label in health}, {None})
+        self.assertFalse(set(health) & set(saved["disabled"]))
+        self.slim("restore", reboot="true")
+        self.assertEqual(self.store(), {}, "no entry before, no entry after")
+        self.assertEqual(self.launchd_disabled(), set())
+
+    def test_restore_leaves_an_entry_someone_else_changed_since(self) -> None:
+        self.write_store({MDM[1]: False})
+        self.slim("apply", **SMALL)
+        # someone else enables one of them by hand after the apply
+        self.write_store({**self.store(), MDM[0]: False})
+        result = self.slim("restore", details="true")
+        self.assertEqual(result["skipped_changed"], [MDM[0]])
+        self.assertEqual(result["restored_labels"], MDM[1:])
+        self.assertEqual(self.store(), {MDM[0]: False, MDM[1]: False})
+        self.assertFalse(self.state_file().exists())
+        # all=true is asked for everything that is disabled, whoever did it
+        self.slim("apply", **SMALL)
+        self.write_store({**self.store(), MDM[0]: "odd"})
+        result = self.slim("restore", all="true")
+        self.assertEqual(result["skipped_changed"], [MDM[0]])
+        self.assertEqual(self.store(), {MDM[0]: "odd", MDM[1]: False})
+
+    def test_a_damaged_state_file_is_not_read_as_nothing_to_restore(self) -> None:
+        self.slim("apply", **SMALL)
+        stored = self.store()
+        for damage in ("{broken", json.dumps({"schema": "other"}), json.dumps(["list"])):
+            with self.subTest(damage=damage):
+                self.state_file().write_text(damage, encoding="utf-8")
+                error = self.slim_error("restore")
+                self.assertEqual(error.code, errors.BACKEND_FAILED)
+                self.assertIn(str(self.state_file()), error.message)
+                self.assertEqual(error.extra["state_file"], str(self.state_file()))
+                self.assertIn("--value all=true", error.hint)
+                self.assertEqual(self.store(), stored, "nothing was changed")
+                self.assertTrue(self.state_file().exists())
+                shown = self.slim("show")["state_file"]
+                self.assertEqual((shown["exists"], shown["readable"]), (True, False))
+                self.assertTrue(shown["problem"])
+                self.assertNotIn("profile", shown)
+                error = self.slim_error("verify")
+                self.assertEqual(error.code, errors.BACKEND_FAILED)
+                self.assertIn(str(self.state_file()), error.message)
+                # settings need no state file
+                self.assertTrue(self.slim("verify", **SMALL)["ok"])
+        result = self.slim("restore", all="true")
+        self.assertTrue(result["state_file_found"])
+        self.assertEqual(result["restored"], 3)
+        self.assertEqual(ios_slim.disabled_in(self.store()), set())
+        self.assertFalse(self.state_file().exists())
+        # absent is still "nothing to restore"
+        self.assertEqual(self.slim("restore")["verification"], "nothing_to_restore")
+        self.assertEqual(self.slim("show")["state_file"]["exists"], False)
+
+    def test_a_boot_that_fails_after_the_restore_write_says_so(self) -> None:
+        self.set_device("Booted")
+        self.slim("apply", reboot="true", **SMALL)
+        self.patch_fake(simctl_fail={"simctl bootstatus": [1, "Unable to boot device"]})
+        error = self.slim_error("restore", reboot="true")
+        self.assertEqual(error.code, errors.IOS_BOOT_FAILED)
+        self.assertIs(error.extra["store_written"], True)
+        self.assertIsNone(error.extra["state_file"], "the restore removed it")
+        self.assertEqual(error.extra["simulator_state"], "Shutdown")
+        self.assertIn("autonom devices boot", error.hint)
+        self.assertIn("simulator slim restore", error.hint)
+        self.assertEqual(ios_slim.disabled_in(self.store()), set())
 
     def test_restore_needs_shutdown_or_reboot(self) -> None:
         self.set_device("Booted")
@@ -893,6 +1034,57 @@ class LiveTests(SlimBase):
         self.set_device("Shutdown")
         self.slim("restore")
         self.assertEqual(self.store(), {"com.apple.runtime.own": False})
+
+    def test_live_changes_record_what_was_there_before(self) -> None:
+        # no state file yet, and a label someone else had disabled
+        self.set_device("Booted")
+        self.set_launchd(disabled=[SEARCH[0]])
+        self.write_store({SEARCH[0]: True})
+        self.slim("enable", ids=SEARCH[0])
+        self.assertIs(self.store()[SEARCH[0]], False)
+        saved = self.saved()
+        self.assertEqual((saved["previous"], saved["written"], saved["disabled"]),
+                         ({SEARCH[0]: True}, {SEARCH[0]: False}, []))
+        # disabling it again is back where it started: nothing left to undo
+        self.slim("disable", ids=SEARCH[0])
+        self.assertEqual(self.saved()["previous"], {})
+        self.slim("enable", ids=SEARCH[0])
+        result = self.slim("restore", reboot="true")
+        self.assertTrue(result["verified"])
+        self.assertEqual(self.store(), {SEARCH[0]: True})
+        self.assertEqual(self.launchd_disabled(), {SEARCH[0]})
+
+    def test_a_failed_state_write_names_the_services_already_changed(self) -> None:
+        self.set_device("Booted")
+        self.write_store({"com.apple.runtime.own": False})
+        before = self.store()
+        with mock.patch.object(ios_slim, "write_state", side_effect=OSError(28, "No space")):
+            error = self.slim_error("disable", ids="mdm")
+        self.assertEqual(error.code, errors.BACKEND_FAILED)
+        self.assertIs(error.extra["store_reverted"], True)
+        self.assertEqual(self.store(), before)
+        self.assertIs(error.extra["live_changed"], True)
+        self.assertEqual(error.extra["live_disabled"], MDM)
+        self.assertIn("put back", error.hint)
+        self.assertIn("running services were already changed", error.hint)
+        for label in MDM:
+            self.assertIn(label, error.hint)
+        self.assertEqual(self.launchd_disabled(), set(MDM), "and they are")
+        # the same for enable
+        self.write_store({label: True for label in MDM})
+        with mock.patch.object(ios_slim, "write_state", side_effect=OSError(28, "No space")):
+            error = self.slim_error("enable", ids="mdm")
+        self.assertIs(error.extra["store_reverted"], True)
+        self.assertEqual(error.extra["live_enabled"], MDM)
+        self.assertIn("running services were already changed", error.hint)
+        self.assertIn(MDM[0], error.hint)
+        self.assertEqual(ios_slim.disabled_in(self.store()), set(MDM))
+        # a store-only command has no live change to report
+        self.set_device("Shutdown")
+        with mock.patch.object(ios_slim, "write_state", side_effect=OSError(28, "No space")):
+            error = self.slim_error("apply", preset="stock", disable="search")
+        self.assertNotIn("live_changed", error.extra)
+        self.assertNotIn("running services", error.hint)
 
     def test_disable_keeps_the_core_services_unless_forced(self) -> None:
         self.set_device("Booted")
