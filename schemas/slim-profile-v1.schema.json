@@ -46,14 +46,13 @@
   },
   "$defs": {
     "names": {
-      "description": "A list of names, or one comma-separated string.",
+      "description": "A list of names, or one comma-separated string. A name given twice counts once.",
       "oneOf": [
         {
           "type": "array",
           "items": {
             "type": "string"
-          },
-          "uniqueItems": true
+          }
         },
         {
           "type": "string"

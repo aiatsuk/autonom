@@ -315,6 +315,83 @@ class ScanTests(unittest.TestCase):
         self.assertEqual(ios_slim.suggest_needs(found)[0],
                          ["maps", "photos", "push", "storekit"])
 
+    def test_a_debug_build_is_scanned_through_its_debug_dylib(self) -> None:
+        # Xcode 16+ Debug: the main executable is a stub, the code is in
+        # <CFBundleExecutable>.debug.dylib next to it
+        app = build_app(self.root)
+        (app / "Shop.debug.dylib").write_bytes(b"\xcf\xfa\xed\xfe")
+        (app / "__preview.dylib").write_bytes(b"\xcf\xfa\xed\xfe")
+        stub = ("{path}:\n\t@rpath/Shop.debug.dylib (compatibility version 0.0.0)\n"
+                "\t/usr/lib/libSystem.B.dylib (compatibility version 1.0.0)\n")
+        code = ("{path}:\n\t@rpath/Shop.debug.dylib (compatibility version 0.0.0)\n"
+                "\t/System/Library/Frameworks/StoreKit.framework/StoreKit (compatibility "
+                "version 1.0.0)\n\t/System/Library/Frameworks/MapKit.framework/MapKit "
+                "(compatibility version 1.0.0)\n")
+        calls: list[str] = []
+
+        def runner(argv):
+            if argv[0] != "otool":
+                return completed(1)
+            calls.append(Path(argv[-1]).name)
+            if argv[-1].endswith("/Shop.debug.dylib"):
+                return completed(0, code.format(path=argv[-1]).encode())
+            return completed(0, stub.format(path=argv[-1]).encode())
+
+        found, _described, limitations = ios_app_scan.scan(app, runner=runner)
+        self.assertEqual(calls, ["Shop", "Shop.debug.dylib", "__preview.dylib"])
+        self.assertEqual(found["linked_frameworks"], {"StoreKit", "MapKit"})
+        need = ios_slim.suggest_needs(found)[0]
+        self.assertIn("storekit", need)
+        self.assertIn("maps", need)
+        self.assertFalse([line for line in limitations if "incomplete" in line])
+
+    def test_a_debug_dylib_that_cannot_be_read_makes_the_scan_incomplete(self) -> None:
+        stub = "{path}:\n\t@rpath/Shop.debug.dylib (compatibility version 0.0.0)\n"
+
+        def runner(argv):
+            if argv[0] == "otool" and argv[-1].endswith("/Shop"):
+                return completed(0, stub.format(path=argv[-1]).encode())
+            return completed(1, b"", b"not an object file")
+
+        # the dylib is there and otool fails on it
+        app = build_app(self.root / "a")
+        (app / "Shop.debug.dylib").write_bytes(b"junk")
+        _found, _described, limitations = ios_app_scan.scan(app, runner=runner)
+        line = next(line for line in limitations if "incomplete" in line)
+        self.assertIn("Shop.debug.dylib", line)
+        # the dylib is linked and missing from the bundle
+        app = build_app(self.root / "b")
+        _found, _described, limitations = ios_app_scan.scan(app, runner=runner)
+        self.assertTrue(any("incomplete" in line and "Shop.debug.dylib" in line
+                            for line in limitations))
+        # no otool at all is the one otool line, not a second complaint
+        _found, _described, limitations = ios_app_scan.scan(app, runner=no_tools)
+        self.assertFalse([line for line in limitations if "incomplete" in line])
+
+    def test_parse_otool_reads_a_fat_binary_once_per_name(self) -> None:
+        text = ("/x/Shop (architecture x86_64):\n"
+                "\t/System/Library/Frameworks/StoreKit.framework/StoreKit (compatibility "
+                "version 1.0.0)\n"
+                "\t@rpath/Flutter.framework/Flutter (compatibility version 1.0.0)\n"
+                "/x/Shop (architecture arm64):\n"
+                "\t/System/Library/Frameworks/MapKit.framework/MapKit (compatibility "
+                "version 1.0.0)\n"
+                "\t/System/Library/Frameworks/StoreKit.framework/StoreKit (compatibility "
+                "version 1.0.0)\n"
+                "\t@rpath/Flutter.framework/Flutter (compatibility version 1.0.0)\n")
+        self.assertEqual(ios_app_scan.parse_otool(text),
+                         ({"StoreKit", "MapKit"}, {"Flutter"}))
+        # a header is skipped wherever it stands, a first line that is none is read
+        self.assertEqual(ios_app_scan.parse_otool(
+            "\t/System/Library/Frameworks/MapKit.framework/MapKit (compatibility)\n"),
+            ({"MapKit"}, set()))
+        self.assertEqual(ios_app_scan.parse_otool(
+            "/x/Health.framework/Health (architecture arm64):\n"), (set(), set()))
+        self.assertEqual(ios_app_scan.linked_debug_dylibs(
+            "/x/Shop:\n\t@rpath/Shop.debug.dylib (compatibility version 0.0.0)\n"
+            "\t/usr/lib/libobjc.A.dylib (compatibility version 1.0.0)\n"),
+            {"Shop.debug.dylib"})
+
     def test_every_missing_piece_is_a_limitation_not_an_error(self) -> None:
         app = self.root / "Bare.app"
         app.mkdir()
@@ -574,6 +651,19 @@ class SchemaTests(unittest.TestCase):
         self.assertEqual(lists, set(ios_slim._LIST_FIELDS))
         for name in ("name", "description"):
             self.assertEqual(self.schema["properties"][name]["type"], "string")
+
+    def test_a_name_given_twice_is_accepted_by_both(self) -> None:
+        # the validator de-duplicates; the schema must not refuse what it takes
+        names = self.schema["$defs"]["names"]["oneOf"]
+        self.assertEqual([item["type"] for item in names], ["array", "string"])
+        self.assertEqual(names[0]["items"], {"type": "string"})
+        self.assertNotIn("uniqueItems", names[0])
+        for field in ios_slim._LIST_FIELDS:
+            item = {"need": "storekit", "keep": "com.apple.cloudd"}.get(field, "search")
+            profile = ios_slim.validate_profile(
+                {"schema": ios_slim.PROFILE_SCHEMA, field: [item, item]},
+                require_schema=True)
+            self.assertEqual(profile[field], [item])
 
     def test_a_field_outside_the_schema_is_refused_by_the_validator(self) -> None:
         with self.assertRaises(errors.AutonomError) as caught:

@@ -3,6 +3,9 @@
 Three sources, each optional: the Info.plist of the app and its extensions,
 the entitlements (`codesign`, else the XML plist a simulator build keeps in
 its executable), and the frameworks the binaries link (`otool -L`) or ship.
+The binaries are the main executable, every `*.dylib` next to it (an Xcode
+Debug build keeps the app's code in `<name>.debug.dylib`) and the embedded
+frameworks.
 Nothing here fails the scan: a missing tool or an unreadable file becomes a
 line in `limitations`. The rules that turn the facts into features are data
 in `ios_slim.py`.
@@ -21,13 +24,14 @@ from . import ios_slim
 Runner = Callable[[Sequence[str]], "subprocess.CompletedProcess[bytes]"]
 
 TOOL_TIMEOUT = 20
-MAX_BINARIES = 120          # otool runs: the main executable and its frameworks
+MAX_BINARIES = 120          # otool runs: the main executable, its dylibs and frameworks
 MAX_EXTENSIONS = 40
 MAX_EMBEDDED_PLISTS = 16    # XML plists looked at inside one executable
 MAX_PLIST_BYTES = 1 << 20
 _XML_START = b"<?xml"
 _PLIST_END = b"</plist>"
 _FRAMEWORK = re.compile(r"([^/\s]+)\.framework/")
+_DEBUG_DYLIB = ".debug.dylib"
 _USAGE_KEY = re.compile(r"^NS[A-Za-z0-9]*UsageDescription$")
 _OTHER_INFO_KEYS = ("NSSupportsLiveActivities",)
 
@@ -119,18 +123,37 @@ def embedded_entitlements(executable: Path) -> dict[str, Any] | None:
             view.close()
 
 
+def _otool_entries(text: str) -> list[str]:
+    """The install names in `otool -L` output. Every line that ends with a
+    colon is a header: a fat binary prints one per architecture."""
+    entries = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.endswith(":"):
+            continue
+        entries.append(line.split(" (", 1)[0])
+    return entries
+
+
 def parse_otool(text: str) -> tuple[set[str], set[str]]:
     """`otool -L` output -> (system framework names, names of frameworks the
-    app ships itself: `@rpath/...`, `@executable_path/...`, `@loader_path/...`)."""
+    app ships itself: `@rpath/...`, `@executable_path/...`, `@loader_path/...`).
+    A name linked by several architectures is counted once."""
     system: set[str] = set()
     shipped: set[str] = set()
-    for line in text.splitlines()[1:]:
-        entry = line.strip().split(" (", 1)[0]
+    for entry in _otool_entries(text):
         match = _FRAMEWORK.search(entry)
         if not match:
             continue
         (shipped if entry.startswith("@") else system).add(match.group(1))
     return system, shipped
+
+
+def linked_debug_dylibs(text: str) -> set[str]:
+    """File names of the `*.debug.dylib` an executable links (`otool -L`
+    output): where an Xcode Debug build keeps the app's own code."""
+    return {entry.rsplit("/", 1)[-1] for entry in _otool_entries(text)
+            if entry.startswith("@") and entry.endswith(_DEBUG_DYLIB)}
 
 
 def _entitlements(app: Path, executable: Path | None, runner: Runner,
@@ -198,6 +221,10 @@ def scan(app: Path, *, runner: Runner = run_tool) -> tuple[dict[str, Any], dict[
 
     binaries: list[Path] = [executable] if executable is not None else []
     try:
+        binaries.extend(path for path in sorted(app.glob("*.dylib")) if path.is_file())
+    except OSError:
+        pass
+    try:
         frameworks = sorted((app / "Frameworks").glob("*.framework"))
     except OSError:
         frameworks = []
@@ -212,6 +239,8 @@ def scan(app: Path, *, runner: Runner = run_tool) -> tuple[dict[str, Any], dict[
         binaries = binaries[:MAX_BINARIES]
     failed = 0
     reason = ""
+    read: set[Path] = set()
+    debug_dylibs: set[str] = set()
     for binary in binaries:
         completed = runner(["otool", "-L", str(binary)])
         if completed.returncode != 0:
@@ -220,14 +249,24 @@ def scan(app: Path, *, runner: Runner = run_tool) -> tuple[dict[str, Any], dict[
             if completed.returncode == 127:
                 break  # no otool on this host: one line, not one per binary
             continue
-        system, shipped = parse_otool((completed.stdout or b"").decode("utf-8", "replace"))
+        text = (completed.stdout or b"").decode("utf-8", "replace")
+        system, shipped = parse_otool(text)
         facts["linked_frameworks"] |= system
         facts["embedded_frameworks"] |= shipped
+        read.add(binary)
+        if binary == executable:
+            debug_dylibs = linked_debug_dylibs(text)
     if failed:
         limitations.append(
             f"linked frameworks: otool could not read {failed} of {len(binaries)} "
             f"binaries ({reason[:120] or 'no output'}); frameworks linked only there "
             "are missing")
+    for name in sorted(debug_dylibs):
+        if app / name not in read:
+            limitations.append(
+                f"linked frameworks: the scan is incomplete: {executable.name} links "
+                f"{name} (the app's code in a Debug build), which could not be read; "
+                "frameworks the app links are missing")
     if not facts["embedded_frameworks"]:
         limitations.append("no embedded frameworks: plugins linked statically show up "
                            "only through the system frameworks they use")

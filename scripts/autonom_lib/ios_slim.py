@@ -79,7 +79,7 @@ _LIST_FIELDS = ("need", "enable", "disable", "keep")
 _PERSISTENT_SINCE = {"iOS": (18, 5), "tvOS": (18, 5), "watchOS": (11, 5),
                      "xrOS": (2, 5), "visionOS": (2, 5)}
 _RUNTIME = re.compile(r"(?:^|\.)([A-Za-z]+)-(\d+)(?:-(\d+))?(?:-\d+)*$")
-_UDID = re.compile(r"^[0-9A-Fa-f]{8}(?:-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}$")
+_UDID = re.compile(r"[0-9A-Fa-f]{8}(?:-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}")
 
 
 # --- catalog -------------------------------------------------------------------
@@ -344,7 +344,7 @@ def persistent_supported(runtime_identifier: str | None) -> bool:
 def require_udid(udid: str) -> str:
     """One exact simulator: `all`, `booted` and anything that is not a UDID
     are refused before a path is built from it."""
-    if not _UDID.match(udid or ""):
+    if not _UDID.fullmatch(udid or ""):
         raise errors.AutonomError(
             errors.INVALID_VALUE,
             f"simulator slim needs one exact simulator UDID, got {udid!r}",

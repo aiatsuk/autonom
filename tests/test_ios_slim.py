@@ -513,7 +513,8 @@ class StoreTests(SlimBase):
         self.assertIsNone(ios_slim.read_state(UDID))
 
     def test_only_an_exact_udid_names_a_store(self) -> None:
-        for bad in ("all", "booted", "", "../../etc", "AAAAAAAA-1111"):
+        for bad in ("all", "booted", "", "../../etc", "AAAAAAAA-1111", UDID + "\n",
+                    UDID + "\n/../x"):
             with self.subTest(udid=bad), self.assertRaises(errors.AutonomError) as caught:
                 ios_slim.store_path(bad)
             self.assertEqual(caught.exception.code, errors.INVALID_VALUE)

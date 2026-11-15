@@ -17,6 +17,7 @@ from ..platform import ANDROID, Target
 
 SEMANTICS = "ios_simulator_tree_footprint_v1"
 ROOT_MARKER = "{udid}/data/var/run/launchd_bootstrap"
+ROOT_COMMAND = "launchd_sim"
 TOP_PROCESSES = 5
 HOST_TIMEOUT = 60
 LIMITATIONS = [
@@ -95,14 +96,36 @@ def tree_pids(root: int, table: dict[int, tuple[int, float, str]]) -> list[int]:
     return sorted(seen)
 
 
-def find_root(udid: str, runner: Runner) -> int | None:
-    """The simulator's launchd_sim: the first process whose command line
-    names this device's bootstrap path."""
+def root_candidates(udid: str, runner: Runner) -> list[int]:
+    """Every process whose command line names this device's bootstrap path.
+    The simulator's `launchd_sim` is one of them; a tool that was passed the
+    same path (an editor, a `tail`) can be another."""
     completed = runner(["pgrep", "-f", ROOT_MARKER.format(udid=udid)])
-    for line in (completed.stdout or "").splitlines():
-        if line.strip().isdigit():
-            return int(line.strip())
-    return None
+    return [int(line.strip()) for line in (completed.stdout or "").splitlines()
+            if line.strip().isdigit()]
+
+
+def pick_root(candidates: Sequence[int], table: dict[int, tuple[int, float, str]],
+              ) -> tuple[int | None, str | None]:
+    """(root pid, limitation): the candidate whose command is `launchd_sim`.
+    With none, the first candidate and a note that it is a guess."""
+    for pid in candidates:
+        if pid in table and table[pid][2].rsplit("/", 1)[-1] == ROOT_COMMAND:
+            return pid, None
+    if not candidates:
+        return None, None
+    return candidates[0], (
+        f"no process naming this simulator's bootstrap path is {ROOT_COMMAND}; the "
+        f"first match (pid {candidates[0]}) was taken as the root, so the numbers "
+        "may describe another process tree")
+
+
+def find_root(udid: str, runner: Runner,
+              table: dict[int, tuple[int, float, str]] | None = None) -> int | None:
+    """The simulator's launchd_sim: the process whose command line names this
+    device's bootstrap path and, when the `ps` table is given, whose command
+    is `launchd_sim`."""
+    return pick_root(root_candidates(udid, runner), table or {})[0]
 
 
 def slim_block(udid: str) -> dict[str, Any]:
@@ -142,17 +165,20 @@ def take(target: Target, *, runner: Runner = run_host) -> dict[str, Any]:
     if found.state != "Booted":
         raise _not_booted(udid, found.state, "only a booted simulator has processes "
                                              "to measure")
-    root = find_root(udid, runner)
-    if root is None:
+    candidates = root_candidates(udid, runner)
+    if not candidates:
         raise _not_booted(udid, found.state, "its launchd_sim process was not found "
                                              "on this host")
     table = parse_ps(runner(["ps", "-axo", "pid,ppid,%cpu,comm"]).stdout or "")
+    root, guessed = pick_root(candidates, table)
     if root not in table:
         raise _not_booted(udid, found.state, "its launchd_sim process ended while it "
                                              "was measured")
     pids = tree_pids(root, table)
     memory = parse_top(runner(["top", "-l", "1", "-stats", "pid,mem"]).stdout or "")
     limitations = list(LIMITATIONS)
+    if guessed:
+        limitations.append(guessed)
     measured = [pid for pid in pids if pid in memory]
     if not measured:
         # a sum of nothing would read as "this simulator uses 0 bytes"

@@ -155,6 +155,24 @@ class TakeTests(EnvSandboxMixin, unittest.TestCase):
             ["ps", "-axo", "pid,ppid,%cpu,comm"],
             ["top", "-l", "1", "-stats", "pid,mem"]])
 
+    def test_the_root_is_the_launchd_sim_among_the_pgrep_hits(self) -> None:
+        # pid 901 (an editor that was passed the same path) is listed first
+        reply = simulator_tree.take(self.target, runner=runner_for(pgrep="901\n500\n"))
+        self.assertEqual(reply["root_pid"], 500)
+        self.assertEqual(reply["processes"], 5)
+        self.assertFalse([line for line in reply["limitations"] if "first match" in line])
+        table = simulator_tree.parse_ps(PS)
+        self.assertEqual(simulator_tree.pick_root([901, 500], table), (500, None))
+        self.assertEqual(simulator_tree.pick_root([], table), (None, None))
+        self.assertEqual(simulator_tree.find_root(UDID, runner_for("901\n500\n"), table), 500)
+
+    def test_without_a_launchd_sim_the_first_hit_is_a_stated_guess(self) -> None:
+        reply = simulator_tree.take(self.target, runner=runner_for(pgrep="900\n901\n"))
+        self.assertEqual(reply["root_pid"], 900)
+        line = next(line for line in reply["limitations"] if "first match" in line)
+        self.assertIn("launchd_sim", line)
+        self.assertIn("900", line)
+
     def test_top_five_only(self) -> None:
         ps = "PID PPID %CPU COMM\n500 1 0.0 launchd_sim\n" + "".join(
             f"{600 + index} 500 0.0 /x/daemon{index}\n" for index in range(8))
