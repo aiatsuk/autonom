@@ -55,7 +55,7 @@ polling, validation and destructive confirmation remain domain behavior.
 ## Verification
 
     node --test tests/canvas-ui.test.mjs tests/canvas-dropdown.test.mjs tests/canvas-theme-page.test.mjs tests/canvas-tools-page.test.mjs tests/canvas-actions.test.mjs tests/canvas-workspace-page.test.mjs tests/canvas-mock-form.test.mjs
-    node --test tests/canvas-shortcuts.test.mjs tests/canvas-display-menu.test.mjs
+    node --test tests/canvas-shortcuts.test.mjs tests/canvas-display-menu.test.mjs tests/canvas-push-form.test.mjs
     node --test --test-name-pattern='^(page:|display: the Android page)' tests/browser-scrcpy.test.mjs
     make check
 

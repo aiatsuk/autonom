@@ -45,10 +45,12 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
   key your app reads a link from goes there), Delivery "To the app" or
   "Notification shade only" and "Reach a stopped app" (Android), Edit as JSON
   (a raw APNs object on iOS is sent as it is), Preview (the read-only
-  `push.compose`, never leased) and Reset. The page checks the message before
+  `push.compose`, never leased) and Reset, with a second Send in the form's
+  footer that shows its result right under it. The page checks the message before
   any call (empty, duplicate and reserved data keys, the badge, the app id,
   4 KB); the status line says where the push went and every warning in plain
-  words, and a push the emulator did not deliver says what to do (an image
+  words (when notifications are not allowed for the app it says that is why
+  nothing is shown), and a push the emulator did not deliver says what to do (an image
   without Play Store or shade delivery for `no_root`, open the app or "Reach a
   stopped app" for `not_received`). The message, the delivery choice and the
   open block are remembered per platform in this browser, never the app id.
