@@ -113,6 +113,13 @@ ANDROID_TEXT_CODES = {
 NEW_CODES.update(ANDROID_TEXT_CODES)
 ANDROID_TEXT_SECTION = "### Android typing, `ui fill` and key names (Unreleased)"
 
+# Push notifications: compose, and delivery on an Android emulator.
+PUSH_CODES = {
+    "PUSH_NOT_DELIVERED": "push_not_delivered",
+}
+NEW_CODES.update(PUSH_CODES)
+PUSH_SECTION = "### Push compose and Android delivery (Unreleased)"
+
 # Host identity (run ws-p3-mcp-adapter, contract 1.1).
 NEW_CODES.update({
     "HOST_IDENTITY_INVALID": "host_identity_invalid",
@@ -226,6 +233,27 @@ class AdditiveErrorCodeTests(unittest.TestCase):
         for action in ("presets", "show", "suggest", "apply", "verify", "enable", "restore"):
             with self.subTest(action=action):
                 self.assertTrue(any(f"`simulator slim {action}`" in row for row in rows), action)
+
+    def test_compatibility_records_the_push_code(self) -> None:
+        text = (ROOT / "docs/COMPATIBILITY.md").read_text(encoding="utf-8")
+        parts = text.split(PUSH_SECTION, 1)
+        self.assertEqual(len(parts), 2, "COMPATIBILITY.md has no push section")
+        section = parts[1].split("\n### ", 1)[0]
+        head = text.split("## Response shape", 1)[0]
+        for name, value in PUSH_CODES.items():
+            with self.subTest(code=name):
+                self.assertIn(f"| `{value}` |", section)
+                self.assertIn(f"`{value}`", head, "the Error codes list names the round")
+        for code in ("push_payload_large", "push_notifications_denied", "push_shade_only"):
+            with self.subTest(warning=code):
+                self.assertIn(f"`{code}`", section)
+                self.assertIn(f"`{code}`", head)
+        for reason in ("no_root", "no_receiver", "not_received", "rejected"):
+            self.assertIn(f"`{reason}`", section)
+        rows = [line for line in section.splitlines() if line.startswith("| `simulator push")]
+        for action in ("compose", "send"):
+            with self.subTest(action=action):
+                self.assertTrue(any(f"`simulator push {action}" in row for row in rows), action)
 
     def test_compatibility_records_the_agent_loop_code(self) -> None:
         text = (ROOT / "docs/COMPATIBILITY.md").read_text(encoding="utf-8")

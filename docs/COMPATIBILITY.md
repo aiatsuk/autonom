@@ -116,6 +116,12 @@ strengthened, never silently weakened.
   `simulator_service_disabled`, and the warning codes `slim_not_started`,
   `slim_core_kept`, `slim_universal_links_off` and `slim_push_off`; see
   [Simulator slimming](#simulator-slimming-unreleased).
+- Push compose and Android delivery add one code, `push_not_delivered`
+  (`reason`: `no_root`, `no_receiver`, `not_received`, `rejected`), the
+  warning codes `push_payload_large`, `push_notifications_denied` and
+  `push_shade_only`, and change one emission: `simulator push send` on an
+  Android emulator was `unsupported_capability` and now delivers; see
+  [Push compose and Android delivery](#push-compose-and-android-delivery-unreleased).
 
 ## Response shape
 
@@ -815,6 +821,41 @@ whole-simulator memory and the guard by `tests/test_ios_slim_suggest.py`,
 | `capabilities` | — | adds `simulator.slim` (iOS Simulator only) |
 | Control lease | — | `presets`, `show`, `suggest` and `verify` are READONLY, as is `metrics simulator`; `apply`, `enable`, `disable` and `restore` are MUTATING |
 | State | — | `$AUTONOM_HOME/simulator-slim/<UDID>.json` (`status`, `profile`, `disabled`, `previous`, `written`, `live`, `applied_at`); `session stop` and `cleanup` leave it and the simulator's overrides alone |
+
+### Push compose and Android delivery (Unreleased)
+
+A push is described once as a push message (`autonom.push/v1`,
+`schemas/push-v1.schema.json`, `scripts/autonom_lib/push_message.py`) and
+rendered for each platform; `simulator push send` now also delivers on an
+Android emulator (`scripts/autonom_lib/android_push.py`). `push send` with a
+raw `payload` on iOS is unchanged: the same `simctl push` argv, reply keys,
+errors and slim warning. Pinned by `tests/test_push.py`,
+`tests/test_canvas_tools.py`, `tests/canvas-tools-server.test.mjs`,
+`tests/test_verb_classification.py` and `tests/test_error_codes_additive.py`.
+One error code is added:
+
+| Code | Emitted by |
+| --- | --- |
+| `push_not_delivered` | `simulator push send` on an Android emulator with `delivery=app` when the push did not reach the app (`reason`, `capability: "simulator.push"`, `app_id`). `no_root`: neither adbd runs as root (`id -u`) nor `su 0 id -u` prints `0` (a Play Store image has no su); nothing was sent; the hint names a `google_apis` image, `receiver=`/`action=` and `delivery=shade`. `no_receiver`: the package has no receiver for `com.google.android.c2dm.intent.RECEIVE`; nothing was sent; the hint names `receiver=`/`action=` and `delivery=shade`. `not_received`: the broadcast answered `result=0` (`receiver_result: 0`; the app is stopped or was never started: launch it once or pass `include_stopped=true`). `rejected`: any other result than `-1` and `0` (`receiver_result`) |
+
+Warning codes (on an `ok: true` reply, `{code, error, hint}`):
+`push_payload_large` (`bytes`, `limit`: the APNs payload is above 4096
+bytes; `compose` and iOS `send`, simctl still decides),
+`push_notifications_denied` (`permission`: a notification message to an app
+on API 33+ that has not been granted `android.permission.POST_NOTIFICATIONS`;
+the hint is `autonom permissions grant notifications <app_id>`; a failed
+lookup adds no warning) and `push_shade_only` (always with `delivery=shade`:
+the notification belongs to `com.android.shell`, the app's code did not run
+and a tap opens nothing).
+
+| Surface | Before | Now |
+| --- | --- | --- |
+| `simulator push compose` | — | read-only, needs no device and resolves no target (works without adb or simctl). Message fields from `--json` and `--value` (`title`, `subtitle`, `body`, `badge`, `sound`, `category`, `thread`, `channel`, `image`, `silent`, `data`, `data.<key>`, `message_id`, `fcm`, `ios`, `android`, `name`, `description`), `file=<path>` (a saved message, command-line fields laid over it), `platform=ios\|android`, `write=<path>`, `overwrite=true`. Reply: `control`, `action: "compose"`, `message` (normalized, with `schema`), `message_id` (generated for the preview, never written unless given), `ios: {payload, bytes, over_limit}`, `android: {extras, kind: "notification"\|"data"}`, `notes`, `warnings`, `written` (path or null), `next` (the `push send --value file=<path>` line, or null). Errors: `invalid_value` (`field`, `missing`, `path`: an unknown field, a bad type, `silent` with a title, subtitle or body, a reserved `data` key, a message with nothing to show, a raw `payload` or a raw APNs file, a value of `push send` such as `app_id`, an existing `write` target without `overwrite=true`, a missing or unreadable file), `output_not_writable` |
+| `simulator push send` (iOS) | — | unchanged with a raw `payload` (or `file=` holding an object with a top-level `aps`). With message fields or a message file the push is rendered (the `compose` iOS payload) and sent the same way; the reply adds `composed: true`, `message_id`, `kind`, `payload_bytes` and the `push_payload_large` warning above 4096 bytes. New refusals (`invalid_value`): `delivery` other than `app`, a raw `payload` together with message fields or a file, and, without a raw `payload`, any unknown value and, beside message fields, the Android values `receiver`, `action`, `include_stopped` and the compose values `write`, `overwrite`, `platform` (the raw `payload` path still ignores values it does not use). With nothing given the error is the same (`push send needs payload (a JSON object)`) and its hint also names the message fields. `--value` without `=` no longer echoes the value in its error (`flow_command_invalid`, every control) |
+| `simulator push send` (Android emulator) | `unsupported_capability` | message fields or a message file (a raw APNs `payload` is `invalid_value` with the message-field hint). `delivery=app` (default): `pm path` (else `app_not_installed`), root through adbd or `su 0` (else `push_not_delivered` `no_root`; `adb root` is never run), the FCM receiver (`cmd package query-receivers`, else `no_receiver`), one `am broadcast [--include-stopped-packages] -a com.google.android.c2dm.intent.RECEIVE -p <app>` with one `--es` per extra, then the read-back. `receiver=<pkg>/<class>` (or `.Class`) sends with `-n`, `action=` changes the intent action; either skips the receiver check, is sent as the shell when there is no root (`route: "shell"`) and accepts `result=0`. Reply: `control`, `app_id`, `app_id_source`, `composed`, `message_id`, `kind`, `delivery: "app"`, `route` (`root`, `su`, `shell`), `receiver_result`, `extras_count`, `receiver` and `intent_action` when given, `verified`, `verification` (`read_back`: a new `dumpsys notification --noredact` record of the app shows the title, or the body without a title, within 3 s; `not_in_shade`: none did, a foreground app handles the message itself; `receiver_accepted`: a data-only message). `delivery=shade` (API 29+, else `unsupported_capability` with `api_level`): `cmd notification post -S bigtext [-t <title>] autonom_push_<message_id> <body or title>` as the shell, never through su; reply `delivery: "shade"`, `owner: "com.android.shell"`, `tag`, `verified` from a 3 s read-back of that tag (else `not_in_shade` with `verification_detail`), and always `push_shade_only`; `app_id` is not needed (null when there is none). Every text argument is shell-quoted; no error and no journal entry holds the notification text. A physical phone is refused as before |
+| `capabilities` | `simulator.push` unavailable on Android | available on an Android emulator too |
+| Control lease | `simulator push` all MUTATING | `compose` is READONLY, `send` stays MUTATING |
+| Mobile Canvas tools | `simulate` push iOS only, `payload` only | `simulate` push `send` on Android too; values `payload` (raw APNs, iOS only) or `message` (a push message object or its JSON text, at most 4096 bytes), `app_id`, `delivery`, `include_stopped`; the journal keeps `payload_len` / `message_len`, never the text. New read op `push.compose` (`{"message", "platform"}`): the `simulator push compose` reply, no device call, not journaled, not leased. `push_not_delivered` is HTTP 409 and keeps `reason`. `context.simulate` lists `push` on an Android emulator; the page's push form stays iOS-only for now |
 
 ### iOS UI recovery and `--session-id` (0.32.0)
 

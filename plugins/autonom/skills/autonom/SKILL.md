@@ -148,6 +148,7 @@ small JPEG whose `coordinates` note converts image pixels to `ui tap` values.
 | Slim simulators (iOS) | `simulator slim suggest\|apply\|verify\|restore`, `devices boot --slim`, `metrics simulator` — background services off, about 4x less memory per simulator; see `mobile-session` |
 | Deterministic state | `simulator status-bar pin\|clear` (both platforms), `simulator keyboard pin\|reset\|show` (iOS), `simulator animations pin\|reset\|show` (Android) — remove clock, battery, animation, and autocorrect noise from before/after comparisons; `verified` only after a read-back |
 | Device state | `open` (deep link; Android names the activity that took it in `handled_by`), `permissions`, `location` (iOS + Android emulator), `media add`, `file ls/pull` |
+| Push notifications | `simulator push compose\|send` — describe a push once (`title`, `body`, `data`, ...); iOS through `simctl push`, an Android emulator into the app's own FCM receiver (a `google_apis` image) or a plain notification in the shade; see `mobile-session` |
 | Diagnostics | `logs tail`, `crash list/show` |
 | Live observation | `session outputs`, `logs follow`, `network requests follow`, `journal --follow` — bounded NDJSON streams |
 | Metrics | `metrics snapshot/series/list-presets`, `metrics memory capture/analyze/warn`, `metrics frames …`, `metrics trace --preset …` |

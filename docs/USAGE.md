@@ -312,6 +312,62 @@ boot, 2026-11-15): stock 10.7 GB / 238 processes, `optimized` 4.3 GB / 108,
 `minimal` 2.8 GB / 77. When `media add` fails on a slimmed simulator the
 error names the service to switch back on (`simulator_service_disabled`).
 
+## Push notifications
+
+```text
+Send my app an "Order shipped" push with order 42 in it, on the iOS
+Simulator and on the Android emulator, and tell me whether it showed up.
+```
+
+Describe the push once, see what each platform gets, save it, send it:
+
+```bash
+autonom simulator push compose --value title="Order shipped" \
+        --value body="Your order #42 is on its way" --value data.order_id=42 \
+        --value write=.autonom/pushes/order-shipped.json   # message, ios, android, next
+autonom --udid <UDID> simulator push send --value file=.autonom/pushes/order-shipped.json
+autonom --serial emulator-5554 simulator push send \
+        --value file=.autonom/pushes/order-shipped.json --value badge=3
+autonom --serial emulator-5554 simulator push send --value delivery=shade \
+        --value title="Order shipped" --value body="Your order #42"
+```
+
+`compose` needs no device. The fields are `title`, `subtitle`, `body`,
+`badge`, `sound`, `category`, `thread`, `channel`, `image`, `silent`,
+`data` (one key with `--value data.<key>=<text>`, or a JSON object),
+`message_id` and `fcm`; `ios` and `android` are objects merged over what
+each platform gets. `notes` says what a platform leaves out (`channel` on
+iOS, `subtitle` and `thread` on Android). The key an app reads a deep link
+from is app-specific: put it under `data` (`data.url=...`, `data.route=...`).
+`app_id` comes from the session on that target when it is left out. A raw
+APNs payload still works on iOS: `--value payload='{"aps": {...}}'`.
+
+Android has two deliveries:
+
+- **`delivery=app`** (default) hands the message to the app's own FCM receiver
+  the way Google Play services does, so Firebase Messaging (FlutterFire
+  included) runs its normal code: `onMessageReceived` when the app is in
+  front, a notification the SDK posts when it is in the background. It needs
+  root: a `google_apis` emulator image (`su`), or adbd as root. A Play Store
+  image has no root and answers `push_not_delivered` (`no_root`). An app that
+  was force-stopped or never started does not get it (`not_received`, as with
+  real FCM): launch it once or pass `include_stopped=true`. An app without
+  Firebase Messaging has no receiver (`no_receiver`): send to a receiver of
+  its own with `receiver=<package>/<class>` or `action=<intent action>` (sent
+  as the shell when there is no root). `verified: true` means the
+  notification was read back from the shade; `not_in_shade` usually means the
+  app was in front and handled it; a data-only message is
+  `receiver_accepted`. On API 33+ an app without the notification permission
+  shows nothing: the `push_notifications_denied` warning says so, and
+  `autonom permissions grant notifications <app_id>` fixes it.
+- **`delivery=shade`** (API 29+) posts a plain notification with the title
+  and body. It belongs to `com.android.shell`: the app's code does not run
+  and a tap opens nothing (the `push_shade_only` warning). Use it to check
+  how a notification looks, not how the app handles it.
+
+Not covered: real FCM or APNs sends through Google's or Apple's servers,
+physical devices, and `delivery=app` on Play Store emulator images.
+
 ## Watch and drive the Simulator at 60 fps in the browser
 
 ```text

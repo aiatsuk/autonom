@@ -81,6 +81,7 @@ autonom ui find --desc "Log In" --mode exact
 autonom ui tap --desc "Continue"
 autonom simulator status-bar pin            # full battery and signal: diff-stable screenshots
 autonom devices boot --udid <UDID> --slim minimal   # iOS: background services off, about 4x less memory
+autonom simulator push send --value title="Order shipped" --value data.order_id=42   # iOS, or the app's FCM receiver on an emulator
 autonom screenshot --label "after login"    # reports width/height too
 autonom logs tail --package com.example.app --since 60
 autonom location get                        # current position (Android)

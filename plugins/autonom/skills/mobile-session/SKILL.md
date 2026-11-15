@@ -323,6 +323,43 @@ slim enable` fixed goes into the profile as a category id in `enable`, a
 feature id in `need`, a label in `keep`. For what one app needs, see "Build
 a slim profile for this app" in `ios-project-setup`.
 
+## Push notifications
+
+Describe a push once with plain fields; Autonom renders it for each platform.
+`compose` needs no device and shows what each side gets; `send` delivers it.
+
+```bash
+autonom simulator push compose --value title="Order shipped" --value body="Order #42" \
+        --value data.order_id=42 --value write=.autonom/pushes/order.json
+autonom --udid <UDID> simulator push send --value file=.autonom/pushes/order.json
+autonom --serial emulator-5554 simulator push send --value file=.autonom/pushes/order.json
+autonom --serial emulator-5554 simulator push send --value delivery=shade --value title=Hi
+```
+
+- Fields: `title`, `subtitle`, `body`, `badge`, `sound`, `category`, `thread`,
+  `channel`, `image`, `silent`, `data` (`--value data.<key>=<text>`),
+  `message_id`, `fcm`; `ios` / `android` objects are merged over the render.
+  `app_id` comes from the session on that target when left out.
+- The key an app reads a deep link or screen from is app-specific: read the
+  app's push handler and put that key under `data` (`data.url=...`).
+- Android `delivery=app` (default) is the one to test app behaviour: the
+  message goes into the app's own FCM receiver, as from Google Play services.
+  It needs a `google_apis` emulator image (root through `su`); a Play Store
+  image answers `push_not_delivered` with `reason: no_root`. Launch the app
+  once first, or pass `include_stopped=true` (`not_received` otherwise). An
+  app without Firebase Messaging takes `receiver=<pkg>/<class>` or
+  `action=<intent action>`.
+- `verified: true` means the notification was read back from the shade.
+  `not_in_shade` usually means the app was in front and handled it itself:
+  check the screen and the app's log. A `push_notifications_denied` warning
+  means API 33+ without the permission: `autonom permissions grant
+  notifications <app_id>`.
+- Android `delivery=shade` only shows a notification (owned by the shell; the
+  app's code does not run, a tap opens nothing). Use it for how a
+  notification looks, never as proof the app handles pushes.
+- Not covered: real FCM/APNs sends through Google's or Apple's servers and
+  physical devices.
+
 ## Related skills
 
 - `mobile-screen` — UI tree, find, tap, screenshot

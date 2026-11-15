@@ -9,6 +9,26 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
 
 ### Added
 
+- **Push notifications: compose once, send on iOS and Android.**
+  `simulator push compose` (read-only, no device) turns plain fields
+  (`title`, `body`, `data`, `badge`, `sound`, `image`, `silent`, ...) into one
+  push message (`autonom.push/v1`, new schema `schemas/push-v1.schema.json`)
+  and shows the APNs payload and the Android FCM extras it becomes;
+  `write=<path>` saves it and `file=<path>` loads it again. `simulator push
+  send` takes the same fields or file on both platforms (a raw APNs `payload`
+  on iOS works as before). On an Android emulator, `delivery=app` delivers
+  the message into the app's own FCM receiver the way Google Play services
+  does (needs root: a `google_apis` image; `adb root` is never run) and reads
+  the shade back; `delivery=shade` posts a plain notification that belongs to
+  the shell. New error code `push_not_delivered` (`reason`: `no_root`,
+  `no_receiver`, `not_received`, `rejected`), warnings `push_payload_large`,
+  `push_notifications_denied` and `push_shade_only`; `simulator.push` is now
+  available on Android emulators. The Canvas tools process sends a push
+  `message` on Android and previews one with the read op `push.compose`; the
+  page's push form stays iOS-only for now. Not covered: real FCM/APNs sends
+  through Google's or Apple's servers, physical devices, Play Store images for
+  `delivery=app`.
+
 - **`simulator slim`: switch iOS Simulator background services off.** A stock
   simulator runs well over two hundred launchd jobs an app under test never
   uses; with them off one simulator measured 2.8 GB instead of 10.7 GB.
