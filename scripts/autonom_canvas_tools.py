@@ -76,7 +76,7 @@ import autonom_canvas_bridge as bridge  # noqa: E402
 from autonom_lib import adb as adb_mod  # noqa: E402
 from autonom_lib import canvas_capture_frame, device_frames, device_language, captures, tool_health  # noqa: E402
 from autonom_lib import device_state, errors, ios_simctl, journal  # noqa: E402
-from autonom_lib import screenshot, session, simulator, ui  # noqa: E402
+from autonom_lib import push_message, screenshot, session, simulator, ui  # noqa: E402
 from autonom_lib.network import device_proxy_ios  # noqa: E402
 from autonom_lib.network import mocks as mocks_mod  # noqa: E402
 from autonom_lib.network import redact, store  # noqa: E402
@@ -85,7 +85,7 @@ from autonom_lib.platform import ANDROID, IOS, Target  # noqa: E402
 
 ORIGINS = bridge.ORIGINS
 READ_OPS = ("context", "permissions.list", "location.get", "biometric.status", "network.status",
-            "network.requests", "network.request", "mocks.list")
+            "network.requests", "network.request", "mocks.list", "push.compose")
 MUTATING_OPS = ("permissions.set", "location.set", "location.clear", "simulate",
                 "network.start", "network.capture", "network.attach", "network.detach", "network.stop",
                 "mocks.add", "mocks.update", "mocks.enable", "mocks.disable",
@@ -134,7 +134,9 @@ APP_LOCALES_MIN_SDK = 33
 
 # The device simulations the drawer may run, and the values each one takes.
 SIMULATE_VALUES: dict[str, tuple[str, ...]] = {
-    "push": ("app_id", "payload"),
+    # `payload` is a raw APNs payload (iOS only); `message` a push message
+    # (autonom.push/v1) as an object or its JSON text.
+    "push": ("app_id", "payload", "message", "delivery", "include_stopped"),
     "biometric": ("finger_id",),
     "battery": ("level", "state"),
     "network": ("speed", "delay"),
@@ -150,7 +152,8 @@ SIMULATE_SUPPORT: dict[str, dict[str, tuple[str, ...]]] = {
           "battery": simulator.CONTROL_ACTIONS["battery"],
           "appearance": simulator.CONTROL_ACTIONS["appearance"],
           "text-size": ("small", "large", "extra-extra-extra-large", "accessibility-extra-extra-extra-large")},
-    ANDROID: {"biometric": ("match", "nonmatch", "settings"),
+    ANDROID: {"push": ("send",),
+              "biometric": ("match", "nonmatch", "settings"),
               "battery": simulator.CONTROL_ACTIONS["battery"],
               "network": ("online", "offline"),
               "appearance": simulator.CONTROL_ACTIONS["appearance"],
@@ -253,6 +256,29 @@ def _utf8_length(text: str) -> int:
     return len(text.encode("utf-8"))
 
 
+def _push_message(value: Any) -> tuple[dict[str, Any], int]:
+    """A checked push message (an object or its JSON text) and the length of
+    its text, which is all the journal may say about it."""
+    example = "Send one JSON object, e.g. {\"title\": \"Hello\", \"data\": {\"order_id\": 42}}."
+    if isinstance(value, str):
+        size = _utf8_length(value)
+    elif isinstance(value, dict):
+        size = _utf8_length(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
+    else:
+        raise _invalid("push message must be a JSON object or its JSON text", example)
+    if size > MAX_PUSH_PAYLOAD:
+        raise _invalid(f"push message is {size} bytes; at most {MAX_PUSH_PAYLOAD} are allowed",
+                       "Shorten the body or the data.")
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except ValueError:
+            raise _invalid("push message is not valid JSON", example) from None
+        if not isinstance(value, dict):
+            raise _invalid("push message must be a JSON object", example)
+    return push_message.normalize(value), size
+
+
 def _mock_lists(payload: dict[str, Any]) -> dict[str, list[Any]]:
     """The condition and edit lists a mock payload sets, by key.
 
@@ -319,6 +345,7 @@ class Tools:
             "network.requests": self.network_requests,
             "network.request": self.network_request,
             "mocks.list": self.mocks_list,
+            "push.compose": self.push_compose,
             "permissions.set": self.permissions_set,
             "location.set": self.location_set,
             "location.clear": self.location_clear,
@@ -580,6 +607,7 @@ class Tools:
             raise _invalid(f"simulate {control} does not take: {', '.join(unknown)}",
                            f"Values it takes: {', '.join(allowed) or 'none'}.")
         words: list[str] = []
+        checked = dict(values)
         for key, value in values.items():
             if control == "push" and key == "payload":
                 if isinstance(value, str):
@@ -594,6 +622,11 @@ class Tools:
                                    f"{MAX_PUSH_PAYLOAD} are allowed")
                 words.append(f"payload_len={size}")
                 continue
+            if control == "push" and key == "message":
+                # only the length is journaled, never the text
+                checked["message"], size = _push_message(value)
+                words.append(f"message_len={size}")
+                continue
             if isinstance(value, str):
                 if len(value) > 256:
                     raise _invalid(f"simulate value {key} is too long")
@@ -603,7 +636,7 @@ class Tools:
                 raise errors.AutonomError(errors.INVALID_VALUE,
                                           f"not a bundle id: {value!r}")
             words.append(f"{key}={value}")
-        return values, words
+        return checked, words
 
     def simulate(self, payload: dict[str, Any], record: dict[str, Any] | None):
         control = payload.get("control")
@@ -613,15 +646,39 @@ class Tools:
         action = payload.get("action")
         if not isinstance(action, str) or not action or len(action) > 64:
             raise _invalid("simulate action must be a non-empty string")
+        if control == "push" and action == "compose":
+            raise _invalid("push compose changes nothing on the device",
+                           "Use the read-only op push.compose with {\"message\": ...}.")
         values, words = self._simulate_values(control, payload.get("values"))
+        values = dict(values)
+        if control == "push" and "message" in values:
+            # the library reads a push message's fields at the top level
+            values.update(values.pop("message"))
         # `session` is where push takes its default app id: only this target's.
-        result = simulator.apply(self.target, control, action, dict(values),
+        result = simulator.apply(self.target, control, action, values,
                                  session=record or {})
         if control == "push" and result.get("app_id"):
             words = [word for word in words if not word.startswith("app_id=")]
             words.append(f"app_id={result['app_id']}")
         summary = {"app_id": result["app_id"]} if result.get("app_id") else {}
         return {**result, **self.target.identity()}, [control, action, *words], summary
+
+    def push_compose(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """What `simulator push compose` returns for one push message: a
+        preview for the page, read-only, no device call, never journaled."""
+        unknown = sorted(set(payload) - {"message", "platform"})
+        if unknown:
+            raise _invalid(f"push.compose does not take: {', '.join(unknown)}",
+                           "It takes message (a push message object or its JSON text) and "
+                           "an optional platform (ios or android).")
+        if "message" not in payload:
+            raise errors.AutonomError(errors.INVALID_VALUE, "push.compose needs a message",
+                                      push_message.MESSAGE_HINT, missing=["message"])
+        message, _size = _push_message(payload["message"])
+        values: dict[str, Any] = dict(message)
+        if payload.get("platform") is not None:
+            values["platform"] = payload["platform"]
+        return simulator.push_compose(values)
 
     def network_start(self, payload: dict[str, Any], record: dict[str, Any] | None):
         record = self.require_session(record)
