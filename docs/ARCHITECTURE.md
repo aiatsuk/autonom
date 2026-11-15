@@ -575,19 +575,22 @@ hand-write an APNs dictionary for iOS and an FCM bundle for Android.
 - **Android, `delivery=app`.** Google Play services hands an FCM message to
   the app as an ordered broadcast of `com.google.android.c2dm.intent.RECEIVE`
   that only a privileged sender reaches: from the shell it is silently dropped
-  (`result=0`). `android_push.py` therefore finds root first (`id -u`, then
-  `su 0 id -u`; never `adb root`, which restarts adbd and drops every
-  forward), checks the package (`pm path`) and its receiver (`cmd package
-  query-receivers`), sends one `am broadcast` with the extras as `--es`
+  (`result=0`). `android_push.py` therefore checks the package first (`pm path`,
+  so a missing app is `app_not_installed` on any image), then finds root
+  (`id -u`, then `su 0 id -u`; never `adb root`, which restarts adbd and
+  drops every forward), then the receiver (`cmd package query-receivers`),
+  sends one `am broadcast` with the extras as `--es`
   pairs (each word shell-quoted; `su 0` hands its words to the command
   unparsed), judges `Broadcast completed: result=<n>` (`-1` delivered, `0`
   not received, anything else rejected), and reads the shade back from
   `dumpsys notification --noredact` for up to 3 s, counting only a record
-  that was not there before the send. The permission reader of
+  that was not there before the send or whose text changed since (a
+  replaced notification). The permission reader of
   `device_state.py` supplies the API 33+ `POST_NOTIFICATIONS` warning.
 - **Android, `delivery=shade`.** `cmd notification post` as the shell (a
-  root-posted notification is not shown), read back by its unique tag
-  `autonom_push_<message_id>`. The notification belongs to
+  root-posted notification is not shown), read back by its tag
+  `autonom_push_<message_id>` (unique unless the caller passes the same
+  `message_id` twice). The notification belongs to
   `com.android.shell`; the `-c` content intent is refused on recent Android,
   so a tap opens nothing.
 - **Canvas.** The tools process takes `message` (or `payload` on iOS) in
