@@ -154,6 +154,13 @@ class PushTests(GuardBase):
         self.assertTrue(result["warnings"][0]["hint"])
         self.assertTrue(any(argv[1:2] == ["push"] for argv in self.calls()))
 
+    def test_a_composed_push_with_apsd_off_keeps_the_warning(self) -> None:
+        self.write_store({APSD: True})
+        result = simulator.apply(self.target, "push", "send",
+                                 {"app_id": "com.example.app", "title": "hi"}, session={})
+        self.assertTrue(result["composed"])
+        self.assertEqual([item["code"] for item in result["warnings"]], ["slim_push_off"])
+
     def test_push_with_apsd_on_or_unknown_has_no_warning(self) -> None:
         self.assertNotIn("warnings",
                          simulator.apply(self.target, "push", "send", dict(self.VALUES)))

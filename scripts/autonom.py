@@ -6055,8 +6055,10 @@ def cmd_simulator(args: argparse.Namespace) -> int:
         values.update(parsed)
     for pair in args.value or []:
         if "=" not in pair:
+            # never echo the value: it may be a push title or other text
             raise errors.AutonomError(errors.FLOW_COMMAND_INVALID,
-                                      f"--value takes KEY=VALUE, got {pair!r}")
+                                      "--value takes KEY=VALUE; one value has no '='",
+                                      "Pass --value KEY=VALUE, e.g. --value title=Hello.")
         key, value = pair.split("=", 1)
         values[key] = value
     if args.control == "slim" and args.action == "presets":
@@ -6064,6 +6066,9 @@ def cmd_simulator(args: argparse.Namespace) -> int:
         from autonom_lib import simulator_slim
         return emit({"ok": True, **simulator_slim.run(None, "presets", values)},
                     as_json=True)
+    if args.control == "push" and args.action == "compose":
+        # a push is described and rendered for both platforms without a device
+        return emit({"ok": True, **simulator_mod.push_compose(values)}, as_json=True)
     if (args.control == "slim" and args.action == "suggest"
             and not _explicit_target_flags(args)):
         # an app bundle on disk is read without a simulator; a bundle id
@@ -7154,7 +7159,8 @@ _CONTROL_BY_ACTION: dict[str, frozenset[str]] = {
     "ui helper": frozenset({"status"}),
     "simulator battery": frozenset(),
     "simulator network": frozenset(),
-    "simulator push": frozenset(),
+    # `compose` renders a push message and touches no device.
+    "simulator push": frozenset({"compose"}),
     "simulator sms": frozenset(),
     "simulator call": frozenset(),
     "simulator biometric": frozenset(),

@@ -26,6 +26,8 @@ State keys used by the simulator controls (all optional):
 ``privacy_help``     the text ``help privacy`` prints (default: Xcode 27.0's)
 ``simctl_hang``      ``{argv prefix: seconds}``: sleep that long first (a wedged
                      simctl, for timeout paths)
+``pushes``           every ``push <udid> <bundle> <file>``: ``{udid, bundle, payload,
+                     text}``, the file's JSON and exact text (the file is temporary)
 
 launchd overrides (``simulator slim``), per device under ``launchd[<udid>]``:
 
@@ -303,6 +305,24 @@ def main(argv: list[str]) -> int:
 
     if args[:2] == ["list", "devices"]:
         sys.stdout.write(json.dumps(state.get("simctl_devices", DEFAULT_DEVICES)))
+        return 0
+
+    if args[:1] == ["push"] and len(args) >= 4:
+        # `push <udid> <bundle> <file>`: the file is temporary, so what it held
+        # is kept under `pushes` (parsed JSON, or the text when it is not JSON)
+        try:
+            text = Path(args[3]).read_text(encoding="utf-8")
+        except OSError as exc:
+            sys.stderr.write(f"An error was encountered processing the command: {exc}\n")
+            return 1
+        try:
+            content = json.loads(text)
+        except ValueError:
+            content = text
+        if os.environ.get("AUTONOM_FAKE_STATE"):
+            state.setdefault("pushes", []).append(
+                {"udid": args[1], "bundle": args[2], "payload": content, "text": text})
+            write_state(state)
         return 0
 
     if args[:1] == ["bootstatus"]:

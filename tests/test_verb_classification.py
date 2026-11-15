@@ -113,6 +113,7 @@ class VerbClassificationTests(unittest.TestCase):
         self.assertEqual(self.cli._CONTROL_BY_ACTION["simulator animations"], {"show"})
         self.assertEqual(self.cli._CONTROL_BY_ACTION["simulator slim"],
                          {"presets", "show", "suggest", "verify"})
+        self.assertEqual(self.cli._CONTROL_BY_ACTION["simulator push"], {"compose"})
 
     def mode(self, *argv: str) -> str:
         args = self.parser.parse_args(list(argv))
@@ -142,6 +143,8 @@ class VerbClassificationTests(unittest.TestCase):
             (("simulator", "slim", "disable"), "mutating"),
             (("simulator", "slim", "restore"), "mutating"),
             (("simulator", "battery", "set"), "mutating"),
+            (("simulator", "push", "compose"), "readonly"),
+            (("simulator", "push", "send"), "mutating"),
             (("session", "start"), "lifecycle"),
             (("session", "start", "--launch", "com.example.app"), "mutating"),
             (("session", "start", "--launch"), "mutating"),
