@@ -264,6 +264,36 @@ autonom --udid <UDID> simulator slim restore --value reboot=true
 import, universal links and push stay on in `optimized` and `minimal`.
 Slimming needs iOS 18.5 or newer and stays until `restore`.
 
+- **Which field takes which id.** Live `simulator slim enable --value
+  ids=...` takes category ids, feature ids and labels. When it fixed
+  something, write the same id into the profile: a category id in `enable`,
+  a feature id in `need`, a single label in `keep`. An id that is both a
+  category and a feature (`siri`, `health`, `icloud`, `mdm`, `photos`,
+  `widgets`) is read as the category, so it goes in `enable`.
+- **Shared daemons.** Categories overlap. `optimized` with `disable=icloud`
+  also stops the account daemons iCloud shares with `store`
+  (`com.apple.amsaccountsd` and its two helpers), and `show` then reports
+  `store` under `partial`. Add `enable=store` or `keep=<label>` when the app
+  needs them.
+- **Restore.** The state file records the entry every label had before
+  Autonom changed it, in either direction, and the entry Autonom wrote.
+  `restore` puts the old value back, or removes the entry when there was
+  none. An entry that no longer holds what Autonom wrote was changed by
+  someone else: it is left alone and listed in `skipped_changed`. A state
+  file that is there and cannot be read fails `restore` and `verify`
+  (`backend_failed`, naming the file; `--value all=true` re-enables every
+  catalog service), and `show` reports `state_file: {exists: true,
+  readable: false}`.
+- **Status.** `show` gives the state file's `status`: `applied`, or
+  `not_persisted` when the runtime did not keep the overrides after a reboot
+  (`slim_not_persisted`). The file stays so `restore` can undo the write.
+- **A boot that fails after the write.** When `apply` or `restore` with
+  `reboot=true`, `devices boot --slim` or `session start --slim` cannot boot
+  the simulator after the store was written, the error keeps its code and
+  adds `store_written`, `store`, `state_file` and `simulator_state`. Two
+  ways out: retry `autonom devices boot --udid <UDID>` and run `simulator
+  slim verify`, or undo with `autonom simulator slim restore`.
+
 Build a profile for one app, boot slimmed, and measure the whole simulator:
 
 ```bash

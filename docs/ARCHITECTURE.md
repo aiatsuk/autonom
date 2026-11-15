@@ -469,7 +469,7 @@ and deletes the section. `keyboard pin` keeps its own per-UDID snapshot under
 
 `simulator slim` switches iOS Simulator background services off. A stock
 simulator runs well over two hundred launchd jobs an app under test never
-talks to; with all slimmable ones off, one simulator measured 2.8 GB and 82
+talks to; with all slimmable ones off, one simulator measured 2.8 GB and 77
 processes instead of 10.7 GB and 238 (iOS 27.2).
 
 - **Catalog.** `ios_slim_catalog.py` lists the slimmable launchd labels in 16
@@ -498,24 +498,37 @@ processes instead of 10.7 GB and 238 (iOS 27.2).
   itself it runs `launchctl print-disabled system` in the simulator and
   compares. Overrides that are missing are set one by one with `launchctl
   disable`/`enable`, the simulator is rebooted once more and read again;
-  still missing is `slim_not_persisted`. A simulator left shut down answers
-  `verified: false` with `verification: "store_written"`.
+  still missing is `slim_not_persisted`, which marks the state file
+  `status: "not_persisted"` (a successful apply writes `"applied"`). A
+  simulator left shut down answers `verified: false` with `verification:
+  "store_written"`. A boot that fails or times out after the store write
+  keeps its error code and adds `store_written`, `store`, `state_file`,
+  `simulator_state` and a hint with both ways out (boot again, or restore).
 - **Live changes.** `enable` and `disable` work on a booted simulator without
   a reboot (`launchctl enable` + `bootstrap` of the job plist under the
   runtime's `RuntimeRoot`; `launchctl disable` + `bootout`) and flip the same
   store entries, so the next boot agrees. A service that will not load in the
   running boot session is reported as `not_started`.
 - **State file.** `$AUTONOM_HOME/simulator-slim/<UDID>.json` (mode `0600`)
-  records the profile applied, the labels Autonom disabled and what the store
-  held for them before. `restore` puts exactly those back and deletes the
-  file. The store is written first and the state file second; if the state
-  file cannot be written the store is put back, so the file never describes a
-  change that is not in the store. Slimming is not undone by `session stop`.
+  records the profile applied, its `status`, and for every label a command
+  flipped in either direction (`apply`, live `enable` and `disable`) the
+  entry the store held before (`previous`, null for none) and the entry
+  Autonom wrote (`written`). `restore` puts the previous value back, or
+  removes the entry when there was none, and deletes the file; an entry that
+  no longer holds what Autonom wrote is someone else's and is listed in
+  `skipped_changed` instead. A file that is there and unreadable is not read
+  as absent: `restore` and `verify` fail naming it, `show` reports
+  `readable: false`. The store is written first and the state file second;
+  if the state file cannot be written the store is put back, so the file
+  never describes a change that is not in the store (after a live `enable`
+  or `disable` the error also names the running services already changed).
+  Slimming is not undone by `session stop`.
 - **App analysis.** `simulator slim suggest` is the deterministic half of
   "what does this app need": `ios_app_scan.py` reads the `Info.plist` of the
   app and its extensions, the entitlements (`codesign`, else the XML plist a
   simulator build keeps in its executable) and the frameworks the binaries
-  link (`otool -L`) or ship; `SUGGEST_RULES` in `ios_slim.py` (data) maps
+  link (`otool -L` on the main executable, every `*.dylib` next to it, where
+  a Debug build keeps the app's code, and the embedded frameworks) or ship; `SUGGEST_RULES` in `ios_slim.py` (data) maps
   that evidence to feature ids with a reason each. Every source is optional:
   a missing tool is a `limitations` line. The other half is the agent reading
   the project (`ios-project-setup` skill).
@@ -525,7 +538,9 @@ processes instead of 10.7 GB and 238 (iOS 27.2).
   unless it already matches). The Canvas boot job is unchanged.
 - **Whole-simulator memory.** `metrics simulator`
   (`metrics/simulator_tree.py`) finds the simulator's `launchd_sim` with
-  `pgrep -f <udid>/data/var/run/launchd_bootstrap`, walks the process tree
+  `pgrep -f <udid>/data/var/run/launchd_bootstrap` (among the hits, the one
+  whose command is `launchd_sim`; else the first, with a limitation), walks
+  the process tree
   from one `ps`, and sums the physical footprint from one `top -l 1`.
 - **Guard.** Verbs that need a core service read the store file (never the
   device): a failed `media add` with `com.apple.assetsd` off is

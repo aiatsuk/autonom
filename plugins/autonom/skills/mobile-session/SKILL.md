@@ -314,8 +314,14 @@ One machine's figures (iPhone 17 Pro, iOS 27.2, 24 GB Mac, 180 s after boot,
 2026-11-15); yours will differ. Photo import (`media add`), universal links
 and push always stay on in `optimized` and `minimal`; custom-scheme deep
 links need no service. `--slim` needs a shut-down simulator and iOS 18.5 or
-newer, and stays until `restore` (`session stop` does not undo it). For what
-one app needs, see "Build a slim profile for this app" in `ios-project-setup`.
+newer, and stays until `restore` (`session stop` does not undo it). `restore`
+puts back exactly what Autonom changed; an entry someone else changed since
+is left alone and listed in `skipped_changed`. A boot that fails after the
+write says so (`store_written`, `state_file`, `simulator_state`): retry
+`autonom devices boot`, or `autonom simulator slim restore`. What `simulator
+slim enable` fixed goes into the profile as a category id in `enable`, a
+feature id in `need`, a label in `keep`. For what one app needs, see "Build
+a slim profile for this app" in `ios-project-setup`.
 
 ## Related skills
 

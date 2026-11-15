@@ -102,8 +102,11 @@ A slimmed simulator uses about a quarter of the memory (`mobile-session`,
    .autonom/slim-profile.json`, `autonom simulator slim verify`, then run the
    task. When something system-level fails on a slim simulator, suspect
    slimming first: `simulator slim show`, `simulator slim enable --value
-   ids=<category or feature>`, retry, and if that fixes it add it to the
-   profile's `need`.
+   ids=<category, feature or label>`, retry, and if that fixes it add the
+   same id to the profile under the field that takes it: a category id in
+   `enable`, a feature id in `need`, a single label in `keep`. An id that
+   is both a category and a feature (`siri`, `health`, `icloud`, `mdm`,
+   `photos`, `widgets`) was enabled as the category, so it goes in `enable`.
 
 ## Accessibility readiness
 

@@ -1424,5 +1424,61 @@ class CliTests(SlimBase):
         self.assertEqual(found["simulator.slim"].state, "unavailable")
 
 
+class DocsTests(unittest.TestCase):
+    """What the docs and skills say about slimming matches the code."""
+
+    def read(self, path: str) -> str:
+        return " ".join((ROOT / path).read_text(encoding="utf-8").split())
+
+    def test_the_minimal_figure_is_the_same_everywhere(self) -> None:
+        for path in ("docs/ARCHITECTURE.md", "docs/USAGE.md",
+                     "plugins/autonom/skills/mobile-session/SKILL.md"):
+            with self.subTest(path=path):
+                text = self.read(path)
+                self.assertRegex(text, r"2\.8 GB(,| /| and) 77")
+                self.assertNotRegex(text, r"2\.8 GB(,| /| and) 82")
+
+    def test_a_fixed_id_goes_into_the_field_that_takes_it(self) -> None:
+        # ids that are both a category and a feature are read as the category
+        both = sorted(set(ios_slim.CATEGORY_BY_ID) & set(ios_slim.FEATURE_BY_ID))
+        self.assertIn("siri", both)
+        for item in both:
+            labels, _named, _protected = ios_slim.resolve_ids([item])
+            self.assertEqual(labels, ios_slim.category_labels(item))
+        for path in ("plugins/autonom/skills/ios-project-setup/SKILL.md",
+                     "plugins/autonom/skills/mobile-session/SKILL.md", "docs/USAGE.md"):
+            with self.subTest(path=path):
+                text = self.read(path)
+                self.assertRegex(text, r"category id in `enable`")
+                self.assertRegex(text, r"feature id in `need`")
+                self.assertRegex(text, r"label in `keep`")
+                self.assertNotIn("add it to the profile's `need`", text)
+        for path in ("plugins/autonom/skills/ios-project-setup/SKILL.md", "docs/USAGE.md"):
+            text = self.read(path)
+            for item in both:
+                self.assertIn(f"`{item}`", text, path)
+
+    def test_the_new_fields_and_codes_are_documented(self) -> None:
+        compatibility = self.read("docs/COMPATIBILITY.md")
+        row = next(line for line in (ROOT / "docs/COMPATIBILITY.md").read_text(
+            encoding="utf-8").splitlines() if line.startswith("| `slim_not_persisted`"))
+        self.assertIn("devices boot --slim", row)
+        self.assertIn("session start --slim", row)
+        for word in ("skipped_changed", "store_written", "simulator_state", "not_persisted",
+                     "readable: false", "live_changed"):
+            self.assertIn(word, compatibility)
+        usage = self.read("docs/USAGE.md")
+        for word in ("skipped_changed", "store_written", "simulator_state", "not_persisted",
+                     "disable=icloud"):
+            self.assertIn(word, usage)
+        # the documented overlap is what the resolver does
+        disabled = ios_slim.resolve(ios_slim.validate_profile(
+            {"preset": "optimized", "disable": "icloud"}))
+        self.assertIn("com.apple.amsaccountsd", disabled)
+        self.assertIn("store", ios_slim.summarize(disabled)["categories"]["partial"])
+        self.assertNotIn("store", ios_slim.summarize(ios_slim.resolve(
+            ios_slim.validate_profile({"preset": "optimized"})))["categories"]["partial"])
+
+
 if __name__ == "__main__":
     unittest.main()
