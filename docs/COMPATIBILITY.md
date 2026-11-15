@@ -111,9 +111,10 @@ strengthened, never silently weakened.
   `text_mismatch`, and a new emission of `no_focused_field` (the Android
   helper) and of `invalid_value` (`ui key` names); see
   [Android typing, `ui fill` and key names](#android-typing-ui-fill-and-key-names-unreleased).
-- Simulator slimming adds three codes, `slim_unsupported_runtime`,
-  `slim_not_persisted` and `slim_profile_invalid`, and the warning codes
-  `slim_not_started` and `slim_core_kept`; see
+- Simulator slimming adds four codes, `slim_unsupported_runtime`,
+  `slim_not_persisted`, `slim_profile_invalid` and
+  `simulator_service_disabled`, and the warning codes `slim_not_started`,
+  `slim_core_kept`, `slim_universal_links_off` and `slim_push_off`; see
   [Simulator slimming](#simulator-slimming-unreleased).
 
 ## Response shape
@@ -783,24 +784,34 @@ A new simulator control, `simulator slim`, switches iOS Simulator background
 services off. Everything is additive: no existing verb, key or code changes.
 Pinned by `tests/test_ios_slim.py`, `tests/test_verb_classification.py`,
 `tests/test_control_cli.py`, `tests/test_docs_cli_surface.py` and
-`tests/test_error_codes_additive.py`. Three error codes are added:
+`tests/test_error_codes_additive.py`; the app analysis, slim at boot,
+whole-simulator memory and the guard by `tests/test_ios_slim_suggest.py`,
+`tests/test_slim_boot.py`, `tests/test_metrics_simulator.py` and
+`tests/test_slim_guard.py`. Four error codes are added:
 
 | Code | Emitted by |
 | --- | --- |
 | `slim_unsupported_runtime` | `simulator slim apply` with anything to disable on a runtime older than iOS 18.5, which does not keep launchd overrides across a reboot (`runtime`); nothing is written |
 | `slim_not_persisted` | `simulator slim apply` / `restore` with `reboot=true` when the booted simulator still does not show the overrides after the store write, a per-label `launchctl` pass and a second reboot (`labels`, `missing`, `extra`, `state_file`) |
 | `slim_profile_invalid` | a slim setting or profile file that names an unknown field, preset, category id, feature id or a label outside the catalog, a wrong `schema`, `profile=` combined with other settings, an unreadable profile file, or a `--value` key the action does not take (`field`, `item`); nothing is written |
+| `simulator_service_disabled` | iOS `media add` whose import failed while `com.apple.assetsd` is switched off by slimming (`service`, `backend_error`); the hint is `autonom simulator slim enable --value ids=com.apple.assetsd` |
 
 | Surface | Before | Now |
 | --- | --- | --- |
 | `simulator slim presets` | — | read-only, needs no device: `presets` (id, description, `disabled_labels`, `disabled_categories`), `default_preset`, `core_keep`, `categories` (id, name, description, downside, `approx_memory_mb`, `labels`), `features`, `catalog_labels`, `profile_schema` |
 | `simulator slim show` | — | read-only: `state` (`stock`, `slim`, `partial`), `disabled`, `total`, `categories` (`on`, `off`, `partial`), `matches_preset`, `source` (`launchctl` on a booted simulator, else `store`), `simulator_state`, `runtime`, `persistent`, `core_keep`, `state_file` |
 | `simulator slim apply` | — | values `preset`, `need`, `enable`, `disable`, `keep`, or `profile=<path>`; `reboot=true`, `details=true`. Reply: `profile`, `desired_disabled`, `changed`, `disabled_now`, `enabled_now`, `rebooted`, `fallback`, `verified`, `verification` (`read_back` after a boot the verb made, `store_written` or `store_matches` on a simulator left shut down). A booted simulator without `reboot=true` is `simulator_must_be_shutdown`, unless it already matches (then `changed: 0` and no reboot) |
+| `simulator slim suggest` | — | read-only, values `app=<path to .app \| bundle id>` (a path needs no device; a bundle id is looked up with `simctl get_app_container <udid> <bundle> app`), `preset` (default `minimal`), `write=<path>`, `overwrite=true`. Reply: `app`, `need`, `evidence` (`feature`, `source`, `detail`; at most 60, with `truncated`), `already_core`, `profile` (`autonom.slim-profile/v1`), `estimate` (`disabled_labels`, `kept_for_need`, `catalog_labels`), `limitations`, `written`, `next`. Errors: `install_path_not_found` (`path`), `invalid_value` (not an `.app` bundle, no `app`, an existing `write` target without `overwrite=true`), `app_not_installed`, `no_target` (a bundle id without a simulator), `output_not_writable` |
+| `devices boot --slim`, `session start --slim` | — | `--slim <preset \| profile path>` (iOS): a shut-down simulator gets the profile written, is booted and read back, and the reply adds `slim` (`state`, `disabled`, `verified`, `verification`, `preset`, `profile`, `changed`, `fallback`); a booted simulator that already matches answers `changed: 0` with a `note`, one that differs is `simulator_must_be_shutdown`; Android is `unsupported_capability`. Without `--slim` both verbs are unchanged |
+| `metrics simulator` | — | read-only, iOS: `metric_semantics: "ios_simulator_tree_footprint_v1"`, `root_pid`, `processes`, `footprint_bytes`, `cpu_percent`, `top` (5 largest: `name`, `pid`, `bytes`), `slim` (`state`, `disabled`, from the store), `source`, `limitations`. A simulator that is not booted and Android are `unsupported_capability` |
+| `media add` (iOS) | the backend error | when the import fails and `com.apple.assetsd` is disabled in the simulator's override store: `simulator_service_disabled` (`service`, `backend_error`) with the `simulator slim enable` command; any other failure is unchanged |
+| `open <http(s) url>` (iOS), `simulator push send` | — | still run; add a warning `slim_universal_links_off` (`com.apple.swcd` disabled) / `slim_push_off` (`com.apple.apsd` disabled) with `service` and the enable command. The lookup reads the store file only; if it cannot be read there is no warning |
+| `doctor` | — | adds `ios.booted_simulators`: `[{udid, slim_state, disabled}]` from the device list and each store file; not part of health or `--strict` |
 | `simulator slim verify` | — | read-only: `ok`, `missing`, `extra`, `expected_disabled`, `compared_with` (`settings`, `state_file`, `stock`). Drift answers on stdout with `ok: false` and exit code 1, as `ui settle` does |
 | `simulator slim enable` / `disable` | — | values `ids=<category ids, feature ids or labels>`; booted simulator only (`unsupported_capability` otherwise), no reboot. `enable`: `started`, `not_started`, `already_running`, `on_demand`, `still_disabled`. `disable`: `stopped`, `still_enabled`, `kept_core`, `still_running`; a core service named by its label needs `force=true` (`invalid_value`) |
 | `simulator slim restore` | — | puts back what `apply` and `disable` changed (state file), or with `all=true` re-enables every catalog service; without a state file and without `all=true` it answers `changed: 0` with a `note` |
 | `capabilities` | — | adds `simulator.slim` (iOS Simulator only) |
-| Control lease | — | `presets`, `show` and `verify` are READONLY; `apply`, `enable`, `disable` and `restore` are MUTATING |
+| Control lease | — | `presets`, `show`, `suggest` and `verify` are READONLY, as is `metrics simulator`; `apply`, `enable`, `disable` and `restore` are MUTATING |
 | State | — | `$AUTONOM_HOME/simulator-slim/<UDID>.json`; `session stop` and `cleanup` leave it and the simulator's overrides alone |
 
 ### iOS UI recovery and `--session-id` (0.32.0)

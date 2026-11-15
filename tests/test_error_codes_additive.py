@@ -74,6 +74,7 @@ SLIM_CODES = {
     "SLIM_UNSUPPORTED_RUNTIME": "slim_unsupported_runtime",
     "SLIM_NOT_PERSISTED": "slim_not_persisted",
     "SLIM_PROFILE_INVALID": "slim_profile_invalid",
+    "SIMULATOR_SERVICE_DISABLED": "simulator_service_disabled",
 }
 NEW_CODES.update(SLIM_CODES)
 SLIM_SECTION = "### Simulator slimming (Unreleased)"
@@ -217,7 +218,12 @@ class AdditiveErrorCodeTests(unittest.TestCase):
                 self.assertIn(f"| `{value}` |", section)
                 self.assertIn(f"`{value}`", head, "the Error codes list names the round")
         rows = [line for line in section.splitlines() if line.startswith("| `simulator slim")]
-        for action in ("presets", "show", "apply", "verify", "enable", "restore"):
+        for code in ("slim_universal_links_off", "slim_push_off"):
+            self.assertIn(f"`{code}`", section)
+            self.assertIn(f"`{code}`", head)
+        for surface in ("`devices boot --slim`", "`metrics simulator`", "`doctor`"):
+            self.assertIn(f"| {surface}", section)
+        for action in ("presets", "show", "suggest", "apply", "verify", "enable", "restore"):
             with self.subTest(action=action):
                 self.assertTrue(any(f"`simulator slim {action}`" in row for row in rows), action)
 

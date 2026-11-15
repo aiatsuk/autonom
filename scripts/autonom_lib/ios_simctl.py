@@ -139,6 +139,20 @@ def list_devices(xcrun: str, *, available_only: bool = True) -> list[Simulator]:
     return parse_devices(payload)
 
 
+def booted_udids(xcrun: str, *, timeout: float = 15) -> list[str]:
+    """The UDIDs of the booted simulators; empty when the list cannot be
+    read. Never raises (doctor asks, and doctor only reports)."""
+    try:
+        completed = run_simctl(xcrun, ["list", "devices", "--json"], timeout=timeout,
+                               check=False)
+        if completed.returncode != 0:
+            return []
+        return sorted(simulator.udid for simulator in parse_devices(
+            json.loads(completed.stdout)) if simulator.state == "Booted")
+    except Exception:  # noqa: BLE001 - a missing or broken xcrun is not doctor's failure
+        return []
+
+
 def find_simulator(xcrun: str, udid: str) -> Simulator | None:
     for simulator in list_devices(xcrun, available_only=False):
         if simulator.udid == udid:

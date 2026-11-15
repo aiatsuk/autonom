@@ -499,7 +499,24 @@ def add_media(target: Target, path: Path) -> dict[str, Any]:
             "Pass an existing image or video path.",
         )
     if target.platform == IOS:
-        ios_simctl.add_media(target.tool, target.target_id, path)
+        try:
+            ios_simctl.add_media(target.tool, target.target_id, path)
+        except errors.AutonomError as exc:
+            from . import ios_slim  # noqa: PLC0415 - only a failed import pays for it
+
+            # A slimmed simulator without the photo library daemon refuses
+            # every import (PHPhotosErrorDomain 3301): name the real cause.
+            if exc.code == errors.INSTALL_PATH_NOT_FOUND or ios_slim.service_disabled(target.target_id,
+                                         ios_slim.SERVICE_PHOTOS) is not True:
+                raise
+            raise errors.AutonomError(
+                errors.SIMULATOR_SERVICE_DISABLED,
+                f"media add failed and {ios_slim.SERVICE_PHOTOS} (the photo library "
+                "service) is switched off on this simulator by simulator slim",
+                hint="Switch it back on with "
+                     f"'{ios_slim.enable_command(ios_slim.SERVICE_PHOTOS)}', then retry.",
+                service=ios_slim.SERVICE_PHOTOS, target_id=target.target_id,
+                backend_error=exc.message) from exc
         return {"added": str(path)}
     remote = f"/sdcard/Pictures/{path.name}"
     adb_mod.run_adb(target.tool, ["push", str(path), remote],

@@ -161,6 +161,9 @@ SLIM_UNSUPPORTED_RUNTIME = "slim_unsupported_runtime"
 SLIM_NOT_PERSISTED = "slim_not_persisted"
 # A slim setting or profile file names something unknown (the item is in `item`).
 SLIM_PROFILE_INVALID = "slim_profile_invalid"
+# A verb failed and the simulator service it needs is switched off by slimming
+# (`service` names it, the hint has the command that switches it back on).
+SIMULATOR_SERVICE_DISABLED = "simulator_service_disabled"
 
 
 # --- UI recovery (optional XCUITest backend) ----------------------------------

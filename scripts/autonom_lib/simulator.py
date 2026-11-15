@@ -876,7 +876,15 @@ def _push(target: Target, values: dict[str, Any],
         handle.flush()
         _simctl(target, ["push", target.target_id, app_id, handle.name])
     # simctl accepted the payload; whether the app showed it is not known.
-    return _unverified({"control": "push", "app_id": app_id, "app_id_source": source})
+    result = _unverified({"control": "push", "app_id": app_id, "app_id_source": source})
+    from . import ios_slim  # noqa: PLC0415 - kept off the other controls' import path
+
+    warning = ios_slim.service_warning(
+        target.target_id, ios_slim.SERVICE_PUSH, ios_slim.WARN_PUSH_OFF,
+        "simctl accepted the notification and the simulator may not show it")
+    if warning:
+        result.setdefault("warnings", []).append(warning)
+    return result
 
 
 def _telephony(target: Target, control: str, action: str,

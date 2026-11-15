@@ -2834,6 +2834,15 @@ def cmd_open(args: argparse.Namespace) -> int:
         device_state.open_url(target, args.url)
         # `simctl openurl` does not say which app took the URL
         detail = {"handled_by": "unknown"}
+        if re.match(r"(?i)https?://", args.url or ""):
+            from autonom_lib import ios_slim
+
+            warning = ios_slim.service_warning(
+                target.target_id, ios_slim.SERVICE_UNIVERSAL_LINKS,
+                ios_slim.WARN_UNIVERSAL_LINKS_OFF,
+                "a universal link is not handed to its app and stays in Safari")
+            if warning:
+                detail["warnings"] = [warning]
     return emit({"ok": True, "opened": args.url, **detail, **target.identity()},
                 as_json=True)
 

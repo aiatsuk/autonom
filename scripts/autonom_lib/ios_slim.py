@@ -601,6 +601,52 @@ def expected_disabled(state: dict[str, Any] | None) -> frozenset[str]:
     return frozenset(base & CATALOG_LABELS)
 
 
+# --- feature guard ------------------------------------------------------------------------------
+
+# Warning codes for a verb that ran on a simulator whose service is off.
+WARN_UNIVERSAL_LINKS_OFF = "slim_universal_links_off"
+WARN_PUSH_OFF = "slim_push_off"
+SERVICE_PHOTOS = "com.apple.assetsd"
+SERVICE_UNIVERSAL_LINKS = "com.apple.swcd"
+SERVICE_PUSH = "com.apple.apsd"
+
+
+def service_disabled(udid: str, label: str) -> bool | None:
+    """Whether the override store says `label` is disabled on this simulator.
+    One small file read, never a device call; None means unknown (no store
+    yet reads as False). Never raises: a guard must not add a failure mode."""
+    try:
+        return read_store(udid).get(label) is True
+    except Exception:  # noqa: BLE001 - any trouble reading the store is "unknown"
+        return None
+
+
+def enable_command(label: str) -> str:
+    return f"autonom simulator slim enable --value ids={label}"
+
+
+def service_warning(udid: str, label: str, code: str, effect: str) -> dict[str, Any] | None:
+    """The warning for a verb that needs `label`, when slimming switched it
+    off; None when it is on or unknown."""
+    if service_disabled(udid, label) is not True:
+        return None
+    return {"code": code,
+            "error": f"{label} is switched off on this simulator (simulator slim): "
+                     f"{effect}",
+            "hint": f"Switch it back on with '{enable_command(label)}'.",
+            "service": label}
+
+
+def doctor_row(udid: str) -> dict[str, Any]:
+    """`{udid, slim_state, disabled}` from the store file alone."""
+    try:
+        summary = summarize(disabled_in(read_store(udid)))
+        return {"udid": udid, "slim_state": summary["state"],
+                "disabled": summary["disabled"]}
+    except Exception:  # noqa: BLE001 - doctor reports, it does not fail
+        return {"udid": udid, "slim_state": "unknown", "disabled": None}
+
+
 # --- suggest: what an app needs --------------------------------------------------------------
 #
 # Evidence about one built app -> the features it needs. Each rule names a
