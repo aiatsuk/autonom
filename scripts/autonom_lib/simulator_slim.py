@@ -19,22 +19,29 @@ Only labels of the slim catalog are ever written, enabled or disabled.
 """
 from __future__ import annotations
 
+import json
+import os
+import tempfile
+from pathlib import Path
 from typing import Any, Iterable
 
 from . import errors, ios_simctl, ios_slim, simulator
 from .platform import ANDROID, Target
 
 CONTROL = "slim"
-ACTIONS = ("presets", "show", "apply", "verify", "enable", "disable", "restore")
-READONLY_ACTIONS = frozenset({"presets", "show", "verify"})
+ACTIONS = ("presets", "show", "suggest", "apply", "verify", "enable", "disable", "restore")
+READONLY_ACTIONS = frozenset({"presets", "show", "suggest", "verify"})
 _JSON_SCALARS = (bool, int, float, str)
 
 
 def run(target: Target | None, action: str, values: dict[str, Any]) -> dict[str, Any]:
-    """Run one slim action. `presets` describes the catalog and needs no target."""
-    if action == "presets" or target is None:
+    """Run one slim action. `presets` describes the catalog and needs no
+    target; `suggest` needs one only to find an installed app by bundle id."""
+    if action == "presets" or (target is None and action != "suggest"):
         return _presets()
     _check_keys(action, values)
+    if action == "suggest" and target is None:
+        return _suggest(None, values)
     if target.platform == ANDROID:
         raise errors.AutonomError(
             errors.UNSUPPORTED_CAPABILITY,
@@ -43,14 +50,14 @@ def run(target: Target | None, action: str, values: dict[str, Any]) -> dict[str,
             hint="Use it with --platform ios --udid <UDID>; on Android pick a lighter "
                  "system image instead.",
             capability="simulator.slim")
-    handlers = {"show": _show, "apply": _apply, "verify": _verify, "enable": _enable,
+    handlers = {"show": _show, "suggest": _suggest, "apply": _apply, "verify": _verify, "enable": _enable,
                 "disable": _disable, "restore": _restore}
     return handlers[action](target, values)
 
 
 _SETTINGS = (*ios_slim.SETTING_KEYS, "profile")
 VALUE_KEYS: dict[str, tuple[str, ...]] = {
-    "show": (), "verify": _SETTINGS, "apply": (*_SETTINGS, "reboot", "details"),
+    "show": (), "suggest": ("app", "preset", "write", "overwrite"), "verify": _SETTINGS, "apply": (*_SETTINGS, "reboot", "details"),
     "enable": ("ids",), "disable": ("ids", "force"), "restore": ("reboot", "all", "details"),
 }
 
@@ -207,7 +214,7 @@ def _commit(udid: str, entries: dict[str, Any], planned: dict[str, Any],
 
 
 def _converge(target: Target, udid: str, *, want_disabled: Iterable[str],
-              want_enabled: Iterable[str]) -> dict[str, Any]:
+              want_enabled: Iterable[str], boot_timeout: float = 120) -> dict[str, Any]:
     """Boot, read the overrides back, and when the runtime ignored the store
     set the missing ones with `launchctl` and reboot once. Still missing after
     that is `slim_not_persisted`."""
@@ -217,7 +224,7 @@ def _converge(target: Target, udid: str, *, want_disabled: Iterable[str],
         after = _live_disabled(target, udid)
         return sorted(off - after), sorted(on & after)
 
-    ios_simctl.boot(target.tool, udid)
+    ios_simctl.boot(target.tool, udid, timeout=boot_timeout)
     missing, extra = lost()
     if not missing and not extra:
         return {"fallback": False}
@@ -226,7 +233,7 @@ def _converge(target: Target, udid: str, *, want_disabled: Iterable[str],
     for label in extra:
         ios_simctl.launchctl_enable(target.tool, udid, label)
     _shutdown(target, udid, written=True)
-    ios_simctl.boot(target.tool, udid)
+    ios_simctl.boot(target.tool, udid, timeout=boot_timeout)
     still_missing, still_extra = lost()
     if still_missing or still_extra:
         labels = sorted({*still_missing, *still_extra})
@@ -288,6 +295,120 @@ def _verify(target: Target, values: dict[str, Any]) -> dict[str, Any]:
                    "simulator_state": sim_state, "verified": True,
                    "verification": "read_back" if source == "launchctl" else "store_read"})
     return result
+
+
+# --- suggest -------------------------------------------------------------------------
+
+
+def app_is_path(values: dict[str, Any]) -> bool:
+    """Whether `app=` names a bundle on disk (no simulator needed) rather
+    than a bundle id to look up on one."""
+    app = values.get("app")
+    if not isinstance(app, str) or not app.strip():
+        return False
+    app = app.strip()
+    return "/" in app or app.endswith(".app") or Path(app).expanduser().exists()
+
+
+def _app_bundle(target: Target | None, app: str) -> Path:
+    if app_is_path({"app": app}):
+        path = Path(app).expanduser()
+        if not path.exists():
+            raise errors.AutonomError(
+                errors.INSTALL_PATH_NOT_FOUND, f"app not found: {path}",
+                "Pass app=<path to a built .app bundle>, or app=<bundle id> of an app "
+                "installed on the simulator.", path=str(path))
+        if not path.is_dir() or path.suffix != ".app":
+            raise errors.AutonomError(
+                errors.INVALID_VALUE, f"{path} is not an .app bundle",
+                "Pass the built .app directory (for an .ipa, unzip it and pass "
+                "Payload/<name>.app).", path=str(path))
+        return path
+    if target is None:
+        raise errors.AutonomError(
+            errors.NO_TARGET,
+            f"app={app} is a bundle id; a simulator is needed to find the installed app",
+            "Add --udid <UDID>, or pass app=<path to the .app bundle>.")
+    udid, _state = _device(target)
+    container = ios_simctl.app_container(target.tool, udid, app, "app")
+    if container is None or not container.is_dir():
+        raise errors.AutonomError(
+            errors.APP_NOT_INSTALLED,
+            f"{app} is not installed on simulator {udid} (or the simulator is not booted)",
+            "Boot the simulator and install the app, or pass app=<path to the .app "
+            "bundle>.", app_id=app, target_id=udid)
+    return container
+
+
+def _write_profile(path: Path, profile: dict[str, Any]) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handle, temp = tempfile.mkstemp(prefix=path.name + ".", dir=str(path.parent))
+        try:
+            with os.fdopen(handle, "w", encoding="utf-8") as stream:
+                stream.write(json.dumps(profile, ensure_ascii=False, indent=2) + "\n")
+            os.chmod(temp, 0o644)
+            os.replace(temp, path)
+        except BaseException:
+            try:
+                os.unlink(temp)
+            except OSError:
+                pass
+            raise
+    except OSError as exc:
+        raise errors.AutonomError(
+            errors.OUTPUT_NOT_WRITABLE,
+            f"cannot write the slim profile {path}: {exc.strerror or exc}",
+            "Pass write=<path> in a writable directory.", path=str(path)) from exc
+
+
+def _suggest(target: Target | None, values: dict[str, Any]) -> dict[str, Any]:
+    from . import ios_app_scan
+
+    app = values.get("app")
+    if not isinstance(app, str) or not app.strip():
+        raise errors.AutonomError(
+            errors.INVALID_VALUE, "simulator slim suggest needs app=<path | bundle id>",
+            "Pass --value app=<path to the built .app> or --value app=<bundle id>.")
+    preset = values.get("preset", ios_slim.SUGGEST_DEFAULT_PRESET)
+    ios_slim.validate_profile({"preset": preset})
+    overwrite = simulator._bool(values, "overwrite", False)
+    write = values.get("write")
+    out: Path | None = None
+    if write is not None:
+        if not isinstance(write, str) or not write.strip():
+            raise errors.AutonomError(
+                errors.INVALID_VALUE, "write needs a file path",
+                "Pass --value write=.autonom/slim-profile.json.")
+        out = Path(write.strip()).expanduser()
+        if out.is_dir():
+            raise errors.AutonomError(
+                errors.INVALID_VALUE, f"{out} is a directory",
+                "Pass write=<path to a .json file>.", path=str(out))
+        if out.exists() and not overwrite:
+            raise errors.AutonomError(
+                errors.INVALID_VALUE, f"{out} already exists and was left as it is",
+                "Pass --value overwrite=true to replace it, or another write=<path>.",
+                path=str(out))
+    bundle = _app_bundle(target, app.strip())
+    facts, described, limitations = ios_app_scan.scan(bundle)
+    label = described.get("bundle_id") or described.get("name") or bundle.stem
+    body = ios_slim.suggestion(
+        facts, preset=preset, name=f"{label} slim profile",
+        description=f"Suggested from a scan of {bundle.name}; review before use.")
+    if out is not None:
+        _write_profile(out, body["profile"])
+    udid = target.target_id if target is not None else "<UDID>"
+    if out is not None:
+        settings = f"--value profile={out}"
+    else:
+        settings = f"--value preset={body['profile']['preset']}"
+        if body["need"]:
+            settings += " --value need=" + ",".join(body["need"])
+    return {"control": CONTROL, "action": "suggest", "app": described, **body,
+            "limitations": limitations, "written": str(out) if out is not None else None,
+            "next": f"autonom simulator slim apply --platform ios --udid {udid} {settings}",
+            "verified": True, "verification": "bundle_read"}
 
 
 # --- apply / restore -----------------------------------------------------------------
@@ -427,6 +548,74 @@ def _restore(target: Target, values: dict[str, Any]) -> dict[str, Any]:
     simulator._checked(result, True)
     _finish_reboot(target, result)
     return result
+
+
+# --- slim at boot (`devices boot --slim`, `session start --slim`) -----------------------
+
+
+def refuse_android(flag: str = "--slim") -> errors.AutonomError:
+    return errors.AutonomError(
+        errors.UNSUPPORTED_CAPABILITY,
+        f"{flag} switches iOS Simulator background services off; an Android emulator "
+        "has no such store",
+        hint=f"Drop {flag}, or use it with --platform ios --udid <UDID>.",
+        capability="simulator.slim")
+
+
+def flag_values(value: str) -> dict[str, Any]:
+    """`--slim <preset | profile path>` as `apply` values: one of the preset
+    ids is a preset, anything else is a profile file."""
+    value = (value or "").strip()
+    if not value:
+        raise ios_slim.invalid(
+            "--slim needs a preset or a profile path",
+            "Presets: " + ", ".join(ios_slim.PRESETS) + "; or pass a profile .json file.",
+            field="slim", item="slim")
+    return {"preset": value} if value in ios_slim.PRESETS else {"profile": value}
+
+
+def boot(target: Target, value: str, *, timeout: float = 120) -> tuple[bool, dict[str, Any]]:
+    """Boot one simulator slimmed: (this call booted it, the `slim` object of
+    the reply). A shut-down simulator gets the profile written, is booted and
+    read back; a booted one is left alone when it already matches and is
+    refused otherwise."""
+    if target.platform == ANDROID:
+        raise refuse_android()
+    values = flag_values(value)
+    profile = ios_slim.profile_from_values(values)
+    desired = ios_slim.resolve(profile)
+    udid, sim_state = _device(target)
+    _refuse_in_flux(udid, sim_state)
+    block: dict[str, Any] = {"preset": profile["preset"],
+                             "profile": values.get("profile")}
+    if sim_state == "Booted":
+        live = _live_disabled(target, udid)
+        to_disable, to_enable = ios_slim.delta(live, desired)
+        if to_disable or to_enable:
+            raise errors.AutonomError(
+                errors.SIMULATOR_MUST_BE_SHUTDOWN,
+                f"simulator {udid} is already booted and does not match the slim "
+                f"profile ({len(to_disable)} service(s) to disable, {len(to_enable)} "
+                "to enable); launchd reads its overrides at boot",
+                hint="Shut it down first ('autonom devices shutdown --udid <UDID>') and "
+                     "retry, or run 'autonom simulator slim apply --value reboot=true' "
+                     "with the same settings.",
+                target_id=udid, to_disable=len(to_disable), to_enable=len(to_enable))
+        summary = ios_slim.summarize(live, desired)
+        block.update({"state": summary["state"], "disabled": summary["disabled"],
+                      "verified": True, "verification": "read_back", "changed": 0,
+                      "note": "already booted with this slim state; nothing changed"})
+        return False, block
+    applied = _apply(target, values)
+    converged = _converge(target, udid, want_disabled=desired,
+                          want_enabled=ios_slim.CATALOG_LABELS - desired,
+                          boot_timeout=timeout)
+    summary = ios_slim.summarize(_live_disabled(target, udid), desired)
+    block.update({"state": summary["state"], "disabled": summary["disabled"],
+                  "verified": True, "verification": "read_back",
+                  "changed": applied.get("changed", 0),
+                  "fallback": converged["fallback"]})
+    return True, block
 
 
 # --- live enable / disable --------------------------------------------------------------

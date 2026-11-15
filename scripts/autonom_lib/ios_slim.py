@@ -599,3 +599,226 @@ def expected_disabled(state: dict[str, Any] | None) -> frozenset[str]:
     base |= set(live.get("disabled") or ())
     base -= set(live.get("enabled") or ())
     return frozenset(base & CATALOG_LABELS)
+
+
+# --- suggest: what an app needs --------------------------------------------------------------
+#
+# Evidence about one built app -> the features it needs. Each rule names a
+# feature id and the conditions that prove it; one condition is enough, and a
+# tuple of conditions inside `when` must all hold. Condition kinds:
+#   ("framework", name)         a linked or embedded framework, exact name
+#   ("plugin", prefix)          a framework shipped inside the app whose name
+#                               starts with the prefix, any case (Flutter and
+#                               React Native plugins); never a system framework
+#   ("info_key", prefix)        an Info.plist key of the app or an extension
+#   ("entitlement", key)        an entitlement that is present and not empty
+#   ("entitlement_value", key, prefix)  one of the entitlement's values
+#   ("background_mode", mode)   a UIBackgroundModes entry
+#   ("extension_point", id)     an extension's NSExtensionPointIdentifier
+#   ("activity_suffix", text)   an NSUserActivityTypes entry ending with text
+#   ("app_clip",)               the bundle carries an App Clip
+
+SUGGEST_RULES: tuple[dict[str, Any], ...] = (
+    {"feature": "storekit", "when": (
+        ("framework", "StoreKit"), ("plugin", "in_app_purchase"),
+        ("plugin", "purchases_flutter"), ("plugin", "RevenueCat"),
+        ("plugin", "RNPurchases"), ("plugin", "RNIap"))},
+    {"feature": "health", "when": (
+        ("framework", "HealthKit"), ("framework", "HealthKitUI"),
+        ("info_key", "NSHealth"), ("plugin", "health"),
+        ("entitlement", "com.apple.developer.healthkit"))},
+    {"feature": "homekit", "when": (
+        ("framework", "HomeKit"), ("info_key", "NSHomeKitUsageDescription"),
+        ("entitlement", "com.apple.developer.homekit"))},
+    {"feature": "icloud", "when": (
+        ("framework", "CloudKit"),
+        ("entitlement", "com.apple.developer.icloud-container-identifiers"),
+        ("entitlement", "com.apple.developer.icloud-services"),
+        ("entitlement", "com.apple.developer.ubiquity-container-identifiers"),
+        ("entitlement", "com.apple.developer.ubiquity-kvstore-identifier"))},
+    {"feature": "contacts", "when": (
+        ("framework", "Contacts"), ("framework", "ContactsUI"),
+        ("info_key", "NSContactsUsageDescription"))},
+    {"feature": "calendar", "when": (
+        ("framework", "EventKit"), ("framework", "EventKitUI"),
+        ("info_key", "NSCalendars"))},
+    {"feature": "reminders", "when": (("info_key", "NSReminders"),)},
+    {"feature": "mail", "when": (("framework", "MessageUI"),)},
+    {"feature": "photos", "when": (
+        ("framework", "Photos"), ("framework", "PhotosUI"),
+        ("info_key", "NSPhotoLibrary"), ("plugin", "image_picker"))},
+    {"feature": "widgets", "when": (
+        ("framework", "WidgetKit"), ("framework", "ActivityKit"),
+        ("extension_point", "com.apple.widgetkit-extension"),
+        ("info_key", "NSSupportsLiveActivities"))},
+    {"feature": "wallet", "when": (
+        ("framework", "PassKit"), ("entitlement", "com.apple.developer.in-app-payments"),
+        ("entitlement", "com.apple.developer.pass-type-identifiers"))},
+    {"feature": "maps", "when": (("framework", "MapKit"),)},
+    {"feature": "weather", "when": (
+        ("framework", "WeatherKit"), ("entitlement", "com.apple.developer.weatherkit"))},
+    {"feature": "game-center", "when": (
+        ("framework", "GameKit"), ("entitlement", "com.apple.developer.game-center"))},
+    {"feature": "siri", "when": (
+        ("framework", "Intents"), ("framework", "IntentsUI"), ("framework", "AppIntents"),
+        ("framework", "Speech"), ("info_key", "NSSpeechRecognition"),
+        ("info_key", "NSSiriUsageDescription"),
+        ("entitlement", "com.apple.developer.siri"),
+        ("extension_point", "com.apple.intents-service"),
+        ("extension_point", "com.apple.intents-ui-service"),
+        ("activity_suffix", "Intent"))},
+    {"feature": "spotlight", "when": (
+        ("framework", "CoreSpotlight"),
+        ("extension_point", "com.apple.spotlight.import"),
+        ("extension_point", "com.apple.spotlight.index"))},
+    {"feature": "universal-links", "when": (
+        ("entitlement", "com.apple.developer.associated-domains"),)},
+    {"feature": "push", "when": (
+        ("entitlement", "aps-environment"), ("framework", "UserNotifications"),
+        ("framework", "UserNotificationsUI"), ("plugin", "firebase_messaging"),
+        ("background_mode", "remote-notification"),
+        ("extension_point", "com.apple.usernotifications.service"),
+        ("extension_point", "com.apple.usernotifications.content-extension"))},
+    {"feature": "keychain-sync", "when": (
+        (("entitlement", "keychain-access-groups"),
+         ("framework", "AuthenticationServices")),
+        ("entitlement_value", "com.apple.developer.associated-domains", "webcredentials:"))},
+    {"feature": "screen-time", "when": (
+        ("framework", "FamilyControls"), ("framework", "DeviceActivity"),
+        ("framework", "ManagedSettings"),
+        ("entitlement", "com.apple.developer.family-controls"))},
+    {"feature": "app-clips", "when": (
+        ("app_clip",),
+        ("entitlement", "com.apple.developer.associated-appclip-app-identifiers"),
+        ("entitlement", "com.apple.developer.parent-application-identifiers"))},
+    {"feature": "imessage", "when": (
+        ("framework", "Messages"),
+        ("extension_point", "com.apple.message-payload-provider"))},
+)
+
+SUGGEST_EVIDENCE_CAP = 60
+SUGGEST_DEFAULT_PRESET = "minimal"
+_CONDITION_SOURCES = {
+    "info_key": "info_plist", "entitlement": "entitlements",
+    "entitlement_value": "entitlements", "background_mode": "info_plist",
+    "extension_point": "extension", "activity_suffix": "info_plist",
+    "app_clip": "bundle",
+}
+
+
+def empty_facts() -> dict[str, Any]:
+    """The evidence `suggest_needs` reads; a scan fills what it could find."""
+    return {"linked_frameworks": set(), "embedded_frameworks": set(), "info_keys": set(),
+            "background_modes": set(), "activity_types": set(), "extension_points": set(),
+            "entitlements": {}, "app_clip": False}
+
+
+def _entitlement_values(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, (list, tuple)):
+        return [item for item in value if isinstance(item, str)]
+    return []
+
+
+def _condition_hit(condition: tuple[Any, ...], facts: dict[str, Any]) -> tuple[str, str] | None:
+    """(source, detail) when the condition holds for `facts`, else None."""
+    kind = condition[0]
+    if kind == "framework":
+        name = condition[1]
+        if name in facts["linked_frameworks"]:
+            return "linked_framework", name
+        if name in facts["embedded_frameworks"]:
+            return "embedded_framework", name
+        return None
+    if kind == "plugin":
+        prefix = condition[1].lower()
+        for name in sorted(facts["embedded_frameworks"]):
+            if name.lower().startswith(prefix):
+                return "embedded_framework", name
+        return None
+    if kind == "info_key":
+        for key in sorted(facts["info_keys"]):
+            if key.startswith(condition[1]):
+                return "info_plist", key
+        return None
+    if kind == "entitlement":
+        value = facts["entitlements"].get(condition[1])
+        if value in (None, False, "", [], {}):
+            return None
+        return "entitlements", condition[1]
+    if kind == "entitlement_value":
+        for item in _entitlement_values(facts["entitlements"].get(condition[1])):
+            if item.startswith(condition[2]):
+                return "entitlements", f"{condition[1]}: {condition[2]}"
+        return None
+    if kind == "background_mode":
+        return (("info_plist", f"UIBackgroundModes: {condition[1]}")
+                if condition[1] in facts["background_modes"] else None)
+    if kind == "extension_point":
+        return (("extension", condition[1])
+                if condition[1] in facts["extension_points"] else None)
+    if kind == "activity_suffix":
+        for item in sorted(facts["activity_types"]):
+            if item.endswith(condition[1]):
+                return "info_plist", f"NSUserActivityTypes: {item}"
+        return None
+    if kind == "app_clip":
+        return ("bundle", "AppClips") if facts["app_clip"] else None
+    return None
+
+
+def suggest_needs(facts: dict[str, Any]) -> tuple[list[str], list[dict[str, str]]]:
+    """(feature ids, evidence) the rules find in `facts`. Every condition
+    that holds is one evidence entry, so the reason for a feature is on record."""
+    need: set[str] = set()
+    evidence: list[dict[str, str]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for rule in SUGGEST_RULES:
+        for condition in rule["when"]:
+            parts = condition if isinstance(condition[0], tuple) else (condition,)
+            hits = [_condition_hit(part, facts) for part in parts]
+            if not all(hits):
+                continue
+            need.add(rule["feature"])
+            source = hits[0][0]
+            detail = " + ".join(hit[1] for hit in hits)
+            key = (rule["feature"], source, detail)
+            if key not in seen:
+                seen.add(key)
+                evidence.append({"feature": rule["feature"], "source": source,
+                                 "detail": detail})
+    return sorted(need), evidence
+
+
+def core_features() -> list[str]:
+    """Features every non-stock preset keeps on already (their labels are all
+    in CORE_KEEP)."""
+    core = set(CORE_KEEP)
+    return sorted(item["id"] for item in FEATURES
+                  if feature_labels(item["id"]) and feature_labels(item["id"]) <= core)
+
+
+def suggestion(facts: dict[str, Any], *, preset: str = SUGGEST_DEFAULT_PRESET,
+               name: str | None = None, description: str | None = None) -> dict[str, Any]:
+    """The reply body of `simulator slim suggest` for scanned `facts`."""
+    need, evidence = suggest_needs(facts)
+    raw: dict[str, Any] = {"schema": PROFILE_SCHEMA, "preset": preset, "need": need}
+    if name:
+        raw["name"] = name
+    if description:
+        raw["description"] = description
+    profile = validate_profile(raw)
+    disabled = resolve(profile)
+    without = resolve({**profile, "need": []})
+    core = set(core_features())
+    return {
+        "need": need,
+        "evidence": evidence[:SUGGEST_EVIDENCE_CAP],
+        "truncated": max(0, len(evidence) - SUGGEST_EVIDENCE_CAP),
+        "already_core": sorted(set(need) & core),
+        "profile": profile,
+        "estimate": {"disabled_labels": len(disabled),
+                     "kept_for_need": sorted(without - disabled),
+                     "catalog_labels": len(CATALOG_LABELS)},
+    }

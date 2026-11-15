@@ -156,7 +156,8 @@ CONTROL_ACTIONS: dict[str, tuple[str, ...]] = {
     "status-bar": ("override", "pin", "clear"),
     "keyboard": ("pin", "reset", "show"),
     "animations": ("pin", "reset", "show"),
-    "slim": ("presets", "show", "apply", "verify", "enable", "disable", "restore"),
+    "slim": ("presets", "show", "suggest", "apply", "verify", "enable", "disable",
+             "restore"),
 }
 CONTROLS = (*CONTROL_ACTIONS, "text-size")
 
