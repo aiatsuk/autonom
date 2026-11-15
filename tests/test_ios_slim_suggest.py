@@ -534,5 +534,43 @@ class SuggestCliTests(SuggestBase):
         self.assertEqual(payload["error_code"], errors.INVALID_VALUE)
 
 
+class SchemaTests(unittest.TestCase):
+    """`schemas/slim-profile-v1.schema.json` and the validator agree."""
+
+    def setUp(self) -> None:
+        self.schema = json.loads(
+            (ROOT / "schemas/slim-profile-v1.schema.json").read_text("utf-8"))
+
+    def test_field_names_match_the_validator(self) -> None:
+        self.assertEqual(set(self.schema["properties"]), set(ios_slim.PROFILE_FIELDS))
+        self.assertIs(self.schema["additionalProperties"], False)
+        self.assertEqual(self.schema["properties"]["schema"]["const"],
+                         ios_slim.PROFILE_SCHEMA)
+        self.assertEqual(self.schema["required"], ["schema"])
+
+    def test_presets_and_default_match(self) -> None:
+        preset = self.schema["properties"]["preset"]
+        self.assertEqual(preset["enum"], list(ios_slim.PRESETS))
+        self.assertEqual(preset["default"], ios_slim.DEFAULT_PRESET)
+
+    def test_list_fields_are_the_validators_list_fields(self) -> None:
+        lists = {name for name, spec in self.schema["properties"].items()
+                 if spec.get("$ref") == "#/$defs/names"}
+        self.assertEqual(lists, set(ios_slim._LIST_FIELDS))
+        for name in ("name", "description"):
+            self.assertEqual(self.schema["properties"][name]["type"], "string")
+
+    def test_a_field_outside_the_schema_is_refused_by_the_validator(self) -> None:
+        with self.assertRaises(errors.AutonomError) as caught:
+            ios_slim.validate_profile({"schema": ios_slim.PROFILE_SCHEMA, "extra": 1})
+        self.assertEqual(caught.exception.code, errors.SLIM_PROFILE_INVALID)
+        # and every schema field is accepted
+        full = {"schema": ios_slim.PROFILE_SCHEMA, "preset": "minimal",
+                "need": ["storekit"], "enable": ["search"], "disable": ["icloud"],
+                "keep": ["com.apple.cloudd"], "name": "n", "description": "d"}
+        self.assertEqual(set(full), set(self.schema["properties"]))
+        self.assertEqual(ios_slim.validate_profile(full, require_schema=True), full)
+
+
 if __name__ == "__main__":
     unittest.main()

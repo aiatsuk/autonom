@@ -511,6 +511,26 @@ processes instead of 10.7 GB and 238 (iOS 27.2).
   file. The store is written first and the state file second; if the state
   file cannot be written the store is put back, so the file never describes a
   change that is not in the store. Slimming is not undone by `session stop`.
+- **App analysis.** `simulator slim suggest` is the deterministic half of
+  "what does this app need": `ios_app_scan.py` reads the `Info.plist` of the
+  app and its extensions, the entitlements (`codesign`, else the XML plist a
+  simulator build keeps in its executable) and the frameworks the binaries
+  link (`otool -L`) or ship; `SUGGEST_RULES` in `ios_slim.py` (data) maps
+  that evidence to feature ids with a reason each. Every source is optional:
+  a missing tool is a `limitations` line. The other half is the agent reading
+  the project (`ios-project-setup` skill).
+- **Slim at boot.** `devices boot --slim` and `session start --slim` run the
+  same apply, boot and read-back for a shut-down simulator; a booted one is
+  never rebooted behind the caller's back (`simulator_must_be_shutdown`
+  unless it already matches). The Canvas boot job is unchanged.
+- **Whole-simulator memory.** `metrics simulator`
+  (`metrics/simulator_tree.py`) finds the simulator's `launchd_sim` with
+  `pgrep -f <udid>/data/var/run/launchd_bootstrap`, walks the process tree
+  from one `ps`, and sums the physical footprint from one `top -l 1`.
+- **Guard.** Verbs that need a core service read the store file (never the
+  device): a failed `media add` with `com.apple.assetsd` off is
+  `simulator_service_disabled`; `open <http url>` and `push send` warn. A
+  store that cannot be read means "unknown" and changes nothing.
 
 ### Control lease
 

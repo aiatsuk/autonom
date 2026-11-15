@@ -289,6 +289,34 @@ python3 <autonom-root>/scripts/autonom.py control release --serial emulator-5584
   lease expires within 30 s). Do not retry in a loop: poll `control status`
   and continue once it reads `free`.
 
+## Slim simulators
+
+A stock iOS Simulator runs over two hundred background services the app
+under test never uses. Slim it when several simulators must fit on one Mac,
+or when the host is short of memory; leave it stock when the task is about a
+system feature you would switch off.
+
+```bash
+autonom devices boot --udid <UDID> --slim minimal        # write, boot, read back
+autonom session start --platform ios --udid <UDID> --slim .autonom/slim-profile.json
+autonom --udid <UDID> simulator slim show                # stock | slim | partial
+autonom --udid <UDID> metrics simulator                  # processes, footprint_bytes
+autonom --udid <UDID> simulator slim restore --value reboot=true   # as it was
+```
+
+| Preset | What is off | Measured |
+| --- | --- | --- |
+| `stock` | nothing | 10.7 GB, 238 processes |
+| `optimized` | widgets, Siri, telemetry, stock apps, family, health, messaging, connectivity, MDM, other | 4.3 GB, 108 processes |
+| `minimal` | every slimmable service | 2.8 GB, 77 processes |
+
+One machine's figures (iPhone 17 Pro, iOS 27.2, 24 GB Mac, 180 s after boot,
+2026-11-15); yours will differ. Photo import (`media add`), universal links
+and push always stay on in `optimized` and `minimal`; custom-scheme deep
+links need no service. `--slim` needs a shut-down simulator and iOS 18.5 or
+newer, and stays until `restore` (`session stop` does not undo it). For what
+one app needs, see "Build a slim profile for this app" in `ios-project-setup`.
+
 ## Related skills
 
 - `mobile-screen` — UI tree, find, tap, screenshot

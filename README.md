@@ -80,6 +80,7 @@ autonom ui tree --format outline --interactable   # one line per actionable node
 autonom ui find --desc "Log In" --mode exact
 autonom ui tap --desc "Continue"
 autonom simulator status-bar pin            # full battery and signal: diff-stable screenshots
+autonom devices boot --udid <UDID> --slim minimal   # iOS: background services off, about 4x less memory
 autonom screenshot --label "after login"    # reports width/height too
 autonom logs tail --package com.example.app --since 60
 autonom location get                        # current position (Android)

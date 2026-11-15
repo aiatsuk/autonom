@@ -22,6 +22,21 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
   `slim_profile_invalid`; new capability `simulator.slim`. The service
   catalog comes from simslim (MIT, copyright Interlap), see
   `THIRD_PARTY_NOTICES.md`.
+- **A slim profile for one app, slim at boot, whole-simulator memory.**
+  `simulator slim suggest --value app=<.app path | bundle id>` reads the
+  app's Info.plist, entitlements and frameworks and answers with the features
+  it needs, the evidence for each, a ready profile (`write=<path>` saves it)
+  and the apply command. `devices boot --slim <preset|profile.json>` and
+  `session start --slim <...>` write the profile, boot and read it back.
+  `metrics simulator` sums the host memory of every process of one booted
+  simulator (one machine, iPhone 17 Pro, iOS 27.2, 180 s after boot: stock
+  10.7 GB / 238 processes, `optimized` 4.3 GB / 108, `minimal` 2.8 GB / 77).
+  A failed `media add` on a simulator whose photo service is off is the new
+  code `simulator_service_disabled`; `open <http url>` and `simulator push
+  send` warn (`slim_universal_links_off`, `slim_push_off`); `doctor` lists
+  the booted simulators' slim state. New schema
+  `schemas/slim-profile-v1.schema.json`. The skills `mobile-session` and
+  `ios-project-setup` explain when to slim and how to build a profile.
 
 ## [0.38.1] - 2026-11-10
 

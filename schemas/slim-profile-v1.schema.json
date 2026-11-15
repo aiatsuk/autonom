@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autonom.dev/schemas/slim-profile-v1.schema.json",
+  "title": "Autonom Slim Profile v1",
+  "description": "Which iOS Simulator background services to switch off: the settings of 'autonom simulator slim apply' as a file (profile=<path>, devices boot --slim <path>, session start --slim <path>). 'autonom simulator slim suggest' writes one for a built app; 'autonom simulator slim presets' lists the valid preset, feature and category ids. Keeping wins over disabling: need, enable and keep are subtracted from what the preset and disable switch off.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema"
+  ],
+  "properties": {
+    "schema": {
+      "const": "autonom.slim-profile/v1"
+    },
+    "preset": {
+      "enum": [
+        "stock",
+        "optimized",
+        "minimal"
+      ],
+      "default": "optimized",
+      "description": "stock disables nothing; optimized disables services an app rarely needs; minimal disables every slimmable service. Photo import, universal links and push stay on outside stock."
+    },
+    "need": {
+      "$ref": "#/$defs/names",
+      "description": "Feature ids the app needs (storekit, health, icloud, ...); their services stay on."
+    },
+    "enable": {
+      "$ref": "#/$defs/names",
+      "description": "Category ids kept on whole (search, icloud, store, ...)."
+    },
+    "disable": {
+      "$ref": "#/$defs/names",
+      "description": "Category ids switched off in addition to the preset."
+    },
+    "keep": {
+      "$ref": "#/$defs/names",
+      "description": "Single launchd labels from the catalog that stay on."
+    },
+    "name": {
+      "type": "string"
+    },
+    "description": {
+      "type": "string"
+    }
+  },
+  "$defs": {
+    "names": {
+      "description": "A list of names, or one comma-separated string.",
+      "oneOf": [
+        {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "uniqueItems": true
+        },
+        {
+          "type": "string"
+        }
+      ]
+    }
+  }
+}

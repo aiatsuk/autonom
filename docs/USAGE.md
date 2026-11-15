@@ -264,6 +264,24 @@ autonom --udid <UDID> simulator slim restore --value reboot=true
 import, universal links and push stay on in `optimized` and `minimal`.
 Slimming needs iOS 18.5 or newer and stays until `restore`.
 
+Build a profile for one app, boot slimmed, and measure the whole simulator:
+
+```bash
+autonom simulator slim suggest --value app=build/ios/iphonesimulator/Runner.app \
+        --value write=.autonom/slim-profile.json    # need, evidence, profile, next
+autonom --udid <UDID> simulator slim suggest --value app=com.example.app   # installed app
+autonom devices boot --udid <UDID> --slim minimal   # write, boot, read back
+autonom session start --platform ios --udid <UDID> --slim .autonom/slim-profile.json
+autonom --udid <UDID> metrics simulator             # processes, footprint_bytes, top 5
+```
+
+`suggest` only reads: what the binary scan cannot see (features reached at
+runtime or in web views) is the agent's part, see the `ios-project-setup`
+skill. One machine's figures (iPhone 17 Pro, iOS 27.2, 24 GB Mac, 180 s after
+boot, 2026-11-15): stock 10.7 GB / 238 processes, `optimized` 4.3 GB / 108,
+`minimal` 2.8 GB / 77. When `media add` fails on a slimmed simulator the
+error names the service to switch back on (`simulator_service_disabled`).
+
 ## Watch and drive the Simulator at 60 fps in the browser
 
 ```text
