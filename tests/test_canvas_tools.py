@@ -709,6 +709,34 @@ class AndroidSimulateTests(ToolsCase):
         self.assertIn("delivery=shade", self.journal(record)[0]["argv"])
         self.assertNotIn(SECRET, self.journal_text(record))
 
+    def test_the_push_form_values_reach_a_stopped_app_and_journal_lengths_only(self) -> None:
+        # Exactly what the page's push form sends: a message object, delivery and a
+        # boolean include_stopped (canvas-push-form.mjs, build()).
+        record = self.start_session()
+        self.fake_state(stopped_packages=[APP])
+        message = {"title": "Order shipped", "body": SECRET, "badge": 3,
+                   "data": {"url": "myapp://orders/" + SECRET}}
+        refused = self.refused("simulate", {"control": "push", "action": "send", "values": {
+            "app_id": APP, "message": message, "delivery": "app", "include_stopped": False}},
+            errors.PUSH_NOT_DELIVERED)
+        self.assertEqual(refused["reason"], "not_received")
+        self.assertIn("include_stopped", refused["hint"])
+        result = self.ok("simulate", {"control": "push", "action": "send", "values": {
+            "app_id": APP, "message": message, "delivery": "app", "include_stopped": True}})
+        self.assertEqual((result["delivery"], result["kind"], result["app_id_source"]),
+                         ("app", "notification", "value"))
+        state = json.loads(self.state.read_text(encoding="utf-8"))
+        first, second = state["broadcasts"]
+        self.assertEqual((first["include_stopped"], second["include_stopped"]), (False, True))
+        self.assertEqual(second["extras"]["url"], "myapp://orders/" + SECRET)
+        self.assertEqual(second["extras"]["gcm.notification.notification_count"], "3")
+        size = len(json.dumps(message, separators=(",", ":")).encode())
+        entries = self.journal(record)
+        self.assertEqual(entries[-1]["argv"], ["canvas", "simulate", "push", "send",
+                                               f"message_len={size}", "delivery=app",
+                                               "include_stopped=True", f"app_id={APP}"])
+        self.assertNotIn(SECRET, self.journal_text(record))
+
     def test_a_refused_push_journals_its_code_and_never_the_text(self) -> None:
         record = self.start_session()
         self.fake_state(su_uid=None)

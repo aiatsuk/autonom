@@ -1,5 +1,6 @@
 import { canvasIcon as svg, canvasIconData, canvasTabList, canvasTabPanel, canvasDomScript } from "./canvas-ui.mjs";
 import { mockFormMarkup, mockFormScript, mockFormStyles } from "./canvas-mock-form.mjs";
+import { pushFormMarkup, pushFormScript, pushFormStyles } from "./canvas-push-form.mjs";
 // The Tools drawer of the Mobile Canvas page (contract section 3 of run canvas-web-controls):
 // permissions and location (App), device simulations, network capture, network mocks and the
 // live device log. Four pure functions return strings that renderPage inlines: the header
@@ -8,7 +9,6 @@ import { mockFormMarkup, mockFormScript, mockFormStyles } from "./canvas-mock-fo
 
 const LOG_ROW_LIMIT = 2000;
 const REQUEST_ROW_LIMIT = 500;
-const PUSH_PAYLOAD_LIMIT = 4096;
 
 export const TOOLS_TABS = Object.freeze([
   Object.freeze({ id: "app", label: "App" }),
@@ -30,7 +30,6 @@ const LOCATION_PRESETS = Object.freeze([
   ["Sydney", -33.8688, 151.2093],
 ]);
 
-const DEFAULT_PUSH = '{"aps":{"alert":{"title":"Autonom","body":"Hello from the Canvas"},"sound":"default"}}';
 const HTTP_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"];
 
 function platformOf(context) {
@@ -128,11 +127,8 @@ function simulatePanel(ios) {
   const batteryState = ios
     ? `<select id="tools-battery-state" aria-label="Battery state"><option value="charged">Charged</option><option value="charging">Charging</option><option value="discharging">Discharging</option></select>`
     : "";
-  const push = ios ? row("push", "Push notification", simButton("push", "send", "Send push", true, "Send"),
-    `<details class="tools-sim-details"><summary>Payload</summary><label class="tools-label" for="tools-push-app">Bundle id</label>` +
-    `<input id="tools-push-app" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Same as the App tab">` +
-    `<label class="tools-label" for="tools-push-payload">Payload</label>` +
-    `<textarea id="tools-push-payload" rows="4" spellcheck="false" title="JSON payload, up to 4 KB">${DEFAULT_PUSH.replace(/&/g, "&amp;").replace(/</g, "&lt;")}</textarea></details>`) : "";
+  // Both platforms: the form is canvas-push-form.mjs; Send stays in the row, where it was.
+  const push = row("push", "Push notification", simButton("push", "send", "Send push", true, "Send"), pushFormMarkup(ios ? "ios" : "android"));
   return panel("simulate", push + biometric +
     row("battery", "Battery", `<input id="tools-battery-level" aria-label="Battery level (%)" title="Battery level (%)" type="number" inputmode="numeric" min="0" max="100" step="1" value="20">` + batteryState +
       simButton("battery", "set", "Set battery", true, "Set") + simButton("battery", "reset", "Reset")) +
@@ -279,6 +275,7 @@ body.tools-open aside.side{display:none}
 .tools-inline-field{display:flex;align-items:center;gap:6px;min-width:0}
 .tools-inline-field label{font-size:12px;color:var(--text-2)}
 ${mockFormStyles().trim()}
+${pushFormStyles().trim()}
 .tools-log-filters{display:grid;gap:6px}
 .tools-log-search{display:grid;grid-template-columns:minmax(100px,1fr) minmax(0,2fr);gap:6px}
 .tools-filters{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin-bottom:10px}
@@ -448,7 +445,7 @@ html:root #tools-net-body>.tools-requests-group{display:flex;flex-direction:colu
 export function toolsScript() {
   return `(function(){
 "use strict";
-const LOG_LIMIT=${LOG_ROW_LIMIT},REQUEST_LIMIT=${REQUEST_ROW_LIMIT},PUSH_LIMIT=${PUSH_PAYLOAD_LIMIT};
+const LOG_LIMIT=${LOG_ROW_LIMIT},REQUEST_LIMIT=${REQUEST_ROW_LIMIT};
 const drawer=$("tools"),toggle=$("tools-toggle");
 if(!drawer||!toggle)return;
 const PLATFORM=drawer.getAttribute("data-platform")==="ios"?"ios":"android";
@@ -464,12 +461,12 @@ const state={open:false,tab:"app",context:null,contextBusy:false,lockTimer:null,
 function text(id,value){const node=$(id);if(node&&node.textContent!==value)node.textContent=value}
 ${canvasDomScript()}
 ${mockFormScript()}
+${pushFormScript()}
 function capital(value){return value.charAt(0).toUpperCase()+value.slice(1)}
-function utf8(value){return new TextEncoder().encode(value).length}
 function hasCsrf(){return typeof csrf!=="undefined"&&csrf}
 
-// Requests: the page's post() only throws the message, so this wrapper keeps error_code and hint.
-function failure(payload,status){const error=new Error(payload&&payload.error||"the request failed"+(status?" ("+status+")":""));error.code=payload&&payload.error_code||null;error.hint=payload&&payload.hint||null;error.status=status||0;return error}
+// Requests: the page's post() only throws the message, so this wrapper keeps error_code, hint and reason.
+function failure(payload,status){const error=new Error(payload&&payload.error||"the request failed"+(status?" ("+status+")":""));error.code=payload&&payload.error_code||null;error.hint=payload&&payload.hint||null;error.reason=payload&&payload.reason||null;error.status=status||0;return error}
 async function request(method,path,body){const init={method,headers:{}};if(method!=="GET"){init.headers["Content-Type"]="application/json";init.headers["X-Autonom-Origin"]="human";if(hasCsrf())init.headers["X-Autonom-CSRF"]=csrf;init.body=JSON.stringify(body||{})}let response;try{response=await fetch(url(path),init)}catch(error){throw failure({error:"The Canvas did not answer: "+(error&&error.message||error),error_code:"unreachable"},0)}let payload=null;try{payload=await response.json()}catch{payload=null}if(!response.ok||!payload||payload.ok===false)throw failure(payload||{error:response.statusText||null},response.status);return payload}
 async function call(op,payload){const answer=await request("POST","/tools/call",{op,payload:payload||{}});return answer.result||{}}
 function localError(message,code,hint){return failure({error:message,error_code:code||null,hint:hint||null},0)}
@@ -477,8 +474,9 @@ function localError(message,code,hint){return failure({error:message,error_code:
 // Messages: one line for the outcome, a second for the hint; text only.
 function message(panel,kind,value,hint){const box=$("tools-msg-"+panel);if(!box)return;box.replaceChildren();if(!value){box.hidden=true;box.removeAttribute("data-kind");return}box.setAttribute("data-kind",kind);box.appendChild(el("p","tools-msg-text",value));if(hint)box.appendChild(el("p","tools-msg-hint",hint));box.hidden=false}
 function errorText(error){return(error&&error.message||String(error))+(error&&error.code?" ("+error.code+")":"")}
-function showError(panel,error){message(panel,"error",errorText(error),error&&error.hint||"")}
-function showOk(panel,value){message(panel,"ok",value,"")}
+// A push the emulator did not deliver says what to do in the page's own words (PUSH_FORM.failureHint).
+function showError(panel,error){message(panel,"error",errorText(error),PUSH_FORM.failureHint(error)||error&&error.hint||"")}
+function showOk(panel,value,hint){message(panel,"ok",value,hint||"")}
 
 // Device changes follow the page's control rule; the reason shows while they are off.
 function allowed(){try{return Boolean(canSendInput())}catch{return true}}
@@ -586,8 +584,12 @@ let biometrySeq=0;
 async function refreshBiometry(){if(!state.context||!state.context.simulate||!state.context.simulate.biometric)return;const seq=++biometrySeq;try{const result=await call("biometric.status");if(seq!==biometrySeq)return;const kind=result.biometry;const label=kind==="face"?"Face ID":kind==="touch"?"Touch ID":kind==="fingerprint"?"Fingerprint":"Biometrics";text("tools-biometry-title",label);text("tools-biometry-status",(result.enrolled===true?"Enrolled":result.enrolled===false?"Not enrolled":"Enrollment unavailable")+(Number.isInteger(result.count)&&result.count>0?" · "+result.count+" saved":"")+(result.operation==="idle"?" · No active prompt":result.operation==="enroll"?" · Enrollment waiting":result.operation==="authenticate"?" · Authentication active":""));}catch(error){if(seq===biometrySeq)text("tools-biometry-status",error.message||"Biometric status unavailable")}}
 $("tools-biometry-refresh").addEventListener("click",refreshBiometry);
 function verdict(result){if(result&&result.verified===true)return"confirmed on the device";if(result&&result.verification==="mismatch")return"sent, but the device read back another value";return"sent (the device cannot confirm it)"}
-function simValues(control,action){if(control==="biometric"&&(action==="match"||action==="nonmatch")&&$("tools-finger-id")){const finger=Number($(action==="match"?"tools-finger-id":"tools-finger-failure-id").value);if(!Number.isInteger(finger)||finger<1||finger>2147483647)throw localError("Enter a whole fingerprint id from 1 to 2147483647.","invalid_value");if(action==="nonmatch"&&finger===Number($("tools-finger-id").value))throw localError("Failure must use a different, unenrolled fingerprint id.","invalid_value");return{finger_id:finger}}if(control==="push"){const pushApp=$("tools-push-app"),app=(pushApp&&pushApp.value.trim())||appId(),raw=$("tools-push-payload").value;if(!app)throw localError("Enter a bundle id here or on the App tab.","invalid_value");if(utf8(raw)>PUSH_LIMIT)throw localError("The payload is larger than 4 KB.","invalid_value");let payload;try{payload=JSON.parse(raw)}catch{throw localError("The payload is not valid JSON.","invalid_value")}if(!payload||typeof payload!=="object"||Array.isArray(payload))throw localError("The payload must be a JSON object.","invalid_value");return{app_id:app,payload}}if(control==="battery"&&action==="set"){const level=Number($("tools-battery-level").value);if(!Number.isInteger(level)||level<0||level>100)throw localError("The battery level must be a whole number from 0 to 100.","invalid_value");const values={level};const stateField=$("tools-battery-state");if(stateField)values.state=stateField.value;return values}return{}}
-$("tools-panel-simulate").addEventListener("click",async event=>{const control=event.target&&event.target.closest?event.target.closest("[data-sim]"):null;if(!control||control.disabled)return;const name=control.getAttribute("data-sim"),action=control.getAttribute("data-action");let values;try{values=simValues(name,action)}catch(error){showError("simulate",error);return}const result=await mutate("simulate",control,"simulate",{control:name,action,values});if(result)showOk("simulate",result.message||capital(name)+" "+action+": "+verdict(result)+".");if(name==="biometric")refreshBiometry()});
+function simValues(control,action){if(control==="biometric"&&(action==="match"||action==="nonmatch")&&$("tools-finger-id")){const finger=Number($(action==="match"?"tools-finger-id":"tools-finger-failure-id").value);if(!Number.isInteger(finger)||finger<1||finger>2147483647)throw localError("Enter a whole fingerprint id from 1 to 2147483647.","invalid_value");if(action==="nonmatch"&&finger===Number($("tools-finger-id").value))throw localError("Failure must use a different, unenrolled fingerprint id.","invalid_value");return{finger_id:finger}}if(control==="push"){const built=pushForm.build(appId());if(!built.values)throw localError(built.errors[0].message,"invalid_value");return built.values}if(control==="battery"&&action==="set"){const level=Number($("tools-battery-level").value);if(!Number.isInteger(level)||level<0||level>100)throw localError("The battery level must be a whole number from 0 to 100.","invalid_value");const values={level};const stateField=$("tools-battery-state");if(stateField)values.state=stateField.value;return values}return{}}
+$("tools-panel-simulate").addEventListener("click",async event=>{const control=event.target&&event.target.closest?event.target.closest("[data-sim]"):null;if(!control||control.disabled)return;const name=control.getAttribute("data-sim"),action=control.getAttribute("data-action");let values;try{values=simValues(name,action)}catch(error){showError("simulate",error);return}const result=await mutate("simulate",control,"simulate",{control:name,action,values});if(result&&name==="push"){const line=PUSH_FORM.status(result,PLATFORM);showOk("simulate",line.text,line.hint)}else if(result)showOk("simulate",result.message||capital(name)+" "+action+": "+verdict(result)+".");if(name==="biometric")refreshBiometry()});
+// Push: the form (canvas-push-form.mjs) is remembered per platform in this browser, never its app id.
+// Preview is the read-only push.compose op: no device change, so it is not leased.
+const pushForm=pushFormController({$,el,makeButton,text,core:PUSH_FORM,platform:PLATFORM,read:key=>{try{return localStorage.getItem(key)}catch{return null}},write:(key,value)=>{try{localStorage.setItem(key,value);return true}catch{return false}},problem:value=>showError("simulate",localError(value,"invalid_value"))});
+$("tools-push-preview-run").addEventListener("click",async()=>{const button=$("tools-push-preview-run");if(button.getAttribute("aria-busy")==="true")return;message("simulate");const request=pushForm.previewRequest();if(request.error){showError("simulate",localError(request.error,"invalid_value"));return}if(request.raw){pushForm.showRaw(request.raw,request.bytes);return}button.setAttribute("aria-busy","true");try{pushForm.showPreview(await call("push.compose",{message:request.message,platform:PLATFORM}),request.seq)}catch(error){showError("simulate",error)}finally{button.removeAttribute("aria-busy")}});
 
 // Network: status, consent before start, attach, detach, stop and a live request list.
 function setNoSession(show,error){const box=$("tools-net-nosession"),body=$("tools-net-body");if(show)state.net.ready=false;if(!show){box.hidden=true;body.hidden=false;return}text("tools-net-nosession-text",error&&error.message?error.message:"Network capture needs an Autonom session on this device.");text("tools-net-nosession-hint",error&&error.hint?error.hint:"Start one with autonom session start for this device.");box.hidden=false;body.hidden=true}
