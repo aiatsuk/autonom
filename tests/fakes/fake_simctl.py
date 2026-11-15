@@ -26,11 +26,33 @@ State keys used by the simulator controls (all optional):
 ``privacy_help``     the text ``help privacy`` prints (default: Xcode 27.0's)
 ``simctl_hang``      ``{argv prefix: seconds}``: sleep that long first (a wedged
                      simctl, for timeout paths)
+
+launchd overrides (``simulator slim``), per device under ``launchd[<udid>]``:
+
+``launchd``          ``{udid: {"disabled": {label: bool}, "loaded": [label]}}``: what
+                     ``launchctl print-disabled system`` prints and ``disable`` /
+                     ``enable`` / ``bootstrap`` change. A boot loads ``disabled`` from
+                     the store file ``$AUTONOM_SIMDEVICE_TMP_ROOT/
+                     com.apple.CoreSimulator.SimDevice.<udid>/disabled.plist`` (never
+                     from the real ``/private/var/tmp``: without the variable nothing
+                     is read)
+``slim_store_ignored`` a boot does not read the store file (overrides set with
+                     ``launchctl disable`` still survive the reboot)
+``slim_overrides_lost`` a boot forgets every override (a runtime that keeps none)
+``launchctl_ignored`` ``disable``/``enable`` exit 0 and change nothing
+``launchd_bootout_gone`` labels whose ``bootout`` exits 3 (not loaded)
+``print_disabled_style`` ``legacy`` prints ``=> true``/``=> false``
+``runtime_root``     the ``runtimeRoot`` ``list runtimes -j`` reports for every runtime
+``simctl_runtimes``  the whole ``list runtimes -j`` payload instead
+
+A single label's failure is ``simctl_fail`` with the full argv prefix, e.g.
+``{"simctl spawn <udid> launchctl disable system/com.apple.x": [1, "boom"]}``.
 """
 from __future__ import annotations
 
 import json
 import os
+import plistlib
 import sys
 import time
 from pathlib import Path
@@ -140,6 +162,86 @@ def openstep(fields: dict) -> str:
     return "{\n" + "\n".join(body) + "\n}\n"
 
 
+def launchd_of(state: dict, udid: str) -> dict:
+    launchd = state.setdefault("launchd", {}).setdefault(udid, {})
+    launchd.setdefault("disabled", {})
+    launchd.setdefault("loaded", [])
+    return launchd
+
+
+def boot_launchd(state: dict, udid: str) -> None:
+    """What launchd_sim does when a simulator boots: read the override store."""
+    launchd = launchd_of(state, udid)
+    launchd["loaded"] = []
+    if state.get("slim_overrides_lost"):
+        launchd["disabled"] = {}
+        return
+    root = os.environ.get("AUTONOM_SIMDEVICE_TMP_ROOT")
+    if state.get("slim_store_ignored") or not root:
+        return
+    store = Path(root) / f"com.apple.CoreSimulator.SimDevice.{udid}" / "disabled.plist"
+    if not store.exists():
+        return
+    with store.open("rb") as handle:
+        entries = plistlib.load(handle)
+    launchd["disabled"] = {label: value for label, value in entries.items()
+                           if isinstance(value, bool)}
+
+
+def device_state(state: dict, udid: str) -> str:
+    devices = state.get("simctl_devices", DEFAULT_DEVICES)
+    for entries in devices["devices"].values():
+        for entry in entries:
+            if entry["udid"] == udid:
+                return entry.get("state", "Shutdown")
+    return "Unknown"
+
+
+def launchctl(state: dict, udid: str, args: list[str]) -> int | None:
+    """`simctl spawn <udid> launchctl <args>` for the override verbs; None for
+    anything else (`list` is answered by the caller)."""
+    verb = args[:1]
+    if verb not in (["print-disabled"], ["disable"], ["enable"], ["bootout"], ["bootstrap"]):
+        return None
+    if device_state(state, udid) != "Booted":
+        sys.stderr.write("Unable to lookup in current state: "
+                         f"{device_state(state, udid)}\n")
+        return 149
+    launchd = launchd_of(state, udid)
+    disabled = launchd["disabled"]
+    if verb == ["print-disabled"]:
+        legacy = state.get("print_disabled_style") == "legacy"
+        words = {True: "true" if legacy else "disabled",
+                 False: "false" if legacy else "enabled"}
+        sys.stdout.write("\tdisabled services = {\n")
+        for label in sorted(disabled):
+            sys.stdout.write(f'\t\t"{label}" => {words[bool(disabled[label])]}\n')
+        sys.stdout.write("\t}\n")
+        return 0
+    if verb in (["disable"], ["enable"]):
+        if not state.get("launchctl_ignored"):
+            disabled[args[1].split("/", 1)[1]] = verb == ["disable"]
+            write_state(state)
+        return 0
+    if verb == ["bootout"]:
+        label = args[1].split("/", 1)[1]
+        if label in state.get("launchd_bootout_gone", []):
+            sys.stderr.write("Boot-out failed: 3: No such process\n")
+            return 3
+        if label in launchd["loaded"]:
+            launchd["loaded"].remove(label)
+            write_state(state)
+        return 0
+    label = Path(args[2]).name[:-len(".plist")]
+    if disabled.get(label):
+        sys.stderr.write("Bootstrap failed: 119: Service is disabled\n")
+        return 119
+    if label not in launchd["loaded"]:
+        launchd["loaded"].append(label)
+        write_state(state)
+    return 0
+
+
 def load_state() -> dict:
     path = os.environ.get("AUTONOM_FAKE_STATE")
     if not path or not Path(path).exists():
@@ -208,9 +310,24 @@ def main(argv: list[str]) -> int:
         for entries in devices["devices"].values():
             for entry in entries:
                 if entry["udid"] == args[1]:
+                    if entry.get("state") != "Booted":
+                        boot_launchd(state, args[1])
                     entry["state"] = "Booted"
         write_state(state)
         return 0
+
+    if args[:2] == ["list", "runtimes"]:
+        devices = state.get("simctl_devices", DEFAULT_DEVICES)
+        root = state.get("runtime_root", "/nonexistent/RuntimeRoot")
+        sys.stdout.write(json.dumps(state.get("simctl_runtimes", {"runtimes": [
+            {"identifier": identifier, "runtimeRoot": root, "isAvailable": True}
+            for identifier in devices["devices"]]})))
+        return 0
+
+    if args[:1] == ["spawn"] and args[2:3] == ["launchctl"]:
+        code = launchctl(state, args[1], args[3:])
+        if code is not None:
+            return code
 
     if args[:1] == ["shutdown"]:
         # Mirror the real state machine so a shutdown-write-boot sequence can
@@ -352,6 +469,8 @@ def main(argv: list[str]) -> int:
         sys.stdout.write("PID\tStatus\tLabel\n")
         for bundle in bundles:
             sys.stdout.write(f"{pid}\t0\tUIKitApplication:{bundle}[0xd5f][77]\n")
+        for label in ((state.get("launchd") or {}).get(args[1]) or {}).get("loaded", []):
+            sys.stdout.write(f"-\t0\t{label}\n")
         return 0
 
     if args[:1] == ["spawn"] and "log" in args:

@@ -87,6 +87,10 @@ scripts/autonom_lib/
   emulator.py                 AVD discovery, emulator boot (registered harness-owned) and kill
   simulator.py                `simulator` controls: action whitelist, read-back, pin snapshots
   ios_prefs.py                the shut-down simulator's preference store (`keyboard pin`)
+  ios_slim.py                 simulator slimming rules: presets, profiles, the launchd override
+                              store, the read-back parser, the state file
+  ios_slim_catalog.py         the slimmable services by category and feature (generated)
+  simulator_slim.py           `simulator slim`: apply/restore with read-back, live enable/disable
   device_state.py             deep links, permissions, location, media, crashes, files, recording
   screenshot.py / logs.py     per-platform dispatch; shots carry provenance metadata in the PNG
                               (an Android agent JPEG keeps it in the shots index instead)
@@ -186,7 +190,7 @@ Two rules carry the design.
 | `note add\|list`, `journal` | the run's own record: what was done, what was concluded |
 | `logs tail`, `crash list\|show` | textual evidence |
 | `open`, `permissions`, `location`, `media`, `file` | drive device state |
-| `simulator *` | battery, network, push, telephony, biometric, appearance, text size, clipboard, status-bar/keyboard/animation pins; `verified` only after a read-back |
+| `simulator *` | battery, network, push, telephony, biometric, appearance, text size, clipboard, status-bar/keyboard/animation pins, iOS background-service slimming (`slim`); `verified` only after a read-back |
 | `network *` | consent-gated HTTP(S) capture, mock, HAR |
 | `atlas update\|show\|coverage\|paths\|export\|diff` | the observed application graph, evidence-linked |
 | `proof --base` | run the covering flow suite for a diff; pass/fail/not_covered/blocked/inconclusive |
@@ -460,6 +464,53 @@ pin merges only keys not yet recorded, so the snapshot always describes the
 device before the **first** pin, and `clear`/`reset` restores exactly that
 and deletes the section. `keyboard pin` keeps its own per-UDID snapshot under
 `simulator-prefs/` with the same merge rule.
+
+### Simulator slimming
+
+`simulator slim` switches iOS Simulator background services off. A stock
+simulator runs well over two hundred launchd jobs an app under test never
+talks to; with all slimmable ones off, one simulator measured 2.8 GB and 82
+processes instead of 10.7 GB and 238 (iOS 27.2).
+
+- **Catalog.** `ios_slim_catalog.py` lists the slimmable launchd labels in 16
+  categories, 27 features (feature id -> the labels it needs) and the labels
+  that must never be disabled because the simulator hangs without them. The
+  data comes from simslim v0.14.0 (https://github.com/MobAI-App/simslim, MIT,
+  copyright Interlap; see `THIRD_PARTY_NOTICES.md`); the mechanism in
+  `ios_slim.py` and `simulator_slim.py` is a rewrite of simslim's core in
+  stdlib Python. Only catalog labels are ever written, enabled or disabled.
+- **Settings.** A preset (`stock`, `optimized`, `minimal`) plus `need`
+  (features), `enable`/`disable` (categories) and `keep` (labels), also as a
+  profile file (`autonom.slim-profile/v1`). Keeping wins over disabling.
+  `com.apple.assetsd` (photo import), `com.apple.swcd` (universal links) and
+  `com.apple.apsd` (push) stay on in `optimized` and `minimal`.
+- **Store.** The overrides of a simulator are one flat XML plist at
+  `/private/var/tmp/com.apple.CoreSimulator.SimDevice.<UDID>/disabled.plist`:
+  label -> `true` (disabled) or `false` (explicitly enabled). The runtime
+  keeps entries of its own there, so a write merges and leaves every other
+  entry as it was (temp file, then rename). launchd reads the file when the
+  simulator boots, so `apply` and `restore` need a shut-down simulator or
+  `reboot=true`. Overrides persist across reboots on iOS 18.5 and newer;
+  older runtimes are refused with `slim_unsupported_runtime`.
+  `AUTONOM_SIMDEVICE_TMP_ROOT` moves the directory for tests.
+- **The store is an undocumented Apple detail.** A runtime is free to ignore
+  it, so nothing is trusted without a read-back: after a boot the verb made
+  itself it runs `launchctl print-disabled system` in the simulator and
+  compares. Overrides that are missing are set one by one with `launchctl
+  disable`/`enable`, the simulator is rebooted once more and read again;
+  still missing is `slim_not_persisted`. A simulator left shut down answers
+  `verified: false` with `verification: "store_written"`.
+- **Live changes.** `enable` and `disable` work on a booted simulator without
+  a reboot (`launchctl enable` + `bootstrap` of the job plist under the
+  runtime's `RuntimeRoot`; `launchctl disable` + `bootout`) and flip the same
+  store entries, so the next boot agrees. A service that will not load in the
+  running boot session is reported as `not_started`.
+- **State file.** `$AUTONOM_HOME/simulator-slim/<UDID>.json` (mode `0600`)
+  records the profile applied, the labels Autonom disabled and what the store
+  held for them before. `restore` puts exactly those back and deletes the
+  file. The store is written first and the state file second; if the state
+  file cannot be written the store is put back, so the file never describes a
+  change that is not in the store. Slimming is not undone by `session stop`.
 
 ### Control lease
 

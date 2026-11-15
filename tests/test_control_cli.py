@@ -338,6 +338,7 @@ class RefusalTests(ControlCliCase):
             ("simulator", "clipboard", "set"), ("simulator", "appearance", "dark"),
             ("simulator", "text-size", "large"), ("simulator", "status-bar", "pin"),
             ("simulator", "keyboard", "pin"), ("simulator", "animations", "pin"),
+            ("simulator", "slim", "apply"),
         ]
         cli = load_cli("autonom_cli_control_samples")
         parser = cli.build_parser()

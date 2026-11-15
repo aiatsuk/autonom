@@ -6021,11 +6021,20 @@ def cmd_simulator(args: argparse.Namespace) -> int:
                                       f"--value takes KEY=VALUE, got {pair!r}")
         key, value = pair.split("=", 1)
         values[key] = value
+    if args.control == "slim" and args.action == "presets":
+        # the catalog is the same for every simulator: no device is resolved
+        from autonom_lib import simulator_slim
+        return emit({"ok": True, **simulator_slim.run(None, "presets", values)},
+                    as_json=True)
     target = _target(args)
     # the session record defaults come from (the app `push send` addresses)
     result = simulator_mod.apply(target, args.control, args.action, values,
                                  session=session_mod.load_current())
-    return emit({"ok": True, **result, **target.identity()}, as_json=True)
+    payload = {"ok": True, **result, **target.identity()}
+    code = emit(payload, as_json=True)
+    # a failed check (`slim verify` with drift) answers on stdout with
+    # ok=false and exit 1, as `ui settle` does
+    return code if payload["ok"] else 1
 
 
 def cmd_ci_run(args: argparse.Namespace) -> int:
@@ -7108,6 +7117,7 @@ _CONTROL_BY_ACTION: dict[str, frozenset[str]] = {
     "simulator status-bar": frozenset(),
     "simulator keyboard": frozenset({"show"}),
     "simulator animations": frozenset({"show"}),
+    "simulator slim": frozenset({"presets", "show", "verify"}),
 }
 _CONTROL_RUN_FLAG_VERBS = frozenset({"teach approve", "tour"})
 _CONTROL_ERROR_CODES = frozenset({
@@ -7733,11 +7743,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     simulator = sub.add_parser(
         "simulator", help="battery, network, push, telephony, biometric, UI state, "
-                          "status-bar pin, keyboard/locale pin, and animations")
+                          "status-bar pin, keyboard/locale pin, animations, and "
+                          "iOS background-service slimming")
     simulator_sub = simulator.add_subparsers(dest="simulator_command", required=True)
     for control in ("battery", "network", "push", "sms", "call", "biometric",
                     "clipboard", "appearance", "text-size", "status-bar", "keyboard",
-                    "animations"):
+                    "animations", "slim"):
         valid = simulator_mod.CONTROL_ACTIONS.get(control)
         actions = ("one of: " + ", ".join(valid) if valid
                    else "the iOS content size, e.g. large or accessibility-extra-large")

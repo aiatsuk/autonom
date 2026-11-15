@@ -239,6 +239,31 @@ that `ui tap` reports backend axe and that the tree still comes from idb.
 Select iOS controls with --desc, not --text.
 ```
 
+## Slim an iOS Simulator to save memory
+
+```text
+Show me what Autonom can switch off on this simulator, then apply the
+optimized preset but keep StoreKit working, reboot it, and tell me whether
+the read-back matched. When we are done, put the simulator back as it was.
+```
+
+```bash
+autonom simulator slim presets                      # presets, categories, features
+autonom --udid <UDID> simulator slim show           # stock | slim | partial, per category
+autonom --udid <UDID> simulator slim apply --value preset=optimized \
+        --value need=storekit --value reboot=true   # shut down, write, boot, read back
+autonom --udid <UDID> simulator slim apply --value preset=minimal --value enable=search
+autonom --udid <UDID> simulator slim apply --value profile=./slim-profile.json
+autonom --udid <UDID> simulator slim verify         # ok, missing, extra (exit 1 on drift)
+autonom --udid <UDID> simulator slim enable --value ids=health,com.apple.cloudd   # live
+autonom --udid <UDID> simulator slim disable --value ids=search                   # live
+autonom --udid <UDID> simulator slim restore --value reboot=true
+```
+
+`apply` and `restore` need a shut-down simulator, or `reboot=true`. Photo
+import, universal links and push stay on in `optimized` and `minimal`.
+Slimming needs iOS 18.5 or newer and stays until `restore`.
+
 ## Watch and drive the Simulator at 60 fps in the browser
 
 ```text

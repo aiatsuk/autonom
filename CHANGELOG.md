@@ -7,6 +7,22 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
 
 ## [Unreleased]
 
+### Added
+
+- **`simulator slim`: switch iOS Simulator background services off.** A stock
+  simulator runs well over two hundred launchd jobs an app under test never
+  uses; with them off one simulator measured 2.8 GB instead of 10.7 GB.
+  Presets `stock`, `optimized` (default) and `minimal`, plus `need` (features),
+  `enable`/`disable` (categories), `keep` (labels) or a profile file. Photo
+  import, universal links and push stay on. `apply` and `restore` write the
+  shut-down simulator's launchd override store (`reboot=true` cycles it) and
+  read the state back after the boot; `enable` and `disable` change a booted
+  simulator live; `show`, `verify` and `presets` only read. Needs iOS 18.5 or
+  newer. New error codes `slim_unsupported_runtime`, `slim_not_persisted` and
+  `slim_profile_invalid`; new capability `simulator.slim`. The service
+  catalog comes from simslim (MIT, copyright Interlap), see
+  `THIRD_PARTY_NOTICES.md`.
+
 ## [0.38.1] - 2026-11-10
 
 ### Changed

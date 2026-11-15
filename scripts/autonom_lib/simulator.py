@@ -156,6 +156,7 @@ CONTROL_ACTIONS: dict[str, tuple[str, ...]] = {
     "status-bar": ("override", "pin", "clear"),
     "keyboard": ("pin", "reset", "show"),
     "animations": ("pin", "reset", "show"),
+    "slim": ("presets", "show", "apply", "verify", "enable", "disable", "restore"),
 }
 CONTROLS = (*CONTROL_ACTIONS, "text-size")
 
@@ -239,6 +240,10 @@ def apply(target: Target, control: str, action: str,
         return _status_bar(target, action, values)
     if control == "animations":
         return _animations(target, action)
+    if control == "slim":
+        # iOS Simulator background services (see simulator_slim.py)
+        from . import simulator_slim
+        return simulator_slim.run(target, action, values)
     return _keyboard(target, action, values)
 
 
