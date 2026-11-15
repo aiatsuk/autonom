@@ -365,6 +365,13 @@ Android has two deliveries:
   and a tap opens nothing (the `push_shade_only` warning). Use it to check
   how a notification looks, not how the app handles it.
 
+A silent push (`silent=true`, data only) cannot be tested on the iOS
+Simulator here: simctl on iOS 27.2 refuses a push that shows nothing
+(`push_not_delivered`, `reason: no_visible_content`), and where it takes one
+(iOS 26.4) nothing confirms the app's background handler ran (the
+`push_silent_unconfirmed` warning); on Android it is a data message the app's
+receiver is seen to take.
+
 Not covered: real FCM or APNs sends through Google's or Apple's servers,
 physical devices, and `delivery=app` on Play Store emulator images.
 

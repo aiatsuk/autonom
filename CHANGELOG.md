@@ -21,9 +21,18 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
   does (needs root: a `google_apis` image; `adb root` is never run) and reads
   the shade back; `delivery=shade` posts a plain notification that belongs to
   the shell. New error code `push_not_delivered` (`reason`: `no_root`,
-  `no_receiver`, `not_received`, `rejected`), warnings `push_payload_large`,
-  `push_notifications_denied` and `push_shade_only`; `simulator.push` is now
-  available on Android emulators. The Canvas tools process sends a push
+  `no_receiver`, `not_received`, `rejected`, and `no_visible_content` when
+  the iOS Simulator refuses a push that shows nothing, which iOS 27.2 does for
+  a silent push: test silent pushes on Android), warnings `push_payload_large`
+  (the APNs payload or the Android extras above 4096 bytes),
+  `push_notifications_denied`, `push_shade_only` and `push_silent_unconfirmed`
+  (simctl took a silent push; whether the app's background handler ran is not
+  known); `simulator.push` is now available on Android emulators. A message is
+  checked before anything is sent: no NUL or lone surrogate in any string,
+  finite numbers, at most 32 levels of nesting, at most 64 KB rendered, and in
+  a file or `--json` a JSON integer `badge` and boolean `silent`/`fcm`. A
+  notification in the shade that does not print as UTF-8 never fails a push
+  already sent. The Canvas tools process sends a push
   `message` on Android and previews one with the read op `push.compose`,
   which the page's push form uses (below). Not covered: real FCM/APNs sends
   through Google's or Apple's servers, physical devices, Play Store images for

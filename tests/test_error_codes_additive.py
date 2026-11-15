@@ -244,12 +244,15 @@ class AdditiveErrorCodeTests(unittest.TestCase):
             with self.subTest(code=name):
                 self.assertIn(f"| `{value}` |", section)
                 self.assertIn(f"`{value}`", head, "the Error codes list names the round")
-        for code in ("push_payload_large", "push_notifications_denied", "push_shade_only"):
+        for code in ("push_payload_large", "push_notifications_denied", "push_shade_only",
+                     "push_silent_unconfirmed"):
             with self.subTest(warning=code):
                 self.assertIn(f"`{code}`", section)
                 self.assertIn(f"`{code}`", head)
-        for reason in ("no_root", "no_receiver", "not_received", "rejected"):
+        for reason in ("no_root", "no_receiver", "not_received", "rejected",
+                       "no_visible_content"):
             self.assertIn(f"`{reason}`", section)
+        self.assertIn("`no_visible_content`", head)
         rows = [line for line in section.splitlines() if line.startswith("| `simulator push")]
         for action in ("compose", "send"):
             with self.subTest(action=action):

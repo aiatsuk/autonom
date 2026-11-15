@@ -357,6 +357,9 @@ autonom --serial emulator-5554 simulator push send --value delivery=shade --valu
 - Android `delivery=shade` only shows a notification (owned by the shell; the
   app's code does not run, a tap opens nothing). Use it for how a
   notification looks, never as proof the app handles pushes.
+- A silent push cannot be tested on the iOS Simulator: simctl refuses one that
+  shows nothing (`push_not_delivered`, `reason: no_visible_content`) or takes
+  it unconfirmed (`push_silent_unconfirmed`); test it on Android.
 - Not covered: real FCM/APNs sends through Google's or Apple's servers and
   physical devices.
 
