@@ -24,10 +24,25 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
   `no_receiver`, `not_received`, `rejected`), warnings `push_payload_large`,
   `push_notifications_denied` and `push_shade_only`; `simulator.push` is now
   available on Android emulators. The Canvas tools process sends a push
-  `message` on Android and previews one with the read op `push.compose`; the
-  page's push form stays iOS-only for now. Not covered: real FCM/APNs sends
+  `message` on Android and previews one with the read op `push.compose`,
+  which the page's push form uses (below). Not covered: real FCM/APNs sends
   through Google's or Apple's servers, physical devices, Play Store images for
   `delivery=app`.
+
+- **Mobile Canvas: set up a push and press Send, on iOS and Android.** The
+  Simulate tab's Push notification row is on both platforms, with Send where
+  it was and a block whose summary line shows what Send will send: App,
+  Title, Body, Subtitle (iOS), Badge, Sound, Silent, Data key/value rows (the
+  key your app reads a link from goes there), Delivery "To the app" or
+  "Notification shade only" and "Reach a stopped app" (Android), Edit as JSON
+  (a raw APNs object on iOS is sent as it is), Preview (the read-only
+  `push.compose`, never leased) and Reset. The page checks the message before
+  any call (empty, duplicate and reserved data keys, the badge, the app id,
+  4 KB); the status line says where the push went and every warning in plain
+  words, and a push the emulator did not deliver says what to do (an image
+  without Play Store or shade delivery for `no_root`, open the app or "Reach a
+  stopped app" for `not_received`). The message, the delivery choice and the
+  open block are remembered per platform in this browser, never the app id.
 
 - **`simulator slim`: switch iOS Simulator background services off.** A stock
   simulator runs well over two hundred launchd jobs an app under test never
