@@ -21,7 +21,12 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
   newer. New error codes `slim_unsupported_runtime`, `slim_not_persisted` and
   `slim_profile_invalid`; new capability `simulator.slim`. The service
   catalog comes from simslim (MIT, copyright Interlap), see
-  `THIRD_PARTY_NOTICES.md`.
+  `THIRD_PARTY_NOTICES.md`. `restore` puts back exactly what slimming
+  changed: a value someone else changed since is left alone and listed under
+  `skipped_changed`. A boot that fails after the store was written says so
+  (`store_written`, the state file and both ways out), and a profile the
+  runtime did not keep is marked `status: "not_persisted"`. `suggest` also
+  reads the `*.debug.dylib` of Debug builds and every slice of a fat binary.
 - **A slim profile for one app, slim at boot, whole-simulator memory.**
   `simulator slim suggest --value app=<.app path | bundle id>` reads the
   app's Info.plist, entitlements and frameworks and answers with the features
