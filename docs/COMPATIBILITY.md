@@ -958,8 +958,9 @@ Behaviour changes:
 - Releases are built by `scripts/build_release.sh` (tarball + `SHA256SUMS`)
   and published from tags; `CHANGELOG.md` carries the notes.
 - Supported interpreter: Python >= 3.11 (`MIN_PYTHON` in `scripts/autonom.py`).
-  CI tests 3.11 on pull requests and 3.14 on `main`. Raising it is a breaking
-  change recorded here and in `CHANGELOG.md`. An older interpreter gets a
+  CI tests 3.11 on Linux, on pull requests and on `main`; newer Pythons and
+  the macOS-only tests run in the local gate (`scripts/run_checks.sh`) on a
+  Mac. Raising it is a breaking change recorded here and in `CHANGELOG.md`. An older interpreter gets a
   `tool_missing` envelope (exit 2), never a traceback.
 
 ## Forward commitments
