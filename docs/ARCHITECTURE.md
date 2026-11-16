@@ -86,6 +86,10 @@ scripts/autonom_lib/
   ios_simctl.py               simulator lifecycle, screenshots, logs, device state
   emulator.py                 AVD discovery, emulator boot (registered harness-owned) and kill
   simulator.py                `simulator` controls: action whitelist, read-back, pin snapshots
+  push_message.py             the push message (`autonom.push/v1`): fields, files, the APNs
+                              payload and FCM extras renders, `simulator push compose`
+  android_push.py             `simulator push send` on an Android emulator: root route, FCM
+                              receiver broadcast, shade post, notification read-back
   ios_prefs.py                the shut-down simulator's preference store (`keyboard pin`)
   ios_slim.py                 simulator slimming rules: presets, profiles, the launchd override
                               store, the read-back parser, the state file
@@ -171,6 +175,10 @@ Two rules carry the design.
    the adb command lines that push, start, forward and stop it live in
    `android_helper.py`, and the input it injects is built on the device by its
    own Java source (see [Android on-device helper](#android-on-device-helper)).
+   Android push delivery is a fourth: every adb command line of it (`id -u`,
+   `su 0`, `pm path`, `cmd package query-receivers`, `am broadcast`,
+   `dumpsys notification`, `cmd notification post`) lives in
+   `android_push.py` (see [Push notifications](#push-notifications)).
 2. **Platform knowledge stays below the CLI.** `autonom.py` still branches on
    `target.platform` where the *verb itself* differs between platforms — iOS has
    no `pm clear`, Android has no per-process launch environment, iOS attach is
@@ -190,7 +198,7 @@ Two rules carry the design.
 | `note add\|list`, `journal` | the run's own record: what was done, what was concluded |
 | `logs tail`, `crash list\|show` | textual evidence |
 | `open`, `permissions`, `location`, `media`, `file` | drive device state |
-| `simulator *` | battery, network, push, telephony, biometric, appearance, text size, clipboard, status-bar/keyboard/animation pins, iOS background-service slimming (`slim`); `verified` only after a read-back |
+| `simulator *` | battery, network, push (`compose` without a device, `send` on both platforms), telephony, biometric, appearance, text size, clipboard, status-bar/keyboard/animation pins, iOS background-service slimming (`slim`); `verified` only after a read-back |
 | `network *` | consent-gated HTTP(S) capture, mock, HAR |
 | `atlas update\|show\|coverage\|paths\|export\|diff` | the observed application graph, evidence-linked |
 | `proof --base` | run the covering flow suite for a diff; pass/fail/not_covered/blocked/inconclusive |
@@ -546,6 +554,48 @@ processes instead of 10.7 GB and 238 (iOS 27.2).
   device): a failed `media add` with `com.apple.assetsd` off is
   `simulator_service_disabled`; `open <http url>` and `push send` warn. A
   store that cannot be read means "unknown" and changes nothing.
+
+### Push notifications
+
+A push is described once and rendered per platform, so a test does not
+hand-write an APNs dictionary for iOS and an FCM bundle for Android.
+
+- **Message.** `push_message.py` holds the `autonom.push/v1` fields (`title`,
+  `body`, `data`, `badge`, ... and the escape hatches `ios` / `android`),
+  checks them (`invalid_value` naming the field, never quoting its text),
+  reads `--json`/`--value` and `file=` (a file with a top-level `aps` is a raw
+  APNs payload), and renders the APNs payload (data keys at the top level,
+  `gcm.message_id` so a Firebase SDK treats it as its own) and the FCM extras
+  (all strings: `gcm.n.e`, `gcm.notification.*`, `google.message_id`,
+  `google.sent_time`, `from`, `google.ttl`). `schemas/push-v1.schema.json`
+  is the same object; a test keeps the two in step. `simulator push
+  compose` is that render alone: no target is resolved.
+- **iOS.** The render goes into the temporary `.apns` file of the existing
+  `simctl push`; a raw `payload` keeps the original path unchanged.
+- **Android, `delivery=app`.** Google Play services hands an FCM message to
+  the app as an ordered broadcast of `com.google.android.c2dm.intent.RECEIVE`
+  that only a privileged sender reaches: from the shell it is silently dropped
+  (`result=0`). `android_push.py` therefore checks the package first (`pm path`,
+  so a missing app is `app_not_installed` on any image), then finds root
+  (`id -u`, then `su 0 id -u`; never `adb root`, which restarts adbd and
+  drops every forward), then the receiver (`cmd package query-receivers`),
+  sends one `am broadcast` with the extras as `--es`
+  pairs (each word shell-quoted; `su 0` hands its words to the command
+  unparsed), judges `Broadcast completed: result=<n>` (`-1` delivered, `0`
+  not received, anything else rejected), and reads the shade back from
+  `dumpsys notification --noredact` for up to 3 s, counting only a record
+  that was not there before the send or whose text changed since (a
+  replaced notification). The permission reader of
+  `device_state.py` supplies the API 33+ `POST_NOTIFICATIONS` warning.
+- **Android, `delivery=shade`.** `cmd notification post` as the shell (a
+  root-posted notification is not shown), read back by its tag
+  `autonom_push_<message_id>` (unique unless the caller passes the same
+  `message_id` twice). The notification belongs to
+  `com.android.shell`; the `-c` content intent is refused on recent Android,
+  so a tap opens nothing.
+- **Canvas.** The tools process takes `message` (or `payload` on iOS) in
+  `simulate` and previews with the read op `push.compose`; the journal keeps
+  only `message_len` / `payload_len`.
 
 ### Control lease
 

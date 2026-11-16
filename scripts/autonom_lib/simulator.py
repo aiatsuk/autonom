@@ -25,7 +25,7 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Collection
 
 from . import adb as adb_mod
 from . import errors, ios_prefs, ios_simctl
@@ -147,7 +147,7 @@ IOS_BATTERY_STATES = ("charging", "charged", "discharging")
 CONTROL_ACTIONS: dict[str, tuple[str, ...]] = {
     "battery": ("set", "reset"),
     "network": ("online", "offline", "shape"),
-    "push": ("send",),
+    "push": ("send", "compose"),
     "sms": ("send",),
     "call": ("incoming", "cancel"),
     "biometric": ("enroll", "unenroll", "match", "nonmatch", "settings"),
@@ -194,12 +194,17 @@ def _simctl(target: Target, args: list[str]) -> str:
 
 
 def apply(target: Target, control: str, action: str,
-          values: dict[str, Any], *, session: dict[str, Any] | None = None) -> dict[str, Any]:
+          values: dict[str, Any], *, session: dict[str, Any] | None = None,
+          text_keys: Collection[str] | None = None) -> dict[str, Any]:
     """Run one control. ``session`` is the record defaults come from (the
-    app `push send` addresses); None reads the current session."""
+    app `push send` addresses); None reads the current session.
+    ``text_keys`` names the values given as ``--value`` text: a push parses
+    only those (``badge=3``); None parses every text value."""
     if control not in CONTROLS:
         raise errors.AutonomError(errors.UNSUPPORTED_CAPABILITY,
                                   f"unknown simulator control {control!r}")
+    if control == "push" and action == "compose":
+        return push_compose(values, text_keys)  # read-only, needs no device
     _require_simulator(target)
     _require_action(control, action)
     if control in ("status-bar", "animations") and target.platform == ANDROID:
@@ -226,7 +231,7 @@ def apply(target: Target, control: str, action: str,
     if control == "network":
         return _network(target, action, values)
     if control == "push":
-        return _push(target, values, session)
+        return _push(target, values, session, text_keys)
     if control in ("sms", "call"):
         return _telephony(target, control, action, values)
     if control == "biometric":
@@ -839,44 +844,128 @@ def _current_session() -> dict[str, Any] | None:
         return None
 
 
-def _push(target: Target, values: dict[str, Any],
-          session: dict[str, Any] | None = None) -> dict[str, Any]:
-    if target.platform != IOS:
-        # Refused before the values are judged: no payload makes it possible.
-        raise errors.AutonomError(
-            errors.UNSUPPORTED_CAPABILITY,
-            "Android has no provider-neutral local push injection command",
-            hint="Use a declared fixture or network mock for Android push flows.",
-            capability="simulator.push")
+def push_compose(values: dict[str, Any],
+                 text_keys: Collection[str] | None = None) -> dict[str, Any]:
+    """`simulator push compose`: the push message and what each platform
+    gets (see push_message.py). Read-only; no device is involved."""
+    from . import push_message  # noqa: PLC0415
+
+    return push_message.compose(values, text_keys)
+
+
+def _push_app_id(target: Target, values: dict[str, Any],
+                 session: dict[str, Any] | None) -> tuple[str, str | None]:
+    """The app a push goes to: the value, else the session on this target."""
     app_id = str(values.get("app_id") or "").strip()
-    source = "value"
+    if app_id:
+        return app_id, "value"
+    record = session if session is not None else _current_session()
+    if (isinstance(record, dict) and record.get("app_id")
+            and record.get("target_id") in (None, target.target_id)):
+        return str(record["app_id"]), "session"
+    return "", None
+
+
+def _push(target: Target, values: dict[str, Any],
+          session: dict[str, Any] | None = None,
+          text_keys: Collection[str] | None = None) -> dict[str, Any]:
+    from . import push_message  # noqa: PLC0415 - kept off the other controls' import path
+
+    push = push_message.from_values(values, text_keys)
+    app_id, source = _push_app_id(target, values, session)
+    if target.platform != IOS:
+        from . import android_push  # noqa: PLC0415
+
+        return android_push.send(target, push, app_id, source)
+    if push.options.get("delivery", "app") != "app":
+        raise errors.AutonomError(
+            errors.INVALID_VALUE, "delivery is app on iOS",
+            "simctl push delivers to the app; delivery=shade is Android only.",
+            field="delivery")
+    if push.message is None:
+        # the original path: values it does not use are ignored, as before
+        return _push_raw(target, push, app_id, source or "value")
+    push_message.refuse_other_values(push.options, ("app_id", "file", "delivery"),
+                                     "send (iOS)")
     if not app_id:
-        record = session if session is not None else _current_session()
-        if (isinstance(record, dict) and record.get("app_id")
-                and record.get("target_id") in (None, target.target_id)):
-            app_id = str(record["app_id"])
-            source = "session"
-    payload = values.get("payload")
-    if isinstance(payload, str):
-        # `--value payload={...}` arrives as text.
-        try:
-            payload = json.loads(payload)
-        except ValueError:
-            pass
+        raise errors.AutonomError(
+            errors.INVALID_VALUE, "push send needs app_id",
+            "Pass --value app_id=<bundle id>, or start a session with --app-id on this "
+            "simulator.", missing=["app_id"])
+    message = push.message
+    message_id = push_message.message_id_of(message)
+    payload = push_message.render_ios(message, message_id)
+    size = push_message.payload_bytes(payload)
+    result = _simctl_push(target, app_id, payload)
+    result.update(composed=True, message_id=message_id, kind=push_message.ios_kind(message),
+                  payload_bytes=size)
+    _push_result(target, result, source)
+    if message.get("silent") is True:
+        # simctl took it (iOS 26.4 does; 27.2 refuses it, see _simctl_push),
+        # but nothing says the app's background handler ran
+        result.setdefault("warnings", []).insert(0, push_message.silent_unconfirmed_warning())
+    if size > push_message.IOS_PAYLOAD_LIMIT:
+        result.setdefault("warnings", []).insert(0, push_message.large_payload_warning(size))
+    return result
+
+
+def _push_raw(target: Target, push: Any, app_id: str, source: str) -> dict[str, Any]:
+    """A hand-written APNs payload (`payload=`, or a file with `aps`): the
+    original `push send`, unchanged."""
+    payload = push.payload
     missing = ([] if app_id else ["app_id"]) + (
         [] if isinstance(payload, dict) else ["payload (a JSON object)"])
     if missing:
+        hint = PUSH_JSON_HINT
+        if not push.raw:
+            # nothing was given at all: the message fields are the other way
+            hint += (" Or describe it with message fields: --value title=Hello "
+                     "--value body=... ('autonom simulator push compose' shows the payload).")
         raise errors.AutonomError(
             errors.INVALID_VALUE,
             "push send needs " + " and ".join(missing),
-            PUSH_JSON_HINT, missing=[item.split(" ", 1)[0] for item in missing])
+            hint, missing=[item.split(" ", 1)[0] for item in missing])
+    result = _simctl_push(target, app_id, payload)
+    _push_result(target, result, source)
+    return result
+
+
+# What simctl prints when the Simulator will not deliver a push that shows
+# nothing (seen on iOS 27.2): code 1401 "Notification has no user visible
+# content" for a bare content-available, 2002 "No content that needs to
+# alert" when only a badge or a sound sits next to it.
+_NO_VISIBLE_CONTENT = re.compile(r"UNErrorDomain,\s*code=(?:1401|2002)\b")
+
+
+def _simctl_push(target: Target, app_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     rendered = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     with tempfile.NamedTemporaryFile(mode="w", suffix=".apns", encoding="utf-8") as handle:
         handle.write(rendered)
         handle.flush()
-        _simctl(target, ["push", target.target_id, app_id, handle.name])
+        try:
+            _simctl(target, ["push", target.target_id, app_id, handle.name])
+        except errors.AutonomError as exc:
+            if exc.code == errors.BACKEND_FAILED and _NO_VISIBLE_CONTENT.search(exc.message or ""):
+                raise errors.AutonomError(
+                    errors.PUSH_NOT_DELIVERED,
+                    "the Simulator refused a push with no alert text",
+                    "simctl on this iOS runtime delivers only pushes that show something: add a "
+                    "title or body. A silent (content-available) push cannot be tested through "
+                    "the Simulator here; on Android it works (a data message).",
+                    reason="no_visible_content", capability="simulator.push",
+                    app_id=app_id) from None
+            raise
+    return {"control": "push", "app_id": app_id}
+
+
+def _push_result(target: Target, result: dict[str, Any], source: str | None) -> None:
+    """The reply keys every iOS push has, in the original order."""
+    composed = {key: result.pop(key) for key in ("composed", "message_id", "kind",
+                                                 "payload_bytes") if key in result}
+    result["app_id_source"] = source
+    result.update(composed)
     # simctl accepted the payload; whether the app showed it is not known.
-    result = _unverified({"control": "push", "app_id": app_id, "app_id_source": source})
+    _unverified(result)
     from . import ios_slim  # noqa: PLC0415 - kept off the other controls' import path
 
     warning = ios_slim.service_warning(
@@ -884,7 +973,6 @@ def _push(target: Target, values: dict[str, Any],
         "simctl accepted the notification and the simulator may not show it")
     if warning:
         result.setdefault("warnings", []).append(warning)
-    return result
 
 
 def _telephony(target: Target, control: str, action: str,

@@ -61,6 +61,9 @@ UNKNOWN_CLI_CODES = frozenset({
     "daemon_unreachable",
     # Simulator slimming: the store was written and the simulator rebooted.
     "slim_not_persisted",
+    # Android push: refused before sending (no root, no receiver) or sent and
+    # not received or rejected by the app; one code for both, so unknown.
+    "push_not_delivered",
     "idb_required", "idb_companion_unavailable", "mitmdump_required", "backend_failed",
     "ios_hid_framework_missing", "install_path_not_found", "app_not_installed", "ios_boot_failed",
     "ios_clear_requires_install_path", "emulator_not_found", "avd_not_found", "avd_required",

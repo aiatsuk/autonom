@@ -6520,7 +6520,8 @@ test("page: the iOS page runs without the Size menu, keeps every element id, sho
   assert.ok(document.getElementById("tools-loc-clear"));
   assert.ok(document.getElementById("tools-perms-note"));
   assert.equal(document.getElementById("tools-loc-get"), null);
-  assert.equal(document.querySelectorAll("[data-sim]").filter((element) => element.getAttribute("data-sim") === "push").length, 1);
+  // push: the row's Send and the push form footer's Send
+  assert.equal(document.querySelectorAll("[data-sim]").filter((element) => element.getAttribute("data-sim") === "push").length, 2);
 });
 
 test("page: the served page carries the Tools drawer after the inspector, its toggle in the toolbar, its styles and its script, which parses and runs with the page", async (t) => {

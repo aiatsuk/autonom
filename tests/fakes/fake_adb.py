@@ -47,6 +47,44 @@ State keys (all optional):
 ``monkey_rotation`` false to stop ``monkey`` from resetting the rotation
                     settings the way the real tool does (freeze to 0, thaw)
 
+Push delivery (``simulator push send`` on Android; the outputs are the ones a
+live API 37 google_apis emulator printed):
+
+``shell_uid``       what ``shell id -u`` prints (default ``"2000"``; ``"0"`` = adbd
+                    runs as root)
+``su_uid``          what ``shell su 0 id -u`` prints (default ``"0"``, a google_apis
+                    image); ``null`` = no su (a Play Store image: ``su:
+                    inaccessible or not found``, exit 127). ``su 0 <command>``
+                    runs the push commands below as root
+``packages``        (above) also answers ``pm path <pkg>``: ``package:<apk>`` and
+                    exit 0, or nothing and exit 1
+``receivers``       mapping of package -> components ``cmd package query-receivers
+                    --brief -a com.google.android.c2dm.intent.RECEIVE <pkg>`` lists;
+                    absent = the Firebase receiver; ``[]`` = ``No receivers found``
+``broadcasts``      every targeted ``am broadcast`` (``-p`` or ``-n``), as the device
+                    shell parsed it: ``{via_su, as_root, action, package, component,
+                    include_stopped, extras, result}``
+``broadcast_results`` mapping of package -> the result its broadcast answers;
+                    without it: the FCM action from a non-root shell is dropped
+                    (``result=0``), a package in ``stopped_packages`` is not
+                    reached without ``--include-stopped-packages`` (``0``), a
+                    ``-n`` custom receiver answers ``0``, everything else ``-1``
+``broadcast_output`` the exact text ``am broadcast`` prints instead
+``app_posts_notifications`` true: a delivered FCM notification message (``gcm.n.e``
+                    is ``1``) adds a record for the package, the way the Firebase
+                    SDK posts one for an app in the background
+``notifications``   the records ``dumpsys notification --noredact`` prints:
+                    ``{pkg, user, id, tag, title, text, number}``; ``cmd
+                    notification post`` adds one for ``com.android.shell`` (not
+                    when run through su: a root-posted notification is not shown)
+``notification_delay_reads`` how many ``dumpsys notification`` reads a newly added
+                    record stays hidden for (it appears about 1 s late on API 29)
+``notification_format`` ``api29`` prints the API 29 record line and ``posting:``
+                    (default: the API 37 format and ``posting for user 0:``)
+``notification_encoding`` the encoding ``dumpsys notification`` writes its text in
+                    (default UTF-8); ``latin-1`` prints bytes that are not UTF-8,
+                    as a title another app set can
+
 The on-device Android helper (``scripts/autonom_lib/android_helper.py``; the
 helper itself is ``tests/fakes/fake_android_helper.py``, which reads and
 writes the same state):
@@ -373,6 +411,186 @@ def _helper_command(argv: list[str], args: list[str], state: dict) -> int | None
     return None
 
 
+SU_MISSING = "/system/bin/sh: su: inaccessible or not found"
+FCM_RECEIVE = "com.google.android.c2dm.intent.RECEIVE"
+FCM_RECEIVER = "com.google.firebase.iid.FirebaseInstanceIdReceiver"
+SHELL_PACKAGE = "com.android.shell"
+
+
+def _add_notification(state: dict, record: dict) -> None:
+    record = dict(record)
+    delay = int(state.get("notification_delay_reads", 0) or 0)
+    if delay:
+        record["hidden_reads"] = delay
+    state.setdefault("notifications", []).append(record)
+
+
+def _notification_lines(record: dict, style: str) -> list[str]:
+    pkg, ident = record.get("pkg"), record.get("id", 0)
+    tag, user = record.get("tag") or "null", record.get("user", 0)
+    if style == "api29":
+        lines = [f"    NotificationRecord(0x096ae589: pkg={pkg} user=UserHandle{{{user}}} "
+                 f"id={ident} tag={tag} importance=3 key={user}|{pkg}|{ident}|{tag}|2000"
+                 "appImportanceLocked=false: Notification(channel=shellcmd pri=0 "
+                 "contentView=null vibrate=null sound=null defaults=0x0 flags=0x0 "
+                 "color=0x00000000 vis=PRIVATE)",
+                 "      uid=2000 userId=0", "      opPkg=com.android.shell",
+                 "      extras={"]
+        indent = "        "
+    else:
+        lines = [f"    NotificationRecord(0x0fc49bd6: pkg={pkg} user=UserHandle{{{user}}} "
+                 f"id={ident} tag={tag} importance=3 key={user}|{pkg}|{ident}|{tag}|10231: "
+                 "Notification(channel=probe_default shortcut=null contentView=null "
+                 "vibrate=null sound=null defaults=0x0 flags=0x10 color=0x00000000 vis=PRIVATE))",
+                 "          uid=10231 userId=0", "          contentIntent=PendingIntent{...}",
+                 f"          number={record.get('number', 0)}", "          extras={"]
+        indent = "              "
+    for key in ("title", "text"):
+        if record.get(key) is not None:
+            lines.append(f"{indent}android.{key}=String ({record[key]})")
+    lines.append(indent[:-4] + "}")
+    return lines
+
+
+def _push_shell(words: list[str], state: dict) -> int | None:
+    """The device commands of push delivery; None for every other command."""
+    as_root = str(state.get("shell_uid", "2000")) == "0"
+    via_su = False
+    if words[:1] == ["su"]:
+        if "su_uid" in state and state["su_uid"] is None:
+            sys.stdout.write(SU_MISSING + "\n")
+            return 127
+        if words[1:2] != ["0"]:
+            return None
+        via_su = True
+        as_root = str(state.get("su_uid", "0")) == "0"
+        words = words[2:]
+        if words == ["id", "-u"]:
+            sys.stdout.write(str(state.get("su_uid", "0")) + "\n")
+            return 0
+    elif words == ["id", "-u"]:
+        sys.stdout.write(str(state.get("shell_uid", "2000")) + "\n")
+        return 0
+    if words[:2] == ["pm", "path"] and len(words) == 3:
+        table = state.get("packages")
+        if table is None or words[2] in table:
+            sys.stdout.write(f"package:/data/app/~~fake==/{words[2]}-1/base.apk\n")
+            return 0
+        return 1
+    if words[:3] == ["cmd", "package", "query-receivers"]:
+        action = words[words.index("-a") + 1] if "-a" in words[:-1] else ""
+        package = words[-1]
+        table = state.get("receivers") or {}
+        if package in table:
+            found = list(table[package]) if action == FCM_RECEIVE else []
+        else:
+            found = [f"{package}/{FCM_RECEIVER}"] if action == FCM_RECEIVE else []
+        if not found:
+            sys.stdout.write("No receivers found\n")
+            return 0
+        sys.stdout.write(f"{len(found)} receivers found:\n")
+        for index, component in enumerate(found):
+            sys.stdout.write(f"  Receiver #{index}:\n    priority=0 preferredOrder=0 "
+                             "match=0x108000 specificIndex=-1 isDefault=false\n"
+                             f"    {component}\n")
+        return 0
+    if words[:2] == ["am", "broadcast"] and ("-p" in words or "-n" in words):
+        options = words[2:]
+        sent = {"via_su": via_su, "as_root": as_root, "action": None, "package": None,
+                "component": None, "include_stopped": False, "extras": {}}
+        index = 0
+        while index < len(options):
+            word = options[index]
+            if word == "--include-stopped-packages":
+                sent["include_stopped"] = True
+                index += 1
+            elif word in ("-a", "-p", "-n") and index + 1 < len(options):
+                sent[{"-a": "action", "-p": "package", "-n": "component"}[word]] = options[index + 1]
+                index += 2
+            elif word == "--es" and index + 2 < len(options):
+                sent["extras"][options[index + 1]] = options[index + 2]
+                index += 3
+            else:
+                index += 1
+        package = sent["package"] or (sent["component"] or "").split("/", 1)[0]
+        results = state.get("broadcast_results") or {}
+        if package in results:
+            result = int(results[package])
+        elif sent["action"] == FCM_RECEIVE and not as_root:
+            result = 0  # a shell broadcast of the FCM action is silently dropped
+        elif package in (state.get("stopped_packages") or []) and not sent["include_stopped"]:
+            result = 0
+        elif sent["component"]:
+            result = 0
+        else:
+            result = -1
+        sent["result"] = result
+        state.setdefault("broadcasts", []).append(sent)
+        extras = sent["extras"]
+        if result == -1 and extras.get("gcm.n.e") == "1" and state.get("app_posts_notifications"):
+            count = len(state.get("notifications") or []) + 254377
+            _add_notification(state, {
+                "pkg": package, "id": 0, "tag": f"FCM-Notification:{count}",
+                "title": extras.get("gcm.notification.title", state.get("app_label", "Probe")),
+                "text": extras.get("gcm.notification.body"),
+                "number": extras.get("gcm.notification.notification_count", 0)})
+        write_state(state)
+        if "broadcast_output" in state:
+            sys.stdout.write(state["broadcast_output"])
+            return 0
+        sys.stdout.write(f"Broadcasting: Intent {{ act={sent['action']} flg=0x400000 "
+                         f"pkg={package} (has extras) }}\nBroadcast completed: result={result}\n")
+        return 0
+    if words[:2] == ["dumpsys", "notification"]:
+        style = state.get("notification_format", "api37")
+        lines = ["Current Notification Manager state:", "  Notification List:"]
+        changed = False
+        for item in state.get("notifications") or []:
+            hidden = int(item.get("hidden_reads", 0) or 0)
+            if hidden > 0:
+                item["hidden_reads"] = hidden - 1
+                changed = True
+                continue
+            lines.extend(_notification_lines(item, style))
+        if changed:
+            write_state(state)
+        encoding = state.get("notification_encoding")
+        if encoding:
+            sys.stdout.flush()
+            sys.stdout.buffer.write(("\n".join(lines) + "\n").encode(encoding, "replace"))
+            sys.stdout.buffer.flush()
+            return 0
+        sys.stdout.write("\n".join(lines) + "\n")
+        return 0
+    if words[:3] == ["cmd", "notification", "post"]:
+        options = words[3:]
+        title = None
+        positional: list[str] = []
+        index = 0
+        while index < len(options):
+            if options[index] in ("-S", "-t", "-c", "-i", "-I") and index + 1 < len(options):
+                if options[index] == "-t":
+                    title = options[index + 1]
+                index += 2
+            else:
+                positional.append(options[index])
+                index += 1
+        if len(positional) < 2:
+            sys.stdout.write("Error: no tag or text\n")
+            return 1
+        style = state.get("notification_format", "api37")
+        sys.stdout.write("posting:\n" if style == "api29" else "posting for user 0:\n")
+        if not via_su and not as_root:
+            _add_notification(state, {"pkg": SHELL_PACKAGE, "id": 1138 if style == "api29" else 2020,
+                                      "tag": positional[0], "title": title,
+                                      "text": " ".join(positional[1:])})
+            write_state(state)
+        return 0
+    if via_su:
+        return 0
+    return None
+
+
 def main(argv: list[str]) -> int:
     record(argv)
     state = load_state()
@@ -517,6 +735,9 @@ def main(argv: list[str]) -> int:
             words = shlex.split(" ".join(args[1:]))
         except ValueError:  # unbalanced quotes: sh would refuse the line too
             words = []
+        handled = _push_shell(words, state)
+        if handled is not None:
+            return handled
         if words[:3] == ["cmd", "clipboard", "set"]:
             if state.get("clipboard_unsupported"):
                 sys.stdout.write("No shell command implementation.\n")

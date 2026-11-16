@@ -123,10 +123,11 @@ class LocalDeviceSession:
             "simulator.appearance", "simulator.text_size", "simulator.status_bar",
             "simulator.battery", "simulator.biometric",
         }
+        # push: simctl push on iOS; on an Android emulator the app's own push
+        # receiver (needs root) or a plain notification in the shade
+        supported_simulator |= {"simulator.push"}
         if is_android:
             supported_simulator |= {"simulator.network", "simulator.sms", "simulator.call"}
-        else:
-            supported_simulator |= {"simulator.push"}
         for name in SEMANTIC_CAPABILITIES:
             if not name.startswith("simulator."):
                 continue

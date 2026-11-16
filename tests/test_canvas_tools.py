@@ -277,7 +277,7 @@ class DispatchTests(ToolsCase):
     def test_the_op_list_is_the_contract(self) -> None:
         self.assertEqual(set(tools_mod.READ_OPS), {
             "context", "permissions.list", "location.get", "biometric.status", "network.status",
-            "network.requests", "network.request", "mocks.list"})
+            "network.requests", "network.request", "mocks.list", "push.compose"})
         self.assertEqual(set(tools_mod.MUTATING_OPS), {
             "permissions.set", "location.set", "location.clear", "simulate",
             "network.start", "network.capture", "network.attach", "network.detach", "network.stop",
@@ -348,6 +348,7 @@ class ContextTests(ToolsCase):
         self.assertEqual(result["android_permission_aliases"]["camera"],
                          ["android.permission.CAMERA"])
         self.assertEqual(result["simulate"], {
+            "push": ["send"],
             "biometric": ["match", "nonmatch", "settings"], "battery": ["set", "reset"],
             "network": ["online", "offline"], "appearance": ["light", "dark"],
             "text-size": ["0.85", "1.0", "1.3", "1.5", "2.0"], "animations": ["pin", "reset"]})
@@ -664,13 +665,177 @@ class AndroidSimulateTests(ToolsCase):
         self.assertEqual(self.journal(record)[0]["argv"],
                          ["canvas", "simulate", "battery", "set", "level=42"])
 
-    def test_push_on_android_is_the_library_refusal(self) -> None:
+    def test_a_raw_apns_payload_on_android_is_refused_with_the_message_hint(self) -> None:
         response = self.refused("simulate", {"control": "push", "action": "send",
                                              "values": {"app_id": APP,
                                                         "payload": {"aps": {}}}},
-                                errors.UNSUPPORTED_CAPABILITY)
-        self.assertTrue(response["hint"])
-        self.assertEqual(response["capability"], "simulator.push")
+                                errors.INVALID_VALUE)
+        self.assertIn("message fields", response["hint"])
+        self.assertEqual(self.calls(), [])
+
+    def test_a_push_message_is_delivered_and_only_its_length_is_journaled(self) -> None:
+        record = self.start_session()
+        self.fake_state(app_posts_notifications=True)
+        message = {"title": SECRET, "body": "Order " + SECRET, "data": {"order_id": 42}}
+        for value in (message, json.dumps(message)):
+            with self.subTest(kind=type(value).__name__):
+                result = self.ok("simulate", {"control": "push", "action": "send",
+                                              "values": {"message": value}})
+                self.assertEqual((result["app_id"], result["app_id_source"]), (APP, "session"))
+                self.assertEqual((result["delivery"], result["route"], result["kind"]),
+                                 ("app", "su", "notification"))
+                self.assertTrue(result["verified"])
+        state = json.loads(self.state.read_text(encoding="utf-8"))
+        self.assertEqual(state["broadcasts"][-1]["extras"]["gcm.notification.title"], SECRET)
+        self.assertEqual(state["broadcasts"][-1]["extras"]["order_id"], "42")
+        size = len(json.dumps(message, separators=(",", ":")).encode())
+        first, second = self.journal(record)
+        self.assertEqual(first["argv"], ["canvas", "simulate", "push", "send",
+                                         f"message_len={size}", f"app_id={APP}"])
+        self.assertEqual(second["argv"][4], f"message_len={len(json.dumps(message))}")
+        self.assertNotIn(SECRET, self.journal_text(record))
+        everything = "".join(path.read_text(encoding="utf-8", errors="replace")
+                             for path in Path(record["artifacts_dir"]).rglob("*")
+                             if path.is_file())
+        self.assertNotIn(SECRET, everything)
+
+    def test_shade_delivery_and_its_warning(self) -> None:
+        record = self.start_session()
+        result = self.ok("simulate", {"control": "push", "action": "send", "values": {
+            "message": {"title": "Order shipped", "body": SECRET}, "delivery": "shade"}})
+        self.assertEqual((result["delivery"], result["owner"]), ("shade", "com.android.shell"))
+        self.assertTrue(result["verified"])
+        self.assertEqual([item["code"] for item in result["warnings"]], ["push_shade_only"])
+        self.assertIn("delivery=shade", self.journal(record)[0]["argv"])
+        self.assertNotIn(SECRET, self.journal_text(record))
+
+    def test_the_push_form_values_reach_a_stopped_app_and_journal_lengths_only(self) -> None:
+        # Exactly what the page's push form sends: a message object, delivery and a
+        # boolean include_stopped (canvas-push-form.mjs, build()).
+        record = self.start_session()
+        self.fake_state(stopped_packages=[APP])
+        message = {"title": "Order shipped", "body": SECRET, "badge": 3,
+                   "data": {"url": "myapp://orders/" + SECRET}}
+        refused = self.refused("simulate", {"control": "push", "action": "send", "values": {
+            "app_id": APP, "message": message, "delivery": "app", "include_stopped": False}},
+            errors.PUSH_NOT_DELIVERED)
+        self.assertEqual(refused["reason"], "not_received")
+        self.assertIn("include_stopped", refused["hint"])
+        result = self.ok("simulate", {"control": "push", "action": "send", "values": {
+            "app_id": APP, "message": message, "delivery": "app", "include_stopped": True}})
+        self.assertEqual((result["delivery"], result["kind"], result["app_id_source"]),
+                         ("app", "notification", "value"))
+        state = json.loads(self.state.read_text(encoding="utf-8"))
+        first, second = state["broadcasts"]
+        self.assertEqual((first["include_stopped"], second["include_stopped"]), (False, True))
+        self.assertEqual(second["extras"]["url"], "myapp://orders/" + SECRET)
+        self.assertEqual(second["extras"]["gcm.notification.notification_count"], "3")
+        size = len(json.dumps(message, separators=(",", ":")).encode())
+        entries = self.journal(record)
+        self.assertEqual(entries[-1]["argv"], ["canvas", "simulate", "push", "send",
+                                               f"message_len={size}", "delivery=app",
+                                               "include_stopped=True", f"app_id={APP}"])
+        self.assertNotIn(SECRET, self.journal_text(record))
+
+    def test_a_refused_push_journals_its_code_and_never_the_text(self) -> None:
+        record = self.start_session()
+        self.fake_state(su_uid=None)
+        response = self.refused("simulate", {"control": "push", "action": "send",
+                                             "values": {"message": {"title": SECRET}}},
+                                errors.PUSH_NOT_DELIVERED)
+        self.assertEqual(response["reason"], "no_root")
+        self.assertIn("google_apis", response["hint"])
+        self.assertNotIn(SECRET, json.dumps(response))
+        (entry,) = self.journal(record)
+        self.assertEqual(entry["error_code"], errors.PUSH_NOT_DELIVERED)
+        self.assertNotIn(SECRET, self.journal_text(record))
+
+    def test_bad_push_messages_are_refused_before_the_device(self) -> None:
+        cases = [({"message": [1]}, errors.FLOW_COMMAND_INVALID),
+                 ({"message": "{not json"}, errors.FLOW_COMMAND_INVALID),
+                 ({"message": "[1]"}, errors.FLOW_COMMAND_INVALID),
+                 ({"message": {"title": "x" * 4100}}, errors.FLOW_COMMAND_INVALID),
+                 ({"message": json.dumps({"title": "x" * 4100})}, errors.FLOW_COMMAND_INVALID),
+                 ({"message": {"title": "x", "file": "/etc/passwd"}}, errors.INVALID_VALUE),
+                 ({"message": {"title": "x", "app_id": APP}}, errors.INVALID_VALUE),
+                 ({"message": {"subtitle": "only"}}, errors.INVALID_VALUE),
+                 ({"message": {"title": "x"}, "payload": {"aps": {}}}, errors.INVALID_VALUE),
+                 ({"message": {"title": "x"}, "file": "/tmp/x.json"}, errors.FLOW_COMMAND_INVALID),
+                 ({"message": {"title": "x"}, "delivery": "sky"}, errors.INVALID_VALUE)]
+        for values, code in cases:
+            with self.subTest(values=str(values)[:60]):
+                response = self.refused("simulate", {"control": "push", "action": "send",
+                                                     "values": values}, code)
+                self.assertTrue(response["error"])
+        big = self.refused("simulate", {"control": "push", "action": "send",
+                                        "values": {"message": {"title": "x" * 4100}}},
+                           errors.FLOW_COMMAND_INVALID)
+        self.assertIn("4096", big["error"])
+        self.assertEqual(self.calls(), [])
+
+    def test_push_text_utf8_cannot_hold_is_refused_naming_the_field(self) -> None:
+        # a lone surrogate, typed or as a JSON escape, and numbers JSON has no
+        # strict form for: invalid_value naming the field, before the device
+        lone = "a\ud800b"
+        cases = [({"title": lone}, "title"),
+                 ({"title": "t", "data": {"k": {"deep": [lone]}}}, "data.k"),
+                 (json.dumps({"title": "t", "data": {"k": lone}}), "data.k"),
+                 ('{"title": "t", "data": {"k": "a\\ud800b"}}', "data.k"),
+                 ({"title": "t", "data": {"n": float("nan")}}, "data.n"),
+                 ({"title": "t", "ios": {"aps": {"x": float("inf")}}}, "ios")]
+        for message, field in cases:
+            for op, payload in (("simulate", {"control": "push", "action": "send",
+                                              "values": {"app_id": APP, "message": message}}),
+                                ("push.compose", {"message": message})):
+                with self.subTest(op=op, field=field, kind=type(message).__name__):
+                    response = self.refused(op, payload, errors.INVALID_VALUE)
+                    self.assertEqual(response["field"], field)
+        self.assertEqual(self.calls(), [])
+
+    def test_a_push_message_nested_too_deeply_is_refused(self) -> None:
+        text = '{"title": "t", "data": {"k": ' + "[" * 1990 + "]" * 1990 + "}}"
+        self.assertLessEqual(len(text), tools_mod.MAX_PUSH_PAYLOAD)
+        response = self.refused("simulate", {"control": "push", "action": "send",
+                                             "values": {"app_id": APP, "message": text}},
+                                errors.INVALID_VALUE)
+        # parsed and capped by the model, or too deep for this Python to parse
+        self.assertIn(response["field"], ("data.k", "message"))
+        deep: object = "x"
+        for _ in range(40):
+            deep = {"k": deep}
+        response = self.refused("push.compose", {"message": {"title": "t", "ios": deep}},
+                                errors.INVALID_VALUE)
+        self.assertEqual(response["field"], "ios")
+        self.assertEqual(self.calls(), [])
+
+    def test_compose_through_simulate_points_to_the_read_op(self) -> None:
+        self.refused("simulate", {"control": "push", "action": "compose",
+                                  "values": {"message": {"title": "x"}}},
+                     errors.FLOW_COMMAND_INVALID)
+        self.assertEqual(self.calls(), [])
+
+    def test_push_compose_is_a_preview_without_the_device_or_the_journal(self) -> None:
+        record = self.start_session()
+        self.tools = tools_mod.Tools(android(PHONE))  # even a phone: nothing is sent
+        result = self.ok("push.compose", {"message": json.dumps(
+            {"title": SECRET, "badge": 2, "data": {"n": 1}})})
+        self.assertEqual(result["message"]["title"], SECRET)
+        self.assertEqual(result["ios"]["payload"]["aps"]["badge"], 2)
+        self.assertEqual(result["android"]["kind"], "notification")
+        self.assertEqual(result["android"]["extras"]["n"], "1")
+        self.assertIsNone(result["written"])
+        only = self.ok("push.compose", {"message": {"body": "b"}, "platform": "android"})
+        self.assertNotIn("ios", only)
+        self.assertEqual(self.calls(), [])
+        self.assertEqual(self.journal(record), [])
+        for payload, code in (({}, errors.INVALID_VALUE),
+                              ({"message": {"title": "x"}, "write": "/tmp/p.json"},
+                               errors.FLOW_COMMAND_INVALID),
+                              ({"message": {"title": "x"}, "platform": "web"},
+                               errors.INVALID_VALUE),
+                              ({"message": {"title": "x" * 4100}}, errors.FLOW_COMMAND_INVALID)):
+            with self.subTest(payload=str(payload)[:40]):
+                self.refused("push.compose", payload, code)
 
     def test_an_unknown_action_is_the_library_refusal(self) -> None:
         response = self.refused("simulate", {"control": "appearance", "action": "purple"},
@@ -739,6 +904,16 @@ class IosSimulateTests(ToolsCase):
         self.refused("simulate", {"control": "push", "action": "send",
                                   "values": {"app_id": "bad id", "payload": {}}},
                      errors.INVALID_VALUE)
+        self.assertEqual(self.calls(), [])
+
+    def test_a_push_payload_utf8_cannot_hold_never_reaches_simctl(self) -> None:
+        lone = {"aps": {"alert": "a\ud800b"}}
+        for payload in (lone, json.dumps(lone), '{"aps": {"alert": "a\\ud800b"}}'):
+            with self.subTest(kind=type(payload).__name__):
+                response = self.refused("simulate", {
+                    "control": "push", "action": "send",
+                    "values": {"app_id": APP, "payload": payload}}, errors.INVALID_VALUE)
+                self.assertEqual(response["field"], "payload")
         self.assertEqual(self.calls(), [])
 
     def test_push_without_an_app_is_the_library_refusal(self) -> None:

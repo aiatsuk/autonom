@@ -165,6 +165,11 @@ SLIM_PROFILE_INVALID = "slim_profile_invalid"
 # (`service` names it, the hint has the command that switches it back on).
 SIMULATOR_SERVICE_DISABLED = "simulator_service_disabled"
 
+# --- Push notifications (`simulator push send` on an Android emulator) ----------
+# The push did not reach the app: `reason` says why (`no_root`, `no_receiver`,
+# `not_received`, `rejected`) and the hint names the ways out.
+PUSH_NOT_DELIVERED = "push_not_delivered"
+
 
 # --- UI recovery (optional XCUITest backend) ----------------------------------
 SESSION_STOPPED = "session_stopped"  # --session-id named a stopped session for a mutating verb

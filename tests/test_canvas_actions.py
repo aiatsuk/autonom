@@ -241,7 +241,7 @@ class OpListTests(ActionsCase):
                          + tools_mod.ACTION_READ_OPS + tools_mod.ACTION_DEVICE_OPS
                          + tools_mod.ACTION_LOCAL_OPS + tools_mod.INTERNAL_OPS)
         self.assertEqual(len(set(tools_mod.OPS)), len(tools_mod.OPS))
-        self.assertEqual(len(tools_mod.READ_OPS), 8)
+        self.assertEqual(len(tools_mod.READ_OPS), 9)
         self.assertEqual(len(tools_mod.MUTATING_OPS), 15)
         self.assertEqual(set(self.tools.handlers), set(tools_mod.OPS))
 

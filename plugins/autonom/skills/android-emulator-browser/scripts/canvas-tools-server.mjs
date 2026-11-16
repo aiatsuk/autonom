@@ -57,6 +57,7 @@ export const TOOLS_READ_OPS = Object.freeze([
   "network.requests",
   "network.request",
   "mocks.list",
+  "push.compose",
 ]);
 export const TOOLS_MUTATING_OPS = Object.freeze([
   "permissions.set",
@@ -109,6 +110,8 @@ const STATUS_409 = new Set([
   "session_target_mismatch", "emulator_only", "proxy_not_running",
   "physical_device_attach_unsupported", "install_not_configured", "recording_already_active",
   "recording_not_active",
+  // A push the emulator did not deliver (`reason`: no_root, no_receiver, not_received, rejected).
+  "push_not_delivered",
   // The host control lease and the bound session (contract 6.5).
   "control_held", "control_generation_stale", "control_lease_expired", "control_not_held",
   "session_stopped", "session_not_found",

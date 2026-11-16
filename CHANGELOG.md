@@ -9,6 +9,52 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
 
 ### Added
 
+- **Push notifications: compose once, send on iOS and Android.**
+  `simulator push compose` (read-only, no device) turns plain fields
+  (`title`, `body`, `data`, `badge`, `sound`, `image`, `silent`, ...) into one
+  push message (`autonom.push/v1`, new schema `schemas/push-v1.schema.json`)
+  and shows the APNs payload and the Android FCM extras it becomes;
+  `write=<path>` saves it and `file=<path>` loads it again. `simulator push
+  send` takes the same fields or file on both platforms (a raw APNs `payload`
+  on iOS works as before). On an Android emulator, `delivery=app` delivers
+  the message into the app's own FCM receiver the way Google Play services
+  does (needs root: a `google_apis` image; `adb root` is never run) and reads
+  the shade back; `delivery=shade` posts a plain notification that belongs to
+  the shell. New error code `push_not_delivered` (`reason`: `no_root`,
+  `no_receiver`, `not_received`, `rejected`, and `no_visible_content` when
+  the iOS Simulator refuses a push that shows nothing, which iOS 27.2 does for
+  a silent push: test silent pushes on Android), warnings `push_payload_large`
+  (the APNs payload or the Android extras above 4096 bytes),
+  `push_notifications_denied`, `push_shade_only` and `push_silent_unconfirmed`
+  (simctl took a silent push; whether the app's background handler ran is not
+  known); `simulator.push` is now available on Android emulators. A message is
+  checked before anything is sent: no NUL or lone surrogate in any string,
+  finite numbers, at most 32 levels of nesting, at most 64 KB rendered, and in
+  a file or `--json` a JSON integer `badge` and boolean `silent`/`fcm`. A
+  notification in the shade that does not print as UTF-8 never fails a push
+  already sent. The Canvas tools process sends a push
+  `message` on Android and previews one with the read op `push.compose`,
+  which the page's push form uses (below). Not covered: real FCM/APNs sends
+  through Google's or Apple's servers, physical devices, Play Store images for
+  `delivery=app`.
+
+- **Mobile Canvas: set up a push and press Send, on iOS and Android.** The
+  Simulate tab's Push notification row is on both platforms, with Send where
+  it was and a block whose summary line shows what Send will send: App,
+  Title, Body, Subtitle (iOS), Badge, Sound, Silent, Data key/value rows (the
+  key your app reads a link from goes there), Delivery "To the app" or
+  "Notification shade only" and "Reach a stopped app" (Android), Edit as JSON
+  (a raw APNs object on iOS is sent as it is), Preview (the read-only
+  `push.compose`, never leased) and Reset, with a second Send in the form's
+  footer that shows its result right under it. The page checks the message before
+  any call (empty, duplicate and reserved data keys, the badge, the app id,
+  4 KB); the status line says where the push went and every warning in plain
+  words (when notifications are not allowed for the app it says that is why
+  nothing is shown), and a push the emulator did not deliver says what to do (an image
+  without Play Store or shade delivery for `no_root`, open the app or "Reach a
+  stopped app" for `not_received`). The message, the delivery choice and the
+  open block are remembered per platform in this browser, never the app id.
+
 - **`simulator slim`: switch iOS Simulator background services off.** A stock
   simulator runs well over two hundred launchd jobs an app under test never
   uses; with them off one simulator measured 2.8 GB instead of 10.7 GB.

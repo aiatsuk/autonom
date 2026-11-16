@@ -167,6 +167,9 @@ as four separate categories.
   screenshot or a log line as a performance measurement.
 - Simulator behavior differs from a physical device for camera, sensors, push,
   background execution, and memory pressure. Say so when it matters to the finding.
+  A simulated push (`autonom simulator push send`, the same command on an
+  Android emulator; see "Push notifications" in `mobile-session`) reaches the
+  app without APNs, so it proves the app's handling, not the server's send.
 
 ## Backend recovery and explicit sessions
 

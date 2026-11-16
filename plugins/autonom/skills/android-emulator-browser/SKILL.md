@@ -399,7 +399,7 @@ the system, and every device or network string is shown as text.
 | Tab | What it does | Limits |
 | --- | --- | --- |
 | App | App id (pre-filled from the session on this target or the best-known app, editable); permissions: Android lists the app's requested runtime permissions with granted or denied and grants, revokes or resets one; iOS lists the privacy services with Grant, Revoke and Reset. App-scoped recent deeplinks, named saved locations with edit/delete. Location: latitude and longitude (checked: -90..90, -180..180) or a preset; Android reads the position back | iOS cannot read a permission or the location back, so the drawer says so and shows the last value set. The Android emulator has no location reset, so Clear is iOS only; its position moves only once an app subscribes to location updates, and Read back says "delivered" or "requested only" |
-| Simulate | Push (iOS, JSON payload of at most 4 KB), biometrics (iOS Face ID/Touch ID enroll, unenroll, success/failure; Android fingerprint readiness, enrollment settings and success/failure with configurable IDs), battery level and reset (iOS also its state), network online/offline (Android), appearance light/dark, text size, Android animation disable/restore | Only these controls, and only on an emulator or Simulator; the result says whether the device confirmed the change |
+| Simulate | Push on both platforms: set it up and press Send (App, Title, Body, Subtitle on iOS, Badge, Sound, Silent, Data key/value rows for the link key your app reads, on Android Delivery "To the app" or "Notification shade only" and "Reach a stopped app", Edit as JSON with a raw APNs object on iOS, Preview through the read-only `push.compose`, Reset; at most 4 KB, checked in the page; remembered per platform in this browser, never the app id; see "Push notifications" in `mobile-session`), biometrics (iOS Face ID/Touch ID enroll, unenroll, success/failure; Android fingerprint readiness, enrollment settings and success/failure with configurable IDs), battery level and reset (iOS also its state), network online/offline (Android), appearance light/dark, text size, Android animation disable/restore | Only these controls, and only on an emulator or Simulator; the result says whether the device confirmed the change |
 | Network | Capture status (proxy, device attached yes/no/unknown, recent requests), Start capture starts the proxy and attaches the device after confirmation; Stop capture restores the previous proxy before stopping. These are the two capture controls. Unknown attachment can only be refreshed; a live request list (polled once a second while the tab is visible) with host, method, status and mocked filters; details from the redacted previews; Mock this fills the Mocks form | Needs an Autonom session on this target (`autonom session start` with the Canvas's `--serial`/`--udid`); without one the tab shows that hint and never starts a session. Never raw `--capture-bodies` or system CA installation. Details show redacted previews of at most 2 KB; Pretty also formats marked incomplete JSON. Copy loads complete redacted UTF-8 text on demand, up to 4 MiB per body. New captures retain it in private session `network/copy-bodies/` files; old truncated captures require recapture. Binary/oversized/unavailable bodies are reported explicitly |
 | Mocks | The mock list with hit counts, add, edit, enable, disable, remove, and Clear all after a confirmation; validation errors are shown with their code | Mocks apply to every Autonom session on this Mac (the drawer says so). Hit counts count only the session on this target (0 without one). Status 100-599, body at most 32 KB |
 | Logs | The live device log, optionally for one app package (iOS: process or bundle), with a level filter, a text filter, Pause (keeps polling, stops drawing), Clear and auto-scroll unless you scrolled up | At most 2000 rows in the page; the Canvas keeps the last 2000 lines (at most 1 MiB) and counts the lines it evicted before the page read them. On iOS the feed follows the current session's log stream, so it starts only when that session is on this Simulator and was started with `--log-stream`; otherwise it says how to start one |
@@ -445,8 +445,11 @@ Routes, behind the same authorization and CSRF as every other route:
 
 `/status` `tools` reports `available` and `logs.running`/`logs.package`.
 Every device change is journaled into the session on this target as
-`canvas <op>` with its origin; mock bodies, push payloads and log text are
-never journaled (lengths only), and the Canvas writes no log text to disk.
+`canvas <op>` with its origin; mock bodies, push payloads, push messages
+and log text are never journaled (lengths only: `payload_len`,
+`message_len`), a push Preview (`push.compose`) is not journaled at all, and
+the Canvas writes no log text to disk. The push form keeps its message in this
+browser's storage only, never the app id.
 
 ## The scrcpy page
 
@@ -853,8 +856,8 @@ transport and decoder lines, `fallback_reason`, `scrcpy.version`/`scrcpy.source`
 (`idb.companion_path`/`idb.source` and `idb.streams_opened` on iOS)
 and the display preset, size and density from `/status`, package/activity,
 variant, control owner, and the exact flow replayed. For Tools drawer work,
-the ops called and their results (never mock bodies, push payloads or log
-text).
+the ops called and their results (never mock bodies, push payloads or
+messages, or log text).
 
 
 ### Desktop presentation

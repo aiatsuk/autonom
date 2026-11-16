@@ -20,6 +20,7 @@ import {
   handleToolsRoute,
   literalPattern,
   toolsErrorStatus,
+  toolsReplyResponse,
 } from "../plugins/autonom/skills/android-emulator-browser/scripts/canvas-tools-server.mjs";
 
 const ROOT = resolve(import.meta.dirname, "..");
@@ -364,7 +365,7 @@ async function canvasWorld(t, { env = {}, platform = "android" } = {}) {
 
 test("ops: the allowlist is the read and mutating ops of the contract, with no overlap", () => {
   assert.deepEqual(TOOLS_READ_OPS, ["context", "permissions.list", "location.get", "biometric.status", "network.status",
-    "network.requests", "network.request", "mocks.list"]);
+    "network.requests", "network.request", "mocks.list", "push.compose"]);
   assert.deepEqual(TOOLS_MUTATING_OPS, ["permissions.set", "location.set", "location.clear", "simulate",
     "network.start", "network.capture", "network.attach", "network.detach", "network.stop", "mocks.add", "mocks.update",
     "mocks.enable", "mocks.disable", "mocks.remove", "mocks.clear"]);
@@ -380,12 +381,24 @@ test("errors: each tools error code maps to its HTTP status, anything else is 50
     assert.equal(toolsErrorStatus(code), 404, code);
   }
   for (const code of ["unsupported_on_platform", "unsupported_capability", "no_active_session",
-    "session_target_mismatch", "emulator_only", "proxy_not_running", "physical_device_attach_unsupported"]) {
+    "session_target_mismatch", "emulator_only", "proxy_not_running", "physical_device_attach_unsupported",
+    "push_not_delivered"]) {
     assert.equal(toolsErrorStatus(code), 409, code);
   }
   for (const code of ["backend_failed", "adb_not_found", "something_new", undefined]) {
     assert.equal(toolsErrorStatus(code), 502, String(code));
   }
+});
+
+test("errors: a push the emulator did not deliver is 409 and keeps its reason", () => {
+  const answer = toolsReplyResponse({ id: 1, ok: false, error_code: "push_not_delivered",
+    error: "no root on emulator-5554", hint: "use a google_apis image", capability: "simulator.push",
+    reason: "no_root" });
+  assert.equal(answer.status, 409);
+  assert.equal(answer.body.error_code, "push_not_delivered");
+  assert.equal(answer.body.reason, "no_root");
+  assert.equal(answer.body.capability, "simulator.push");
+  assert.equal(answer.body.hint, "use a google_apis image");
 });
 
 // --- The real Canvas ------------------------------------------------------------------

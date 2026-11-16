@@ -116,6 +116,14 @@ strengthened, never silently weakened.
   `simulator_service_disabled`, and the warning codes `slim_not_started`,
   `slim_core_kept`, `slim_universal_links_off` and `slim_push_off`; see
   [Simulator slimming](#simulator-slimming-unreleased).
+- Push compose and Android delivery add one code, `push_not_delivered`
+  (`reason`: `no_root`, `no_receiver`, `not_received`, `rejected`, and on iOS
+  `no_visible_content`), the warning codes `push_payload_large`,
+  `push_notifications_denied`, `push_shade_only` and
+  `push_silent_unconfirmed`, and change two emissions: `simulator push send`
+  on an Android emulator was `unsupported_capability` and now delivers, and a
+  push the iOS Simulator refuses for showing nothing was `backend_failed`; see
+  [Push compose and Android delivery](#push-compose-and-android-delivery-unreleased).
 
 ## Response shape
 
@@ -815,6 +823,59 @@ whole-simulator memory and the guard by `tests/test_ios_slim_suggest.py`,
 | `capabilities` | — | adds `simulator.slim` (iOS Simulator only) |
 | Control lease | — | `presets`, `show`, `suggest` and `verify` are READONLY, as is `metrics simulator`; `apply`, `enable`, `disable` and `restore` are MUTATING |
 | State | — | `$AUTONOM_HOME/simulator-slim/<UDID>.json` (`status`, `profile`, `disabled`, `previous`, `written`, `live`, `applied_at`); `session stop` and `cleanup` leave it and the simulator's overrides alone |
+
+### Push compose and Android delivery (Unreleased)
+
+A push is described once as a push message (`autonom.push/v1`,
+`schemas/push-v1.schema.json`, `scripts/autonom_lib/push_message.py`) and
+rendered for each platform; `simulator push send` now also delivers on an
+Android emulator (`scripts/autonom_lib/android_push.py`). `push send` with a
+raw `payload` on iOS is unchanged: the same `simctl push` argv, reply keys,
+errors and slim warning. Pinned by `tests/test_push.py`,
+`tests/test_canvas_tools.py`, `tests/canvas-tools-server.test.mjs`,
+`tests/canvas-push-form.test.mjs`, `tests/canvas-tools-page.test.mjs`,
+`tests/test_verb_classification.py` and `tests/test_error_codes_additive.py`.
+One error code is added:
+
+| Code | Emitted by |
+| --- | --- |
+| `push_not_delivered` | `simulator push send` on an Android emulator with `delivery=app` when the push did not reach the app (`reason`, `capability: "simulator.push"`, `app_id`). `no_root`: neither adbd runs as root (`id -u`) nor `su 0 id -u` prints `0` (a Play Store image has no su); nothing was sent; the hint names a `google_apis` image, `receiver=`/`action=` and `delivery=shade`. `no_receiver`: the package has no receiver for `com.google.android.c2dm.intent.RECEIVE`; nothing was sent; the hint names `receiver=`/`action=` and `delivery=shade`. `not_received`: the broadcast answered `result=0` (`receiver_result: 0`; the app is stopped or was never started: launch it once or pass `include_stopped=true`). `rejected`: any other result than `-1` and `0` (`receiver_result`). On the iOS Simulator, `no_visible_content`: `simctl push` failed with `UNErrorDomain` code 1401 (`Notification has no user visible content`) or 2002 (`No content that needs to alert`), as iOS 27.2 answers a silent push or one with only a badge or a sound; composed and raw payloads alike (was `backend_failed` with the `autonom doctor` hint); message `the Simulator refused a push with no alert text`, the hint says to add a title or body and that a silent push is tested on Android |
+
+Warning codes (on an `ok: true` reply, `{code, error, hint}`):
+`push_payload_large` (`bytes`, `limit`, `platform`: the APNs payload is above
+4096 bytes, `compose` and iOS `send`, simctl still decides; or the Android
+extras, keys plus values in UTF-8, are above 4096 bytes, `compose` and Android
+`delivery=app`, which real FCM would refuse and the emulator still takes),
+`push_notifications_denied` (`permission`: a notification message to an app
+on API 33+ that has not been granted `android.permission.POST_NOTIFICATIONS`;
+the hint is `autonom permissions grant notifications <app_id>`; a failed
+lookup, the API level included, adds no warning and never stops the push),
+`push_shade_only` (always with `delivery=shade`: the notification belongs to
+`com.android.shell`, the app's code did not run and a tap opens nothing) and
+`push_silent_unconfirmed` (iOS `send` of a composed `silent` message that
+simctl accepted, as iOS 26.4 does: whether the app ran its background handler
+is not known).
+
+What a message may hold is checked before anything renders or is sent
+(`invalid_value` naming the `field`; the schema says the same where JSON Schema
+can): no string anywhere, key or value, has a NUL character or a lone
+surrogate; numbers are finite (no `NaN` or `Infinity`, so every reply is strict
+JSON); `data`, `ios` and `android` nest at most 32 levels of objects and arrays;
+a message whose render is over 65536 bytes on either platform is refused
+(`bytes`, `limit`, `platform`), so a huge body never becomes an adb line. In a
+file or a `--json` object `badge` is a JSON integer and `silent`/`fcm` JSON
+booleans (`"3"` and `"true"` are refused; `--value` text is parsed). An empty
+key in `data` or `android` is refused by both the schema and the validator.
+
+| Surface | Before | Now |
+| --- | --- | --- |
+| `simulator push compose` | — | read-only, needs no device and resolves no target (works without adb or simctl). Message fields from `--json` and `--value` (`title`, `subtitle`, `body`, `badge`, `sound`, `category`, `thread`, `channel`, `image`, `silent`, `data`, `data.<key>`, `message_id`, `fcm`, `ios`, `android`, `name`, `description`), `file=<path>` (a saved message, command-line fields laid over it), `platform=ios\|android`, `write=<path>`, `overwrite=true`. Reply: `control`, `action: "compose"`, `message` (normalized, with `schema`), `message_id` (generated for the preview, never written unless given), `ios: {payload, bytes, over_limit}`, `android: {extras, kind: "notification"\|"data"}`, `notes` (an `ios:` line for a `silent` message: simctl may refuse it or take it unconfirmed), `warnings` (`push_payload_large` per platform), `written` (path or null), `next` (the `push send --value file=<path>` line, or null). Errors: `invalid_value` (`field`, `missing`, `path`: an unknown field, a bad type, `silent` with a title, subtitle or body, a reserved `data` key, a message with nothing to show, a raw `payload` or a raw APNs file, a value of `push send` such as `app_id`, an existing `write` target without `overwrite=true`, a missing or unreadable file), `output_not_writable` |
+| `simulator push send` (iOS) | — | unchanged with a raw `payload` (or `file=` holding an object with a top-level `aps`). With message fields or a message file the push is rendered (the `compose` iOS payload) and sent the same way; the reply adds `composed: true`, `message_id`, `kind`, `payload_bytes`, the `push_payload_large` warning above 4096 bytes and, for a `silent` message simctl took, `push_silent_unconfirmed`. A simctl refusal for no visible content (`UNErrorDomain` 1401 or 2002) is `push_not_delivered` `no_visible_content` for composed and raw payloads; every other simctl failure stays `backend_failed`, and a raw payload's success reply is unchanged. New refusals (`invalid_value`): `delivery` other than `app`, a raw `payload` together with message fields or a file, and, without a raw `payload`, any unknown value and, beside message fields, the Android values `receiver`, `action`, `include_stopped` and the compose values `write`, `overwrite`, `platform` (the raw `payload` path still ignores values it does not use). With nothing given the error is the same (`push send needs payload (a JSON object)`) and its hint also names the message fields. `--value` without `=` no longer echoes the value in its error (`flow_command_invalid`, every control) |
+| `simulator push send` (Android emulator) | `unsupported_capability` | message fields or a message file (a raw APNs `payload` is `invalid_value` with the message-field hint). `delivery=app` (default): `pm path` (else `app_not_installed`), root through adbd or `su 0` (else `push_not_delivered` `no_root`; `adb root` is never run), the FCM receiver (`cmd package query-receivers`, else `no_receiver`), one `am broadcast [--include-stopped-packages] -a com.google.android.c2dm.intent.RECEIVE -p <app>` with one `--es` per extra, then the read-back. `receiver=<pkg>/<class>` (or `.Class`) sends with `-n`, `action=` changes the intent action; either skips the receiver check, is sent as the shell when there is no root (`route: "shell"`) and accepts `result=0`. Reply: `control`, `app_id`, `app_id_source`, `composed`, `message_id`, `kind`, `delivery: "app"`, `route` (`root`, `su`, `shell`), `receiver_result`, `extras_count`, `receiver` and `intent_action` when given, `verified`, `verification` (`read_back`: a new `dumpsys notification --noredact` record of the app shows the title, or the body without a title, within 3 s; `not_in_shade`: none did, a foreground app handles the message itself; `receiver_accepted`: a data-only message; device output is decoded with bad bytes replaced, so a record that cannot be read is not confirmed, never an error), and `push_payload_large` when the extras are above 4096 bytes. `delivery=shade` (API 29+, else `unsupported_capability` with `api_level`): `cmd notification post -S bigtext [-t <title>] autonom_push_<message_id> <body or title>` as the shell, never through su; reply `delivery: "shade"`, `owner: "com.android.shell"`, `tag`, `verified` from a 3 s read-back of that tag (else `not_in_shade` with `verification_detail`), and always `push_shade_only`; `app_id` is not needed (null when there is none). Every text argument is shell-quoted; no error and no journal entry holds the notification text. A physical phone is refused as before |
+| `capabilities` | `simulator.push` unavailable on Android | available on an Android emulator too |
+| Control lease | `simulator push` all MUTATING | `compose` is READONLY, `send` stays MUTATING |
+| Mobile Canvas tools | `simulate` push iOS only, `payload` only | `simulate` push `send` on Android too; values `payload` (raw APNs, iOS only) or `message` (a push message object or its JSON text, at most 4096 bytes), `app_id`, `delivery`, `include_stopped`; the journal keeps `payload_len` / `message_len`, never the text. New read op `push.compose` (`{"message", "platform"}`): the `simulator push compose` reply, no device call, not journaled, not leased. `push_not_delivered` is HTTP 409 and keeps `reason`. `context.simulate` lists `push` on an Android emulator. The page's push form sends `{app_id, message}` (iOS: `{app_id, payload}` for a raw APNs object), on Android plus `delivery` and, for `app`, a boolean `include_stopped` (`app_id` left out for `shade` when there is none) |
+| Mobile Canvas push form | iOS only: a bundle id and a raw APNs JSON textarea | both platforms (`canvas-push-form.mjs`): App, Title, Body, Subtitle (iOS), Badge, Sound, Silent, Data key/value rows, Delivery and Reach a stopped app (Android), Edit as JSON (the textarea keeps the id `tools-push-payload`; it goes back to the fields only when the form can show every field), Preview (`push.compose`, read-only, never leased, nothing journaled; a raw APNs object is shown locally) and Reset, with a second Send left of Preview in the form's footer (`tools-push-send`: the same values, the same lease rule, and both Sends busy together while a push is on its way); a Send from the footer also shows its result, errors and hints included, in a `role="status"` line under the footer buttons (`tools-push-status`), cleared when the message is edited. Checked in the page before any call: an app id (except shade), a title, body, data or Silent, the badge (a whole number 0 or more), data keys (empty skipped; duplicate and reserved `aps`, `from`, `message_type`, `collapse_key`, `google.*`, `gcm.*` refused), shade needs a title or a body, at most 4096 bytes as compact UTF-8 JSON, JSON mode text parses to an object, a raw APNs object only on iOS. The status line comes from the reply (`delivery`, `verified`, `verification`) and every warning (`not_in_shade` with `push_notifications_denied` says nothing is shown because notifications are not allowed); `push_not_delivered` with `reason` `no_root`, `not_received` or `no_receiver` shows what to do in the page's words, other errors the server's message and hint. Kept in `localStorage` under `autonom.canvas.push.v1:<platform>` (the fields, the JSON text, the delivery choice, Reach a stopped app and the open block; never the app id); a broken value restores the defaults (title `Autonom`, body `Hello from the Canvas`) |
 
 ### iOS UI recovery and `--session-id` (0.32.0)
 
