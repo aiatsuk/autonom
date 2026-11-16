@@ -139,6 +139,20 @@ def list_devices(xcrun: str, *, available_only: bool = True) -> list[Simulator]:
     return parse_devices(payload)
 
 
+def booted_udids(xcrun: str, *, timeout: float = 15) -> list[str]:
+    """The UDIDs of the booted simulators; empty when the list cannot be
+    read. Never raises (doctor asks, and doctor only reports)."""
+    try:
+        completed = run_simctl(xcrun, ["list", "devices", "--json"], timeout=timeout,
+                               check=False)
+        if completed.returncode != 0:
+            return []
+        return sorted(simulator.udid for simulator in parse_devices(
+            json.loads(completed.stdout)) if simulator.state == "Booted")
+    except Exception:  # noqa: BLE001 - a missing or broken xcrun is not doctor's failure
+        return []
+
+
 def find_simulator(xcrun: str, udid: str) -> Simulator | None:
     for simulator in list_devices(xcrun, available_only=False):
         if simulator.udid == udid:
@@ -1349,3 +1363,135 @@ def xcode_info(developer: str | None = None) -> dict[str, Any]:
     elif shared.is_dir():
         info["simulatorkit_path"] = str(shared)
     return info
+
+
+# --- launchd overrides (`simulator slim`) ---------------------------------------
+
+# One `simctl spawn launchctl` can stall for a long time right after a first
+# boot, while the simulator migrates data and indexes.
+LAUNCHCTL_TIMEOUT = 120
+# launchd_sim refuses spawns for a few seconds while a boot session starts or
+# tears down (error 124, "Domain is tearing down"); a read is retried after
+# each of these pauses.
+LAUNCHD_SETTLE_DELAYS: tuple[float, ...] = (1.0, 2.0, 4.0, 8.0)
+LAUNCHCTL_BOOTOUT_GONE = 3  # bootout of a service that is not loaded: already stopped
+LAUNCHD_JOB_DIRS = ("System/Library/LaunchDaemons", "System/Library/LaunchAgents")
+
+
+def _launchctl(xcrun: str, udid: str, args: Sequence[str], *,
+               timeout: float = LAUNCHCTL_TIMEOUT) -> subprocess.CompletedProcess:
+    """`simctl spawn <udid> launchctl ...`; a spawn that ran out of time is
+    reported as exit 124 rather than raised."""
+    try:
+        return run_simctl(xcrun, ["spawn", udid, "launchctl", *args],
+                          timeout=timeout, check=False)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(
+            [xcrun, "simctl", "spawn", udid, "launchctl", *args], 124, "",
+            f"launchctl {args[0] if args else ''} timed out after {timeout:.0f}s")
+
+
+def _launchd_settling(completed: subprocess.CompletedProcess) -> bool:
+    text = (completed.stdout or "") + (completed.stderr or "")
+    return (completed.returncode == 124 or "code=124" in text
+            or "Domain is tearing down" in text)
+
+
+def launchctl_print_disabled(xcrun: str, udid: str, *,
+                             timeout: float = LAUNCHCTL_TIMEOUT) -> str:
+    """The text of `launchctl print-disabled system` inside a booted
+    simulator, retried while launchd is still settling after a boot."""
+    completed = _launchctl(xcrun, udid, ["print-disabled", "system"], timeout=timeout)
+    for pause in LAUNCHD_SETTLE_DELAYS:
+        if completed.returncode == 0 or not _launchd_settling(completed):
+            break
+        time.sleep(pause)
+        completed = _launchctl(xcrun, udid, ["print-disabled", "system"], timeout=timeout)
+    if completed.returncode != 0:
+        detail = ((completed.stderr or "") + (completed.stdout or "")).strip()
+        raise errors.AutonomError(
+            errors.BACKEND_FAILED,
+            detail or f"launchctl print-disabled failed ({completed.returncode})",
+            "Check that the simulator is booted ('autonom devices'), then retry.",
+        )
+    return completed.stdout or ""
+
+
+def launchctl_disable(xcrun: str, udid: str, label: str) -> bool:
+    """Set the disable override of one service (applies at the next bootstrap)."""
+    return _launchctl(xcrun, udid, ["disable", f"system/{label}"]).returncode == 0
+
+
+def launchctl_enable(xcrun: str, udid: str, label: str) -> bool:
+    """Lift the disable override of one service."""
+    return _launchctl(xcrun, udid, ["enable", f"system/{label}"]).returncode == 0
+
+
+def launchctl_bootout(xcrun: str, udid: str, label: str) -> bool:
+    """Stop one running service now. A service that is not loaded is success."""
+    code = _launchctl(xcrun, udid, ["bootout", f"system/{label}"]).returncode
+    return code in (0, LAUNCHCTL_BOOTOUT_GONE)
+
+
+def launchctl_bootstrap(xcrun: str, udid: str, plist: Path | str) -> bool:
+    """Load one job into the running boot session from its plist."""
+    return _launchctl(xcrun, udid, ["bootstrap", "system", str(plist)]).returncode == 0
+
+
+def launchctl_loaded_labels(xcrun: str, udid: str) -> set[str]:
+    """The labels `launchctl list` shows as loaded (empty when it cannot be read)."""
+    completed = _launchctl(xcrun, udid, ["list"])
+    if completed.returncode != 0:
+        return set()
+    labels: set[str] = set()
+    for line in (completed.stdout or "").splitlines()[1:]:
+        parts = line.split(None, 2)
+        if len(parts) == 3:
+            labels.add(parts[2].strip())
+    return labels
+
+
+def device_runtime_identifier(xcrun: str, udid: str) -> str | None:
+    """The runtime identifier (`com.apple.CoreSimulator.SimRuntime.iOS-27-2`)
+    the device list files this simulator under."""
+    completed = run_simctl(xcrun, ["list", "devices", "--json"], timeout=60)
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError:
+        return None
+    for runtime_identifier, entries in (payload.get("devices") or {}).items():
+        for entry in entries or []:
+            if isinstance(entry, dict) and entry.get("udid") == udid:
+                return runtime_identifier
+    return None
+
+
+def runtime_root(xcrun: str, runtime_identifier: str | None) -> Path | None:
+    """The host path of a runtime's RuntimeRoot (`simctl list runtimes -j`),
+    where its launchd job plists live; None when it cannot be found."""
+    if not runtime_identifier:
+        return None
+    completed = run_simctl(xcrun, ["list", "runtimes", "-j"], timeout=60, check=False)
+    if completed.returncode != 0:
+        return None
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError:
+        return None
+    for runtime in (payload.get("runtimes") or []) if isinstance(payload, dict) else []:
+        if (isinstance(runtime, dict) and runtime.get("identifier") == runtime_identifier
+                and runtime.get("runtimeRoot")):
+            return Path(runtime["runtimeRoot"])
+    return None
+
+
+def launchd_job_plist(root: Path | None, label: str) -> Path | None:
+    """The job plist that defines `label` under a RuntimeRoot, or None (an XPC
+    service, for example, has none and starts on demand)."""
+    if root is None:
+        return None
+    for directory in LAUNCHD_JOB_DIRS:
+        candidate = root / directory / f"{label}.plist"
+        if candidate.is_file():
+            return candidate
+    return None

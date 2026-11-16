@@ -490,6 +490,10 @@ def cmd_devices_boot(args: argparse.Namespace) -> int:
             "--avd starts a new emulator; do not also pass --target/--serial/--udid",
             "Pick one: --avd <name> for a new Android emulator, --target for a simulator.",
         )
+    slim = getattr(args, "slim", None)
+    if avd and slim is not None:
+        from autonom_lib import simulator_slim
+        raise simulator_slim.refuse_android()
     if avd:
         adb_path = adb_mod.find_adb(getattr(args, "adb", None))
         emulator_bin = emulator_mod.find_emulator(
@@ -510,6 +514,12 @@ def cmd_devices_boot(args: argparse.Namespace) -> int:
         )
     target = platform_mod.resolve(args)
     _check_ui_backend(args, target)
+    if slim is not None:
+        # iOS only: write the slim profile, boot, read the overrides back
+        from autonom_lib import simulator_slim
+        booted, slim_block = simulator_slim.boot(target, slim, timeout=args.timeout)
+        return emit({"ok": True, "booted": booted, "already_running": not booted,
+                     "slim": slim_block, **target.identity()}, as_json=True)
     if target.platform == IOS:
         booted = ios_simctl.boot(target.tool, target.target_id, timeout=args.timeout)
         return emit(
@@ -658,10 +668,20 @@ def cmd_session_start(args: argparse.Namespace) -> int:
             )
     tooling: dict[str, Any] = {}
     booted = False
+    slim = getattr(args, "slim", None)
+    slim_block: dict[str, Any] | None = None
+    if slim is not None and target.platform != IOS:
+        from autonom_lib import simulator_slim
+        raise simulator_slim.refuse_android()
 
     if target.platform == IOS:
         tooling["simctl"] = target.tool
-        booted = ios_simctl.boot(target.tool, target.target_id)
+        if slim is not None:
+            # refused (booted and different, bad profile) before the session exists
+            from autonom_lib import simulator_slim
+            booted, slim_block = simulator_slim.boot(target, slim)
+        else:
+            booted = ios_simctl.boot(target.tool, target.target_id)
         tooling["idb"] = ios_idb.probe(
             getattr(args, "idb", None),
             ios_idb.companion_endpoint(getattr(args, "idb_host", None), getattr(args, "idb_port", None)),
@@ -765,6 +785,8 @@ def cmd_session_start(args: argparse.Namespace) -> int:
                                "installed": installed, "launched": launched}
     if target.platform == IOS:
         payload["booted"] = booted
+    if slim_block is not None:
+        payload["slim"] = slim_block
     if warnings:
         payload["warnings"] = warnings
     return emit(payload, as_json=True)
@@ -2517,6 +2539,13 @@ def cmd_metrics_snapshot(args: argparse.Namespace) -> int:
     return emit({**payload, **target.identity()}, as_json=True)
 
 
+def cmd_metrics_simulator(args: argparse.Namespace) -> int:
+    from autonom_lib.metrics import simulator_tree
+
+    target = _target(args)
+    return emit({**simulator_tree.take(target), **target.identity()}, as_json=True)
+
+
 def cmd_metrics_series(args: argparse.Namespace) -> int:
     from autonom_lib.metrics import artifacts as metrics_artifacts
     from autonom_lib.metrics import series as metrics_series
@@ -2805,6 +2834,15 @@ def cmd_open(args: argparse.Namespace) -> int:
         device_state.open_url(target, args.url)
         # `simctl openurl` does not say which app took the URL
         detail = {"handled_by": "unknown"}
+        if re.match(r"(?i)https?://", args.url or ""):
+            from autonom_lib import ios_slim
+
+            warning = ios_slim.service_warning(
+                target.target_id, ios_slim.SERVICE_UNIVERSAL_LINKS,
+                ios_slim.WARN_UNIVERSAL_LINKS_OFF,
+                "a universal link is not handed to its app and stays in Safari")
+            if warning:
+                detail["warnings"] = [warning]
     return emit({"ok": True, "opened": args.url, **detail, **target.identity()},
                 as_json=True)
 
@@ -6021,11 +6059,28 @@ def cmd_simulator(args: argparse.Namespace) -> int:
                                       f"--value takes KEY=VALUE, got {pair!r}")
         key, value = pair.split("=", 1)
         values[key] = value
+    if args.control == "slim" and args.action == "presets":
+        # the catalog is the same for every simulator: no device is resolved
+        from autonom_lib import simulator_slim
+        return emit({"ok": True, **simulator_slim.run(None, "presets", values)},
+                    as_json=True)
+    if (args.control == "slim" and args.action == "suggest"
+            and not _explicit_target_flags(args)):
+        # an app bundle on disk is read without a simulator; a bundle id
+        # needs one to find the installed app
+        from autonom_lib import simulator_slim
+        if simulator_slim.app_is_path(values) or "app" not in values:
+            return emit({"ok": True, **simulator_slim.run(None, "suggest", values)},
+                        as_json=True)
     target = _target(args)
     # the session record defaults come from (the app `push send` addresses)
     result = simulator_mod.apply(target, args.control, args.action, values,
                                  session=session_mod.load_current())
-    return emit({"ok": True, **result, **target.identity()}, as_json=True)
+    payload = {"ok": True, **result, **target.identity()}
+    code = emit(payload, as_json=True)
+    # a failed check (`slim verify` with drift) answers on stdout with
+    # ok=false and exit 1, as `ui settle` does
+    return code if payload["ok"] else 1
 
 
 def cmd_ci_run(args: argparse.Namespace) -> int:
@@ -7050,7 +7105,8 @@ _CONTROL_READONLY: frozenset[str] = frozenset({
     "ci pack", "ci merge", "ci finalize", "ci publish", "agent export", "agent inspect",
     "network status", "network requests list", "network requests follow",
     "network requests show", "network export",
-    "metrics snapshot", "metrics series", "metrics memory capture", "metrics memory analyze",
+    "metrics snapshot", "metrics simulator", "metrics series", "metrics memory capture",
+    "metrics memory analyze",
     "metrics frames reset", "metrics frames capture", "metrics frames flutter-summary",
     "metrics trace", "metrics list-presets", "logs tail", "logs follow", "control status",
     # Ticket pre-test: these record pre-test state on the host (checks, findings,
@@ -7108,6 +7164,7 @@ _CONTROL_BY_ACTION: dict[str, frozenset[str]] = {
     "simulator status-bar": frozenset(),
     "simulator keyboard": frozenset({"show"}),
     "simulator animations": frozenset({"show"}),
+    "simulator slim": frozenset({"presets", "show", "suggest", "verify"}),
 }
 _CONTROL_RUN_FLAG_VERBS = frozenset({"teach approve", "tour"})
 _CONTROL_ERROR_CODES = frozenset({
@@ -7422,6 +7479,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--port", type=int,
                    help="console port of the new emulator (even, 5554-5682; serial "
                         "emulator-<port>). Android, with --avd only")
+    p.add_argument("--slim", metavar="PRESET|PROFILE",
+                   help="iOS: boot the simulator with background services switched off "
+                        "(stock, optimized, minimal, or the path of a slim profile .json)")
     p.set_defaults(func=cmd_devices_boot)
 
     p = devices_sub.add_parser(
@@ -7439,6 +7499,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--launch", nargs="?", const="", help="launch app id (defaults to --app-id)")
     p.add_argument("--activity", help="optional activity component (Android)")
     p.add_argument("--log-stream", action="store_true", help="start a background log stream (iOS)")
+    p.add_argument("--slim", metavar="PRESET|PROFILE",
+                   help="iOS: boot the simulator with background services switched off "
+                        "(stock, optimized, minimal, or the path of a slim profile .json)")
     p.add_argument("--alongside", action="store_true",
                    help="start beside the current session without becoming current "
                         "(current.json is left as it is)")
@@ -7733,11 +7796,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     simulator = sub.add_parser(
         "simulator", help="battery, network, push, telephony, biometric, UI state, "
-                          "status-bar pin, keyboard/locale pin, and animations")
+                          "status-bar pin, keyboard/locale pin, animations, and "
+                          "iOS background-service slimming")
     simulator_sub = simulator.add_subparsers(dest="simulator_command", required=True)
     for control in ("battery", "network", "push", "sms", "call", "biometric",
                     "clipboard", "appearance", "text-size", "status-bar", "keyboard",
-                    "animations"):
+                    "animations", "slim"):
         valid = simulator_mod.CONTROL_ACTIONS.get(control)
         actions = ("one of: " + ", ".join(valid) if valid
                    else "the iOS content size, e.g. large or accessibility-extra-large")
@@ -8541,6 +8605,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--task", help="task label recorded with the artifact")
     p.add_argument("--out", help="artifact dir or .json file (default: session metrics/)")
     p.set_defaults(func=cmd_metrics_snapshot)
+    p = metrics_sub.add_parser("simulator", parents=[target_flags],
+                               help="memory and CPU of a whole booted iOS Simulator "
+                                    "(all its host processes)")
+    p.set_defaults(func=cmd_metrics_simulator)
     p = metrics_sub.add_parser("series", parents=[target_flags],
                                help="N snapshots + deltas and directional-growth leads")
     p.add_argument("--app-id")

@@ -69,6 +69,16 @@ ANDROID_READ_CODES = {
     "UI_NOT_IDLE": "ui_not_idle",
 }
 NEW_CODES.update(ANDROID_READ_CODES)
+# Simulator slimming (`simulator slim`).
+SLIM_CODES = {
+    "SLIM_UNSUPPORTED_RUNTIME": "slim_unsupported_runtime",
+    "SLIM_NOT_PERSISTED": "slim_not_persisted",
+    "SLIM_PROFILE_INVALID": "slim_profile_invalid",
+    "SIMULATOR_SERVICE_DISABLED": "simulator_service_disabled",
+}
+NEW_CODES.update(SLIM_CODES)
+SLIM_SECTION = "### Simulator slimming (Unreleased)"
+
 ANDROID_READ_SECTION = "### Android reads: never-idle screens and element state (Unreleased)"
 
 # Agent profile round (agent loop): the exit-130 envelope of an interrupt.
@@ -195,6 +205,27 @@ class AdditiveErrorCodeTests(unittest.TestCase):
             self.assertIn(code, changed)
         self.assertIn("ui_not_idle", text.split("## Response shape", 1)[0],
                       "the Error codes list names the round")
+
+    def test_compatibility_records_the_slim_codes(self) -> None:
+        text = (ROOT / "docs/COMPATIBILITY.md").read_text(encoding="utf-8")
+        parts = text.split(SLIM_SECTION, 1)
+        self.assertEqual(len(parts), 2, "COMPATIBILITY.md has no simulator slimming section")
+        section = parts[1].split("\n### ", 1)[0]
+        head = text.split("## Response shape", 1)[0]
+        for name, value in SLIM_CODES.items():
+            with self.subTest(code=name):
+                self.assertEqual(getattr(errors, name), value)
+                self.assertIn(f"| `{value}` |", section)
+                self.assertIn(f"`{value}`", head, "the Error codes list names the round")
+        rows = [line for line in section.splitlines() if line.startswith("| `simulator slim")]
+        for code in ("slim_universal_links_off", "slim_push_off"):
+            self.assertIn(f"`{code}`", section)
+            self.assertIn(f"`{code}`", head)
+        for surface in ("`devices boot --slim`", "`metrics simulator`", "`doctor`"):
+            self.assertIn(f"| {surface}", section)
+        for action in ("presets", "show", "suggest", "apply", "verify", "enable", "restore"):
+            with self.subTest(action=action):
+                self.assertTrue(any(f"`simulator slim {action}`" in row for row in rows), action)
 
     def test_compatibility_records_the_agent_loop_code(self) -> None:
         text = (ROOT / "docs/COMPATIBILITY.md").read_text(encoding="utf-8")

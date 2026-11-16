@@ -21,7 +21,7 @@ SEMANTIC_CAPABILITIES = (
     "simulator.appearance", "simulator.text_size", "simulator.status_bar",
     "simulator.battery", "simulator.network", "simulator.push",
     "simulator.sms", "simulator.call", "simulator.biometric",
-    "simulator.keyboard",
+    "simulator.keyboard", "simulator.slim",
 )
 
 
@@ -43,6 +43,19 @@ def _keyboard_capability(target: Target, simulated: bool) -> tuple[str, str | No
         return ("unavailable", "no preference store for this simulator yet; boot it once")
     return ("available", "applies at boot: the simulator is shut down for the write "
                          "(pass reboot=true to have the verb do it)")
+
+
+def _slim_capability(target: Target, simulated: bool) -> tuple[str, str | None]:
+    """`simulator slim` switches iOS Simulator launchd services off: iOS
+    only. Whether the runtime keeps the overrides across a reboot (iOS 18.5
+    and newer) is checked by the verb itself (`slim_unsupported_runtime`)."""
+    if target.platform != IOS:
+        return ("unavailable", "an Android emulator has no launchd override store")
+    if not simulated:
+        return ("unavailable", "requires an emulator or simulator")
+    return ("available", "apply and restore take effect at boot: the simulator is "
+                         "shut down for the write (pass reboot=true to have the verb "
+                         "do it); enable and disable change a booted simulator live")
 
 
 class DeviceSession(Protocol):
@@ -119,6 +132,9 @@ class LocalDeviceSession:
                 continue
             if name == "simulator.keyboard":
                 values[name] = _keyboard_capability(self.target, simulated)
+                continue
+            if name == "simulator.slim":
+                values[name] = _slim_capability(self.target, simulated)
                 continue
             available = simulated and name in supported_simulator
             values[name] = (

@@ -81,6 +81,33 @@ Multi-flavor apps usually carry one scheme per flavor and per-configuration
 with `-showBuildSettings` before installing, so the session's `--app-id` matches
 what was actually built.
 
+## Build a slim profile for this app
+
+A slimmed simulator uses about a quarter of the memory (`mobile-session`,
+"Slim simulators"). The profile says which system features the app needs.
+
+1. Scan the built app (read-only):
+   `autonom simulator slim suggest --value app=<path to .app>` — `need`,
+   the `evidence` for each feature, and `limitations`.
+2. Read the project for what a binary scan cannot see: features reached only
+   at runtime or through web views, sign-in methods, share sheets and
+   pickers, background tasks, and the flows named in the ticket or task.
+   List each as feature id + file reference + why
+   (`autonom simulator slim presets` lists the feature ids).
+3. Write `.autonom/slim-profile.json` (`write=.autonom/slim-profile.json` on
+   the scan, then add your features to `need`); keep preset `minimal` unless
+   a listed need says otherwise. State in two lines what was kept and what
+   was dropped on purpose.
+4. Apply and check: `autonom devices boot --udid <UDID> --slim
+   .autonom/slim-profile.json`, `autonom simulator slim verify`, then run the
+   task. When something system-level fails on a slim simulator, suspect
+   slimming first: `simulator slim show`, `simulator slim enable --value
+   ids=<category, feature or label>`, retry, and if that fixes it add the
+   same id to the profile under the field that takes it: a category id in
+   `enable`, a feature id in `need`, a single label in `keep`. An id that
+   is both a category and a feature (`siri`, `health`, `icloud`, `mdm`,
+   `photos`, `widgets`) was enabled as the category, so it goes in `enable`.
+
 ## Accessibility readiness
 
 `ui find` selects by label and identifier. Before a UI-automation pass, check the

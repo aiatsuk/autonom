@@ -239,6 +239,79 @@ that `ui tap` reports backend axe and that the tree still comes from idb.
 Select iOS controls with --desc, not --text.
 ```
 
+## Slim an iOS Simulator to save memory
+
+```text
+Show me what Autonom can switch off on this simulator, then apply the
+optimized preset but keep StoreKit working, reboot it, and tell me whether
+the read-back matched. When we are done, put the simulator back as it was.
+```
+
+```bash
+autonom simulator slim presets                      # presets, categories, features
+autonom --udid <UDID> simulator slim show           # stock | slim | partial, per category
+autonom --udid <UDID> simulator slim apply --value preset=optimized \
+        --value need=storekit --value reboot=true   # shut down, write, boot, read back
+autonom --udid <UDID> simulator slim apply --value preset=minimal --value enable=search
+autonom --udid <UDID> simulator slim apply --value profile=./slim-profile.json
+autonom --udid <UDID> simulator slim verify         # ok, missing, extra (exit 1 on drift)
+autonom --udid <UDID> simulator slim enable --value ids=health,com.apple.cloudd   # live
+autonom --udid <UDID> simulator slim disable --value ids=search                   # live
+autonom --udid <UDID> simulator slim restore --value reboot=true
+```
+
+`apply` and `restore` need a shut-down simulator, or `reboot=true`. Photo
+import, universal links and push stay on in `optimized` and `minimal`.
+Slimming needs iOS 18.5 or newer and stays until `restore`.
+
+- **Which field takes which id.** Live `simulator slim enable --value
+  ids=...` takes category ids, feature ids and labels. When it fixed
+  something, write the same id into the profile: a category id in `enable`,
+  a feature id in `need`, a single label in `keep`. An id that is both a
+  category and a feature (`siri`, `health`, `icloud`, `mdm`, `photos`,
+  `widgets`) is read as the category, so it goes in `enable`.
+- **Shared daemons.** Categories overlap. `optimized` with `disable=icloud`
+  also stops the account daemons iCloud shares with `store`
+  (`com.apple.amsaccountsd` and its two helpers), and `show` then reports
+  `store` under `partial`. Add `enable=store` or `keep=<label>` when the app
+  needs them.
+- **Restore.** The state file records the entry every label had before
+  Autonom changed it, in either direction, and the entry Autonom wrote.
+  `restore` puts the old value back, or removes the entry when there was
+  none. An entry that no longer holds what Autonom wrote was changed by
+  someone else: it is left alone and listed in `skipped_changed`. A state
+  file that is there and cannot be read fails `restore` and `verify`
+  (`backend_failed`, naming the file; `--value all=true` re-enables every
+  catalog service), and `show` reports `state_file: {exists: true,
+  readable: false}`.
+- **Status.** `show` gives the state file's `status`: `applied`, or
+  `not_persisted` when the runtime did not keep the overrides after a reboot
+  (`slim_not_persisted`). The file stays so `restore` can undo the write.
+- **A boot that fails after the write.** When `apply` or `restore` with
+  `reboot=true`, `devices boot --slim` or `session start --slim` cannot boot
+  the simulator after the store was written, the error keeps its code and
+  adds `store_written`, `store`, `state_file` and `simulator_state`. Two
+  ways out: retry `autonom devices boot --udid <UDID>` and run `simulator
+  slim verify`, or undo with `autonom simulator slim restore`.
+
+Build a profile for one app, boot slimmed, and measure the whole simulator:
+
+```bash
+autonom simulator slim suggest --value app=build/ios/iphonesimulator/Runner.app \
+        --value write=.autonom/slim-profile.json    # need, evidence, profile, next
+autonom --udid <UDID> simulator slim suggest --value app=com.example.app   # installed app
+autonom devices boot --udid <UDID> --slim minimal   # write, boot, read back
+autonom session start --platform ios --udid <UDID> --slim .autonom/slim-profile.json
+autonom --udid <UDID> metrics simulator             # processes, footprint_bytes, top 5
+```
+
+`suggest` only reads: what the binary scan cannot see (features reached at
+runtime or in web views) is the agent's part, see the `ios-project-setup`
+skill. One machine's figures (iPhone 17 Pro, iOS 27.2, 24 GB Mac, 180 s after
+boot, 2026-11-15): stock 10.7 GB / 238 processes, `optimized` 4.3 GB / 108,
+`minimal` 2.8 GB / 77. When `media add` fails on a slimmed simulator the
+error names the service to switch back on (`simulator_service_disabled`).
+
 ## Watch and drive the Simulator at 60 fps in the browser
 
 ```text

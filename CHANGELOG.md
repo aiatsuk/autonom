@@ -7,6 +7,42 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
 
 ## [Unreleased]
 
+### Added
+
+- **`simulator slim`: switch iOS Simulator background services off.** A stock
+  simulator runs well over two hundred launchd jobs an app under test never
+  uses; with them off one simulator measured 2.8 GB instead of 10.7 GB.
+  Presets `stock`, `optimized` (default) and `minimal`, plus `need` (features),
+  `enable`/`disable` (categories), `keep` (labels) or a profile file. Photo
+  import, universal links and push stay on. `apply` and `restore` write the
+  shut-down simulator's launchd override store (`reboot=true` cycles it) and
+  read the state back after the boot; `enable` and `disable` change a booted
+  simulator live; `show`, `verify` and `presets` only read. Needs iOS 18.5 or
+  newer. New error codes `slim_unsupported_runtime`, `slim_not_persisted` and
+  `slim_profile_invalid`; new capability `simulator.slim`. The service
+  catalog comes from simslim (MIT, copyright Interlap), see
+  `THIRD_PARTY_NOTICES.md`. `restore` puts back exactly what slimming
+  changed: a value someone else changed since is left alone and listed under
+  `skipped_changed`. A boot that fails after the store was written says so
+  (`store_written`, the state file and both ways out), and a profile the
+  runtime did not keep is marked `status: "not_persisted"`. `suggest` also
+  reads the `*.debug.dylib` of Debug builds and every slice of a fat binary.
+- **A slim profile for one app, slim at boot, whole-simulator memory.**
+  `simulator slim suggest --value app=<.app path | bundle id>` reads the
+  app's Info.plist, entitlements and frameworks and answers with the features
+  it needs, the evidence for each, a ready profile (`write=<path>` saves it)
+  and the apply command. `devices boot --slim <preset|profile.json>` and
+  `session start --slim <...>` write the profile, boot and read it back.
+  `metrics simulator` sums the host memory of every process of one booted
+  simulator (one machine, iPhone 17 Pro, iOS 27.2, 180 s after boot: stock
+  10.7 GB / 238 processes, `optimized` 4.3 GB / 108, `minimal` 2.8 GB / 77).
+  A failed `media add` on a simulator whose photo service is off is the new
+  code `simulator_service_disabled`; `open <http url>` and `simulator push
+  send` warn (`slim_universal_links_off`, `slim_push_off`); `doctor` lists
+  the booted simulators' slim state. New schema
+  `schemas/slim-profile-v1.schema.json`. The skills `mobile-session` and
+  `ios-project-setup` explain when to slim and how to build a profile.
+
 ## [0.38.1] - 2026-11-10
 
 ### Changed

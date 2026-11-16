@@ -154,6 +154,17 @@ INVALID_VALUE = "invalid_value"              # a value the verb could not use (w
 SIMULATOR_MUST_BE_SHUTDOWN = "simulator_must_be_shutdown"
 SIMULATOR_DATA_NOT_FOUND = "simulator_data_not_found"
 
+# --- Simulator slimming (`simulator slim`) --------------------------------------
+# Launchd disable overrides persist across a reboot only on iOS 18.5 and newer.
+SLIM_UNSUPPORTED_RUNTIME = "slim_unsupported_runtime"
+# The overrides were written and the booted simulator still does not show them.
+SLIM_NOT_PERSISTED = "slim_not_persisted"
+# A slim setting or profile file names something unknown (the item is in `item`).
+SLIM_PROFILE_INVALID = "slim_profile_invalid"
+# A verb failed and the simulator service it needs is switched off by slimming
+# (`service` names it, the hint has the command that switches it back on).
+SIMULATOR_SERVICE_DISABLED = "simulator_service_disabled"
+
 
 # --- UI recovery (optional XCUITest backend) ----------------------------------
 SESSION_STOPPED = "session_stopped"  # --session-id named a stopped session for a mutating verb

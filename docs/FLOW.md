@@ -291,7 +291,7 @@ command takeScreenshot: label
 command checkpoint: name
 command note: text
 deferred: waitForIdle extendedWaitUntil runScript evalScript
-requires-capabilities: ui.accessibility ui.input screenshots screen.stream logs network.capture checkpoint.create checkpoint.restore simulator.location simulator.permissions simulator.clipboard simulator.appearance simulator.text_size simulator.status_bar simulator.battery simulator.network simulator.push simulator.sms simulator.call simulator.biometric simulator.keyboard
+requires-capabilities: ui.accessibility ui.input screenshots screen.stream logs network.capture checkpoint.create checkpoint.restore simulator.location simulator.permissions simulator.clipboard simulator.appearance simulator.text_size simulator.status_bar simulator.battery simulator.network simulator.push simulator.sms simulator.call simulator.biometric simulator.keyboard simulator.slim
 ```
 
 `sideEffects` declares the mutation classes a reviewer should expect:

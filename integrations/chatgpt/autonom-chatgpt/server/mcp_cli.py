@@ -50,6 +50,8 @@ REJECTED_CLI_CODES = frozenset({
     "budget_exhausted", "forbidden_action", "app_not_allowed", "pretest_damaged",
     # Android helper and typing refusals: nothing was sent or typed.
     "android_helper_unavailable", "text_not_typable", "fill_target_mismatch",
+    # Simulator slimming: refused before anything is written.
+    "simulator_service_disabled", "slim_profile_invalid", "slim_unsupported_runtime",
 })
 
 UNKNOWN_CLI_CODES = frozenset({
@@ -57,6 +59,8 @@ UNKNOWN_CLI_CODES = frozenset({
     # reply did not come back; never repeated.
     "input_unconfirmed", "ios_input_blocked", "ios_display_not_lit", "companion_too_old",
     "daemon_unreachable",
+    # Simulator slimming: the store was written and the simulator rebooted.
+    "slim_not_persisted",
     "idb_required", "idb_companion_unavailable", "mitmdump_required", "backend_failed",
     "ios_hid_framework_missing", "install_path_not_found", "app_not_installed", "ios_boot_failed",
     "ios_clear_requires_install_path", "emulator_not_found", "avd_not_found", "avd_required",

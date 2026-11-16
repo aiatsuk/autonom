@@ -435,6 +435,15 @@ def _ios_state(tools: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any],
     return ios, capabilities, checks, warnings
 
 
+def _booted_simulators(simctl: dict[str, Any]) -> list[dict[str, Any]]:
+    if not simctl.get("path"):
+        return []
+    from . import ios_slim  # noqa: PLC0415 - doctor's quick paths do not need it
+
+    return [ios_slim.doctor_row(udid)
+            for udid in ios_simctl.booted_udids(str(simctl["path"]))]
+
+
 def collect(args: Any = None) -> dict[str, Any]:
     explicit = lambda name: getattr(args, name, None) if args else None  # noqa: E731
 
@@ -466,6 +475,10 @@ def collect(args: Any = None) -> dict[str, Any]:
     }
     ios_state, ios_caps, checks, ios_warnings = _ios_state(tools)
     capabilities.update(ios_caps)
+    # Which booted simulators are slimmed (`simulator slim`): the device list
+    # and each one's override store file. Information only: not part of
+    # health or `--strict`.
+    ios_state["booted_simulators"] = _booted_simulators(tools["simctl"])
     # The on-device Android helper (AH-02): the JDK and SDK tools found and
     # whether their build is cached; never a build, never a device call. Not
     # in `tools`, so it never gates `--strict`.
