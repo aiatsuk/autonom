@@ -6807,8 +6807,8 @@ async function iosControl(t, options) {
 }
 
 /** Wait until the HID stream has seen `count` events, then return them all. */
-async function hidAtLeast(world, count) {
-  await waitFor(() => hidEvents(world).length >= count, 5000, `${count} HID events`);
+async function hidAtLeast(world, count, timeoutMs = 5000) {
+  await waitFor(() => hidEvents(world).length >= count, timeoutMs, `${count} HID events`);
   return hidEvents(world);
 }
 
@@ -7832,8 +7832,9 @@ waitingTest("ios: a HID write that outlives 5 s but is then taken is journaled, 
   control.send({ t: "system", op: "home" });
   await allHandled(control);
   // The DOWN and the UP each stop holding the queue after 5 s: the record's turn comes at
-  // about 10 s, while neither is confirmed yet.
-  assert.deepEqual(await hidAtLeast(world, 2), [{ button: "HOME", direction: "down" }, { button: "HOME", direction: "up" }]);
+  // about 10 s, while neither is confirmed yet. The UP is only written once the DOWN's 5 s
+  // are over, so waiting 5 s for it would race that timer on a busy machine.
+  assert.deepEqual(await hidAtLeast(world, 2, 15_000), [{ button: "HOME", direction: "down" }, { button: "HOME", direction: "up" }]);
   await sleep(10_600);
   assert.match((await status(canvas)).last_error ?? "", /a write took more than 5000 ms/);
   assert.equal((await journaled(world, "system")).length, 0, "journaled before any write was confirmed");

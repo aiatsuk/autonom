@@ -32,6 +32,22 @@ def packets(data):
             data = data[12+size:]
     return result
 
+def stats_line(stderr):
+    """The helper's own stats: the last JSON object line on stderr.
+
+    VideoToolbox may print its own diagnostics to stderr first (seen on
+    virtual Macs), so the stats are not always the whole stream.
+    """
+    for line in reversed(stderr.decode("utf-8", "replace").splitlines()):
+        if line.startswith("{"):
+            try:
+                value = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(value, dict):
+                return value
+    raise AssertionError(f"no stats line on stderr: {stderr!r}")
+
 @unittest.skipUnless(sys.platform == "darwin", "VideoToolbox requires macOS")
 class OwnedFramesTest(unittest.TestCase):
     @classmethod
@@ -54,7 +70,7 @@ class OwnedFramesTest(unittest.TestCase):
         self.assertEqual(items[0], ("size", (64, 64)))
         self.assertEqual(items[1][0], "config")
         self.assertEqual(items[2][0], "key")
-        stats = json.loads(result.stderr)
+        stats = stats_line(result.stderr)
         self.assertTrue(stats["hardwareRequired"])
         self.assertEqual(stats["encoded"], 1)
         self.assertLessEqual(stats["peakPending"], 2)
@@ -117,7 +133,7 @@ class OwnedFramesTest(unittest.TestCase):
     def test_empty_input_exits(self):
         result = self.run_helper(b"")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(json.loads(result.stderr)["encoded"],0)
+        self.assertEqual(stats_line(result.stderr)["encoded"],0)
 
 if __name__ == "__main__":
     unittest.main()

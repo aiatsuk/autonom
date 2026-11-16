@@ -930,7 +930,7 @@ class RunTests(RunsCase):
         self.assertLess(renews[0]["start"] - began, 6.0, renews[0])  # one period would be 15 s
         self.assertIsNone(final["reason"])
 
-    def flaky_renew_run(self, faults: Dict[str, List[Any]], steps: int) -> Any:
+    def flaky_renew_run(self, faults: Dict[str, List[Any]], steps: int, step_ms: int = 1000) -> Any:
         """A run under a 5 s agent lease (renew period 1.7 s) whose keeper runner
         answers each call of a key with the next queued fault
         (``key -> [answer(cli_module, forward)]``, ``forward()`` runs the fake CLI)
@@ -938,7 +938,7 @@ class RunTests(RunsCase):
         the server."""
         session_id = FAKE.add_session(self.fake_state)
         self.configure(agent_lease_ttl_s=5)
-        server, call = self.in_process_server(FAKE_MCP_STEP_MS="1000", FAKE_MCP_FLOW_STEPS=str(steps))
+        server, call = self.in_process_server(FAKE_MCP_STEP_MS=str(step_ms), FAKE_MCP_FLOW_STEPS=str(steps))
         cli = core.import_server_modules()["cli"]
         keeper = server.services.keeper
         inner = keeper.runner
@@ -1056,7 +1056,11 @@ class RunTests(RunsCase):
 
         final, seen, first = self.flaky_renew_run(
             {"control_renew": [lambda cli, forward: cli.CliResult("control_renew", "timeout"), renewed_in_place]},
-            steps=6)
+            # One long step: the flow checks its lease only when a step ends, at about 6 s.
+            # The retried renew is answered at about 2.7 s, and B's grant inside it runs the
+            # CLI; with 1 s steps a busy machine let a step end in between, and the run then
+            # ended on the stale generation before the renew's answer could name the reason.
+            steps=2, step_ms=6000)
         self.assertEqual(granted["generation"], final["generation"] + 1, granted)
         self.assertEqual(granted["holder"], first.services.keeper.holder_id())  # the shared holder id
         self.assertEqual(final["reason"], "lease_renew_refused: control_generation_changed", final)
