@@ -618,6 +618,38 @@ this, such an entry was left out without a word.
 | `replay --run` (or `--bundle`) of a `ui do` run | — | `replay_manifest_invalid` (an existing code) naming the run: its steps came on stdin (`flow_path: "<stdin>"`), so there is no flow file to replay; the hint says to send the steps to `ui do` again or save them as a flow file and use `flow run`. No file of the steps is written for replay, so a sensitive value a step types never sits on disk |
 | iOS idb input that fails with nothing on stderr | `error` was `idb <argv> failed (<exit>)`, the whole argv with the typed text, and that text was read for connection words (a typed `errno 61` sent `ui text` again after a prune) | `error` names the command words only (`idb ui text failed (1)`) and only idb's own stderr is classified: such a failure is `backend_failed`, never retried, and the input is sent once |
 
+### Agent fast loop: waits, text replies, the fast-path line and `--shot` (Unreleased)
+
+Pinned by `tests/test_wait.py` and `tests/test_brief.py`. No error code is
+added. Three warning codes are added (a `warnings[].code`, never an
+`error_code`): `wait_not_met` (`ui wait` by selector and `network requests
+wait` that ended unmet), `until_not_met` (an action whose `--until` ended
+unmet, or whose wait failed; the hint says the input was sent and must not be
+sent again) and `shot_failed` (an action whose `--shot` took no screenshot).
+
+| Surface | Before | Now |
+| --- | --- | --- |
+| `ui wait` | `--settled` only; without it `usage_error` | one condition: `--settled`, or the selector flags of `ui find` (`--text`, `--desc`, `--resource-id`, `--class-name`, `--package`, `--role`, `--clickable`, `--enabled`, `--mode`, `--case-sensitive`, `--index`) with optional `--gone`, all spelled in full only. By selector the reply is `ok`, `wait` (`visible` or `gone`), `selector`, `mode`/`case_sensitive`/`index` when not the defaults, `met`, `count` (on-screen matches in the last read; null when that read failed), `reads`, `elapsed_ms`, `timeout_ms`, `error` (`code`, `message`) when the last read failed, and the target identity; unmet is `ok: false`, `met: false`, the warning `wait_not_met` and exit 1. Only on-screen nodes count. `--settled` together with a selector, `--gone` without a selector, and no condition are `usage_error`. The `--settled` reply is unchanged |
+| `ui wait --timeout N` | `--timeout` (and every other abbreviation of `--timeout-ms`) was read as `--timeout-ms`: `--timeout 40` waited 40 ms | `--timeout-ms` is spelled in full only; an abbreviation is `usage_error`, and the message names `--timeout-ms` and its unit. `--quiet` and the other abbreviations resolve as before |
+| `network requests wait` | — | a new read-only verb: `--host`, `--method`, `--status`, `--path`, `--mocked` (the filters of `network requests list`), `--since-id ID`, `--timeout-ms N` (10000), `--json`. Only requests recorded after the call began count, or after `--since-id` (an unknown id counts every recorded request and adds the warning `since_id_not_found`). Reply: `ok`, `wait: request`, the filters given (`path`, `host`, `method`, `status`, `mocked`), `met`, `request` (`id`, `method`, `host`, `path`, `status`, `mocked`, `duration_ms`; `completed: false` for a request that never completed), `elapsed_ms`, `timeout_ms`; unmet is `ok: false`, `met: false`, `wait_not_met` and exit 1. Without a running proxy it is `proxy_not_running` |
+| `ui tap`, `ui swipe`, `ui pinch`, `ui type`, `ui fill`, `ui key` | — | additive `--until CONDITION` (repeatable), `--until-timeout-ms MS` (10000; below 0 is `invalid_value`), `--shot LABEL`, `--json`, `--screen`, spelled in full only. A condition is `text=V`, `desc=V`, `id=V`, the same after `gone:`, or `request=GLOB`; anything else is `invalid_value` (`flag: --until`), and a request condition without a session (`no_active_session`) or a running proxy (`proxy_not_running`) is refused, all before any input. The reply adds `until`: `met`, `elapsed_ms`, `timeout_ms`, `reads`, `conditions` (each as given, with `met`, `count` for a node, `request` for a request), or `met: false` and `error` when the wait itself failed. Unmet: `ok` stays `true`, the warning `until_not_met` is added and the command exits 1 (the journal records it as not ok). With `--until` the input is not sent as one observed round trip (the Android helper does not settle for it, the iOS daemon does not `act`): observe settles and reads after the wait, so `screen` is the one the wait ended on and `input_confirmed` is not reported. `--shot` adds `shot` (`path`, `label`, `width`, `height`, and `format`, `screen`, `scale`, `coordinates` for an agent screenshot) and files the image like `autonom screenshot --label`; a failed capture is the warning `shot_failed` beside `ok: true`. Without these flags the reply and the device calls are what they were |
+| Replies of `ui tap\|swipe\|pinch\|type\|fill\|key`, `ui do`, `ui wait`, `network requests wait` in an agent-profile session | the JSON line | a few lines of text (`autonom_lib/brief.py`): the status line, `until met in N ms: ...`, `screen: <app> <screen>, N nodes`, `changes: +A -R ~C` with the changed outline lines (the whole outline when there is no baseline), `shot: <path>`, then one `! <code>: <error> <hint>` line per warning and `! observe failed (...)` for `observe_error`. `--json` prints the JSON line exactly as before; `--screen` adds the whole outline to the text. The text is not a parsing contract: a wrapper that parsed these replies in an agent-profile session must pass `--json`. Errors are still the JSON envelope on stderr, the journal still records the whole reply, and the exit codes are unchanged. Every other verb, and every session that is not agent-profile, prints JSON as before |
+| A reply that carries `fallback_reason` | `fallback_reason` and `fallback_hint` were the last keys | they follow `ok` (same keys and values); a text reply starts with `! not on the fast path: <fallback_reason>. <fallback_hint>` |
+| Error envelope of an Android command that failed after auto fell back from the helper | `ok`, `error_code`, `error`, `hint` | additive `fallback_reason` and `fallback_hint` right after `ok` (not under the explicit `uiautomator` choice, whose envelope is unchanged). `error_code`, `error` and `hint` are what they were |
+| `ui do` | — | additive `--json` and `--screen` (see the row above) |
+| `autonom screenshot` | — | unchanged; `--shot` uses the same code path |
+| ChatGPT development adapter (`integrations/chatgpt/autonom-chatgpt`) | passed `--no-observe` to `ui tap`, `ui type`, `ui key` | also passes `--json`, so its replies stay JSON in an agent-profile session |
+
+### MCP server for the agent loop (Unreleased)
+
+Pinned by `tests/test_mcp_server.py`. No error or warning code is added.
+
+| Surface | Before | Now |
+| --- | --- | --- |
+| `autonom mcp serve` | — | a new verb: a persistent MCP server over stdio whose tool calls are Autonom commands run in the server process. Tools, argument names and reply wording are described in `docs/CAPABILITIES.md`; the replies are text for an agent, not a parsing contract (the `autonom` tool prints a verb's own JSON line). It is never journaled itself; every command a tool runs is journaled as if typed |
+| Verbs run through the server | — | `canvas`, `canvas serve`, `report serve` and `mcp serve` are `usage_error` (they serve until stopped); `logs follow`, `network requests follow` and `journal --follow` are `usage_error` without `--max-seconds`. Outside the server these verbs are unchanged |
+| Plugin manifests | skills only | `plugins/autonom/.mcp.json` declares the server (`command: autonom`, `args: ["mcp", "serve"]`) and `.codex-plugin/plugin.json` points at it (`mcpServers`). A host that loads plugin MCP servers starts it per session; when `autonom` is not on that host's `PATH` the server fails to start and the skills work as before |
+
 ### iOS device daemon (Unreleased)
 
 Additive: on by default, and `AUTONOM_IOS_DAEMON=off` (also `0`, `false`,
@@ -930,11 +962,18 @@ Behaviour changes:
   `ok: false` and `strict_failures`) —
   a diagnostic that fails is useless in a pipeline (`scripts/autonom.py`).
   `ui wait --settled` exits `1` when the screen never settled within
-  `--timeout-ms`, like `flow run`'s test failures. `flow run` also exits `1`
+  `--timeout-ms`, like `flow run`'s test failures; so do `ui wait` by
+  selector and `network requests wait` that ended unmet, and an action verb
+  whose `--until` ended unmet (its reply keeps `ok: true`: the input was
+  sent). `flow run` also exits `1`
   for a run that ended `interrupted` by the control lease.
 - stdout carries exactly **one JSON document** per invocation (one line since
   the agent profile release; it was pretty-printed before);
   human prose and consent prompts go to stderr. Documented exceptions are
+  the short text replies of the act and wait verbs in an agent-profile
+  session (`--json` prints the JSON line; see
+  [Agent fast loop](#agent-fast-loop-waits-text-replies-the-fast-path-line-and---shot-unreleased)),
+  `mcp serve` (stdout carries MCP messages only), and the
   opt-in streaming modes — `flow run --events`, `logs follow`,
   `network requests follow`, `journal --follow` — which emit NDJSON (one JSON
   object per line, ending with a `{"kind": "eof"}` line) and are never used by

@@ -168,13 +168,15 @@ class AgentProfileTests(ProfileCase):
     def test_agent_actions_observe_and_no_observe_wins(self) -> None:
         self.start("--profile", "agent")
         self.forget_calls()
-        code, payload = self.android("ui", "tap", "--x", "10", "--y", "10")
+        # --json: the JSON line (an agent session answers actions in text)
+        code, payload = self.android("ui", "tap", "--x", "10", "--y", "10", "--json")
         self.assertEqual(code, 0, payload)
         self.assertIn("screen", payload)
         self.assertIn("foreground", payload)
         self.assertGreaterEqual(self.dumps(), 1)
         self.forget_calls()
-        code, payload = self.android("ui", "tap", "--x", "10", "--y", "10", "--no-observe")
+        code, payload = self.android("ui", "tap", "--x", "10", "--y", "10", "--no-observe",
+                                     "--json")
         self.assertEqual(code, 0, payload)
         self.assertNotIn("screen", payload)
         self.assertEqual(self.dumps(), 0)

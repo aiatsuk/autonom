@@ -1119,12 +1119,17 @@ class RunnerTests(CoreCase):
         self.assertIn("nodes", fake("ui", "tree", "--session-id", agent, "--format", "json"))
         self.assertIn("nodes", fake("ui", "tree", "--session-id", plain))
         self.assertEqual(fake("ui", "tree", "--session-id", plain, "--format", "outline")["format"], "outline")
-        observed = fake("ui", "key", "--session-id", agent, "HOME")
+        # an agent-profile session answers an action in text; --json is the JSON line
+        text = subprocess.run([sys.executable, str(FAKE_CLI), "ui", "key", "--session-id", agent,
+                               "--no-observe", "HOME"], env=self.server_env(),
+                              stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
+        self.assertEqual((text.returncode, text.stdout.strip()), (0, "ui key ok"))
+        observed = fake("ui", "key", "--session-id", agent, "--json", "HOME")
         self.assertIn("screen", observed)
         self.assertEqual(sorted(k for k in ("screen", "changes", "foreground") if k in observed),
                          ["changes", "foreground", "screen"])
-        self.assertNotIn("screen", fake("ui", "key", "--session-id", agent, "--no-observe", "HOME"))
-        self.assertNotIn("screen", fake("ui", "type", "--session-id", agent, "--no-observe", "--", "x"))
+        self.assertNotIn("screen", fake("ui", "key", "--session-id", agent, "--no-observe", "--json", "HOME"))
+        self.assertNotIn("screen", fake("ui", "type", "--session-id", agent, "--no-observe", "--json", "--", "x"))
         self.assertIn("screen", fake("ui", "type", "--session-id", plain, "--observe", "--", "x"))
         self.assertNotIn("screen", fake("ui", "tap", "--session-id", plain, "--text", "Settings"))
         fake("session", "stop", "--session-id", plain)
@@ -1174,13 +1179,13 @@ class RunnerTests(CoreCase):
         argv = cli.build_argv("ui_type", {"session_id": "s_1", "text": "-n secret", "sensitive": True},
                               "op_0000000000000001")
         self.assertEqual(argv, ["ui", "type", "--operation-id", "op_0000000000000001", "--session-id", "s_1",
-                                "--no-observe", "--sensitive", "--", "-n secret"])
+                                "--no-observe", "--json", "--sensitive", "--", "-n secret"])
         self.assertEqual(cli.build_argv("ui_tree", {"session_id": "s_1", "max_nodes": 50}),
                          ["ui", "tree", "--session-id", "s_1", "--format", "json", "--max-nodes", "50",
                           "--no-accessibility-recovery"])
         self.assertEqual(cli.build_argv("ui_key", {"session_id": "s_1", "key": "HOME"}, "op_0000000000000001"),
                          ["ui", "key", "--operation-id", "op_0000000000000001", "--session-id", "s_1",
-                          "--no-observe", "HOME"])
+                          "--no-observe", "--json", "HOME"])
         self.assertEqual(cli.build_argv("screenshot", {"session_id": "s_1", "label": "-x"}),
                          ["screenshot", "--session-id", "s_1", "--no-agent", "--label=-x"])
         for key in cli.ALLOWLIST:

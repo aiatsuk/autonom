@@ -202,17 +202,19 @@ def check_timeout(timeout_ms: int | None) -> int:
     return int(timeout_ms)
 
 
-def read_mark(target: Target) -> tuple[Any, int]:
+def read_mark(target: Target, *, arm: bool = True) -> tuple[Any, int]:
     """Where this thread stands when a command starts: its last read of
     ``target`` and how many inputs it has sent. A read and an input the
     command makes itself can then be told from an earlier command's
     (several commands can run in one process).
 
     When the command observes (``wanted`` said so) an iOS target, its input
-    is armed to go as one daemon `act` on the daemon route (ID-10); any
-    earlier arming of this thread is dropped either way. Never reads."""
+    is armed to go as one daemon `act` on the daemon route (ID-10), unless
+    ``arm`` is false (the command waits after its input and observes the
+    screen the wait ends on: the `act`'s read would be an earlier screen);
+    any earlier arming of this thread is dropped either way. Never reads."""
     mark = ui.last_snapshot(target), ui.inputs_sent()
-    if (target.platform == IOS and getattr(_PLAN, "on", False)
+    if (arm and target.platform == IOS and getattr(_PLAN, "on", False)
             and not ios_idb.xcuitest_session(target.target_id)):
         ios_idb.arm_act(target.target_id, getattr(_PLAN, "timeout_ms", DEFAULT_TIMEOUT_MS))
     else:

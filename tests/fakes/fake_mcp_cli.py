@@ -35,7 +35,8 @@ Profiles: ``session start --profile agent`` (or ``add_session(profile="agent")``
 records an agent-profile session, as the merged CLI does since DEC-028: there
 ``ui tree`` without ``--format`` prints ``outline`` without ``nodes``, and
 ``ui tap/type/key`` observe (adding ``screen``, ``changes`` and ``foreground``
-after ``$FAKE_MCP_OBSERVE_MS``, default 0) unless ``--no-observe`` is given.
+after ``$FAKE_MCP_OBSERVE_MS``, default 0) unless ``--no-observe`` is given,
+and answer in one line of text (``ui tap ok``) unless ``--json`` is given.
 ``--format json|outline`` and ``--observe/--no-observe`` win over the profile
 (the last of the two observe flags wins).
 
@@ -519,7 +520,7 @@ def observe_wanted(args: List[str], record: Dict[str, Any]) -> bool:
 
 
 def ui_action(root: Path, key: str, args: List[str], claim: Dict[str, Optional[str]]) -> Tuple[int, Any]:
-    observe_flags = {"--observe": False, "--no-observe": False}
+    observe_flags = {"--observe": False, "--no-observe": False, "--json": False}
     if key == "ui_tap":
         flags = parse_flags(args, {"--session-id": True, "--text": True, "--desc": True,
                                    "--resource-id": True, "--class-name": True, "--role": True,
@@ -559,6 +560,8 @@ def ui_action(root: Path, key: str, args: List[str], claim: Dict[str, Optional[s
         payload["foreground"] = None
     journal(root, record["session_id"], verb, True, None,
             claim.get("operation_id") if control is not None else None)
+    if _agent(record) and "--json" not in args[:args.index("--") if "--" in args else None]:
+        return 0, verb + " ok"  # the text reply of an agent-profile session
     return 0, payload
 
 
@@ -799,7 +802,9 @@ def main(argv: List[str]) -> int:
         sys.stderr.write(fail_payload(exc.code, exc.message, exc.hint, exc.extra) + "\n")
         log_end(2)
         return 2
-    if payload is not None:
+    if isinstance(payload, str):
+        print(payload)
+    elif payload is not None:
         print(json.dumps(payload, indent=2))
     log_end(code)
     return code

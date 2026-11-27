@@ -426,6 +426,17 @@ def snapshot(target: Target) -> list[dict[str, Any]]:
     return nodes
 
 
+def snapshot_now(target: Target) -> list[dict[str, Any]]:
+    """``snapshot`` for a poll (`ui wait` by selector, `--until`): the screen
+    as it is at this moment. The Android helper is asked not to wait for the
+    screen to go quiet first, so a spinner that never rests cannot hold each
+    read of the poll for the helper's two seconds."""
+    if target.platform != ANDROID:
+        return snapshot(target)
+    with ui_android.read_limits(quiet_ms=ui_android.READ_QUIET_MS, max_ms=0):
+        return snapshot(target)
+
+
 def _keep_read(target: Target, nodes: list[dict[str, Any]], payload: Any) -> None:
     """Hold ``nodes`` (and the raw read they came from) as this thread's
     last snapshot of ``target``."""

@@ -61,6 +61,12 @@ python3 <autonom-root>/scripts/autonom.py network detach
 python3 <autonom-root>/scripts/autonom.py network stop
 ```
 
+Do not `sleep` while the app talks to the backend. Wait for the request
+itself: `--until 'request=*/v1/login*'` on the action that sends it (the
+cursor is taken before the input, so a fast response is not missed), or
+`network requests wait --path '*/v1/login*' [--method M] [--status N]` on its
+own. Both exit 1 when no matching request was recorded in time.
+
 Step 6 uses `disable --all`, not `clear`: the registry is persistent, so `clear`
 throws away rules you may want tomorrow. Use `clear` only to actually delete them.
 

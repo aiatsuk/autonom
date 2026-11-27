@@ -92,6 +92,7 @@ from autonom_lib import __version__  # noqa: E402
 from autonom_lib import actions as actions_mod  # noqa: E402
 from autonom_lib import accessibility as accessibility_mod  # noqa: E402
 from autonom_lib import adb as adb_mod  # noqa: E402
+from autonom_lib import brief as brief_mod  # noqa: E402
 from autonom_lib import consent as consent_mod  # noqa: E402
 from autonom_lib import control as control_mod  # noqa: E402
 from autonom_lib import device_state  # noqa: E402
@@ -121,6 +122,7 @@ from autonom_lib import screenshot as shot_mod  # noqa: E402
 from autonom_lib import selector as selector_mod  # noqa: E402
 from autonom_lib import session as session_mod  # noqa: E402
 from autonom_lib import ui as ui_mod  # noqa: E402
+from autonom_lib import wait as wait_mod  # noqa: E402
 from autonom_lib.platform import ANDROID, IOS, Target  # noqa: E402
 
 # Report, campaign, metrics, network and atlas modules are imported inside the
@@ -220,7 +222,21 @@ def _unique_warnings(warnings: list[Any]) -> list[Any]:
 JSON_SEPARATORS = (",", ":")
 
 
-def emit(data: Any, *, as_json: bool) -> int:
+def _fast_path_first(data: dict[str, Any]) -> dict[str, Any]:
+    """The reply with `fallback_reason` and `fallback_hint` right after `ok`:
+    a call that did not go the fast way says so before anything else, where
+    a reader who stops early still sees it. Same keys and values."""
+    if not data.get("fallback_reason"):
+        return data
+    lead = {key: data[key] for key in ("ok", "fallback_reason", "fallback_hint") if key in data}
+    return {**lead, **{key: value for key, value in data.items() if key not in lead}}
+
+
+def emit(data: Any, *, as_json: bool, text: Any = None) -> int:
+    """Print a reply. ``text`` (a function of the finished reply) prints its
+    lines instead of the JSON line: the short replies of an agent-profile
+    session (`autonom_lib.brief`). The journal keeps the whole reply either
+    way."""
     global _LAST_EMIT
     _with_control(data)
     if isinstance(data, dict) and isinstance(data.get("warnings"), list):
@@ -249,14 +265,50 @@ def emit(data: Any, *, as_json: bool) -> int:
         for key, value in ui_android.provenance(str(data.get("target_id", ""))).items():
             data.setdefault(key, value)
     _LAST_EMIT = data if isinstance(data, dict) else None
-    if as_json or isinstance(data, (dict, list)):
+    if text is not None and isinstance(data, dict):
+        print(text(data))
+    elif as_json or isinstance(data, (dict, list)):
         # One line for every caller and profile (AL-10): the same keys and
         # values the indented form had, compact, so an agent reads a reply
         # in one line and a script splits replies on newlines.
-        print(json.dumps(data, ensure_ascii=False, separators=JSON_SEPARATORS))
+        printed = _fast_path_first(data) if isinstance(data, dict) else data
+        print(json.dumps(printed, ensure_ascii=False, separators=JSON_SEPARATORS))
     else:
         print(data)
     return 0
+
+
+def _text_reply(args: argparse.Namespace, record: dict[str, Any] | None) -> bool:
+    """Does this act or wait verb answer in a few lines of text instead of
+    the JSON line? In an agent-profile session (``record``: the session the
+    reply belongs to), unless `--json` asks for the JSON line."""
+    if getattr(args, "json", False):
+        return False
+    return session_mod.profile_of(record) == session_mod.AGENT_PROFILE
+
+
+# True while `autonom mcp serve` runs commands in this process. It answers one
+# call at a time, so a verb that serves until stopped would hold it for good.
+_IN_SERVER = False
+
+
+def _not_in_server(what: str) -> None:
+    """Refuse `what` (a verb that serves until it is stopped) when the MCP
+    server runs it: `usage_error`, before anything starts."""
+    if _IN_SERVER:
+        raise errors.AutonomError(
+            errors.USAGE_ERROR,
+            f"{what} runs until it is stopped and would hold the MCP server",
+            "Run it in a terminal instead.")
+
+
+def _bounded_in_server(args: argparse.Namespace, what: str) -> None:
+    """A follow stream the MCP server runs must say when it ends."""
+    if _IN_SERVER and not (getattr(args, "max_seconds", 0) or 0) > 0:
+        raise errors.AutonomError(
+            errors.USAGE_ERROR,
+            f"{what} needs --max-seconds through the MCP server",
+            "Add --max-seconds N: the server answers one call at a time.")
 
 
 def _interrupted_error() -> errors.AutonomError:
@@ -271,7 +323,16 @@ def _interrupted_error() -> errors.AutonomError:
 
 
 def fail_error(exc: errors.AutonomError, code: int = 2) -> int:
-    print(json.dumps(exc.as_dict(), ensure_ascii=False), file=sys.stderr)
+    payload = exc.as_dict()
+    # A command that failed after auto fell back from the Android helper says
+    # so first, as a reply does (`_fast_path_first`): the failure of the slow
+    # path is often only a symptom of what took the fast one away.
+    android = sys.modules.get("autonom_lib.ui_android")
+    fallback = android.invocation_fallback() if android is not None else {}
+    if fallback and "fallback_reason" not in payload:
+        payload = {"ok": False, **fallback,
+                   **{key: value for key, value in payload.items() if key != "ok"}}
+    print(json.dumps(payload, ensure_ascii=False), file=sys.stderr)
     return code
 
 
@@ -1452,24 +1513,43 @@ def cmd_ui_helper(args: argparse.Namespace) -> int:
 
 
 def cmd_ui_wait(args: argparse.Namespace) -> int:
-    """`ui wait --settled`: wait until the screen stops changing, bounded.
+    """`ui wait`: wait inside the call instead of sleeping between calls,
+    bounded by --timeout-ms. One condition:
 
-    On the iOS idb route idb is asked whether the app is quiet, then the tree
-    is read once (`method: idb-quiet`); elsewhere, or when idb cannot answer,
-    the tree is polled until two consecutive reads match (`method: poll`).
+    - `--settled`: until the screen stops changing. On the iOS idb route idb
+      is asked whether the app is quiet, then the tree is read once (`method:
+      idb-quiet`); elsewhere, or when idb cannot answer, the tree is polled
+      until two consecutive reads match (`method: poll`);
+    - a selector (the flags of `ui find`): until a matching node is on
+      screen, or with `--gone` until none is (`_wait_for_node`).
+
     Mirrors the other bounded checks (`flow fmt --check`, `doctor --strict`):
-    the report is on stdout either way, and a screen that never settled
-    within --timeout-ms exits 1 with `settled: false`.
+    the report is on stdout either way, and a wait that ended unmet exits 1
+    (`settled: false`, or `met: false`).
     """
-    if not args.settled:
+    fields = _selectors(args)
+    has_selector = any(value is not None for value in fields.values())
+    if args.settled and has_selector:
+        raise errors.AutonomError(
+            errors.USAGE_ERROR, "ui wait takes one condition: --settled or a selector",
+            "Wait for the node (drop --settled); 'ui wait --settled' is a second call.")
+    if not args.settled and not has_selector:
         raise errors.AutonomError(
             errors.USAGE_ERROR, "ui wait needs a condition",
-            "Pass --settled (wait until the screen holds still for --quiet-ms).")
+            "Pass --settled (until the screen holds still for --quiet-ms), or a selector "
+            "(--text/--desc/--resource-id: until such a node is on screen; with --gone, "
+            "until none is).")
     for flag, value in (("--timeout-ms", args.timeout_ms), ("--quiet-ms", args.quiet_ms)):
         if value < 0:
             raise errors.AutonomError(
                 errors.INVALID_VALUE, f"{flag} must be >= 0, got {value}",
                 "Pass a duration in milliseconds.")
+    if has_selector:
+        return _wait_for_node(args, fields)
+    if args.gone:
+        raise errors.AutonomError(
+            errors.USAGE_ERROR, "--gone needs a selector",
+            "Name the node that must leave the screen: --text/--desc/--resource-id.")
     target = _target(args)
     result = ui_mod.settle(target, timeout_ms=args.timeout_ms, quiet_ms=args.quiet_ms)
     payload: dict[str, Any] = {"ok": bool(result["settled"]), **result,
@@ -1480,8 +1560,48 @@ def cmd_ui_wait(args: argparse.Namespace) -> int:
         # budget (or identical dumps short of --quiet-ms) cannot confirm either
         error, hint = ui_mod.unsettled_message(result, args.timeout_ms, args.quiet_ms)
         payload["warnings"] = [{"code": "screen_not_settled", "error": error, "hint": hint}]
-    emit(payload, as_json=True)
+    emit(payload, as_json=True, text=_wait_text(args, observe_mod.session_for(target)))
     return 0 if result["settled"] else 1
+
+
+def _wait_text(args: argparse.Namespace, record: dict[str, Any] | None) -> Any:
+    """`emit`'s ``text`` for a wait verb: the one-line reply of an
+    agent-profile session, or None for the JSON line."""
+    return brief_mod.waited if _text_reply(args, record) else None
+
+
+def _wait_for_node(args: argparse.Namespace, fields: dict[str, Any]) -> int:
+    """`ui wait` by selector: poll the tree until a matching node is on
+    screen (`wait: visible`), or with `--gone` until none is (`wait: gone`).
+    Only on-screen nodes count, as in a flow's `assertVisible`. Nothing is
+    sent to the device. `count` is the number of on-screen matches in the
+    last read, `reads` the number of reads; unmet within --timeout-ms is
+    `met: false` with the warning `wait_not_met`, exit 1."""
+    _check_selector_regex(args)
+    target = _target(args)
+    condition = wait_mod.element(fields, gone=bool(args.gone), mode=args.mode,
+                                 case_sensitive=args.case_sensitive, index=args.index)
+    result = wait_mod.poll([condition], timeout_ms=args.timeout_ms,
+                           read_nodes=lambda: ui_mod.snapshot_now(target))
+    payload = _wait_payload([condition], result)
+    emit({**payload, **target.identity()}, as_json=True,
+         text=_wait_text(args, observe_mod.session_for(target)))
+    return 0 if result["met"] else 1
+
+
+def _wait_payload(conditions: list[Any], result: dict[str, Any]) -> dict[str, Any]:
+    """The reply of a wait for one condition (`ui wait` by selector,
+    `network requests wait`): the condition and what it saw at the top
+    level, then how long it took."""
+    state = dict(result["conditions"][0])
+    payload: dict[str, Any] = {"ok": bool(result["met"]), **state}
+    for key in ("reads", "elapsed_ms", "timeout_ms", "error"):
+        if key in result and not (key == "reads" and not result[key]):
+            payload[key] = result[key]
+    if not result["met"]:
+        error, hint = wait_mod.unmet_message(conditions, result)
+        payload["warnings"] = [{"code": "wait_not_met", "error": error, "hint": hint}]
+    return payload
 
 
 def cmd_note_add(args: argparse.Namespace) -> int:
@@ -1630,6 +1750,7 @@ def _eof_detail(line_filter: Any) -> Any:
 
 
 def cmd_logs_follow(args: argparse.Namespace) -> int:
+    _bounded_in_server(args, "logs follow")
     if args.source == "device":
         return _finish_stream(_follow_device(args))
     record = _observed_session(args)
@@ -1683,6 +1804,7 @@ def cmd_journal(args: argparse.Namespace) -> int:
     session = (_session_by_id(args.session_id) if getattr(args, "session_id", None)
                else session_mod.load_current())
     if getattr(args, "follow", False):
+        _bounded_in_server(args, "journal --follow")
         record = _observed_session(args)
         return _finish_stream(follow_mod.follow_file(
             journal_mod.journal_path(record), source="journal",
@@ -1777,9 +1899,22 @@ def _backend(returned: Any) -> str | None:
 
 
 class _ObservePlan:
-    """Whether an action verb reports the screen it leads to (AL-11), and
-    how: ``--observe`` / ``--no-observe`` win, else the session's profile
-    decides; the budget is checked before any input is sent."""
+    """What an action verb does after its input, decided before it is sent.
+
+    - ``--until`` (repeatable): wait in this call until every condition
+      holds (``wait.parse_until``), at most ``--until-timeout-ms``. The
+      values are parsed, and a request condition's capture is checked,
+      before any input: a wait that could never be met sends nothing. The
+      cursor of a request condition is taken before the input, so a fast
+      response is not missed. An unmet wait leaves ``ok: true`` (the input
+      was sent once), adds the warning ``until_not_met`` and makes the
+      command exit 1.
+    - observe (AL-11): whether the verb reports the screen it leads to, and
+      how: ``--observe`` / ``--no-observe`` win, else the session's profile
+      decides; the budget is checked before any input is sent. After a wait
+      observe settles and reads the screen itself, so the reported screen is
+      the one the wait ended on, not the one right after the input.
+    """
 
     def __init__(self, args: argparse.Namespace) -> None:
         self.timeout_ms = observe_mod.check_timeout(getattr(args, "observe_timeout_ms", None))
@@ -1787,6 +1922,24 @@ class _ObservePlan:
         self.record: dict[str, Any] | None = None
         self.on = False
         self.mark: Any = None
+        self.until = [wait_mod.parse_until(spec) for spec in getattr(args, "until", None) or ()]
+        self.until_timeout_ms = getattr(args, "until_timeout_ms", None)
+        if self.until_timeout_ms is None:
+            self.until_timeout_ms = wait_mod.DEFAULT_UNTIL_TIMEOUT_MS
+        if self.until_timeout_ms < 0:
+            raise errors.AutonomError(
+                errors.INVALID_VALUE,
+                f"--until-timeout-ms must be >= 0, got {self.until_timeout_ms}",
+                f"Pass a duration in milliseconds (default {wait_mod.DEFAULT_UNTIL_TIMEOUT_MS}).")
+        self.tail: Any = None
+        self.unmet = False
+        self.interrupted = False
+        self.shot = getattr(args, "shot", None)
+        if self.shot is not None and not self.shot.strip():
+            raise errors.AutonomError(
+                errors.INVALID_VALUE, "--shot needs a label",
+                "Say what the screenshot shows, e.g. --shot 'order accepted'.", flag="--shot")
+        self.args = args
 
     def resolve(self, target: Target) -> "_ObservePlan":
         """Bind to the session of ``target`` once the target is known, and
@@ -1794,12 +1947,95 @@ class _ObservePlan:
         its input goes out can be told from an earlier command's."""
         self.record = observe_mod.session_for(target)
         self.on = observe_mod.wanted(self.flag, self.record)
-        self.mark = observe_mod.read_mark(target)
+        # with --until the screen is read after the wait, not by the input:
+        # neither the iOS daemon's `act` nor the Android helper settles for it
+        self.mark = observe_mod.read_mark(target, arm=not self.until)
         # through the Android helper, the input itself comes back with the
         # settled screen (AU-03): one round trip, no read of observe's own
-        ui_mod.observe_inputs(target, self.timeout_ms if self.on else None,
+        ui_mod.observe_inputs(target, self.timeout_ms if self.on and not self.until else None,
                               observe_mod.QUIET_MS)
+        if any(item.kind == wait_mod.REQUEST for item in self.until):
+            self.tail = _capture_tail(self.record, "--until request=")
+            self.tail.skip_recorded()
         return self
+
+    def finish(self, payload: dict[str, Any], target: Target, verb: str,
+               secret: str | None = None) -> int:
+        """Everything after the input of ``verb``: the ``--until`` wait,
+        observe, then the reply; the command's exit code."""
+        self._wait(payload, target, verb)
+        if not self.interrupted:
+            self.into(payload, target, verb, secret=secret)
+        if self.shot is not None and not _OBSERVE_INTERRUPTED:
+            self._take_shot(payload, target)
+        text = None
+        if _text_reply(self.args, self.record):
+            whole = bool(getattr(self.args, "screen", False))
+            text = lambda data: brief_mod.action(verb, data, screen=whole)  # noqa: E731
+        emit({**payload, **target.identity()}, as_json=True, text=text)
+        return 1 if self.unmet and not self.interrupted else 0
+
+    def _take_shot(self, payload: dict[str, Any], target: Target) -> None:
+        """`--shot LABEL`: the screenshot `autonom screenshot --label LABEL`
+        takes, in this call, of the screen the action (its wait, its observe)
+        ended on. ``shot`` in the reply names the file. Never raises: the
+        input was already sent, so a failed capture is the warning
+        ``shot_failed`` beside ``ok: true``."""
+        try:
+            taken = _screenshot(self.args, target, session_mod.load_current(),
+                                label=self.shot, task=None, out=None)
+        except Exception as exc:  # noqa: BLE001 - a capture must never fail the action
+            message = (exc.message if isinstance(exc, errors.AutonomError)
+                       else " ".join(str(exc).split())[:300] or exc.__class__.__name__)
+            payload.setdefault("warnings", []).append({
+                "code": "shot_failed", "error": f"--shot took no screenshot: {message}",
+                "hint": "The action ran. Take the evidence with 'autonom screenshot --label "
+                        "...'."})
+            return
+        warnings = taken.pop("warnings", None)
+        payload["shot"] = {key: taken[key] for key in _SHOT_KEYS if taken.get(key) is not None}
+        payload["shot"]["label"] = self.shot
+        if warnings:
+            payload.setdefault("warnings", []).extend(warnings)
+
+    def _wait(self, payload: dict[str, Any], target: Target, verb: str) -> None:
+        """Add ``until`` (the wait's result) to ``payload``. Never raises:
+        the input was already sent, so a failure of the wait is reported
+        beside ``ok: true`` (``until.error``), like a failure of observe. An
+        interrupt ends the command after this reply with exit 130."""
+        global _OBSERVE_INTERRUPTED
+        if not self.until:
+            return
+        try:
+            result = wait_mod.poll(
+                self.until, timeout_ms=self.until_timeout_ms,
+                read_nodes=lambda: ui_mod.snapshot_now(target),
+                fresh_requests=self.tail.fresh if self.tail is not None else None)
+        except KeyboardInterrupt:
+            self.interrupted = _OBSERVE_INTERRUPTED = True
+            payload["until"] = {"met": False, "error": {
+                "code": errors.INTERRUPTED,
+                "message": f"the input of {verb} was sent; the wait for --until was "
+                           "interrupted",
+                "hint": "The input was delivered: do not send it again. Run autonom ui "
+                        "tree to see the screen."}}
+            return
+        except Exception as exc:  # noqa: BLE001 - the wait must never fail the action
+            code = exc.code if isinstance(exc, errors.AutonomError) else errors.BACKEND_FAILED
+            message = (exc.message if isinstance(exc, errors.AutonomError)
+                       else " ".join(str(exc).split())[:300] or exc.__class__.__name__)
+            result = {"met": False, "error": {"code": code, "message": message}}
+        payload["until"] = result
+        if not result["met"]:
+            self.unmet = True
+            if "conditions" in result:
+                error, hint = wait_mod.unmet_message(self.until, result, "--until-timeout-ms")
+            else:
+                error, hint = (f"the wait for --until failed: {result['error']['message']}",
+                               "Run autonom ui tree to see the screen.")
+            payload.setdefault("warnings", []).append({
+                "code": "until_not_met", "error": error,
+                "hint": f"The input of {verb} was sent: do not send it again. " + hint})
 
     def into(self, payload: dict[str, Any], target: Target, verb: str,
              secret: str | None = None) -> dict[str, Any]:
@@ -1813,12 +2049,14 @@ class _ObservePlan:
         global _OBSERVE_INTERRUPTED
         if not self.on:
             return payload
+        # after a wait the whole observe budget is for the screen it ended on
+        waited = bool(self.until)
         keys, warnings = observe_mod.after_action(
             target, self.record, verb=verb,
             baseline_payload=observe_mod.own_read(target, since=self.mark),
             timeout_ms=self.timeout_ms, secret=secret,
-            input_reply=ui_mod.input_reply(target, after=self.mark[1]),
-            input_ended=ui_mod.input_ended(target, after=self.mark[1]))
+            input_reply=None if waited else ui_mod.input_reply(target, after=self.mark[1]),
+            input_ended=None if waited else ui_mod.input_ended(target, after=self.mark[1]))
         if observe_mod.interrupted(keys):
             _OBSERVE_INTERRUPTED = True
         payload.update(keys)
@@ -1907,8 +2145,7 @@ def cmd_ui_tap(args: argparse.Namespace) -> int:
         payload["detail"] = detail
     if evidence_warning:
         payload.setdefault("warnings", []).append(evidence_warning)
-    plan.into(payload, target, "ui tap")
-    return emit({**payload, **target.identity()}, as_json=True)
+    return plan.finish(payload, target, "ui tap")
 
 
 # `ui swipe --duration` is in seconds; a value past this is a millisecond
@@ -1943,8 +2180,7 @@ def cmd_ui_swipe(args: argparse.Namespace) -> int:
                                "duration": args.duration}
     if backend:
         payload["backend"] = backend
-    plan.into(payload, target, "ui swipe")
-    return emit({**payload, **target.identity()}, as_json=True)
+    return plan.finish(payload, target, "ui swipe")
 
 
 def cmd_ui_gesture(args: argparse.Namespace) -> int:
@@ -1963,8 +2199,7 @@ def cmd_ui_gesture(args: argparse.Namespace) -> int:
         metadata = ui_mod.pinch(target, x, y, scale=args.scale, duration=args.duration)
         payload = {"ok": True, "gesture": "pinch", "at": [x, y], "scale": args.scale,
                    "duration": args.duration, **metadata, **target.identity()}
-        plan.into(payload, target, "ui pinch")
-        return emit(payload, as_json=True)
+        return plan.finish(payload, target, "ui pinch")
     target = _target(args)
     ui_mod.gesture(target, args.gesture)
     return emit({"ok": True, "gesture": args.gesture, **target.identity()}, as_json=True)
@@ -2032,8 +2267,7 @@ def cmd_ui_type(args: argparse.Namespace) -> int:
     if evidence_warning:
         payload.setdefault("warnings", []).append(evidence_warning)
     # a sensitive value never reaches the observed screen or its saved tree
-    plan.into(payload, target, "ui type", secret=args.text if sensitive else None)
-    return emit({**payload, **target.identity()}, as_json=True)
+    return plan.finish(payload, target, "ui type", secret=args.text if sensitive else None)
 
 
 def _typed_keys(payload: dict[str, Any], reply: dict[str, Any],
@@ -2182,8 +2416,7 @@ def cmd_ui_fill(args: argparse.Namespace) -> int:
         payload["warnings"] = warnings
     if evidence_warning:
         payload.setdefault("warnings", []).append(evidence_warning)
-    plan.into(payload, target, "ui fill", secret=text if sensitive else None)
-    return emit({**payload, **target.identity()}, as_json=True)
+    return plan.finish(payload, target, "ui fill", secret=text if sensitive else None)
 
 
 def _check_android_key(key: str) -> None:
@@ -2206,8 +2439,7 @@ def cmd_ui_key(args: argparse.Namespace) -> int:
     payload: dict[str, Any] = {"ok": True, "keycode": args.keycode}
     if backend:
         payload["backend"] = backend
-    plan.into(payload, target, "ui key")
-    return emit({**payload, **target.identity()}, as_json=True)
+    return plan.finish(payload, target, "ui key")
 
 
 def cmd_ui_do(args: argparse.Namespace) -> int:
@@ -2246,7 +2478,11 @@ def cmd_ui_do(args: argparse.Namespace) -> int:
     payload.update(keys)
     if warnings:
         payload.setdefault("warnings", []).extend(warnings)
-    emit({**payload, **target.identity()}, as_json=True)
+    text = None
+    if _text_reply(args, observe_mod.session_for(target)):
+        whole = bool(getattr(args, "screen", False))
+        text = lambda data: brief_mod.steps(data, screen=whole)  # noqa: E731
+    emit({**payload, **target.identity()}, as_json=True, text=text)
     return 0 if result.status == "passed" else 1
 
 
@@ -2314,11 +2550,26 @@ def _agent_screenshot(args: argparse.Namespace, target: Target,
     return agent
 
 
+# What `--shot` on an action verb reports of the screenshot it took.
+_SHOT_KEYS = ("path", "width", "height", "format", "screen", "scale", "coordinates",
+              "fallback_reason")
+
+
 def cmd_screenshot(args: argparse.Namespace) -> int:
     out = _output_path(args.out, "--out") if args.out else None
     _check_max_edge(getattr(args, "max_edge", None))
     target = _target(args)
-    record = session_mod.load_current()
+    payload = _screenshot(args, target, session_mod.load_current(),
+                          label=getattr(args, "label", None), task=getattr(args, "task", None),
+                          out=out)
+    return emit({"ok": True, **payload, **target.identity()}, as_json=True)
+
+
+def _screenshot(args: argparse.Namespace, target: Target, record: dict[str, Any] | None, *,
+                label: str | None, task: str | None, out: Path | None) -> dict[str, Any]:
+    """One screenshot as `autonom screenshot` takes and files it (also for
+    `--shot` on an action verb): what the capture reports, the status-bar
+    re-pin and its warnings."""
     agent = _agent_screenshot(args, target, record, out)
     # A live Android status-bar pin drifts within a minute; re-send it so
     # before/after frames show the same bar.
@@ -2326,16 +2577,17 @@ def cmd_screenshot(args: argparse.Namespace) -> int:
     # AS-03: an agent screenshot (`--agent`, or the agent profile on Android)
     # is the helper's small JPEG with a coordinate note; every other one is
     # exactly today's PNG
-    extra: dict[str, Any] = {"agent": True, "max_edge": args.max_edge} if agent else {}
+    extra: dict[str, Any] = ({"agent": True, "max_edge": getattr(args, "max_edge", None)}
+                             if agent else {})
     detail = shot_mod.capture_evidence(
         target,
         record,
-        label=getattr(args, "label", None),
-        task=getattr(args, "task", None),
+        label=label,
+        task=task,
         out=out,
         **extra,
     )
-    payload: dict[str, Any] = {"ok": True, **detail}
+    payload: dict[str, Any] = dict(detail)
     if repin is not None:
         payload["repinned"] = repin["repinned"]
         payload["repinned_controls"] = repin["controls"]
@@ -2352,7 +2604,7 @@ def cmd_screenshot(args: argparse.Namespace) -> int:
                          "boot) on this serial was dropped, not replayed",
                 "hint": "Run 'simulator status-bar pin' on this device if the capture "
                         "needs a deterministic bar."})
-    return emit({**payload, **target.identity()}, as_json=True)
+    return payload
 
 
 def cmd_shots_list(args: argparse.Namespace) -> int:
@@ -3416,86 +3668,88 @@ def cmd_network_requests_list(args: argparse.Namespace) -> int:
 
 
 def cmd_network_requests_follow(args: argparse.Namespace) -> int:
-    from autonom_lib.network import redact as redact_mod
     from autonom_lib.network import store as store_mod
 
+    _bounded_in_server(args, "network requests follow")
     record = session_mod.require_current()
     filters = {"host": args.host, "method": args.method, "status": args.status,
                "path_glob": args.path, "mocked": args.mocked}
-    flows_file = store_mod.flows_path(record)
-    seen: set[str] = set()
-    # The store is append-only JSONL (its own contract), so the follow tails
-    # by byte offset and parses only what was appended — never the whole
-    # history again on every tick. A shrink means the store was replaced:
-    # start over from byte 0; `seen` keeps replayed flows from re-emitting.
-    # `skipped` counts lines that are not flow records — not JSON, deeper than
-    # the parser allows, JSON but not an object, nested deeper than
-    # `store.MAX_LINE_DEPTH`, or refused by the scrubber — exactly like
-    # `store.read_all_counted`; the eof line carries the count. A record whose
-    # id is not a string is counted too: it cannot be deduplicated.
-    state = {"offset": 0, "buffer": b"", "skipped": 0}
-
-    def read_appended() -> list[dict[str, Any]]:
-        if not flows_file.exists():
-            return []
-        size = flows_file.stat().st_size
-        if size < state["offset"]:
-            state["offset"], state["buffer"] = 0, b""
-        if size == state["offset"]:
-            return []
-        with flows_file.open("rb") as handle:
-            handle.seek(state["offset"])
-            chunk = handle.read()
-        state["offset"] += len(chunk)
-        state["buffer"] += chunk
-        *complete, state["buffer"] = state["buffer"].split(b"\n")
-        parsed: list[dict[str, Any]] = []
-        for raw_line in complete:
-            line = raw_line.decode("utf-8", errors="replace").strip()
-            if not line:
-                continue
-            try:
-                row = json.loads(line)
-            except (ValueError, RecursionError):
-                state["skipped"] += 1  # a torn write or a hostile nesting depth
-                continue
-            if not isinstance(row, dict) or store_mod.too_deep(row):
-                # `3`, `null`, `[1]`, `"x"` are not flow records; a too-deep
-                # value would raise RecursionError when filtered or printed.
-                state["skipped"] += 1
-                continue
-            if row.get("id") is not None and not isinstance(row.get("id"), str):
-                state["skipped"] += 1  # a list or dict id is unhashable for `seen`
-                continue
-            try:
-                parsed.append(redact_mod.scrub_flow(row))
-            except (TypeError, ValueError, AttributeError, RecursionError):
-                state["skipped"] += 1
-        return parsed
-
+    # The store is tailed by byte offset (`store.Tail`): only what was
+    # appended is parsed on each tick, and the eof line carries the count of
+    # lines that are not flow records.
+    tail = store_mod.Tail(record)
     if not args.from_start:
-        for flow in read_appended():  # baseline: everything already recorded
-            if flow.get("id"):
-                seen.add(flow["id"])
+        tail.skip_recorded()  # baseline: everything already recorded
 
     def fetch_new() -> list[dict[str, Any]]:
-        fresh = []
-        for flow in read_appended():
-            flow_id = flow.get("id")
-            if not flow_id or flow_id in seen:
-                continue
-            seen.add(flow_id)  # dedup happens pre-filter: skipped ≠ unseen
-            fresh.append(flow)
-        return store_mod.filter_flows(fresh, **filters)
+        # dedup happens pre-filter: skipped ≠ unseen
+        return store_mod.filter_flows(tail.fresh(), **filters)
 
     def emit_line(payload: Any) -> None:
-        if isinstance(payload, dict) and payload.get("kind") == "eof" and state["skipped"]:
-            payload["skipped"] = state["skipped"]  # the same dict becomes the journal payload
+        if isinstance(payload, dict) and payload.get("kind") == "eof" and tail.skipped:
+            payload["skipped"] = tail.skipped  # the same dict becomes the journal payload
         _stream_print(payload)
 
     return _finish_stream(follow_mod.follow_poll(
         fetch_new, emit=emit_line, interval=args.interval,
         max_seconds=args.max_seconds, max_items=args.max))
+
+
+def _capture_tail(record: dict[str, Any] | None, what: str) -> Any:
+    """A tail of the flow store of `record` for a wait on a request, refused
+    when it could never be met: without a session (`no_active_session`) or
+    without a running proxy (`proxy_not_running`)."""
+    from autonom_lib.network import proxy as proxy_mod
+    from autonom_lib.network import store as store_mod
+
+    if not record:
+        raise errors.AutonomError(
+            errors.NO_ACTIVE_SESSION, f"{what} needs the session that captures this device",
+            "Start one with 'autonom session start', then 'autonom network start "
+            "--i-understand-mitm' and 'autonom network attach'.")
+    if not proxy_mod.status(record)["running"]:
+        raise errors.AutonomError(
+            errors.PROXY_NOT_RUNNING, "no proxy is running for this session",
+            f"{what} waits for a request the proxy records. Start one first: 'autonom "
+            "network start --i-understand-mitm', then 'autonom network attach'.")
+    return store_mod.Tail(record)
+
+
+def cmd_network_requests_wait(args: argparse.Namespace) -> int:
+    """`network requests wait`: wait until the session's proxy records a
+    request that matches the filters of `network requests list`, at most
+    --timeout-ms. Only requests recorded after the call began count, or
+    after `--since-id` (a cursor taken before the action that sends the
+    request, so a fast response is not missed). The proxy is Autonom's own:
+    this works for any app whose traffic it sees. The reply names the
+    request that met the wait (`request`); unmet is `met: false` with the
+    warning `wait_not_met`, exit 1."""
+    if args.timeout_ms < 0:
+        raise errors.AutonomError(
+            errors.INVALID_VALUE, f"--timeout-ms must be >= 0, got {args.timeout_ms}",
+            "Pass a duration in milliseconds.")
+    record = session_mod.require_current()
+    tail = _capture_tail(record, "network requests wait")
+    warnings: list[dict[str, Any]] = []
+    if args.since_id:
+        if not tail.skip_through(args.since_id):
+            warnings.append({
+                "code": "since_id_not_found",
+                "error": f"no recorded flow with id {args.since_id}; every recorded "
+                         "request counts",
+                "hint": "The store may have been cleared; take a new cursor from the "
+                        "latest id 'autonom network requests list' shows.",
+            })
+    else:
+        tail.skip_recorded()
+    condition = wait_mod.request(host=args.host, method=args.method, status=args.status,
+                                 path_glob=args.path, mocked=args.mocked)
+    result = wait_mod.poll([condition], timeout_ms=args.timeout_ms, fresh_requests=tail.fresh)
+    payload = _wait_payload([condition], result)
+    if warnings:
+        payload["warnings"] = warnings + payload.get("warnings", [])
+    emit(payload, as_json=True, text=_wait_text(args, record))
+    return 0 if result["met"] else 1
 
 
 def cmd_network_requests_show(args: argparse.Namespace) -> int:
@@ -5677,6 +5931,7 @@ def cmd_report_export(args: argparse.Namespace) -> int:
 
 def cmd_report_serve(args: argparse.Namespace) -> int:
     """Serve one local report with narrowly-scoped prefix replay controls."""
+    _not_in_server("report serve")
     import html
     import http.server
     import secrets as secrets_mod
@@ -6622,6 +6877,7 @@ def cmd_canvas(args: argparse.Namespace) -> int:
 
 
 def cmd_canvas_serve(args: argparse.Namespace) -> int:
+    _not_in_server("canvas serve")
     _canvas_check_values(args)
     devices = _canvas_device_specs(args.device)
     bootable = _canvas_bootable(args.bootable)
@@ -7088,6 +7344,60 @@ def cmd_control_renew(args: argparse.Namespace) -> int:
                  "env": _control_env(holder, answer["generation"])}, as_json=True)
 
 
+def _run_in_process(argv: list[str], stdin_text: str | None) -> tuple[int | None, str, str]:
+    """One command for the MCP server: `main(argv)` in this process, with
+    what it prints captured and `stdin_text` as its stdin (the steps of `ui
+    do`). Returns the exit code, stdout and stderr."""
+    import contextlib
+    import io
+
+    out, err = io.StringIO(), io.StringIO()
+    held = sys.stdin
+    sys.stdin = io.StringIO(stdin_text or "")
+    try:
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                code = main(list(argv))
+            except SystemExit as exc:  # argparse's usage envelope
+                code = exc.code if isinstance(exc.code, int) else 2
+    finally:
+        sys.stdin = held
+    return code, out.getvalue(), err.getvalue()
+
+
+def cmd_mcp_serve(args: argparse.Namespace) -> int:
+    """`mcp serve`: the persistent MCP server of the agent loop (stdio;
+    `autonom_lib/mcp_server.py`). Every tool call is an Autonom command run
+    in this process, so there is no interpreter start per call.
+
+    The protocol keeps private copies of stdin and stdout: fd 0 becomes
+    /dev/null and fd 1 becomes stderr for everything else, so a device tool
+    a command starts can neither read a request nor write into the replies.
+    Ends when stdin ends."""
+    global _IN_SERVER
+    from autonom_lib import mcp_server
+
+    _not_in_server("mcp serve")
+    requests = os.fdopen(os.dup(sys.stdin.fileno()), "rb")
+    replies = os.fdopen(os.dup(sys.stdout.fileno()), "wb")
+    devnull = os.open(os.devnull, os.O_RDONLY)
+    os.dup2(devnull, sys.stdin.fileno())
+    os.close(devnull)
+    sys.stdout.flush()
+    os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
+
+    def log(line: str) -> None:
+        print(f"autonom mcp: {line}", file=sys.stderr, flush=True)
+
+    _IN_SERVER = True
+    try:
+        return mcp_server.Server(_run_in_process, requests, replies, log).serve()
+    except BrokenPipeError:
+        return 0  # the client went away
+    finally:
+        _IN_SERVER = False
+
+
 # --- verb classification (contract 5.3) -------------------------------------
 # Every verb path printed by walking build_parser() (aliases included; bare
 # group forms such as `devices` and `canvas` too) is in exactly one table, so
@@ -7114,7 +7424,7 @@ _CONTROL_READONLY: frozenset[str] = frozenset({
     "report watch", "report pack", "report merge", "report finalize",
     "ci pack", "ci merge", "ci finalize", "ci publish", "agent export", "agent inspect",
     "network status", "network requests list", "network requests follow",
-    "network requests show", "network export",
+    "network requests wait", "network requests show", "network export",
     "metrics snapshot", "metrics simulator", "metrics series", "metrics memory capture",
     "metrics memory analyze",
     "metrics frames reset", "metrics frames capture", "metrics frames flutter-summary",
@@ -7134,6 +7444,8 @@ _CONTROL_LIFECYCLE: frozenset[str] = frozenset({
     "session start", "session stop", "devices boot", "canvas", "canvas serve", "canvas stop",
     "canvas attach", "canvas detach", "canvas list", "cleanup", "control acquire",
     "control release", "control renew", "pretest start", "pretest stop",
+    # the MCP server: each tool call is a command of its own class
+    "mcp serve",
 })
 _CONTROL_HOST: frozenset[str] = frozenset({
     "network start", "network mock add", "network mock list", "network mock show",
@@ -7308,6 +7620,15 @@ def _add_selector_flags(parser: argparse.ArgumentParser) -> None:
 # The observe flags of the action verbs (AL-11), matched only when spelled
 # in full like every flag added after abbreviations were in use.
 _OBSERVE_FLAGS = frozenset({"--observe", "--no-observe", "--observe-timeout-ms"})
+# What an action verb does after its input besides observing (`--until`,
+# `--shot`) and how it answers (`--json`, `--screen`).
+_REPLY_FLAGS = frozenset({"--json", "--screen"})
+_LOOP_FLAGS = frozenset({"--until", "--until-timeout-ms", "--shot"}) | _REPLY_FLAGS
+# `ui wait`: the selector flags and --gone, and --timeout-ms (see the parser).
+_WAIT_EXACT_FLAGS = frozenset({
+    "--text", "--desc", "--resource-id", "--class-name", "--package", "--role",
+    "--clickable", "--enabled", "--mode", "--case-sensitive", "--index", "--gone",
+    "--timeout-ms"})
 
 
 def _add_observe_flags(parser: argparse.ArgumentParser) -> None:
@@ -7322,7 +7643,34 @@ def _add_observe_flags(parser: argparse.ArgumentParser) -> None:
                         metavar="MS",
                         help="how long observe waits for the screen to settle "
                              f"(default {observe_mod.DEFAULT_TIMEOUT_MS})")
-    parser.exact_only_options = journal_mod.EXACT_ONLY_OPTIONS | _OBSERVE_FLAGS
+    parser.add_argument("--until", action="append", metavar="CONDITION",
+                        help="after the input, wait in this call until CONDITION holds: "
+                             "text=VALUE, desc=VALUE or id=VALUE (a node on screen), "
+                             "gone:text=VALUE and the like (no such node), or request=GLOB "
+                             "(a request the proxy records); repeat it for several, all "
+                             "must hold")
+    parser.add_argument("--until-timeout-ms", type=int,
+                        default=wait_mod.DEFAULT_UNTIL_TIMEOUT_MS, metavar="MS",
+                        help="how long --until waits (exit 1 when unmet; default "
+                             f"{wait_mod.DEFAULT_UNTIL_TIMEOUT_MS})")
+    parser.add_argument("--shot", metavar="LABEL",
+                        help="after the input (and --until, and observe), take a screenshot "
+                             "labelled LABEL in this call, filed like 'autonom screenshot "
+                             "--label LABEL'; the reply names its path")
+    _add_reply_flags(parser, screen=True)
+    parser.exact_only_options = journal_mod.EXACT_ONLY_OPTIONS | _OBSERVE_FLAGS | _LOOP_FLAGS
+
+
+def _add_reply_flags(parser: argparse.ArgumentParser, *, screen: bool) -> None:
+    """How an act or wait verb answers in an agent-profile session, where
+    the default is a few lines of text (`autonom_lib.brief`)."""
+    parser.add_argument("--json", action="store_true",
+                        help="print the JSON line with every key (the default outside an "
+                             "agent-profile session)")
+    if screen:
+        parser.add_argument("--screen", action="store_true",
+                            help="agent-profile text reply: add the whole screen outline, "
+                                 "not only what changed")
 
 
 # `session outputs`, `journal` and `logs follow` had their own --session-id
@@ -7600,16 +7948,24 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--all", action="store_true")
     p.set_defaults(func=cmd_ui_find)
 
-    p = ui_sub.add_parser("wait", help="wait until the screen stops changing",
-                          parents=[target_flags])
+    p = ui_sub.add_parser("wait", help="wait for the screen to settle, or for a node to "
+                          "come on screen or leave it", parents=[target_flags])
     p.add_argument("--settled", action="store_true",
                    help="wait until the screen holds still for --quiet-ms (iOS idb: "
                         "'idb ui quiet', then one read; otherwise poll until two "
                         "consecutive trees match)")
+    _add_selector_flags(p)
+    p.add_argument("--gone", action="store_true",
+                   help="with a selector: wait until no matching node is on screen")
     p.add_argument("--timeout-ms", type=int, default=5000,
-                   help="give up after N ms (exit 1, settled: false)")
+                   help="give up after N milliseconds (exit 1; default 5000)")
     p.add_argument("--quiet-ms", type=int, default=500,
-                   help="how long the tree must hold still (default 500)")
+                   help="--settled: how long the tree must hold still (default 500)")
+    # The selector flags and --gone came after abbreviations of the older
+    # flags were in use; --timeout-ms is spelled in full so that `--timeout
+    # 40` is refused instead of being read as 40 milliseconds.
+    _add_reply_flags(p, screen=False)
+    p.exact_only_options = journal_mod.EXACT_ONLY_OPTIONS | _WAIT_EXACT_FLAGS | {"--json"}
     p.set_defaults(func=cmd_ui_wait)
 
     p = ui_sub.add_parser("tap", help="tap by selector or coordinates", parents=[target_flags])
@@ -7677,7 +8033,9 @@ def build_parser() -> argparse.ArgumentParser:
                    metavar="MS",
                    help="how long the final screen may take to settle "
                         f"(default {observe_mod.DEFAULT_TIMEOUT_MS})")
-    p.exact_only_options = journal_mod.EXACT_ONLY_OPTIONS | {"--observe-timeout-ms"}
+    _add_reply_flags(p, screen=True)
+    p.exact_only_options = (journal_mod.EXACT_ONLY_OPTIONS | {"--observe-timeout-ms"}
+                            | _REPLY_FLAGS)
     p.set_defaults(func=cmd_ui_do)
 
     p = sub.add_parser("screenshot", help="capture PNG screenshot", parents=[target_flags])
@@ -7773,6 +8131,12 @@ def build_parser() -> argparse.ArgumentParser:
     p = host_sub.add_parser("info", help="the stable host id (minted once per state base), "
                                          "name, version, platform and capabilities")
     p.set_defaults(func=cmd_host_info)
+
+    mcp = sub.add_parser("mcp", help="MCP server for agent hosts")
+    mcp_sub = mcp.add_subparsers(dest="mcp_command", required=True)
+    p = mcp_sub.add_parser("serve", help="serve the agent loop as MCP tools over stdio; each "
+                                         "call runs in this process (no start-up per call)")
+    p.set_defaults(func=cmd_mcp_serve)
 
     p = sub.add_parser("processes", help="list Autonom-spawned processes machine-wide")
     p.set_defaults(func=cmd_processes)
@@ -8505,6 +8869,22 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--from-start", action="store_true",
                    help="emit already-recorded flows first, then follow")
     p.set_defaults(func=cmd_network_requests_follow)
+    p = requests_sub.add_parser("wait", parents=[target_flags],
+                                help="wait until the proxy records a matching request")
+    p.add_argument("--host")
+    p.add_argument("--method")
+    p.add_argument("--status", type=int)
+    p.add_argument("--path", help="glob over path or url")
+    p.add_argument("--mocked", nargs="?", const=True, default=None, type=_bool_flag)
+    p.add_argument("--since-id", help="count requests recorded after this id too (a cursor "
+                                      "taken before the action that sends the request)")
+    p.add_argument("--timeout-ms", type=int, default=wait_mod.DEFAULT_UNTIL_TIMEOUT_MS,
+                   help="give up after N milliseconds (exit 1; default "
+                        f"{wait_mod.DEFAULT_UNTIL_TIMEOUT_MS})")
+    _add_reply_flags(p, screen=False)
+    p.exact_only_options = journal_mod.EXACT_ONLY_OPTIONS | {"--timeout-ms", "--since-id",
+                                                             "--json"}
+    p.set_defaults(func=cmd_network_requests_wait)
     p = requests_sub.add_parser("show", parents=[target_flags])
     p.add_argument("id")
     p.add_argument("--full", action="store_true", help="include full bodies when captured")
@@ -8757,7 +9137,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 # Verbs whose own handler writes the journal, or that only read it — never
 # journaled by the choke point, to avoid double entries and read-noise.
-_JOURNAL_SKIP = {"note", "journal", "version", "teach"}
+_JOURNAL_SKIP = {"note", "journal", "version", "teach", "mcp"}
 
 # Sub-command dests, in priority order, for reconstructing a verb string.
 _SUBCOMMAND_DESTS = (
@@ -8768,7 +9148,7 @@ _SUBCOMMAND_DESTS = (
     "logs_command", "metrics_command", "teach_command", "app_skill_command",
     "simulator_command", "canvas_command", "ci_command", "agent_command",
     "pretest_command", "pretest_check_command", "pretest_finding_command",
-    "control_command",
+    "control_command", "mcp_command",
 )
 
 
@@ -8955,9 +9335,28 @@ def _parse(parser: argparse.ArgumentParser, argv: list[str] | None) -> argparse.
     was given to: the hint is `ui tap`'s usage, not the root's 60-verb list."""
     args, extras = parser.parse_known_args(argv)
     if extras:
-        _leaf_parser(parser, args).error(
-            "unrecognized arguments: " + " ".join(extras))
+        leaf = _leaf_parser(parser, args)
+        leaf.error("unrecognized arguments: " + " ".join(extras)
+                   + _spelled_in_full(leaf, extras))
     return args
+
+
+def _spelled_in_full(parser: argparse.ArgumentParser, extras: list[str]) -> str:
+    """A note for an unknown flag that abbreviates a flag of this verb
+    matched only when spelled in full: `ui wait --timeout 40` names
+    `--timeout-ms` and its unit instead of leaving `--timeout` unexplained
+    (it used to be read as 40 milliseconds)."""
+    exact_only = getattr(parser, "exact_only_options", frozenset())
+    for token in extras:
+        name = token.partition("=")[0]
+        if not name.startswith("--") or len(name) < 3:
+            continue
+        meant = sorted(option for option in parser._option_string_actions  # noqa: SLF001
+                       if option in exact_only and option != name and option.startswith(name))
+        if len(meant) == 1:
+            unit = ", in milliseconds" if meant[0].endswith("-ms") else ""
+            return f" ({name} is not a flag here; {meant[0]} is spelled in full{unit})"
+    return ""
 
 
 def _apply_ios_overrides(args: argparse.Namespace) -> None:

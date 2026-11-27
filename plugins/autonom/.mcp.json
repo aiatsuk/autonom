@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "autonom": {
+      "command": "autonom",
+      "args": ["mcp", "serve"]
+    }
+  }
+}

@@ -183,8 +183,9 @@ SELECTOR_FLAGS = (("text", "--text"), ("desc", "--desc"), ("resource_id", "--res
 
 
 def _no_observe(params: Mapping[str, Any]) -> List[str]:
-    """``--session-id S --no-observe``: an agent-profile session observes by default."""
-    return _sid(params) + ["--no-observe"]
+    """``--session-id S --no-observe --json``: an agent-profile session
+    observes by default and answers an action in a few lines of text."""
+    return _sid(params) + ["--no-observe", "--json"]
 
 
 def _b_ui_tap(params: Mapping[str, Any]) -> List[str]:

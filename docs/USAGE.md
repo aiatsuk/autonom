@@ -221,6 +221,48 @@ control labelled Continue, capture a screenshot, tail logcat for the package,
 and report measured on-screen text separately from hypotheses.
 ```
 
+## Drive a device with few calls and no sleeps
+
+An agent-profile session answers each action with what changed, so the next
+step needs no extra read; a wait runs inside the call instead of a `sleep`
+between calls; the evidence screenshot is taken by the action itself.
+
+```bash
+autonom session start --serial emulator-5554 --app-id com.example.app --launch --profile agent
+
+# one call: tap, wait for the list to load, report what changed, keep a screenshot
+autonom ui tap --text "Orders" --until gone:text=Loading --until text="Order #" --shot "orders list"
+# ui tap ok at 540,1210 (n14)
+# until met in 840 ms: gone: text "Loading"; text "Order #"
+# screen: com.example.app .MainActivity, 31 nodes
+# changes: +12 -3 ~1
+# + n9 text "Order #1042" ...
+# shot: .../shots/0003_101500_orders-list.jpg
+
+# wait for a request the proxy records (network capture is on): any app, no app hooks
+autonom ui tap --text "Refresh" --until 'request=*/v1/orders*'
+
+# waits on their own
+autonom ui wait --text "Order accepted" --timeout-ms 15000
+autonom ui wait --resource-id com.example.app:id/spinner --gone
+autonom network requests wait --path '*/v1/orders*' --method POST --status 201
+
+# the JSON line with every key, or the text plus the whole screen
+autonom ui key BACK --json
+autonom ui key BACK --screen
+```
+
+A wait that ends unmet exits 1 and says what did not hold. After an action
+with an unmet `--until` the input was already sent: read the screen, do not
+send it again. A reply that starts with `! not on the fast path:` names why a
+slower backend served the call and how to get the fast one back.
+
+An agent host that loads the plugin's MCP server (`autonom mcp serve`) gets
+the same loop as tools: `tap`, `type_text`, `key`, `swipe`, `wait`, `screen`,
+`steps`, `screenshot` and `autonom` for any other verb. Each call runs inside
+one long-lived process, so nothing starts up per step, and `until` and `shot`
+are tool arguments.
+
 ## Drive an iOS app on the Simulator
 
 ```text

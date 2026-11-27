@@ -612,7 +612,7 @@ class ObservedSignalTests(SignalsCase):
         self.start_session("--profile", "agent")
         self.helper.xml_after = PERMISSION_XML
         self.helper.windows = WINDOWS["permission"]
-        code, payload = self.cli("ui", "tap", "--x", "540", "--y", "700")
+        code, payload = self.cli("ui", "tap", "--x", "540", "--y", "700", "--json")
         self.assertEqual(code, 0, payload)
         self.assertEqual(payload["screen"]["signals"]["dialog"]["kind"], "permission")
         saved = json.loads(Path(payload["screen"]["saved"]).read_text(encoding="utf-8"))

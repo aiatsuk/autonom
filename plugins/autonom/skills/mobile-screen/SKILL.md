@@ -36,8 +36,10 @@ python3 <autonom-root>/scripts/autonom.py ui accessibility enable   # explicit r
 python3 <autonom-root>/scripts/autonom.py ui accessibility reset    # restore saved settings
 python3 <autonom-root>/scripts/autonom.py ui tree --no-accessibility-recovery  # inspection only
 
-# Wait until the screen stops changing (animations, spinners, loading lists)
-python3 <autonom-root>/scripts/autonom.py ui wait --settled --timeout-ms 5000       # settled, snapshots, changes, elapsed_ms; exit 1 if never settled
+# Wait inside the call, never with `sleep` (see "Waiting" below)
+python3 <autonom-root>/scripts/autonom.py ui wait --text "Welcome" --timeout-ms 15000  # until such a node is on screen; exit 1 if it never came
+python3 <autonom-root>/scripts/autonom.py ui wait --resource-id com.example:id/spinner --gone   # until no such node is on screen
+python3 <autonom-root>/scripts/autonom.py ui wait --settled --timeout-ms 5000       # until the screen stops changing; exit 1 if never settled
 
 # Find
 python3 <autonom-root>/scripts/autonom.py ui find --text "Login" --mode contains     # Android
@@ -52,6 +54,7 @@ python3 <autonom-root>/scripts/autonom.py ui fill "user@example.com" --resource-
 python3 <autonom-root>/scripts/autonom.py ui swipe --from 200,600 --to 200,200
 python3 <autonom-root>/scripts/autonom.py ui key KEYCODE_BACK      # Android
 python3 <autonom-root>/scripts/autonom.py ui key HOME              # iOS
+python3 <autonom-root>/scripts/autonom.py ui tap --desc "Continue" --until text="Welcome" --shot "signed in"   # tap, wait, screenshot: one call
 python3 <autonom-root>/scripts/autonom.py ui tap --desc "Continue" --observe        # outside an agent session: also return the new screen
 python3 <autonom-root>/scripts/autonom.py ui swipe --from 200,600 --to 200,200 --no-observe   # agent session: return right after the input
 
@@ -74,7 +77,28 @@ python3 <autonom-root>/scripts/autonom.py ui tree --dump tests/fixtures/ui_dump.
 python3 <autonom-root>/scripts/autonom.py ui tree --dump tests/fixtures/idb_describe_all_sample.json
 ```
 
-Every reply is one line of JSON.
+Every reply is one line of JSON. In an agent-profile session the action verbs,
+`ui do` and `ui wait` answer in a few lines of text instead; `--json` on the
+verb prints the JSON line.
+
+## Waiting: never `sleep`
+
+A `sleep` between calls waits blind: too short and the next read is wrong, too
+long and the time is lost. Wait for the thing itself, inside the call:
+
+- on the action: `--until text=V`, `desc=V`, `id=V` (a node on screen),
+  `gone:text=V` and the like (no such node), `'request=*/v1/orders*'` (a
+  request the capture proxy records). Repeat `--until`; all must hold, at
+  most `--until-timeout-ms` (10000). The condition is matched like the
+  selector flags (contains, any case);
+- on its own: `ui wait` with the selector flags (`--gone` for "until it
+  leaves"), `ui wait --settled`, `network requests wait --path GLOB`.
+
+Only nodes on screen count. A wait never sends input. When it ends unmet the
+command exits 1 and says what did not hold; after an action the reply keeps
+`ok: true` and warns `until_not_met`: the input **was** sent, so read the
+screen and never send it again. `--timeout 40` is refused on purpose: the
+flag is `--timeout-ms`, in milliseconds.
 
 ## Agent profile: the new screen in every reply
 
@@ -85,7 +109,20 @@ session:
   `ref role "label" id=... @x,y wxh [state]`. `--format json` still gives `nodes`.
 - `ui tap`, `ui type`, `ui fill`, `ui swipe` and `ui key` wait for the screen
   to settle after the input (at most `--observe-timeout-ms`, default 3000) and
-  add the new screen to their own reply:
+  report the new screen in their own reply, as a few lines of text:
+
+  ```text
+  ui tap ok at 540,390 (n3)
+  screen: com.android.settings .MainActivity, 3 nodes
+  changes: +3 -4 ~0
+  + n2 button "About" @40,220 1000x100 [clickable]
+  - n4 button "Display" @40,460 1000x100 [clickable]
+  ```
+
+  A line that starts with `!` is a warning, and `! not on the fast path:` as
+  the first line says a slower backend served the call and how to get the
+  fast one back. `--screen` adds the whole outline to the text; `--json`
+  prints the JSON line, whose keys are:
   - `screen.outline` — the screen now, as `ui tree` prints it (`count`,
     `truncated`);
   - `changes` — `added`, `removed` and `changed` counts and up to 20 outline
@@ -99,8 +136,9 @@ session:
     the on-device helper the reply also says `settled` and `settle_ms`.
 
 **Read the next step from that reply.** Do not follow every action with
-`ui tree` or `ui wait --settled`: the reply already waited and read the screen
-once. Read the tree yourself only when the reply says so:
+`ui tree` or `ui wait --settled`, and do not pipe the reply away: it already
+waited and read the screen once. Read the tree yourself only when the reply
+says so:
 
 - `observe_error` — the input **was** sent; only the read after it failed.
   Run `ui tree`. Never send the input again.
@@ -509,7 +547,8 @@ the space you computed in when you report a coordinate.
 2. `ui tree` once → read labels, roles, enabled and checked state from the
    outline. Note which field holds the label.
 3. `ui tap` / `ui type` / `ui fill` / `ui swipe` / `ui key` for the next
-   action, then read the reply's `screen`, `changes` and `foreground` — no
+   action, with `--until` for what it should lead to (never a `sleep`), then
+   read the reply's `screen`, `changes` and `foreground` — no
    `ui tree` or `ui wait --settled` in between unless the reply carries
    `observe_error`, or a `screen_not_settled` warning and a `screen` that does
    not show what you expected (common on the Android uiautomator fallback
@@ -519,7 +558,7 @@ the space you computed in when you report a coordinate.
    after each navigation.
 4. A path whose steps you already know goes in one `ui do`, with an
    `assertVisible` where the screen matters.
-5. `screenshot` after state changes that need visual proof — **compare before/after**;
+5. `--shot LABEL` on the action (or `screenshot`) for state changes that need visual proof — **compare before/after**;
    an exit code of 0 does not prove the screen changed. Pin the status bar first
    so the diff shows only what the app changed. In an agent session on Android
    it is the small JPEG: tap from the tree, or convert with `coordinates`.

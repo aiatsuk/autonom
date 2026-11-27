@@ -192,8 +192,9 @@ class DeviceVerbTests(OneLineCase):
                                  "--profile", "agent")
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assert_one_line(completed.stdout)
-        for argv in (("ui", "tree"), ("ui", "tap", "--x", "1", "--y", "1"),
-                     ("ui", "key", "KEYCODE_BACK")):
+        # an action answers in a few lines of text there; --json is the JSON line
+        for argv in (("ui", "tree"), ("ui", "tap", "--x", "1", "--y", "1", "--json"),
+                     ("ui", "key", "KEYCODE_BACK", "--json")):
             with self.subTest(argv=argv):
                 completed = self.android(*argv)
                 self.assertEqual(completed.returncode, 0, completed.stderr)

@@ -4,6 +4,10 @@ This package contains 24 portable skills for testing and debugging mobile apps
 on Android and the iOS Simulator. Start with the `autonom` skill, then use
 `project-router` to select the skills for your app and task.
 
+The package also declares an optional MCP server, `autonom mcp serve`: the
+same device loop as tools served by one long-lived process. It needs the CLI
+on the host's `PATH`; the skills work without it.
+
 The Autonom CLI is installed separately. Follow the
 [installation guide](https://autonom.yatsuk.me/docs/install/) to install the CLI
 and the device tools for your platform. Python 3.11+ is required; the iOS
