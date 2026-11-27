@@ -1,6 +1,6 @@
 # Agent fast loop: wait in the call, short replies, visible slow path
 
-- Status: active
+- Status: completed
 - Source: owner request, 2026-11-27
 - Last updated: 2026-11-27 Europe/Moscow
 
@@ -89,7 +89,7 @@ tokens per step, on any app:
 
 ## Current status
 
-All seven items are implemented with tests and documentation. Not committed.
+All seven items are implemented with tests and documentation and released in 0.39.0.
 
 ## Completed
 
@@ -109,9 +109,9 @@ All seven items are implemented with tests and documentation. Not committed.
 
 ## Next step
 
-Run one scenario end to end with an agent (the model in the loop) on the released CLI
-and on the working tree, and count calls, time and tokens per action; then run the full
-`make check`.
+None for this plan. A follow-up worth its own plan: run one scenario end to end with an
+agent (the model in the loop) on 0.38.1 and on 0.39.0, and count calls, time and tokens
+per action.
 
 ## Failed approaches
 
@@ -130,8 +130,9 @@ and on the working tree, and count calls, time and tokens per action; then run t
   `test_brief` (40), `test_mcp_server` (24), `test_skill_loop` (10), and the observe,
   agent-profile, Android helper, journal, flow compiler, bare-host, documentation and
   ChatGPT adapter suites. No JavaScript changed.
-- The full gate (`make check`) is left to CI: `test_network` and
-  `test_transparent_capture` create temporary certificates and keys.
+- The full gate (`scripts/run_checks.sh`) passed in CI on the pull request. Locally
+  `test_network` and `test_transparent_capture` were not run: they create temporary
+  certificates and keys.
 - Real Android emulator (API 34, the on-device helper serving every measured call),
   Settings, open one section and go back, 10 repeats, medians:
 
@@ -157,7 +158,9 @@ and on the working tree, and count calls, time and tokens per action; then run t
 - Polling a tree through `uiautomator dump` costs a second or more per read; waits
   are only cheap on the helper and on iOS idb.
 - The MCP server is declared for every plugin user: a host without `autonom` on its
-  `PATH` lists it as failed. It has not been tried in a real agent host yet.
+  `PATH`, or with a CLI older than 0.39.0, lists it as failed. Checked in Claude Code
+  2.1.325 (the plugin loads, the server connects, 13 tools are listed); not checked in
+  Codex.
 - After a `uiautomation_busy` failure the helper is not tried again for 60 s, so a
   session keeps the slow path for a minute after the other tool has gone.
 - An observed tap waits for half a second of quiet: about 1.4 s a tap on the emulator
