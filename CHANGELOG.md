@@ -7,6 +7,8 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
 
 ## [Unreleased]
 
+## [0.39.0] - 2026-11-27
+
 ### Added
 
 - **Wait inside the call.** `ui wait` takes a selector (the flags of `ui
