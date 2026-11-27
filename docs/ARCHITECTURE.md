@@ -75,6 +75,10 @@ scripts/autonom_lib/
                               admission rule, the per-invocation claim and admit-once state
   journal.py                  append-only journal.ndjson: every verb, parser-resolved scrubbed argv, notes
   consent.py                  the consent gate: per-invocation flag + typed phrase, never cached
+  wait.py                     waiting inside a call: a node, a node gone, a recorded request
+  brief.py                    the short text replies of an agent-profile session
+  mcp_server.py               `mcp serve`: the agent loop as MCP tools over stdio; each call
+                              is `main(argv)` in the server process
   selector.py                 shared selector matching and duplicate policy
   ui.py                       platform dispatch + the compact node schema
   ui_android.py / adb.py      UI Automator parsing and adb actuation; the Android backend
@@ -947,6 +951,7 @@ point/pixel mix-up otherwise "succeeds" while landing in the wrong place.
 | Claude marketplace | `.claude-plugin/marketplace.json` | Claude Code |
 | Codex marketplace | `.agents/plugins/marketplace.json` | Codex |
 | Plugin manifests | `plugins/autonom/.claude-plugin/plugin.json`, `.codex-plugin/plugin.json` | Claude, Codex |
+| MCP server | `plugins/autonom/.mcp.json` (`autonom mcp serve`) | hosts that load plugin MCP servers |
 | One-command installer | `install.sh` (+ `scripts/bootstrap.sh` for device tools) | everyone |
 | Per-layer installers | `install_cli.sh`, `install_claude.sh`, `install_codex.sh`, `install_skills.sh` | Claude, Codex, Grok, generic |
 | Validation | `scripts/validate_plugin.py`, `scripts/run_checks.sh` | local + CI (`.github/workflows/`) |

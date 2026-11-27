@@ -320,6 +320,9 @@ codex plugin add autonom@autonom
 
 Start a new Codex thread after install so the skill index reloads.
 
+The plugin also declares the MCP server `autonom mcp serve` (see
+[Claude Code](#claude-code) below for what it is and what it needs).
+
 ## Claude Code
 
 Install as a plugin — skills load namespaced as `autonom:<name>`:
@@ -337,6 +340,13 @@ After the source changes, run `claude plugin update autonom@autonom` (or
 re-run the script); releases bump the version precisely so the cache notices.
 
 Start a new Claude session after install so the plugin loads.
+
+The plugin also declares an MCP server, `autonom mcp serve`: the agent loop
+(`tap`, `wait`, `screen`, ...) as tools whose calls run inside one long-lived
+process, with no start-up per call. It needs `autonom` on the `PATH` Claude
+Code starts with ([Put `autonom` on PATH](#put-autonom-on-path)); without it
+the server is listed as failed in `/mcp` and the skills work as before. To
+add it by hand to any MCP host: command `autonom`, arguments `mcp serve`.
 
 ### Fallback: loose skills
 

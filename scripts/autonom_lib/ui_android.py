@@ -696,6 +696,24 @@ def provenance(target_id: str, since: int = 0) -> dict[str, Any]:
     return result
 
 
+def invocation_fallback() -> dict[str, Any]:
+    """``fallback_reason`` and ``fallback_hint`` when auto mode fell back to
+    uiautomator and adb for a device in this invocation; empty otherwise,
+    and under the explicit ``uiautomator`` choice. For the envelope of a
+    command that failed after the fallback: without them a read that
+    uiautomator could not make either (another tool holds UiAutomation)
+    names a symptom and not its cause."""
+    for state in _STATE.values():
+        if state.get("preference") == UIAUTOMATOR or not state.get("fallen_back"):
+            continue
+        if state.get("fallback_reason"):
+            found = {"fallback_reason": state["fallback_reason"]}
+            if state.get("fallback_hint"):
+                found["fallback_hint"] = state["fallback_hint"]
+            return found
+    return {}
+
+
 def fall_back(target: Any, reason: str, hint: str | None) -> None:
     """Auto mode: the rest of this invocation reads with uiautomator and sends
     with adb, and each of those calls says why."""

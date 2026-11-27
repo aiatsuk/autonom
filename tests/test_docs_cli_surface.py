@@ -41,6 +41,14 @@ SELECTOR_FLAGS = frozenset({
     "--clickable", "--enabled", "--mode", "--case-sensitive", "--index",
 })
 
+# What an action verb does after its input and how it answers: spelled out
+# on `ui tap`, referred to on the other action verbs.
+ACTION_TOKEN = "[action flags]"
+ACTION_FLAGS = frozenset({
+    "--observe", "--no-observe", "--observe-timeout-ms", "--until", "--until-timeout-ms",
+    "--shot", "--json", "--screen",
+})
+
 # Verbs the parser accepts that the doc writes as one optional word rather than
 # a second entry: `autonom devices [list]` is the same command either way.
 ALIASES = {"devices list": "devices"}
@@ -168,6 +176,8 @@ def documented_surface() -> dict[str, set[str]]:
             }
             if SELECTOR_TOKEN in alternative:
                 flags |= SELECTOR_FLAGS
+            if ACTION_TOKEN in alternative:
+                flags |= ACTION_FLAGS
             tail = leading_words(alternative)
             if index and tail:
                 # `network mock list | show <id>` means `network mock show`; but

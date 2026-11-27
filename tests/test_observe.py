@@ -178,6 +178,10 @@ finally:
 '''
 
 
+# The verbs `run_cli` asks for the JSON line (`--json`).
+ACTION_VERBS = (("tap",), ("swipe",), ("pinch",), ("type",), ("fill",), ("key",), ("do",))
+
+
 class ObserveCase(EnvSandboxMixin, unittest.TestCase):
     """A private AUTONOM_HOME, fake adb/simctl/idb behind the screen-changing
     wrapper, and a PATH without any real tool."""
@@ -219,12 +223,23 @@ class ObserveCase(EnvSandboxMixin, unittest.TestCase):
         self.state.write_text(json.dumps(state), encoding="utf-8")
 
     def run_cli(self, *argv: str) -> tuple[int, dict[str, Any], str]:
+        """The reply as an object. An action verb is asked for its JSON line
+        (`--json`): in an agent-profile session it answers in a few lines of
+        text by default, which `run_text` returns."""
+        if "ui" in argv and argv[argv.index("ui") + 1:][:1] in ACTION_VERBS \
+                and "--json" not in argv:
+            argv = (*argv, "--json")
+        code, stdout, stderr = self.run_text(*argv)
+        stream = stdout if stdout.strip() else stderr
+        return code, json.loads(stream), stdout
+
+    def run_text(self, *argv: str) -> tuple[int, str, str]:
+        """Exit code, stdout and stderr exactly as the CLI printed them."""
         completed = subprocess.run(
             [sys.executable, str(CLI), *argv], cwd=self.root, env=self.env, text=True,
             stdin=subprocess.DEVNULL, capture_output=True, check=False, timeout=120)
         self.assertNotIn("Traceback", completed.stdout + completed.stderr)
-        stream = completed.stdout if completed.stdout.strip() else completed.stderr
-        return completed.returncode, json.loads(stream), completed.stdout
+        return completed.returncode, completed.stdout, completed.stderr
 
     def calls(self, tool: str) -> list[list[str]]:
         if not self.log.exists():

@@ -589,10 +589,10 @@ class MutationTests(SessionsCase):
         self.assertEqual(len(self.cli_calls("control_acquire")), 1)
         taps = self.cli_calls("ui_tap")
         self.assertEqual(taps[0]["argv"], ["ui", "tap", "--operation-id", first["operation_id"],
-                                           "--session-id", session_id, "--no-observe", "--text", "Settings",
+                                           "--session-id", session_id, "--no-observe", "--json", "--text", "Settings",
                                            "--mode", "contains"])
         self.assertEqual(taps[1]["argv"], ["ui", "tap", "--operation-id", second["operation_id"],
-                                           "--session-id", session_id, "--no-observe", "--desc=-dash", "--role", "button",
+                                           "--session-id", session_id, "--no-observe", "--json", "--desc=-dash", "--role", "button",
                                            "--mode", "exact", "--index", "0"])
         for tap in taps:
             self.assertEqual(tap["claim"], {"AUTONOM_CONTROL_HOLDER": "chatgpt-agent:" + host,
@@ -610,9 +610,10 @@ class MutationTests(SessionsCase):
 
     def test_agent_profile_session_still_reads_nodes_and_acts_without_observing(self) -> None:
         """A session started with --profile agent defaults to the outline tree and
-        to observing after each action (DEC-028); the adapter pins --format json and
-        --no-observe, so get_ui_tree still returns nodes and every action completes
-        without the observe wait (the fake would sleep a minute if it observed)."""
+        to observing after each action (DEC-028), and answers an action in text; the
+        adapter pins --format json, --no-observe and --json, so get_ui_tree still
+        returns nodes and every action completes without the observe wait (the fake
+        would sleep a minute if it observed) and is read as JSON."""
         session_id = FAKE.add_session(self.fake_state, profile="agent")
         server = self.started(FAKE_MCP_OBSERVE_MS="60000")
         host = self.host_id(server)
@@ -628,7 +629,7 @@ class MutationTests(SessionsCase):
         for verb in ("ui_tap", "ui_type", "ui_key"):
             calls = self.cli_calls(verb)
             self.assertEqual(len(calls), 1, verb)
-            self.assertEqual(calls[0]["argv"][6], "--no-observe", verb)
+            self.assertEqual(calls[0]["argv"][6:8], ["--no-observe", "--json"], verb)
         for result in (tapped, typed):
             self.assertNotIn("changes", result)
         self.assertEqual(len(self.cli_calls("control_acquire")), 1)
@@ -827,7 +828,7 @@ class MutationTests(SessionsCase):
         self.assertEqual((typed["chars"], typed["action"]["verb"]), (14, "ui type"))
         argv = self.cli_calls("ui_type")[0]["argv"]
         self.assertEqual(argv, ["ui", "type", "--operation-id", typed["operation_id"], "--session-id",
-                                session_id, "--no-observe", "--sensitive", "--", "<redacted>"])
+                                session_id, "--no-observe", "--json", "--sensitive", "--", "<redacted>"])
         self.assertNotIn(SECRET, json.dumps(self.last_result))
         refused = self.started(FAKE_MCP_CLI_MODE="crash:ui_type")
         host = self.host_id(refused)
@@ -942,7 +943,7 @@ class MutationTests(SessionsCase):
         pressed = self.call_ok(server, "press_key", self.ref(host, session_id, key="BACK"))
         self.assertEqual(self.cli_calls("ui_key")[0]["argv"],
                          ["ui", "key", "--operation-id", pressed["operation_id"], "--session-id", session_id,
-                          "--no-observe", "BACK"])
+                          "--no-observe", "--json", "BACK"])
         refusing = self.started(FAKE_MCP_CLI_MODE="fail:ui_key:unsupported_key_for_platform,"
                                                   "fail:ui_tap:ui_action_uncertain")
         host = self.host_id(refusing)

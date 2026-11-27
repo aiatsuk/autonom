@@ -263,7 +263,7 @@ class AgentProfileTests(ShotCase):
 
     def test_flow_take_screenshot_stays_png_in_an_agent_session(self) -> None:
         session = self.start_session("--profile", "agent")
-        code, reply = self.cli("ui", "do", stdin='[{"takeScreenshot": "flowshot"}]')
+        code, reply = self.cli("ui", "do", "--json", stdin='[{"takeScreenshot": "flowshot"}]')
         self.assertEqual(code, 0, reply)
         shots = list(Path(session["artifacts_dir"]).rglob("*flowshot*"))
         self.assertTrue(shots, "the flow took its screenshot")

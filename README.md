@@ -13,7 +13,8 @@ node schema is identical on both, so one skill body drives either platform.
 
 Skills are portable `SKILL.md` packages. The **CLI control plane** — installed
 as `autonom` — is the stable JSON API. Helpers stay dependency-light. No MCP
-server is required (optional MCP wrapper is planned).
+server is required; `autonom mcp serve` is an optional one that serves the
+agent loop as tools from one long-lived process.
 
 **Shipped:** Android emulator + iOS Simulator sessions, UI trees, semantic
 find/tap/gestures, screenshots and recordings, logs and crashes, deep links,
@@ -37,8 +38,7 @@ animations off on Android — with a `repair` hand-off (including ranked
 on-screen candidates) on every failed flow step. iOS input runs through idb
 or, where Xcode 27 broke an older idb companion, through AXe. Domain packs for Flutter, native
 Kotlin/Jetpack Compose, and iOS.  
-**Roadmap:** Flutter VM Service, React Native skills, optional MCP wrapper,
-hosted device providers.
+**Roadmap:** Flutter VM Service, React Native skills, hosted device providers.
 
 **Proposed ChatGPT desktop workspace:** [architecture and implementation plan](docs/plans/CHATGPT_DEVICE_WORKSPACE.md)
 for local and remote Canvas connections, concurrent device sessions, and shared
@@ -75,6 +75,8 @@ autonom session start --platform ios --target <UDID> \
 
 # Same verbs on either platform
 autonom ui wait --settled --timeout-ms 5000  # until two consecutive trees match
+autonom ui wait --text "Welcome"             # until such a node is on screen (--gone: until none is)
+autonom ui tap --text "Orders" --until gone:text=Loading --shot "orders"   # tap, wait, screenshot: one call
 autonom ui tree
 autonom ui tree --format outline --interactable   # one line per actionable node
 autonom ui find --desc "Log In" --mode exact
@@ -205,7 +207,9 @@ The setup skill downloads the matching GitHub Release, checks its SHA-256,
 and installs the CLI without cloning the repository. Python 3.11+ is required.
 It returns an absolute executable path for Desktop environments where
 `~/.local/bin` is not on PATH. Device SDKs remain a separate setup step.
-The plugin contains skills only; no MCP server is required.
+The plugin contains the skills and declares one optional MCP server
+(`autonom mcp serve`, started by the host when `autonom` is on its PATH); the
+skills work without it.
 
 For updates, refresh the marketplace and reinstall the plugin, then run setup
 in a new session. The default source follows the repository's default branch.

@@ -9,6 +9,35 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
 
 ### Added
 
+- **Wait inside the call.** `ui wait` takes a selector (the flags of `ui
+  find`) and waits until a matching node is on screen, or with `--gone` until
+  none is; `network requests wait` waits until the session's proxy records a
+  request matching the filters of `network requests list` (after the call
+  began, or after `--since-id`), which works for any app whose traffic the
+  proxy sees. The action verbs (`ui tap|swipe|pinch|type|fill|key`) take
+  `--until CONDITION` (repeatable, all must hold; `--until-timeout-ms`, 10 s
+  by default): `text=V`, `desc=V`, `id=V`, the same after `gone:`, or
+  `request=GLOB`, whose cursor is taken before the input so a fast response
+  is not missed. A wait only reads. Unmet waits exit 1 with the report on
+  stdout: `ui wait` and `network requests wait` with `met: false` and the
+  warning `wait_not_met`; an action keeps `ok: true` (its input was sent
+  once) and adds `until_not_met`. A bad condition, or a request condition
+  without a running proxy, is refused before any input.
+- **`autonom mcp serve`: a persistent MCP server for the agent loop.** One
+  process over stdio serves `devices`, `session_start`, `session_stop`,
+  `screen`, `tap`, `type_text`, `fill`, `swipe`, `key`, `wait`, `steps`,
+  `screenshot` and `autonom` (any other verb by its arguments). Every tool
+  call is an Autonom command run inside that process, so nothing starts up
+  per call, and the same checks, session, control lease and journal apply.
+  The action tools take `until`, `shot` and `whole_screen` and answer in the
+  short text of an agent-profile session whatever the session's profile.
+  The plugin declares the server (`plugins/autonom/.mcp.json`); the host
+  needs `autonom` on its `PATH`. Verbs that serve until stopped are refused
+  through it, and follow streams need `--max-seconds`.
+- **`--shot LABEL` on the action verbs.** The screenshot `autonom screenshot
+  --label LABEL` takes, in the action's own call, after its `--until` wait
+  and observe; the reply names it (`shot.path`). A failed capture is the
+  warning `shot_failed` and never fails the action.
 - **Push notifications: compose once, send on iOS and Android.**
   `simulator push compose` (read-only, no device) turns plain fields
   (`title`, `body`, `data`, `badge`, `sound`, `image`, `silent`, ...) into one
@@ -88,6 +117,45 @@ semver as enforced by `scripts/validate_plugin.py` (the library version in
   the booted simulators' slim state. New schema
   `schemas/slim-profile-v1.schema.json`. The skills `mobile-session` and
   `ios-project-setup` explain when to slim and how to build a profile.
+
+### Changed
+
+- **The start skill is the work loop, in 5 KB.** `autonom` is now one short
+  page: the loop, eight rules (never `sleep`; read the reply; a line that
+  starts with `!` needs you; select by meaning; a screenshot is evidence;
+  known steps in one `ui do`; one explicit target; consent and honesty), the
+  Android fast path and a table of five recipes of 2 to 3 KB each
+  (`recipes/session.md`, `act-and-wait.md`, `mocks.md`, `evidence.md`,
+  `fast-path.md`). The map it used to be is `references/system-map.md`.
+  `mobile-screen` gains a "Waiting: never `sleep`" section and the text
+  reply; `mobile-network` and `mobile-session` say how to wait for a request
+  and for the first screen. `tests/test_skill_loop.py` parses every command
+  these pages show with the real parser.
+- **Flutter: hot reload, hot restart or rebuild.** `flutter-debugger-agent`
+  says how to keep one debug `flutter run` alive and reach it (`--pid-file`
+  with `SIGUSR1`/`SIGUSR2`, the `--machine` `app.restart` command, `flutter
+  attach`), which change needs which, and to check the result with a wait
+  inside the call.
+- **An agent-profile session answers actions and waits in a few lines of
+  text.** `ui tap|swipe|pinch|type|fill|key`, `ui do`, `ui wait` and `network
+  requests wait` print the status, what changed on the screen (`changes: +A
+  -R ~C` and the changed outline lines), the screenshot path and one line per
+  warning instead of the JSON line. `--json` prints the JSON line with every
+  key and `--screen` adds the whole outline to the text; a wrapper that
+  parsed these replies in an agent-profile session passes `--json`. Other
+  verbs, default sessions, error envelopes, exit codes and the journal are
+  unchanged.
+- **A reply says first when the fast path was not used.** The text reply
+  starts with `! not on the fast path: <reason>. <hint>`, and a JSON reply
+  carries `fallback_reason` and `fallback_hint` right after `ok` instead of
+  at its end. An Android command that fails after the fallback now carries
+  them in its error envelope too: with another tool holding UiAutomation the
+  uiautomator read fails as well, and the envelope used to name only that
+  (`UIAutomator returned an incomplete hierarchy`).
+- **`ui wait --timeout 40` is refused** (`usage_error`, naming `--timeout-ms`
+  and its unit). It was read as `--timeout-ms 40`: 40 milliseconds.
+- **The ChatGPT development adapter passes `--json`** to `ui tap`, `ui type`
+  and `ui key`, so its replies stay JSON in an agent-profile session.
 
 ## [0.38.1] - 2026-11-10
 

@@ -122,6 +122,110 @@ def skipped_count(warnings: list[dict[str, Any]]) -> int:
 SKIP_WARNING_CODES = ("truncated_flow_record", "invalid_flow_record")
 
 
+class Tail:
+    """What a session's flow store gained since the last look
+    (`network requests follow`, `network requests wait`, `--until request=`).
+
+    The store is append-only JSONL (its own contract), so the tail reads by
+    byte offset and parses only what was appended — never the whole history
+    again on every look. A shrink means the store was replaced: it starts
+    over from byte 0, and `seen` keeps replayed flows from coming back.
+    `skipped` counts lines that are not flow records — not JSON, deeper than
+    the parser allows, JSON but not an object, nested deeper than
+    `MAX_LINE_DEPTH`, or refused by the scrubber — exactly like
+    `read_all_counted`. A record whose id is not a string is counted too: it
+    cannot be deduplicated.
+    """
+
+    def __init__(self, record: dict[str, Any]) -> None:
+        self.path = flows_path(record)
+        self.offset = 0
+        self.buffer = b""
+        self.skipped = 0
+        self.seen: set[str] = set()
+        # read while looking for a cursor (`skip_through`), not yet handed out
+        self._pending: list[dict[str, Any]] = []
+
+    def read_appended(self) -> list[dict[str, Any]]:
+        """Every record appended since the last call, scrubbed."""
+        if not self.path.exists():
+            return []
+        size = self.path.stat().st_size
+        if size < self.offset:
+            self.offset, self.buffer = 0, b""
+        if size == self.offset:
+            return []
+        with self.path.open("rb") as handle:
+            handle.seek(self.offset)
+            chunk = handle.read()
+        self.offset += len(chunk)
+        self.buffer += chunk
+        *complete, self.buffer = self.buffer.split(b"\n")
+        parsed: list[dict[str, Any]] = []
+        for raw_line in complete:
+            line = raw_line.decode("utf-8", errors="replace").strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except (ValueError, RecursionError):
+                self.skipped += 1  # a torn write or a hostile nesting depth
+                continue
+            if not isinstance(row, dict) or too_deep(row):
+                # `3`, `null`, `[1]`, `"x"` are not flow records; a too-deep
+                # value would raise RecursionError when filtered or printed.
+                self.skipped += 1
+                continue
+            if row.get("id") is not None and not isinstance(row.get("id"), str):
+                self.skipped += 1  # a list or dict id is unhashable for `seen`
+                continue
+            try:
+                parsed.append(redact.scrub_flow(row))
+            except (TypeError, ValueError, AttributeError, RecursionError):
+                self.skipped += 1
+        return parsed
+
+    def skip_recorded(self) -> str | None:
+        """Take everything already recorded as seen: only what comes later
+        is new. Returns the id of the latest record (None for an empty
+        store)."""
+        latest = None
+        for flow in self.read_appended():
+            if flow.get("id"):
+                self.seen.add(flow["id"])
+                latest = flow["id"]
+        return latest
+
+    def skip_through(self, flow_id: str) -> bool:
+        """Take the records up to and including `flow_id` as seen; the ones
+        after it are still to come from `fresh`. False when no record has
+        that id (then nothing is taken as seen)."""
+        recorded = self.read_appended()
+        position = next((index for index, flow in enumerate(recorded)
+                         if flow.get("id") == flow_id), None)
+        if position is None:
+            self._pending = recorded
+            return False
+        for flow in recorded[:position + 1]:
+            if flow.get("id"):
+                self.seen.add(flow["id"])
+        self._pending = recorded[position + 1:]
+        return True
+
+    def fresh(self) -> list[dict[str, Any]]:
+        """Records not seen before, each once (deduplicated before any
+        filter: a record the caller filters out is still seen)."""
+        pending, self._pending = self._pending, []
+        fresh = []
+        for flow in [*pending, *self.read_appended()]:
+            flow_id = flow.get("id")
+            if not flow_id or flow_id in self.seen:
+                continue
+            self.seen.add(flow_id)
+            fresh.append(flow)
+        return fresh
+
+
 def _since_cutoff(seconds: float) -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - seconds))
 

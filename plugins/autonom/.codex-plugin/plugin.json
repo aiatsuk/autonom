@@ -38,6 +38,7 @@
     "ui-tree"
   ],
   "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "Autonom",
     "shortDescription": "Test and debug mobile apps",

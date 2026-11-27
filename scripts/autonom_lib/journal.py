@@ -196,15 +196,19 @@ def _entered_text(args: Any, verb: str | None) -> str | None:
 
 
 # `ui fill`'s own options, as build_parser() declares them (the selector set
-# of `ui tap`, `--sensitive` and the observe flags): value-taking ones, and
-# switches. `tests/test_journal.py` checks them against the real parser.
+# of `ui tap`, `--sensitive`, the observe flags, and what an action does after
+# its input and how it answers): value-taking ones, and switches.
+# `tests/test_journal.py` checks them against the real parser.
 _FILL_VALUE_OPTIONS = frozenset({
     "--text", "--desc", "--resource-id", "--class-name", "--package", "--role",
     "--clickable", "--enabled", "--mode", "--index", "--observe-timeout-ms",
+    "--until", "--until-timeout-ms", "--shot",
 })
-_FILL_SWITCHES = frozenset({"--case-sensitive", "--sensitive", "--observe", "--no-observe"})
+_FILL_SWITCHES = frozenset({"--case-sensitive", "--sensitive", "--observe", "--no-observe",
+                            "--json", "--screen"})
 # Matched only when spelled in full, like argparse's exact-only options.
-_FILL_EXACT_ONLY = frozenset({"--observe", "--no-observe", "--observe-timeout-ms"})
+_FILL_EXACT_ONLY = frozenset({"--observe", "--no-observe", "--observe-timeout-ms",
+                              "--until", "--until-timeout-ms", "--shot", "--json", "--screen"})
 
 
 def _fill_option(name: str) -> str | None:

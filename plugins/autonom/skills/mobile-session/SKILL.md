@@ -175,6 +175,9 @@ export AUTONOM_IDB_COMPANION=mac-farm-01:10882
 5. If a session died without stopping, `autonom doctor` lists orphaned processes,
    any device left pointing at a dead proxy, and any emulator still routed
    through another session's *live* proxy (`device_attached_to_foreign_proxy`).
+6. After a launch, a clear or a deep link, do not `sleep`: wait for the first
+   screen itself, `ui wait --text "..." --timeout-ms 20000` (see `mobile-screen`,
+   "Waiting").
 
 ## Failure codes worth knowing
 
